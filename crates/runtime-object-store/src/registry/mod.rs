@@ -876,6 +876,30 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
 }
 
 impl SpiceObjectStoreRegistry {
+    /// Keep a store this origin already has. Build a plaintext one only when
+    /// the origin has no fragment-built or externally registered store.
+    ///
+    /// A SQL `http://` URL asks for `allow_http=true` and nothing else.
+    /// Replacing a dataset store with that URL would drop credentials and
+    /// timeouts already configured for the origin. A bare HTTPS-only entry
+    /// cannot fetch the URL, so that entry is replaced.
+    pub fn ensure_plaintext_http_store(
+        &self,
+        url: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let key = Self::url_key(url);
+        if let Some(config) = self.configs.get(&key)
+            && matches!(
+                config.value(),
+                StoreConfig::Fragment(_) | StoreConfig::External
+            )
+            && let Ok(store) = self.inner.get_store(url)
+        {
+            return Ok(store);
+        }
+        self.get_store(url)
+    }
+
     fn should_reuse_cached(&self, key: &str, wanted: &StoreConfig) -> bool {
         self.configs
             .get(key)
@@ -945,10 +969,11 @@ impl SpiceObjectStoreRegistry {
 
 // This method uses unwrap_or_default, however it should never fail on the initialization. See
 // RuntimeEnv::default()
+/// A DataFusion runtime whose object-store registry is `registry`.
 #[must_use]
-pub fn default_runtime_env(io_runtime: Handle) -> Arc<RuntimeEnv> {
+pub fn runtime_env_with_registry(registry: Arc<SpiceObjectStoreRegistry>) -> Arc<RuntimeEnv> {
     match RuntimeEnvBuilder::default()
-        .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::new(io_runtime)))
+        .with_object_store_registry(registry)
         .build_arc()
     {
         Ok(runtime_env) => runtime_env,
@@ -956,6 +981,11 @@ pub fn default_runtime_env(io_runtime: Handle) -> Arc<RuntimeEnv> {
             unreachable!("Tests ensure this should never fail: {e}");
         }
     }
+}
+
+#[must_use]
+pub fn default_runtime_env(io_runtime: Handle) -> Arc<RuntimeEnv> {
+    runtime_env_with_registry(Arc::new(SpiceObjectStoreRegistry::new(io_runtime)))
 }
 
 #[cfg(test)]

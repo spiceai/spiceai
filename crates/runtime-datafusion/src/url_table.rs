@@ -383,6 +383,9 @@ pub struct SpiceUrlTableFactory {
     /// Weak reference to the session state for schema inference.
     /// Uses `parking_lot::RwLock` because that's what `SessionContext` uses internally.
     state: RwLock<Option<Weak<RwLock<SessionState>>>>,
+    /// The session's object-store registry. An `http://` SQL URL registers a
+    /// plaintext store here without replacing one a dataset already configured.
+    registry: RwLock<Option<Arc<runtime_object_store::registry::SpiceObjectStoreRegistry>>>,
 }
 
 impl Default for SpiceUrlTableFactory {
@@ -397,12 +400,21 @@ impl SpiceUrlTableFactory {
     pub fn new() -> Self {
         Self {
             state: RwLock::new(None),
+            registry: RwLock::new(None),
         }
     }
 
     /// Set the session state reference for schema inference.
     pub fn with_state(&self, state: Weak<RwLock<SessionState>>) {
         *self.state.write() = Some(state);
+    }
+
+    /// Use the same object-store registry the session queries with.
+    pub fn with_registry(
+        &self,
+        registry: Arc<runtime_object_store::registry::SpiceObjectStoreRegistry>,
+    ) {
+        *self.registry.write() = Some(registry);
     }
 }
 
@@ -451,10 +463,13 @@ impl UrlTableFactory for SpiceUrlTableFactory {
         }; // Lock is dropped here
 
         if store_url.scheme() == "http" {
-            state
-                .runtime_env()
-                .object_store_registry
-                .get_store(&store_url)?;
+            let registry = self.registry.read().clone();
+            let Some(registry) = registry else {
+                return Err(DataFusionError::Plan(format!(
+                    "Failed to read URL table '{url}'. Plaintext HTTP is not set up for this runtime."
+                )));
+            };
+            registry.ensure_plaintext_http_store(&store_url)?;
         }
 
         // Infer options and schema from the URL
@@ -638,6 +653,10 @@ impl CatalogProviderList for DynamicUrlCatalogList {
 mod tests {
     use super::*;
     use datafusion::catalog::{MemoryCatalogProvider, MemoryCatalogProviderList};
+
+    /// `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS` is process-global. These tests
+    /// set it, so they take this lock for the whole body.
+    static HTTP_URL_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_is_url_like() {
@@ -1167,7 +1186,7 @@ mod tests {
     #[tokio::test]
     async fn http_sql_url_table_reaches_an_explicit_http_server() {
         use datafusion::prelude::{SessionConfig, SessionContext};
-        use runtime_object_store::registry::default_runtime_env;
+        use runtime_object_store::registry::{SpiceObjectStoreRegistry, runtime_env_with_registry};
 
         struct ClearAllowPrivateHosts;
         impl Drop for ClearAllowPrivateHosts {
@@ -1176,6 +1195,9 @@ mod tests {
                 unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
             }
         }
+        let _env_lock = HTTP_URL_ENV
+            .lock()
+            .expect("the HTTP URL env lock is not poisoned");
         unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
         let _clear = ClearAllowPrivateHosts;
 
@@ -1199,11 +1221,15 @@ mod tests {
         });
 
         let url = format!("http://127.0.0.1:{port}/data.csv");
+        let registry = Arc::new(SpiceObjectStoreRegistry::new(
+            tokio::runtime::Handle::current(),
+        ));
         let ctx = SessionContext::new_with_config_rt(
             SessionConfig::new(),
-            default_runtime_env(tokio::runtime::Handle::current()),
+            runtime_env_with_registry(Arc::clone(&registry)),
         );
         let factory = SpiceUrlTableFactory::new();
+        factory.with_registry(Arc::clone(&registry));
         factory.with_state(ctx.state_weak_ref());
 
         let blocked = factory
@@ -1231,6 +1257,198 @@ mod tests {
         assert!(
             requests.iter().any(|request| request.contains("/data.csv")),
             "the server saw {requests:?}"
+        );
+        assert!(
+            table
+                .schema()
+                .fields()
+                .iter()
+                .any(|field| field.name() == "id"),
+            "schema: {:?}",
+            table.schema()
+        );
+    }
+
+    /// A dataset store for this origin already carries `basic_auth`. The SQL
+    /// URL must keep that store. Replacing it with only `allow_http=true`
+    /// drops the credential, and the server answers 401.
+    #[tokio::test]
+    async fn http_sql_url_keeps_a_configured_store_credential() {
+        use datafusion::execution::object_store::ObjectStoreRegistry;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+        use runtime_object_store::registry::{SpiceObjectStoreRegistry, runtime_env_with_registry};
+
+        struct ClearAllowPrivateHosts;
+        impl Drop for ClearAllowPrivateHosts {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
+            }
+        }
+        let _env_lock = HTTP_URL_ENV
+            .lock()
+            .expect("the HTTP URL env lock is not poisoned");
+        unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
+        let _clear = ClearAllowPrivateHosts;
+
+        const EXPECTED_AUTH: &str = "Basic dXNlcjpwYXNz";
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the csv server binds");
+        let port = listener
+            .local_addr()
+            .expect("the csv server has a port")
+            .port();
+        let seen_server = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen_server = Arc::clone(&seen_server);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let n = match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|window| window == b"\r\n\r\n") || buf.len() > 8192 {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf);
+                    let mut lines = text.split("\r\n");
+                    let mut request = lines.next().unwrap_or("").split_whitespace();
+                    let method = request.next().unwrap_or("").to_string();
+                    let path = request.next().unwrap_or("").to_string();
+                    let auth = lines
+                        .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                        .map_or_else(
+                            || "missing".to_string(),
+                            |line| {
+                                line.split_once(':')
+                                    .map_or("", |(_, value)| value.trim())
+                                    .to_string()
+                            },
+                        );
+                    seen_server.lock().push(format!("{method} {path} {auth}"));
+                    if auth != EXPECTED_AUTH {
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    const CSV: &[u8] = b"id\n1\n";
+                    let mut range: Option<(usize, usize)> = None;
+                    for line in lines {
+                        let Some(spec) = line.split_once(':') else {
+                            continue;
+                        };
+                        if !spec.0.eq_ignore_ascii_case("range") {
+                            continue;
+                        }
+                        let spec = spec.1.trim().strip_prefix("bytes=").unwrap_or("");
+                        let Some((start_s, end_s)) = spec.split_once('-') else {
+                            continue;
+                        };
+                        let Ok(start) = start_s.parse::<usize>() else {
+                            continue;
+                        };
+                        let end = end_s
+                            .parse::<usize>()
+                            .unwrap_or(CSV.len().saturating_sub(1))
+                            .min(CSV.len().saturating_sub(1));
+                        if start < CSV.len() && start <= end {
+                            range = Some((start, end));
+                        }
+                    }
+                    let response = if method == "HEAD" {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            CSV.len()
+                        )
+                        .into_bytes()
+                    } else if method == "GET" {
+                        let (status, body) = if let Some((start, end)) = range {
+                            let slice = &CSV[start..=end];
+                            (
+                                format!(
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Type: text/csv\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    CSV.len(),
+                                    slice.len()
+                                ),
+                                slice,
+                            )
+                        } else {
+                            (
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    CSV.len()
+                                ),
+                                CSV,
+                            )
+                        };
+                        let mut bytes = status.into_bytes();
+                        bytes.extend_from_slice(body);
+                        bytes
+                    } else {
+                        b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec()
+                    };
+                    let _ = socket.write_all(&response).await;
+                });
+            }
+        });
+
+        let registry = Arc::new(SpiceObjectStoreRegistry::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let mut configured = Url::parse(&format!("http://127.0.0.1:{port}/data.csv"))
+            .expect("the configured URL parses");
+        let token = runtime_object_store::http_auth::register(
+            &configured,
+            "user",
+            secrecy::SecretString::from("pass"),
+        );
+        configured.set_fragment(Some(&format!(
+            "allow_http=true&{}={token}",
+            runtime_object_store::http_auth::FRAGMENT_KEY
+        )));
+        registry
+            .get_store(&configured)
+            .expect("the dataset store builds");
+
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new(),
+            runtime_env_with_registry(Arc::clone(&registry)),
+        );
+        let factory = SpiceUrlTableFactory::new();
+        factory.with_registry(Arc::clone(&registry));
+        factory.with_state(ctx.state_weak_ref());
+        unsafe { std::env::set_var(ALLOW_PRIVATE_HOSTS_ENV, "true") };
+
+        let table = factory
+            .try_new(&format!("http://127.0.0.1:{port}/data.csv"))
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "configured http URL loads: {err}; requests={:?}",
+                    seen.lock()
+                )
+            })
+            .expect("the URL is a table");
+        let requests = seen.lock().clone();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.ends_with(EXPECTED_AUTH)),
+            "{requests:?}"
         );
         assert!(
             table

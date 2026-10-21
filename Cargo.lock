@@ -18161,6 +18161,7 @@ dependencies = [
  "runtime-request-context",
  "runtime-udfs-api",
  "search",
+ "secrecy",
  "serde_json",
  "snafu",
  "spice-table",
