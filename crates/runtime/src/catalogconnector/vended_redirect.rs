@@ -714,6 +714,118 @@ mod tests {
         }
     }
 
+    /// Read one HTTP request, including a body that arrives after the headers.
+    ///
+    /// One `read` can return only the header block. These fixtures record that
+    /// text and assert on the body, so this waits until the last parsable
+    /// `Content-Length` bytes have arrived after the header terminator, or
+    /// until the peer closes the connection or two seconds pass. No
+    /// `Content-Length` means the body is empty once the headers are complete.
+    async fn read_http_request<R>(stream: &mut R) -> String
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if http_message_is_complete(&buf) {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let n = match tokio::time::timeout(remaining, stream.read(&mut chunk)).await {
+                Ok(Ok(n)) if n > 0 => n,
+                _ => break,
+            };
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// True once the header block is present and its declared body has arrived.
+    fn http_message_is_complete(buf: &[u8]) -> bool {
+        let Some(header_end) = buf.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let Some(length) = declared_body_length(&buf[..header_end]) else {
+            return true;
+        };
+        buf.len() >= header_end.saturating_add(4).saturating_add(length)
+    }
+
+    /// The last `Content-Length` value that parses. An unparsable length does
+    /// not replace an earlier one.
+    fn declared_body_length(headers: &[u8]) -> Option<usize> {
+        let header_text = std::str::from_utf8(headers).ok()?;
+        let mut length = None;
+        for line in header_text.split("\r\n") {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("content-length")
+                && let Ok(parsed) = value.trim().parse::<usize>()
+            {
+                length = Some(parsed);
+            }
+        }
+        length
+    }
+
+    /// One chunk per `read`, then end of file. The upload tests deliver the
+    /// headers and the body as separate chunks.
+    struct ScriptedRead {
+        chunks: Vec<&'static [u8]>,
+        next: usize,
+    }
+
+    impl tokio::io::AsyncRead for ScriptedRead {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.next >= self.chunks.len() {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let chunk = self.chunks[self.next];
+            self.next += 1;
+            let n = chunk.len().min(buf.remaining());
+            buf.put_slice(&chunk[..n]);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn split_http_upload_is_recorded_whole() {
+        for (label, chunks) in [
+            (
+                "headers then body",
+                vec![
+                    &b"PUT /object HTTP/1.1\r\nContent-Length: 15\r\n\r\n"[..],
+                    &b"uploaded-object"[..],
+                ],
+            ),
+            (
+                "the last content-length",
+                vec![
+                    &b"PUT /object HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 15\r\n\r\n"[..],
+                    &b"uploaded-object"[..],
+                ],
+            ),
+        ] {
+            let mut stream = ScriptedRead { chunks, next: 0 };
+            let recorded = read_http_request(&mut stream).await;
+            assert!(
+                recorded.contains("uploaded-object"),
+                "{label}: a body that arrives after the headers was dropped: {recorded:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn catalog_vended_put_redirect_keeps_the_upload() {
         let host = "put-redirect.vended.test";
@@ -737,11 +849,9 @@ mod tests {
                     let recorded = std::sync::Arc::clone(&recorded);
                     let redirect_to = redirect_to.clone();
                     tokio::spawn(async move {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let mut buf = vec![0_u8; 8192];
-                        let n = stream.read(&mut buf).await.unwrap_or(0);
-                        let head = String::from_utf8_lossy(&buf[..n]);
-                        let line = head.lines().next().unwrap_or_default().to_string();
+                        use tokio::io::AsyncWriteExt;
+                        let head = read_http_request(&mut stream).await;
+                        let line = head.lines().next().unwrap_or_default();
                         let path = line.split_whitespace().nth(1).unwrap_or_default();
                         let response = if path == "/object" {
                             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -751,7 +861,7 @@ mod tests {
                                 "HTTP/1.1 {status} {reason}\r\nLocation: {redirect_to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                             )
                         };
-                        recorded.lock().push(head.into_owned());
+                        recorded.lock().push(head);
                         let _ = stream.write_all(response.as_bytes()).await;
                     });
                 }
@@ -852,10 +962,8 @@ mod tests {
                 let middle = middle.clone();
                 let object = object.clone();
                 tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0_u8; 8192];
-                    let n = stream.read(&mut buf).await.unwrap_or(0);
-                    let head = String::from_utf8_lossy(&buf[..n]);
+                    use tokio::io::AsyncWriteExt;
+                    let head = read_http_request(&mut stream).await;
                     let line = head.lines().next().unwrap_or_default();
                     let path = line.split_whitespace().nth(1).unwrap_or_default();
                     let response = if path == "/middle" {
@@ -870,7 +978,7 @@ mod tests {
                             "HTTP/1.1 303 See Other\r\nLocation: {middle}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         )
                     };
-                    recorded.lock().push(head.into_owned());
+                    recorded.lock().push(head);
                     let _ = stream.write_all(response.as_bytes()).await;
                 });
             }
