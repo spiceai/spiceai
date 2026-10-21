@@ -206,7 +206,9 @@ fn check_arrow_cast_type_depth(expr: &Expr) -> DFResult<()> {
 ///
 /// `arrow_cast(x, ('Int64'))` parses the type argument as [`Expr::Nested`], not
 /// as a bare literal. Those parentheses are grouping, so the string inside is
-/// still the type the Arrow parser will recurse through.
+/// still the type the Arrow parser will recurse through. Escaped (`E'…'`) and
+/// dollar-quoted (`$$…$$`) literals are included because planning turns them
+/// into the same UTF-8 type string as a single-quoted literal.
 fn string_literal_text(expr: &Expr) -> Option<&str> {
     let mut current = expr;
     while let Expr::Nested(inner) = current {
@@ -216,7 +218,10 @@ fn string_literal_text(expr: &Expr) -> Option<&str> {
         return None;
     };
     match &value.value {
-        Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => Some(text.as_str()),
+        Value::SingleQuotedString(text)
+        | Value::DoubleQuotedString(text)
+        | Value::EscapedStringLiteral(text) => Some(text.as_str()),
+        Value::DollarQuotedString(text) => Some(text.value.as_str()),
         _ => None,
     }
 }
@@ -515,6 +520,37 @@ mod tests {
             .expect("a shallow parenthesized type is allowed");
         depth_check("SELECT arrow_try_cast(NULL, (('Utf8')))")
             .expect("a shallow double-parenthesized type is allowed");
+    }
+
+    /// Escaped and dollar-quoted literals are still the type string. `DataFusion`
+    /// plans both as UTF-8 literals and then parses them as Arrow types.
+    #[test]
+    fn rejects_deep_escaped_and_dollar_quoted_arrow_cast_type() {
+        let open = "List(".repeat(MAX_ARROW_TYPE_DEPTH + 50);
+        let close = ")".repeat(MAX_ARROW_TYPE_DEPTH + 50);
+        let escaped = format!("SELECT arrow_cast(NULL, E'{open}Int64{close}')");
+        let err = depth_check(&escaped).expect_err("escaped deep arrow_cast type is rejected");
+        assert!(
+            err.to_string().contains("arrow_cast"),
+            "unexpected error: {err}"
+        );
+
+        let dollar = format!("SELECT arrow_try_cast(NULL, $${open}Int64{close}$$)");
+        let err =
+            depth_check(&dollar).expect_err("dollar-quoted deep arrow_try_cast type is rejected");
+        assert!(
+            err.to_string().contains("arrow_try_cast"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Shallow escaped and dollar-quoted types are normal casts.
+    #[test]
+    fn allows_shallow_escaped_and_dollar_quoted_arrow_cast_type() {
+        depth_check("SELECT arrow_cast(NULL, E'Int64')")
+            .expect("a shallow escaped type is allowed");
+        depth_check("SELECT arrow_try_cast(NULL, $$Utf8$$)")
+            .expect("a shallow dollar-quoted type is allowed");
     }
 
     /// A query wrapped in `COPY (...) TO` is planned, so it is depth-checked.
