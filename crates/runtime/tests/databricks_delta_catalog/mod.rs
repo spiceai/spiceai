@@ -16,9 +16,10 @@ limitations under the License.
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use app::AppBuilder;
+use futures::TryStreamExt;
 
 use runtime::Runtime;
 use spicepod::{component::catalog::Catalog, param::Params};
@@ -28,6 +29,7 @@ use std::sync::Arc;
 async fn databricks_delta_lake_integration_test_catalog() -> Result<(), anyhow::Error> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(None);
+    register_test_connectors().await;
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
@@ -51,7 +53,7 @@ async fn databricks_delta_lake_integration_test_catalog() -> Result<(), anyhow::
                     .await;
             let cloned_rt = Arc::new(rt.clone());
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     panic!("Timeout waiting for components to load");
                 }
 () = cloned_rt.load_components() => {}
@@ -60,7 +62,7 @@ async fn databricks_delta_lake_integration_test_catalog() -> Result<(), anyhow::
             runtime_ready_check(&rt).await;
 
             let queries: QueryTests = vec![(
-                "SELECT * FROM db_uc.tpch.lineitem LIMIT 10",
+                "SELECT * FROM db_uc.tpch.lineitem ORDER BY l_orderkey, l_linenumber LIMIT 10",
                 "select_tpch",
                 Some(Box::new(|result_batches| {
                     for batch in &result_batches {
@@ -72,11 +74,11 @@ async fn databricks_delta_lake_integration_test_catalog() -> Result<(), anyhow::
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Databricks Catalog (mode: delta_lake) Integration Test Results"),
+                        description => "Databricks Catalog (mode: delta_lake) Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("test_select_tpch"), results);
+                        insta::assert_snapshot!("test_select_tpch", results);
                     });
                 })),
             ),
@@ -93,11 +95,11 @@ async fn databricks_delta_lake_integration_test_catalog() -> Result<(), anyhow::
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Databricks Catalog (mode: delta_lake) Integration Test Results"),
+                        description => "Databricks Catalog (mode: delta_lake) Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("test_select_tpcds"), results);
+                        insta::assert_snapshot!("test_select_tpcds", results);
                     });
                 })),
             ),
@@ -114,6 +116,105 @@ async fn databricks_delta_lake_integration_test_catalog() -> Result<(), anyhow::
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn databricks_delta_lake_catalog_schema_discovery_test() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+
+    test_request_context()
+        .scope(async {
+            // Only include tpch — tpcds should NOT appear
+            let mut db_catalog = Catalog::new(
+                "databricks:spiceai_sandbox".to_string(),
+                "db_uc".to_string(),
+            );
+            db_catalog.include = vec!["tpch.*".to_string()];
+            db_catalog.params = Some(get_params());
+
+            let app = AppBuilder::new("databricks_delta_lake_catalog_schema_discovery_test")
+                .with_catalog(db_catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
+                    panic!("Timeout waiting for components to load");
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // tpch tables should be present
+            let tpch_result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT COUNT(*) as cnt FROM information_schema.tables \
+                     WHERE table_catalog = 'db_uc' AND table_schema = 'tpch'",
+                )
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let tpch_count: i64 = tpch_result
+                .first()
+                .and_then(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .map(|a| a.value(0))
+                })
+                .unwrap_or(0);
+            assert!(
+                tpch_count > 0,
+                "Expected tpch tables to be registered, found {tpch_count}"
+            );
+
+            // tpcds tables should NOT be present (excluded by include filter)
+            let tpcds_result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT COUNT(*) as cnt FROM information_schema.tables \
+                     WHERE table_catalog = 'db_uc' AND table_schema = 'tpcds'",
+                )
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let tpcds_count: i64 = tpcds_result
+                .first()
+                .and_then(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .map(|a| a.value(0))
+                })
+                .unwrap_or(0);
+            assert_eq!(
+                tpcds_count, 0,
+                "Expected tpcds tables to be excluded by include filter, found {tpcds_count}"
+            );
 
             Ok(())
         })

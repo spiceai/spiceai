@@ -1,0 +1,12 @@
+name: 'Allocate Spice runtime ports'
+description: |
+  Derives an HTTP and a Flight port for this job's Spice runtime and exports
+  them as SPICE_HTTP_PORT / SPICE_FLIGHT_PORT / SPICE_HTTP_ENDPOINT /
+  SPICE_FLIGHT_ENDPOINT, so jobs sharing a self-hosted host cannot collide on
+  spiced's defaults 8090 and 50051 (#12419).
+runs:
+  using: 'composite'
+  steps:
+    - name: Allocate Spice runtime ports
+      shell: bash
+      run: bash "${GITHUB_ACTION_PATH}/allocate_ports.sh"

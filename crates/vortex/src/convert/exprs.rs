@@ -1,0 +1,2434 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+use std::sync::Arc;
+use std::sync::LazyLock;
+
+use arrow_schema::DataType;
+use arrow_schema::Schema;
+use datafusion_common::Result as DFResult;
+use datafusion_common::ScalarValue;
+use datafusion_common::exec_datafusion_err;
+use datafusion_common::tree_node::TreeNode;
+use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_expr::Operator as DFOperator;
+use datafusion_functions::core::getfield::GetFieldFunc;
+use datafusion_functions_nested::length::ArrayLength;
+use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::ScalarFunctionExpr;
+use datafusion_physical_expr::projection::ProjectionExpr;
+use datafusion_physical_expr::projection::ProjectionExprs;
+use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_plan::expressions as df_expr;
+use itertools::Itertools;
+use vortex::VortexSessionDefault;
+use vortex::array::Canonical;
+use vortex::array::IntoArray;
+use vortex::array::VortexSessionExecute;
+use vortex::array::arrays::ConstantArray;
+use vortex::array::builtins::ArrayBuiltins;
+use vortex::arrow::ArrowSession;
+use vortex::dtype::DType;
+use vortex::dtype::Nullability;
+use vortex::dtype::half::f16;
+use vortex::expr::Expression;
+use vortex::expr::and_collect;
+use vortex::expr::cast;
+use vortex::expr::get_item;
+use vortex::expr::list_contains;
+use vortex::expr::list_length;
+use vortex::expr::lit;
+use vortex::expr::not;
+use vortex::expr::pack;
+use vortex::expr::root;
+use vortex::expr::zip_expr;
+use vortex::expr::{is_not_null, is_null};
+use vortex::scalar::DecimalValue;
+use vortex::scalar::Scalar;
+use vortex::scalar_fn::ScalarFnVTableExt;
+use vortex::scalar_fn::fns::binary::Binary;
+use vortex::scalar_fn::fns::like::Like;
+use vortex::scalar_fn::fns::like::LikeOptions;
+use vortex::scalar_fn::fns::operators::Operator;
+use vortex::session::VortexSession;
+use vortex_utils::aliases::dash_map::DashMap;
+
+use crate::convert::FromDataFusion;
+
+/// Result of splitting a projection into Vortex expressions and leftover `DataFusion` projections.
+pub struct ProcessedProjection {
+    /// Projection expression evaluated by the Vortex scan.
+    pub scan_projection: Expression,
+    /// Projection expressions evaluated by `DataFusion` after the scan.
+    pub leftover_projection: ProjectionExprs,
+}
+
+/// Tries to convert the expressions into a vortex conjunction. Will return `None` iff the input conjunction is empty.
+pub(crate) fn make_vortex_predicate(
+    expr_convertor: &dyn ExpressionConvertor,
+    predicate: &[Arc<dyn PhysicalExpr>],
+) -> DFResult<Option<Expression>> {
+    let exprs: Vec<_> = predicate
+        .iter()
+        .map(|e| expr_convertor.convert_predicate(e.as_ref()))
+        .collect::<DFResult<_>>()?;
+
+    Ok(and_collect(exprs))
+}
+
+/// Trait for converting `DataFusion` expressions to Vortex ones.
+pub trait ExpressionConvertor: Send + Sync {
+    /// Can an expression be pushed down given a specific schema
+    fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool;
+
+    /// Try and convert a `DataFusion` [`PhysicalExpr`] into a Vortex [`Expression`]
+    /// that evaluates to the same value, NULLs included, wherever it is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the expression cannot be represented as a Vortex expression.
+    fn convert(&self, expr: &dyn PhysicalExpr) -> DFResult<Expression>;
+
+    /// Convert a filter predicate: an expression whose result only decides whether
+    /// a row is kept, so a NULL result and a FALSE one mean the same thing. That
+    /// freedom lets a convertor emit a cheaper expression than [`Self::convert`]
+    /// where the two differ only in NULL versus FALSE. The default is
+    /// [`Self::convert`], which is exact everywhere and therefore always correct.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the expression cannot be represented as a Vortex expression.
+    fn convert_predicate(&self, expr: &dyn PhysicalExpr) -> DFResult<Expression> {
+        self.convert(expr)
+    }
+
+    /// Split a projection into Vortex expressions that can be pushed down and leftover
+    /// `DataFusion` projections that need to be evaluated after the scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the projected expressions cannot be converted or mapped to the schemas.
+    fn split_projection(
+        &self,
+        source_projection: ProjectionExprs,
+        input_schema: &Schema,
+        output_schema: &Schema,
+    ) -> DFResult<ProcessedProjection>;
+
+    /// Create a projection that reads only the required columns without pushing down
+    /// any expressions. All projection logic is applied after the scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the projection cannot be mapped to the input schema.
+    fn no_pushdown_projection(
+        &self,
+        source_projection: ProjectionExprs,
+        input_schema: &Schema,
+    ) -> DFResult<ProcessedProjection> {
+        // Get all unique column indices referenced by the projection
+        let column_indices = source_projection.column_indices();
+
+        // Create scan projection that reads the required columns
+        let scan_columns: Vec<(String, Expression)> = column_indices
+            .into_iter()
+            .map(|idx| {
+                let field = input_schema.field(idx);
+                let name = field.name().clone();
+                (name.clone(), get_item(name, root()))
+            })
+            .collect();
+
+        Ok(ProcessedProjection {
+            scan_projection: pack(scan_columns, Nullability::NonNullable),
+            leftover_projection: source_projection,
+        })
+    }
+}
+
+/// The default [`ExpressionConvertor`].
+#[derive(Default)]
+pub struct DefaultExpressionConvertor {}
+
+impl DefaultExpressionConvertor {
+    /// Attempts to convert `DataFusion`'s `array_length` function (aliased as `list_length`) to
+    /// Vortex `list_length`.
+    ///
+    /// Supports the single-argument form `array_length(arr)` and the equivalent two-argument
+    /// form with an explicit first dimension `array_length(arr, 1)`.
+    fn try_convert_array_length(&self, scalar_fn: &ScalarFunctionExpr) -> DFResult<Expression> {
+        let Some(input) = array_length_input(scalar_fn) else {
+            return Err(exec_datafusion_err!(
+                "array_length pushdown supports only the one-argument form or an explicit first dimension"
+            ));
+        };
+
+        let input = self.convert(input.as_ref())?;
+        let nullability = if scalar_fn.nullable() {
+            Nullability::Nullable
+        } else {
+            Nullability::NonNullable
+        };
+        // Match the DataFusion return field (UInt64, nullability from the list argument)
+        // so a pushed `array_length` has the same type the plan already expects.
+        let return_dtype = ArrowSession::default()
+            .from_arrow_datatype(scalar_fn.return_type(), nullability)
+            .map_err(|e| {
+                exec_datafusion_err!(
+                    "Failed to convert array_length return type to a Vortex dtype: {e}"
+                )
+            })?;
+        Ok(cast(list_length(input), return_dtype))
+    }
+
+    /// Attempts to convert a `DataFusion` `ScalarFunctionExpr` to a Vortex expression.
+    fn try_convert_scalar_function(&self, scalar_fn: &ScalarFunctionExpr) -> DFResult<Expression> {
+        if let Some(array_length_fn) =
+            ScalarFunctionExpr::try_downcast_func::<ArrayLength>(scalar_fn)
+        {
+            return self.try_convert_array_length(array_length_fn);
+        }
+
+        if let Some(get_field_fn) = ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn)
+        {
+            // DataFusion's GetFieldFunc flattens nested field access into a single call
+            // with multiple field name arguments. For example, `outer.inner.leaf` becomes
+            // get_field(Column("outer"), "inner", "leaf"). We build a chain of get_item
+            // calls for each field name in the path.
+            let (source_expr, field_names) = get_field_fn
+                .args()
+                .split_first()
+                .ok_or_else(|| exec_datafusion_err!("get_field missing source expression"))?;
+
+            let mut result = self.convert(source_expr.as_ref())?;
+            for expr in field_names {
+                let field_name = expr
+                    .downcast_ref::<df_expr::Literal>()
+                    .ok_or_else(|| exec_datafusion_err!("get_field field name must be a literal"))?
+                    .value()
+                    .try_as_str()
+                    .flatten()
+                    .ok_or_else(|| {
+                        exec_datafusion_err!("get_field field name must be a UTF-8 string")
+                    })?;
+                result = get_item(field_name.to_string(), result);
+            }
+            return Ok(result);
+        }
+
+        Err(exec_datafusion_err!(
+            "Unsupported ScalarFunctionExpr: {}",
+            scalar_fn.name()
+        ))
+    }
+
+    fn try_convert_case_expr(&self, case_expr: &df_expr::CaseExpr) -> DFResult<Expression> {
+        let mut else_expr = if let Some(else_expr) = case_expr.else_expr() {
+            self.convert(else_expr.as_ref())?
+        } else {
+            return Err(exec_datafusion_err!(
+                "CASE expression without ELSE is not supported for pushdown"
+            ));
+        };
+
+        if let Some(base_expr) = case_expr.expr() {
+            // `DataFusion` matches a simple `CASE` operand against each `WHEN`
+            // value by bits, `-0.0` and `0.0` apart as in Vortex, unlike its
+            // `=` (see `compare_with_float_zero`).
+            let base_expr = self.convert(base_expr.as_ref())?;
+            for (when_expr, then_expr) in case_expr.when_then_expr().iter().rev() {
+                let when_expr = self.convert(when_expr.as_ref())?;
+                let then_expr = self.convert(then_expr.as_ref())?;
+                else_expr = zip_expr(
+                    Binary.new_expr(Operator::Eq, [base_expr.clone(), when_expr]),
+                    then_expr,
+                    else_expr,
+                );
+            }
+        } else {
+            for (when_expr, then_expr) in case_expr.when_then_expr().iter().rev() {
+                let when_expr = self.convert(when_expr.as_ref())?;
+                let then_expr = self.convert(then_expr.as_ref())?;
+                else_expr = zip_expr(when_expr, then_expr, else_expr);
+            }
+        }
+
+        Ok(else_expr)
+    }
+
+    /// `left operator right` when one side is a floating-point zero literal,
+    /// rewritten so it holds for exactly the rows `DataFusion` keeps; `None`
+    /// for any other comparison, which converts as it is.
+    ///
+    /// `DataFusion` compares floats with `-0.0` and `0.0` equal (both operands
+    /// have their zeros normalized first), while Vortex compares them by IEEE
+    /// 754 total order, where `-0.0` sorts just below `0.0`. The two orders
+    /// agree on every comparison with a non-zero value, so only a comparison
+    /// with a zero needs both zeros spelled out. A comparison of two
+    /// non-literal floats has no such rewrite and is not pushed down (see
+    /// [`can_binary_be_pushed_down`]).
+    fn compare_with_float_zero(
+        &self,
+        operator: Operator,
+        left: &Arc<dyn PhysicalExpr>,
+        right: &Arc<dyn PhysicalExpr>,
+    ) -> DFResult<Option<Expression>> {
+        let (operand, operator) = if is_float_zero_literal(right) {
+            (left, operator)
+        } else if is_float_zero_literal(left) {
+            // `0 < x` is `x > 0`.
+            let swapped = match operator {
+                Operator::Lt => Operator::Gt,
+                Operator::Lte => Operator::Gte,
+                Operator::Gt => Operator::Lt,
+                Operator::Gte => Operator::Lte,
+                other => other,
+            };
+            (right, swapped)
+        } else {
+            return Ok(None);
+        };
+        let zero = if is_float_zero_literal(right) {
+            right
+        } else {
+            left
+        };
+        let Some((negative, positive)) = float_zeros(zero)? else {
+            return Ok(None);
+        };
+        let operand = self.convert(operand.as_ref())?;
+        let compare = |operator, zero: &Scalar| {
+            Binary.new_expr(operator, [operand.clone(), lit(zero.clone())])
+        };
+        Ok(Some(match operator {
+            Operator::Eq => Binary.new_expr(
+                Operator::Or,
+                [
+                    compare(Operator::Eq, &negative),
+                    compare(Operator::Eq, &positive),
+                ],
+            ),
+            Operator::NotEq => Binary.new_expr(
+                Operator::And,
+                [
+                    compare(Operator::NotEq, &negative),
+                    compare(Operator::NotEq, &positive),
+                ],
+            ),
+            Operator::Lt => compare(Operator::Lt, &negative),
+            Operator::Lte => compare(Operator::Lte, &positive),
+            Operator::Gt => compare(Operator::Gt, &positive),
+            Operator::Gte => compare(Operator::Gte, &negative),
+            // Arithmetic on a zero is not a comparison.
+            _ => return Ok(None),
+        }))
+    }
+
+    /// Converts an `IN` list, exactly or as a predicate (see [`InListUse`]).
+    ///
+    /// Vortex's `list_contains` answers FALSE where SQL answers NULL: when the
+    /// value is NULL, and when the value matches nothing in a list that holds a
+    /// NULL. As a predicate that is harmless for `IN`, since a filter drops the row
+    /// either way, and `list_contains` alone keeps the zone-map pruning it enables.
+    /// It is wrong everywhere else: negated, `x NOT IN (1, 2)` would keep a NULL
+    /// `x`, and as a value, `x IN (1, 2)` would read FALSE instead of NULL.
+    fn convert_in_list(
+        &self,
+        in_list: &df_expr::InListExpr,
+        usage: InListUse,
+    ) -> DFResult<Expression> {
+        let value = self.convert(in_list.expr().as_ref())?;
+        let list_elements: Vec<_> = in_list
+            .list()
+            .iter()
+            .map(|e| {
+                if let Some(lit) = e.downcast_ref::<df_expr::Literal>() {
+                    Scalar::from_df(lit.value()).map_err(|e| {
+                        exec_datafusion_err!(
+                            "Failed to convert IN list literal to a Vortex scalar: {e}"
+                        )
+                    })
+                } else {
+                    Err(exec_datafusion_err!("Failed to cast sub-expression"))
+                }
+            })
+            .try_collect()?;
+        // `DataFusion` holds `-0.0` and `0.0` equal and Vortex does not (see
+        // `compare_with_float_zero`), so a list holding one zero holds both.
+        let mut list_elements = list_elements;
+        for element in in_list.list() {
+            if let Some((negative, positive)) = float_zeros(element)? {
+                list_elements.extend([negative, positive]);
+            }
+        }
+
+        let Some(first_element) = list_elements.first() else {
+            return Ok(lit(Scalar::from(in_list.negated())));
+        };
+
+        // `Scalar::list` compares every element's dtype against the list's
+        // element dtype including nullability, and panics on a mismatch —
+        // inside the scan, so it surfaces as a panicked task rather than an
+        // error a caller can report. DataFusion types a NULL in an `IN` list
+        // as a nullable value of the list's type and the elements that carry
+        // a value as non-nullable, so the first element's dtype describes the
+        // whole list only when every element agrees with it: a list holding
+        // both a NULL and a value does not, whichever comes first. Take the
+        // dtype from an element that carries a value, widen it to hold the
+        // nulls when there are any, and bring every element to it.
+        let holds_a_null = list_elements.iter().any(Scalar::is_null);
+        let element_dtype = list_elements
+            .iter()
+            .find(|element| !element.is_null())
+            .unwrap_or(first_element)
+            .dtype()
+            .clone();
+        let element_dtype = if holds_a_null {
+            element_dtype.as_nullable()
+        } else {
+            element_dtype
+        };
+
+        let list_elements: Vec<Scalar> = list_elements
+            .into_iter()
+            .map(|element| {
+                if element.dtype() == &element_dtype {
+                    return Ok(element);
+                }
+                element.cast(&element_dtype).map_err(|e| {
+                    exec_datafusion_err!(
+                        "Failed to convert IN list literal to a Vortex scalar: {e}"
+                    )
+                })
+            })
+            .try_collect()?;
+
+        let list = Scalar::list(element_dtype, list_elements, Nullability::Nullable);
+        let contains = list_contains(lit(list), value.clone());
+
+        match (usage, in_list.negated()) {
+            (InListUse::Predicate, false) => Ok(contains),
+            // SQL's `x NOT IN (…, NULL)` is FALSE or NULL for every row, so no
+            // row passes; otherwise a NULL `x` is NULL and must not pass either.
+            (InListUse::Predicate, true) if holds_a_null => Ok(lit(false)),
+            (InListUse::Predicate, true) => {
+                Ok(Binary.new_expr(Operator::And, [is_not_null(value), not(contains)]))
+            }
+            (InListUse::Value, negated) => {
+                let null = lit(Scalar::null(DType::Bool(Nullability::Nullable)));
+                let exact = if holds_a_null {
+                    // TRUE on a match and NULL otherwise, a NULL value included.
+                    zip_expr(contains, lit(true), null)
+                } else {
+                    zip_expr(is_null(value), null, contains)
+                };
+                // `not` keeps NULL as NULL, as SQL's `NOT` does.
+                Ok(if negated { not(exact) } else { exact })
+            }
+        }
+    }
+}
+
+/// How an `IN` list's result is used, which decides how exactly it must follow
+/// SQL's NULL semantics.
+#[derive(Clone, Copy)]
+enum InListUse {
+    /// The result decides whether a row is kept, so NULL and FALSE mean the same.
+    Predicate,
+    /// The result is a value: a projection, or an operand of `NOT`, a comparison,
+    /// `IS NULL`, a cast or `CASE`. NULL must stay NULL.
+    Value,
+}
+
+impl ExpressionConvertor for DefaultExpressionConvertor {
+    fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+        can_be_pushed_down_impl(expr, schema)
+    }
+
+    fn convert(&self, df: &dyn PhysicalExpr) -> DFResult<Expression> {
+        // TODO(joe): Don't return an error when we have an unsupported node, bubble up "TRUE" as in keep
+        //  for that node, up to any `and` or `or` node.
+        if let Some(binary_expr) = df.downcast_ref::<df_expr::BinaryExpr>() {
+            let operator = try_operator_from_df(*binary_expr.op())?;
+            if let Some(compared) =
+                self.compare_with_float_zero(operator, binary_expr.left(), binary_expr.right())?
+            {
+                return Ok(compared);
+            }
+            let left = self.convert(binary_expr.left().as_ref())?;
+            let right = self.convert(binary_expr.right().as_ref())?;
+
+            return Ok(Binary.new_expr(operator, [left, right]));
+        }
+
+        if let Some(col_expr) = df.downcast_ref::<df_expr::Column>() {
+            return Ok(get_item(col_expr.name().to_owned(), root()));
+        }
+
+        if let Some(like) = df.downcast_ref::<df_expr::LikeExpr>() {
+            let child = self.convert(like.expr().as_ref())?;
+            let pattern = self.convert(like.pattern().as_ref())?;
+            return Ok(Like.new_expr(
+                LikeOptions {
+                    negated: like.negated(),
+                    case_insensitive: like.case_insensitive(),
+                },
+                [child, pattern],
+            ));
+        }
+
+        if let Some(literal) = df.downcast_ref::<df_expr::Literal>() {
+            let value = Scalar::from_df(literal.value()).map_err(|e| {
+                exec_datafusion_err!("Failed to convert literal to a Vortex scalar: {e}")
+            })?;
+            return Ok(lit(value));
+        }
+
+        if let Some(cast_expr) = df.downcast_ref::<df_expr::CastExpr>() {
+            let cast_dtype = ArrowSession::default()
+                .from_arrow_datatype(cast_expr.cast_type(), Nullability::Nullable)
+                .map_err(|e| {
+                    exec_datafusion_err!("Failed to convert cast type to a Vortex dtype: {e}")
+                })?;
+            let child = self.convert(cast_expr.expr().as_ref())?;
+            return Ok(cast(child, cast_dtype));
+        }
+
+        if let Some(is_null_expr) = df.downcast_ref::<df_expr::IsNullExpr>() {
+            let arg = self.convert(is_null_expr.arg().as_ref())?;
+            return Ok(is_null(arg));
+        }
+
+        if let Some(is_not_null_expr) = df.downcast_ref::<df_expr::IsNotNullExpr>() {
+            let arg = self.convert(is_not_null_expr.arg().as_ref())?;
+            // Emit native is_not_null (not `not(is_null(...))`): the negation
+            // has no zone-map falsifier, but is_not_null does — this lights up
+            // the AllNull/AllNonNull pruning rules so IS NOT NULL can skip zones.
+            return Ok(is_not_null(arg));
+        }
+
+        if let Some(not_expr) = df.downcast_ref::<df_expr::NotExpr>() {
+            // Boolean NOT. Vortex's `not` inverts the value bits while preserving
+            // the validity buffer (NOT NULL = NULL), matching SQL three-valued
+            // logic and DataFusion's `FilterExec`. DataFusion normalizes
+            // `col = false`, `col != true`, and `NOT (a AND b)` fragments to a
+            // `NotExpr` over a boolean operand, so this arm is what lets those
+            // common boolean-flag filters push into the Vortex scan instead of
+            // being row-evaluated above it.
+            let arg = self.convert(not_expr.arg().as_ref())?;
+            return Ok(not(arg));
+        }
+
+        if let Some(in_list) = df.downcast_ref::<df_expr::InListExpr>() {
+            return self.convert_in_list(in_list, InListUse::Value);
+        }
+
+        if let Some(dynamic_filter) = df.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>() {
+            let current = dynamic_filter.current()?;
+            return self.convert(current.as_ref());
+        }
+
+        if let Some(scalar_fn) = df.downcast_ref::<ScalarFunctionExpr>() {
+            return self.try_convert_scalar_function(scalar_fn);
+        }
+
+        if let Some(case_expr) = df.downcast_ref::<df_expr::CaseExpr>() {
+            return self.try_convert_case_expr(case_expr);
+        }
+
+        Err(exec_datafusion_err!(
+            "Couldn't convert DataFusion physical {df} expression to a vortex expression"
+        ))
+    }
+
+    fn convert_predicate(&self, df: &dyn PhysicalExpr) -> DFResult<Expression> {
+        // A predicate stays a predicate through `AND` and `OR`: with Kleene logic the
+        // combined result is TRUE for exactly the rows it would be TRUE for if every
+        // NULL operand were FALSE, so its operands may use the cheaper forms too.
+        // Anything else (`NOT`, a comparison, `IS NULL`, a cast) observes the
+        // difference, so below it the exact conversion applies.
+        if let Some(binary_expr) = df.downcast_ref::<df_expr::BinaryExpr>()
+            && matches!(binary_expr.op(), DFOperator::And | DFOperator::Or)
+        {
+            let left = self.convert_predicate(binary_expr.left().as_ref())?;
+            let right = self.convert_predicate(binary_expr.right().as_ref())?;
+            let operator = try_operator_from_df(*binary_expr.op())?;
+            return Ok(Binary.new_expr(operator, [left, right]));
+        }
+
+        if let Some(in_list) = df.downcast_ref::<df_expr::InListExpr>() {
+            return self.convert_in_list(in_list, InListUse::Predicate);
+        }
+
+        if let Some(dynamic_filter) = df.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>() {
+            let current = dynamic_filter.current()?;
+            return self.convert_predicate(current.as_ref());
+        }
+
+        self.convert(df)
+    }
+
+    fn split_projection(
+        &self,
+        source_projection: ProjectionExprs,
+        input_schema: &Schema,
+        output_schema: &Schema,
+    ) -> DFResult<ProcessedProjection> {
+        let mut scan_projection = vec![];
+        let mut leftover_projection: Vec<ProjectionExpr> = vec![];
+
+        for projection_expr in source_projection.iter() {
+            let r = projection_expr.expr.apply(|node| {
+                // Vortex evaluates decimal-to-floating casts with different
+                // precision/null semantics than DataFusion for some inputs, and
+                // has no kernel for some other casts. Keep those expressions above
+                // the scan.
+                if contains_decimal_to_floating_cast(node, input_schema)
+                    || contains_cast_vortex_cannot_evaluate(node, input_schema)
+                {
+                    scan_projection.extend(
+                        collect_columns(node)
+                            .into_iter()
+                            .map(|c| (c.name().to_string(), get_item(c.name(), root()))),
+                    );
+
+                    leftover_projection.push(projection_expr.clone());
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+
+                // We only pull column children of scalar functions that we can't push into the scan.
+                if let Some(scalar_fn_expr) = node.downcast_ref::<ScalarFunctionExpr>()
+                    && !can_scalar_fn_be_pushed_down(scalar_fn_expr, input_schema)
+                {
+                    scan_projection.extend(
+                        collect_columns(node)
+                            .into_iter()
+                            .map(|c| (c.name().to_string(), get_item(c.name(), root()))),
+                    );
+
+                    leftover_projection.push(projection_expr.clone());
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+
+                // DataFusion assumes different decimal types can be coerced.
+                // Vortex expects a perfect match so we don't push it down.
+                if let Some(binary_expr) = node.downcast_ref::<df_expr::BinaryExpr>()
+                    && binary_expr.op().is_numerical_operators()
+                    && (is_decimal(&binary_expr.left().data_type(input_schema)?)
+                        && is_decimal(&binary_expr.right().data_type(input_schema)?))
+                {
+                    scan_projection.extend(
+                        collect_columns(node)
+                            .into_iter()
+                            .map(|c| (c.name().to_string(), get_item(c.name(), root()))),
+                    );
+
+                    leftover_projection.push(projection_expr.clone());
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+
+            // if we didn't stop early
+            if matches!(r, TreeNodeRecursion::Continue) {
+                scan_projection.push((
+                    projection_expr.alias.clone(),
+                    self.convert(projection_expr.expr.as_ref())?,
+                ));
+                leftover_projection.push(ProjectionExpr {
+                    expr: Arc::new(df_expr::Column::new_with_schema(
+                        projection_expr.alias.as_str(),
+                        output_schema,
+                    )?),
+                    alias: projection_expr.alias.clone(),
+                });
+            }
+        }
+
+        Ok(ProcessedProjection {
+            scan_projection: pack(scan_projection, Nullability::NonNullable),
+            leftover_projection: leftover_projection.into(),
+        })
+    }
+}
+
+fn try_operator_from_df(value: DFOperator) -> DFResult<Operator> {
+    match value {
+        DFOperator::Eq => Ok(Operator::Eq),
+        DFOperator::NotEq => Ok(Operator::NotEq),
+        DFOperator::Lt => Ok(Operator::Lt),
+        DFOperator::LtEq => Ok(Operator::Lte),
+        DFOperator::Gt => Ok(Operator::Gt),
+        DFOperator::GtEq => Ok(Operator::Gte),
+        DFOperator::And => Ok(Operator::And),
+        DFOperator::Or => Ok(Operator::Or),
+        DFOperator::Plus => Ok(Operator::Add),
+        DFOperator::Minus => Ok(Operator::Sub),
+        DFOperator::Multiply => Ok(Operator::Mul),
+        DFOperator::Divide => Ok(Operator::Div),
+        DFOperator::IsDistinctFrom
+        | DFOperator::IsNotDistinctFrom
+        | DFOperator::RegexMatch
+        | DFOperator::RegexIMatch
+        | DFOperator::RegexNotMatch
+        | DFOperator::RegexNotIMatch
+        | DFOperator::LikeMatch
+        | DFOperator::ILikeMatch
+        | DFOperator::NotLikeMatch
+        | DFOperator::NotILikeMatch
+        | DFOperator::BitwiseAnd
+        | DFOperator::BitwiseOr
+        | DFOperator::BitwiseXor
+        | DFOperator::BitwiseShiftRight
+        | DFOperator::BitwiseShiftLeft
+        | DFOperator::StringConcat
+        | DFOperator::AtArrow
+        | DFOperator::ArrowAt
+        | DFOperator::Modulo
+        | DFOperator::Arrow
+        | DFOperator::LongArrow
+        | DFOperator::HashArrow
+        | DFOperator::HashLongArrow
+        | DFOperator::AtAt
+        | DFOperator::IntegerDivide
+        | DFOperator::HashMinus
+        | DFOperator::AtQuestion
+        | DFOperator::Question
+        | DFOperator::QuestionAnd
+        | DFOperator::QuestionPipe
+        | DFOperator::Colon => {
+            tracing::debug!(operator = %value, "Can't pushdown binary_operator operator");
+            Err(exec_datafusion_err!(
+                "Unsupported datafusion operator {value}"
+            ))
+        }
+    }
+}
+
+fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    if contains_decimal_to_floating_cast(df_expr, schema) {
+        tracing::debug!(%df_expr, "DataFusion expression contains decimal-to-floating cast and can't be pushed down");
+        return false;
+    }
+
+    if contains_cast_vortex_cannot_evaluate(df_expr, schema) {
+        tracing::debug!(%df_expr, "DataFusion expression contains a cast Vortex can't evaluate and can't be pushed down");
+        return false;
+    }
+
+    let expr = df_expr;
+    if let Some(binary) = expr.downcast_ref::<df_expr::BinaryExpr>() {
+        can_binary_be_pushed_down(binary, schema)
+    } else if let Some(col) = expr.downcast_ref::<df_expr::Column>() {
+        schema
+            .field_with_name(col.name())
+            .is_ok_and(|field| supported_data_types(field.data_type()))
+    } else if let Some(like) = expr.downcast_ref::<df_expr::LikeExpr>() {
+        can_be_pushed_down_impl(like.expr(), schema)
+            && can_be_pushed_down_impl(like.pattern(), schema)
+    } else if let Some(lit) = expr.downcast_ref::<df_expr::Literal>() {
+        supported_data_types(&lit.value().data_type())
+    } else if let Some(cast_expr) = expr.downcast_ref::<df_expr::CastExpr>() {
+        // CastExpr child must be an expression type that convert() can handle
+        is_convertible_expr(cast_expr.expr())
+    } else if let Some(is_null) = expr.downcast_ref::<df_expr::IsNullExpr>() {
+        can_be_pushed_down_impl(is_null.arg(), schema)
+    } else if let Some(is_not_null) = expr.downcast_ref::<df_expr::IsNotNullExpr>() {
+        can_be_pushed_down_impl(is_not_null.arg(), schema)
+    } else if let Some(not_expr) = expr.downcast_ref::<df_expr::NotExpr>() {
+        can_be_pushed_down_impl(not_expr.arg(), schema)
+    } else if let Some(in_list) = expr.downcast_ref::<df_expr::InListExpr>() {
+        can_be_pushed_down_impl(in_list.expr(), schema)
+            && in_list
+                .list()
+                .iter()
+                .all(|e| can_be_pushed_down_impl(e, schema))
+    } else if let Some(scalar_fn) = expr.downcast_ref::<ScalarFunctionExpr>() {
+        can_scalar_fn_be_pushed_down(scalar_fn, schema)
+    } else if let Some(case_expr) = expr.downcast_ref::<df_expr::CaseExpr>() {
+        can_case_be_pushed_down(case_expr, schema)
+    } else if let Some(dynamic_filter) = expr.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>() {
+        match dynamic_filter.current() {
+            Ok(current) => can_be_pushed_down_impl(&current, schema),
+            Err(err) => {
+                tracing::debug!(%err, "DataFusion dynamic filter current expression can't be read");
+                false
+            }
+        }
+    } else {
+        tracing::debug!(%df_expr, "DataFusion expression can't be pushed down");
+        false
+    }
+}
+
+/// Checks if an expression type is one that `convert()` can handle.
+/// This is less restrictive than `can_be_pushed_down` since it only checks
+/// expression types, not data type support.
+///
+/// It is deliberately a conservative subset of `convert()`:
+/// `DynamicFilterPhysicalExpr` is handled by `convert()` (via its
+/// `current()` snapshot) but omitted here, because a `CAST` over a dynamic
+/// filter is not a plan shape `DataFusion` produces. A conservative result
+/// only forgoes a pushdown for such a (non-occurring) expression — it is never
+/// incorrect.
+fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
+    let expr = df_expr;
+
+    // Expression types that convert() handles. Every wrapper convert() rewrites
+    // must recurse into the children convert() will visit, and must enforce
+    // convert()-specific restrictions (supported binary operators, literal-only
+    // IN lists, UTF-8 get_field names, CASE with ELSE). Accepting a wrapper
+    // whose child convert() cannot rewrite would let
+    // `array_length(CASE WHEN lower(name) LIKE '%x%' THEN a ELSE b END)` pass
+    // the pushdown gate and then fail at scan planning.
+    expr.downcast_ref::<df_expr::BinaryExpr>()
+        .is_some_and(|binary| {
+            try_operator_from_df(*binary.op()).is_ok()
+                && is_convertible_expr(binary.left())
+                && is_convertible_expr(binary.right())
+        })
+        || expr.downcast_ref::<df_expr::Column>().is_some()
+        || expr
+            .downcast_ref::<df_expr::LikeExpr>()
+            .is_some_and(|like| {
+                is_convertible_expr(like.expr()) && is_convertible_expr(like.pattern())
+            })
+        || expr
+            .downcast_ref::<df_expr::Literal>()
+            .is_some_and(|literal| Scalar::from_df(literal.value()).is_ok())
+        || expr
+            .downcast_ref::<df_expr::CastExpr>()
+            .is_some_and(|e| is_convertible_expr(e.expr()))
+        || expr
+            .downcast_ref::<df_expr::IsNullExpr>()
+            .is_some_and(|e| is_convertible_expr(e.arg()))
+        || expr
+            .downcast_ref::<df_expr::IsNotNullExpr>()
+            .is_some_and(|e| is_convertible_expr(e.arg()))
+        || expr
+            .downcast_ref::<df_expr::NotExpr>()
+            .is_some_and(|n| is_convertible_expr(n.arg()))
+        || expr
+            .downcast_ref::<df_expr::InListExpr>()
+            .is_some_and(is_convertible_in_list_expr)
+        || expr
+            .downcast_ref::<df_expr::CaseExpr>()
+            .is_some_and(is_convertible_case_expr)
+        || expr
+            .downcast_ref::<ScalarFunctionExpr>()
+            .is_some_and(|sf| is_convertible_get_field(sf) || is_convertible_array_length(sf))
+}
+
+/// Type-only convertibility check for `InListExpr`, matching `convert()`:
+/// the haystack expression must be convertible, and every list value must be a
+/// literal `Scalar::from_df` accepts. `convert()` rejects non-literal list
+/// values (`Failed to cast sub-expression`), so accepting them here would break
+/// the "accepted for pushdown => convertible" invariant.
+fn is_convertible_in_list_expr(in_list: &df_expr::InListExpr) -> bool {
+    is_convertible_expr(in_list.expr())
+        && in_list.list().iter().all(|value| {
+            value
+                .downcast_ref::<df_expr::Literal>()
+                .is_some_and(|literal| Scalar::from_df(literal.value()).is_ok())
+        })
+}
+
+/// Type-only convertibility check for `get_field`, matching `convert()`:
+/// the source expression must be convertible, and every field-name argument
+/// must be a UTF-8 string literal.
+fn is_convertible_get_field(scalar_fn: &ScalarFunctionExpr) -> bool {
+    if ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_none() {
+        return false;
+    }
+
+    let Some((source, field_names)) = scalar_fn.args().split_first() else {
+        return false;
+    };
+
+    is_convertible_expr(source)
+        && field_names.iter().all(|field_name| {
+            field_name
+                .downcast_ref::<df_expr::Literal>()
+                .and_then(|literal| literal.value().try_as_str().flatten())
+                .is_some()
+        })
+}
+
+/// Type-only convertibility check for a `CASE` expression, mirroring
+/// [`DefaultExpressionConvertor::try_convert_case_expr`]: the expression must
+/// have an `ELSE` branch (Vortex cannot represent a `CASE` without one, and
+/// `convert` returns an error for it) and every sub-expression — the optional
+/// base, each `WHEN`/`THEN`, and the `ELSE` — must itself be convertible.
+/// `try_convert_case_expr` always converts the `ELSE` branch, so accepting a
+/// `CASE` whose `ELSE` holds an unsupported expression would break the
+/// "accepted for pushdown => convertible" invariant and fail at scan time.
+/// Without this, a `CAST(CASE ... END)` over a non-elided type-changing cast
+/// (e.g. `CAST(CASE ... END AS DOUBLE)`) is left in a `FilterExec` above the
+/// scan even though `convert` could push it.
+fn is_convertible_case_expr(case_expr: &df_expr::CaseExpr) -> bool {
+    case_expr.else_expr().is_some_and(is_convertible_expr)
+        && case_expr.expr().is_none_or(is_convertible_expr)
+        && case_expr
+            .when_then_expr()
+            .iter()
+            .all(|(when_expr, then_expr)| {
+                is_convertible_expr(when_expr) && is_convertible_expr(then_expr)
+            })
+}
+
+fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> bool {
+    let is_op_supported = try_operator_from_df(*binary.op()).is_ok();
+    is_op_supported
+        && !compares_two_float_expressions(*binary.op(), binary.left(), binary.right(), schema)
+        && can_be_pushed_down_impl(binary.left(), schema)
+        && can_be_pushed_down_impl(binary.right(), schema)
+}
+
+/// Whether `left op right` compares two floating-point operands neither of
+/// which is a literal. Vortex orders `-0.0` below `0.0` and `DataFusion` holds
+/// them equal, and with no literal to spell both zeros out (see
+/// `compare_with_float_zero`), such a comparison is left to `DataFusion`.
+fn compares_two_float_expressions(
+    op: DFOperator,
+    left: &Arc<dyn PhysicalExpr>,
+    right: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> bool {
+    matches!(
+        op,
+        DFOperator::Eq
+            | DFOperator::NotEq
+            | DFOperator::Lt
+            | DFOperator::LtEq
+            | DFOperator::Gt
+            | DFOperator::GtEq
+    ) && left.downcast_ref::<df_expr::Literal>().is_none()
+        && right.downcast_ref::<df_expr::Literal>().is_none()
+        && [left, right].iter().any(|operand| {
+            operand
+                .data_type(schema)
+                .is_ok_and(|data_type| is_float(&data_type))
+        })
+}
+
+fn is_float(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, value) => is_float(value),
+        other => other.is_floating(),
+    }
+}
+
+/// Whether `expr` is a literal `0.0` or `-0.0` of a floating-point type.
+fn is_float_zero_literal(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.downcast_ref::<df_expr::Literal>()
+        .is_some_and(|literal| float_zeros_of(literal.value()).is_some())
+}
+
+/// Both zeros of `value`'s type, negative first, when `value` is a
+/// floating-point zero.
+fn float_zeros_of(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue)> {
+    match value {
+        ScalarValue::Float16(Some(v)) if *v == f16::ZERO => Some((
+            ScalarValue::Float16(Some(f16::NEG_ZERO)),
+            ScalarValue::Float16(Some(f16::ZERO)),
+        )),
+        ScalarValue::Float32(Some(v)) if *v == 0.0 => Some((
+            ScalarValue::Float32(Some(-0.0)),
+            ScalarValue::Float32(Some(0.0)),
+        )),
+        ScalarValue::Float64(Some(v)) if *v == 0.0 => Some((
+            ScalarValue::Float64(Some(-0.0)),
+            ScalarValue::Float64(Some(0.0)),
+        )),
+        ScalarValue::Dictionary(key, value) => float_zeros_of(value).map(|(negative, positive)| {
+            (
+                ScalarValue::Dictionary(key.clone(), Box::new(negative)),
+                ScalarValue::Dictionary(key.clone(), Box::new(positive)),
+            )
+        }),
+        _ => None,
+    }
+}
+
+/// Both zeros of a floating-point zero literal's type as Vortex scalars,
+/// negative first; `None` when `expr` is no such literal.
+fn float_zeros(expr: &Arc<dyn PhysicalExpr>) -> DFResult<Option<(Scalar, Scalar)>> {
+    let Some((negative, positive)) = expr
+        .downcast_ref::<df_expr::Literal>()
+        .and_then(|literal| float_zeros_of(literal.value()))
+    else {
+        return Ok(None);
+    };
+    let to_scalar = |value: &ScalarValue| {
+        Scalar::from_df(value)
+            .map_err(|e| exec_datafusion_err!("Failed to convert literal to a Vortex scalar: {e}"))
+    };
+    Ok(Some((to_scalar(&negative)?, to_scalar(&positive)?)))
+}
+
+fn contains_decimal_to_floating_cast(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    let expr = df_expr;
+
+    if let Some(cast) = expr.downcast_ref::<df_expr::CastExpr>() {
+        let casts_to_floating = matches!(cast.cast_type(), DataType::Float32 | DataType::Float64);
+        if casts_to_floating {
+            let casts_from_decimal = cast
+                .expr()
+                .data_type(schema)
+                .map_or(true, |data_type| is_decimal(&data_type));
+
+            if casts_from_decimal {
+                return true;
+            }
+        }
+    }
+
+    if let Some(dynamic_filter) = expr.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+        && let Ok(current) = dynamic_filter.current()
+        && contains_decimal_to_floating_cast(&current, schema)
+    {
+        return true;
+    }
+
+    df_expr
+        .children()
+        .into_iter()
+        .any(|child| contains_decimal_to_floating_cast(child, schema))
+}
+
+/// Whether `df_expr` holds a cast Vortex can't evaluate.
+///
+/// A static filter rarely carries a cast, because `DataFusion` unwraps it into the
+/// literal. A join's dynamic filter on a coerced key does, and so does a `TopK` filter
+/// pushed through a view's `CAST`.
+fn contains_cast_vortex_cannot_evaluate(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    if let Some(cast) = df_expr.downcast_ref::<df_expr::CastExpr>() {
+        let evaluable = cast
+            .expr()
+            .data_type(schema)
+            .is_ok_and(|source| vortex_evaluates_cast(&source, cast.cast_type()));
+        if !evaluable {
+            return true;
+        }
+    }
+
+    if let Some(dynamic_filter) = df_expr.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+        && let Ok(current) = dynamic_filter.current()
+        && contains_cast_vortex_cannot_evaluate(&current, schema)
+    {
+        return true;
+    }
+
+    df_expr
+        .children()
+        .into_iter()
+        .any(|child| contains_cast_vortex_cannot_evaluate(child, schema))
+}
+
+/// Whether Vortex casts a `source` value to `target`.
+///
+/// A pushed-down cast runs in the scan twice: on a column's rows, and on the min/max
+/// statistics that prune zones. Each path has its own Vortex kernels, and a pair that
+/// either lacks fails the query, so both are tried on one value of `source`. The answer
+/// depends only on the two types, so it is computed once per pair.
+fn vortex_evaluates_cast(source: &DataType, target: &DataType) -> bool {
+    static EVALUATES: LazyLock<DashMap<(DataType, DataType), bool>> =
+        LazyLock::new(DashMap::default);
+
+    if let Some(evaluates) = EVALUATES.get(&(source.clone(), target.clone())) {
+        return *evaluates;
+    }
+    let evaluates = probe_vortex_cast(source, target);
+    EVALUATES.insert((source.clone(), target.clone()), evaluates);
+    evaluates
+}
+
+fn probe_vortex_cast(source: &DataType, target: &DataType) -> bool {
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::default);
+
+    let arrow = ArrowSession::default();
+    let (Ok(source), Ok(target)) = (
+        arrow.from_arrow_datatype(source, Nullability::Nullable),
+        arrow.from_arrow_datatype(target, Nullability::Nullable),
+    ) else {
+        return false;
+    };
+    let value = match &source {
+        DType::Null => Scalar::null(DType::Null),
+        // One unit in the last place, so a cast that drops fractional digits has to round.
+        DType::Decimal(decimal, nullability) => {
+            Scalar::decimal(DecimalValue::I128(1), *decimal, *nullability)
+        }
+        DType::Bool(_)
+        | DType::Primitive(..)
+        | DType::Utf8(_)
+        | DType::Binary(_)
+        | DType::Extension(_) => Scalar::zero_value(&source),
+        // A nested value has no generic probe value. The opener's schema adapter casts a
+        // file's struct to the table's, so a nested cast is left to Vortex.
+        _ => return true,
+    };
+
+    if value.cast(&target).is_err() {
+        return false;
+    }
+
+    let mut ctx = SESSION.create_execution_ctx();
+    ConstantArray::new(value, 1)
+        .into_array()
+        .execute::<Canonical>(&mut ctx)
+        .and_then(|rows| rows.into_array().cast(target))
+        .and_then(|cast| cast.execute::<Canonical>(&mut ctx))
+        .is_ok()
+}
+
+fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bool {
+    case_expr
+        .expr()
+        .is_none_or(|base_expr| can_be_pushed_down_impl(base_expr, schema))
+        && case_expr
+            .when_then_expr()
+            .iter()
+            .all(|(when_expr, then_expr)| {
+                can_be_pushed_down_impl(when_expr, schema)
+                    && can_be_pushed_down_impl(then_expr, schema)
+            })
+        && case_expr
+            .else_expr()
+            .is_some_and(|else_expr| can_be_pushed_down_impl(else_expr, schema))
+}
+
+fn supported_data_types(dt: &DataType) -> bool {
+    use DataType::{
+        Binary, BinaryView, Boolean, Date32, Date64, Dictionary, LargeBinary, LargeUtf8, Time32,
+        Time64, Timestamp, Utf8, Utf8View,
+    };
+
+    // For dictionary types, check if the value type is supported.
+    if let Dictionary(_, value_type) = dt {
+        return supported_data_types(value_type.as_ref());
+    }
+
+    let is_supported = dt.is_null()
+        || dt.is_numeric()
+        || matches!(
+            dt,
+            Boolean
+                | Utf8
+                | LargeUtf8
+                | Utf8View
+                | Binary
+                | LargeBinary
+                | BinaryView
+                | Date32
+                | Date64
+                | Timestamp(_, _)
+                | Time32(_)
+                | Time64(_)
+        );
+
+    if !is_supported {
+        tracing::debug!("DataFusion data type {dt:?} is not supported");
+    }
+
+    is_supported
+}
+
+/// Checks if a scalar function can be pushed down.
+/// Currently `GetFieldFunc` (when its arguments are pushable) and `ArrayLength` are supported.
+fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema) -> bool {
+    if ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_some() {
+        return scalar_fn
+            .args()
+            .iter()
+            .all(|arg| can_be_pushed_down_impl(arg, schema));
+    }
+
+    ScalarFunctionExpr::try_downcast_func::<ArrayLength>(scalar_fn)
+        .is_some_and(|array_length| can_array_length_be_pushed_down(array_length, schema))
+}
+
+fn can_array_length_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema) -> bool {
+    let Some(input) = array_length_input(scalar_fn) else {
+        return false;
+    };
+
+    // The argument must resolve to a list type. We gate on the resolved data type rather than
+    // `can_be_pushed_down_impl`, since list columns are intentionally rejected there. We still
+    // require the argument to be a convertible expression (e.g. a column or struct field access).
+    input.data_type(schema).as_ref().is_ok_and(|data_type| {
+        matches!(
+            data_type,
+            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+        )
+    }) && is_convertible_expr(input)
+}
+
+/// `true` when `convert()` can rewrite this `array_length` call to Vortex `list_length`.
+/// Higher-dimension forms (`array_length(arr, n)` with `n != 1`) must be declined so a
+/// `CAST(array_length(arr, 2) ...)` is not accepted for pushdown and then fail at scan time.
+fn is_convertible_array_length(scalar_fn: &ScalarFunctionExpr) -> bool {
+    ScalarFunctionExpr::try_downcast_func::<ArrayLength>(scalar_fn)
+        .and_then(array_length_input)
+        .is_some_and(is_convertible_expr)
+}
+
+/// Returns the list argument of an `array_length` call if the call is a form we can rewrite to
+/// `list_length`: either the single-argument form `array_length(arr)`, or the two-argument form
+/// with an explicit first dimension `array_length(arr, 1)`, which is equivalent. Higher
+/// dimensions recurse into nested lists and are not supported.
+fn array_length_input(scalar_fn: &ScalarFunctionExpr) -> Option<&Arc<dyn PhysicalExpr>> {
+    match scalar_fn.args() {
+        [input] => Some(input),
+        [input, dimension] if is_dimension_one(dimension) => Some(input),
+        _ => None,
+    }
+}
+
+/// Returns true if `expr` is an `Int64` literal equal to 1. `DataFusion` coerces the `array_length`
+/// dimension argument to `Int64`, so that is the only form we need to recognize; any other literal
+/// simply isn't pushed down.
+fn is_dimension_one(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.downcast_ref::<df_expr::Literal>()
+        .is_some_and(|literal| matches!(literal.value(), ScalarValue::Int64(Some(1))))
+}
+
+// TODO(adam): Replace with `DataType::is_decimal` once its released.
+fn is_decimal(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_schema::DataType;
+    use arrow_schema::Field;
+    use arrow_schema::Schema;
+    use arrow_schema::TimeUnit as ArrowTimeUnit;
+    use datafusion_common::ScalarValue;
+    use datafusion_common::config::ConfigOptions;
+    use datafusion_expr::Operator as DFOperator;
+    use datafusion_expr::ScalarUDF;
+    use datafusion_physical_expr::PhysicalExpr;
+    use datafusion_physical_plan::expressions as df_expr;
+    use insta::assert_snapshot;
+    use rstest::rstest;
+    use vortex::VortexSessionDefault;
+    use vortex::dtype::PType;
+    use vortex::dtype::StructFields;
+    use vortex::session::VortexSession;
+
+    use super::*;
+    use crate::common_tests::TestSessionContext;
+
+    #[rstest::fixture]
+    fn test_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("score", DataType::Float64, true),
+            Field::new("active", DataType::Boolean, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                "unsupported_list",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+        ])
+    }
+
+    fn array_length_expr(
+        args: Vec<Arc<dyn PhysicalExpr>>,
+        schema: &Schema,
+    ) -> Arc<dyn PhysicalExpr> {
+        Arc::new(
+            ScalarFunctionExpr::try_new(
+                Arc::new(ScalarUDF::from(ArrayLength::new())),
+                args,
+                schema,
+                Arc::new(ConfigOptions::new()),
+            )
+            .expect("array_length expression should be valid"),
+        )
+    }
+
+    fn lower_name_expr(schema: &Schema) -> Arc<dyn PhysicalExpr> {
+        let name = Arc::new(df_expr::Column::new("name", 1)) as Arc<dyn PhysicalExpr>;
+        Arc::new(
+            ScalarFunctionExpr::try_new(
+                datafusion_functions::string::lower(),
+                vec![name],
+                schema,
+                Arc::new(ConfigOptions::new()),
+            )
+            .expect("lower(name) expression should be valid"),
+        )
+    }
+
+    fn like_pattern(expr: Arc<dyn PhysicalExpr>, pattern: &str) -> Arc<dyn PhysicalExpr> {
+        let pattern = Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+            pattern.to_string(),
+        )))) as Arc<dyn PhysicalExpr>;
+        Arc::new(df_expr::LikeExpr::new(false, false, expr, pattern))
+    }
+
+    #[test]
+    fn test_make_vortex_predicate_empty() {
+        let expr_convertor = DefaultExpressionConvertor::default();
+        let result = make_vortex_predicate(&expr_convertor, &[])
+            .expect("empty predicate conversion should succeed");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_make_vortex_predicate_single() {
+        let expr_convertor = DefaultExpressionConvertor::default();
+        let col_expr = Arc::new(df_expr::Column::new("test", 0)) as Arc<dyn PhysicalExpr>;
+        let result = make_vortex_predicate(&expr_convertor, &[col_expr])
+            .expect("single predicate conversion should succeed")
+            .expect("a non-empty conjunction converts to an expression");
+        // A lone predicate is the converted column itself, not wrapped in a conjunction.
+        assert_eq!(result.to_string(), get_item("test", root()).to_string());
+    }
+
+    #[test]
+    fn test_make_vortex_predicate_multiple() {
+        let expr_convertor = DefaultExpressionConvertor::default();
+        let col1 = Arc::new(df_expr::Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
+        let col2 = Arc::new(df_expr::Column::new("col2", 1)) as Arc<dyn PhysicalExpr>;
+        let result = make_vortex_predicate(&expr_convertor, &[col1, col2])
+            .expect("multiple predicate conversion should succeed")
+            .expect("a non-empty conjunction converts to an expression");
+        // Every predicate filters the scan, so the result is the AND of both columns.
+        assert_eq!(
+            result.to_string(),
+            vortex::expr::and(get_item("col1", root()), get_item("col2", root())).to_string()
+        );
+    }
+
+    #[rstest]
+    #[case::eq(DFOperator::Eq, Operator::Eq)]
+    #[case::not_eq(DFOperator::NotEq, Operator::NotEq)]
+    #[case::lt(DFOperator::Lt, Operator::Lt)]
+    #[case::lte(DFOperator::LtEq, Operator::Lte)]
+    #[case::gt(DFOperator::Gt, Operator::Gt)]
+    #[case::gte(DFOperator::GtEq, Operator::Gte)]
+    #[case::and(DFOperator::And, Operator::And)]
+    #[case::or(DFOperator::Or, Operator::Or)]
+    #[case::plus(DFOperator::Plus, Operator::Add)]
+    #[case::minus(DFOperator::Minus, Operator::Sub)]
+    #[case::multiply(DFOperator::Multiply, Operator::Mul)]
+    #[case::divide(DFOperator::Divide, Operator::Div)]
+    fn test_operator_conversion_supported(
+        #[case] df_op: DFOperator,
+        #[case] expected_vortex_op: Operator,
+    ) {
+        let result = try_operator_from_df(df_op).expect("supported operator converts");
+        assert_eq!(result, expected_vortex_op);
+    }
+
+    #[rstest]
+    #[case::modulo(DFOperator::Modulo)]
+    #[case::bitwise_and(DFOperator::BitwiseAnd)]
+    #[case::regex_match(DFOperator::RegexMatch)]
+    #[case::like_match(DFOperator::LikeMatch)]
+    fn test_operator_conversion_unsupported(#[case] df_op: DFOperator) {
+        let result = try_operator_from_df(df_op);
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("unsupported operator should fail to convert")
+                .to_string()
+                .contains("Unsupported datafusion operator")
+        );
+    }
+
+    #[test]
+    fn test_expr_from_df_column() {
+        let col_expr = df_expr::Column::new("test_column", 0);
+        let result = DefaultExpressionConvertor::default()
+            .convert(&col_expr)
+            .expect("column expression should convert");
+
+        assert_snapshot!("expr_from_df_column", result.display_tree().to_string());
+    }
+
+    #[test]
+    fn test_expr_from_df_literal() {
+        let literal_expr = df_expr::Literal::new(ScalarValue::Int32(Some(42)));
+        let result = DefaultExpressionConvertor::default()
+            .convert(&literal_expr)
+            .expect("literal expression should convert");
+
+        assert_snapshot!("expr_from_df_literal", result.display_tree().to_string());
+    }
+
+    #[test]
+    fn test_expr_from_df_binary() {
+        let left = Arc::new(df_expr::Column::new("left", 0)) as Arc<dyn PhysicalExpr>;
+        let right =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(42)))) as Arc<dyn PhysicalExpr>;
+        let binary_expr = df_expr::BinaryExpr::new(left, DFOperator::Eq, right);
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&binary_expr)
+            .expect("binary expression should convert");
+
+        assert_snapshot!("expr_from_df_binary", result.display_tree().to_string());
+    }
+
+    #[test]
+    fn test_expr_from_dynamic_filter_in_list_uses_current_expression() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let column = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let values = vec![
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(3)))) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(7)))) as Arc<dyn PhysicalExpr>,
+        ];
+        let in_list = Arc::new(
+            df_expr::InListExpr::try_new(Arc::clone(&column), values, false, &schema)
+                .expect("IN-list expression should be valid"),
+        ) as Arc<dyn PhysicalExpr>;
+        let dynamic_filter = df_expr::DynamicFilterPhysicalExpr::new(
+            vec![column],
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        );
+        dynamic_filter
+            .update(in_list)
+            .expect("dynamic filter update should succeed");
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&dynamic_filter)
+            .expect("dynamic IN-list should convert through its current expression");
+
+        let display = result.display_tree().to_string();
+        assert!(display.contains("vortex.list.contains"));
+        assert!(display.contains("vortex.get_item(id)"));
+    }
+
+    #[test]
+    fn test_in_list_conversion_produces_pruning_expression() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let column = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let values = vec![
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(3)))) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(7)))) as Arc<dyn PhysicalExpr>,
+        ];
+        let in_list = df_expr::InListExpr::try_new(column, values, false, &schema)
+            .expect("IN-list expression should be valid");
+
+        // Filters convert as predicates, which keeps an IN list a bare
+        // `list_contains`; that is what min/max pruning recognizes.
+        let result = DefaultExpressionConvertor::default()
+            .convert_predicate(&in_list)
+            .expect("IN-list should convert to a Vortex expression");
+        // The converted IN-list must be falsifiable from min/max statistics on `id`,
+        // producing a pruning expression over the column's stats.
+        let scope = DType::Struct(
+            StructFields::new(
+                ["id"].into(),
+                vec![DType::Primitive(PType::I32, Nullability::NonNullable)],
+            ),
+            Nullability::NonNullable,
+        );
+        let session = VortexSession::default();
+        let pruning_expr = result
+            .bind(&scope)
+            .expect("converted IN-list should bind to the scope")
+            .falsify(&session)
+            .expect("falsify should not error")
+            .expect("converted IN-list should support min/max pruning");
+
+        // The pruning expression must be derived from the min and max statistics of `id` —
+        // that is what makes an IN-list prunable. Assert both stat references are present; a
+        // weaker check (e.g. that the string merely contains "id") would pass even if the
+        // expression were not actually using min/max stats.
+        let pruning_display = pruning_expr.to_string();
+        assert!(
+            pruning_display.contains("stat($.id, vortex.min())"),
+            "pruning expression should reference id's min statistic: {pruning_display}"
+        );
+        assert!(
+            pruning_display.contains("stat($.id, vortex.max())"),
+            "pruning expression should reference id's max statistic: {pruning_display}"
+        );
+    }
+
+    fn nullable_in_list(values: Vec<Option<i32>>, negated: bool) -> df_expr::InListExpr {
+        let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
+        let column = Arc::new(df_expr::Column::new("x", 0)) as Arc<dyn PhysicalExpr>;
+        let values = values
+            .into_iter()
+            .map(|value| {
+                Arc::new(df_expr::Literal::new(ScalarValue::Int32(value))) as Arc<dyn PhysicalExpr>
+            })
+            .collect();
+        df_expr::InListExpr::try_new(column, values, negated, &schema)
+            .expect("IN-list expression should be valid")
+    }
+
+    #[test]
+    fn test_in_list_value_conversion_keeps_null_for_a_null_value() {
+        // As a value, `x IN (…)` must be NULL for a NULL `x`, which a bare
+        // `list_contains` (FALSE) is not.
+        let result = DefaultExpressionConvertor::default()
+            .convert(&nullable_in_list(
+                vec![Some(1), Some(2), Some(3), Some(4)],
+                false,
+            ))
+            .expect("IN-list should convert to a Vortex expression");
+        let display = result.display_tree().to_string();
+        assert!(display.contains("vortex.list.contains"), "{display}");
+        assert!(display.contains("vortex.is_null"), "{display}");
+        assert!(display.contains("vortex.zip"), "{display}");
+    }
+
+    #[test]
+    fn test_not_in_predicate_conversion_excludes_null_values() {
+        // As a predicate, a NULL `x` must not pass `x NOT IN (…)`.
+        let result = DefaultExpressionConvertor::default()
+            .convert_predicate(&nullable_in_list(
+                vec![Some(1), Some(2), Some(3), Some(4)],
+                true,
+            ))
+            .expect("NOT IN list should convert to a Vortex expression");
+        let display = result.display_tree().to_string();
+        assert!(display.contains("vortex.is_not_null"), "{display}");
+        assert!(display.contains("vortex.not"), "{display}");
+        assert!(display.contains("vortex.list.contains"), "{display}");
+    }
+
+    #[test]
+    fn test_not_in_predicate_with_a_null_in_the_list_keeps_no_row() {
+        // `x NOT IN (1, NULL)` is FALSE or NULL for every row.
+        let result = DefaultExpressionConvertor::default()
+            .convert_predicate(&nullable_in_list(vec![Some(1), None], true))
+            .expect("NOT IN list should convert to a Vortex expression");
+        assert_eq!(result.to_string(), lit(false).to_string());
+    }
+
+    #[rstest]
+    #[case::in_empty(false, "false")]
+    #[case::not_in_empty(true, "true")]
+    fn test_empty_in_list_conversion_produces_boolean_literal(
+        #[case] negated: bool,
+        #[case] expected_literal: &str,
+    ) {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let column = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let in_list = df_expr::InListExpr::try_new(column, vec![], negated, &schema)
+            .expect("empty IN-list expression should be valid");
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&in_list)
+            .expect("empty IN-list should convert to a boolean literal");
+
+        let display = result.display_tree().to_string();
+        assert!(display.contains("vortex.literal"));
+        assert!(display.contains(expected_literal));
+    }
+
+    #[rstest]
+    #[case::like_normal(false, false)]
+    #[case::like_negated(true, false)]
+    #[case::like_case_insensitive(false, true)]
+    #[case::like_negated_case_insensitive(true, true)]
+    fn test_expr_from_df_like(#[case] negated: bool, #[case] case_insensitive: bool) {
+        let expr = Arc::new(df_expr::Column::new("text_col", 0)) as Arc<dyn PhysicalExpr>;
+        let pattern = Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+            "test%".to_string(),
+        )))) as Arc<dyn PhysicalExpr>;
+        let like_expr = df_expr::LikeExpr::new(negated, case_insensitive, expr, pattern);
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&like_expr)
+            .expect("like expression should convert");
+        let like_opts = result.as_::<Like>();
+        assert_eq!(
+            like_opts,
+            &LikeOptions {
+                negated,
+                case_insensitive
+            }
+        );
+    }
+
+    #[test]
+    fn test_expr_from_df_not() {
+        // `NOT (id = 42)` must convert to a Vortex `not` over the pushed comparison.
+        let left = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let right =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(42)))) as Arc<dyn PhysicalExpr>;
+        let binary = Arc::new(df_expr::BinaryExpr::new(left, DFOperator::Eq, right));
+        let not_expr = df_expr::NotExpr::new(binary);
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&not_expr)
+            .expect("NOT expression should convert");
+
+        let display = result.display_tree().to_string();
+        assert!(
+            display.contains("vortex.not"),
+            "converted NOT must emit a vortex.not node: {display}"
+        );
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_not_over_boolean_column(test_schema: Schema) {
+        // `NOT active` where `active` is a supported boolean column pushes down.
+        let active = Arc::new(df_expr::Column::new("active", 3)) as Arc<dyn PhysicalExpr>;
+        let not_expr = Arc::new(df_expr::NotExpr::new(active)) as Arc<dyn PhysicalExpr>;
+
+        assert!(can_be_pushed_down_impl(&not_expr, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_not_unsupported_operand(test_schema: Schema) {
+        // `NOT` over an unsupported-typed column must not push (the convertor
+        // must never promise DataFusion a pushdown the scan can't honor).
+        let list_col =
+            Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+        let not_expr = Arc::new(df_expr::NotExpr::new(list_col)) as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&not_expr, &test_schema));
+    }
+
+    #[test]
+    fn test_expr_from_df_case_when_with_else() {
+        let when_then_expr = vec![(
+            Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+                "yes".to_string(),
+            )))) as Arc<dyn PhysicalExpr>,
+        )];
+        let case_expr = df_expr::CaseExpr::try_new(
+            None,
+            when_then_expr,
+            Some(Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+                "no".to_string(),
+            )))) as Arc<dyn PhysicalExpr>),
+        )
+        .expect("CASE expression with ELSE should build");
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&case_expr)
+            .expect("CASE expression with ELSE should convert");
+
+        assert_snapshot!(
+            "expr_from_df_case_when_with_else",
+            result.display_tree().to_string()
+        );
+    }
+
+    #[test]
+    fn test_expr_from_df_case_when_without_else_not_pushable() {
+        let when_then_expr = vec![(
+            Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+                "yes".to_string(),
+            )))) as Arc<dyn PhysicalExpr>,
+        )];
+        let case_expr = Arc::new(
+            df_expr::CaseExpr::try_new(None, when_then_expr, None)
+                .expect("CASE expression without ELSE should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        let schema = Schema::new(vec![Field::new("active", DataType::Boolean, false)]);
+        assert!(!can_be_pushed_down_impl(&case_expr, &schema));
+    }
+
+    #[test]
+    fn test_cast_case_convertibility_requires_else() {
+        // A CAST over a CASE is convertible (so `CAST(CASE ...)` can push) only
+        // when the CASE has an ELSE branch — `convert` errors on a CASE without
+        // one, so `is_convertible_expr` must decline it to preserve the
+        // "accepted for pushdown => convertible" invariant.
+        let when_then = vec![(
+            Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(1)))) as Arc<dyn PhysicalExpr>,
+        )];
+
+        // CAST(CASE ... ELSE ... END AS DOUBLE): has an ELSE, so it is convertible.
+        let pushable = Arc::new(df_expr::CastExpr::new(
+            Arc::new(
+                df_expr::CaseExpr::try_new(
+                    None,
+                    when_then.clone(),
+                    Some(Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(0))))),
+                )
+                .expect("CASE with ELSE should build"),
+            ),
+            DataType::Float64,
+            None,
+        )) as Arc<dyn PhysicalExpr>;
+
+        // CAST(CASE ... END AS DOUBLE) without ELSE: convert() can't represent it,
+        // so is_convertible_expr must decline the whole cast.
+        let declined = Arc::new(df_expr::CastExpr::new(
+            Arc::new(
+                df_expr::CaseExpr::try_new(None, when_then, None)
+                    .expect("CASE without ELSE should build"),
+            ),
+            DataType::Float64,
+            None,
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            is_convertible_expr(&pushable),
+            "CAST over a CASE with ELSE should be convertible"
+        );
+        assert!(
+            !is_convertible_expr(&declined),
+            "CAST over a CASE without ELSE must not be convertible"
+        );
+    }
+
+    #[test]
+    fn test_cast_case_convertibility_requires_convertible_else() {
+        // The ELSE branch must itself be convertible: `try_convert_case_expr`
+        // always converts the ELSE, so accepting a CASE whose ELSE holds an
+        // unconvertible expression would break the "accepted for pushdown =>
+        // convertible" invariant and fail inside `convert()` at scan time.
+        //
+        // Use a nested CASE *without* an ELSE as the outer ELSE branch: Vortex
+        // can never represent an ELSE-less CASE (a permanent limitation, unlike
+        // the evolving set of supported leaf expressions), so the outer CASE is
+        // rejected precisely by the new ELSE-convertibility check. This keeps
+        // the test valid no matter which leaf expressions `convert()` later
+        // grows support for.
+        let inner_case_without_else = Arc::new(
+            df_expr::CaseExpr::try_new(
+                None,
+                vec![(
+                    Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
+                    Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(2))))
+                        as Arc<dyn PhysicalExpr>,
+                )],
+                None,
+            )
+            .expect("inner CASE without ELSE should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        let when_then = vec![(
+            Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(1)))) as Arc<dyn PhysicalExpr>,
+        )];
+
+        // CAST(CASE ... ELSE (CASE ... /* no ELSE */) END AS DOUBLE): the outer
+        // ELSE is not convertible, so the whole cast must be declined.
+        let declined = Arc::new(df_expr::CastExpr::new(
+            Arc::new(
+                df_expr::CaseExpr::try_new(None, when_then, Some(inner_case_without_else))
+                    .expect("outer CASE with ELSE should build"),
+            ),
+            DataType::Float64,
+            None,
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            !is_convertible_expr(&declined),
+            "CAST over a CASE whose ELSE is not convertible must not be convertible"
+        );
+    }
+
+    /// Which casts the pushdown gate lets into the scan: those Vortex evaluates on
+    /// both a column's rows and its min/max statistics.
+    #[rstest]
+    #[case::timestamp_unit_change(
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, Some(Arc::from("UTC"))),
+        DataType::Timestamp(ArrowTimeUnit::Nanosecond, None),
+        false
+    )]
+    #[case::timestamp_unit_change_same_timezone(
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, Some(Arc::from("UTC"))),
+        DataType::Timestamp(ArrowTimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+        false
+    )]
+    #[case::timestamp_timezone_change(
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, Some(Arc::from("UTC"))),
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+        false
+    )]
+    #[case::timestamp_to_date(
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+        DataType::Date32,
+        false
+    )]
+    #[case::timestamp_to_storage(
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+        DataType::Int64,
+        true
+    )]
+    #[case::date_to_storage(DataType::Date32, DataType::Int32, true)]
+    #[case::date_to_wider_int(DataType::Date32, DataType::Int64, false)]
+    #[case::int_to_timestamp(
+        DataType::Int64,
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+        false
+    )]
+    #[case::string_to_timestamp(
+        DataType::Utf8,
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+        false
+    )]
+    #[case::time_unit_change(
+        DataType::Time32(ArrowTimeUnit::Millisecond),
+        DataType::Time64(ArrowTimeUnit::Nanosecond),
+        false
+    )]
+    #[case::timestamp_identity(
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, Some(Arc::from("UTC"))),
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, Some(Arc::from("UTC"))),
+        true
+    )]
+    #[case::date_to_timestamp(
+        DataType::Date32,
+        DataType::Timestamp(ArrowTimeUnit::Nanosecond, None),
+        true
+    )]
+    #[case::int_widening(DataType::Int32, DataType::Int64, true)]
+    #[case::int_to_float(DataType::Int64, DataType::Float64, true)]
+    #[case::int_to_decimal(DataType::Int64, DataType::Decimal128(20, 0), true)]
+    #[case::decimal_widening(DataType::Decimal128(19, 0), DataType::Decimal128(20, 0), true)]
+    #[case::decimal_scale_up(DataType::Decimal128(10, 2), DataType::Decimal128(12, 4), true)]
+    #[case::decimal_scale_down(DataType::Decimal128(10, 2), DataType::Decimal128(10, 0), false)]
+    #[case::decimal_to_int(DataType::Decimal128(19, 0), DataType::Int64, false)]
+    #[case::float_to_decimal(DataType::Float64, DataType::Decimal128(20, 0), false)]
+    #[case::int64_to_string(DataType::Int64, DataType::Utf8, false)]
+    #[case::int32_to_string_view(DataType::Int32, DataType::Utf8View, false)]
+    #[case::string_to_int(DataType::Utf8, DataType::Int64, false)]
+    #[case::string_to_decimal(DataType::Utf8, DataType::Decimal128(19, 0), false)]
+    #[case::string_to_string_view(DataType::Utf8, DataType::Utf8View, true)]
+    #[case::binary_to_string(DataType::Binary, DataType::Utf8, false)]
+    #[case::bool_to_int(DataType::Boolean, DataType::Int32, false)]
+    #[case::dictionary_to_string(
+        DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+        DataType::Utf8,
+        true
+    )]
+    fn test_cast_pushdown(
+        #[case] source: DataType,
+        #[case] target: DataType,
+        #[case] pushed: bool,
+    ) {
+        let schema = Schema::new(vec![Field::new("c", source, true)]);
+        let cast = Arc::new(df_expr::CastExpr::new(
+            Arc::new(df_expr::Column::new("c", 0)),
+            target,
+            None,
+        )) as Arc<dyn PhysicalExpr>;
+        let is_null =
+            Arc::new(df_expr::IsNullExpr::new(Arc::clone(&cast))) as Arc<dyn PhysicalExpr>;
+        let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(df_expr::Column::new("c", 0)) as Arc<dyn PhysicalExpr>],
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic_filter
+            .update(Arc::clone(&is_null))
+            .expect("dynamic filter update should succeed");
+
+        assert_eq!(can_be_pushed_down_impl(&is_null, &schema), pushed);
+        assert_eq!(
+            can_be_pushed_down_impl(&(dynamic_filter as Arc<dyn PhysicalExpr>), &schema),
+            pushed
+        );
+    }
+
+    #[rstest]
+    // Supported types
+    #[case::null(DataType::Null, true)]
+    #[case::boolean(DataType::Boolean, true)]
+    #[case::int8(DataType::Int8, true)]
+    #[case::int16(DataType::Int16, true)]
+    #[case::int32(DataType::Int32, true)]
+    #[case::int64(DataType::Int64, true)]
+    #[case::uint8(DataType::UInt8, true)]
+    #[case::uint16(DataType::UInt16, true)]
+    #[case::uint32(DataType::UInt32, true)]
+    #[case::uint64(DataType::UInt64, true)]
+    #[case::float32(DataType::Float32, true)]
+    #[case::float64(DataType::Float64, true)]
+    #[case::utf8(DataType::Utf8, true)]
+    #[case::utf8_view(DataType::Utf8View, true)]
+    #[case::binary(DataType::Binary, true)]
+    #[case::binary_view(DataType::BinaryView, true)]
+    #[case::date32(DataType::Date32, true)]
+    #[case::date64(DataType::Date64, true)]
+    #[case::timestamp_ms(DataType::Timestamp(ArrowTimeUnit::Millisecond, None), true)]
+    #[case::timestamp_us(
+        DataType::Timestamp(ArrowTimeUnit::Microsecond, Some(Arc::from("UTC"))),
+        true
+    )]
+    #[case::time32_s(DataType::Time32(ArrowTimeUnit::Second), true)]
+    #[case::time64_ns(DataType::Time64(ArrowTimeUnit::Nanosecond), true)]
+    // Unsupported types
+    #[case::list(
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        false
+    )]
+    #[case::struct_type(DataType::Struct(vec![Field::new("field", DataType::Int32, true)].into()
+    ), false)]
+    // Dictionary types - should be supported if value type is supported
+    #[case::dict_utf8(
+        DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+        true
+    )]
+    #[case::dict_int32(
+        DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Int32)),
+        true
+    )]
+    #[case::dict_unsupported(
+        DataType::Dictionary(
+            Box::new(DataType::UInt32),
+            Box::new(DataType::List(Arc::new(Field::new("item", DataType::Int32, true))))
+        ),
+        false
+    )]
+    fn test_supported_data_types(#[case] data_type: DataType, #[case] expected: bool) {
+        assert_eq!(supported_data_types(&data_type), expected);
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_column_supported(test_schema: Schema) {
+        let col_expr = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+
+        assert!(can_be_pushed_down_impl(&col_expr, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_column_unsupported_type(test_schema: Schema) {
+        let col_expr =
+            Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&col_expr, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_column_not_found(test_schema: Schema) {
+        let col_expr = Arc::new(df_expr::Column::new("nonexistent", 99)) as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&col_expr, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_literal_supported(test_schema: Schema) {
+        let lit_expr =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(42)))) as Arc<dyn PhysicalExpr>;
+
+        assert!(can_be_pushed_down_impl(&lit_expr, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_literal_unsupported(test_schema: Schema) {
+        // Use a simpler unsupported type - Duration is not supported
+        let unsupported_literal = ScalarValue::DurationSecond(Some(42));
+        let lit_expr =
+            Arc::new(df_expr::Literal::new(unsupported_literal)) as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&lit_expr, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_binary_supported(test_schema: Schema) {
+        let left = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let right =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(42)))) as Arc<dyn PhysicalExpr>;
+        let binary_expr = Arc::new(df_expr::BinaryExpr::new(left, DFOperator::Eq, right))
+            as Arc<dyn PhysicalExpr>;
+
+        assert!(can_be_pushed_down_impl(&binary_expr, &test_schema));
+    }
+
+    #[test]
+    fn test_decimal_to_floating_cast_not_pushed_down() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            true,
+        )]);
+        let amount = Arc::new(df_expr::Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
+        let cast = Arc::new(df_expr::CastExpr::new(amount, DataType::Float64, None))
+            as Arc<dyn PhysicalExpr>;
+        let literal = Arc::new(df_expr::Literal::new(ScalarValue::Float64(Some(1.0))))
+            as Arc<dyn PhysicalExpr>;
+        let predicate = Arc::new(df_expr::BinaryExpr::new(cast, DFOperator::Lt, literal))
+            as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&predicate, &schema));
+    }
+
+    #[test]
+    fn test_decimal_to_decimal_predicate_can_be_pushed_down() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            true,
+        )]);
+        let amount = Arc::new(df_expr::Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
+        let literal = Arc::new(df_expr::Literal::new(ScalarValue::Decimal128(
+            Some(100),
+            15,
+            2,
+        ))) as Arc<dyn PhysicalExpr>;
+        let predicate = Arc::new(df_expr::BinaryExpr::new(amount, DFOperator::Lt, literal))
+            as Arc<dyn PhysicalExpr>;
+
+        assert!(can_be_pushed_down_impl(&predicate, &schema));
+    }
+
+    #[test]
+    fn test_dynamic_filter_decimal_to_floating_not_pushed_down() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            true,
+        )]);
+        let amount = Arc::new(df_expr::Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
+        let cast = Arc::new(df_expr::CastExpr::new(
+            Arc::clone(&amount),
+            DataType::Float64,
+            None,
+        ));
+        let literal = Arc::new(df_expr::Literal::new(ScalarValue::Float64(Some(1.0))));
+        let current = Arc::new(df_expr::BinaryExpr::new(cast, DFOperator::Lt, literal));
+        let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            vec![amount],
+            current,
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&dynamic_filter, &schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_binary_unsupported_operator(test_schema: Schema) {
+        let left = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let right =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(42)))) as Arc<dyn PhysicalExpr>;
+        let binary_expr = Arc::new(df_expr::BinaryExpr::new(
+            left,
+            DFOperator::AtQuestion,
+            right,
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&binary_expr, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_binary_unsupported_operand(test_schema: Schema) {
+        let left = Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+        let right =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(42)))) as Arc<dyn PhysicalExpr>;
+        let binary_expr = Arc::new(df_expr::BinaryExpr::new(left, DFOperator::Eq, right))
+            as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&binary_expr, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_like_supported(test_schema: Schema) {
+        let expr = Arc::new(df_expr::Column::new("name", 1)) as Arc<dyn PhysicalExpr>;
+        let pattern = Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+            "test%".to_string(),
+        )))) as Arc<dyn PhysicalExpr>;
+        let like_expr =
+            Arc::new(df_expr::LikeExpr::new(false, false, expr, pattern)) as Arc<dyn PhysicalExpr>;
+
+        assert!(can_be_pushed_down_impl(&like_expr, &test_schema));
+    }
+
+    #[rstest]
+    fn test_expr_from_df_array_length(test_schema: Schema) {
+        let expr = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![expr], &test_schema);
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(array_length.as_ref())
+            .expect("array_length should convert to vortex.list.length");
+
+        assert_snapshot!(
+            "expr_from_df_array_length",
+            result.display_tree().to_string()
+        );
+    }
+
+    #[rstest]
+    fn test_expr_from_df_array_length_dimension_one(test_schema: Schema) {
+        // `array_length(arr, 1)` is the first-dimension length, equivalent to `list_length`.
+        let list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let dimension =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(1)))) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![list, dimension], &test_schema);
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(array_length.as_ref())
+            .expect("array_length(arr, 1) should convert to vortex.list.length");
+
+        let display = result.display_tree().to_string();
+        assert!(
+            display.contains("vortex.list.length"),
+            "array_length(arr, 1) must emit vortex.list.length: {display}"
+        );
+        assert!(
+            display.contains("vortex.get_item(tags)"),
+            "converted array_length must read the list column: {display}"
+        );
+    }
+
+    #[rstest]
+    fn test_expr_from_df_array_length_higher_dimension_errors(test_schema: Schema) {
+        // Dimensions other than 1 recurse into nested lists, which `list_length` does not model.
+        let list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let dimension =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(2)))) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![list, dimension], &test_schema);
+
+        let err = DefaultExpressionConvertor::default()
+            .convert(array_length.as_ref())
+            .expect_err("array_length(arr, 2) must not convert");
+        assert!(
+            err.to_string()
+                .contains("array_length pushdown supports only the one-argument form"),
+            "unexpected convert error: {err}"
+        );
+    }
+
+    #[rstest]
+    fn test_cast_array_length_higher_dimension_not_convertible(test_schema: Schema) {
+        // A CAST over `array_length(arr, 2)` must not be convertible: convert() errors on
+        // that form, so accepting it for pushdown would fail at scan time.
+        let list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let dimension =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(2)))) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![list, dimension], &test_schema);
+        let cast = Arc::new(df_expr::CastExpr::new(
+            array_length,
+            DataType::Float64,
+            None,
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            !is_convertible_expr(&cast),
+            "CAST over array_length(arr, 2) must not be convertible"
+        );
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_array_length_supported(test_schema: Schema) {
+        let expr = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![expr], &test_schema);
+
+        assert!(can_be_pushed_down_impl(&array_length, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_array_length_unsupported_operand(test_schema: Schema) {
+        // `array_length` over a non-list column cannot be pushed down.
+        let expr = Arc::new(df_expr::Column::new("name", 1)) as Arc<dyn PhysicalExpr>;
+        let array_length = Arc::new(ScalarFunctionExpr::new(
+            "array_length",
+            Arc::new(ScalarUDF::from(ArrayLength::new())),
+            vec![expr],
+            Arc::new(Field::new("array_length", DataType::UInt64, true)),
+            Arc::new(ConfigOptions::new()),
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&array_length, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_array_length_dimension_one_supported(test_schema: Schema) {
+        // `array_length(arr, 1)` is the first-dimension length, equivalent to `list_length`.
+        let list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let dimension =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(1)))) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![list, dimension], &test_schema);
+
+        assert!(can_be_pushed_down_impl(&array_length, &test_schema));
+    }
+
+    fn int32_list_literal(elements: &[i32]) -> Arc<dyn PhysicalExpr> {
+        use datafusion_common::arrow::array::Int32Builder;
+        use datafusion_common::arrow::array::ListBuilder;
+
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        for element in elements {
+            builder.values().append_value(*element);
+        }
+        builder.append(true);
+        Arc::new(df_expr::Literal::new(ScalarValue::List(Arc::new(
+            builder.finish(),
+        ))))
+    }
+
+    #[rstest]
+    fn test_array_length_case_with_list_literals_not_pushed_down(test_schema: Schema) {
+        // `CASE WHEN active THEN [1, 2] ELSE [3] END` is list-typed and looks
+        // convertible (literals + ELSE), but `Scalar::from_df` has no `List` arm.
+        // Accepting it for pushdown would fail at scan planning instead of leaving
+        // `array_length` above the scan.
+        let when_then = vec![(
+            Arc::new(df_expr::Column::new("active", 3)) as Arc<dyn PhysicalExpr>,
+            int32_list_literal(&[1, 2]),
+        )];
+        let case_expr = Arc::new(
+            df_expr::CaseExpr::try_new(None, when_then, Some(int32_list_literal(&[3])))
+                .expect("CASE with list literals should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        DefaultExpressionConvertor::default()
+            .convert(case_expr.as_ref())
+            .expect_err("list literals must not convert to a Vortex scalar");
+
+        let array_length = array_length_expr(vec![case_expr], &test_schema);
+        assert!(
+            !can_be_pushed_down_impl(&array_length, &test_schema),
+            "array_length over a CASE of list literals must not be accepted for pushdown"
+        );
+    }
+
+    #[rstest]
+    fn test_array_length_case_with_regex_when_not_pushed_down(test_schema: Schema) {
+        // `CASE WHEN CAST(id AS VARCHAR) ~ '^1$' THEN tags ELSE unsupported_list END`
+        // is list-typed. convert() rejects RegexMatch, so the pushdown gate must
+        // decline this CASE and leave array_length above the scan.
+        let id = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let cast_id = Arc::new(df_expr::CastExpr::new(id, DataType::Utf8, None));
+        let pattern = Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+            "^1$".to_string(),
+        )))) as Arc<dyn PhysicalExpr>;
+        let regex_when = Arc::new(df_expr::BinaryExpr::new(
+            cast_id,
+            DFOperator::RegexMatch,
+            pattern,
+        )) as Arc<dyn PhysicalExpr>;
+        let then_list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let else_list =
+            Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+        let case_expr = Arc::new(
+            df_expr::CaseExpr::try_new(None, vec![(regex_when, then_list)], Some(else_list))
+                .expect("CASE with regex WHEN should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        DefaultExpressionConvertor::default()
+            .convert(case_expr.as_ref())
+            .expect_err("RegexMatch WHEN must not convert to a Vortex expression");
+
+        let array_length = array_length_expr(vec![case_expr], &test_schema);
+        assert!(
+            !can_be_pushed_down_impl(&array_length, &test_schema),
+            "array_length over a CASE with RegexMatch WHEN must not be accepted for pushdown"
+        );
+    }
+
+    #[rstest]
+    fn test_array_length_case_with_unconvertible_like_when_not_pushed_down(test_schema: Schema) {
+        // `CASE WHEN lower(name) LIKE '%x%' THEN tags ELSE unsupported_list END`
+        // is list-typed. convert() rejects `lower`, so LikeExpr must recurse
+        // into its children and decline — otherwise the pushdown gate accepts
+        // the CASE and convert() fails at scan planning.
+        let when = like_pattern(lower_name_expr(&test_schema), "%x%");
+        let then_list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let else_list =
+            Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+        let declined_case = Arc::new(
+            df_expr::CaseExpr::try_new(None, vec![(when, then_list)], Some(else_list))
+                .expect("CASE with lower(name) LIKE WHEN should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        DefaultExpressionConvertor::default()
+            .convert(declined_case.as_ref())
+            .expect_err("LIKE over lower(name) must not convert to a Vortex expression");
+
+        assert!(
+            !is_convertible_expr(&declined_case),
+            "CASE WHEN lower(name) LIKE '%x%' must not be convertible"
+        );
+
+        let declined = array_length_expr(vec![declined_case], &test_schema);
+        assert!(
+            !is_convertible_expr(&declined),
+            "array_length over a CASE with lower(name) LIKE WHEN must not be convertible"
+        );
+        assert!(
+            !can_be_pushed_down_impl(&declined, &test_schema),
+            "array_length over a CASE with lower(name) LIKE WHEN must not be accepted for pushdown"
+        );
+
+        // The same CASE with only convertible children still pushes down.
+        let convertible_when = like_pattern(
+            Arc::new(df_expr::Column::new("name", 1)) as Arc<dyn PhysicalExpr>,
+            "%x%",
+        );
+        let convertible_then = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let convertible_else =
+            Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+        let convertible_case = Arc::new(
+            df_expr::CaseExpr::try_new(
+                None,
+                vec![(convertible_when, convertible_then)],
+                Some(convertible_else),
+            )
+            .expect("CASE with name LIKE WHEN should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            is_convertible_expr(&convertible_case),
+            "CASE WHEN name LIKE '%x%' with list columns must stay convertible"
+        );
+
+        let pushable = array_length_expr(vec![convertible_case], &test_schema);
+        assert!(
+            is_convertible_expr(&pushable),
+            "array_length over a CASE with convertible LIKE WHEN must stay convertible"
+        );
+        assert!(
+            can_be_pushed_down_impl(&pushable, &test_schema),
+            "array_length over a CASE with convertible LIKE WHEN must still push down"
+        );
+    }
+
+    #[test]
+    fn test_in_list_non_literal_values_not_convertible() {
+        // convert() only rewrites IN-list values that are literals. A column
+        // value must decline convertibility so pushdown falls back to DataFusion.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("other", DataType::Int32, false),
+        ]);
+        let expr = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let non_literal = Arc::new(df_expr::Column::new("other", 1)) as Arc<dyn PhysicalExpr>;
+        let declined = Arc::new(
+            df_expr::InListExpr::try_new(Arc::clone(&expr), vec![non_literal], false, &schema)
+                .expect("IN-list with a column value should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        DefaultExpressionConvertor::default()
+            .convert(declined.as_ref())
+            .expect_err("non-literal IN list values must not convert");
+
+        assert!(
+            !is_convertible_expr(&declined),
+            "IN list with a non-literal value must not be convertible"
+        );
+
+        let literal_values = vec![
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(1)))) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(2)))) as Arc<dyn PhysicalExpr>,
+        ];
+        let convertible = Arc::new(
+            df_expr::InListExpr::try_new(expr, literal_values, false, &schema)
+                .expect("IN-list with literal values should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            is_convertible_expr(&convertible),
+            "IN list with only convertible literals must stay convertible"
+        );
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_array_length_higher_dimension_not_supported(test_schema: Schema) {
+        // Dimensions other than 1 recurse into nested lists, which `list_length` does not model,
+        // so they must not be pushed down.
+        let list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let dimension =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(2)))) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![list, dimension], &test_schema);
+
+        assert!(!can_be_pushed_down_impl(&array_length, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_like_unsupported_operand(test_schema: Schema) {
+        let expr = Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+        let pattern = Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+            "test%".to_string(),
+        )))) as Arc<dyn PhysicalExpr>;
+        let like_expr =
+            Arc::new(df_expr::LikeExpr::new(false, false, expr, pattern)) as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&like_expr, &test_schema));
+    }
+
+    /// The values of the single column `sql` returns, rendered as text.
+    async fn single_column_as_text(
+        ctx: &TestSessionContext,
+        sql: &str,
+    ) -> anyhow::Result<Vec<Option<String>>> {
+        let batches = ctx.session.sql(sql).await?.collect().await?;
+        let mut values = Vec::new();
+        for batch in &batches {
+            anyhow::ensure!(
+                batch.num_columns() == 1,
+                "expected one column from `{sql}`, got {}",
+                batch.num_columns()
+            );
+            let text = datafusion::arrow::compute::cast(batch.column(0), &DataType::Utf8)?;
+            let text = text
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("a cast to Utf8 must yield a StringArray"))?;
+            values.extend(text.iter().map(|value| value.map(str::to_string)));
+        }
+        Ok(values)
+    }
+
+    /// Writes a one-row file with `id = 1` and checks every shape of an
+    /// integer-to-string cast over it returns that one row: the cast as an aliased
+    /// projection under a filter, the cast inside the filter, and the bare cast
+    /// projection that, with projection pushdown, is evaluated by the Vortex scan.
+    async fn assert_cast_int_to_string_results(ctx: &TestSessionContext) -> anyhow::Result<()> {
+        ctx.session
+            .sql(r#"copy (select 1 as id) to 'example.vortex'"#)
+            .await?
+            .collect()
+            .await?;
+
+        assert_eq!(
+            single_column_as_text(
+                ctx,
+                r#"select cast(id as string) as sid from 'example.vortex' where id > 0"#
+            )
+            .await?,
+            vec![Some("1".to_string())]
+        );
+        assert_eq!(
+            single_column_as_text(
+                ctx,
+                r#"select id from 'example.vortex' where cast (id as string) == '1'"#
+            )
+            .await?,
+            vec![Some("1".to_string())]
+        );
+        assert_eq!(
+            single_column_as_text(ctx, r#"select cast(id as string) from 'example.vortex'"#)
+                .await?,
+            vec![Some("1".to_string())]
+        );
+        Ok(())
+    }
+
+    // https://github.com/vortex-data/vortex/issues/6211
+    #[tokio::test]
+    async fn test_cast_int_to_string() -> anyhow::Result<()> {
+        // Projection pushdown off (the format's default): the casts run above the scan.
+        assert_cast_int_to_string_results(&TestSessionContext::default()).await
+    }
+}

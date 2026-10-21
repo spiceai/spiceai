@@ -26,7 +26,7 @@ Represents models with the lowest certification for use with the Spice Runtime, 
   - More than 50% of the time, the model produces valid SQL when using text-to-SQL (NSQL) queries.
   - More than 50% of the time, the model does not enter a recursion loop through any means (tool use, chat completions, etc).
 
-#### Grade-B
+### Grade B
 
 Represents models certified for use with the Spice Runtime which support more advanced use cases, like tool use (collecting data from connected sources) and text-to-SQL (NSQL).
 
@@ -44,7 +44,7 @@ Represents models certified for use with the Spice Runtime which support more ad
   - More than 75% of the time, the model produces valid SQL when using text-to-SQL (NSQL) queries.
   - More than 75% of the time, the model accurately references documentation and information collected through tool use, including providing accurate citations to connected sources (including SQL tables).
 
-#### Grade-A
+### Grade A
 
 Represents the most advanced model capabilities certified for use with the Spice Runtime, suitable for any use case that requires reasoning, structured outputs, or a high success rate in tool use and text-to-SQL (NSQL).
 

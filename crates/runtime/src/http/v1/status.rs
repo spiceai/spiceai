@@ -16,9 +16,7 @@ limitations under the License.
 use csv::Writer;
 use flight_client::{Credentials, FlightClient};
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
-use tonic::transport::Channel;
-use tonic_health::{ServingStatus, pb::health_client::HealthClient};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Extension, Json,
@@ -39,6 +37,14 @@ pub struct QueryParams {
     #[serde(default)]
     pub format: Format,
 }
+
+/// Marker extension indicating whether the metrics endpoint terminates TLS.
+///
+/// When spiced is configured with TLS the metrics server is served over HTTPS,
+/// so the status probe must use the `https` scheme (and tolerate a loopback
+/// certificate mismatch) rather than hardcoding `http`.
+#[derive(Debug, Clone, Copy)]
+pub struct MetricsTlsEnabled(pub bool);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -100,10 +106,12 @@ pub struct ConnectionDetails {
 pub(crate) async fn get(
     Extension(cfg): Extension<Arc<config::Config>>,
     Extension(with_metrics): Extension<Option<SocketAddr>>,
+    Extension(metrics_tls): Extension<MetricsTlsEnabled>,
     Query(params): Query<QueryParams>,
 ) -> Response {
     let cfg = cfg.as_ref();
     let flight_url = cfg.flight_bind_address.to_string();
+    let flight_status = get_flight_status(&flight_url).await;
 
     let details = vec![
         ConnectionDetails {
@@ -113,41 +121,30 @@ pub(crate) async fn get(
         },
         ConnectionDetails {
             name: "flight",
-            status: get_flight_status(&flight_url).await,
-            endpoint: flight_url,
+            status: flight_status.clone(),
+            endpoint: flight_url.clone(),
         },
         ConnectionDetails {
             name: "metrics",
             endpoint: with_metrics.map_or("N/A".to_string(), |addr| addr.to_string()),
             status: match with_metrics {
-                Some(metrics_url) => match get_metrics_status(&metrics_url.to_string()).await {
-                    Ok(status) => status,
-                    Err(e) => {
-                        tracing::error!("Error getting metrics status from {metrics_url}: {e}");
-                        ComponentStatus::Error
+                Some(metrics_url) => {
+                    match get_metrics_status(&metrics_url.to_string(), metrics_tls.0).await {
+                        Ok(status) => status,
+                        Err(e) => {
+                            tracing::error!("Error getting metrics status from {metrics_url}: {e}");
+                            ComponentStatus::error_with_message(e.to_string())
+                        }
                     }
-                },
+                }
                 None => ComponentStatus::Disabled,
             },
         },
+        // OpenTelemetry is served on the same gRPC port as Flight
         ConnectionDetails {
             name: "opentelemetry",
-            status: match get_opentelemetry_status(
-                cfg.open_telemetry_bind_address.to_string().as_str(),
-            )
-            .await
-            {
-                Ok(status) => status,
-                Err(e) => {
-                    tracing::error!(
-                        "Error getting opentelemetry status from {}: {}",
-                        cfg.open_telemetry_bind_address,
-                        e
-                    );
-                    ComponentStatus::Error
-                }
-            },
-            endpoint: cfg.open_telemetry_bind_address.to_string(),
+            status: flight_status.clone(),
+            endpoint: flight_url,
         },
     ];
 
@@ -180,45 +177,64 @@ async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
         format!("http://{flight_addr}").into(),
         Credentials::anonymous(),
         None,
+        None,
     )
     .await
     {
         Ok(_) => ComponentStatus::Ready,
         Err(e) => {
             tracing::error!("Error connecting to flight when checking status: {e}");
-            ComponentStatus::Error
+            ComponentStatus::error_with_message(e.to_string())
         }
     }
 }
 
 async fn get_metrics_status(
     metrics_addr: &str,
+    tls_enabled: bool,
 ) -> Result<ComponentStatus, Box<dyn std::error::Error>> {
-    let resp = reqwest::get(format!("http://{metrics_addr}/health")).await?;
+    use std::sync::LazyLock;
+
+    // Plain HTTP client for non-TLS metrics endpoints.
+    static METRICS_CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> =
+        LazyLock::new(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(5))
+                .build()
+        });
+
+    // HTTPS client for TLS-terminating metrics endpoints. This probe is an
+    // in-process loopback request, so the certificate's SAN almost certainly
+    // won't match 127.0.0.1/0.0.0.0 — accept invalid certs for the health check.
+    static METRICS_TLS_CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> =
+        LazyLock::new(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(5))
+                .danger_accept_invalid_certs(true)
+                .build()
+        });
+
+    let client = if tls_enabled {
+        &METRICS_TLS_CLIENT
+    } else {
+        &METRICS_CLIENT
+    };
+    let client = client.as_ref().map_err(|e| {
+        Box::new(std::io::Error::other(format!(
+            "Failed to build metrics HTTP client: {e}"
+        ))) as Box<dyn std::error::Error>
+    })?;
+
+    let scheme = if tls_enabled { "https" } else { "http" };
+    let resp = client
+        .get(format!("{scheme}://{metrics_addr}/health"))
+        .send()
+        .await?;
     if resp.status().is_success() && resp.text().await? == "OK" {
         Ok(ComponentStatus::Ready)
     } else {
-        Ok(ComponentStatus::Error)
-    }
-}
-async fn get_opentelemetry_status(
-    addr: &str,
-) -> Result<ComponentStatus, Box<dyn std::error::Error>> {
-    let channel = Channel::from_shared(format!("http://{addr}"))?
-        .connect()
-        .await?;
-
-    let mut client = HealthClient::new(channel);
-
-    let resp = client
-        .check(tonic_health::pb::HealthCheckRequest {
-            service: String::new(),
-        })
-        .await?;
-
-    if resp.into_inner().status == ServingStatus::Serving as i32 {
-        Ok(ComponentStatus::Ready)
-    } else {
-        Ok(ComponentStatus::Error)
+        Ok(ComponentStatus::error())
     }
 }

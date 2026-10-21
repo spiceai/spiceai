@@ -1,0 +1,8 @@
+tests:
+  append:
+    spicepod_path: accelerated/append/file[parquet]-cayenne[file]-append.yaml
+    query_set: tpch
+    duration: 720
+    concurrency: 4
+    load_interval: 30
+    load_steps: 20

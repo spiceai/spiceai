@@ -1,0 +1,16 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: orders_pk_1000000"
+---
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                  |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Filter: orders.o_orderkey = Int64(1000000)                                                                                                            |
+|               |   TableScan: orders projection=[o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment] |
+| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                                                                                           |
+|               |   FilterExec: o_orderkey@0 = 1000000                                                                                                                  |
+|               |     SchemaCastScanExec                                                                                                                                |
+|               |       BytesProcessedExec                                                                                                                              |
+|               |         DataSourceExec: partitions=16, partition_sizes=[12, 12, 12, 12, 12, 12, 12, 12, 11, 11, 11, 11, 11, 11, 11, 11]                               |
+|               |                                                                                                                                                       |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -26,11 +26,14 @@ on:
       - trunk
       - release-*
       - release/*
-    paths-ignore:
-      - 'docs/**'
-      - 'README.md'
-      - 'version.txt'
-      - 'acknowledgements.md'
+      - feature-*
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  workflow_dispatch:
 
 env:
   FORBIDDEN_LICENSE_CHECK: |
@@ -40,42 +43,30 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
+  # Required check, so it runs on every merge-queue entry (merge_group can't
+  # path-filter). Dependency licenses are the gate here; running
+  # unconditionally is intentional.
   license-check-rust:
     name: Check Rust Licenses
-    runs-on: self-hosted
+    # Emit the required context on pull requests without running cargo-deny;
+    # the real check runs on the merge-group commit.
+    if: ${{ github.event_name != 'pull_request' }}
+    # The pool of the other required macOS checks. The bare `self-hosted` label
+    # matched any self-hosted runner, so this gate landed on a `spiceai-macos`
+    # mini in 115 of 238 merge-queue runs (2026-09-29..10-06).
+    runs-on: spiceai-macos-large
+    # Slowest observed success in the 2026-07-25..08-08 window: 8 min.
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: macos
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny || true
+        run: cargo install cargo-deny --version 0.19.6 --locked --force
 
       - name: Check Rust Licenses
         run: cargo deny check licenses
-
-  license-check-go:
-    name: Check Golang Licenses
-    runs-on: self-hosted
-    env:
-      GOVER: 1.25.3
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
-
-      - name: Install go-licences
-        run: go get github.com/google/go-licenses
-
-      - name: Check spice licenses
-        working-directory: bin/spice
-        run: |
-          go-licenses csv . 2>&1 | ${{ env.FORBIDDEN_LICENSE_CHECK }}

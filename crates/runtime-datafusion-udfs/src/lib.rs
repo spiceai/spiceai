@@ -17,8 +17,27 @@ limitations under the License.
 #[cfg(feature = "models")]
 pub mod ai;
 pub mod alias;
+
+/// Name of the `embed` scalar UDF. Lives at the crate root, outside the
+/// `models`-gated `embed` module that implements the UDF, so builds without
+/// the `models` feature can still look the UDF up by name (and fail with a
+/// structured error when it is not registered).
+pub static EMBED_UDF_NAME: &str = "embed";
+pub mod assert;
 pub mod bucket;
 pub mod cosine_distance;
 pub mod digest_many;
+#[cfg(feature = "models")]
 pub mod embed;
+pub mod flatten_json;
+pub mod inner_product;
+pub mod json_properties;
+pub mod json_tree;
+pub mod l2_distance;
+pub mod l2_norm;
+pub mod primitive_json_codec;
+pub mod timeseries;
 pub mod truncate;
+pub mod user_functions;
+pub(crate) mod vector_simd;
+mod vendored_hash;

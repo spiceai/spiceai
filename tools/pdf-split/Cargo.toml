@@ -1,0 +1,26 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "pdf-split"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "pdf_split"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pdf-split"
+path = "src/main.rs"
+
+[dependencies]
+blake3.workspace = true
+clap = { workspace = true, features = ["derive"] }
+lopdf = { path = "../../crates/vendor/lopdf" }
+snafu.workspace = true
+
+[lints]
+workspace = true

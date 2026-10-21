@@ -16,19 +16,15 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::{Runtime, metrics, status, timing::TimeMeasurement, worker::try_construct_worker};
+use crate::{Runtime, status, worker::try_construct_worker};
 use opentelemetry::KeyValue;
-use snafu::prelude::*;
-
-#[derive(Debug, Snafu)]
-#[allow(dead_code)]
-pub enum Error {}
+use runtime_metrics as metrics;
+use telemetry::timing::TimeMeasurement;
 
 impl Runtime {
+    #[cfg(feature = "models")]
     pub(crate) async fn load_workers(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-
-        if let Some(app) = app_lock.as_ref() {
+        if let Some(app) = self.read_app().await {
             for worker in &app.workers {
                 let runtime = Arc::clone(&self);
                 runtime
@@ -51,8 +47,10 @@ impl Runtime {
             Ok(worker) => worker,
             Err(e) => {
                 tracing::error!("Failed to load worker [{}]: {e}", cfg.name);
-                self.status
-                    .update_worker(&cfg.name, status::ComponentStatus::Error);
+                self.status.update_worker(
+                    &cfg.name,
+                    status::ComponentStatus::error_with_message(e.to_string()),
+                );
                 return;
             }
         };
@@ -60,7 +58,8 @@ impl Runtime {
         let cloned_worker = Arc::clone(&worker);
 
         if let Some(model) = Arc::clone(&worker).as_model() {
-            let mut llm_registry = self.completion_llms.write().await;
+            let completion_llms = self.completion_llms();
+            let mut llm_registry = completion_llms.write().await;
             llm_registry.insert(cfg.name.clone(), model);
             drop(llm_registry);
         }
@@ -78,15 +77,18 @@ impl Runtime {
             .await
         {
             tracing::error!("Failed to create scheduler for worker [{}]: {e}", cfg.name);
-            self.status
-                .update_worker(&cfg.name, status::ComponentStatus::Error);
+            self.status.update_worker(
+                &cfg.name,
+                status::ComponentStatus::error_with_message(e.to_string()),
+            );
         } else {
             tracing::info!("Scheduler for worker [{}] created successfully", cfg.name);
         }
     }
 
     async fn remove_worker(self: Arc<Self>, cfg: &spicepod::component::worker::Worker) {
-        let mut llm_registry = self.completion_llms.write().await;
+        let completion_llms = self.completion_llms();
+        let mut llm_registry = completion_llms.write().await;
         llm_registry.remove(&cfg.name);
 
         if let Err(e) = Arc::clone(&self)
@@ -94,8 +96,10 @@ impl Runtime {
             .await
         {
             tracing::error!("Failed to remove scheduler for worker [{}]: {e}", cfg.name);
-            self.status
-                .update_worker(&cfg.name, status::ComponentStatus::Error);
+            self.status.update_worker(
+                &cfg.name,
+                status::ComponentStatus::error_with_message(e.to_string()),
+            );
             return;
         }
 

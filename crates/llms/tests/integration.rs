@@ -16,6 +16,14 @@ limitations under the License.
 
 pub mod llms;
 
+// Credential-free tests that run in `make nextest`; `llms` calls live provider
+// APIs and runs in `integration_llms.yml`.
+mod anthropic_stream_errors;
+mod list_models_errors;
+#[cfg(feature = "local_embed")]
+mod model2vec_hf_cache;
+mod xai_errors;
+
 use std::{collections::HashSet, sync::LazyLock};
 
 use tracing_subscriber::EnvFilter;
@@ -86,4 +94,20 @@ fn init_tracing(default_level: Option<&str>) -> tracing::subscriber::DefaultGuar
         .with_ansi(true)
         .finish();
     tracing::subscriber::set_default(subscriber)
+}
+
+/// Fails the calling test unless it runs in a process of its own.
+///
+/// nextest runs every test in its own process; plain `cargo test` runs a
+/// binary's tests on threads of one process. A test that changes process-global
+/// state calls this before changing it, so under `cargo test` it fails with
+/// instructions instead of changing the state every neighbouring test runs under.
+/// `why` names that state.
+fn require_process_per_test(why: &str) {
+    assert!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test"),
+        "{why}, so it must run in a process of its own. Run it with \
+         `cargo nextest run -p llms --test integration <test name>`: plain \
+         `cargo test` runs every test in the binary on threads of one process"
+    );
 }

@@ -16,17 +16,23 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
-    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
+    catalog::TableProviderFactory,
+    common::{Constraint, Constraints},
+    datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
 use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
+use crate::component::dataset::acceleration::{Engine, IndexType, RefreshMode};
 use crate::parameters::ParameterSpec;
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, AcceleratorEngineRegistry, DataAccelerator};
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption, unsupported_sidecar};
+use runtime_checkpoint_api::CheckpointError;
 
 pub struct ArrowAccelerator {
     arrow_factory: ArrowFactory,
@@ -47,7 +53,54 @@ impl Default for ArrowAccelerator {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("file_watcher")];
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::runtime("file_watcher"),
+    ParameterSpec::component("sort_columns")
+        .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
+];
+
+/// Arrow treats a `unique` index like `enabled`: say so at registration, as Cayenne
+/// does, rather than let a slow lookup say it. Shared with the partitioned accelerator.
+pub(crate) fn warn_if_unique_index(source: Option<&dyn AccelerationSource>) {
+    if let Some(source) = source
+        && let Some(acceleration) = source.acceleration()
+        && acceleration
+            .indexes
+            .values()
+            .any(|index_type| matches!(index_type, IndexType::Unique))
+    {
+        tracing::warn!(
+            "{}",
+            data_components::arrow::unique_index_warning(&source.name().to_string())
+        );
+    }
+}
+
+pub(crate) fn enable_hash_index_for_primary_key_or_indexes(cmd: &mut CreateExternalTable) {
+    let has_primary_key = cmd.constraints.iter().any(
+        |constraint| matches!(constraint, Constraint::PrimaryKey(columns) if !columns.is_empty()),
+    );
+    let has_indexes = cmd
+        .options
+        .get("indexes")
+        .is_some_and(|indexes| !indexes.trim().is_empty());
+
+    if !has_primary_key && !has_indexes {
+        return;
+    }
+
+    if let Some(value) = cmd.options.get("hash_index")
+        && !value.eq_ignore_ascii_case("enabled")
+    {
+        tracing::warn!(
+            hash_index = %value,
+            "Arrow acceleration with primary_key or indexes requires hash_index; overriding hash_index to enabled"
+        );
+    }
+
+    cmd.options
+        .insert("hash_index".to_string(), "enabled".to_string());
+}
 
 #[async_trait]
 impl DataAccelerator for ArrowAccelerator {
@@ -62,23 +115,52 @@ impl DataAccelerator for ArrowAccelerator {
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
-        cmd: CreateExternalTable,
-        _source: Option<&dyn AccelerationSource>,
-        partition_by: Vec<PartitionedBy>,
+        mut cmd: CreateExternalTable,
+        source: Option<&dyn AccelerationSource>,
+        _partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        ensure!(
-            partition_by.is_empty(),
-            super::InvalidConfigurationSnafu {
-                msg: "Arrow data accelerator does not support the `partition_by` parameter but it was provided".to_string()
-            }
-        );
+        // For caching mode, strip primary key constraints since Arrow uses InsertOp::Replace
+        // which overwrites the entire table. Primary key constraints cause uniqueness validation
+        // errors during inserts because Arrow doesn't support upsert operations.
+        let is_caching_mode = source
+            .and_then(|s| s.acceleration())
+            .and_then(|a| a.refresh_mode.as_ref())
+            .is_some_and(|mode| matches!(mode, RefreshMode::Caching));
 
-        let ctx = SessionContext::new();
+        if is_caching_mode {
+            cmd.constraints = Constraints::new_unverified(vec![]);
+        }
+
+        // Extract sort_columns from acceleration params if provided
+        if let Some(source) = source
+            && let Some(acceleration) = source.acceleration()
+            && let Some(sort_cols_str) = acceleration.params.get("sort_columns")
+        {
+            cmd.options
+                .insert("sort_columns".to_string(), sort_cols_str.clone());
+        }
+
+        warn_if_unique_index(source);
+        enable_hash_index_for_primary_key_or_indexes(&mut cmd);
+
+        let ctx = util::session_state::session_context();
         let table_provider = TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &cmd)
             .await
             .boxed()?;
 
         Ok(table_provider)
+    }
+
+    async fn sidecar(
+        &self,
+        _source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
+        _open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        // In-memory: there is no database to keep sidecar tables in, and nothing would
+        // survive a restart if there were.
+        Err(unsupported_sidecar("arrow", "sidecar"))
     }
 
     fn prefix(&self) -> &'static str {
@@ -87,5 +169,72 @@ impl DataAccelerator for ArrowAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+}
+
+data_accelerator_api::register_data_accelerator!(Engine::Arrow, ArrowAccelerator);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::dataset::acceleration::Acceleration;
+    use crate::component::dataset::schema_inference::apply_inferred_schema;
+    use crate::parameters::Parameters;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use data_components::inferred_schema::{InferredSchema, InferredSortColumn};
+    use runtime_secrets::{Secrets, get_params_with_secrets};
+    use tokio::sync::RwLock;
+
+    /// Regression test for #14023: the sort order schema inference writes into
+    /// the acceleration params must be spelled the way this accelerator's
+    /// parameter validation accepts it. An unprefixed `sort_columns` is dropped
+    /// by `Parameters::try_new` with a warning about a parameter the user never
+    /// wrote, so this drives the inferred params through the same validation the
+    /// runtime applies before the table is created.
+    #[tokio::test]
+    async fn inferred_sort_columns_survive_arrow_parameter_validation() {
+        let mut acceleration = Acceleration {
+            engine: Engine::Arrow,
+            ..Acceleration::default()
+        };
+        let inferred = InferredSchema {
+            sort_columns: vec![InferredSortColumn {
+                column: "id".to_string(),
+                desc: false,
+                nulls_first: None,
+            }],
+            ..InferredSchema::default()
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        apply_inferred_schema(
+            &mut acceleration,
+            &inferred,
+            &schema,
+            "ds",
+            RefreshMode::Full,
+        );
+
+        // The same conversion and validation the runtime applies before it
+        // creates the accelerated table.
+        let accelerator = ArrowAccelerator::new();
+        let secrets = Arc::new(RwLock::new(Secrets::new()));
+        let params_with_secrets =
+            get_params_with_secrets(Arc::clone(&secrets), &acceleration.params).await;
+        let params = Parameters::try_new(
+            "accelerator arrow",
+            params_with_secrets.into_iter().collect(),
+            accelerator.prefix(),
+            secrets,
+            accelerator.parameters(),
+        )
+        .await
+        .expect("inferred acceleration params validate");
+
+        let sort_columns = params
+            .get("sort_columns")
+            .expose()
+            .ok()
+            .expect("inferred sort order must survive parameter validation");
+        assert_eq!(sort_columns, "id ASC");
     }
 }

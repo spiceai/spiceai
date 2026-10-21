@@ -159,9 +159,7 @@ mod tests {
 
         for input in inputs {
             let lexer = SecretReplacementMatcher::new(input);
-
-            let matches: Vec<ReplacementMatch> = lexer.collect();
-            assert_eq!(matches.len(), 0);
+            assert_eq!(lexer.count(), 0);
         }
     }
 
@@ -169,9 +167,7 @@ mod tests {
     fn test_secret_lexer_no_matches() {
         let input = "Hello world";
         let lexer = SecretReplacementMatcher::new(input);
-
-        let matches: Vec<ReplacementMatch> = lexer.collect();
-        assert_eq!(matches.len(), 0);
+        assert_eq!(lexer.count(), 0);
     }
 
     #[test]

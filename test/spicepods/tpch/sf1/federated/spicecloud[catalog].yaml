@@ -8,3 +8,4 @@ catalogs:
       - 'tpch.*'
     params:
       spiceai_api_key: ${secrets:SPICEAI_TPCH_API_KEY}
+      spiceai_region: us-east-1

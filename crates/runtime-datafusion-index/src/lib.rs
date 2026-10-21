@@ -14,28 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_trait::async_trait;
-use std::{any::Any, fmt::Debug};
+//! `DataFusion` optimizer machinery that turns an indexed [`spice_table::SpiceTable`]
+//! scan into an index-served plan.
 
-use datafusion::arrow::array::RecordBatch;
-use datafusion::error::Result;
+use snafu::prelude::*;
 
 pub mod analyzer;
-mod provider;
-pub use provider::*;
 
-#[async_trait]
-pub trait Index: Debug + Send + Sync + 'static {
-    fn name(&self) -> &'static str;
+#[derive(Snafu, Debug)]
+pub enum Error {
+    #[snafu(display("Index table scans should have only one input. Received {input_len} inputs."))]
+    MultipleInputs { input_len: usize },
 
-    /// Columns that are required for the index to be computed.
-    fn required_columns(&self) -> Vec<String>;
-
-    /// Compute the index - if the index data is represented in the batch itself (i.e. a vector
-    /// "*_embedding" column) then modify the provided batches to include the computed column.
-    async fn compute_index(&self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
-        Ok(batches)
-    }
-
-    fn as_any(&self) -> &dyn Any;
+    #[snafu(display(
+        "Index table scans should have no expressions. Received {expr_len} expressions."
+    ))]
+    NoExpressions { expr_len: usize },
 }

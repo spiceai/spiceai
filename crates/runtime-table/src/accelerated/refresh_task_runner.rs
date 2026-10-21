@@ -1,0 +1,601 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use crate::federated::FederatedTable;
+use runtime_status as status;
+
+use super::{
+    metrics,
+    refresh::RefreshOverrides,
+    refresh_completion::RefreshRequestId,
+    refresh_task::{RefreshOutcome, RefreshTask, append_cursor::AppendCursorStore},
+    synchronized_table::SynchronizedTable,
+};
+use futures::{FutureExt, future::BoxFuture};
+use tokio::{
+    runtime::Handle,
+    select,
+    sync::{
+        Semaphore,
+        mpsc::{self, Receiver, Sender},
+    },
+    task::JoinHandle,
+};
+
+use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::{any::Any, panic::AssertUnwindSafe, sync::Arc};
+use tokio::sync::{Mutex, RwLock};
+
+use super::refresh::Refresh;
+use datafusion::{common::TableReference, datasource::TableProvider};
+use opentelemetry::KeyValue;
+use spicepod::metric::Metrics;
+
+pub struct RefreshTaskRunnerBuilder {
+    runtime_status: Arc<status::RuntimeStatus>,
+    dataset_name: TableReference,
+    federated: Arc<FederatedTable>,
+    federated_source: Option<String>,
+    refresh: Arc<RwLock<Refresh>>,
+    accelerator: Arc<dyn TableProvider>,
+    change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    cache_write_sender: Option<super::caching::CacheWriteSender>,
+    disable_federation: bool,
+    semaphore: Option<Arc<Semaphore>>,
+    metrics: Option<Metrics>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
+    resource_monitor: Option<runtime_resources::ResourceMonitor>,
+    /// The runtime's query `RuntimeEnv`: its memory pool bounds what a refresh holds in
+    /// memory, and its disk manager is where the refresh spills. `None` uses an unbounded
+    /// default.
+    query_runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
+    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
+    /// Shared with `CachingAccelerationScanExec`.
+    accelerator_write_mutex: Arc<Mutex<()>>,
+    last_updated_at: Arc<AtomicI64>,
+    initial_load_completed: Option<Arc<AtomicBool>>,
+    /// Whether the acceleration uses S3 Express One Zone storage.
+    is_s3_express_acceleration: bool,
+    engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
+    snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
+    /// Forwarded to the refresh task so the caching stale-row refresh claims
+    /// the keys it replaces.
+    in_flight_revalidations: Option<crate::accelerated::caching::InFlightRevalidations>,
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    append_cursor_store: Option<AppendCursorStore>,
+}
+
+impl RefreshTaskRunnerBuilder {
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        runtime_status: Arc<status::RuntimeStatus>,
+        dataset_name: TableReference,
+        federated: Arc<FederatedTable>,
+        federated_source: Option<String>,
+        refresh: Arc<RwLock<Refresh>>,
+        accelerator: Arc<dyn TableProvider>,
+        io_runtime: Handle,
+        accelerator_write_mutex: Arc<Mutex<()>>,
+    ) -> Self {
+        Self {
+            runtime_status,
+            dataset_name,
+            federated,
+            federated_source,
+            refresh,
+            accelerator,
+            change_sink: None,
+            cache_write_sender: None,
+            disable_federation: false,
+            semaphore: None,
+            metrics: None,
+            cpu_runtime: None,
+            io_runtime,
+            resource_monitor: None,
+            query_runtime_env: None,
+            accelerator_write_mutex,
+            last_updated_at: Arc::new(AtomicI64::new(0)),
+            initial_load_completed: None,
+            is_s3_express_acceleration: false,
+            engine_type_rewrites: &[],
+            snapshot_refresh_state: None,
+            in_flight_revalidations: None,
+            append_cursor_store: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_change_sink(
+        mut self,
+        sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    ) -> Self {
+        self.change_sink = sink;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cache_write_sender(
+        mut self,
+        sender: Option<super::caching::CacheWriteSender>,
+    ) -> Self {
+        self.cache_write_sender = sender;
+        self
+    }
+
+    /// Sets the `disable_federation` flag
+    #[must_use]
+    pub fn with_disable_federation(mut self, disable: bool) -> Self {
+        self.disable_federation = disable;
+        self
+    }
+
+    #[must_use]
+    pub fn with_semaphore(mut self, semaphore: Arc<Semaphore>) -> Self {
+        self.semaphore = Some(semaphore);
+        self
+    }
+
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Option<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cpu_runtime(mut self, runtime: Option<Handle>) -> Self {
+        self.cpu_runtime = runtime;
+        self
+    }
+
+    #[must_use]
+    pub fn with_resource_monitor(mut self, monitor: runtime_resources::ResourceMonitor) -> Self {
+        self.resource_monitor = Some(monitor);
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_runtime_env(
+        mut self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> Self {
+        self.query_runtime_env = Some(runtime_env);
+        self
+    }
+
+    #[must_use]
+    pub fn with_last_updated_at(mut self, last_updated_at: Arc<AtomicI64>) -> Self {
+        self.last_updated_at = last_updated_at;
+        self
+    }
+
+    #[must_use]
+    pub fn with_initial_load_completed(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.initial_load_completed = Some(flag);
+        self
+    }
+
+    /// Set whether the acceleration uses S3 Express One Zone storage.
+    #[must_use]
+    pub fn with_s3_express_acceleration(mut self, is_s3_express: bool) -> Self {
+        self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
+    /// Declare the acceleration engine's own type rewrites.
+    #[must_use]
+    pub fn with_engine_type_rewrites(
+        mut self,
+        rules: arrow_tools::type_rewrite::TypeRewriteRules,
+    ) -> Self {
+        self.engine_type_rewrites = rules;
+        self
+    }
+
+    /// Provide the snapshot-refresh state required for `RefreshMode::Snapshot`.
+    #[must_use]
+    pub fn with_snapshot_refresh_state(
+        mut self,
+        state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
+    ) -> Self {
+        self.snapshot_refresh_state = state;
+        self
+    }
+
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    #[must_use]
+    pub fn with_append_cursor_store(mut self, store: Option<AppendCursorStore>) -> Self {
+        self.append_cursor_store = store;
+        self
+    }
+
+    /// Shares the caching accelerator's claim set with the refresh task, so
+    /// its periodic stale-row refresh claims the keys it replaces.
+    #[must_use]
+    pub fn with_in_flight_revalidations(
+        mut self,
+        in_flight_revalidations: crate::accelerated::caching::InFlightRevalidations,
+    ) -> Self {
+        self.in_flight_revalidations = Some(in_flight_revalidations);
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> RefreshTaskRunner {
+        let mut refresh_task_builder = RefreshTask::builder(
+            self.runtime_status,
+            self.dataset_name.clone(),
+            self.federated,
+            self.federated_source,
+            self.accelerator,
+            self.io_runtime,
+            self.accelerator_write_mutex,
+        )
+        .with_disable_federation(self.disable_federation)
+        .with_change_sink(self.change_sink)
+        .with_cache_write_sender(self.cache_write_sender)
+        .with_last_updated_at(Arc::clone(&self.last_updated_at))
+        .with_metrics(self.metrics);
+
+        if let Some(semaphore) = self.semaphore {
+            refresh_task_builder = refresh_task_builder.with_semaphore(semaphore);
+        }
+
+        refresh_task_builder = refresh_task_builder.with_cpu_runtime(self.cpu_runtime);
+
+        if let Some(resource_monitor) = self.resource_monitor {
+            refresh_task_builder = refresh_task_builder.with_resource_monitor(resource_monitor);
+        }
+
+        if let Some(runtime_env) = self.query_runtime_env {
+            refresh_task_builder = refresh_task_builder.with_query_runtime_env(runtime_env);
+        }
+
+        refresh_task_builder =
+            refresh_task_builder.with_s3_express_acceleration(self.is_s3_express_acceleration);
+
+        refresh_task_builder =
+            refresh_task_builder.with_engine_type_rewrites(self.engine_type_rewrites);
+
+        refresh_task_builder =
+            refresh_task_builder.with_snapshot_refresh_state(self.snapshot_refresh_state);
+
+        refresh_task_builder =
+            refresh_task_builder.with_append_cursor_store(self.append_cursor_store);
+
+        if let Some(flag) = self.initial_load_completed {
+            refresh_task_builder = refresh_task_builder.with_initial_load_completed(flag);
+        }
+
+        if let Some(in_flight_revalidations) = self.in_flight_revalidations {
+            refresh_task_builder =
+                refresh_task_builder.with_in_flight_revalidations(in_flight_revalidations);
+        }
+
+        let refresh_task = Arc::new(refresh_task_builder.build());
+
+        RefreshTaskRunner {
+            dataset_name: self.dataset_name,
+            refresh: self.refresh,
+            refresh_task,
+            task: None,
+        }
+    }
+}
+
+/// `RefreshTaskRunner` is responsible for running all refresh tasks for a dataset. It is expected
+/// that only one [`RefreshTaskRunner`] is used per dataset, and that is is the only entity
+/// refreshing an `accelerator`.
+#[derive(Debug)]
+pub struct RefreshTaskRunner {
+    dataset_name: TableReference,
+    refresh: Arc<RwLock<Refresh>>,
+    refresh_task: Arc<RefreshTask>,
+    task: Option<JoinHandle<()>>,
+}
+
+type RefreshRunFuture =
+    BoxFuture<'static, std::result::Result<super::Result<RefreshOutcome>, Box<dyn Any + Send>>>;
+
+/// One refresh request: the id it was issued under, and the overrides it
+/// carries.
+///
+/// The id travels with the request so the completion it produces can be
+/// attributed to it. A refresh already running when a request arrives is
+/// cancelled and never completes, so a completion cannot be attributed by
+/// counting requests — see [`RefreshRequestId`].
+pub type RefreshRequest = (RefreshRequestId, Option<RefreshOverrides>);
+
+/// A finished refresh, reported under the id of the request that started it.
+pub type RefreshTaskCompletion = (RefreshRequestId, super::Result<RefreshOutcome>);
+
+type RefreshTaskStartSender = Sender<RefreshRequest>;
+type RefreshTaskCompletionReceiver = Receiver<RefreshTaskCompletion>;
+
+impl RefreshTaskRunner {
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn builder(
+        runtime_status: Arc<status::RuntimeStatus>,
+        dataset_name: TableReference,
+        federated: Arc<FederatedTable>,
+        federated_source: Option<String>,
+        refresh: Arc<RwLock<Refresh>>,
+        accelerator: Arc<dyn TableProvider>,
+        io_runtime: Handle,
+        accelerator_write_mutex: Arc<Mutex<()>>,
+    ) -> RefreshTaskRunnerBuilder {
+        RefreshTaskRunnerBuilder::new(
+            runtime_status,
+            dataset_name,
+            federated,
+            federated_source,
+            refresh,
+            accelerator,
+            io_runtime,
+            accelerator_write_mutex,
+        )
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if the refresh task cannot be spawned.
+    pub fn start(
+        &mut self,
+    ) -> super::Result<(RefreshTaskStartSender, RefreshTaskCompletionReceiver)> {
+        if self.task.is_some() {
+            return Err(super::Error::RefreshTaskAlreadyStarted {});
+        }
+
+        let (start_refresh, mut on_start_refresh) = mpsc::channel::<RefreshRequest>(1);
+
+        let (notify_refresh_complete, on_refresh_complete) =
+            mpsc::channel::<RefreshTaskCompletion>(1);
+
+        let dataset_name = self.dataset_name.clone();
+        let notify_refresh_complete = Arc::new(notify_refresh_complete);
+
+        let base_refresh = Arc::clone(&self.refresh);
+
+        let refresh_task = Arc::clone(&self.refresh_task);
+
+        self.task = Some(tokio::spawn(async move {
+            let mut task_completion: Option<RefreshRunFuture> = None;
+            // The request the in-flight refresh was started for, so its
+            // completion is reported under the id that asked for it. A request
+            // arriving mid-refresh replaces both together: the running future is
+            // dropped by the `select!` below, so it never reports at all.
+            let mut running_request: RefreshRequestId = 0;
+            // The owed reload the in-flight refresh runs as, if any.
+            let mut running_reload: Option<u64> = None;
+
+            loop {
+                if let Some(task) = task_completion.take() {
+                    select! {
+                        res = task => {
+                            match res {
+                                Ok(Ok(outcome)) => {
+                                    tracing::debug!("Dataset {dataset_name} refreshed successfully ({outcome:?})");
+                                    if let Some(generation) = running_reload.take() {
+                                        base_refresh.write().await.reload_succeeded(generation);
+                                    }
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Ok(outcome))).await {
+                                        tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
+                                    }
+                                },
+                                Ok(Err(err)) => {
+                                    tracing::debug!("Dataset {dataset_name} failed to refresh with error: {err}");
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Err(err))).await {
+                                        tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
+                                    }
+                                },
+                                Err(panic_payload) => {
+                                    let dataset_label = dataset_name.to_string();
+                                    let panic_message = Self::panic_to_message(panic_payload);
+                                    tracing::error!(
+                                        dataset = %dataset_label,
+                                        %panic_message,
+                                        "Refresh worker panicked; continuing refresh loop"
+                                    );
+                                    metrics::REFRESH_WORKER_PANICS.add(1, &[KeyValue::new("dataset", dataset_label.clone())]);
+
+                                    let panic_error = super::Error::RefreshWorkerPanicked {
+                                        dataset_name: dataset_label,
+                                        message: panic_message.clone(),
+                                    };
+
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Err(panic_error))).await {
+                                        tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
+                                    }
+                                }
+                            }
+                        },
+                        Some((request_id, overrides_opt)) = on_start_refresh.recv() => {
+                            running_request = request_id;
+                            let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            running_reload = request.reload.then_some(request.reload_generation);
+                            task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
+                        }
+                    }
+                } else {
+                    select! {
+                        Some((request_id, overrides_opt)) = on_start_refresh.recv() => {
+                            running_request = request_id;
+                            let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            running_reload = request.reload.then_some(request.reload_generation);
+                            task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
+                        }
+                        else => {
+                            // The parent refresher is shutting down, we should too
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+
+        Ok((start_refresh, on_refresh_complete))
+    }
+
+    /// Subscribes a new acceleration table provider to the existing `AccelerationSink` managed by this `RefreshTask`.
+    pub async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
+        self.refresh_task
+            .add_synchronized_table(synchronized_table)
+            .await;
+    }
+
+    /// The [`RefreshTask`] this runner drives. Used by the refresher loop to
+    /// resolve the live set of dataset names (self + synchronized children) at
+    /// refresh completion — children attach after their own initial load, so
+    /// the set cannot be captured up front.
+    pub(crate) fn refresh_task(&self) -> &Arc<RefreshTask> {
+        &self.refresh_task
+    }
+
+    /// Create a new [`Refresh`] based on defaults and overrides.
+    async fn create_refresh_from_overrides(
+        defaults: Arc<RwLock<Refresh>>,
+        overrides_opt: Option<RefreshOverrides>,
+    ) -> Refresh {
+        let mut r = defaults.read().await.clone();
+        if let Some(overrides) = overrides_opt {
+            r = r.with_overrides(&overrides);
+        }
+        r.for_run()
+    }
+
+    fn wrap_refresh_future(refresh_task: Arc<RefreshTask>, request: Refresh) -> RefreshRunFuture {
+        Box::pin(AssertUnwindSafe(async move { refresh_task.run(request).await }).catch_unwind())
+    }
+
+    fn panic_to_message(panic: Box<dyn Any + Send>) -> String {
+        match panic.downcast::<String>() {
+            Ok(message) => *message,
+            Err(panic) => match panic.downcast::<&'static str>() {
+                Ok(message) => (*message).to_string(),
+                Err(_) => "refresh worker panicked with a non-string payload".to_string(),
+            },
+        }
+    }
+
+    /// Transfer the worker to the table generation's cancellation and drain owner.
+    pub(crate) fn take_task(&mut self) -> Option<JoinHandle<()>> {
+        self.task.take()
+    }
+
+    pub fn abort(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+            self.task = None;
+        }
+    }
+}
+
+impl Drop for RefreshTaskRunner {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use data_components::arrow::write::MemTable;
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::SessionContext;
+    use runtime_component::dataset::TimeFormat;
+    use runtime_component::dataset::acceleration::RefreshMode;
+
+    /// A refresh the timer or a client asks for while a reload is owed runs as that reload,
+    /// and its success settles it.
+    #[tokio::test]
+    async fn a_refresh_requested_while_a_reload_is_owed_reloads_and_settles_it() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        // Ids 1 to 6 are older (ts 1 to 6) than those the acceleration holds (7 to 12, ts 107 to 112).
+        let rows = |ids: std::ops::RangeInclusive<i64>| {
+            let ts = ids
+                .clone()
+                .map(|id| if id <= 6 { id } else { id + 100 })
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids.collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(ts)),
+                ],
+            )
+            .expect("batch builds")
+        };
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![rows(7..=12)]])
+                .expect("accelerator builds"),
+        ) as Arc<dyn TableProvider>;
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![rows(1..=12)]])
+                .expect("source builds"),
+        ) as Arc<dyn TableProvider>;
+        let mut refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::UnixSeconds);
+        refresh.owe_reload();
+        let refresh = Arc::new(RwLock::new(refresh));
+        let mut runner = RefreshTaskRunner::builder(
+            status::RuntimeStatus::new(),
+            TableReference::bare("owed_reload"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            Arc::clone(&refresh),
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+        let (start, mut completed) = runner.start().expect("the runner starts");
+
+        start.send((1, None)).await.expect("the request is sent");
+        let (id, outcome) = completed.recv().await.expect("the refresh completes");
+        assert_eq!(id, 1);
+        outcome.expect("the refresh succeeds");
+
+        let ctx = SessionContext::new();
+        let plan = accelerator
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("the acceleration scans");
+        let mut ids: Vec<i64> = collect(plan, ctx.task_ctx())
+            .await
+            .expect("the acceleration reads")
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=12).collect::<Vec<_>>());
+        assert!(!refresh.read().await.reload, "the reload is settled");
+    }
+}

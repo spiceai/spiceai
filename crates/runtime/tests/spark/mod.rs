@@ -20,7 +20,7 @@ use app::AppBuilder;
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::test_request_context,
+    utils::{register_test_connectors, test_request_context},
 };
 
 use runtime::Runtime;
@@ -33,10 +33,10 @@ fn make_spark_dataset(path: &str, name: &str) -> Dataset {
             "spark_remote".to_string(),
             format!(
                 "sc://{}:443/;use_ssl=true;user_id=spice.ai;session_id={};token={};x-databricks-cluster-id={}",
-                std::env::var("TEST_DATABRICKS_HOST").unwrap_or_default(),
+                std::env::var("NEW_DATABRICKS_HOST").unwrap_or_default(),
                 uuid::Uuid::new_v4(),
-                std::env::var("TEST_DATABRICKS_TOKEN").unwrap_or_default(),
-                std::env::var("TEST_DATABRICKS_CLUSTER_ID").unwrap_or_default(),
+                std::env::var("NEW_DATABRICKS_TOKEN").unwrap_or_default(),
+                std::env::var("NEW_DATABRICKS_CLUSTER_ID").unwrap_or_default(),
             ),
         )]
             .into_iter()
@@ -57,6 +57,7 @@ async fn spark_integration_test() -> Result<(), anyhow::Error> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -74,14 +75,14 @@ async fn spark_integration_test() -> Result<(), anyhow::Error> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
             }
 
             let queries: QueryTests = vec![(
-                "select l_comment, l_partkey from lineitem order by l_linenumber desc limit 10",
+                "select l_comment, l_partkey from lineitem order by l_linenumber desc, l_partkey desc, l_comment desc limit 10",
                 "select",
                 Some(Box::new(|result_batches| {
                     for batch in &result_batches {
@@ -93,11 +94,11 @@ async fn spark_integration_test() -> Result<(), anyhow::Error> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Spark Integration Test Results"),
+                        description => "Spark Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("spark_select"), results);
+                        insta::assert_snapshot!("spark_select", results);
                     });
                 })),
             )];

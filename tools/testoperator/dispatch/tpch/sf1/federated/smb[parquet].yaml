@@ -1,0 +1,5 @@
+tests:
+  nas:
+    spicepod_path: federated/smb[parquet].yaml
+    runner_type: spiceai-macos
+    validate_results: true

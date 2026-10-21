@@ -11,11 +11,9 @@ description: "Query: tpch_simple_q5"
 |               |       Projection: o.o_totalprice, l.l_linestatus                                                                                                |
 |               |         Inner Join: o.o_orderkey = l.l_orderkey                                                                                                 |
 |               |           SubqueryAlias: o                                                                                                                      |
-|               |             BytesProcessedNode                                                                                                                  |
-|               |               TableScan: orders projection=[o_orderkey, o_totalprice]                                                                           |
+|               |             TableScan: orders projection=[o_orderkey, o_totalprice]                                                                             |
 |               |           SubqueryAlias: l                                                                                                                      |
-|               |             BytesProcessedNode                                                                                                                  |
-|               |               TableScan: lineitem projection=[l_orderkey, l_linestatus]                                                                         |
+|               |             TableScan: lineitem projection=[l_orderkey, l_linestatus]                                                                           |
 | physical_plan | SortExec: expr=[total_price@0 DESC], preserve_partitioning=[false]                                                                              |
 |               |   CoalescePartitionsExec                                                                                                                        |
 |               |     ProjectionExec: expr=[sum(o.o_totalprice)@1 as total_price, l_linestatus@0 as l_linestatus]                                                 |
@@ -27,23 +25,23 @@ description: "Query: tpch_simple_q5"
 |               |                 HashJoinExec: mode=Partitioned, join_type=Inner, on=[(o_orderkey@0, l_orderkey@0)], projection=[o_totalprice@1, l_linestatus@3] |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |                     RepartitionExec: partitioning=Hash([o_orderkey@0], 32), input_partitions=32                                                 |
-|               |                       BytesProcessedExec                                                                                                        |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                     |
 |               |                         SchemaCastScanExec                                                                                                      |
-|               |                           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                 |
-|               |                             FallbackOnZeroResultsScanExec                                                                                       |
-|               |                               CoalescePartitionsExec                                                                                            |
-|               |                                 RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                           |
-|               |                                   CooperativeExec                                                                                               |
+|               |                           FallbackOnZeroResultsScanExec                                                                                         |
+|               |                             CoalescePartitionsExec                                                                                              |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                             |
+|               |                                 CooperativeExec                                                                                                 |
+|               |                                   BytesProcessedExec                                                                                            |
 |               |                                     DuckSqlExec sql= SELECT "o_orderkey", "o_totalprice" FROM orders                                            |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 32), input_partitions=32                                                 |
-|               |                       BytesProcessedExec                                                                                                        |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                     |
 |               |                         SchemaCastScanExec                                                                                                      |
-|               |                           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                 |
-|               |                             FallbackOnZeroResultsScanExec                                                                                       |
-|               |                               CoalescePartitionsExec                                                                                            |
-|               |                                 RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                           |
-|               |                                   CooperativeExec                                                                                               |
+|               |                           FallbackOnZeroResultsScanExec                                                                                         |
+|               |                             CoalescePartitionsExec                                                                                              |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                             |
+|               |                                 CooperativeExec                                                                                                 |
+|               |                                   BytesProcessedExec                                                                                            |
 |               |                                     DuckSqlExec sql= SELECT "l_orderkey", "l_linestatus" FROM lineitem                                          |
 |               |                                                                                                                                                 |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+

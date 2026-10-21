@@ -14,17 +14,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::error::Error;
 use app::spicepod::component::runtime::ApiKey;
 use axum::http;
+use sha2::{Digest, Sha256};
 
 pub type AuthPrincipalRef = Arc<dyn AuthPrincipal + Sync + Send>;
 
 pub trait AuthPrincipal {
     fn username(&self) -> &str; // The username as presented during auth
     fn groups(&self) -> &[&str]; // Group memberships
+
+    /// A stable, opaque identifier for this principal, suitable for use as
+    /// a cache namespace key. Returning `None` means the principal is
+    /// effectively anonymous and should share the public cache scope.
+    ///
+    /// The id MUST be:
+    /// - **stable** across credential rotation for the same identity (so
+    ///   rotating an OIDC token does not invalidate the principal's cache);
+    /// - **opaque** — not the bearer token or API key value itself; and
+    /// - prefixed with the auth scheme (e.g. `apikey:`, `u2m:`) so two
+    ///   schemes that happen to mint the same id never collide.
+    ///
+    /// The default implementation returns `None`, which is the correct
+    /// behavior for anonymous principals. Real principals must override.
+    fn stable_id(&self) -> Option<Cow<'_, str>> {
+        None
+    }
 }
 pub trait AuthRequestContext {
     /// Sets the current authentication principal for the request context.
@@ -59,7 +78,29 @@ impl AuthPrincipal for ApiKey {
             ApiKey::ReadWrite { .. } => &["read_write"],
         }
     }
+
+    /// Stable opaque id derived from the SHA-256 of the API key material,
+    /// truncated to 16 bytes (32 hex chars). The key value itself is
+    /// never exposed; rotating the key produces a new id (which is the
+    /// desired behavior — rotated keys are a different principal).
+    ///
+    /// Format: `apikey:<32-hex-chars>`.
+    fn stable_id(&self) -> Option<Cow<'_, str>> {
+        let key_bytes = match self {
+            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key.as_bytes(),
+        };
+        let digest = Sha256::digest(key_bytes);
+        let mut id = String::with_capacity("apikey:".len() + 32);
+        id.push_str("apikey:");
+        for byte in &digest[..16] {
+            id.push(HEX[usize::from(byte >> 4)] as char);
+            id.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
+        Some(Cow::Owned(id))
+    }
 }
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
 pub trait HttpAuth {
     /// Receive the entire HTTP request object and return a verdict on whether to allow/deny it

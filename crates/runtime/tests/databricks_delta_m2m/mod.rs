@@ -20,7 +20,7 @@ use app::AppBuilder;
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::test_request_context,
+    utils::{register_test_connectors, test_request_context},
 };
 
 use runtime::Runtime;
@@ -72,6 +72,7 @@ fn get_params() -> Params {
 async fn databricks_delta_lake_m2m_integration_test() -> Result<(), anyhow::Error> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -83,18 +84,13 @@ async fn databricks_delta_lake_m2m_integration_test() -> Result<(), anyhow::Erro
                 .build();
 
             configure_test_datafusion();
-            let mut rt =
-                Runtime::builder()
-                    .with_app(app)
-                    .build()
-                    .await
-            ;
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -113,11 +109,11 @@ async fn databricks_delta_lake_m2m_integration_test() -> Result<(), anyhow::Erro
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Databricks (mode: delta_lake) Integration Test Results"),
+                        description => "Databricks (mode: delta_lake) Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("databricks_delta_lake_m2m_select"), results);
+                        insta::assert_snapshot!("databricks_delta_lake_m2m_select", results);
                     });
                 })),
             )];

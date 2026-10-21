@@ -14,138 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{
-    Read, ReadWrite,
-    delete::{DeletionExec, DeletionSink, DeletionTableProvider},
-};
+use crate::{Read, ReadWrite};
 use async_trait::async_trait;
-use datafusion::{
-    catalog::Session, datasource::TableProvider, logical_expr::Expr, physical_plan::ExecutionPlan,
-    sql::TableReference,
-};
-use datafusion_table_providers::{
-    duckdb::{DuckDB, DuckDBTableFactory, TableDefinition, write::DuckDBTableWriter},
-    sql::{
-        db_connection_pool::duckdbpool::DuckDbConnectionPool, sql_provider_datafusion::expr::Engine,
-    },
-    util,
-};
-use duckdb::Transaction;
-use snafu::prelude::*;
+use datafusion::{common::TableReference, datasource::TableProvider};
+use datafusion_table_providers::duckdb::DuckDBTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use std::sync::Arc;
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Unable to delete data from the duckdb table: {source}"))]
-    UnableToDeleteDuckdbData { source: duckdb::Error },
-
-    #[snafu(display("Unable to query data from the duckdb table: {source}"))]
-    UnableToQueryData { source: duckdb::Error },
-
-    #[snafu(display("Unable to commit transaction: {source}"))]
-    UnableToCommitTransaction { source: duckdb::Error },
-
-    #[snafu(display("Unable to begin duckdb transaction: {source}"))]
-    UnableToBeginTransaction { source: duckdb::Error },
-
-    #[snafu(display(
-        "Unable to delete data from the duckdb table. An internal table and base table exist for the same table. Manually migrate the table by deleting '{internal_table}' or {table_name}', and try again."
-    ))]
-    UnableToDeleteDataInternalTable {
-        internal_table: String,
-        table_name: String,
-    },
-}
-
-type Result<T, E = Error> = std::result::Result<T, E>;
-
-#[async_trait]
-impl DeletionTableProvider for DuckDBTableWriter {
-    async fn delete_from(
-        &self,
-        _state: &dyn Session,
-        filters: &[Expr],
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DeletionExec::new(
-            Arc::new(DuckDBDeletionSink::new(
-                self.pool(),
-                self.table_definition(),
-                filters,
-            )),
-            &self.schema(),
-        )))
-    }
-}
-
-struct DuckDBDeletionSink {
-    pool: Arc<DuckDbConnectionPool>,
-    table_definition: Arc<TableDefinition>,
-    filters: Vec<Expr>,
-}
-
-impl DuckDBDeletionSink {
-    fn new(
-        pool: Arc<DuckDbConnectionPool>,
-        table_definition: Arc<TableDefinition>,
-        filters: &[Expr],
-    ) -> Self {
-        Self {
-            pool,
-            table_definition,
-            filters: filters.to_vec(),
-        }
-    }
-}
-
-#[async_trait]
-impl DeletionSink for DuckDBDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let pool = Arc::clone(&self.pool);
-        let table_definition = Arc::clone(&self.table_definition);
-        let filters = self.filters.clone();
-
-        tokio::task::spawn_blocking(
-            move || -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-                let mut db_conn = pool.connect_sync()?;
-                let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                let tx = duckdb_conn
-                    .conn
-                    .transaction()
-                    .context(UnableToBeginTransactionSnafu)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                let has_table = table_definition
-                    .has_table(&tx)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                let mut internal_tables = table_definition
-                    .list_internal_tables(&tx)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                let table_name = match (internal_tables.pop(), has_table) {
-                    (Some((table_name, _)), true) => {
-                        return Err(Box::new(Error::UnableToDeleteDataInternalTable {
-                            internal_table: table_name.to_string(),
-                            table_name: table_definition.name().to_string(),
-                        }));
-                    }
-                    (Some((table_name, _)), false) => table_name,
-                    (None, true) => table_definition.name().clone(),
-                    (None, false) => {
-                        return Ok(0);
-                    }
-                };
-
-                let sql = util::filters_to_sql(&filters, Some(Engine::DuckDB))
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                let count = delete_from(&table_name.to_string(), tx, &sql)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-                Ok(count)
-            },
-        )
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-    }
-}
 
 #[async_trait]
 impl Read for DuckDBTableFactory {
@@ -167,21 +41,89 @@ impl ReadWrite for DuckDBTableFactory {
     }
 }
 
-fn delete_from(table_name: &str, tx: Transaction<'_>, where_clause: &str) -> Result<u64> {
-    let count_sql = format!(r#"SELECT COUNT(*) FROM "{table_name}" WHERE {where_clause}"#);
+/// The statement [`with_utc_session_timezone`] applies.
+pub const SET_UTC_SESSION_TIMEZONE: &str = "SET TimeZone = 'UTC'";
 
-    let mut count: u64 = tx
-        .query_row(&count_sql, [], |row| row.get::<usize, u64>(0))
-        .context(UnableToQueryDataSnafu)?;
+/// Pin a Spice-opened `DuckDB` connection to `UTC`.
+///
+/// `DuckDB` labels a `TIMESTAMPTZ` column it exports to Arrow with the connection's own
+/// `TimeZone`, so an unpinned session makes a dataset's *schema* depend on the host: the same
+/// table reads back as `Timestamp(us, "Asia/Tokyo")` on one machine and `Timestamp(us, "UTC")`
+/// on another. `DataFusion` coerces a naive timestamp literal into the column's zone, and
+/// Arrow reads that literal as wall-clock in it, so `WHERE ts > TIMESTAMP '2024-01-15 15:00:00'`
+/// selects a different set of rows on each host ([#13899](https://github.com/spiceai/spiceai/issues/13899)).
+///
+/// `TimeZone` is a session setting, so this is applied per connection — the same scope the
+/// accelerator uses for it (`accelerator-duckdb`'s `settings::TimeZone`,
+/// `DuckDBSettingScope::Local`). Existing setup queries are kept, and `connect_sync` runs them
+/// in order, so a caller that set its own zone is overridden rather than dropped.
+#[must_use]
+pub fn with_utc_session_timezone(pool: DuckDbConnectionPool) -> DuckDbConnectionPool {
+    let mut queries = pool.connection_setup_queries().to_vec();
+    queries.push(Arc::from(SET_UTC_SESSION_TIMEZONE));
+    pool.with_connection_setup_queries(queries)
+}
 
-    let sql = format!(r#"DELETE FROM "{table_name}" WHERE {where_clause}"#);
-    tx.execute(&sql, [])
-        .context(UnableToDeleteDuckdbDataSnafu)?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 
-    count -= tx
-        .query_row(&count_sql, [], |row| row.get::<usize, u64>(0))
-        .context(UnableToQueryDataSnafu)?;
+    /// Read `TimeZone` back off a connection the pool hands out — the setup queries run on
+    /// `connect_sync`, so a live connection is the only place their effect is observable.
+    fn session_timezone(pool: DuckDbConnectionPool) -> String {
+        let mut conn = Arc::new(pool).connect_sync().expect("connect to DuckDB");
+        conn.as_any_mut()
+            .downcast_mut::<DuckDbConnection>()
+            .expect("DuckDB hands out a DuckDB connection")
+            .get_underlying_conn_mut()
+            .query_row("SELECT current_setting('TimeZone')", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("read the session TimeZone")
+    }
 
-    tx.commit().context(UnableToCommitTransactionSnafu)?;
-    Ok(count)
+    fn seeded_with(query: &str) -> DuckDbConnectionPool {
+        DuckDbConnectionPool::new_memory()
+            .expect("in-memory DuckDB pool")
+            .with_connection_setup_queries(vec![Arc::from(query)])
+    }
+
+    /// The pool is seeded with a non-UTC zone on purpose: a CI host already running UTC would
+    /// satisfy the second assertion with or without the pin, so the seed is what makes this
+    /// measure something. Without [`with_utc_session_timezone`] the connection stays on
+    /// `Asia/Tokyo`, and a `TIMESTAMPTZ` column then reaches Arrow labelled with it (#13899).
+    #[test]
+    fn the_pin_overrides_a_zone_the_session_already_carries() {
+        assert_eq!(
+            session_timezone(seeded_with("SET TimeZone = 'Asia/Tokyo'")),
+            "Asia/Tokyo",
+            "the seed has to take effect, or the pinned case below proves nothing"
+        );
+
+        assert_eq!(
+            session_timezone(with_utc_session_timezone(seeded_with(
+                "SET TimeZone = 'Asia/Tokyo'"
+            ))),
+            "UTC"
+        );
+    }
+
+    /// `with_connection_setup_queries` replaces the whole list, so the pin has to append to
+    /// what a caller already set rather than dropping it — `search`'s `DuckDB` index relies on a
+    /// `LOAD vss` setup query, and losing one would be silent.
+    #[test]
+    fn the_pin_keeps_the_setup_queries_already_on_the_pool() {
+        let pinned = with_utc_session_timezone(seeded_with("SET memory_limit = '123MB'"));
+        let queries: Vec<&str> = pinned
+            .connection_setup_queries()
+            .iter()
+            .map(AsRef::as_ref)
+            .collect();
+
+        assert_eq!(
+            queries,
+            vec!["SET memory_limit = '123MB'", SET_UTC_SESSION_TIMEZONE]
+        );
+    }
 }

@@ -1,0 +1,618 @@
+name: build_nightly
+
+on:
+  schedule:
+    - cron: '0 9 * * *' # Runs the workflow at 9:00 AM UTC (1AM PT) every day
+
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the Docker images to the registry (CLI binaries are uploaded as artifacts only)
+        required: false
+        type: boolean
+        default: false
+      profile_option:
+        description: 'Which Rust build profile to use? (Default is release)'
+        required: false
+        type: choice
+        options:
+          - 'release'
+          - 'release-lto'
+        default: 'release'
+
+env:
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  check_commits:
+    runs-on: ubuntu-24.04
+    outputs:
+      has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check new commits since latest nightly build
+        id: check_commits
+        run: |
+          # Get the latest commit hash from the default branch
+          latest_commit=$(git rev-parse HEAD)
+
+          # Attempt to get the commit hash of the current nightly tag
+          nightly_commit=$(git rev-list -n 1 nightly 2>/dev/null || echo "")
+
+          # Check if there are new commits since the last nightly tag
+          if [ "$latest_commit" = "$nightly_commit" ]; then
+            echo "No new commits since the last nightly build. Exiting..."
+            echo "has_new_commits=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "New commits found. Proceeding with the build."
+          echo "has_new_commits=true" >> $GITHUB_OUTPUT
+        shell: bash
+
+  setup:
+    needs: check_commits
+    if: needs.check_commits.outputs.has_new_commits == 'true'
+
+    runs-on: ubuntu-24.04
+    outputs:
+      rel_version: ${{ steps.set_version.outputs.rel_version }}
+      nightly_label: ${{ steps.set_version.outputs.nightly_label }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set Nightly REL_VERSION from current timestamp
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Add REL_VERSION to output
+        id: set_version
+        run: |
+          commit_hash=$(git rev-parse --short HEAD)
+          date="$(date +%Y%m%d)"
+          version="${date}-${commit_hash}"
+          # `g`-prefix the commit hash (git-describe convention) so it is always a
+          # valid SemVer pre-release identifier in the Cargo.toml version below.
+          # An all-numeric short SHA with a leading zero (e.g. 0882134) is an
+          # invalid numeric SemVer identifier and fails `cargo build`.
+          nightly_label="nightly.${date}.g${commit_hash}"
+          echo "rel_version=${version}" >> $GITHUB_OUTPUT
+          echo "nightly_label=${nightly_label}" >> $GITHUB_OUTPUT
+          echo "Preparing to publish nightly build with version: \"${version}\""
+
+  # ==================== BINARY BUILD JOBS ====================
+
+  build-linux-x64:
+    name: Build - Linux x64
+    needs: [check_commits, setup]
+    if: needs.check_commits.outputs.has_new_commits == 'true'
+
+    runs-on: ubuntu-24.04
+    env:
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Add nightly postfix to version in Cargo.toml
+        env:
+          NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$NIGHTLY_LABEL"
+          else
+            new_version="${current_version}-$NIGHTLY_LABEL"
+          fi
+          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Install protoc
+        uses: ./.github/actions/install-protoc
+
+      - name: Build spiced and spice CLI
+        working-directory: bin/spiced
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,spicebench -p spiced -p spice --target-dir ../../target
+
+      - name: tar spiced binary
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+          tar czf spiced_linux_x86_64.tar.gz spiced
+
+      - name: tar spice CLI binary
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+          tar czf spice_linux_x86_64.tar.gz spice
+
+      - name: Print versions
+        run: |
+          ./spiced --version
+          ./spice version
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spiced_linux_x86_64
+          path: spiced_linux_x86_64.tar.gz
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spice_linux_x86_64
+          path: spice_linux_x86_64.tar.gz
+
+  build-linux-arm64:
+    name: Build - Linux aarch64
+    needs: [check_commits, setup]
+    if: needs.check_commits.outputs.has_new_commits == 'true'
+
+    runs-on: hosted-linux-arm-runner
+    env:
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Add nightly postfix to version in Cargo.toml
+        env:
+          NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$NIGHTLY_LABEL"
+          else
+            new_version="${current_version}-$NIGHTLY_LABEL"
+          fi
+          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Install missing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential libssl-dev pkg-config cmake unzip -y
+
+      - name: Install protoc
+        uses: ./.github/actions/install-protoc
+
+      - name: Build spiced and spice CLI
+        working-directory: bin/spiced
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,spicebench -p spiced -p spice --target-dir ../../target
+
+      - name: tar spiced binary
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+          tar czf spiced_linux_aarch64.tar.gz spiced
+
+      - name: tar spice CLI binary
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+          tar czf spice_linux_aarch64.tar.gz spice
+
+      - name: Print versions
+        run: |
+          ./spiced --version
+          ./spice version
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spiced_linux_aarch64
+          path: spiced_linux_aarch64.tar.gz
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spice_linux_aarch64
+          path: spice_linux_aarch64.tar.gz
+
+  build-macos-arm64:
+    name: Build - macOS aarch64
+    needs: [check_commits, setup]
+    if: needs.check_commits.outputs.has_new_commits == 'true'
+
+    # The standard pool, not `spiceai-macos-large`: this build blocks nothing,
+    # so its own latency is free, and it starts at 09:13 UTC when the pool is
+    # near-idle. Its tail is the cost -- the slowest recent run took 235 minutes
+    # and finished at 13:10 UTC -- which is paid by whatever shares its Mac mini
+    # by then, not by the nightly.
+    runs-on: spiceai-macos
+    env:
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Add nightly postfix to version in Cargo.toml
+        env:
+          NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$NIGHTLY_LABEL"
+          else
+            new_version="${current_version}-$NIGHTLY_LABEL"
+          fi
+          sed -i '' "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
+      - name: Install missing tools
+        # `missing=()` is bash-specific; the default shell is a runner-image property.
+        shell: bash
+        run: |
+          # Probe before reaching for brew. On the self-hosted pool the formulas are
+          # already there, so every `brew` call is a no-op that still has to reach brew
+          # first — and any brew-level breakage (an unreadable global lock, a half-written
+          # `brew`) then fails the build over a toolchain it already had (#13463).
+          # `setup-cc` probes the same way for every other macOS job; this step and its
+          # twin in build_and_release.yml are the two that still call brew directly.
+          brew_bin="$(command -v brew || true)"
+          if [ -z "$brew_bin" ]; then
+            echo "::error::'brew' is not on PATH, so cmake and unixodbc cannot be installed or verified on this runner."
+            exit 1
+          fi
+          # The spiceai-macos flock wrapper is `/opt/spice/bin/brew`, so
+          # dirname/dirname of `command -v brew` is `/opt/spice` and every
+          # keg looks missing. Prefer the well-known prefixes; do not invoke
+          # brew (that takes the lock this probe exists to avoid).
+          if [ -x /opt/homebrew/bin/brew ]; then
+            brew_prefix=/opt/homebrew
+          elif [ -x /usr/local/bin/brew ]; then
+            brew_prefix=/usr/local
+          else
+            brew_prefix="$(dirname "$(dirname "$brew_bin")")"
+          fi
+          missing=()
+          # cmake is invoked by bare name from build scripts, so being in the Cellar is
+          # not enough — the name has to resolve to *this* Homebrew. Matching the prefix
+          # rather than a fixed path stays correct on an Intel runner, and catches an
+          # unlinked keg or a foreign copy earlier on PATH; both route into `brew link`.
+          case "$(command -v cmake 2>/dev/null || true)" in
+            "$brew_prefix"/*) ;;
+            *) missing+=("cmake") ;;
+          esac
+          # unixodbc is consumed through the library search path, never by name, so the
+          # keg being present is the whole requirement.
+          [ -d "$brew_prefix/opt/unixodbc" ] || missing+=("unixodbc")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "Toolchain incomplete on this runner (${missing[*]}); installing."
+            brew update
+            brew install cmake unixodbc
+            # `brew install` only warns — and still exits 0 — on a formula that is in the
+            # Cellar but unlinked, so its binaries never reach PATH.
+            brew link --overwrite cmake || true
+          else
+            echo "cmake and unixodbc already present under $brew_prefix; skipping brew."
+          fi
+          # Assert unconditionally, so a runner whose install was skipped still fails here
+          # with a named cause rather than deep inside a build script. Only that the name
+          # resolves — deliberately not that it resolves under $brew_prefix — so a runner
+          # building today against a cmake from elsewhere on PATH keeps working.
+          if ! command -v cmake >/dev/null 2>&1; then
+            echo "::error::'cmake' is not on PATH after setup. Run 'brew link --overwrite cmake' on this runner."
+            exit 1
+          fi
+          # Prefix resolved from the located brew rather than hardcoded, so an Intel runner
+          # gets its own; unchanged on Apple Silicon. A derived value carries an injection
+          # surface a literal does not — a two-line `$GITHUB_ENV` entry appends a second
+          # variable to every later step — so refuse one, as `setup-cc` does for its own.
+          #
+          # Only the unixodbc keg, never `$brew_prefix/lib`. A RUSTFLAGS `-L` is searched
+          # before a build script's own `rustc-link-search`, so whatever static library
+          # Homebrew has linked into `$brew_prefix/lib` under the same name replaces the
+          # vendored one when rustc bundles it. With a foreign `libcrypto.a` there,
+          # openssl-sys bundles that instead of the vendored OpenSSL that librdkafka was
+          # compiled against, and the link fails on undefined `_ENGINE_*` symbols. The keg
+          # holds only the libodbc* families, which is all the odbc build needs.
+          rustflags="-L $brew_prefix/opt/unixodbc/lib"
+          if [ "$(printf '%s' "$rustflags" | wc -l | tr -d ' ')" != "0" ]; then
+            echo "::error::Refusing to export a multi-line RUSTFLAGS built from '$brew_prefix'."
+            exit 1
+          fi
+          echo "RUSTFLAGS=$rustflags" >> "$GITHUB_ENV"
+          # The probe above accepts an unlinked unixodbc keg — `$brew_prefix/opt/unixodbc`
+          # exists for a formula that was never linked — and in that state nothing under
+          # `$brew_prefix/lib` holds `libodbc.dylib`, so a link that searched only there
+          # would die as "ld: library 'odbc' not found" (#13475). The keg's own lib
+          # directory covers it, for rustc above and for the C toolchain here, as `setup-cc`
+          # does for every other macOS job. clang expands LIBRARY_PATH into -L entries
+          # after those already on the command line, so this restores the search path without
+          # displacing anything a build script emitted, and it is not a cargo fingerprint
+          # input, so it costs no rebuild.
+          library_path="${LIBRARY_PATH:+$LIBRARY_PATH:}$brew_prefix/opt/unixodbc/lib"
+          if [ "$(printf '%s' "$library_path" | wc -l | tr -d ' ')" != "0" ]; then
+            echo "::error::Refusing to export a multi-line LIBRARY_PATH built from '$brew_prefix'."
+            exit 1
+          fi
+          echo "LIBRARY_PATH=$library_path" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install protoc
+        uses: ./.github/actions/install-protoc
+
+      - name: Build spiced and spice CLI
+        working-directory: bin/spiced
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,spicebench -p spiced -p spice --target-dir ../../target
+
+      - name: tar spiced binary
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+          tar czf spiced_darwin_aarch64.tar.gz spiced
+
+      - name: tar spice CLI binary
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+          tar czf spice_darwin_aarch64.tar.gz spice
+
+      - name: Print versions
+        run: |
+          ./spiced --version
+          ./spice version
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spiced_darwin_aarch64
+          path: spiced_darwin_aarch64.tar.gz
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spice_darwin_aarch64
+          path: spice_darwin_aarch64.tar.gz
+
+  # ==================== DOCKER IMAGE BUILD JOBS ====================
+  # These jobs use pre-built spiced binaries from the CLI build jobs
+
+  build-docker-arm64:
+    name: Build Docker - ARM64
+    needs: [check_commits, setup, build-linux-arm64]
+    if: needs.check_commits.outputs.has_new_commits == 'true'
+
+    runs-on: hosted-linux-arm-runner
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download spiced binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: spiced_linux_aarch64
+          path: /tmp
+
+      - name: Extract spiced binary
+        run: |
+          tar -xzf /tmp/spiced_linux_aarch64.tar.gz -C .
+          chmod +x spiced
+          mv spiced .spiced-local-tmp
+          ./.spiced-local-tmp --version
+
+      - name: Install docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg lsb-release
+          sudo mkdir -m 0755 -p /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -i | awk '{ print tolower($3) }') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+      - name: Start Docker service
+        run: |
+          sudo systemctl start docker
+          sudo systemctl status docker
+
+      - name: chown /var/run/docker.sock to current user
+        run: |
+          sudo chown $USER /var/run/docker.sock
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before building so the ubuntu base image
+        # pull uses authenticated rate limits instead of anonymous (per-IP) limits.
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build ARM64 Docker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.local
+          platforms: linux/arm64
+          outputs: type=docker,name=localhost:5000/spiceai:default-arm64,dest=/tmp/image-arm64-default.tar
+          cache-from: type=gha,scope=build-docker-arm64
+          cache-to: type=gha,scope=build-docker-arm64,mode=max
+
+      - name: Upload ARM64 Docker image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: images-arm64
+          path: /tmp/image-arm64-default.tar
+
+  build-docker-amd64:
+    name: Build Docker - AMD64
+    needs: [check_commits, setup, build-linux-x64]
+    if: needs.check_commits.outputs.has_new_commits == 'true'
+
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download spiced binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: spiced_linux_x86_64
+          path: /tmp
+
+      - name: Extract spiced binary
+        run: |
+          tar -xzf /tmp/spiced_linux_x86_64.tar.gz -C .
+          chmod +x spiced
+          mv spiced .spiced-local-tmp
+          ./.spiced-local-tmp --version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before building so the ubuntu base image
+        # pull uses authenticated rate limits instead of anonymous (per-IP) limits.
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build AMD64 Docker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.local
+          platforms: linux/amd64
+          outputs: type=docker,name=localhost:5000/spiceai:default-amd64,dest=/tmp/image-amd64-default.tar
+          cache-from: type=gha,scope=build-docker-amd64
+          cache-to: type=gha,scope=build-docker-amd64,mode=max
+
+      - name: Upload AMD64 Docker image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: images-amd64
+          path: /tmp/image-amd64-default.tar
+
+  publish-docker:
+    name: Publish Docker Images
+    needs: [check_commits, setup, build-docker-amd64, build-docker-arm64]
+    if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish)
+
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Download Docker image artifacts
+      - name: Download Docker image artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: /tmp
+          pattern: images-*
+          merge-multiple: true
+
+      - name: Verify artifacts
+        run: |
+          echo "Docker images:"
+          ls -l /tmp
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before pulling so we use the authenticated
+        # rate limits instead of anonymous (per-IP) limits when pulling
+        # registry:2 below.
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Start local registry
+        run: |
+          docker run -d -p 5000:5000 --restart=always --name registry registry:2
+
+      - name: Login to GitHub Package Registry
+        if: github.event_name == 'schedule' || inputs.publish
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Import images and create manifests
+        env:
+          REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+          PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
+        run: |
+          echo "REL_VERSION=${REL_VERSION}"
+          echo "PUBLISH=${PUBLISH}"
+
+          # Load both architecture images
+          echo "Loading AMD64 image"
+          docker load -i /tmp/image-amd64-default.tar
+          echo "Loading ARM64 image"
+          docker load -i /tmp/image-arm64-default.tar
+
+          # Push images to local registry
+          echo "Pushing images to local registry"
+          docker push localhost:5000/spiceai:default-amd64
+          docker push localhost:5000/spiceai:default-arm64
+
+          if [[ "${PUBLISH}" == "true" ]]; then
+            # Push to GitHub Container Registry
+            echo "Pushing to GHCR"
+            docker buildx imagetools create \
+              -t ghcr.io/spiceai/spiceai-nightly:${REL_VERSION} \
+              -t ghcr.io/spiceai/spiceai-nightly:latest \
+              localhost:5000/spiceai:default-amd64 \
+              localhost:5000/spiceai:default-arm64
+
+            echo "Verifying GHCR image:"
+            docker buildx imagetools inspect ghcr.io/spiceai/spiceai-nightly:${REL_VERSION}
+          else
+            echo "Skipping push for non-tag build"
+            echo "Creating local manifest for testing:"
+            docker buildx imagetools create \
+              -t localhost:5000/spiceai:latest \
+              localhost:5000/spiceai:default-amd64 \
+              localhost:5000/spiceai:default-arm64
+
+            docker buildx imagetools inspect localhost:5000/spiceai:latest
+          fi
+
+      - name: Update nightly tag
+        run: |
+          git tag -f nightly
+          # Non-interactive: a credential helper on the runner can otherwise intercept
+          # this push and block on a prompt forever. See
+          # scripts/check_ci_git_push_noninteractive.py.
+          git -c credential.helper='' -c credential.interactive=false \
+            push origin nightly --force
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Never fall back to an interactive prompt; fail fast if auth is rejected.
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: 'never'

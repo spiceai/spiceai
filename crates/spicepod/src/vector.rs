@@ -20,11 +20,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     param::Params,
-    partitioning::{PartitionedBy, deserialize_partition_by},
+    partitioning::{PartitionedBy, deserialize_partition_by, serialize_partition_by},
 };
 
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct VectorStore {
@@ -34,10 +33,22 @@ pub struct VectorStore {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
 
+    /// Partition expressions used to organize vector data.
+    ///
+    /// Each item accepts either:
+    /// - a plain expression string, for example `"YEAR(created_at)"` or
+    ///   `"bucket(100, user_id)"`; or
+    /// - a single-entry mapping of a partition name to an expression, for
+    ///   example `{ year: "YEAR(created_at)" }`.
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_partition_by",
         deserialize_with = "deserialize_partition_by"
+    )]
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(with = "Vec<crate::partitioning::PartitionedBySchema>")
     )]
     pub partition_by: Vec<PartitionedBy>,
 

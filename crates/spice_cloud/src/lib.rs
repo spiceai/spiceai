@@ -14,36 +14,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use data_accelerator_api::AcceleratorEngineRegistry;
+use data_connector_api::DataConnectorError;
+use runtime::dataconnector::parameters::RuntimeConnectorContext;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{common::TableReference, datasource::TableProvider};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use snafu::{ResultExt, prelude::*};
 
 use runtime::{
     Runtime,
-    accelerated_table::{
-        AcceleratedTable, AcceleratedTableBuilderError, Retention, refresh::Refresh,
-    },
+    accelerated::{AcceleratedTable, AcceleratedTableBuilderError, Retention, refresh::Refresh},
     component::{
         access::AccessMode,
         dataset::{
             TimeFormat,
-            acceleration::{Acceleration, RefreshMode},
+            acceleration::{Acceleration, Engine, RefreshMode},
             builder::DatasetBuilder,
             replication::Replication,
         },
     },
-    dataaccelerator::{self, AcceleratorEngineRegistry},
-    dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},
+    dataconnector::{create_new_connector, parameters::ConnectorParamsBuilder},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
-    federated_table::FederatedTable,
-    secrets::{ExposeSecret, Secrets},
+    federated::FederatedTable,
     spice_metrics::get_metrics_table_reference,
     status,
 };
+use runtime_secrets::{ExposeSecret, Secrets};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
@@ -69,7 +69,7 @@ pub enum Error {
     UnableToCreateSourceTableProvider { source: DataConnectorError },
 
     #[snafu(display("Unable to create accelerated table provider: {source}"))]
-    UnableToCreateAcceleratedTableProvider { source: dataaccelerator::Error },
+    UnableToCreateAcceleratedTableProvider { source: data_accelerator_api::Error },
 
     #[snafu(display("Unable to get Spice Cloud secret: {source}"))]
     UnableToGetSpiceSecret {
@@ -85,6 +85,11 @@ pub enum Error {
     #[snafu(display("Unable to connect to Spice Cloud: {source}"))]
     UnableToConnectToSpiceCloud { source: reqwest::Error },
 
+    #[snafu(display(
+        "Spice Cloud HTTP client not initialized. Ensure the extension is initialized before use."
+    ))]
+    ClientNotInitialized {},
+
     #[snafu(display("Unable to build accelerated table: {source}"))]
     UnableToBuildAcceleratedTable {
         source: AcceleratedTableBuilderError,
@@ -94,6 +99,7 @@ pub enum Error {
 pub struct SpiceExtension {
     manifest: ExtensionManifest,
     api_key: String,
+    client: Option<reqwest::Client>,
 }
 
 impl SpiceExtension {
@@ -102,6 +108,7 @@ impl SpiceExtension {
         SpiceExtension {
             manifest,
             api_key: String::new(),
+            client: None,
         }
     }
 
@@ -113,20 +120,19 @@ impl SpiceExtension {
         self.manifest
             .params
             .get("metrics")
-            .map_or_else(|| false, |v| v.eq_ignore_ascii_case("true"))
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     }
 
     fn spice_http_url(&self) -> String {
         self.manifest
             .params
             .get("endpoint")
-            .unwrap_or(&"https://data.spiceai.io".to_string())
-            .to_string()
+            .cloned()
+            .unwrap_or_else(|| "https://data.spiceai.io".to_string())
     }
 
     async fn get_spice_api_key(&self, runtime: &Runtime) -> Result<String, Error> {
-        let secret = runtime.secrets();
-        let secret = secret.read().await;
+        let secret = Secrets::snapshot(&runtime.secrets()).await;
         let api_key = secret
             .get_secret("spiceai_api_key")
             .await
@@ -145,7 +151,7 @@ impl SpiceExtension {
         path: &str,
         body: Req,
     ) -> Result<Resp, Error> {
-        let client = reqwest::Client::new();
+        let client = self.client.as_ref().ok_or(Error::ClientNotInitialized {})?;
         let response = client
             .post(format!("{}{path}", self.spice_http_url()))
             .json(&body)
@@ -168,11 +174,11 @@ impl SpiceExtension {
         runtime: Arc<Runtime>,
         from: String,
     ) -> Result<()> {
-        let retention = Retention::builder()
+        let retention = Retention::builder(get_metrics_table_reference().to_string())
             .time_column(Some("timestamp".to_string()))
             .time_format(Some(TimeFormat::UnixSeconds))
-            .time_period(Some(Duration::from_secs(1800))) // delete metrics older than 30 minutes
-            .check_interval(Some(Duration::from_secs(300))) // run retention every 5 minutes
+            .time_period(Some(Duration::from_mins(30))) // delete metrics older than 30 minutes
+            .check_interval(Some(Duration::from_mins(5))) // run retention every 5 minutes
             .enabled(true)
             .build();
 
@@ -180,7 +186,7 @@ impl SpiceExtension {
             .time_column("timestamp".to_string())
             .time_format(TimeFormat::UnixSeconds)
             .check_interval(Duration::from_secs(10))
-            .period(Duration::from_secs(1800)); // sync only last 30 minutes from cloud
+            .period(Duration::from_mins(30)); // sync only last 30 minutes from cloud
 
         let metrics_table_reference = get_metrics_table_reference();
 
@@ -189,7 +195,10 @@ impl SpiceExtension {
             runtime.status(),
             metrics_table_reference.clone(),
             from.as_str(),
-            Acceleration::default(),
+            Acceleration {
+                engine: Engine::Arrow,
+                ..Acceleration::default()
+            },
             refresh,
             retention,
             runtime.secrets(),
@@ -201,7 +210,7 @@ impl SpiceExtension {
 
         runtime
             .datafusion()
-            .register_table_as_writable_and_with_schema(metrics_table_reference, table)
+            .register_table_as_writable_and_with_schema(metrics_table_reference, table.into_table())
             .boxed()
             .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
@@ -224,7 +233,7 @@ impl SpiceExtension {
             connection.org_name, connection.app_name, connection.metrics_dataset_name
         );
 
-        let from = spiceai_metrics_dataset_path.to_string();
+        let from = spiceai_metrics_dataset_path;
         self.register_runtime_metrics_table(runtime, from.clone())
             .await?;
         tracing::info!("Enabled metrics sync from runtime.metrics to {from}");
@@ -235,7 +244,7 @@ impl SpiceExtension {
 
 impl Default for SpiceExtension {
     fn default() -> Self {
-        SpiceExtension::new(ExtensionManifest::default())
+        Self::new(ExtensionManifest::default())
     }
 }
 
@@ -249,6 +258,16 @@ impl Extension for SpiceExtension {
         if !self.manifest.enabled {
             return Ok(());
         }
+
+        self.client = Some(
+            reqwest::Client::builder()
+                .use_rustls_tls()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_mins(30))
+                .build()
+                .boxed()
+                .map_err(|source| ExtensionError::UnableToInitializeExtension { source })?,
+        );
 
         let api_key = self
             .get_spice_api_key(runtime)
@@ -281,10 +300,7 @@ impl SpiceExtensionFactory {
 
 impl ExtensionFactory for SpiceExtensionFactory {
     fn create(&self) -> Box<dyn Extension> {
-        Box::new(SpiceExtension {
-            manifest: self.manifest.clone(),
-            api_key: String::new(),
-        })
+        Box::new(SpiceExtension::new(self.manifest.clone()))
     }
 }
 
@@ -316,18 +332,19 @@ async fn get_spiceai_table_provider(
     dataset.access = AccessMode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
-    let params = ConnectorParamsBuilder::new(name.into(), (&dataset).into())
+    let params = ConnectorParamsBuilder::for_dataset(name.into(), &dataset)
         .build(secrets, io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 
-    let data_connector = create_new_connector("spice.ai", params)
+    let context = RuntimeConnectorContext::for_dataset(&dataset);
+    let data_connector = create_new_connector("spice.ai", params, &context)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateDataConnectorSnafu)?;
 
     let source_table_provider = data_connector
-        .read_write_provider(&dataset)
+        .read_write_provider(&context, &dataset)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateSourceTableProviderSnafu)?;
@@ -340,7 +357,7 @@ async fn get_spiceai_table_provider(
 /// # Errors
 ///
 /// This function will return an error if the accelerated table provider cannot be created
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn create_synced_internal_accelerated_table(
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     runtime_status: Arc<status::RuntimeStatus>,
@@ -384,9 +401,10 @@ pub async fn create_synced_internal_accelerated_table(
         refresh,
         runtime.tokio_io_runtime(),
     );
-    builder.cpu_runtime(runtime.datafusion().cpu_runtime().cloned());
+    builder.cpu_runtime(runtime.datafusion().refresh_runtime().cloned());
 
     builder.retention(retention);
+    builder.node_local();
 
     let accelerated_table = builder
         .build()
@@ -397,7 +415,7 @@ pub async fn create_synced_internal_accelerated_table(
 }
 
 #[derive(Deserialize, Debug)]
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 struct SpiceCloudConnectResponse {
     org_name: String,
     app_name: String,

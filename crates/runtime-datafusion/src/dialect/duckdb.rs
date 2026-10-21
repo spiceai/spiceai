@@ -1,0 +1,2400 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use datafusion::common::DFSchema;
+use datafusion::common::tree_node::{TreeNode as _, TreeNodeRecursion};
+use datafusion::error::DataFusionError;
+use datafusion::logical_expr::ExprSchemable as _;
+use datafusion::logical_expr::{Cast, TryCast};
+use datafusion::prelude::Expr;
+use datafusion::scalar::ScalarValue;
+use datafusion::sql::sqlparser;
+use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
+use datafusion::sql::sqlparser::ast::{
+    self, Array, Function, FunctionArg, FunctionArgExpr, Ident, ObjectName, ValueWithSpan,
+};
+use itertools::Itertools;
+
+use super::re2;
+
+pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_matches";
+pub(crate) const REGEXP_REPLACE_NAME: &str = "regexp_replace";
+pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
+
+/// `DuckDB`'s list-length function, applied over `regexp_extract_all` to
+/// count the matches `regexp_count` asks for.
+const LEN_NAME: &str = "len";
+
+/// The one regexp flag both engines were measured to act on alike — see
+/// [`DuckDBRegexpFunction::screen_flags`].
+const GLOBAL_REPLACE_FLAG: &str = "g";
+
+/// `DuckDB`'s name for the both-ends trim `DataFusion` calls `btrim`.
+pub(crate) const TRIM_NAME: &str = "trim";
+
+/// The trim set `btrim` uses when called with one argument — see
+/// [`btrim_to_trim`] for why it has to be passed to `DuckDB` explicitly.
+const ASCII_SPACE: &str = " ";
+
+/// The name both engines give the integer-to-hex function. They disagree only
+/// on the case of the digits — see [`to_hex_to_lowercase_hex`].
+const TO_HEX_NAME: &str = "to_hex";
+
+/// `DuckDB`'s lower-casing function, applied over [`TO_HEX_NAME`] to match
+/// `DataFusion`'s lower-case hex digits.
+const LOWER_NAME: &str = "lower";
+
+/// `DuckDB`'s finite-number test, applied over `array_inner_product` to adopt
+/// the kernel's NULL-for-undefined rule — see [`inner_product_to_sql`].
+const IS_FINITE_NAME: &str = "isfinite";
+
+/// `DuckDB`'s list-mapping and element-access functions. [`finite_or_null`]
+/// screens a value through a one-element list so the value is written — and so
+/// evaluated — exactly once.
+const LIST_TRANSFORM_NAME: &str = "list_transform";
+const LIST_EXTRACT_NAME: &str = "list_extract";
+
+/// The lambda parameter [`finite_or_null`] binds the screened value to.
+const SCREENED_VALUE_PARAM: &str = "v";
+
+/// The name both engines give the SHA-256 function. They disagree on what it
+/// returns — see [`sha256_to_digest_bytes`].
+const SHA256_NAME: &str = "sha256";
+
+/// `DuckDB`'s hex-text-to-`BLOB` decoder, applied over [`SHA256_NAME`] so a
+/// federated digest comes back as the same bytes the kernel produces.
+const UNHEX_NAME: &str = "unhex";
+
+/// `DuckDB`'s blob-to-hex-text encoder. Used by [`encode_to_lowercase_hex`]
+/// because `DuckDB`'s own `encode` is a charset conversion, not a hex
+/// encoding.
+const HEX_NAME: &str = "hex";
+
+/// Renders `args` as a call to `duckdb_fn`, in the order given.
+///
+/// The caller is responsible for having already put `args` into the shape
+/// `duckdb_fn` expects — see [`btrim_to_trim`], which has to supply a trim set
+/// the `DataFusion` call left implicit. A function needing per-argument
+/// inspection or rejection wants
+/// [`DuckDBRegexpFunction::to_datafusion_function`]'s shape instead.
+fn renamed_fn_to_sql(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+    duckdb_fn: &str,
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    let ast_args: Vec<FunctionArg> = args
+        .iter()
+        .map(|arg| {
+            Ok::<FunctionArg, DataFusionError>(FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                unparser.expr_to_sql(arg)?,
+            )))
+        })
+        .try_collect()?;
+
+    Ok(Some(ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(duckdb_fn))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: ast_args,
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })))
+}
+
+/// Converts `DataFusion`'s `btrim` into `DuckDB`'s [`TRIM_NAME`].
+///
+/// `trim` is only an alias in `DataFusion`: the function's own name is `btrim`,
+/// so that is what the unparser emits, and `DuckDB` has no function of that
+/// name. `SELECT trim(name) FROM <a DuckDB-accelerated dataset>` therefore
+/// fails with `Catalog Error: Scalar Function with name btrim does not exist!`
+/// (issue #13794).
+///
+/// **The one-argument form is not a bare rename.** `btrim(str)` strips ASCII
+/// `U+0020` and nothing else — `general_trim` calls `trim_ascii_char(s, b' ')` —
+/// whereas `DuckDB`'s one-argument `trim(str)` strips every Unicode `Zs`
+/// separator. On `U+00A0 'x' U+00A0` `DataFusion` returns the string unchanged
+/// and `DuckDB` returns `x`, so renaming it would turn a remote error into a
+/// silently different answer, which is worse. Passing the trim set explicitly
+/// as `trim(str, ' ')` puts `DuckDB` on the character-set path, where it strips
+/// exactly the characters given.
+///
+/// The two-argument form *is* a rename: both engines strip any character of the
+/// set from both ends.
+pub(crate) fn btrim_to_trim(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    match args {
+        [input] => renamed_fn_to_sql(
+            unparser,
+            &[input.clone(), datafusion::prelude::lit(ASCII_SPACE)],
+            TRIM_NAME,
+        ),
+        [_, _] => renamed_fn_to_sql(unparser, args, TRIM_NAME),
+        // `btrim`'s signature admits one or two arguments, so the planner
+        // cannot build this. Fail rather than fall through to `Ok(None)`,
+        // which would put `btrim` back into the DuckDB SQL.
+        _ => Err(DataFusionError::Plan(format!(
+            "btrim takes one or two arguments, got {}; cannot render it as DuckDB SQL.",
+            args.len()
+        ))),
+    }
+}
+
+/// Renders `args` as a call to `function_name`, taking the arguments already
+/// as SQL. [`renamed_fn_to_sql`] is the equivalent for arguments that still
+/// need unparsing.
+fn call_ast_fn(function_name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+    ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
+            function_name,
+        ))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: args
+                .into_iter()
+                .map(|arg| FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)))
+                .collect(),
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })
+}
+
+/// Renders `inner` as the sole argument of a call to `function_name`.
+fn wrap_in_call(inner: ast::Expr, function_name: &str) -> ast::Expr {
+    call_ast_fn(function_name, vec![inner])
+}
+
+/// An unsigned integer literal.
+fn number_literal(digits: impl Into<String>) -> ast::Expr {
+    ast::Expr::Value(sqlparser::ast::Value::Number(digits.into(), false).into())
+}
+
+/// The text of a string-literal argument, or `None` for any other shape — a
+/// column, a NULL, an expression — whose value cannot be inspected at unparse
+/// time.
+fn string_literal(arg: &FunctionArg) -> Option<&str> {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(ValueWithSpan {
+            value:
+                sqlparser::ast::Value::SingleQuotedString(text)
+                | sqlparser::ast::Value::DoubleQuotedString(text),
+            ..
+        }))) => Some(text),
+        _ => None,
+    }
+}
+
+/// Why [`DuckDBRegexpFunction::screen_pattern`] refuses a pattern.
+#[derive(Debug)]
+enum PatternRefusal {
+    /// Syntax the two engines read differently — see [`re2`].
+    Syntax(re2::EngineDependentSyntax),
+    /// The pattern can match the empty string (or never matches), which the
+    /// two engines count differently.
+    MayMatchEmpty,
+}
+
+impl std::fmt::Display for PatternRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Syntax(syntax) => std::fmt::Display::fmt(syntax, f),
+            Self::MayMatchEmpty => f.write_str(
+                "it can match the empty string, which DuckDB counts differently from DataFusion",
+            ),
+        }
+    }
+}
+
+/// Whether a match of the literal `pattern` is a match to `DuckDB` exactly
+/// where it is one to the kernel: **only syntax both engines read alike**,
+/// judged by [`re2::engine_neutral_ast`] on the syntax tree the kernel's own
+/// `regex-syntax` parses.
+///
+/// This is what the whole regexp family needs, and it returns the syntax tree
+/// so `regexp_count` can add the one thing more it needs
+/// ([`screen_regexp_count_pattern`]) without parsing the text twice.
+fn screen_regexp_pattern(pattern: &str) -> Result<regex_syntax::ast::Ast, PatternRefusal> {
+    re2::engine_neutral_ast(pattern).map_err(PatternRefusal::Syntax)
+}
+
+/// The kernel's translation of a parsed pattern, or `None` where it rejects it.
+fn translate(pattern: &str, ast: &regex_syntax::ast::Ast) -> Option<regex_syntax::hir::Hir> {
+    regex_syntax::hir::translate::Translator::new()
+        .translate(pattern, ast)
+        .ok()
+}
+
+/// Whether `DuckDB` counts the matches of the literal `pattern` exactly as the
+/// kernel does. Two properties are required (issue #13870):
+///
+/// - **Only syntax both engines read alike**, [`screen_regexp_pattern`].
+/// - **Every match is at least one character long.** The kernel skips an
+///   empty match that abuts the match before it, RE2's extraction loop keeps
+///   it, so `'a*'` over `ab` counts 2 locally and 3 federated. A minimum match
+///   length of one or more rules the case out; `None` (a pattern that can
+///   never match, such as `[a&&b]`) is refused as unmeasured.
+///
+/// Counting is the only member of the family that needs it: measured on the
+/// bundled `DuckDB`, `regexp_like(s, 'a*')` and `regexp_replace(s, 'a*', 'X')`
+/// — with and without the `g` flag — answer what local evaluation answers on
+/// every row, because asking *whether* a pattern matches and replacing *a*
+/// match do not depend on how an empty match is iterated over.
+fn screen_regexp_count_pattern(pattern: &str) -> Result<regex_syntax::ast::Ast, PatternRefusal> {
+    let ast = screen_regexp_pattern(pattern)?;
+    let minimum_len = translate(pattern, &ast).and_then(|hir| hir.properties().minimum_len());
+    match minimum_len {
+        Some(min) if min > 0 => Ok(ast),
+        _ => Err(PatternRefusal::MayMatchEmpty),
+    }
+}
+
+/// Lower-cases `DuckDB`'s `to_hex`, which upper-cases the digits `DataFusion`
+/// renders in lower case.
+///
+/// Both engines have a `to_hex`, so nothing denied the call and nothing
+/// rewrote it: it was pushed into the accelerated store verbatim and came back
+/// with different characters. `to_hex(255)` is `ff` from the kernel and `FF`
+/// from `DuckDB`, so the same query over the same rows answered differently
+/// depending on whether the dataset happened to be accelerated, with no error
+/// and no warning (issue #13818). A predicate such as
+/// `WHERE to_hex(h) = 'deadbeef'` simply matched nothing.
+///
+/// Case is the *only* divergence: measured across `Int16`, `Int32` and `Int64`
+/// inputs, negative values, zero and NULL, both engines widen to 64 bits and
+/// produce the same digits in the same order, so wrapping the call in
+/// [`LOWER_NAME`] makes the two answers identical rather than merely closer.
+pub(crate) fn to_hex_to_lowercase_hex(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    match args {
+        [_] => Ok(renamed_fn_to_sql(unparser, args, TO_HEX_NAME)?
+            .map(|hex| wrap_in_call(hex, LOWER_NAME))),
+        // `to_hex` is a single-argument function, so the planner cannot build
+        // this. Fail rather than fall through to `Ok(None)`, which would put
+        // the un-lowered `to_hex` back into the DuckDB SQL.
+        _ => Err(DataFusionError::Plan(format!(
+            "to_hex takes one argument, got {}; cannot render it as DuckDB SQL.",
+            args.len()
+        ))),
+    }
+}
+
+/// Renders `concat` as `DuckDB`'s `||` operator, the only rendering whose NULL
+/// handling matches the `concat` this runtime actually evaluates.
+///
+/// The `concat` a Spice query resolves is Spark's, not `DataFusion`'s:
+/// `crates/runtime/src/datafusion/builder.rs` registers every
+/// `datafusion-spark` scalar function over the built-in of the same name,
+/// skipping only `trunc` and `avg`. `SparkConcat` computes a null mask,
+/// delegates to `DataFusion`'s `ConcatFunc`, and applies the mask, so it
+/// returns NULL when *any* argument is NULL. `DuckDB`'s `concat` — like
+/// `ConcatFunc` itself — skips a NULL argument and concatenates the rest.
+///
+/// Both engines have a function called `concat`, so nothing denied the call
+/// and nothing rewrote it: it was pushed into the accelerated store verbatim
+/// and answered differently. Over a column with one NULL row,
+/// `concat(name, 'z')` is `'z'` from `DuckDB` and NULL locally — a different
+/// value *and* a different truth under `IS NULL`, decided by whether the
+/// dataset happened to be accelerated, with no error and no warning
+/// (issue #13849).
+///
+/// `DuckDB`'s `||` propagates NULL, so `a || b || …` answers what the
+/// registered function answers. Rendering the operator rather than denying
+/// `concat` keeps the call pushed down: a deny unfederates the whole plan it
+/// appears in, which for a function this common costs every other pushdown in
+/// the query.
+///
+/// The operands are rendered as `unparser` gives them and are not cast. That
+/// is deliberate: it leaves a non-string argument to `DuckDB`'s own implicit
+/// cast, which is what the un-rewritten `concat` call already relied on.
+pub(crate) fn concat_to_string_concat(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    let Some((first, rest)) = args.split_first() else {
+        // `SparkConcat` accepts zero arguments and answers the empty string:
+        // its `coerce_types` passes an empty argument list through, and
+        // `spark_concat` returns `''` for it. So the planner does build
+        // `concat()`, and failing here would turn a query that evaluates
+        // locally into a federated plan error. Render the same constant.
+        return Ok(Some(unparser.expr_to_sql(&datafusion::prelude::lit(""))?));
+    };
+
+    let mut concatenated = unparser.expr_to_sql(first)?;
+    for arg in rest {
+        concatenated = ast::Expr::BinaryOp {
+            left: Box::new(concatenated),
+            op: ast::BinaryOperator::StringConcat,
+            right: Box::new(unparser.expr_to_sql(arg)?),
+        };
+    }
+
+    // Parenthesised so the operator keeps the precedence the function call it
+    // replaces had, wherever the expression is spliced in.
+    Ok(Some(ast::Expr::Nested(Box::new(concatenated))))
+}
+
+/// Whether [`concat_to_string_concat`]'s rendering answers what the registered
+/// `concat` answers, for a call with these arguments.
+///
+/// The rendering is `||`, which `DuckDB` types by its operands: `VARCHAR ||
+/// VARCHAR` is a `VARCHAR`, and `BLOB || BLOB` is a **`BLOB`**. The `concat` a
+/// Spice query resolves is `datafusion-spark`'s `SparkConcat`, whose
+/// `return_field_from_args` seeds `Utf8` and only ever widens to `LargeUtf8` or
+/// `Utf8View`, so it returns a string whatever its arguments are — reading a
+/// binary argument's bytes into the string builder, which validates them. So on
+/// a binary operand the two disagree on the result's *type*, and on bytes that
+/// are not valid UTF-8 they disagree on whether the query succeeds at all: the
+/// kernel raises `Invalid UTF8 sequence`, and `DuckDB` returns a row
+/// (issue #13915).
+///
+/// No rendering closes that. `concat(a, b)` has `DuckDB`'s NULL semantics,
+/// which is the divergence `concat_to_string_concat` exists to remove
+/// (issue #13849), and `CAST(a AS VARCHAR)` renders a non-UTF-8 `BLOB` as its
+/// 12-character escaped literal rather than its bytes. What is left is to keep
+/// the call local, which is what this refusal does.
+///
+/// `scope` is the schema the arguments resolve against and is `None` where the
+/// type cannot be proven. A column whose type cannot be read is refused rather
+/// than assumed to be a string: assuming wrong is a wrong answer, and refusing
+/// costs only the pushdown. A literal carries its own type and needs no scope,
+/// so an all-literal call still federates.
+///
+/// The operand's *final* type is not enough, because a cast launders it while
+/// leaving the rendering just as wrong. `CAST(blob AS VARCHAR)` reports `Utf8`
+/// here, and `DuckDB` renders the bytes as their **escaped literal** rather
+/// than validating them, where `DataFusion`'s own cast raises
+/// `Encountered non UTF-8 data`. Measured on `DuckDB` v1.4.4 through a real
+/// `spiced`: the bytes `FF FE 20 62 61 64` come back from
+/// `concat(CAST(a AS VARCHAR), 'z')` as the 13-character `\xFF\xFE badz`,
+/// with no error anywhere — the remote call already returned `VARCHAR`, so
+/// there is not even a failed scan cast to notice it, while the same query on
+/// an unaccelerated copy of the same rows refuses to answer. The operand tree is
+/// therefore searched, not just its root, which also covers the shapes a
+/// cast-only rule would miss (`coalesce`, `CASE`, a nested `concat`, or
+/// `sha256`, whose `unhex` rewrite is itself a `BLOB`).
+///
+/// This is deliberately conservative: an operand that merely *contains* a
+/// binary value is refused even where the enclosing function would have
+/// normalised it to text (`md5(blob)` agrees on both engines). That costs a
+/// pushdown on a rare shape and cannot return a wrong row, which is the
+/// direction this check is required to err in.
+pub(crate) fn concat_arguments_are_renderable(args: &[Expr], scope: Option<&DFSchema>) -> bool {
+    !args.iter().any(|arg| operand_reaches_binary(arg, scope))
+}
+
+/// Whether `DuckDB` evaluates this cast the way `DataFusion` does.
+///
+/// A cast into text is where the two engines part on binary input.
+/// `DataFusion` validates the bytes: `CAST` raises `Encountered non UTF-8
+/// data` and `TRY_CAST` answers NULL. `DuckDB`'s `CAST(BLOB AS VARCHAR)`
+/// validates nothing and renders unprintable bytes as their escaped form
+/// (`\xFF\xFE`), so both spellings return a row — in a projection, and in a
+/// filter that then selects it (issue #14355). As with
+/// [`concat_arguments_are_renderable`], no rendering closes that, so the cast
+/// stays local.
+///
+/// Casting a binary operand into a number, a date or a boolean federates: it is
+/// unsupported on both engines, so both refuse the query.
+///
+/// A cast *into* binary is refused whatever its operand, because no rendering
+/// of one answers what `DataFusion` does (issue #14397). The unparser renders
+/// no binary type, so a cast of a column fails the query at planning with
+/// `Unsupported DataType: conversion: Binary`. A cast of a string literal it
+/// sends as the bare string, which `DuckDB` converts to `BLOB` itself — and
+/// `DuckDB`'s conversion reads `\xFF` as one escaped byte and refuses
+/// non-ASCII text, where `DataFusion` keeps the string's UTF-8 bytes. The
+/// strings `\xFF` and `é` are `5c784646` and `c3a9` locally, while `DuckDB`
+/// answers `FF` for the first and raises a conversion error for the second,
+/// so a federated `a = CAST('\xFF' AS BYTEA)` selects the row holding `FF`
+/// instead of the one holding `5c784646`. Rendering `BLOB` would carry the same
+/// conversion.
+pub(crate) fn cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let (Expr::Cast(Cast {
+        expr: operand,
+        field,
+    })
+    | Expr::TryCast(TryCast {
+        expr: operand,
+        field,
+    })) = expr
+    else {
+        return true;
+    };
+    let target = field.data_type();
+    if target.is_binary() {
+        return false;
+    }
+    !target.is_string() || !operand_reaches_binary(operand, scope)
+}
+
+/// Whether `DuckDB` reads this literal as the value it carries.
+///
+/// The unparser spells a non-NULL binary literal as a hex string literal,
+/// `X'ff'`, and `DuckDB` does not read that as a `BLOB`: v1.4.4 parses `X'ff'`
+/// as the *text* `'xff'`. Compared against a `BLOB` column it then matches the
+/// row holding the three bytes `xff` instead of the one byte `0xFF`, and
+/// `X''` matches nothing where the empty blob is a row — a wrong answer with no
+/// error. The dialect has no hook for rendering a literal, so the literal, and
+/// with it the expression around it, stays local; a NULL renders as `NULL` and
+/// is read correctly.
+pub(crate) fn literal_is_renderable(expr: &Expr) -> bool {
+    let Expr::Literal(value, _) = expr else {
+        return true;
+    };
+    !is_rendered_as_hex_string(value)
+}
+
+/// Whether the unparser renders this scalar as an `X'..'` hex string literal.
+fn is_rendered_as_hex_string(value: &ScalarValue) -> bool {
+    match value {
+        ScalarValue::Binary(Some(_))
+        | ScalarValue::LargeBinary(Some(_))
+        | ScalarValue::BinaryView(Some(_))
+        | ScalarValue::FixedSizeBinary(_, Some(_)) => true,
+        ScalarValue::Dictionary(_, inner) => is_rendered_as_hex_string(inner),
+        _ => false,
+    }
+}
+
+/// Whether any node of this operand's expression tree is, or carries, a binary
+/// value — including one a cast has since retyped as text.
+///
+/// With no `scope`, a column's type cannot be read, so it counts as binary.
+fn operand_reaches_binary(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let empty = DFSchema::empty();
+    let scope = scope.unwrap_or(&empty);
+    let mut reaches = false;
+    // `Expr::apply` is infallible for a closure that never errors, so the
+    // result carries no information and the flag is the answer.
+    let _ = expr.apply(|node| {
+        // `DataType::is_binary` is Arrow's own set — `Binary`, `LargeBinary`,
+        // `FixedSizeBinary` and `BinaryView` — so a byte-array variant added
+        // upstream arrives with the dependency rather than having to be found
+        // by grep.
+        let carries_binary = match node.get_type(scope) {
+            Ok(data_type) => data_type.is_binary(),
+            // The error is deliberately not propagated: a node whose type will
+            // not resolve is treated as binary, because unprovable and unsafe
+            // are the same answer for a check that must not admit a call it
+            // cannot vouch for.
+            Err(_) => true,
+        };
+        if carries_binary {
+            reaches = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
+    reaches
+}
+
+/// Decodes `DuckDB`'s `sha256`, which returns the digest's hex *text*, back
+/// into the 32 raw bytes `DataFusion` returns.
+///
+/// Both engines have a `sha256`, so nothing denied the call and nothing
+/// rewrote it: it was pushed into the accelerated store verbatim, and the two
+/// return different things. `DataFusion`'s `sha256` returns the 32-byte digest
+/// as `Binary`; `DuckDB`'s returns its 64-character hex rendering as
+/// `VARCHAR`. The scan then casts that text into the plan's `Binary` column,
+/// so the federated column held the *ASCII bytes of the hex string* — 64 bytes
+/// that are not the digest of anything — with no error and no warning (issue
+/// #13850). Every non-NULL row differed, in length as well as content, so
+/// anything comparing a stored digest against `sha256(col)`, deduplicating on
+/// it, or joining on it changed behaviour the moment a dataset was
+/// accelerated.
+///
+/// `unhex` reverses exactly that rendering: measured on `DuckDB` v1.4.4,
+/// `unhex(sha256(x))` is a 32-byte `BLOB` holding the same digest the kernel
+/// computes, for an ASCII string, the empty string, a non-ASCII one, and NULL
+/// (which stays NULL). It also holds for a `BLOB` argument, which is what an
+/// Arrow `Binary` column becomes: `DuckDB` hashes a `BLOB`'s raw bytes rather
+/// than a text rendering of them, so a column carrying bytes that are not
+/// valid UTF-8 hashes the same on both sides.
+///
+/// The sibling digests need no handler for the same reason they cannot produce
+/// wrong data: `md5` agrees with the kernel (both render lower-case hex text),
+/// and `DuckDB` has no `sha224`, `sha384` or `sha512` at all, so those fail
+/// loudly rather than silently — the unknown-function class tracked by #10583.
+pub(crate) fn sha256_to_digest_bytes(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    match args {
+        [_] => Ok(renamed_fn_to_sql(unparser, args, SHA256_NAME)?
+            .map(|hex_text| wrap_in_call(hex_text, UNHEX_NAME))),
+        // `sha256` is a single-argument function, so the planner cannot build
+        // this. Fail rather than fall through to `Ok(None)`, which would put
+        // the undecoded `sha256` back into the DuckDB SQL.
+        _ => Err(DataFusionError::Plan(format!(
+            "sha256 takes one argument, got {}; cannot render it as DuckDB SQL.",
+            args.len()
+        ))),
+    }
+}
+
+/// Renders `DataFusion`'s `encode(x, 'hex')` as `lower(hex(x))`.
+///
+/// `DuckDB`'s `encode` is a charset conversion (`encode(s, 'utf-8')` → `BLOB`),
+/// not a hex encoder. After [`sha256_to_digest_bytes`] the nested call
+/// `encode(sha256(x), 'hex')` is unparsed as `encode(unhex(sha256(x)), 'hex')`,
+/// which `DuckDB` rejects with `Binder Error: No function matches ...
+/// encode(BLOB, STRING_LITERAL)`.
+///
+/// `hex` is `DuckDB`'s blob-to-hex-text function and upper-cases the digits
+/// `DataFusion`'s `encode(..., 'hex')` renders in lower case, so the call is
+/// wrapped in [`LOWER_NAME`]. Every other encoding, arity, or a non-literal
+/// format is refused so the call evaluates locally rather than failing remotely.
+pub(crate) fn encode_to_lowercase_hex(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    match args {
+        [data, encoding] if is_literal_hex_encoding(encoding) => {
+            Ok(
+                renamed_fn_to_sql(unparser, std::slice::from_ref(data), HEX_NAME)?
+                    .map(|hex| wrap_in_call(hex, LOWER_NAME)),
+            )
+        }
+        _ => Err(DataFusionError::Plan(format!(
+            "encode is rendered as DuckDB SQL only for a literal 'hex' encoding, got {} argument(s).",
+            args.len()
+        ))),
+    }
+}
+
+/// The order-sensitive aggregates [`ordered_aggregate_to_sql`] renders, as
+/// `DataFusion` names them, with the `DuckDB` aggregate each one becomes.
+///
+/// `DuckDB`'s `first_value` and `last_value` are window functions only. Its `first`
+/// and `last` aggregates return the first and last value in the order given, null
+/// or not, which is `DataFusion`'s default (`RESPECT NULLS`) answer.
+const ORDERED_AGGREGATES: &[(&str, &str)] = &[
+    ("string_agg", "string_agg"),
+    ("array_agg", "array_agg"),
+    ("first_value", "first"),
+    ("last_value", "last"),
+];
+
+/// Whether [`ordered_aggregate_to_sql`] renders the argument-list `ORDER BY` of the
+/// aggregate `DataFusion` calls `name`.
+pub(crate) fn renders_aggregate_order_by(name: &str) -> bool {
+    ORDERED_AGGREGATES
+        .iter()
+        .any(|(datafusion_name, _)| *datafusion_name == name)
+}
+
+/// Renders an aggregate's argument-list `ORDER BY` inside the `DuckDB` call.
+///
+/// The unparser renders an aggregate `ORDER BY` only as `WITHIN GROUP` and drops
+/// every other one, so `array_agg(x ORDER BY y)` reaches `DuckDB` as `array_agg(x)`
+/// and comes back in whatever order `DuckDB` produced. `DuckDB` takes the ordering
+/// inside the call, as `DataFusion` does, so these aggregates keep both their
+/// pushdown and their order. Any other aggregate, or one without an `ORDER BY`, is
+/// `Ok(None)` and keeps the default rendering; `duckdb_can_translate_aggregate`
+/// does not federate a default rendering that would drop an ordering.
+pub(crate) fn ordered_aggregate_to_sql(
+    unparser: &datafusion::sql::unparser::Unparser,
+    func_name: &str,
+    args: &[Expr],
+    distinct: bool,
+    filter: Option<&Expr>,
+    order_by: &[datafusion::logical_expr::SortExpr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    let Some((_, duckdb_name)) = ORDERED_AGGREGATES
+        .iter()
+        .find(|(datafusion_name, _)| *datafusion_name == func_name)
+    else {
+        return Ok(None);
+    };
+    if order_by.is_empty() {
+        return Ok(None);
+    }
+
+    let args: Vec<FunctionArg> = args
+        .iter()
+        .map(|arg| {
+            Ok::<FunctionArg, DataFusionError>(FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                unparser.expr_to_sql(arg)?,
+            )))
+        })
+        .try_collect()?;
+    let order_by: Vec<ast::OrderByExpr> = order_by
+        .iter()
+        .map(|sort| unparser.sort_to_sql(sort))
+        .try_collect()?;
+    let filter = filter
+        .map(|predicate| unparser.expr_to_sql(predicate))
+        .transpose()?
+        .map(Box::new);
+
+    Ok(Some(ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
+            *duckdb_name,
+        ))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: distinct.then_some(ast::DuplicateTreatment::Distinct),
+            args,
+            clauses: vec![ast::FunctionArgumentClause::OrderBy(order_by)],
+        }),
+        filter,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })))
+}
+
+/// Whether `encoding` is the string literal `hex`.
+///
+/// `DataFusion` matches the format case-sensitively (`"hex"` only), so a
+/// mixed-case or upper-case literal must stay local rather than answering
+/// where the kernel errors.
+fn is_literal_hex_encoding(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(value, _) => value.try_as_str().flatten() == Some("hex"),
+        _ => false,
+    }
+}
+
+/// Shared conversion for Spice vector UDFs that have a native `DuckDB` ARRAY
+/// equivalent taking two equal-length `FLOAT[N]` operands (e.g.
+/// `array_cosine_distance`, `array_inner_product`).
+///
+///  - replaces the `make_array` constructor with a `DuckDB` array literal
+///    (`make_array` is not supported in `DuckDB`)
+///  - applies the required `::FLOAT[N]` cast to array operands (only FLOAT
+///    embeddings are currently supported)
+///  - emits a call to `duckdb_fn`
+fn spice_array_fn_to_sql(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+    duckdb_fn: &str,
+) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
+    let ast_args: Vec<ast::Expr> = args
+        .iter()
+        .map(|arg| match arg {
+            // embeddings array is wrapped in a make_array function, unwrap it
+            Expr::ScalarFunction(scalar_func)
+                if scalar_func.name().to_lowercase() == "make_array" =>
+            {
+                let num_elements = scalar_func.args.len() as u64;
+
+                let array = ast::Expr::Array(ast::Array {
+                    elem: scalar_func
+                        .args
+                        .iter()
+                        .map(|x| unparser.expr_to_sql(x))
+                        .try_collect()?,
+                    named: false,
+                });
+
+                // Apply required ::FLOAT[] casting. Only FLOAT embeddings are currently supported
+                Ok(ast::Expr::Cast {
+                    expr: Box::new(array),
+                    data_type: ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
+                        Box::new(ast::DataType::Float(ast::ExactNumberInfo::None)),
+                        Some(num_elements),
+                    )),
+                    kind: ast::CastKind::DoubleColon,
+                    array: false,
+                    format: None,
+                })
+            }
+            Expr::Literal(ScalarValue::FixedSizeList(array), None) => {
+                let num_elements = u64::try_from(array.value_length()).map_err(|e| {
+                    DataFusionError::Execution(format!("Cannot cast array length to u64 {e}"))
+                })?;
+                let array = unparser.expr_to_sql(arg)?;
+
+                // Apply required ::FLOAT[] casting. Only FLOAT embeddings are curently supported
+                Ok(ast::Expr::Cast {
+                    expr: Box::new(array),
+                    data_type: ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
+                        Box::new(ast::DataType::Float(ast::ExactNumberInfo::None)),
+                        Some(num_elements),
+                    )),
+                    kind: ast::CastKind::DoubleColon,
+                    array: false,
+                    format: None,
+                })
+            }
+            // For all other expressions, directly convert them to SQL
+            _ => unparser.expr_to_sql(arg),
+        })
+        .try_collect()?;
+
+    let ast_fn = ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(duckdb_fn))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: ast_args
+                .into_iter()
+                .map(|x| ast::FunctionArg::Unnamed(FunctionArgExpr::Expr(x)))
+                .collect(),
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    });
+
+    Ok(Some(ast_fn))
+}
+
+/// Converts the `cosine_distance` UDF into `DuckDB`'s `array_cosine_distance`:
+/// `https://duckdb.org/docs/sql/functions/array.html#array_cosine_distancearray1-array2`
+pub(crate) fn cosine_distance_to_sql(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
+    spice_array_fn_to_sql(unparser, args, "array_cosine_distance")
+}
+
+/// Converts the `inner_product` UDF into `DuckDB`'s `array_inner_product` (dot
+/// product, `sum(a[i] * b[i])`), screened so a result that is not a finite
+/// number comes back NULL.
+/// `https://duckdb.org/docs/sql/functions/array.html#array_inner_productarray1-array2`
+///
+/// The screen makes the two sides agree about a result that is *not a finite
+/// number*, which is the whole of what it claims. Spice's kernel treats an
+/// undefined dot product as NULL — `compute_fsl_f32` appends a null whenever
+/// the result is not finite — because `_score` is derived from it and a
+/// fabricated score outranks every real match. `array_inner_product` has no
+/// such rule and hands back the `inf` or `nan` it computed, so a vector the
+/// kernel drops as undefined became the top row of every federated query
+/// instead (issue #13787). Measured on the pinned `DuckDB` 1.4.4 for a dot
+/// product that overflows `FLOAT` and for a vector carrying `nan` or an
+/// infinity; a null operand is already NULL on both sides.
+///
+/// **Finite results still differ, and this does not address that.** Both sides
+/// accumulate in `f32` but in different summation orders, so 149 of 269
+/// measured rows disagree — most by one ULP, and a cancelling case by `2.8e30`.
+/// No rewrite of the emitted SQL reconciles a summation order; issue #13893
+/// holds that question.
+///
+/// Screening the *result* rather than the inputs is what the kernel does, and
+/// for this kernel the two coincide: a non-finite element always reaches the
+/// sum (`inf * 0` is `nan`, `inf + -inf` is `nan`), so there is no input that
+/// produces a finite dot product. `Kernel::hides_non_finite_input` records the
+/// same reasoning on the Rust side, where only `Cosine` needs the input screen.
+pub(crate) fn inner_product_to_sql(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
+    Ok(spice_array_fn_to_sql(unparser, args, "array_inner_product")?.map(finite_or_null))
+}
+
+/// Wraps `value` so that a non-finite result renders as NULL, binding it to a
+/// lambda parameter so it is evaluated once:
+/// `list_extract(list_transform([<value>], v -> CASE WHEN isfinite(v) THEN v END), 1)`.
+///
+/// **The one-element list is what makes the screen sound, not decoration.** The
+/// direct spelling — `CASE WHEN isfinite(<value>) THEN <value> END` — writes
+/// `value` twice, and `DuckDB` evaluates the two occurrences independently. A
+/// volatile argument therefore draws a different number in the test than in the
+/// result, and a row whose test drew a finite value returns its non-finite one:
+/// the screen passes through exactly what it exists to stop. `rand` is in
+/// [`crate::dialect::duckdb_scalar_overrides`] and renders as `random()`, so
+/// `inner_product(make_array(rand(), …), col)` is a call this handler can be
+/// given; nothing on the unparse path gates on volatility. Raised by Copilot on
+/// PR #13895.
+///
+/// Measured on the pinned `DuckDB` 1.4.4, over 400 rows whose array argument
+/// draws `1.0` or `3e38` per evaluation against a `[3e38]` column, so every
+/// product either is finite or overflows `FLOAT`:
+///
+/// | screen | non-finite values that survived |
+/// |---|---|
+/// | `CASE WHEN isfinite(x) THEN x END` | **94 of 400** |
+/// | this one | **0 of 400** |
+///
+/// Both screens NULL all 400 when the same product is written non-volatile, so
+/// the difference is the double evaluation and nothing else.
+///
+/// The list costs little where it matters. Same engine, `ORDER BY … DESC LIMIT
+/// 10` over `array_inner_product` against the unscreened call: 1.91x on
+/// 8-element vectors (2M rows), **1.03x** on 384-element ones (200k rows). The
+/// margin collapses as the per-row vector work grows, because what the screen
+/// adds is per-row list machinery rather than a second dot product — which is
+/// also the measurement that rules out the list being materialised per element.
+fn finite_or_null(value: ast::Expr) -> ast::Expr {
+    let param = ast::Expr::Identifier(Ident::new(SCREENED_VALUE_PARAM));
+    let screen = ast::Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![ast::CaseWhen {
+            condition: wrap_in_call(param.clone(), IS_FINITE_NAME),
+            result: param,
+        }],
+        // No ELSE: a CASE with no matching WHEN is NULL, which is the answer
+        // the kernel gives for a result that is not a finite number.
+        else_result: None,
+    };
+
+    let screened = call_ast_fn(
+        LIST_TRANSFORM_NAME,
+        vec![
+            ast::Expr::Array(Array {
+                elem: vec![value],
+                named: false,
+            }),
+            ast::Expr::Lambda(ast::LambdaFunction {
+                params: ast::OneOrManyWithParens::One(ast::LambdaFunctionParameter {
+                    name: Ident::new(SCREENED_VALUE_PARAM),
+                    data_type: None,
+                }),
+                body: Box::new(screen),
+                syntax: ast::LambdaSyntax::Arrow,
+            }),
+        ],
+    );
+
+    call_ast_fn(LIST_EXTRACT_NAME, vec![screened, number_literal("1")])
+}
+
+/// Converts `array_distance(query, embed_col)` to `DuckDB` `array_distance` with explicit
+/// `::FLOAT[N]` casts on both arguments.
+///
+/// `DuckDB`'s `array_distance` requires both arguments to have the same element type. When the
+/// stored embedding column has type `DECIMAL(12,11)[]` and the query literal is `FLOAT[N]`,
+/// `DuckDB` rejects the call. Casting both sides to `FLOAT[N]` resolves the mismatch.
+pub(crate) fn array_distance_to_sql(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
+    let num_elements: Option<u64> = args.iter().find_map(|arg| match arg {
+        Expr::Literal(ScalarValue::FixedSizeList(array), _) => {
+            u64::try_from(array.value_length()).ok()
+        }
+        _ => None,
+    });
+
+    let cast_to_float_array = |expr: ast::Expr| -> ast::Expr {
+        let Some(n) = num_elements else {
+            return expr;
+        };
+        ast::Expr::Cast {
+            expr: Box::new(expr),
+            data_type: ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
+                Box::new(ast::DataType::Float(ast::ExactNumberInfo::None)),
+                Some(n),
+            )),
+            kind: ast::CastKind::DoubleColon,
+            array: false,
+            format: None,
+        }
+    };
+
+    let ast_args: Vec<ast::Expr> = args
+        .iter()
+        .map(|arg| unparser.expr_to_sql(arg).map(cast_to_float_array))
+        .try_collect()?;
+
+    let ast_fn = ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
+            "array_distance",
+        ))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: ast_args
+                .into_iter()
+                .map(|x| ast::FunctionArg::Unnamed(FunctionArgExpr::Expr(x)))
+                .collect(),
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    });
+
+    Ok(Some(ast_fn))
+}
+
+#[expect(clippy::unnecessary_wraps)] // Required to match the signature of the `ScalarFnToSqlHandler` trait
+pub(crate) fn rand_to_random(
+    _unparser: &datafusion::sql::unparser::Unparser,
+    _args: &[Expr],
+) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
+    let ast_fn = ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new("random"))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    });
+
+    Ok(Some(ast_fn))
+}
+
+pub(super) enum DuckDBRegexpFunction {
+    Like,
+    Replace,
+    Count,
+}
+
+impl DuckDBRegexpFunction {
+    /// Where the call carries its flags, if it carries any: `regexp_like(str,
+    /// regexp[, flags])`, `regexp_replace(str, regexp, replacement[, flags])`,
+    /// `regexp_count(str, regexp[, start[, flags]])`.
+    fn flags_position(&self) -> usize {
+        match self {
+            DuckDBRegexpFunction::Like => 2,
+            DuckDBRegexpFunction::Replace | DuckDBRegexpFunction::Count => 3,
+        }
+    }
+
+    /// Whether `DuckDB` reads the literal `pattern` as this function needs it
+    /// to: every member of the family needs [`screen_regexp_pattern`], and
+    /// `regexp_count` needs [`screen_regexp_count_pattern`]'s extra
+    /// empty-match rule on top of it.
+    fn screen_pattern(&self, pattern: &str) -> Result<regex_syntax::ast::Ast, PatternRefusal> {
+        match self {
+            DuckDBRegexpFunction::Count => screen_regexp_count_pattern(pattern),
+            DuckDBRegexpFunction::Like | DuckDBRegexpFunction::Replace => {
+                screen_regexp_pattern(pattern)
+            }
+        }
+    }
+
+    /// Whether the call's flags argument — absent for the common shape — is
+    /// one the two engines act on alike.
+    ///
+    /// Only `g` is, and only `regexp_replace` takes it. It is not regex syntax
+    /// at all: it selects replace-all over replace-first, which both engines
+    /// do identically — measured on the bundled `DuckDB`, a global replace
+    /// agrees with local evaluation row for row, the empty-match case
+    /// (`regexp_replace(s, 'a*', 'X', 'g')`) included.
+    ///
+    /// Every other flag *is* regex syntax, so the refusal is the one
+    /// [`re2::EngineDependentSyntax::Flag`] already states for the inline
+    /// `(?i)` spelling of the same request — one sentence, written once, so
+    /// the two spellings cannot be explained differently. The divergence it
+    /// describes is measured on the argument spelling too:
+    /// `regexp_like(s, '\x{1C89}', 'i')` over `ᲊ` (U+1C8A) is `true` locally
+    /// and `false` federated, because the pinned `regex-syntax` folds the pair
+    /// and the pinned `DuckDB`'s RE2 does not (issue #14148).
+    fn screen_flags(&self, ast_args: &[FunctionArg]) -> Result<(), DataFusionError> {
+        let Some(flags_arg) = ast_args.get(self.flags_position()) else {
+            return Ok(());
+        };
+        let flags = string_literal(flags_arg);
+        if matches!(self, DuckDBRegexpFunction::Replace) && flags == Some(GLOBAL_REPLACE_FLAG) {
+            return Ok(());
+        }
+        let refusal = PatternRefusal::Syntax(re2::EngineDependentSyntax::Flag);
+        Err(DataFusionError::Plan(format!(
+            "Flags `{}` are not supported for regular expression function {} with DuckDB: {refusal}",
+            flags.unwrap_or_default(),
+            self.federated_function_name()
+        )))
+    }
+
+    /// Whether the two engines build the same string out of the call's
+    /// replacement argument — `regexp_replace` only, and only for a string
+    /// literal, since a value that cannot be read here cannot be judged here.
+    /// `capture_groups` counts the groups of the call's pattern, the ones a
+    /// replacement may name. The rule and its measurement are
+    /// [`re2::engine_neutral_replacement`].
+    fn screen_replacement(
+        &self,
+        ast_args: &[FunctionArg],
+        capture_groups: usize,
+    ) -> Result<(), DataFusionError> {
+        let name = self.federated_function_name();
+        let Some(replacement) = ast_args.get(2).and_then(string_literal) else {
+            return Err(DataFusionError::Plan(format!(
+                "Only string literal replacements are supported for regular expression function {name} with DuckDB"
+            )));
+        };
+        re2::engine_neutral_replacement(replacement, capture_groups).map_err(|syntax| {
+            let refusal = PatternRefusal::Syntax(syntax);
+            DataFusionError::Plan(format!(
+                "Replacement `{replacement}` is not supported for regular expression function {name} with DuckDB: {refusal}"
+            ))
+        })
+    }
+
+    /// Refuses every call the two engines would not answer alike. A refusal is
+    /// not an error the user sees: `duckdb_can_translate` turns it into
+    /// "evaluate locally", so the call still answers (#13900).
+    ///
+    /// The screens run cheapest first, since a refusal by any of them ends the
+    /// call: the flags argument is one string compare, then the pattern is
+    /// parsed, and the replacement is judged last because the groups it may
+    /// name are the pattern's.
+    ///
+    /// **Pattern — all three functions.** Only a string literal is rendered,
+    /// and only one [`screen_regexp_pattern`] accepts: syntax both engines
+    /// read alike, with `regexp_count` additionally requiring that no match be
+    /// empty ([`screen_regexp_count_pattern`]). Anything else — including a
+    /// pattern read from a column, whose values cannot be inspected here —
+    /// stays local. The screen reached `regexp_count` alone until issue
+    /// #14148: measured on the bundled `DuckDB`, `regexp_like(s, '\d')` over
+    /// `xy١` is `true` locally and `false` federated, `regexp_replace(s, '\w',
+    /// 'X')` leaves `ſ` untouched federated and replaces it locally, and
+    /// `regexp_like(s, 'a++')` fails the query remotely with `bad repetition
+    /// operator` where the kernel answers.
+    fn screen_call(&self, ast_args: &[FunctionArg]) -> Result<(), DataFusionError> {
+        let name = self.federated_function_name();
+
+        self.screen_flags(ast_args)?;
+
+        let Some(pattern) = ast_args.get(1).and_then(string_literal) else {
+            return Err(DataFusionError::Plan(format!(
+                "Only string literal patterns are supported for regular expression function {name} with DuckDB"
+            )));
+        };
+        let ast = self.screen_pattern(pattern).map_err(|refusal| {
+            DataFusionError::Plan(format!(
+                "Pattern `{pattern}` is not supported for regular expression function {name} with DuckDB: {refusal}"
+            ))
+        })?;
+
+        if matches!(self, DuckDBRegexpFunction::Replace) {
+            // A pattern the translator rejects has no groups to name, so only
+            // a replacement with no backslash at all can pass.
+            let capture_groups =
+                translate(pattern, &ast).map_or(0, |hir| hir.properties().explicit_captures_len());
+            self.screen_replacement(ast_args, capture_groups)?;
+        }
+        Ok(())
+    }
+
+    /// Reshapes the arguments of `regexp_count(str, regexp[, start[, flags]])`
+    /// into those of `regexp_extract_all(str, regexp[, group, options])`. The
+    /// other two functions take `DuckDB`'s arguments as they stand.
+    ///
+    /// The kernel counts from a 1-based character position, which `DuckDB` has
+    /// no regexp argument for, so the input is narrowed to `SUBSTRING(str,
+    /// start)` first — `SUBSTRING` is 1-based in both engines, so the position
+    /// is passed through unchanged. A start that is not an integer literal
+    /// cannot become an offset at unparse time and is refused, as is one below
+    /// 1, which the kernel rejects, and one above `u32::MAX`, which `DuckDB`'s
+    /// `SUBSTRING` rejects (`Substring offset outside of supported range`)
+    /// where the kernel accepts it.
+    fn process_args(&self, ast_args: &mut Vec<FunctionArg>) -> Result<(), DataFusionError> {
+        let name = self.federated_function_name();
+
+        if !matches!(self, DuckDBRegexpFunction::Count) {
+            return Ok(());
+        }
+
+        if ast_args.len() >= 3 {
+            let start_arg = ast_args.remove(2);
+            let FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(ValueWithSpan {
+                value: sqlparser::ast::Value::Number(num_str, _),
+                ..
+            }))) = start_arg
+            else {
+                return Err(DataFusionError::Plan(format!(
+                    "Only integer start positions are supported for regular expression function {name} with DuckDB"
+                )));
+            };
+            let start: u64 = num_str.parse().map_err(|e| {
+                DataFusionError::Plan(format!(
+                    "Could not parse start position {num_str} as integer for function {name}: {e}"
+                ))
+            })?;
+            if start < 1 {
+                return Err(DataFusionError::Plan(format!(
+                    "Start position must be a positive integer for regular expression function {name}, received {start}"
+                )));
+            }
+            if start > u64::from(u32::MAX) {
+                return Err(DataFusionError::Plan(format!(
+                    "Start position {start} is outside the range DuckDB's SUBSTRING accepts for regular expression function {name}"
+                )));
+            }
+
+            let FunctionArg::Unnamed(FunctionArgExpr::Expr(input)) = ast_args.remove(0) else {
+                return Err(DataFusionError::Plan(format!(
+                    "Regular expression function {name} requires an input expression as its first argument"
+                )));
+            };
+            ast_args.insert(
+                0,
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Substring {
+                    expr: Box::new(input),
+                    substring_from: Some(Box::new(number_literal(num_str))),
+                    substring_for: None,
+                    special: true,
+                    shorthand: false,
+                })),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// `regexp_count` answers NULL for a NULL input, as `PostgreSQL` does, and
+    /// so does `len(regexp_extract_all(NULL, p))`: the count is
+    /// `len(regexp_extract_all(..))`. Any other answer for a NULL row
+    /// propagates differently through `SUM`, through `= 0` and through a
+    /// `WHERE` built on it, so an accelerated dataset would gain or lose rows
+    /// against an unaccelerated one (issue #13870). The other two regexp
+    /// functions propagate NULL in both engines and are left alone.
+    fn postprocess_function(&self, ast_fn: ast::Expr) -> ast::Expr {
+        match self {
+            DuckDBRegexpFunction::Count => wrap_in_call(ast_fn, LEN_NAME),
+            DuckDBRegexpFunction::Like | DuckDBRegexpFunction::Replace => ast_fn,
+        }
+    }
+
+    fn federated_function_name(&self) -> &str {
+        match self {
+            DuckDBRegexpFunction::Like => REGEXP_LIKE_NAME,
+            DuckDBRegexpFunction::Replace => REGEXP_REPLACE_NAME,
+            DuckDBRegexpFunction::Count => REGEXP_COUNT_NAME,
+        }
+    }
+
+    /// Maps an input function to an underlying function, whose underlying function accepts the same arguments as the input function
+    /// For example, ``DataFusion``'s ``regexp_like`` -> ``DuckDB``'s ``regexp_matches``
+    ///
+    /// Screening comes before the reshaping, because [`Self::screen_call`]
+    /// reads the flags at the position the *call* carries them and
+    /// [`Self::process_args`] moves `regexp_count`'s start argument out from
+    /// under it.
+    pub(super) fn to_datafusion_function(
+        &self,
+    ) -> impl Fn(
+        &datafusion::sql::unparser::Unparser,
+        &[Expr],
+    ) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
+        move |unparser, args| {
+            let mut ast_args: Vec<FunctionArg> = args
+                .iter()
+                .map(|arg| {
+                    Ok::<FunctionArg, DataFusionError>(FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                        unparser.expr_to_sql(arg)?,
+                    )))
+                })
+                .try_collect()?;
+
+            self.screen_call(&ast_args)?;
+            self.process_args(&mut ast_args)?;
+
+            let ast_fn = ast::Expr::Function(Function {
+                name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
+                    self.federated_function_name(),
+                ))]),
+                args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                    duplicate_treatment: None,
+                    args: ast_args,
+                    clauses: vec![],
+                }),
+                filter: None,
+                null_treatment: None,
+                over: None,
+                within_group: vec![],
+                parameters: ast::FunctionArguments::None,
+                uses_odbc_syntax: false,
+            });
+
+            Ok(Some(self.postprocess_function(ast_fn)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{FixedSizeListArray, Float32Array};
+    use arrow_schema::{DataType, Field};
+    use datafusion::{
+        common::TableReference,
+        common::{Column, Spans},
+        functions::regex::expr_fn::{regexp_count, regexp_like, regexp_replace},
+        functions_nested::make_array::make_array_udf,
+        logical_expr::expr::ScalarFunction,
+        prelude::{Expr, col, lit},
+        scalar::ScalarValue,
+        sql::unparser::Unparser,
+    };
+
+    use crate::dialect::new_duckdb_dialect;
+
+    fn fixed_size_list_literal(values: Vec<f32>) -> Expr {
+        let n = i32::try_from(values.len()).expect("values length fits in i32");
+        let inner = Arc::new(Float32Array::from(values));
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let array =
+            FixedSizeListArray::try_new(field, n, inner, None).expect("valid FixedSizeListArray");
+        Expr::Literal(ScalarValue::FixedSizeList(Arc::new(array)), None)
+    }
+
+    use super::*;
+
+    #[test]
+    fn test_cosine_distance_to_sql_scalars() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let args = vec![
+            // raw values
+            Expr::ScalarFunction(ScalarFunction::new_udf(
+                make_array_udf(),
+                vec![lit(1.0), lit(2.0), lit(3.0)],
+            )),
+            // values wrapped as literals
+            Expr::ScalarFunction(ScalarFunction::new_udf(
+                make_array_udf(),
+                vec![
+                    Expr::Literal(ScalarValue::Float32(Some(4.0)), None),
+                    Expr::Literal(ScalarValue::Float32(Some(5.0)), None),
+                    Expr::Literal(ScalarValue::Float32(Some(6.0)), None),
+                ],
+            )),
+        ];
+        let result = cosine_distance_to_sql(&unparser, &args)
+            .expect("should execute successfully")
+            .expect("should return expression");
+
+        let expected =
+            "array_cosine_distance([1.0, 2.0, 3.0]::FLOAT[3], [4.0, 5.0, 6.0]::FLOAT[3])";
+
+        assert_eq!(result.to_string(), expected);
+    }
+
+    #[test]
+    fn test_cosine_distance_to_sql_column_and_scalar() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let args = vec![
+            Expr::Column(Column {
+                relation: Some(TableReference::from("table_name")),
+                name: "column_name".to_string(),
+                spans: Spans::new(),
+            }),
+            Expr::ScalarFunction(ScalarFunction::new_udf(
+                make_array_udf(),
+                vec![
+                    Expr::Literal(ScalarValue::Float32(Some(4.0)), None),
+                    Expr::Literal(ScalarValue::Float32(Some(5.0)), None),
+                    Expr::Literal(ScalarValue::Float32(Some(6.0)), None),
+                ],
+            )),
+        ];
+
+        let result = cosine_distance_to_sql(&unparser, &args)
+            .expect("should execute successfully")
+            .expect("should return expression");
+        let expected =
+            r#"array_cosine_distance("table_name"."column_name", [4.0, 5.0, 6.0]::FLOAT[3])"#;
+
+        assert_eq!(result.to_string(), expected);
+    }
+
+    #[test]
+    fn test_inner_product_to_sql_column_and_scalar() {
+        // inner_product(column, [4,5,6]) must unparse to DuckDB's native
+        // array_inner_product with the ::FLOAT[N] casts the array functions
+        // need, wrapped in the `isfinite` screen that gives a non-finite
+        // result the NULL the kernel gives it (issue #13787).
+        //
+        // The call appears ONCE, inside a one-element list. That is what makes
+        // the screen sound against a volatile argument, which DuckDB would
+        // otherwise draw independently for the test and for the result — so a
+        // rewrite back to `CASE WHEN isfinite(<call>) THEN <call> END` must
+        // fail here rather than pass on a shorter string.
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let args = vec![
+            Expr::Column(Column {
+                relation: Some(TableReference::from("table_name")),
+                name: "embedding".to_string(),
+                spans: Spans::new(),
+            }),
+            Expr::ScalarFunction(ScalarFunction::new_udf(
+                make_array_udf(),
+                vec![
+                    Expr::Literal(ScalarValue::Float32(Some(4.0)), None),
+                    Expr::Literal(ScalarValue::Float32(Some(5.0)), None),
+                    Expr::Literal(ScalarValue::Float32(Some(6.0)), None),
+                ],
+            )),
+        ];
+
+        let result = inner_product_to_sql(&unparser, &args)
+            .expect("should execute successfully")
+            .expect("should return expression");
+        let expected = r#"list_extract(list_transform([array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3])], v -> CASE WHEN isfinite(v) THEN v END), 1)"#;
+        let rendered = result.to_string();
+        assert_eq!(rendered, expected);
+        assert_eq!(
+            rendered.matches("array_inner_product").count(),
+            1,
+            "the screened call must be written once, or a volatile argument is \
+             drawn twice and a non-finite result survives the screen: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_array_distance_to_sql_literal_and_column() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let args = vec![
+            fixed_size_list_literal(vec![1.0, 2.0, 3.0]),
+            Expr::Column(Column {
+                relation: Some(TableReference::from("bluesky_posts")),
+                name: "text_embedding".to_string(),
+                spans: Spans::new(),
+            }),
+        ];
+
+        let result = array_distance_to_sql(&unparser, &args)
+            .expect("should execute successfully")
+            .expect("should return expression");
+
+        let expected = r#"array_distance([1.0, 2.0, 3.0]::FLOAT[3], "bluesky_posts"."text_embedding"::FLOAT[3])"#;
+        assert_eq!(result.to_string(), expected);
+    }
+
+    #[test]
+    fn test_array_distance_to_sql_two_literals() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let args = vec![
+            fixed_size_list_literal(vec![0.1, 0.2]),
+            fixed_size_list_literal(vec![0.3, 0.4]),
+        ];
+
+        let result = array_distance_to_sql(&unparser, &args)
+            .expect("should execute successfully")
+            .expect("should return expression");
+
+        let expected = "array_distance([0.1, 0.2]::FLOAT[2], [0.3, 0.4]::FLOAT[2])";
+        assert_eq!(result.to_string(), expected);
+    }
+
+    #[test]
+    fn test_rand_to_random() {
+        // `rand` is a deny-listed Spice function that the federation deny-list
+        // nonetheless lets push down to DuckDB *because* this dialect rewrites it
+        // into DuckDB's native `random()`. This test backs that pushdown claim:
+        // if the rewrite ever broke, pushing `rand` to DuckDB would emit invalid
+        // SQL.
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let result = rand_to_random(&unparser, &[])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(result.to_string(), "random()");
+    }
+
+    /// A filter value with a backslash before a quote must reach `DuckDB` as a
+    /// literal it can parse and that means that value: `DuckDB` reads backslash
+    /// literally, so the quote has to be doubled, and `sqlparser` alone skips it.
+    #[test]
+    fn filter_string_literals_with_backslashes_and_quotes_unparse_exactly() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "customer_id".to_string(),
+            spans: Spans::new(),
+        });
+
+        for (value, expected) in [
+            (r"a\b", r#"("t"."customer_id" = 'a\b')"#),
+            ("a'b", r#"("t"."customer_id" = 'a''b')"#),
+            (r"a\'b", r#"("t"."customer_id" = ('a\' || '''' || 'b'))"#),
+            (
+                "a''b",
+                r#"("t"."customer_id" = ('a' || '''' || '''' || 'b'))"#,
+            ),
+        ] {
+            let rendered = unparser
+                .expr_to_sql(&column.clone().eq(lit(value)))
+                .expect("filter should unparse");
+            assert_eq!(rendered.to_string(), expected, "value {value:?}");
+        }
+    }
+
+    /// `trim` is an alias of `btrim` in `DataFusion`, so the planner resolves
+    /// `trim(x)` to a `btrim` call and the unparser emits the function's own
+    /// name. `DuckDB` has no `btrim`, which is what issue #13794 hits.
+    ///
+    /// The one-argument call must carry the trim set: a bare `trim(x)` puts
+    /// `DuckDB` on its Unicode-`Zs` path, which `btrim` is not.
+    #[test]
+    fn btrim_unparses_to_duckdb_trim() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "name".to_string(),
+            spans: Spans::new(),
+        });
+
+        for (args, expected) in [
+            (vec![column.clone()], r#"trim("t"."name", ' ')"#),
+            (vec![column, lit("xy")], r#"trim("t"."name", 'xy')"#),
+        ] {
+            let rendered = btrim_to_trim(&unparser, &args)
+                .expect("should execute successfully")
+                .expect("should return expression");
+            assert_eq!(rendered.to_string(), expected);
+        }
+    }
+
+    /// `btrim`'s own signature admits only one or two arguments, so this is a
+    /// defensive arm — but it must be an error, not `Ok(None)`, which would
+    /// hand `btrim` straight back to `DuckDB`.
+    #[test]
+    fn btrim_with_an_impossible_arity_is_an_error_not_a_passthrough() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        let error = btrim_to_trim(&unparser, &[lit("a"), lit("b"), lit("c")])
+            .expect_err("three arguments cannot be rendered");
+        assert!(
+            error
+                .to_string()
+                .contains("btrim takes one or two arguments"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The whole `btrim` call, planned from SQL and unparsed through the
+    /// dialect, so a handler that is written but never installed fails here.
+    #[test]
+    fn duckdb_dialect_installs_the_btrim_override() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::string::btrim(),
+            vec![lit("  hi  ")],
+        ));
+
+        let rendered = unparser
+            .expr_to_sql(&call)
+            .expect("btrim unparses for DuckDB");
+        assert_eq!(rendered.to_string(), "trim('  hi  ', ' ')");
+    }
+
+    /// Both engines have a `to_hex`, so the call federated verbatim and came
+    /// back with upper-case digits where the kernel produces lower-case ones —
+    /// a silently different answer, not an error (regression test for #13818).
+    #[test]
+    fn to_hex_unparses_to_a_lowercased_duckdb_to_hex() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "h".to_string(),
+            spans: Spans::new(),
+        });
+
+        let rendered = to_hex_to_lowercase_hex(&unparser, &[column])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(rendered.to_string(), r#"lower(to_hex("t"."h"))"#);
+    }
+
+    /// `to_hex` takes exactly one argument, so this is a defensive arm — but it
+    /// must be an error, not `Ok(None)`, which would hand the un-lowered
+    /// `to_hex` straight back to `DuckDB`.
+    #[test]
+    fn to_hex_with_an_impossible_arity_is_an_error_not_a_passthrough() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        let error = to_hex_to_lowercase_hex(&unparser, &[lit(1_i64), lit(2_i64)])
+            .expect_err("two arguments cannot be rendered");
+        assert!(
+            error.to_string().contains("to_hex takes one argument"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The whole `to_hex` call, planned from the `DataFusion` UDF and unparsed
+    /// through the dialect, so a handler that is written but never installed
+    /// fails here rather than in a federated query.
+    #[test]
+    fn duckdb_dialect_installs_the_to_hex_override() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::string::to_hex(),
+            vec![lit(255_i64)],
+        ));
+
+        let rendered = unparser
+            .expr_to_sql(&call)
+            .expect("to_hex unparses for DuckDB");
+        assert_eq!(rendered.to_string(), "lower(to_hex(255))");
+    }
+
+    /// Both engines have a `sha256`, so the call federated verbatim and came
+    /// back as the digest's hex *text* where the kernel returns the digest's
+    /// 32 bytes — a silently different column, not an error (regression test
+    /// for #13850).
+    #[test]
+    fn sha256_unparses_to_a_duckdb_sha256_decoded_back_to_bytes() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "name".to_string(),
+            spans: Spans::new(),
+        });
+
+        let rendered = sha256_to_digest_bytes(&unparser, &[column])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(rendered.to_string(), r#"unhex(sha256("t"."name"))"#);
+    }
+
+    /// `sha256` takes exactly one argument, so this is a defensive arm — but it
+    /// must be an error, not `Ok(None)`, which would hand the undecoded
+    /// `sha256` straight back to `DuckDB`.
+    #[test]
+    fn sha256_with_an_impossible_arity_is_an_error_not_a_passthrough() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        let error = sha256_to_digest_bytes(&unparser, &[lit("a"), lit("b")])
+            .expect_err("two arguments cannot be rendered");
+        assert!(
+            error.to_string().contains("sha256 takes one argument"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The whole `sha256` call, planned from the `DataFusion` UDF and unparsed
+    /// through the dialect, so a handler that is written but never installed
+    /// fails here rather than in a federated query.
+    #[test]
+    fn duckdb_dialect_installs_the_sha256_override() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::crypto::sha256(),
+            vec![lit("alpha")],
+        ));
+
+        let rendered = unparser
+            .expr_to_sql(&call)
+            .expect("sha256 unparses for DuckDB");
+        assert_eq!(rendered.to_string(), "unhex(sha256('alpha'))");
+    }
+
+    /// `DuckDB`'s `encode` is a charset conversion, so `encode(unhex(sha256(x)),
+    /// 'hex')` fails remotely. The hex form must unparse as `lower(hex(..))`.
+    #[test]
+    fn encode_hex_unparses_to_a_lowercased_duckdb_hex() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "name".to_string(),
+            spans: Spans::new(),
+        });
+
+        let rendered = encode_to_lowercase_hex(&unparser, &[column, lit("hex")])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(rendered.to_string(), r#"lower(hex("t"."name"))"#);
+    }
+
+    /// A non-hex encoding, a column format, or the wrong arity must be an
+    /// error — not `Ok(None)`, which would hand `DuckDB`'s charset `encode`
+    /// the call and fail the query.
+    #[test]
+    fn encode_without_a_literal_hex_format_is_an_error_not_a_passthrough() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "name".to_string(),
+            spans: Spans::new(),
+        });
+
+        for args in [
+            vec![column.clone(), lit("base64")],
+            vec![column.clone(), lit("HEX")],
+            vec![column.clone(), col("fmt")],
+            vec![column.clone()],
+            vec![column, lit("hex"), lit("extra")],
+        ] {
+            let error = encode_to_lowercase_hex(&unparser, &args)
+                .expect_err("only encode(x, 'hex') renders");
+            assert!(
+                error
+                    .to_string()
+                    .contains("encode is rendered as DuckDB SQL only for a literal 'hex'"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    /// `DuckDB` takes an aggregate `ORDER BY` inside the call, as `DataFusion` does,
+    /// and the default rendering drops it. Through the whole dialect, so a rendering
+    /// that is written but never installed fails here: each call keeps its ordering,
+    /// `DISTINCT` and `FILTER`, and `first_value`/`last_value` take `DuckDB`'s
+    /// aggregate names.
+    #[test]
+    fn ordered_aggregates_render_their_order_by_inside_the_duckdb_call() {
+        use datafusion::functions_aggregate::expr_fn::{array_agg, first_value, last_value};
+        use datafusion::functions_aggregate::string_agg::string_agg;
+        use datafusion::logical_expr::ExprFunctionExt as _;
+
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let cases = [
+            (
+                string_agg(col("t.s"), lit("|"))
+                    .distinct()
+                    .order_by(vec![col("t.s").sort(true, false)])
+                    .build()
+                    .expect("ordered distinct string_agg"),
+                r#"string_agg(DISTINCT "t"."s", '|' ORDER BY "t"."s" ASC NULLS LAST)"#,
+            ),
+            (
+                array_agg(col("t.i"))
+                    .order_by(vec![col("t.i").sort(false, true)])
+                    .filter(col("t.i").gt(lit(1)))
+                    .build()
+                    .expect("ordered filtered array_agg"),
+                r#"array_agg("t"."i" ORDER BY "t"."i" DESC NULLS FIRST) FILTER (WHERE ("t"."i" > 1))"#,
+            ),
+            (
+                first_value(col("t.s"), vec![col("t.i").sort(true, false)]),
+                r#"first("t"."s" ORDER BY "t"."i" ASC NULLS LAST)"#,
+            ),
+            (
+                last_value(col("t.s"), vec![col("t.i").sort(false, true)]),
+                r#"last("t"."s" ORDER BY "t"."i" DESC NULLS FIRST)"#,
+            ),
+        ];
+        for (call, expected) in cases {
+            let rendered = unparser
+                .expr_to_sql(&call)
+                .expect("an ordered aggregate unparses for DuckDB");
+            assert_eq!(rendered.to_string(), expected, "rendering of {call}");
+        }
+
+        assert_eq!(
+            unparser
+                .expr_to_sql(&array_agg(col("t.i")))
+                .expect("array_agg unparses for DuckDB")
+                .to_string(),
+            r#"array_agg("t"."i")"#,
+            "an aggregate without an ORDER BY keeps the default rendering"
+        );
+    }
+
+    /// The whole `encode(sha256(x), 'hex')` call, so a handler that is written
+    /// but never installed fails here rather than as a federated Binder Error.
+    #[test]
+    fn duckdb_dialect_installs_the_encode_override() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::encoding::encode(),
+            vec![
+                Expr::ScalarFunction(ScalarFunction::new_udf(
+                    datafusion::functions::crypto::sha256(),
+                    vec![lit("alpha")],
+                )),
+                lit("hex"),
+            ],
+        ));
+
+        let rendered = unparser
+            .expr_to_sql(&call)
+            .expect("encode(sha256(..), 'hex') unparses for DuckDB");
+        assert_eq!(
+            rendered.to_string(),
+            "lower(hex(unhex(sha256('alpha'))))",
+            "the sha256 rewrite yields a BLOB; encode('hex') must wrap that in lower(hex(..))"
+        );
+    }
+
+    #[test]
+    fn duckdb_native_function_names_advertises_denylisted_pushables() {
+        use std::collections::BTreeSet;
+
+        // The federation deny-list relies on these names to let `cosine_distance`
+        // and `rand` push down to DuckDB, so the dialect must advertise them.
+        let names = crate::dialect::duckdb_native_function_names();
+        assert!(
+            names.contains(&runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME),
+            "duckdb_native_function_names() missing cosine_distance; got {names:?}"
+        );
+        assert!(
+            names.contains(&runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME),
+            "duckdb_native_function_names() missing inner_product; got {names:?}"
+        );
+        assert!(
+            names.contains(&"rand"),
+            "duckdb_native_function_names() missing rand; got {names:?}"
+        );
+        // Still derived from the override list, so the two cannot drift — but the
+        // relation is "overrides minus the denied built-ins" rather than 1:1,
+        // because the filter is defence in depth: a denied name has no handler
+        // (`the_constructed_duckdb_dialect_renders_no_denied_builtin` asserts it)
+        // and a handler unfaithful for some call shapes refuses them per call
+        // (#13870); asserting equal lengths would tie this test to the deny-list's
+        // contents instead.
+        let overrides: BTreeSet<&str> = crate::dialect::duckdb_scalar_overrides()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let denied: BTreeSet<&str> = crate::function_support::DUCKDB_DENIED_BUILTINS
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            names.iter().copied().collect::<BTreeSet<&str>>(),
+            &overrides - &denied,
+            "the advertised names must be exactly the overrides that are not denied"
+        );
+    }
+
+    /// Every shape of `regexp_count` the dialect renders, pinned as the SQL
+    /// `DuckDB` is sent (issue #13870).
+    ///
+    /// No `coalesce`: `regexp_extract_all` is NULL for a NULL input and so is
+    /// `len(NULL)`, which is what the kernel answers. The `SUBSTRING` offset is
+    /// the kernel's 1-based start passed through unchanged.
+    #[test]
+    fn regexp_count_unparses_to_a_null_preserving_match_count() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let s = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "s".to_string(),
+            spans: Spans::new(),
+        });
+
+        let render = |expr: Expr| {
+            unparser
+                .expr_to_sql(&expr)
+                .expect("regexp_count unparses for DuckDB")
+                .to_string()
+        };
+
+        assert_eq!(
+            render(regexp_count(s.clone(), lit("a"), None, None)),
+            r#"len(regexp_extract_all("t"."s", 'a'))"#
+        );
+        assert_eq!(
+            render(regexp_count(s.clone(), lit("a"), Some(lit(2)), None)),
+            r#"len(regexp_extract_all(SUBSTRING("t"."s", 2), 'a'))"#,
+            "SUBSTRING is 1-based in both engines, so the start is passed through"
+        );
+        assert_eq!(
+            render(regexp_count(s, lit("^a+$"), None, None)),
+            r#"len(regexp_extract_all("t"."s", '^a+$'))"#,
+            "anchors are zero-width but the match itself is not empty, so the call renders"
+        );
+    }
+
+    /// The cause a refused regexp call names for its flags argument.
+    const FLAG_REFUSAL: &str = "it sets a flag; case-insensitive matching follows each engine's own Unicode case-folding tables and the other flags RE2 reads differently or rejects";
+
+    /// The cause a refused `regexp_count` names for a pattern that can match
+    /// the empty string.
+    const EMPTY_MATCH_REFUSAL: &str =
+        "it can match the empty string, which DuckDB counts differently from DataFusion";
+
+    /// The cause a refused regexp call names for a pattern using a Perl class.
+    const PERL_CLASS_REFUSAL: &str = "it uses a Perl class (`\\d`, `\\w`, `\\s`), which is Unicode-aware in DataFusion and ASCII-only in RE2";
+
+    /// The planning message `unparser` refuses `call` with. Any other outcome
+    /// (a rendering, or an error of another kind) fails the test.
+    fn refusal_message(unparser: &Unparser<'_>, call: &Expr) -> String {
+        match unparser.expr_to_sql(call) {
+            Err(DataFusionError::Plan(message)) => message,
+            other => panic!("{call} must be refused with a planning error, got {other:?}"),
+        }
+    }
+
+    /// Why `screen_regexp_count_pattern` refuses `pattern`, in the refusal's
+    /// `Debug` spelling (`MayMatchEmpty`, `Syntax(PerlClass)`). The refusal
+    /// types have no `PartialEq`, and the spelling lets a table pin each
+    /// pattern to the one reason it is refused for.
+    fn count_refusal(pattern: &str) -> String {
+        match screen_regexp_count_pattern(pattern) {
+            Ok(_) => panic!("`{pattern}` must be refused"),
+            Err(refusal) => format!("{refusal:?}"),
+        }
+    }
+
+    /// The shapes the handler refuses are refused by the unparser itself, not
+    /// only by the per-call check that consults it: a flags argument `DuckDB`
+    /// would reject remotely (it requires a non-NULL constant), a pattern that
+    /// can match the empty string, and a pattern read from a column. Each
+    /// refusal names its own cause, so a refusal for an unrelated reason cannot
+    /// pass for it.
+    #[test]
+    fn regexp_count_refuses_what_duckdb_would_count_differently() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        // A flags value that cannot be read at unparse time is named as empty.
+        for (flags, named) in [
+            (col("f"), ""),
+            (lit(ScalarValue::Utf8(None)), ""),
+            (lit("m"), "m"),
+            (lit("i"), "i"),
+        ] {
+            let call = regexp_count(col("s"), lit("a"), Some(lit(1)), Some(flags));
+            assert_eq!(
+                refusal_message(&unparser, &call),
+                format!(
+                    "Flags `{named}` are not supported for regular expression function regexp_extract_all with DuckDB: {FLAG_REFUSAL}"
+                ),
+                "{call}"
+            );
+        }
+        for (pattern, expected) in [
+            (
+                lit("a*"),
+                format!(
+                    "Pattern `a*` is not supported for regular expression function regexp_extract_all with DuckDB: {EMPTY_MATCH_REFUSAL}"
+                ),
+            ),
+            (
+                lit(""),
+                format!(
+                    "Pattern `` is not supported for regular expression function regexp_extract_all with DuckDB: {EMPTY_MATCH_REFUSAL}"
+                ),
+            ),
+            (
+                col("p"),
+                "Only string literal patterns are supported for regular expression function regexp_extract_all with DuckDB".to_string(),
+            ),
+        ] {
+            let call = regexp_count(col("s"), pattern, None, None);
+            assert_eq!(refusal_message(&unparser, &call), expected, "{call}");
+        }
+    }
+
+    /// The pattern screen, pinned on the patterns that decide it. Anchors are
+    /// zero-width but do not make the match itself empty when something
+    /// non-empty follows; a quantifier admitting zero repetitions or a bare
+    /// zero-width branch does. The allow-list admits what both engines read
+    /// alike and nothing else.
+    #[test]
+    fn a_pattern_is_rendered_only_when_duckdb_counts_it_identically() {
+        for pattern in [
+            "a",
+            "^a+$",
+            "\\Aa\\z",
+            "[0-9]{2,}",
+            "a{1,1000}",
+            "a|bc",
+            "[Kkx]|a",
+            "k|K",
+            "[Kx]",
+            "[^Kk]",
+            "[K-Lk]",
+            "[KK]",
+            "[kk]|a",
+            ".",
+            "[^a]",
+            "[^a-c]",
+            "x\\.",
+            "\\x41",
+            "\\x{1F600}",
+            "\\n",
+            "a+?",
+            "(a)(b)",
+            "(?:ab)+",
+            "é",
+            "\\&",
+            "(a{100}){10}",
+            "((a{10}){10}){10}",
+            "(a{2}){3}b{500}",
+            "(a+){1000}",
+        ] {
+            if let Err(refusal) = screen_regexp_count_pattern(pattern) {
+                panic!(
+                    "`{pattern}` is counted identically and must render, but was refused: {refusal}"
+                );
+            }
+        }
+
+        // Each refused pattern is pinned to the reason it is refused for, so a
+        // refusal for an unrelated reason cannot stand in for the one claimed.
+        for (pattern, reason) in [
+            ("a*", "MayMatchEmpty"),
+            ("a?", "MayMatchEmpty"),
+            ("a{0,}", "MayMatchEmpty"),
+            ("", "MayMatchEmpty"),
+            ("^", "MayMatchEmpty"),
+            // Never matches, so it has no minimum match length to measure.
+            ("[^\\x00-\\x{10FFFF}]", "MayMatchEmpty"),
+            // Zero-width, but refused as a word boundary before any length is
+            // measured.
+            ("\\b", "Syntax(WordBoundary)"),
+            ("a|\\b", "Syntax(WordBoundary)"),
+            ("(", "Syntax(Unparseable)"),
+            // Never matches, but refused for its class-set operation first.
+            ("[a&&b]", "Syntax(ClassSetOperation)"),
+        ] {
+            assert_eq!(
+                count_refusal(pattern),
+                reason,
+                "`{pattern}` can match the empty string, never matches, or does not compile"
+            );
+        }
+        for (pattern, reason) in [
+            ("\\d", "Syntax(PerlClass)"),
+            ("\\w", "Syntax(PerlClass)"),
+            ("\\s", "Syntax(PerlClass)"),
+            ("\\D", "Syntax(PerlClass)"),
+            ("[\\d]", "Syntax(PerlClass)"),
+            ("[a\\w]", "Syntax(PerlClass)"),
+            ("\\ba", "Syntax(WordBoundary)"),
+            ("a\\B", "Syntax(WordBoundary)"),
+            ("\\<a", "Syntax(WordBoundary)"),
+            ("a\\>", "Syntax(WordBoundary)"),
+        ] {
+            assert_eq!(
+                count_refusal(pattern),
+                reason,
+                "`{pattern}` is Unicode-aware in the kernel and ASCII-only in RE2, so it must stay local"
+            );
+        }
+        for (pattern, reason) in [
+            ("[a&&a]", "Syntax(ClassSetOperation)"),
+            ("[a--b]", "Syntax(ClassSetOperation)"),
+            ("[a~~b]", "Syntax(ClassSetOperation)"),
+            ("[a[b]]", "Syntax(NestedOrEmptyClass)"),
+            ("(?x)a b", "Syntax(Flag)"),
+            ("(?s)a", "Syntax(Flag)"),
+            ("(?m)a", "Syntax(Flag)"),
+            ("(?i)k", "Syntax(Flag)"),
+            ("(?i:k)a", "Syntax(Flag)"),
+            ("(?-i)a", "Syntax(Flag)"),
+            ("(?i-s)a", "Syntax(Flag)"),
+            ("a++", "Syntax(StackedRepetition)"),
+            ("a{1}{2}", "Syntax(StackedRepetition)"),
+            ("a*?+", "Syntax(StackedRepetition)"),
+            ("a{01}", "Syntax(RepetitionSpelling)"),
+            ("a{1, 2}", "Syntax(RepetitionSpelling)"),
+            ("a{1 }", "Syntax(RepetitionSpelling)"),
+            ("a{ 1}", "Syntax(RepetitionSpelling)"),
+            ("a{1,02}", "Syntax(RepetitionSpelling)"),
+            ("[Kk]", "Syntax(CaseFoldPair)"),
+            ("[kK]", "Syntax(CaseFoldPair)"),
+            ("([Kk]|a)", "Syntax(CaseFoldPair)"),
+            ("[Ss]|a", "Syntax(CaseFoldPair)"),
+            ("[K-Kk]", "Syntax(CaseFoldPair)"),
+            ("[KkK]", "Syntax(CaseFoldPair)"),
+            ("([SsS]|a)", "Syntax(CaseFoldPair)"),
+            ("[kk-kK]", "Syntax(CaseFoldPair)"),
+            (
+                "[^\\x00-\\x4A\\x4C-\\x6A\\x6C-\\x{10FFFF}]|a",
+                "Syntax(CaseFoldPair)",
+            ),
+            ("(?P<n>a)", "Syntax(NamedGroup)"),
+            ("(?<n>a)", "Syntax(NamedGroup)"),
+            ("\\p{Nd}", "Syntax(UnicodeProperty)"),
+            ("\\pL", "Syntax(UnicodeProperty)"),
+            ("[\\p{Nd}]", "Syntax(UnicodeProperty)"),
+            ("[[:alpha:]]", "Syntax(AsciiClass)"),
+            ("\\u0041", "Syntax(Escape)"),
+            ("\\U00000041", "Syntax(Escape)"),
+            ("\\u{41}", "Syntax(Escape)"),
+            ("a{1001}", "Syntax(RepetitionBound)"),
+            ("a{2,1001}", "Syntax(RepetitionBound)"),
+            ("(a{100}){11}", "Syntax(RepetitionBound)"),
+            ("((a{10}){10}){11}", "Syntax(RepetitionBound)"),
+            ("(a{100,}){11}", "Syntax(RepetitionBound)"),
+        ] {
+            assert_eq!(
+                count_refusal(pattern),
+                reason,
+                "`{pattern}` is syntax RE2 reads differently, rejects, or that is unmeasured, so it must stay local"
+            );
+        }
+    }
+
+    /// `regexp_like` and `regexp_replace` are screened by the same allow-list
+    /// as `regexp_count`, minus the empty-match rule that only counting needs
+    /// (issue #14148).
+    ///
+    /// What the allow-list admits and refuses is pinned by
+    /// `a_pattern_is_rendered_only_when_duckdb_counts_it_identically`, which
+    /// runs the same walker. The new fact here is the *difference* between the
+    /// two screens — an empty-matching pattern is admitted for these two —
+    /// and that both functions reach the walker at all, which is the bug:
+    /// measured on the bundled `DuckDB`, `regexp_like(s, '\d')` over `xy١` is
+    /// `true` locally and `false` federated, and `regexp_replace(s, '\w',
+    /// 'X')` replaces `ſ` locally and leaves it untouched federated.
+    #[test]
+    fn regexp_like_and_replace_render_only_patterns_both_engines_read_alike() {
+        for pattern in ["a*", "a?", "a{0,}"] {
+            if let Err(refusal) = screen_regexp_pattern(pattern) {
+                panic!(
+                    "`{pattern}` can match the empty string, which only the count screen refuses, but was refused: {refusal}"
+                );
+            }
+            assert_eq!(
+                count_refusal(pattern),
+                "MayMatchEmpty",
+                "`{pattern}` must still be refused for the count, or the two screens have merged"
+            );
+        }
+
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        for (call, expected) in [
+            (
+                regexp_like(col("s"), lit("\\d"), None),
+                format!(
+                    "Pattern `\\d` is not supported for regular expression function regexp_matches with DuckDB: {PERL_CLASS_REFUSAL}"
+                ),
+            ),
+            (
+                regexp_like(col("s"), col("p"), None),
+                "Only string literal patterns are supported for regular expression function regexp_matches with DuckDB".to_string(),
+            ),
+            (
+                regexp_replace(col("s"), lit("\\w"), lit("X"), None),
+                format!(
+                    "Pattern `\\w` is not supported for regular expression function regexp_replace with DuckDB: {PERL_CLASS_REFUSAL}"
+                ),
+            ),
+            (
+                regexp_replace(col("s"), col("p"), lit("X"), None),
+                "Only string literal patterns are supported for regular expression function regexp_replace with DuckDB".to_string(),
+            ),
+        ] {
+            assert_eq!(refusal_message(&unparser, &call), expected, "{call}");
+        }
+        for (call, expected) in [
+            (
+                regexp_like(col("s"), lit("a*"), None),
+                r#"regexp_matches("s", 'a*')"#,
+            ),
+            (
+                regexp_replace(col("s"), lit("(a)(b)"), lit("X"), None),
+                r#"regexp_replace("s", '(a)(b)', 'X')"#,
+            ),
+        ] {
+            let rendered = unparser.expr_to_sql(&call).unwrap_or_else(|e| {
+                panic!("{call} is read alike by both engines and must keep federating: {e}")
+            });
+            assert_eq!(rendered.to_string(), expected);
+        }
+    }
+
+    /// A replacement renders when it is plain text or names one of the
+    /// pattern's groups as `\N`; the rule and why every other `$` and `\`
+    /// form stays local are on [`re2::engine_neutral_replacement`]. A
+    /// replacement whose value cannot be read at unparse time is refused too.
+    #[test]
+    fn regexp_replace_renders_plain_text_and_one_digit_group_references() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        for replacement in [
+            lit("$2$1"),
+            lit("$$"),
+            lit("\\1$1"),
+            // Group 10 to the kernel, group 1 then `0` to RE2.
+            lit("\\10"),
+            // The kernel's `\d+` is Unicode-aware: group `1١` to it.
+            lit("\\1\u{0661}"),
+            // A literal backslash then `1` to RE2, group 1 to the kernel.
+            lit("\\\\1"),
+            // `(a)(b)` has no group 3: empty to the kernel, an error to RE2.
+            lit("\\3"),
+            lit("\\q"),
+            lit("\\n"),
+            lit("x\\"),
+            col("r"),
+        ] {
+            let call = regexp_replace(col("s"), lit("(a)(b)"), replacement.clone(), None);
+            assert!(
+                unparser.expr_to_sql(&call).is_err(),
+                "replacement {replacement:?} is read differently by RE2 and must stay local"
+            );
+        }
+        for replacement in [
+            lit("X"),
+            lit(""),
+            lit("a b.c"),
+            lit("\\2\\1"),
+            lit("\\0"),
+            lit("<\\1>x"),
+        ] {
+            let call = regexp_replace(col("s"), lit("(a)(b)"), replacement.clone(), None);
+            assert!(
+                unparser.expr_to_sql(&call).is_ok(),
+                "replacement {replacement:?} is read alike by both engines and must keep federating"
+            );
+        }
+
+        // Groups are counted in the call's own pattern, and a non-capturing
+        // group is not one.
+        let non_capturing = regexp_replace(col("s"), lit("(?:a)(b)"), lit("\\2"), None);
+        assert!(
+            unparser.expr_to_sql(&non_capturing).is_err(),
+            "{non_capturing} names a group its pattern does not have"
+        );
+
+        // The ClickBench q29 shape, which the benchmark's DuckDB plans federate.
+        let referer = regexp_replace(
+            col("s"),
+            lit("^https?://(?:www\\.)?([^/]+)/.*$"),
+            lit("\\1"),
+            None,
+        );
+        let rendered = unparser
+            .expr_to_sql(&referer)
+            .expect("the ClickBench q29 extraction must federate");
+        assert_eq!(
+            rendered.to_string(),
+            r#"regexp_replace("s", '^https?://(?:www\.)?([^/]+)/.*$', '\1')"#
+        );
+    }
+
+    #[test]
+    fn concat_unparses_to_the_duckdb_string_concat_operator() {
+        // The operator, not the function: DuckDB's `concat` skips a NULL
+        // argument, `||` propagates it as the kernel does (issue #13849).
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let name = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "name".to_string(),
+            spans: Spans::new(),
+        });
+
+        let rendered = concat_to_string_concat(&unparser, &[name.clone(), lit("z")])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(rendered.to_string(), r#"("t"."name" || 'z')"#);
+
+        let three = concat_to_string_concat(&unparser, &[name.clone(), lit("z"), name.clone()])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(
+            three.to_string(),
+            r#"("t"."name" || 'z' || "t"."name")"#,
+            "every argument must join the operator chain"
+        );
+
+        let one = concat_to_string_concat(&unparser, &[name])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(
+            one.to_string(),
+            r#"("t"."name")"#,
+            "a one-argument concat is the argument itself, NULL included"
+        );
+    }
+
+    #[test]
+    fn concat_with_zero_arguments_renders_the_empty_string() {
+        // `the_registered_concat_accepts_zero_arguments` shows the planner
+        // builds `concat()` and evaluates it to `''`. Erroring here instead
+        // would fail a query that runs unaccelerated (issue #13849).
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        let rendered = concat_to_string_concat(&unparser, &[])
+            .expect("a zero-argument concat renders")
+            .expect("should return expression");
+        assert_eq!(rendered.to_string(), "''");
+    }
+
+    #[test]
+    fn duckdb_dialect_installs_the_concat_override() {
+        // The handler is only reached if the dialect registers it, and a
+        // missing registration is exactly the shape of #13849: the call is
+        // emitted verbatim and DuckDB answers it differently.
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::string::concat(),
+            vec![lit("a"), lit("b")],
+        ));
+
+        let rendered = unparser
+            .expr_to_sql(&call)
+            .expect("concat unparses for DuckDB");
+        assert_eq!(rendered.to_string(), "('a' || 'b')");
+    }
+
+    /// `DuckDB`'s `date_part('dow', …)` counts Sunday as 0, matching
+    /// `DataFusion` and `PostgreSQL` `EXTRACT(DOW)`. Spark's simplify stub rewrites
+    /// `'dow'` / `'DOW'` / mixed case to the built-in plus one (Sunday = 1).
+    /// The dialect must not apply that shift when unparsing: a
+    /// `DuckDB`-accelerated `GROUP BY date_part('dow', …)` would then disagree
+    /// with the local result once the session keeps the built-in.
+    #[test]
+    fn date_part_dow_unparses_without_a_sunday_one_shift() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let ts = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "ts".to_string(),
+            spans: Spans::new(),
+        });
+
+        let rendered: Vec<String> = ["dow", "DOW", "Dow"]
+            .into_iter()
+            .map(|field| {
+                let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+                    datafusion::functions::datetime::date_part(),
+                    vec![lit(field), ts.clone()],
+                ));
+                unparser
+                    .expr_to_sql(&call)
+                    .expect("date_part unparses for DuckDB")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                r#"date_part('dow', "t"."ts")"#,
+                r#"date_part('DOW', "t"."ts")"#,
+                r#"date_part('Dow', "t"."ts")"#,
+            ],
+        );
+    }
+
+    /// The premise the rewrite rests on, pinned against the function the
+    /// runtime actually registers.
+    ///
+    /// `crates/runtime/src/datafusion/builder.rs` registers every
+    /// `datafusion-spark` scalar function over the built-in of the same name
+    /// (skipping only `trunc` and `avg`), so the `concat` a Spice query
+    /// resolves is `SparkConcat`, not `DataFusion`'s `ConcatFunc` — and the
+    /// two disagree about exactly this. `SparkConcat` computes a null mask,
+    /// delegates to `ConcatFunc`, and applies the mask; `ConcatFunc` alone
+    /// skips a NULL argument and concatenates the rest.
+    ///
+    /// `||` is the faithful `DuckDB` rendering *because* of that mask. If the
+    /// registration ever stops shadowing the built-in, or Spark's NULL
+    /// handling changes, this test fails rather than
+    /// [`concat_to_string_concat`] silently inverting.
+    #[tokio::test]
+    async fn the_registered_concat_propagates_a_null_argument() {
+        use datafusion::assert_batches_eq;
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        let concat = datafusion_spark::all_default_scalar_functions()
+            .into_iter()
+            .find(|udf| udf.name() == "concat")
+            .expect("datafusion-spark provides a concat");
+        ctx.register_udf(concat.as_ref().clone());
+
+        let batches = ctx
+            .sql(
+                "SELECT concat(a, 'z') AS c, concat(a, 'z') IS NULL AS isn \
+                 FROM (VALUES ('x'), (NULL), ('y')) AS t(a)",
+            )
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect("executes");
+
+        // The middle row is the whole point: DataFusion's own `concat` answers
+        // `z` here, and if this ever does too, `concat_to_string_concat` is
+        // rendering the wrong semantics into DuckDB SQL (issue #13849). It
+        // carries `isn` because an empty cell alone cannot tell
+        // NULL from the empty string.
+        assert_batches_eq!(
+            &[
+                "+----+-------+",
+                "| c  | isn   |",
+                "+----+-------+",
+                "| xz | false |",
+                "|    | true  |",
+                "| yz | false |",
+                "+----+-------+",
+            ],
+            &batches
+        );
+    }
+
+    /// Refutation probe: does the planner actually build a zero-argument
+    /// `concat`? Run against the registered function, not the built-in.
+    #[tokio::test]
+    async fn the_registered_concat_accepts_zero_arguments() {
+        use datafusion::assert_batches_eq;
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        let concat = datafusion_spark::all_default_scalar_functions()
+            .into_iter()
+            .find(|udf| udf.name() == "concat")
+            .expect("datafusion-spark provides a concat");
+        ctx.register_udf(concat.as_ref().clone());
+
+        let batches = ctx
+            .sql("SELECT concat() AS c, concat() IS NULL AS isn")
+            .await
+            .expect("a zero-argument concat plans")
+            .collect()
+            .await
+            .expect("a zero-argument concat executes");
+
+        assert_batches_eq!(
+            &[
+                "+---+-------+",
+                "| c | isn   |",
+                "+---+-------+",
+                "|   | false |",
+                "+---+-------+",
+            ],
+            &batches
+        );
+    }
+}

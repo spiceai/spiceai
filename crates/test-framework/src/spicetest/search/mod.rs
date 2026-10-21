@@ -24,7 +24,7 @@ use crate::{
         Builder, BuilderTarget, ExtendedMetrics, MetricCollector, QueryMetric, QueryStatus,
         StatisticsCollector, system_time_to_unix_epoch_ms,
     },
-    spicetest::search::evaluate::calculate_ndcg,
+    spicetest::search::evaluate::calculate_retrieval_metrics,
 };
 use anyhow::{Context, Result};
 use arrow::{
@@ -37,9 +37,14 @@ use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 
 mod evaluate;
 mod worker;
-pub use worker::SearchResult;
-pub use worker::{SearchConfig, SearchRequest};
+pub use evaluate::RetrievalMetrics;
+pub use worker::{
+    CorpusId, SearchApiResponse, SearchConfig, SearchMethod, SearchRequest, SearchResponse,
+    SearchResult, SqlPipeline, SqlSearchHit, SqlSearchResponse,
+};
 use worker::{VectorSearchWorker, VectorSearchWorkerResult};
+
+pub use evaluate::{QueryId, QueryRetrievalMetrics, RetrievalEvaluation};
 
 #[derive(Default)]
 pub struct NotStarted {
@@ -96,6 +101,7 @@ impl SpiceTest<NotStarted> {
             .http_client()?;
 
         // Split the requests among workers based on the parallel_count
+        let method = self.state.config.method().clone();
         let requests = self.state.config.into_requests();
         let chunk_size = if self.state.parallel_count > 0 {
             requests.len().div_ceil(self.state.parallel_count)
@@ -107,7 +113,9 @@ impl SpiceTest<NotStarted> {
             .chunks(chunk_size)
             .enumerate()
             .map(|(worker_id, chunk)| {
-                let worker_config = SearchConfig::new().add_requests(chunk.iter().cloned());
+                let worker_config = SearchConfig::new()
+                    .with_method(method.clone())
+                    .add_requests(chunk.iter().cloned());
                 VectorSearchWorker::new(worker_id, http_client.clone(), worker_config).start()
             })
             .collect();
@@ -120,6 +128,7 @@ impl SpiceTest<NotStarted> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: Running {
                 vector_workers: workers,
             },
@@ -148,6 +157,7 @@ impl SpiceTest<Running> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: Completed {
                 end_time: SystemTime::now(),
                 search_results,
@@ -170,7 +180,7 @@ impl SpiceTest<Completed> {
             .map(|result| result.duration) // Convert to milliseconds
             .collect::<Vec<_>>();
 
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         let p95 = durations.percentile(95.0)?.as_millis() as f64;
         Ok(p95)
     }
@@ -178,29 +188,48 @@ impl SpiceTest<Completed> {
     pub fn get_rps_metric(&self) -> Result<f64> {
         let total_duration = self.state.end_time.duration_since(self.start_time)?;
 
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         let total_requests = self.state.search_results.len() as f64;
-        if total_duration.as_secs() == 0 {
+        let seconds = total_duration.as_secs_f64();
+        if seconds <= 0.0 {
             return Ok(total_requests);
         }
-        Ok(total_requests / total_duration.as_secs_f64())
+        Ok(total_requests / seconds)
     }
 
-    /// Calculate overall search score metric based on the search results and query relevance data.
-    /// The `transform` function is used to convert the search results into a format suitable for
-    /// evaluation
-    pub fn calculate_search_score_metric<S, F>(
+    /// Calculate retrieval-quality metrics (NDCG, Recall, MRR, Precision, all at the same rank
+    /// cutoff) based on the search results and query relevance data. The `transform` function is
+    /// used to convert the search results into a format suitable for evaluation.
+    pub fn calculate_search_score_metrics<S, F>(
         &self,
         qrels: &HashMap<String, HashMap<String, i32, S>, S>,
         transform: F,
-    ) -> Result<f64>
+    ) -> Result<RetrievalMetrics>
     where
         S: ::std::hash::BuildHasher,
         F: Fn(&BTreeMap<String, SearchResult>) -> HashMap<String, HashMap<String, f64, S>, S>,
     {
         let transformed_results = transform(&self.state.search_results);
-        // Similar to MTEB, use NDCG@10 as the main metric for search score
-        Ok(calculate_ndcg(qrels, &transformed_results, 10))
+        // Matches MTEB's methodology of evaluating retrieval quality at rank cutoff 10.
+        calculate_retrieval_metrics(qrels, &transformed_results, 10)
+    }
+
+    /// Evaluate retrieval quality (NDCG, Recall, MRR, Precision) for every judged query at every
+    /// rank cutoff `k` in `1..=n`, where `n` is the largest number of results returned for any
+    /// query. Computing the full metric-vs-`k` curve requires no additional search — it is
+    /// post-processing over the already-ranked results. The `transform` function converts the
+    /// search results into a format suitable for evaluation.
+    pub fn evaluate_search_results<S, F>(
+        &self,
+        qrels: &HashMap<String, HashMap<String, i32, S>, S>,
+        transform: F,
+    ) -> Result<RetrievalEvaluation>
+    where
+        S: ::std::hash::BuildHasher,
+        F: Fn(&BTreeMap<String, SearchResult>) -> HashMap<String, HashMap<String, f64, S>, S>,
+    {
+        let transformed_results = transform(&self.state.search_results);
+        RetrievalEvaluation::up_to_longest_result_list(qrels, &transformed_results)
     }
 }
 
@@ -275,7 +304,11 @@ impl SearchScoreMetric {
 pub struct SearchRunMetric {
     pub rps: f64,
     pub p95_latency_ms: f64,
+    /// NDCG@10 (kept as `score` for telemetry backward-compatibility).
     pub score: f64,
+    pub recall: f64,
+    pub mrr: f64,
+    pub precision: f64,
 }
 impl ExtendedMetrics for SearchRunMetric {
     fn fields() -> Vec<Field> {
@@ -283,6 +316,9 @@ impl ExtendedMetrics for SearchRunMetric {
             Field::new("rps", DataType::Float64, false),
             Field::new("p95_latency_ms", DataType::Float64, false),
             Field::new("score", DataType::Float64, false),
+            Field::new("recall", DataType::Float64, false),
+            Field::new("mrr", DataType::Float64, false),
+            Field::new("precision", DataType::Float64, false),
         ]
     }
 
@@ -294,6 +330,15 @@ impl ExtendedMetrics for SearchRunMetric {
             Builder::Float64(Float64Builder::new()),
         );
         builders.insert("score".to_string(), Builder::Float64(Float64Builder::new()));
+        builders.insert(
+            "recall".to_string(),
+            Builder::Float64(Float64Builder::new()),
+        );
+        builders.insert("mrr".to_string(), Builder::Float64(Float64Builder::new()));
+        builders.insert(
+            "precision".to_string(),
+            Builder::Float64(Float64Builder::new()),
+        );
         builders
     }
 
@@ -302,16 +347,29 @@ impl ExtendedMetrics for SearchRunMetric {
             BuilderTarget::Float64(("rps".to_string(), self.rps)),
             BuilderTarget::Float64(("p95_latency_ms".to_string(), self.p95_latency_ms)),
             BuilderTarget::Float64(("score".to_string(), self.score)),
+            BuilderTarget::Float64(("recall".to_string(), self.recall)),
+            BuilderTarget::Float64(("mrr".to_string(), self.mrr)),
+            BuilderTarget::Float64(("precision".to_string(), self.precision)),
         ])
     }
 }
 impl SearchRunMetric {
     #[must_use]
-    pub fn new(rps: f64, p95_latency_ms: f64, score: f64) -> Self {
+    pub fn new(
+        rps: f64,
+        p95_latency_ms: f64,
+        score: f64,
+        recall: f64,
+        mrr: f64,
+        precision: f64,
+    ) -> Self {
         Self {
             rps,
             p95_latency_ms,
             score,
+            recall,
+            mrr,
+            precision,
         }
     }
 }

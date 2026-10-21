@@ -1,0 +1,5934 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Maintained aggregate state for append-heavy Cayenne CDC streams.
+//!
+//! The implementation follows a conservative DBSP-style delta contract: rows
+//! are applied as positive deltas only while the view is known fresh. Any
+//! operation that needs a retraction but cannot provide the old row values marks
+//! the view stale. The physical optimizer may only serve this state when it is
+//! fresh at the scan snapshot epoch captured by
+//! [`crate::provider::CayenneAccelerationExec`], so the served batch is the
+//! aggregate of the rows that scan would read.
+
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, new_empty_array, new_null_array,
+};
+use arrow::datatypes::Decimal128Type;
+use arrow_schema::{
+    DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, FieldRef, Schema, SchemaRef,
+};
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::error::Result as DataFusionResult;
+use datafusion::logical_expr::ColumnarValue;
+use datafusion::physical_expr_common::physical_expr::is_volatile;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion_common::{DataFusionError, ScalarValue};
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_functions_aggregate_common::utils::DecimalAverager;
+use datafusion_physical_expr::expressions::{CastExpr, Column, Literal};
+use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr::{Distribution, OrderingRequirements};
+use datafusion_physical_expr::{DynamicFilterTracking, PhysicalExpr, split_conjunction};
+use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use hash_index::PrehashedBuildHasher;
+use parking_lot::RwLock;
+
+use crate::provider::pk_index::pk_digest_bytes;
+use crate::row_converter::{RowConverter, SortField};
+
+/// A Cayenne-maintained aggregate view declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MaintainedAggregateSpec {
+    /// Input columns used as the `GROUP BY` key, in query output order.
+    pub group_by: Vec<String>,
+    /// Aggregate expressions maintained for each group.
+    pub aggregates: Vec<MaintainedAggregateExpr>,
+    /// Optional row predicate (a physical expression over the table/input
+    /// schema) that selects which rows contribute to the view — the maintained
+    /// equivalent of a query `WHERE`. `None` maintains the aggregate over every
+    /// row (the original behavior). When set, maintenance applies only rows the
+    /// predicate selects, and the optimizer serves a query from this view only
+    /// when the predicate the query's scan applies has exactly this predicate's
+    /// conjuncts (see [`PredicateConjuncts`]). A volatile predicate selects
+    /// different rows on every evaluation, so a view declared with one never
+    /// serves. This is what lets the
+    /// flagship serve filtered analytical queries (e.g. CH-benCH q1/q6) that
+    /// every general-purpose engine must re-scan O(rows) for, while Cayenne
+    /// maintains the filtered relation from the CDC delta and serves O(groups).
+    pub filter: Option<Arc<dyn PhysicalExpr>>,
+}
+
+/// One aggregate expression inside a maintained aggregate view.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MaintainedAggregateExpr {
+    /// Aggregate function to maintain.
+    pub function: MaintainedAggregateFunction,
+    /// Input column for `SUM`, `AVG`, and `COUNT(column)`. `None` means
+    /// `COUNT(*)` and is valid only for [`MaintainedAggregateFunction::Count`].
+    pub column: Option<String>,
+}
+
+/// Aggregate functions supported by Cayenne maintained aggregate views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MaintainedAggregateFunction {
+    /// SQL `COUNT(*)` or `COUNT(column)`.
+    Count,
+    /// SQL `SUM(column)` over the signed-integer (`Int8`..`Int64`),
+    /// unsigned-integer (`UInt8`..`UInt64`), floating-point
+    /// (`Float32`/`Float64`), or `Decimal128` families. Narrower integer/float
+    /// widths widen losslessly to the `BIGINT`/`Float64` sum output, matching
+    /// `DataFusion`'s `SUM` output type; `Decimal128(p, s)` sums its `i128`
+    /// backing values exactly and widens the precision to
+    /// `Decimal128(min(38, p + 10), s)` (`DataFusion`'s decimal `SUM` output).
+    Sum,
+    /// SQL `AVG(column)` over the signed-integer (`Int8`..`Int64`),
+    /// unsigned-integer (`UInt8`..`UInt64`), floating-point
+    /// (`Float32`/`Float64`), or non-negative-scale `Decimal128` families.
+    /// Integer/float inputs output `Float64` (matching `DataFusion`'s `AVG`
+    /// output type); integer inputs fold their running sum exactly into an
+    /// `i128` accumulator, floats into an `f64` one. `Decimal128(p, s)` inputs
+    /// output `Decimal128(min(38, p + 4), min(38, s + 4))` (`DataFusion`'s
+    /// decimal `AVG` output), folding the exact `i128` backing-value sum and
+    /// dividing down to the output scale only when served.
+    Avg,
+    /// SQL `MIN(column)` over signed/unsigned integers, `Date32`/`Date64`,
+    /// `Timestamp`, and `Decimal128`. Unlike `SUM` (which widens to `BIGINT`),
+    /// the output preserves the input type (`MIN(Int32) -> Int32`).
+    /// Retraction-hard: deleting the current minimum needs the next-smallest
+    /// value, so a per-group ordered multiset ([`SortedScalarIndex`]) keeps the
+    /// live values. Float `MIN`/`MAX` (NaN ordering) is a follow-up.
+    Min,
+    /// SQL `MAX(column)` — the mirror of [`Self::Min`], reading the largest
+    /// live value from the same ordered-multiset structure.
+    Max,
+}
+
+/// Shared maintained aggregate state for a single Cayenne table.
+pub struct MaintainedAggregateRegistry {
+    state: RwLock<RegistryState>,
+    /// Upper bound on approximate resident BYTES retained across all views:
+    /// the per-PK retraction records plus distinct `MIN`/`MAX` multiset values.
+    /// When the total would exceed this, the registry fails safe to `Stale` and
+    /// clears all retained state.
+    ///
+    /// Bytes, not entries: entry width varies by orders of magnitude with key and
+    /// aggregate-input types, so a count cap bounds memory only for one schema
+    /// shape. This is derived from `runtime.query.memory_limit` by the provider,
+    /// so the index cannot grow past the operator's budget.
+    max_index_bytes: usize,
+    /// Whether a per-PK index is maintained (a non-empty PK was configured), so
+    /// UPDATE/DELETE can be retracted incrementally rather than marking stale.
+    has_pk_index: bool,
+    /// Whether no views are configured. Fixed at construction and read without
+    /// the state lock: the write path and every scan ask it, and they must not
+    /// queue behind the applier holding the lock to fold a delta.
+    no_views: bool,
+    /// The table schema the views resolve their columns against.
+    schema: SchemaRef,
+}
+
+/// A summary, never the retained state. Every Cayenne scan plan carries the
+/// registry, and plans are formatted with `Debug` on ordinary planning paths:
+/// `DataFusion`'s physical planner formats each extension node it plans (a
+/// materialized CTE wraps a scan) to build an error context, whether or not
+/// planning fails. Printing the retraction index, one entry per maintained row,
+/// would cost seconds and gigabytes on every such plan.
+impl std::fmt::Debug for MaintainedAggregateRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MaintainedAggregateRegistry")
+            .field("has_pk_index", &self.has_pk_index)
+            .field("max_index_bytes", &self.max_index_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct RegistryState {
+    epoch: u64,
+    status: RegistryStatus,
+    views: Vec<MaintainedAggregateView>,
+    /// What each primary key's current row contributed, shared by every view;
+    /// `None` when no primary key is configured.
+    index: Option<RetractionIndex>,
+    /// The rebuild in progress, if any: the epoch of the snapshot it reads and
+    /// the deltas of later epochs, held to be applied on top of it.
+    rebuild: Option<PendingRebuild>,
+    /// Deltas at or below this epoch are already in the state the last rebuild
+    /// installed, so they are skipped rather than applied twice.
+    rebuilt_through: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryStatus {
+    Fresh,
+    Stale,
+}
+
+/// A rebuild in progress. Every delta after `hold_from` is held here, in epoch
+/// order, because the rebuild reads a snapshot taken after it started: the held
+/// deltas the snapshot already contains are dropped when the rebuild is
+/// installed, and the rest are applied on top of it.
+#[derive(Debug)]
+struct PendingRebuild {
+    hold_from: u64,
+    deltas: Vec<(u64, PendingDelta)>,
+    /// Memory the held deltas reference.
+    bytes: usize,
+}
+
+#[derive(Debug)]
+enum PendingDelta {
+    Upserts(Vec<RecordBatch>),
+    Deletes(RecordBatch),
+}
+
+impl PendingDelta {
+    fn memory_size(&self) -> usize {
+        match self {
+            Self::Upserts(batches) => batches
+                .iter()
+                .map(RecordBatch::get_array_memory_size)
+                .fold(0, usize::saturating_add),
+            Self::Deletes(batch) => batch.get_array_memory_size(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MaintainedAggregateView {
+    spec: ResolvedAggregateSpec,
+    /// Optional row predicate over the input schema. When set, only rows the
+    /// predicate selects are folded into the groups and given a retraction
+    /// record; a non-matching row is treated exactly as an absent row (not
+    /// indexed, not accumulated), so all retraction logic is reused unchanged.
+    /// See [`MaintainedAggregateSpec::filter`].
+    filter: Option<Arc<dyn PhysicalExpr>>,
+    /// `filter` as the conjunct set a query's predicate is matched against:
+    /// empty when the view has no filter, `None` when the filter is volatile, so
+    /// the view describes rows no query can reproduce and never serves.
+    filter_conjuncts: Option<PredicateConjuncts>,
+    groups: GroupTable,
+    /// Exact number of distinct ordered-multiset nodes retained by this view.
+    /// Updated on every `MIN`/`MAX` insert/retract so cap checks stay O(1)
+    /// regardless of group cardinality.
+    retained_multiset_entries: usize,
+}
+
+/// Approximate resident bytes one `MIN`/`MAX` ordered-multiset node costs: the
+/// retained `ScalarValue`, its occurrence counter, and the node's container
+/// overhead. Deliberately a flat estimate — the nodes are small and uniform.
+const APPROX_MULTISET_NODE_BYTES: usize = std::mem::size_of::<ScalarValue>() + 32;
+
+/// The groups of one view, each under a stable id so a retraction record can
+/// name its group in four bytes. A group that loses its last row is removed
+/// (SQL `GROUP BY` emits no row for an empty group) and its id is reused.
+#[derive(Debug, Default)]
+struct GroupTable {
+    ids: HashMap<Vec<ScalarValue>, u32>,
+    slots: Vec<Option<(Vec<ScalarValue>, GroupAccumulator)>>,
+    free: Vec<u32>,
+}
+
+impl GroupTable {
+    /// The id of the group keyed `key`, creating it when absent.
+    fn id_for(
+        &mut self,
+        key: Vec<ScalarValue>,
+        spec: &ResolvedAggregateSpec,
+    ) -> DataFusionResult<u32> {
+        if let Some(&id) = self.ids.get(&key) {
+            return Ok(id);
+        }
+        let group = Some((key.clone(), GroupAccumulator::try_new(spec)?));
+        let id = if let Some(id) = self.free.pop() {
+            self.slots[id as usize] = group;
+            id
+        } else {
+            let id = u32::try_from(self.slots.len()).map_err(|_| index_entry_overflow())?;
+            self.slots.push(group);
+            id
+        };
+        self.ids.insert(key, id);
+        Ok(id)
+    }
+
+    fn get_mut(&mut self, id: u32) -> Option<&mut GroupAccumulator> {
+        self.slots
+            .get_mut(id as usize)?
+            .as_mut()
+            .map(|(_, accumulator)| accumulator)
+    }
+
+    fn remove(&mut self, id: u32) {
+        if let Some(slot) = self.slots.get_mut(id as usize)
+            && let Some((key, _)) = slot.take()
+        {
+            self.ids.remove(&key);
+            self.free.push(id);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&[ScalarValue], &GroupAccumulator)> {
+        self.slots
+            .iter()
+            .flatten()
+            .map(|(key, accumulator)| (key.as_slice(), accumulator))
+    }
+}
+
+/// A primary key's identity in the [`RetractionIndex`]: the [`pk_digest_bytes`]
+/// of its row-encoded columns — the identity Cayenne's upsert path already gives
+/// a key — held as two words so a map entry stays 8-byte aligned (a `u128` key
+/// pads each entry to 32 bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PkKey([u64; 2]);
+
+impl PkKey {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "splits the 128-bit digest into its two halves"
+    )]
+    fn of(encoded: &[u8]) -> Self {
+        let digest = pk_digest_bytes(encoded);
+        Self([digest as u64, (digest >> 64) as u64])
+    }
+}
+
+/// The digest is uniformly distributed, so one half is a full-quality hash for
+/// [`PrehashedBuildHasher`]; equality still compares both halves.
+impl std::hash::Hash for PkKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.0[0]);
+    }
+}
+
+/// Where each part of a retraction record lives. A record is `stride` words:
+/// flag words (one membership bit per view, then one non-null bit per stored
+/// column), the group the row joined in each view (two `u32` per word), then
+/// each stored column's value words.
+#[derive(Debug, Clone)]
+struct RecordLayout {
+    stride: usize,
+    view_count: usize,
+    group_words: usize,
+    columns: Vec<StoredColumn>,
+    /// Per view, per aggregate: the stored column feeding it, `None` for
+    /// `COUNT(*)`.
+    view_inputs: Vec<Vec<Option<usize>>>,
+}
+
+/// One table column whose value a retraction needs.
+#[derive(Debug, Clone)]
+struct StoredColumn {
+    /// Position in the table schema.
+    index: usize,
+    data_type: DataType,
+    /// First value word in the record, and how many there are: none when only
+    /// whether the value was null matters (`COUNT(column)`).
+    word: usize,
+    words: usize,
+}
+
+impl RecordLayout {
+    fn try_new(views: &[MaintainedAggregateView]) -> DataFusionResult<Self> {
+        let mut columns: Vec<StoredColumn> = Vec::new();
+        let mut view_inputs = Vec::with_capacity(views.len());
+        for view in views {
+            let mut inputs = Vec::with_capacity(view.spec.aggregates.len());
+            for aggregate in &view.spec.aggregates {
+                let Some(column) = &aggregate.column else {
+                    inputs.push(None);
+                    continue;
+                };
+                let words = match aggregate.function {
+                    MaintainedAggregateFunction::Count => 0,
+                    MaintainedAggregateFunction::Sum
+                    | MaintainedAggregateFunction::Avg
+                    | MaintainedAggregateFunction::Min
+                    | MaintainedAggregateFunction::Max => value_words(&column.data_type)
+                        .ok_or_else(|| {
+                            DataFusionError::Plan(format!(
+                                "{:?} maintained aggregate does not support column type {}",
+                                aggregate.function, column.data_type
+                            ))
+                        })?,
+                };
+                let position = if let Some(position) = columns
+                    .iter()
+                    .position(|stored| stored.index == column.index)
+                {
+                    columns[position].words = columns[position].words.max(words);
+                    position
+                } else {
+                    columns.push(StoredColumn {
+                        index: column.index,
+                        data_type: column.data_type.clone(),
+                        word: 0,
+                        words,
+                    });
+                    columns.len() - 1
+                };
+                inputs.push(Some(position));
+            }
+            view_inputs.push(inputs);
+        }
+        let flag_words = (views.len() + columns.len()).div_ceil(64).max(1);
+        let mut next = flag_words + views.len().div_ceil(2);
+        for column in &mut columns {
+            column.word = next;
+            next += column.words;
+        }
+        Ok(Self {
+            stride: next,
+            view_count: views.len(),
+            group_words: flag_words,
+            columns,
+            view_inputs,
+        })
+    }
+
+    fn bit(record: &[u64], bit: usize) -> bool {
+        (record[bit / 64] >> (bit % 64)) & 1 == 1
+    }
+
+    fn set_bit(record: &mut [u64], bit: usize) {
+        record[bit / 64] |= 1 << (bit % 64);
+    }
+
+    fn is_member(record: &[u64], view: usize) -> bool {
+        Self::bit(record, view)
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "each half of the word holds one u32 group id"
+    )]
+    fn group(&self, record: &[u64], view: usize) -> u32 {
+        (record[self.group_words + view / 2] >> ((view % 2) * 32)) as u32
+    }
+
+    /// Records that the row joined `group` in `view`.
+    fn join(&self, record: &mut [u64], view: usize, group: u32) {
+        Self::set_bit(record, view);
+        record[self.group_words + view / 2] |= u64::from(group) << ((view % 2) * 32);
+    }
+
+    /// Stores the row's value of every stored column.
+    fn write_values(
+        &self,
+        record: &mut [u64],
+        batch: &RecordBatch,
+        row: usize,
+    ) -> DataFusionResult<()> {
+        for (position, column) in self.columns.iter().enumerate() {
+            let array = batch.column(column.index);
+            if array.is_null(row) {
+                continue;
+            }
+            Self::set_bit(record, self.view_count + position);
+            if column.words > 0 {
+                let words = encode_value(&ScalarValue::try_from_array(array, row)?)?;
+                record[column.word..column.word + column.words]
+                    .copy_from_slice(&words[..column.words]);
+            }
+        }
+        Ok(())
+    }
+
+    /// The input `view`'s aggregates captured from the row, in the shape
+    /// [`GroupAccumulator::retract_row`] takes: `None` for `COUNT(*)` and for a
+    /// null value.
+    fn inputs(&self, record: &[u64], view: usize) -> DataFusionResult<Vec<Option<ScalarValue>>> {
+        self.view_inputs[view]
+            .iter()
+            .map(|input| {
+                let Some(position) = *input else {
+                    return Ok(None);
+                };
+                if !Self::bit(record, self.view_count + position) {
+                    return Ok(None);
+                }
+                let column = &self.columns[position];
+                if column.words == 0 {
+                    // Only `COUNT(column)` reads this column, and it needs only
+                    // to know the value was not null.
+                    return Ok(Some(ScalarValue::Boolean(Some(true))));
+                }
+                decode_value(
+                    &record[column.word..column.word + column.words],
+                    &column.data_type,
+                )
+                .map(Some)
+            })
+            .collect()
+    }
+}
+
+/// Value words a column of `data_type` needs to rebuild the exact
+/// [`ScalarValue`] it contributed: one for every type up to 64 bits wide,
+/// including a `Decimal128` whose precision keeps it within `i64`, and two for
+/// a wider `Decimal128`. `None` for a type no maintained `SUM`/`AVG`/`MIN`/`MAX`
+/// accepts.
+fn value_words(data_type: &DataType) -> Option<usize> {
+    match data_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Timestamp(_, _) => Some(1),
+        // 10^18 - 1 < 2^63, so a value of precision 18 or less fits in an i64.
+        DataType::Decimal128(precision, _) => Some(if *precision <= 18 { 1 } else { 2 }),
+        _ => None,
+    }
+}
+
+/// The backing integer (or float bits) of a non-null aggregate input, as the
+/// two words of its two's-complement `i128`. A one-word column keeps the low
+/// word, which [`decode_value`] sign- or zero-extends by the column's type.
+fn encode_value(scalar: &ScalarValue) -> DataFusionResult<[u64; 2]> {
+    let wide = match scalar {
+        ScalarValue::Int8(Some(value)) => i128::from(*value),
+        ScalarValue::Int16(Some(value)) => i128::from(*value),
+        ScalarValue::Int32(Some(value)) | ScalarValue::Date32(Some(value)) => i128::from(*value),
+        ScalarValue::Int64(Some(value))
+        | ScalarValue::Date64(Some(value))
+        | ScalarValue::TimestampSecond(Some(value), _)
+        | ScalarValue::TimestampMillisecond(Some(value), _)
+        | ScalarValue::TimestampMicrosecond(Some(value), _)
+        | ScalarValue::TimestampNanosecond(Some(value), _) => i128::from(*value),
+        ScalarValue::UInt8(Some(value)) => i128::from(*value),
+        ScalarValue::UInt16(Some(value)) => i128::from(*value),
+        ScalarValue::UInt32(Some(value)) => i128::from(*value),
+        ScalarValue::UInt64(Some(value)) => i128::from(*value),
+        ScalarValue::Float32(Some(value)) => i128::from(value.to_bits()),
+        ScalarValue::Float64(Some(value)) => i128::from(value.to_bits()),
+        ScalarValue::Decimal128(Some(value), _, _) => *value,
+        other => return Err(type_mismatch("a maintained aggregate input", other)),
+    };
+    let bits = wide.cast_unsigned();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "splits the 128 bits into their two words"
+    )]
+    Ok([bits as u64, (bits >> 64) as u64])
+}
+
+/// The [`ScalarValue`] of type `data_type` that [`encode_value`] stored in
+/// `words`.
+fn decode_value(words: &[u64], data_type: &DataType) -> DataFusionResult<ScalarValue> {
+    let low = words[0];
+    let wide = match words.get(1) {
+        Some(high) => ((u128::from(*high) << 64) | u128::from(low)).cast_signed(),
+        None => i128::from(low.cast_signed()),
+    };
+    let out_of_range = |_| {
+        DataFusionError::Internal(format!(
+            "maintained aggregate retraction record holds a value outside {data_type}"
+        ))
+    };
+    let timestamp = |unit: &arrow_schema::TimeUnit, tz: &Option<Arc<str>>| {
+        let value = Some(i64::try_from(wide).map_err(out_of_range)?);
+        Ok::<_, DataFusionError>(match unit {
+            arrow_schema::TimeUnit::Second => ScalarValue::TimestampSecond(value, tz.clone()),
+            arrow_schema::TimeUnit::Millisecond => {
+                ScalarValue::TimestampMillisecond(value, tz.clone())
+            }
+            arrow_schema::TimeUnit::Microsecond => {
+                ScalarValue::TimestampMicrosecond(value, tz.clone())
+            }
+            arrow_schema::TimeUnit::Nanosecond => {
+                ScalarValue::TimestampNanosecond(value, tz.clone())
+            }
+        })
+    };
+    Ok(match data_type {
+        DataType::Int8 => ScalarValue::Int8(Some(i8::try_from(wide).map_err(out_of_range)?)),
+        DataType::Int16 => ScalarValue::Int16(Some(i16::try_from(wide).map_err(out_of_range)?)),
+        DataType::Int32 => ScalarValue::Int32(Some(i32::try_from(wide).map_err(out_of_range)?)),
+        DataType::Int64 => ScalarValue::Int64(Some(i64::try_from(wide).map_err(out_of_range)?)),
+        DataType::UInt8 => ScalarValue::UInt8(Some(u8::try_from(low).map_err(out_of_range)?)),
+        DataType::UInt16 => ScalarValue::UInt16(Some(u16::try_from(low).map_err(out_of_range)?)),
+        DataType::UInt32 => ScalarValue::UInt32(Some(u32::try_from(low).map_err(out_of_range)?)),
+        DataType::UInt64 => ScalarValue::UInt64(Some(low)),
+        DataType::Float32 => ScalarValue::Float32(Some(f32::from_bits(
+            u32::try_from(low).map_err(out_of_range)?,
+        ))),
+        DataType::Float64 => ScalarValue::Float64(Some(f64::from_bits(low))),
+        DataType::Date32 => ScalarValue::Date32(Some(i32::try_from(wide).map_err(out_of_range)?)),
+        DataType::Date64 => ScalarValue::Date64(Some(i64::try_from(wide).map_err(out_of_range)?)),
+        DataType::Timestamp(unit, tz) => timestamp(unit, tz)?,
+        DataType::Decimal128(precision, scale) => {
+            ScalarValue::Decimal128(Some(wide), *precision, *scale)
+        }
+        other => {
+            return Err(DataFusionError::Internal(format!(
+                "maintained aggregate retraction record cannot hold a {other} value"
+            )));
+        }
+    })
+}
+
+/// Per primary key, what its current row contributed to every view, so an
+/// UPDATE or DELETE retracts exactly that without a CDC before-image: the old
+/// values are read from here, keyed by the primary key every CDC source
+/// delivers. One record per key serves every view on the table, so the key and
+/// the values two views share are held once.
+///
+/// Records are fixed-width words in one vector, addressed by a slot the key
+/// maps to. That keeps a row of the CH-benCH `order_line` views (one grouped
+/// and one global aggregate over two columns) at four words plus its map
+/// entry, which is what lets a maintained aggregate cover a table of tens of
+/// millions of rows within its budget.
+#[derive(Debug)]
+struct RetractionIndex {
+    /// Table-schema positions of the primary-key columns, in key order.
+    pk_columns: Vec<usize>,
+    pk_fields: Vec<SortField>,
+    /// Encodes a batch's primary-key columns for [`PkKey::of`].
+    converter: RowConverter,
+    layout: RecordLayout,
+    slots: HashMap<PkKey, u32, PrehashedBuildHasher>,
+    records: Vec<u64>,
+    /// The most recently released slot. A released record's first word holds
+    /// the next released slot plus one (zero ends the chain), so reusing slots
+    /// needs no allocation of its own.
+    free_head: Option<u32>,
+}
+
+impl RetractionIndex {
+    fn try_new(
+        pk_columns: &[usize],
+        schema: &SchemaRef,
+        views: &[MaintainedAggregateView],
+    ) -> DataFusionResult<Self> {
+        let pk_fields = pk_columns
+            .iter()
+            .map(|&index| SortField::new(schema.field(index).data_type().clone()))
+            .collect::<Vec<_>>();
+        Ok(Self {
+            pk_columns: pk_columns.to_vec(),
+            converter: RowConverter::new(pk_fields.clone())
+                .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?,
+            pk_fields,
+            layout: RecordLayout::try_new(views)?,
+            slots: HashMap::default(),
+            records: Vec::new(),
+            free_head: None,
+        })
+    }
+
+    /// An empty index with the same key and layout.
+    fn empty_like(&self) -> DataFusionResult<Self> {
+        Ok(Self {
+            pk_columns: self.pk_columns.clone(),
+            converter: RowConverter::new(self.pk_fields.clone())
+                .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?,
+            pk_fields: self.pk_fields.clone(),
+            layout: self.layout.clone(),
+            slots: HashMap::default(),
+            records: Vec::new(),
+            free_head: None,
+        })
+    }
+
+    /// The key of each row of `pk_columns`, which are the primary-key columns
+    /// in key order.
+    fn keys(&self, pk_columns: &[ArrayRef]) -> DataFusionResult<Vec<PkKey>> {
+        let rows = self
+            .converter
+            .convert_columns(pk_columns)
+            .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?;
+        Ok(rows.iter().map(|row| PkKey::of(row.as_ref())).collect())
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Bytes the index holds: its allocated capacity rather than its live
+    /// entries, since a map or vector keeps its high-water capacity after
+    /// removals and that memory is what the budget must cover.
+    fn approx_bytes(&self) -> usize {
+        // A map of capacity `c` has about `c * 8 / 7` buckets, each holding an
+        // entry and a control byte.
+        let buckets = self.slots.capacity().saturating_mul(8) / 7;
+        buckets
+            .saturating_mul(std::mem::size_of::<(PkKey, u32)>() + 1)
+            .saturating_add(
+                self.records
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+    }
+
+    /// Releases every record and the memory behind them.
+    fn reset(&mut self) {
+        drop(self.take_storage());
+    }
+
+    /// Moves the records out, leaving the index empty, so a caller can free
+    /// them off the current thread.
+    fn take_storage(&mut self) -> RetiredIndex {
+        self.free_head = None;
+        (
+            std::mem::take(&mut self.slots),
+            std::mem::take(&mut self.records),
+        )
+    }
+
+    fn record(&self, slot: u32) -> &[u64] {
+        let start = slot as usize * self.layout.stride;
+        &self.records[start..start + self.layout.stride]
+    }
+
+    fn record_mut(&mut self, slot: u32) -> &mut [u64] {
+        let start = slot as usize * self.layout.stride;
+        &mut self.records[start..start + self.layout.stride]
+    }
+
+    /// A zeroed record's slot, reusing a released one when there is one.
+    fn allocate(&mut self) -> DataFusionResult<u32> {
+        if let Some(slot) = self.free_head {
+            let record = self.record_mut(slot);
+            let next = record[0];
+            record.fill(0);
+            self.free_head = next
+                .checked_sub(1)
+                .map(|next| u32::try_from(next).map_err(|_| index_entry_overflow()))
+                .transpose()?;
+            return Ok(slot);
+        }
+        let slot = u32::try_from(self.records.len() / self.layout.stride)
+            .map_err(|_| index_entry_overflow())?;
+        self.records
+            .resize(self.records.len() + self.layout.stride, 0);
+        Ok(slot)
+    }
+
+    fn release(&mut self, slot: u32) {
+        let next = self.free_head.map_or(0, |next| u64::from(next) + 1);
+        self.record_mut(slot)[0] = next;
+        self.free_head = Some(slot);
+    }
+}
+
+/// An index's storage moved out to be freed off the current thread.
+type RetiredIndex = (HashMap<PkKey, u32, PrehashedBuildHasher>, Vec<u64>);
+
+/// Takes `key`'s record out of `index` and subtracts what its row contributed
+/// from every view it joined. Idempotent: a key with no record contributed
+/// nothing, so there is nothing to retract.
+fn retract_key(
+    views: &mut [MaintainedAggregateView],
+    index: &mut RetractionIndex,
+    key: PkKey,
+) -> DataFusionResult<()> {
+    let Some(slot) = index.slots.remove(&key) else {
+        return Ok(());
+    };
+    let record = index.record(slot);
+    for (view_index, view) in views.iter_mut().enumerate() {
+        if RecordLayout::is_member(record, view_index) {
+            let inputs = index.layout.inputs(record, view_index)?;
+            view.retract(index.layout.group(record, view_index), &inputs)?;
+        }
+    }
+    index.release(slot);
+    Ok(())
+}
+
+/// Folds `batch`'s rows into `views`. With a retraction index every row is an
+/// upsert: a key that already has a record is an UPDATE, so its old
+/// contribution is retracted first — even when the new row matches no view's
+/// filter, so a row updated out of a filter drops its old contribution. A row
+/// that matches no filter contributes nothing and gets no record, exactly like
+/// an absent row.
+fn apply_upserts(
+    views: &mut [MaintainedAggregateView],
+    index: Option<&mut RetractionIndex>,
+    batch: &RecordBatch,
+) -> DataFusionResult<()> {
+    let rows = batch.num_rows();
+    if rows == 0 {
+        return Ok(());
+    }
+    // `None` mask => every row contributes (an unfiltered view).
+    let masks = views
+        .iter()
+        .map(|view| view.evaluate_filter_mask(batch))
+        .collect::<DataFusionResult<Vec<_>>>()?;
+    let matches = |view: usize, row: usize| {
+        masks[view]
+            .as_ref()
+            .is_none_or(|mask| mask.is_valid(row) && mask.value(row))
+    };
+
+    let Some(index) = index else {
+        for (view_index, view) in views.iter_mut().enumerate() {
+            for row in 0..rows {
+                if matches(view_index, row) {
+                    view.insert_row(batch, row)?;
+                }
+            }
+        }
+        return Ok(());
+    };
+
+    let pk_columns = index
+        .pk_columns
+        .iter()
+        .map(|&column| Arc::clone(batch.column(column)))
+        .collect::<Vec<_>>();
+    let keys = index.keys(&pk_columns)?;
+    for (row, key) in keys.into_iter().enumerate() {
+        retract_key(views, index, key)?;
+        if !(0..views.len()).any(|view_index| matches(view_index, row)) {
+            continue;
+        }
+        let slot = index.allocate()?;
+        let RetractionIndex {
+            layout, records, ..
+        } = &mut *index;
+        let start = slot as usize * layout.stride;
+        let record = &mut records[start..start + layout.stride];
+        layout.write_values(record, batch, row)?;
+        for (view_index, view) in views.iter_mut().enumerate() {
+            if matches(view_index, row) {
+                let group = view.insert_row(batch, row)?;
+                layout.join(record, view_index, group);
+            }
+        }
+        index.slots.insert(key, slot);
+    }
+    Ok(())
+}
+
+/// Retracts every row of `pk_batch`, whose columns are the primary-key columns
+/// in key order.
+fn apply_deletes(
+    views: &mut [MaintainedAggregateView],
+    index: &mut RetractionIndex,
+    pk_batch: &RecordBatch,
+) -> DataFusionResult<()> {
+    for key in index.keys(pk_batch.columns())? {
+        retract_key(views, index, key)?;
+    }
+    Ok(())
+}
+
+/// A rebuild of a registry's views from a snapshot of the table, folded
+/// without holding the registry's lock and installed by
+/// [`MaintainedAggregateRegistry::finish_rebuild`]. Started by
+/// [`MaintainedAggregateRegistry::begin_rebuild`].
+#[derive(Debug)]
+pub struct MaintainedAggregateRebuilder {
+    hold_from: u64,
+    snapshot_epoch: Option<u64>,
+    views: Vec<MaintainedAggregateView>,
+    index: Option<RetractionIndex>,
+    max_index_bytes: usize,
+    schema: SchemaRef,
+}
+
+impl MaintainedAggregateRebuilder {
+    /// The epoch of the snapshot being read once it is known, else the epoch
+    /// the registry started holding deltas after.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.snapshot_epoch.unwrap_or(self.hold_from)
+    }
+
+    /// Records the epoch of the snapshot the rebuild reads. Returns `false` when
+    /// the snapshot predates the epoch the registry started holding deltas
+    /// after: the deltas in between were dropped, so the rebuild cannot be
+    /// completed and must be abandoned.
+    #[must_use]
+    pub fn set_snapshot_epoch(&mut self, epoch: u64) -> bool {
+        if epoch < self.hold_from {
+            return false;
+        }
+        self.snapshot_epoch = Some(epoch);
+        true
+    }
+
+    /// Folds a batch of the snapshot that holds only the table columns at
+    /// `columns` (table positions, in the batch's column order) — what a scan
+    /// projected to [`MaintainedAggregateRegistry::rebuild_columns`] returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a maintained accumulator overflows, Arrow scalar
+    /// extraction fails, or the rebuilt state exceeds the byte budget.
+    pub fn apply_projected(
+        &mut self,
+        batch: &RecordBatch,
+        columns: &[usize],
+    ) -> DataFusionResult<()> {
+        // The views read columns by table position, so the batch is laid out
+        // in the table schema, with the columns no view reads left null.
+        let rows = batch.num_rows();
+        let mut fields = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+            .collect::<Vec<FieldRef>>();
+        let mut arrays = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| new_null_array(field.data_type(), rows))
+            .collect::<Vec<ArrayRef>>();
+        for (position, &column) in columns.iter().enumerate() {
+            let read = batch.column(position);
+            let read_field = &batch.schema_ref().fields()[position];
+            // A table with `force_view_read_schema` scans a stored `Utf8`
+            // column as `Utf8View` (`viewify_read_schema`). The views and the
+            // retraction index hold the stored types, so such a column is
+            // folded back to `Utf8`; any other difference from the stored type
+            // reaches them unchanged and is refused there.
+            if read.data_type() == &DataType::Utf8View
+                && self.schema.field(column).data_type() == &DataType::Utf8
+            {
+                arrays[column] = arrow::compute::cast(read, &DataType::Utf8)
+                    .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?;
+                fields[column] =
+                    Arc::new(read_field.as_ref().clone().with_data_type(DataType::Utf8));
+            } else {
+                arrays[column] = Arc::clone(read);
+                fields[column] = Arc::clone(read_field);
+            }
+        }
+        let widened = RecordBatch::try_new_with_options(
+            Arc::new(Schema::new(fields)),
+            arrays,
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )
+        .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?;
+        apply_upserts(&mut self.views, self.index.as_mut(), &widened)?;
+        let retained = retained_bytes(&self.views, self.index.as_ref());
+        if retained > self.max_index_bytes {
+            return Err(index_cap_exceeded(
+                retained_entries(&self.views, self.index.as_ref()),
+                retained,
+                self.max_index_bytes,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedAggregateSpec {
+    group_by: Vec<ResolvedColumn>,
+    aggregates: Vec<ResolvedAggregateExpr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedColumn {
+    name: String,
+    index: usize,
+    data_type: DataType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedAggregateExpr {
+    function: MaintainedAggregateFunction,
+    column: Option<ResolvedColumn>,
+    output_type: AggregateOutputType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateOutputType {
+    Count,
+    Int64,
+    UInt64,
+    Float64,
+    /// `SUM`/`AVG` over a `Decimal128` input. Unlike the fixed widened outputs
+    /// above, the output precision/scale depend on the input type (`SUM(p, s)`
+    /// -> `(min(38, p + 10), s)`; `AVG(p, s)` -> `(min(38, p + 4),
+    /// min(38, s + 4))`, `DataFusion`'s decimal output types), so the resolved
+    /// parameters are carried here.
+    Decimal128 {
+        precision: u8,
+        scale: i8,
+    },
+    /// The output type equals the aggregate's input column type — `MIN`/`MAX`,
+    /// which preserve type rather than widen. The concrete `DataType` lives on
+    /// the [`ResolvedAggregateExpr`]'s resolved column, so field matching for
+    /// this variant is done by [`ResolvedAggregateExpr::output_matches_field`].
+    SameAsInput,
+}
+
+impl AggregateOutputType {
+    fn matches_field(self, field: &FieldRef) -> bool {
+        match self {
+            Self::Count | Self::Int64 => field.data_type() == &DataType::Int64,
+            Self::UInt64 => field.data_type() == &DataType::UInt64,
+            Self::Float64 => field.data_type() == &DataType::Float64,
+            Self::Decimal128 { precision, scale } => {
+                field.data_type() == &DataType::Decimal128(precision, scale)
+            }
+            // Matched against the input column type in
+            // `ResolvedAggregateExpr::output_matches_field`, never here.
+            Self::SameAsInput => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GroupAccumulator {
+    /// Live row count for this group. A group is dropped when it reaches 0 so
+    /// a fully-retracted group disappears (SQL `GROUP BY` emits no row for an
+    /// empty group).
+    rows: u64,
+    aggregates: Vec<AggregateAccumulator>,
+}
+
+#[derive(Debug, Clone)]
+enum AggregateAccumulator {
+    CountAll {
+        value: i64,
+    },
+    CountColumn {
+        column_index: usize,
+        value: i64,
+    },
+    SumInt64 {
+        column_index: usize,
+        value: Option<i64>,
+        non_null_count: u64,
+    },
+    SumUInt64 {
+        column_index: usize,
+        value: Option<u64>,
+        non_null_count: u64,
+    },
+    SumFloat64 {
+        column_index: usize,
+        value: Option<f64>,
+        non_null_count: u64,
+    },
+    /// `SUM` over a `Decimal128(p, s)` column. The output keeps the input scale
+    /// (only the precision widens, to `min(38, p + 10)`), so the running sum is
+    /// the exact `i128` backing-value sum — exactly invertible on the retract
+    /// path, like the integer sums. `precision`/`scale` are the *output* type
+    /// parameters, carried so the served scalar is typed exactly. Unlike
+    /// `SumInt64`'s `Option<i64>`, the SQL-`NULL` state is encoded as
+    /// `non_null_count == 0` rather than an `Option<i128>`: an `Option<i128>`
+    /// has no niche, and its extra 16 aligned bytes would grow *every*
+    /// [`AggregateAccumulator`] (the enum takes the largest variant's size)
+    /// for all views, decimal or not.
+    SumDecimal128 {
+        column_index: usize,
+        value: i128,
+        non_null_count: u64,
+        precision: u8,
+        scale: i8,
+    },
+    AvgFloat64 {
+        column_index: usize,
+        sum: f64,
+        count: i64,
+    },
+    /// `AVG` over the signed/unsigned integer family. The running sum is folded
+    /// exactly in `i128` (never materialized as an integer — always divided down
+    /// to the `Float64` AVG output), so it is exactly invertible on the retract
+    /// path and, unlike `SumInt64`'s `i64`, wide enough to average many values
+    /// near `i64::MAX`/`u64::MAX` without overflowing.
+    AvgInt128 {
+        column_index: usize,
+        sum: i128,
+        count: i64,
+    },
+    /// `AVG` over a `Decimal128(p, sum_scale)` column. The running sum is the
+    /// exact `i128` backing-value sum at the *input* scale (exactly invertible
+    /// on the retract path, like [`Self::AvgInt128`]); only when served is it
+    /// rescaled to `target_scale` and divided by the count — by `DataFusion`'s
+    /// own `DecimalAverager`, so the quotient (truncation, precision
+    /// validation, overflow behavior) is identical to a base-table re-scan by
+    /// construction.
+    AvgDecimal128 {
+        column_index: usize,
+        sum: i128,
+        count: i64,
+        sum_scale: i8,
+        target_precision: u8,
+        target_scale: i8,
+    },
+    /// SQL `MIN(column)`: the smallest live value in the group, read as the
+    /// first key of a retraction-capable ordered multiset.
+    Min {
+        column_index: usize,
+        index: SortedScalarIndex,
+    },
+    /// SQL `MAX(column)`: the largest live value, read as the last key of the
+    /// same ordered-multiset structure.
+    Max {
+        column_index: usize,
+        index: SortedScalarIndex,
+    },
+}
+
+/// A per-group ordered multiset of the live (non-null) values feeding a
+/// maintained `MIN`/`MAX` — the structure that makes those *retraction-hard*
+/// aggregates incrementally maintainable. `COUNT`/`SUM`/`AVG` invert a
+/// retraction by subtracting; `MIN`/`MAX` cannot — deleting the current
+/// extremum needs the next value, which only a kept ordered structure has.
+/// Keyed by a lossless `i128` order key over the whole signed/unsigned integer
+/// family, so `BTreeMap` gives O(log distinct) insert/retract and O(1)
+/// `MIN` (first key) / `MAX` (last key). Only non-null values are stored, so an
+/// empty index means the extremum is SQL `NULL`. The exact input-typed
+/// [`ScalarValue`] is stored (not the widened key) because the strict
+/// [`scalar_for_field`] requires the output scalar to match the column type
+/// exactly.
+///
+/// Memory bound: each view counts its distinct multiset nodes
+/// (`retained_multiset_entries`), and the registry charges them alongside the
+/// per-PK retraction records. The exact count is maintained incrementally, so
+/// cap checks do not scan every group. The
+/// runtime additionally rejects user-configured `MIN`/`MAX` without a primary
+/// key because retraction cannot be supported there.
+#[derive(Debug, Clone, Default)]
+struct SortedScalarIndex {
+    entries: BTreeMap<i128, (ScalarValue, u64)>,
+}
+
+impl SortedScalarIndex {
+    /// Add one live value. `checked_add` on the per-value count matches the
+    /// crate-wide "never silently clamp a maintained counter" discipline.
+    /// Returns whether this inserted a new distinct map entry.
+    fn insert(&mut self, scalar: ScalarValue) -> DataFusionResult<bool> {
+        let key = scalar_order_key(&scalar)?;
+        if let Some((_, count)) = self.entries.get_mut(&key) {
+            *count = count.checked_add(1).ok_or_else(count_overflow)?;
+            Ok(false)
+        } else {
+            self.entries.insert(key, (scalar, 1));
+            Ok(true)
+        }
+    }
+
+    /// Remove one live value (the inverse of [`Self::insert`]). A key that is
+    /// absent, or a count that underflows, is a state inconsistency the caller
+    /// turns into a fail-safe-to-stale, exactly like the additive retraction path.
+    /// Returns whether this removed a distinct map entry.
+    fn retract(&mut self, scalar: &ScalarValue) -> DataFusionResult<bool> {
+        let key = scalar_order_key(scalar)?;
+        let Some((_, count)) = self.entries.get_mut(&key) else {
+            return Err(retract_underflow());
+        };
+        *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+        if *count == 0 {
+            self.entries.remove(&key);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// The smallest live value (SQL `MIN`), or `None` when no non-null value
+    /// remains (the group's `MIN` is `NULL`).
+    fn min_scalar(&self) -> Option<ScalarValue> {
+        self.entries
+            .values()
+            .next()
+            .map(|(scalar, _)| scalar.clone())
+    }
+
+    /// The largest live value (SQL `MAX`), or `None` when the index is empty.
+    fn max_scalar(&self) -> Option<ScalarValue> {
+        self.entries
+            .values()
+            .next_back()
+            .map(|(scalar, _)| scalar.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueryAggregateSpec {
+    group_by: Vec<String>,
+    aggregates: Vec<QueryAggregateExpr>,
+    /// The predicate every row reaching the aggregate satisfied — the query's
+    /// `WHERE`, wherever planning put it — or no conjuncts for an unfiltered
+    /// query. A view serves the query only when this equals the view's own
+    /// filter: a filtered view must never answer an unfiltered query, and vice
+    /// versa, or the result would be wrong.
+    filter: PredicateConjuncts,
+}
+
+/// A row predicate as the set of its `AND`-ed conjuncts, compared independently
+/// of the plan that carries it.
+///
+/// A query's `WHERE` reaches the physical optimizer in whatever shape planning
+/// left it: a `FilterExec` above the scan, a predicate pushed into a Vortex file
+/// source, a `FilterExec` on the scan's in-memory branch, or several of these at
+/// once. Each copy references columns by the position in its own input, so the
+/// same column is `ol_delivery_d@1` above the scan and `ol_delivery_d@6` in a
+/// file source. Comparing conjunct sets makes the match independent of how the
+/// predicate was split across operators and in what order, and identifying each
+/// column by name alone makes it independent of position. Everything else is
+/// compared structurally, literal types included, so a predicate matches only
+/// one written against the same column types.
+#[derive(Debug, Clone, Default)]
+pub struct PredicateConjuncts(Vec<Arc<dyn PhysicalExpr>>);
+
+impl PredicateConjuncts {
+    /// The conjuncts of `predicate`, or `None` when it is volatile or dynamic. A
+    /// volatile function (`random()`) or a hash join's runtime filter selects
+    /// different rows each time it is evaluated, so no maintained view can
+    /// describe the rows it keeps.
+    #[must_use]
+    pub fn try_from_predicate(predicate: &Arc<dyn PhysicalExpr>) -> Option<Self> {
+        let mut conjuncts = Self::default();
+        conjuncts.try_add_predicate(predicate)?;
+        Some(conjuncts)
+    }
+
+    /// Adds the conjuncts of `predicate`, with the same `None` contract as
+    /// [`Self::try_from_predicate`]. On `None`, `self` may hold some of the
+    /// conjuncts and must be discarded.
+    #[must_use]
+    pub fn try_add_predicate(&mut self, predicate: &Arc<dyn PhysicalExpr>) -> Option<()> {
+        if is_volatile(predicate)
+            || DynamicFilterTracking::classify(predicate).contains_dynamic_filter()
+        {
+            return None;
+        }
+        for conjunct in split_conjunction(predicate) {
+            // A pushed-down filter can leave a literal `true` behind where a
+            // conjunct was absorbed; it selects every row.
+            if conjunct
+                .downcast_ref::<Literal>()
+                .is_some_and(|literal| literal.value() == &ScalarValue::Boolean(Some(true)))
+            {
+                continue;
+            }
+            self.insert(name_columns_only(conjunct).ok()?);
+        }
+        Some(())
+    }
+
+    /// Adds every conjunct of `other`.
+    pub fn extend(&mut self, other: &Self) {
+        for conjunct in &other.0 {
+            self.insert(Arc::clone(conjunct));
+        }
+    }
+
+    /// Whether there are no conjuncts, i.e. the predicate selects every row.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn insert(&mut self, conjunct: Arc<dyn PhysicalExpr>) {
+        if !self.0.contains(&conjunct) {
+            self.0.push(conjunct);
+        }
+    }
+}
+
+/// Set equality: both sides hold each conjunct once, so equal lengths and
+/// containment one way imply containment the other way.
+impl PartialEq for PredicateConjuncts {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() && self.0.iter().all(|conjunct| other.0.contains(conjunct))
+    }
+}
+
+impl Eq for PredicateConjuncts {}
+
+/// `expr` with every column reference identified by its name alone (position
+/// 0), so two copies of a predicate planned over different input schemas
+/// compare equal.
+fn name_columns_only(expr: &Arc<dyn PhysicalExpr>) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
+    Arc::clone(expr)
+        .transform_up(|node| {
+            let Some(column) = node.downcast_ref::<Column>() else {
+                return Ok(Transformed::no(node));
+            };
+            if column.index() == 0 {
+                return Ok(Transformed::no(node));
+            }
+            Ok(Transformed::yes(
+                Arc::new(Column::new(column.name(), 0)) as Arc<dyn PhysicalExpr>
+            ))
+        })
+        .data()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueryAggregateExpr {
+    function: MaintainedAggregateFunction,
+    column: Option<String>,
+}
+
+enum CountQueryColumn {
+    AllRows,
+    Column(String),
+}
+
+/// Execution plan returned by the maintained aggregate optimizer rewrite.
+#[derive(Debug)]
+pub struct MaintainedAggregateExec {
+    inner: Arc<dyn ExecutionPlan>,
+}
+
+impl MaintainedAggregateExec {
+    /// Create a maintained aggregate execution plan from a materialized batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the in-memory execution plan cannot be built.
+    pub fn try_new(batch: RecordBatch) -> DataFusionResult<Self> {
+        let schema = batch.schema();
+        let inner = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)?;
+        Ok(Self { inner })
+    }
+}
+
+impl DisplayAs for MaintainedAggregateExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MaintainedAggregateExec")
+    }
+}
+
+impl ExecutionPlan for MaintainedAggregateExec {
+    fn name(&self) -> &'static str {
+        "MaintainedAggregateExec"
+    }
+
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "MaintainedAggregateExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.inner.properties()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.inner]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "MaintainedAggregateExec expected one child, got {}",
+                children.len()
+            )));
+        }
+
+        let Some(inner) = children.pop() else {
+            return Err(DataFusionError::Internal(
+                "MaintainedAggregateExec expected one child".to_string(),
+            ));
+        };
+        Ok(Arc::new(Self { inner }))
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::UnspecifiedDistribution; self.children().len()]
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        vec![None; self.children().len()]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true; self.children().len()]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false; self.children().len()]
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        self.inner.execute(partition, context)
+    }
+}
+
+impl MaintainedAggregateRegistry {
+    /// Create a registry for the provided aggregate view specs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a spec references a missing column or an aggregate
+    /// type Cayenne cannot maintain exactly.
+    pub fn try_new(
+        specs: &[MaintainedAggregateSpec],
+        schema: &SchemaRef,
+    ) -> DataFusionResult<Self> {
+        Self::try_new_inner(specs, schema, &[], usize::MAX)
+    }
+
+    /// As [`Self::try_new`], but maintains a per-PK contribution index keyed on
+    /// `pk_columns` so UPDATE/DELETE can be retracted incrementally (see
+    /// [`Self::apply_pk_deletes`]). `max_index_bytes` bounds all retained index
+    /// entries across the views; exceeding it fails the registry safe to `Stale`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a spec references a missing column or an aggregate
+    /// type Cayenne cannot maintain exactly.
+    pub fn try_new_with_pk(
+        specs: &[MaintainedAggregateSpec],
+        schema: &SchemaRef,
+        pk_columns: &[usize],
+        max_index_bytes: usize,
+    ) -> DataFusionResult<Self> {
+        Self::try_new_inner(specs, schema, pk_columns, max_index_bytes)
+    }
+
+    fn try_new_inner(
+        specs: &[MaintainedAggregateSpec],
+        schema: &SchemaRef,
+        pk_columns: &[usize],
+        max_index_bytes: usize,
+    ) -> DataFusionResult<Self> {
+        let has_pk_index = !pk_columns.is_empty();
+        let views = specs
+            .iter()
+            .map(|spec| MaintainedAggregateView::try_new(spec, schema))
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        let index = has_pk_index
+            .then(|| RetractionIndex::try_new(pk_columns, schema, &views))
+            .transpose()?;
+
+        Ok(Self {
+            state: RwLock::new(RegistryState {
+                epoch: 0,
+                status: RegistryStatus::Fresh,
+                views,
+                index,
+                rebuild: None,
+                rebuilt_through: 0,
+            }),
+            max_index_bytes,
+            has_pk_index,
+            no_views: specs.is_empty(),
+            schema: Arc::clone(schema),
+        })
+    }
+
+    /// Returns true when no maintained aggregate views are configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.no_views
+    }
+
+    /// Whether this registry maintains a per-PK index and can therefore retract
+    /// UPDATE/DELETE incrementally ([`Self::apply_pk_deletes`] for deletes, the
+    /// retract-old-then-insert path in [`Self::apply_insert_batches`] for
+    /// updates) rather than falling back to a full rebuild via [`Self::mark_stale`].
+    #[must_use]
+    pub fn supports_retraction(&self) -> bool {
+        self.has_pk_index
+    }
+
+    /// Whether the registry is currently stale, i.e. serving nothing and
+    /// discarding every delta until a rebuild restores it.
+    ///
+    /// Staleness is a *recoverable* degradation, not a terminal state: every
+    /// fail-safe path (cap exceeded, apply-queue overflow, accumulator overflow,
+    /// epoch gap) lands here, and only a rebuild clears it. Callers poll this to
+    /// drive that rebuild — without one, a single transient failure would disable
+    /// maintained aggregates for the provider's whole lifetime.
+    #[must_use]
+    pub fn is_stale(&self) -> bool {
+        self.state.read().status == RegistryStatus::Stale
+    }
+
+    /// The epoch of the last delta or rebuild the registry took in, whether or not
+    /// it is stale.
+    #[cfg(test)]
+    pub(crate) fn epoch_for_test(&self) -> u64 {
+        self.state.read().epoch
+    }
+
+    /// Approximate resident bytes currently retained across every view, and the
+    /// byte budget they are held to. Exposed for observability: an operator
+    /// diagnosing a stale registry needs to see how close the indexes are to
+    /// their cap.
+    #[must_use]
+    pub fn retained_bytes_and_budget(&self) -> (usize, usize) {
+        (
+            retained_index_bytes(&self.state.read()),
+            self.max_index_bytes,
+        )
+    }
+
+    /// Mark all maintained aggregate views stale at `epoch` and detach their
+    /// retained state immediately, abandoning any rebuild in progress. When
+    /// called from a `Tokio` runtime, destruction of the detached state runs on
+    /// the blocking pool so a large stale view does not stall an async
+    /// visibility fence.
+    pub fn mark_stale(&self, epoch: u64) {
+        let retired = {
+            let mut state = self.state.write();
+            let state = &mut *state;
+            state.epoch = epoch;
+            state.status = RegistryStatus::Stale;
+            state.rebuild = None;
+            let groups = state
+                .views
+                .iter_mut()
+                .map(MaintainedAggregateView::take_groups)
+                .collect::<Vec<_>>();
+            let index = state.index.as_mut().map(RetractionIndex::take_storage);
+            (groups, index)
+        };
+
+        let (groups, index) = &retired;
+        if groups.iter().all(GroupTable::is_empty)
+            && index
+                .as_ref()
+                .is_none_or(|(slots, records)| slots.capacity() == 0 && records.capacity() == 0)
+        {
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            drop(handle.spawn_blocking(move || drop(retired)));
+        } else {
+            drop(retired);
+        }
+    }
+
+    /// Apply positive row deltas if the state is fresh, otherwise keep it stale.
+    /// Bounds memory: if the retained indexes would exceed their cap, all indexes are
+    /// cleared and the registry fails safe to stale.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error (after clearing the indexes and marking the registry
+    /// stale) when a maintained accumulator overflows, Arrow scalar extraction
+    /// fails, or the retained indexes exceed their entry cap. Queries then fall back
+    /// to base-table scans until the next rebuild.
+    pub fn apply_insert_batches(
+        &self,
+        epoch: u64,
+        batches: &[RecordBatch],
+    ) -> DataFusionResult<()> {
+        let mut state = self.state.write();
+        let state = &mut *state;
+
+        // Async write-path maintenance must apply deltas in strict
+        // visibility-epoch order; an out-of-order/skipped epoch or an
+        // already-stale registry short-circuits (see `begin_maintenance_pass`).
+        match begin_maintenance_pass(state, epoch) {
+            Pass::Skip => return Ok(()),
+            Pass::Hold => {
+                hold_delta(
+                    state,
+                    epoch,
+                    PendingDelta::Upserts(batches.to_vec()),
+                    self.max_held_bytes(),
+                );
+                return Ok(());
+            }
+            Pass::Apply => {}
+        }
+
+        let failure = apply_upsert_batches(state, batches, self.max_index_bytes).err();
+        finalize_maintenance_pass(state, self.max_index_bytes, failure)
+    }
+
+    /// Retract delete rows whose primary-key columns are supplied directly as
+    /// the columns of `pk_batch`, in `pk_columns` order (positions `0..n`). The
+    /// caller resolves the PK columns BY NAME from the CDC delete batch, so this
+    /// is independent of that batch's source-schema column layout. Requires a PK
+    /// index ([`Self::try_new_with_pk`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error (after clearing the indexes and marking the registry
+    /// stale) when retraction fails. An out-of-order epoch silently marks stale
+    /// and returns `Ok`.
+    pub fn apply_pk_deletes(&self, epoch: u64, pk_batch: &RecordBatch) -> DataFusionResult<()> {
+        let mut state = self.state.write();
+        let state = &mut *state;
+
+        match begin_maintenance_pass(state, epoch) {
+            Pass::Skip => return Ok(()),
+            Pass::Hold => {
+                hold_delta(
+                    state,
+                    epoch,
+                    PendingDelta::Deletes(pk_batch.clone()),
+                    self.max_held_bytes(),
+                );
+                return Ok(());
+            }
+            Pass::Apply => {}
+        }
+
+        let failure = apply_delete_batch(state, pk_batch).err();
+        finalize_maintenance_pass(state, self.max_index_bytes, failure)
+    }
+
+    /// Rebuild every view from a complete table snapshot. Bounds memory: the
+    /// retained index total is checked against its cap after each batch, so rebuilding a
+    /// table larger than `max_index_bytes` fails safe to stale (clearing the
+    /// indexes) instead of growing the index unbounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error (after clearing the indexes and marking the registry
+    /// stale) if a maintained accumulator overflows, Arrow scalar extraction
+    /// fails, or the retained indexes exceed their entry cap.
+    pub fn rebuild_from_batches(
+        &self,
+        epoch: u64,
+        batches: &[RecordBatch],
+    ) -> DataFusionResult<()> {
+        let mut state = self.state.write();
+        let state = &mut *state;
+        state.epoch = epoch;
+        state.status = RegistryStatus::Fresh;
+        state.rebuild = None;
+        reset_retained_state(state);
+        let failure = apply_upsert_batches(state, batches, self.max_index_bytes).err();
+        finalize_maintenance_pass(state, self.max_index_bytes, failure)
+    }
+
+    /// The table columns a rebuild reads, by table position ascending: the
+    /// primary key and every column a view groups by, aggregates, or filters on.
+    #[must_use]
+    pub fn rebuild_columns(&self) -> Vec<usize> {
+        let state = self.state.read();
+        let mut columns = BTreeSet::new();
+        if let Some(index) = &state.index {
+            columns.extend(index.pk_columns.iter().copied());
+        }
+        for view in &state.views {
+            columns.extend(view.spec.group_by.iter().map(|column| column.index));
+            columns.extend(
+                view.spec
+                    .aggregates
+                    .iter()
+                    .filter_map(|aggregate| aggregate.column.as_ref().map(|column| column.index)),
+            );
+            if let Some(filter) = &view.filter {
+                columns.extend(collect_columns(filter).iter().map(Column::index));
+            }
+        }
+        // `COUNT(*)` alone reads no column, but the scan must still return the
+        // rows it counts.
+        if columns.is_empty() && !self.schema.fields().is_empty() {
+            columns.insert(0);
+        }
+        columns.into_iter().collect()
+    }
+
+    /// Starts rebuilding the views. From here until the rebuild is installed by
+    /// [`Self::finish_rebuild`], the registry is stale and holds the delta of
+    /// every epoch after `hold_from`, so that whatever epoch the rebuild's
+    /// snapshot turns out to be at (see
+    /// [`MaintainedAggregateRebuilder::set_snapshot_epoch`]), the writes after it
+    /// are applied on top — writes that land while the rebuild reads the table do
+    /// not undo it.
+    ///
+    /// `hold_from` must be the table's epoch at a moment no write can publish a
+    /// new one (the provider's `write_lock`), and the snapshot must be taken
+    /// after this call, so no delta after the snapshot can arrive unheld.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the primary-key encoder cannot be built.
+    pub fn begin_rebuild(&self, hold_from: u64) -> DataFusionResult<MaintainedAggregateRebuilder> {
+        let mut state = self.state.write();
+        let state = &mut *state;
+        let views = state
+            .views
+            .iter()
+            .map(MaintainedAggregateView::empty_like)
+            .collect();
+        let index = state
+            .index
+            .as_ref()
+            .map(RetractionIndex::empty_like)
+            .transpose()?;
+        state.status = RegistryStatus::Stale;
+        reset_retained_state(state);
+        // The table is at `hold_from`. Queued deltas at or below it are in the
+        // snapshot; advance so the first held delta is `hold_from + 1` even
+        // when those queued deltas have not drained yet.
+        state.epoch = state.epoch.max(hold_from);
+        state.rebuild = Some(PendingRebuild {
+            hold_from,
+            deltas: Vec::new(),
+            bytes: 0,
+        });
+        Ok(MaintainedAggregateRebuilder {
+            hold_from,
+            snapshot_epoch: None,
+            views,
+            index,
+            max_index_bytes: self.max_index_bytes,
+            schema: Arc::clone(&self.schema),
+        })
+    }
+
+    /// Whether `rebuilder` is still the rebuild in progress. A stale mark, an
+    /// epoch gap, or more held deltas than the budget allows abandons it.
+    #[must_use]
+    pub fn rebuild_is_current(&self, rebuilder: &MaintainedAggregateRebuilder) -> bool {
+        self.state
+            .read()
+            .rebuild
+            .as_ref()
+            .is_some_and(|rebuild| rebuild.hold_from == rebuilder.hold_from)
+    }
+
+    /// Abandons `rebuilder` and drops the deltas held for it; the registry stays
+    /// stale.
+    pub fn abandon_rebuild(&self, rebuilder: &MaintainedAggregateRebuilder) {
+        let mut state = self.state.write();
+        if state
+            .rebuild
+            .as_ref()
+            .is_some_and(|rebuild| rebuild.hold_from == rebuilder.hold_from)
+        {
+            state.rebuild = None;
+        }
+    }
+
+    /// Installs a rebuild that has read its whole snapshot and applies the held
+    /// deltas the snapshot does not contain. Returns `Ok(false)` when the rebuild
+    /// was abandoned in the meantime or never learned its snapshot's epoch; the
+    /// registry then stays stale for a later attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error (after clearing the indexes and marking the registry
+    /// stale) when a held delta fails to apply or the result exceeds the byte
+    /// budget.
+    pub fn finish_rebuild(
+        &self,
+        rebuilder: MaintainedAggregateRebuilder,
+    ) -> DataFusionResult<bool> {
+        let mut state = self.state.write();
+        let state = &mut *state;
+        let Some(snapshot_epoch) = rebuilder.snapshot_epoch else {
+            if state
+                .rebuild
+                .as_ref()
+                .is_some_and(|rebuild| rebuild.hold_from == rebuilder.hold_from)
+            {
+                state.rebuild = None;
+            }
+            return Ok(false);
+        };
+        let Some(rebuild) = state
+            .rebuild
+            .take_if(|rebuild| rebuild.hold_from == rebuilder.hold_from)
+        else {
+            return Ok(false);
+        };
+        state.views = rebuilder.views;
+        state.index = rebuilder.index;
+        state.status = RegistryStatus::Fresh;
+        // Deltas of the snapshot's own epochs may still be queued behind the
+        // ones already taken in; they are in the snapshot, so they are skipped.
+        // Every later delta was held, so applying them in order brings the views
+        // to the registry's epoch.
+        state.epoch = state.epoch.max(snapshot_epoch);
+        state.rebuilt_through = state.rebuilt_through.max(snapshot_epoch);
+        let mut failure = None;
+        for (epoch, delta) in rebuild.deltas {
+            if epoch <= snapshot_epoch {
+                continue;
+            }
+            let applied = match delta {
+                PendingDelta::Upserts(batches) => {
+                    apply_upsert_batches(state, &batches, self.max_index_bytes)
+                }
+                PendingDelta::Deletes(pk_batch) => apply_delete_batch(state, &pk_batch),
+            };
+            if let Err(error) = applied {
+                failure = Some(error);
+                break;
+            }
+        }
+        finalize_maintenance_pass(state, self.max_index_bytes, failure)?;
+        Ok(true)
+    }
+
+    /// The most memory the deltas held for a rebuild may reference before the
+    /// rebuild is abandoned: a quarter of the index budget, so the held deltas
+    /// and the index being rebuilt fit together.
+    fn max_held_bytes(&self) -> usize {
+        self.max_index_bytes / 4
+    }
+
+    /// Materialize a maintained aggregate batch matching `aggregate`, if fresh.
+    ///
+    /// Returns `None` when the aggregate shape is unsupported, no declared view
+    /// matches it, or the registry is stale or not at the scan snapshot epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a matching maintained view cannot be materialized.
+    pub fn batch_for_aggregate(
+        &self,
+        aggregate: &AggregateExec,
+        scan_epoch: u64,
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        self.batch_for_aggregate_with_output(
+            aggregate,
+            aggregate,
+            scan_epoch,
+            PredicateConjuncts::default(),
+        )
+    }
+
+    /// Materialize a maintained aggregate batch by matching `query_aggregate`
+    /// while using `output_aggregate` as the returned batch schema.
+    ///
+    /// This is used for `DataFusion`'s split aggregate plans: the partial
+    /// aggregate still names the original input columns, while the final
+    /// aggregate carries the user-visible output schema. `filter` is the
+    /// predicate every row reaching `query_aggregate` satisfied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a matching maintained view cannot be materialized.
+    pub fn batch_for_aggregate_with_output(
+        &self,
+        query_aggregate: &AggregateExec,
+        output_aggregate: &AggregateExec,
+        scan_epoch: u64,
+        filter: PredicateConjuncts,
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        let Some(mut query) = query_spec_for_aggregate(query_aggregate) else {
+            return Ok(None);
+        };
+        query.filter = filter;
+        self.serve(&query, scan_epoch, output_aggregate.schema())
+    }
+
+    /// Serve a maintained view directly from a declared [`MaintainedAggregateSpec`]
+    /// (group-by + aggregates + optional filter) into `output_schema`, without an
+    /// `AggregateExec`. Exercises the same fresh/epoch gate, view match (incl.
+    /// filter equality), and O(groups) materialize the optimizer rewrite uses —
+    /// the entry point for benches/tests that measure the maintained serve cost.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(batch))` when the registry is fresh at `scan_epoch`, a
+    /// view matches `spec` exactly, and it materializes into `output_schema`.
+    /// `Ok(None)` is the fallback signal (the caller should run normal
+    /// execution) when the registry is stale or at a different epoch than
+    /// `scan_epoch`, no view matches `spec`, or the matched view does not fit
+    /// `output_schema`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a matched view fails to build its result
+    /// arrays (e.g. a group-key or scalar-value conversion error) — not for the
+    /// stale / no-match / schema-mismatch fallbacks above, which are `Ok(None)`.
+    pub fn batch_for_spec(
+        &self,
+        spec: &MaintainedAggregateSpec,
+        scan_epoch: u64,
+        output_schema: SchemaRef,
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        let filter = match &spec.filter {
+            None => PredicateConjuncts::default(),
+            Some(filter) => match PredicateConjuncts::try_from_predicate(filter) {
+                Some(filter) => filter,
+                None => return Ok(None),
+            },
+        };
+        let query = QueryAggregateSpec {
+            group_by: spec.group_by.clone(),
+            aggregates: spec
+                .aggregates
+                .iter()
+                .map(|aggregate| QueryAggregateExpr {
+                    function: aggregate.function,
+                    column: aggregate.column.clone(),
+                })
+                .collect(),
+            filter,
+        };
+        self.serve(&query, scan_epoch, output_schema)
+    }
+
+    /// Shared serve path: only answer from a maintained view when the registry is
+    /// fresh at the scan's epoch and a view matches the query shape exactly.
+    ///
+    /// The rewrite replaces an immutable scan snapshot. A registry at a different
+    /// epoch holds a different published state of the table, so serving it would
+    /// make this aggregate disagree with other scans of the same snapshot. A
+    /// read-only CDC table may reuse a scan view across later writes; when that
+    /// happens the registry is ahead and this path falls back to the captured
+    /// scan. A registry behind the scan also falls back: it would drop rows the
+    /// snapshot contains.
+    fn serve(
+        &self,
+        query: &QueryAggregateSpec,
+        scan_epoch: u64,
+        output_schema: SchemaRef,
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        let state = self.state.read();
+        if state.status != RegistryStatus::Fresh || state.epoch != scan_epoch {
+            return Ok(None);
+        }
+
+        for view in &state.views {
+            if view.matches_query(query) {
+                // Moved on the diverging return path — at most one view matches,
+                // so no clone of the schema is needed.
+                return view.materialize(output_schema);
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+impl MaintainedAggregateView {
+    fn try_new(spec: &MaintainedAggregateSpec, schema: &SchemaRef) -> DataFusionResult<Self> {
+        // A filter is a `WHERE` condition, so it must evaluate to Boolean.
+        // Validate at construction so a non-Boolean predicate fails fast here with
+        // a clear error, rather than later in `evaluate_filter_mask` with an
+        // internal error. This guards every caller — config, tests, benches, and
+        // any future programmatic construction.
+        if let Some(filter) = &spec.filter {
+            let data_type = filter.data_type(schema)?;
+            if data_type != DataType::Boolean {
+                return Err(DataFusionError::Plan(format!(
+                    "maintained aggregate filter must be a Boolean predicate, but it evaluates to {data_type}"
+                )));
+            }
+        }
+        let filter_conjuncts = match &spec.filter {
+            None => Some(PredicateConjuncts::default()),
+            Some(filter) => PredicateConjuncts::try_from_predicate(filter),
+        };
+        Ok(Self {
+            spec: ResolvedAggregateSpec::try_new(spec, schema)?,
+            filter: spec.filter.clone(),
+            filter_conjuncts,
+            groups: GroupTable::default(),
+            retained_multiset_entries: 0,
+        })
+    }
+
+    /// The same view with no rows folded in.
+    fn empty_like(&self) -> Self {
+        Self {
+            spec: self.spec.clone(),
+            filter: self.filter.clone(),
+            filter_conjuncts: self.filter_conjuncts.clone(),
+            groups: GroupTable::default(),
+            retained_multiset_entries: 0,
+        }
+    }
+
+    /// Evaluate the view's row predicate over `batch`, returning a per-row
+    /// boolean mask. `None` (no filter configured) means every row contributes.
+    /// SQL `WHERE` semantics: a row contributes only when the predicate is
+    /// exactly `TRUE` (a `NULL`/`FALSE` result excludes it).
+    fn evaluate_filter_mask(&self, batch: &RecordBatch) -> DataFusionResult<Option<BooleanArray>> {
+        let Some(filter) = &self.filter else {
+            return Ok(None);
+        };
+        let array = match filter.evaluate(batch)? {
+            ColumnarValue::Array(array) => array,
+            scalar @ ColumnarValue::Scalar(_) => scalar.into_array(batch.num_rows())?,
+        };
+        let mask = array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "maintained aggregate filter must evaluate to Boolean, got {}",
+                    array.data_type()
+                ))
+            })?;
+        Ok(Some(mask.clone()))
+    }
+
+    /// Folds `row` into its group, creating the group on first use, and returns
+    /// the group's id.
+    fn insert_row(&mut self, batch: &RecordBatch, row: usize) -> DataFusionResult<u32> {
+        let key = Self::scalar_key(batch, row, self.spec.group_by.iter().map(|c| c.index))?;
+        let id = self.groups.id_for(key, &self.spec)?;
+        let group = self.groups.get_mut(id).ok_or_else(index_entry_overflow)?;
+        let retained_entries_added = group.apply_insert_row(batch, row)?;
+        self.retained_multiset_entries = self
+            .retained_multiset_entries
+            .checked_add(retained_entries_added)
+            .ok_or_else(index_entry_overflow)?;
+        Ok(id)
+    }
+
+    /// Subtracts a row's `inputs` from the group `id`, dropping the group when
+    /// it becomes empty. A group that does not exist means the retraction
+    /// record and the views disagree, which fails safe to stale.
+    fn retract(&mut self, id: u32, inputs: &[Option<ScalarValue>]) -> DataFusionResult<()> {
+        let group = self.groups.get_mut(id).ok_or_else(retract_underflow)?;
+        let (group_is_empty, retained_entries_removed) = group.retract_row(inputs)?;
+        self.retained_multiset_entries = self
+            .retained_multiset_entries
+            .checked_sub(retained_entries_removed)
+            .ok_or_else(retract_underflow)?;
+        if group_is_empty {
+            self.groups.remove(id);
+        }
+        Ok(())
+    }
+
+    /// Drops every group, releasing their memory.
+    fn clear(&mut self) {
+        self.groups = GroupTable::default();
+        self.retained_multiset_entries = 0;
+    }
+
+    /// Moves the groups out, leaving the view empty, so a caller can free them
+    /// off the current thread.
+    fn take_groups(&mut self) -> GroupTable {
+        self.retained_multiset_entries = 0;
+        std::mem::take(&mut self.groups)
+    }
+
+    /// Approximate resident bytes of the view's `MIN`/`MAX` multiset nodes, the
+    /// part of its retained state that grows with rows rather than groups.
+    fn approx_multiset_bytes(&self) -> usize {
+        self.retained_multiset_entries
+            .saturating_mul(APPROX_MULTISET_NODE_BYTES)
+    }
+
+    /// Build a group key from the given column indices at `row`.
+    fn scalar_key(
+        batch: &RecordBatch,
+        row: usize,
+        indices: impl Iterator<Item = usize>,
+    ) -> DataFusionResult<Vec<ScalarValue>> {
+        indices
+            .map(|index| ScalarValue::try_from_array(batch.column(index), row))
+            .collect()
+    }
+
+    fn matches_query(&self, query: &QueryAggregateSpec) -> bool {
+        // The filter must match exactly: an unfiltered view answers only
+        // unfiltered queries, and a filtered view only a query whose rows
+        // satisfied the same conjuncts. A predicate that is equivalent but
+        // written differently (`a > 1` against `1 < a`), or compares a column
+        // under a different type, does not match and the query re-scans the
+        // table — correct, just not accelerated.
+        self.filter_conjuncts.as_ref() == Some(&query.filter)
+            && self
+                .spec
+                .group_by
+                .iter()
+                .map(|c| c.name.as_str())
+                .eq(query.group_by.iter().map(String::as_str))
+            && self.spec.aggregates.len() == query.aggregates.len()
+            && self
+                .spec
+                .aggregates
+                .iter()
+                .zip(&query.aggregates)
+                .all(|(declared, requested)| {
+                    declared.function == requested.function
+                        && declared.column.as_ref().map(|c| c.name.as_str())
+                            == requested.column.as_deref()
+                })
+    }
+
+    fn materialize(&self, schema: SchemaRef) -> DataFusionResult<Option<RecordBatch>> {
+        if !self.output_schema_matches(&schema) {
+            return Ok(None);
+        }
+
+        // Iterate the live groups BY REFERENCE — never clone the accumulator. A
+        // maintained MIN/MAX accumulator owns the whole per-group ordered multiset,
+        // so cloning it (as this did) made materialize O(total distinct) ≈ O(rows)
+        // and defeated the O(groups) serve the whole lever depends on; for the
+        // additive accumulators it was needless allocation. The empty global
+        // aggregate (no groups, no GROUP BY) still emits one SQL row from a
+        // default accumulator, which must outlive `rows`.
+        let default_global;
+        let rows: Vec<(&[ScalarValue], &GroupAccumulator)> =
+            if self.groups.is_empty() && self.spec.group_by.is_empty() {
+                default_global = GroupAccumulator::try_new(&self.spec)?;
+                vec![(&[][..], &default_global)]
+            } else {
+                self.groups.iter().collect()
+            };
+
+        let output_columns = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(field_index, field)| {
+                if rows.is_empty() {
+                    return Ok(new_empty_array(field.data_type()));
+                }
+
+                let scalars = if field_index < self.spec.group_by.len() {
+                    rows.iter()
+                        .map(|(key, _)| {
+                            key.get(field_index).cloned().ok_or_else(|| {
+                                DataFusionError::Internal(
+                                    "maintained aggregate group key index out of bounds"
+                                        .to_string(),
+                                )
+                            })
+                        })
+                        .collect::<DataFusionResult<Vec<_>>>()?
+                } else {
+                    let aggregate_index = field_index - self.spec.group_by.len();
+                    rows.iter()
+                        .map(|(_, acc)| acc.scalar_value(aggregate_index, field))
+                        .collect::<DataFusionResult<Vec<_>>>()?
+                };
+
+                ScalarValue::iter_to_array(scalars)
+            })
+            .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
+
+        RecordBatch::try_new(schema, output_columns)
+            .map(Some)
+            .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))
+    }
+
+    fn output_schema_matches(&self, schema: &SchemaRef) -> bool {
+        if schema.fields().len() != self.spec.group_by.len() + self.spec.aggregates.len() {
+            return false;
+        }
+
+        for (field, group_column) in schema.fields().iter().zip(&self.spec.group_by) {
+            if field.data_type() != &group_column.data_type {
+                return false;
+            }
+        }
+
+        self.spec
+            .aggregates
+            .iter()
+            .zip(schema.fields().iter().skip(self.spec.group_by.len()))
+            .all(|(aggregate, field)| aggregate.output_matches_field(field))
+    }
+}
+
+impl ResolvedAggregateSpec {
+    fn try_new(spec: &MaintainedAggregateSpec, schema: &SchemaRef) -> DataFusionResult<Self> {
+        let group_by = spec
+            .group_by
+            .iter()
+            .map(|column| resolve_column(schema, column))
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        for column in &group_by {
+            if !is_supported_group_key_type(&column.data_type) {
+                return Err(DataFusionError::Plan(format!(
+                    "Maintained aggregate GROUP BY column '{}' uses unsupported type {}",
+                    column.name, column.data_type
+                )));
+            }
+        }
+
+        let aggregates = spec
+            .aggregates
+            .iter()
+            .map(|aggregate| ResolvedAggregateExpr::try_new(aggregate, schema))
+            .collect::<DataFusionResult<Vec<_>>>()?;
+
+        Ok(Self {
+            group_by,
+            aggregates,
+        })
+    }
+}
+
+impl ResolvedAggregateExpr {
+    fn try_new(expr: &MaintainedAggregateExpr, schema: &SchemaRef) -> DataFusionResult<Self> {
+        let column = expr
+            .column
+            .as_ref()
+            .map(|column| resolve_column(schema, column))
+            .transpose()?;
+
+        let output_type = match (expr.function, column.as_ref().map(|c| &c.data_type)) {
+            (MaintainedAggregateFunction::Count, _) => AggregateOutputType::Count,
+            // SQL `SUM(int)` widens to `BIGINT` (DataFusion's `Int64`/`UInt64`
+            // sum output), so the whole signed/unsigned integer family is summed
+            // exactly via lossless i64/u64 widening — Postgres `INTEGER` (arrow
+            // `Int32`) is the common CDC case, not `BIGINT` (`Int64`).
+            (MaintainedAggregateFunction::Sum, Some(data_type))
+                if data_type.is_signed_integer() =>
+            {
+                AggregateOutputType::Int64
+            }
+            (MaintainedAggregateFunction::Sum, Some(data_type))
+                if data_type.is_unsigned_integer() =>
+            {
+                AggregateOutputType::UInt64
+            }
+            // SQL `AVG(int)` outputs `Float64` (DataFusion's AVG output type) for
+            // the whole signed/unsigned integer family; the running sum is folded
+            // exactly in `i128` (see `AvgInt128`), so a narrow CDC column (Postgres
+            // `INTEGER` -> arrow `Int32`) is averaged without overflow.
+            (MaintainedAggregateFunction::Avg, Some(data_type))
+                if data_type.is_signed_integer() || data_type.is_unsigned_integer() =>
+            {
+                AggregateOutputType::Float64
+            }
+            // `SUM`/`AVG` over floating-point widen to `Float64` (DataFusion's
+            // float sum/avg output type); `Float32` widens losslessly.
+            (
+                MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg,
+                Some(data_type),
+            ) if is_maintainable_float(data_type) => AggregateOutputType::Float64,
+            // SQL `SUM(Decimal128(p, s))` keeps the scale and widens the
+            // precision to `min(38, p + 10)` (DataFusion's decimal SUM output
+            // type), so the running sum is the exact `i128` backing-value sum —
+            // the common CDC money-column case (Postgres `NUMERIC(6, 2)` ->
+            // arrow `Decimal128(6, 2)`). `Decimal256` (i256 backing) stays a
+            // follow-up and falls to the catch-all below.
+            (MaintainedAggregateFunction::Sum, Some(&DataType::Decimal128(precision, scale))) => {
+                AggregateOutputType::Decimal128 {
+                    precision: DECIMAL128_MAX_PRECISION.min(precision.saturating_add(10)),
+                    scale,
+                }
+            }
+            // SQL `AVG(Decimal128(p, s))` outputs `Decimal128(min(38, p + 4),
+            // min(38, s + 4))` (DataFusion's decimal AVG output type). Restricted
+            // to non-negative input scales: the serve-time quotient is computed
+            // by DataFusion's `DecimalAverager`, whose `10^scale` factors are
+            // only meaningful for `s >= 0`. A negative-scale decimal falls to
+            // the catch-all.
+            (MaintainedAggregateFunction::Avg, Some(&DataType::Decimal128(precision, scale)))
+                if scale >= 0 =>
+            {
+                AggregateOutputType::Decimal128 {
+                    precision: DECIMAL128_MAX_PRECISION.min(precision.saturating_add(4)),
+                    scale: DECIMAL128_MAX_SCALE.min(scale.saturating_add(4)),
+                }
+            }
+            (
+                MaintainedAggregateFunction::Sum
+                | MaintainedAggregateFunction::Avg
+                | MaintainedAggregateFunction::Min
+                | MaintainedAggregateFunction::Max,
+                None,
+            ) => {
+                return Err(DataFusionError::Plan(format!(
+                    "{:?} maintained aggregate requires a column",
+                    expr.function
+                )));
+            }
+            // `MIN`/`MAX` preserve the input type (no widening) and are maintained
+            // via an ordered multiset. Supported: the signed/unsigned integer
+            // families, the integer-backed temporal types (`Date32`/`Date64`/
+            // `Timestamp`), and `Decimal128` (its backing value is an `i128`) — all
+            // totally ordered by an integer, so the `i128` order key sorts them
+            // exactly. Float `MIN`/`MAX` (NaN ordering) and `Decimal256` (i256, too
+            // wide for the key) are follow-ups and fall to the catch-all below (the
+            // view does not build; the query re-scans — correct, not fast).
+            (
+                MaintainedAggregateFunction::Min | MaintainedAggregateFunction::Max,
+                Some(data_type),
+            ) if data_type.is_signed_integer()
+                || data_type.is_unsigned_integer()
+                || is_maintainable_temporal(data_type)
+                || matches!(data_type, DataType::Decimal128(_, _)) =>
+            {
+                AggregateOutputType::SameAsInput
+            }
+            (function, Some(data_type)) => {
+                return Err(DataFusionError::Plan(format!(
+                    "{function:?} maintained aggregate does not support column type {data_type}"
+                )));
+            }
+        };
+
+        Ok(Self {
+            function: expr.function,
+            column,
+            output_type,
+        })
+    }
+
+    /// Whether this aggregate's output `field` matches the maintained result
+    /// type. For `MIN`/`MAX` ([`AggregateOutputType::SameAsInput`]) the output
+    /// preserves the input column type, so it is checked against the resolved
+    /// column's `DataType`; every other aggregate has a fixed output type.
+    fn output_matches_field(&self, field: &FieldRef) -> bool {
+        match self.output_type {
+            AggregateOutputType::SameAsInput => self
+                .column
+                .as_ref()
+                .is_some_and(|column| field.data_type() == &column.data_type),
+            fixed => fixed.matches_field(field),
+        }
+    }
+}
+
+impl GroupAccumulator {
+    fn try_new(spec: &ResolvedAggregateSpec) -> DataFusionResult<Self> {
+        let aggregates = spec
+            .aggregates
+            .iter()
+            .map(AggregateAccumulator::try_new)
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        Ok(Self {
+            rows: 0,
+            aggregates,
+        })
+    }
+
+    fn apply_insert_row(&mut self, batch: &RecordBatch, row: usize) -> DataFusionResult<usize> {
+        let mut retained_entries_added = 0_usize;
+        for aggregate in &mut self.aggregates {
+            retained_entries_added = retained_entries_added
+                .checked_add(aggregate.apply_insert_row(batch, row)?)
+                .ok_or_else(index_entry_overflow)?;
+        }
+        // `checked_add` (not saturating): a silently-clamped counter would break
+        // the "drop the group when its last row is retracted" invariant, so an
+        // overflow must fail the registry safe to stale instead.
+        self.rows = self.rows.checked_add(1).ok_or_else(count_overflow)?;
+        Ok(retained_entries_added)
+    }
+
+    /// Subtract a previously-captured row's per-aggregate contributions
+    /// (inverse of [`Self::apply_insert_row`]). Returns whether the group is now
+    /// empty and how many distinct multiset entries were removed.
+    fn retract_row(&mut self, inputs: &[Option<ScalarValue>]) -> DataFusionResult<(bool, usize)> {
+        if inputs.len() != self.aggregates.len() {
+            return Err(retract_underflow());
+        }
+        let mut retained_entries_removed = 0_usize;
+        for (aggregate, input) in self.aggregates.iter_mut().zip(inputs) {
+            retained_entries_removed = retained_entries_removed
+                .checked_add(aggregate.retract_row(input.as_ref())?)
+                .ok_or_else(retract_underflow)?;
+        }
+        // `checked_sub` (not saturating): if retractions ever outnumber inserts
+        // for a group (index/state inconsistency), surface it as an error so the
+        // caller fails safe to stale rather than silently clamping at 0 and
+        // mis-dropping the group.
+        self.rows = self.rows.checked_sub(1).ok_or_else(retract_underflow)?;
+        Ok((self.rows == 0, retained_entries_removed))
+    }
+
+    fn scalar_value(
+        &self,
+        aggregate_index: usize,
+        field: &FieldRef,
+    ) -> DataFusionResult<ScalarValue> {
+        let Some(aggregate) = self.aggregates.get(aggregate_index) else {
+            return Err(DataFusionError::Internal(
+                "maintained aggregate output index out of bounds".to_string(),
+            ));
+        };
+        aggregate.scalar_value(field)
+    }
+}
+
+impl AggregateAccumulator {
+    fn try_new(expr: &ResolvedAggregateExpr) -> DataFusionResult<Self> {
+        let accumulator = match (expr.function, expr.output_type, expr.column.as_ref()) {
+            (MaintainedAggregateFunction::Count, _, None) => Self::CountAll { value: 0 },
+            (MaintainedAggregateFunction::Count, _, Some(column)) => Self::CountColumn {
+                column_index: column.index,
+                value: 0,
+            },
+            (MaintainedAggregateFunction::Sum, AggregateOutputType::Int64, Some(column)) => {
+                Self::SumInt64 {
+                    column_index: column.index,
+                    value: None,
+                    non_null_count: 0,
+                }
+            }
+            (MaintainedAggregateFunction::Sum, AggregateOutputType::UInt64, Some(column)) => {
+                Self::SumUInt64 {
+                    column_index: column.index,
+                    value: None,
+                    non_null_count: 0,
+                }
+            }
+            (MaintainedAggregateFunction::Sum, AggregateOutputType::Float64, Some(column)) => {
+                Self::SumFloat64 {
+                    column_index: column.index,
+                    value: None,
+                    non_null_count: 0,
+                }
+            }
+            (
+                MaintainedAggregateFunction::Sum,
+                AggregateOutputType::Decimal128 { precision, scale },
+                Some(column),
+            ) => Self::SumDecimal128 {
+                column_index: column.index,
+                value: 0,
+                non_null_count: 0,
+                precision,
+                scale,
+            },
+            (
+                MaintainedAggregateFunction::Avg,
+                AggregateOutputType::Decimal128 { precision, scale },
+                Some(column),
+            ) => {
+                let DataType::Decimal128(_, sum_scale) = column.data_type else {
+                    return Err(DataFusionError::Internal(format!(
+                        "invalid maintained aggregate accumulator state: {expr:?}"
+                    )));
+                };
+                Self::AvgDecimal128 {
+                    column_index: column.index,
+                    sum: 0,
+                    count: 0,
+                    sum_scale,
+                    target_precision: precision,
+                    target_scale: scale,
+                }
+            }
+            (MaintainedAggregateFunction::Avg, AggregateOutputType::Float64, Some(column))
+                if column.data_type.is_signed_integer()
+                    || column.data_type.is_unsigned_integer() =>
+            {
+                Self::AvgInt128 {
+                    column_index: column.index,
+                    sum: 0,
+                    count: 0,
+                }
+            }
+            (MaintainedAggregateFunction::Avg, AggregateOutputType::Float64, Some(column)) => {
+                Self::AvgFloat64 {
+                    column_index: column.index,
+                    sum: 0.0,
+                    count: 0,
+                }
+            }
+            (MaintainedAggregateFunction::Min, AggregateOutputType::SameAsInput, Some(column)) => {
+                Self::Min {
+                    column_index: column.index,
+                    index: SortedScalarIndex::default(),
+                }
+            }
+            (MaintainedAggregateFunction::Max, AggregateOutputType::SameAsInput, Some(column)) => {
+                Self::Max {
+                    column_index: column.index,
+                    index: SortedScalarIndex::default(),
+                }
+            }
+            _ => {
+                return Err(DataFusionError::Internal(format!(
+                    "invalid maintained aggregate accumulator state: {expr:?}"
+                )));
+            }
+        };
+        Ok(accumulator)
+    }
+
+    fn apply_insert_row(&mut self, batch: &RecordBatch, row: usize) -> DataFusionResult<usize> {
+        let inserted_multiset_entry = match self {
+            Self::CountAll { value } => {
+                *value = value.checked_add(1).ok_or_else(count_overflow)?;
+                false
+            }
+            Self::CountColumn {
+                column_index,
+                value,
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    *value = value.checked_add(1).ok_or_else(count_overflow)?;
+                }
+                false
+            }
+            Self::SumInt64 {
+                column_index,
+                value,
+                non_null_count,
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    let delta = scalar_as_i64(&scalar)?;
+                    let next_value = match *value {
+                        Some(current) => current.checked_add(delta).ok_or_else(sum_overflow)?,
+                        None => delta,
+                    };
+                    let next_count = non_null_count.checked_add(1).ok_or_else(count_overflow)?;
+                    *value = Some(next_value);
+                    *non_null_count = next_count;
+                }
+                false
+            }
+            Self::SumUInt64 {
+                column_index,
+                value,
+                non_null_count,
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    let delta = scalar_as_u64(&scalar)?;
+                    let next_value = match *value {
+                        Some(current) => current.checked_add(delta).ok_or_else(sum_overflow)?,
+                        None => delta,
+                    };
+                    let next_count = non_null_count.checked_add(1).ok_or_else(count_overflow)?;
+                    *value = Some(next_value);
+                    *non_null_count = next_count;
+                }
+                false
+            }
+            Self::SumFloat64 {
+                column_index,
+                value,
+                non_null_count,
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    let delta = scalar_as_f64(&scalar)?;
+                    let next_value = (*value).map_or(delta, |current| current + delta);
+                    let next_count = non_null_count.checked_add(1).ok_or_else(count_overflow)?;
+                    *value = Some(next_value);
+                    *non_null_count = next_count;
+                }
+                false
+            }
+            Self::AvgFloat64 {
+                column_index,
+                sum,
+                count,
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    let delta = scalar_as_f64(&scalar)?;
+                    *sum += delta;
+                    *count = count.checked_add(1).ok_or_else(count_overflow)?;
+                }
+                false
+            }
+            Self::AvgInt128 {
+                column_index,
+                sum,
+                count,
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    let delta = scalar_as_i128(&scalar)?;
+                    *sum = sum.checked_add(delta).ok_or_else(avg_overflow)?;
+                    *count = count.checked_add(1).ok_or_else(count_overflow)?;
+                }
+                false
+            }
+            Self::SumDecimal128 {
+                column_index,
+                value,
+                non_null_count,
+                ..
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    let delta = scalar_as_decimal_i128(&scalar)?;
+                    let next_value = value.checked_add(delta).ok_or_else(sum_overflow)?;
+                    let next_count = non_null_count.checked_add(1).ok_or_else(count_overflow)?;
+                    *value = next_value;
+                    *non_null_count = next_count;
+                }
+                false
+            }
+            Self::AvgDecimal128 {
+                column_index,
+                sum,
+                count,
+                ..
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    let delta = scalar_as_decimal_i128(&scalar)?;
+                    *sum = sum.checked_add(delta).ok_or_else(avg_overflow)?;
+                    *count = count.checked_add(1).ok_or_else(count_overflow)?;
+                }
+                false
+            }
+            // `MIN`/`MAX` insert identically — add the live value to the ordered
+            // multiset; the query reads the min/max end. A null contributes
+            // nothing to an extremum, so it is left out of the index.
+            Self::Min {
+                column_index,
+                index,
+            }
+            | Self::Max {
+                column_index,
+                index,
+            } => {
+                if batch.column(*column_index).is_null(row) {
+                    false
+                } else {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    index.insert(scalar)?
+                }
+            }
+        };
+        Ok(usize::from(inserted_multiset_entry))
+    }
+
+    /// Inverse of [`Self::apply_insert_row`], subtracting a previously-captured
+    /// input scalar. `SUM` also tracks its non-null cardinality so retracting the
+    /// last value restores SQL `NULL` even when null-valued rows keep the group
+    /// alive. `COUNT`/integer `SUM`/`AVG(int)` are exactly invertible;
+    /// floating-point `SUM`/`AVG` subtract and rely on a periodic
+    /// [`MaintainedAggregateRegistry::rebuild_from_batches`] to bound drift. A
+    /// null input contributed nothing, so it retracts nothing.
+    fn retract_row(&mut self, input: Option<&ScalarValue>) -> DataFusionResult<usize> {
+        let removed_multiset_entry = match self {
+            Self::CountAll { value } => {
+                *value = value.checked_sub(1).ok_or_else(retract_underflow)?;
+                false
+            }
+            Self::CountColumn { value, .. } => {
+                if input.is_some_and(|scalar| !scalar.is_null()) {
+                    *value = value.checked_sub(1).ok_or_else(retract_underflow)?;
+                }
+                false
+            }
+            Self::SumInt64 {
+                value,
+                non_null_count,
+                ..
+            } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_i64(scalar)?;
+                    let current = (*value).ok_or_else(retract_underflow)?;
+                    let remaining = current.checked_sub(delta).ok_or_else(sum_overflow)?;
+                    let next_count = non_null_count
+                        .checked_sub(1)
+                        .ok_or_else(retract_underflow)?;
+                    if next_count == 0 && remaining != 0 {
+                        return Err(retract_underflow());
+                    }
+                    *value = (next_count != 0).then_some(remaining);
+                    *non_null_count = next_count;
+                }
+                false
+            }
+            Self::SumUInt64 {
+                value,
+                non_null_count,
+                ..
+            } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_u64(scalar)?;
+                    let current = (*value).ok_or_else(retract_underflow)?;
+                    let remaining = current.checked_sub(delta).ok_or_else(retract_underflow)?;
+                    let next_count = non_null_count
+                        .checked_sub(1)
+                        .ok_or_else(retract_underflow)?;
+                    if next_count == 0 && remaining != 0 {
+                        return Err(retract_underflow());
+                    }
+                    *value = (next_count != 0).then_some(remaining);
+                    *non_null_count = next_count;
+                }
+                false
+            }
+            Self::SumFloat64 {
+                value,
+                non_null_count,
+                ..
+            } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_f64(scalar)?;
+                    let current = (*value).ok_or_else(retract_underflow)?;
+                    let next_count = non_null_count
+                        .checked_sub(1)
+                        .ok_or_else(retract_underflow)?;
+                    *value = (next_count != 0).then_some(current - delta);
+                    *non_null_count = next_count;
+                }
+                false
+            }
+            Self::AvgFloat64 { sum, count, .. } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_f64(scalar)?;
+                    let next_count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+                    let remaining = *sum - delta;
+                    *sum = if next_count == 0 { 0.0 } else { remaining };
+                    *count = next_count;
+                }
+                false
+            }
+            Self::AvgInt128 { sum, count, .. } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_i128(scalar)?;
+                    let remaining = sum.checked_sub(delta).ok_or_else(retract_underflow)?;
+                    let next_count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+                    if next_count == 0 && remaining != 0 {
+                        return Err(retract_underflow());
+                    }
+                    *sum = if next_count == 0 { 0 } else { remaining };
+                    *count = next_count;
+                }
+                false
+            }
+            Self::SumDecimal128 {
+                value,
+                non_null_count,
+                ..
+            } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_decimal_i128(scalar)?;
+                    let remaining = value.checked_sub(delta).ok_or_else(sum_overflow)?;
+                    let next_count = non_null_count
+                        .checked_sub(1)
+                        .ok_or_else(retract_underflow)?;
+                    if next_count == 0 && remaining != 0 {
+                        return Err(retract_underflow());
+                    }
+                    *value = remaining;
+                    *non_null_count = next_count;
+                }
+                false
+            }
+            Self::AvgDecimal128 { sum, count, .. } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_decimal_i128(scalar)?;
+                    let remaining = sum.checked_sub(delta).ok_or_else(retract_underflow)?;
+                    let next_count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+                    if next_count == 0 && remaining != 0 {
+                        return Err(retract_underflow());
+                    }
+                    *sum = if next_count == 0 { 0 } else { remaining };
+                    *count = next_count;
+                }
+                false
+            }
+            // `MIN`/`MAX` retract identically — remove the captured live value
+            // from the ordered multiset; the extremum falls back to the next
+            // value automatically. A null contributed nothing, so it retracts
+            // nothing.
+            Self::Min { index, .. } | Self::Max { index, .. } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    index.retract(scalar)?
+                } else {
+                    false
+                }
+            }
+        };
+        Ok(usize::from(removed_multiset_entry))
+    }
+
+    fn scalar_value(&self, field: &FieldRef) -> DataFusionResult<ScalarValue> {
+        match self {
+            Self::CountAll { value } | Self::CountColumn { value, .. } => {
+                scalar_for_field(field, Some(ScalarValue::Int64(Some(*value))))
+            }
+            Self::SumInt64 { value, .. } => {
+                scalar_for_field(field, Some(ScalarValue::Int64(*value)))
+            }
+            Self::SumUInt64 { value, .. } => {
+                scalar_for_field(field, Some(ScalarValue::UInt64(*value)))
+            }
+            Self::SumFloat64 { value, .. } => {
+                scalar_for_field(field, Some(ScalarValue::Float64(*value)))
+            }
+            Self::SumDecimal128 {
+                value,
+                non_null_count,
+                precision,
+                scale,
+                ..
+            } => {
+                // `non_null_count == 0` encodes SQL `NULL` (see the variant doc).
+                let value = (*non_null_count != 0).then_some(*value);
+                scalar_for_field(
+                    field,
+                    Some(ScalarValue::Decimal128(value, *precision, *scale)),
+                )
+            }
+            Self::AvgFloat64 { sum, count, .. } => {
+                if *count == 0 {
+                    scalar_for_field(field, Some(ScalarValue::Float64(None)))
+                } else {
+                    let count_f64 = exact_i64_to_f64(*count)?;
+                    scalar_for_field(field, Some(ScalarValue::Float64(Some(*sum / count_f64))))
+                }
+            }
+            Self::AvgInt128 { sum, count, .. } => {
+                if *count == 0 {
+                    scalar_for_field(field, Some(ScalarValue::Float64(None)))
+                } else {
+                    let count_f64 = exact_i64_to_f64(*count)?;
+                    // The exact `i128` sum is divided down to the `Float64` AVG
+                    // output; the cast rounds to nearest for sums beyond 2^53,
+                    // which is inherent to producing an `f64` average and matches
+                    // DataFusion's `AVG(int)` -> `Float64` result.
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "AVG output is Float64; rounding the i128 sum to f64 is intended"
+                    )]
+                    let sum_f64 = *sum as f64;
+                    scalar_for_field(field, Some(ScalarValue::Float64(Some(sum_f64 / count_f64))))
+                }
+            }
+            Self::AvgDecimal128 {
+                sum,
+                count,
+                sum_scale,
+                target_precision,
+                target_scale,
+                ..
+            } => {
+                // DataFusion's own sum/count -> decimal quotient (rescale to
+                // the output scale, truncate toward zero, validate precision),
+                // so the maintained result is structurally identical to what a
+                // base-table re-scan computes — including erroring the query
+                // with DataFusion's "Arithmetic Overflow in `AvgAccumulator`"
+                // when the rescale or output precision overflows.
+                let avg = if *count == 0 {
+                    None
+                } else {
+                    Some(
+                        DecimalAverager::<Decimal128Type>::try_new(
+                            *sum_scale,
+                            *target_precision,
+                            *target_scale,
+                        )?
+                        .avg(*sum, i128::from(*count))?,
+                    )
+                };
+                scalar_for_field(
+                    field,
+                    Some(ScalarValue::Decimal128(
+                        avg,
+                        *target_precision,
+                        *target_scale,
+                    )),
+                )
+            }
+            // The stored extremum is already the exact input-typed scalar, so
+            // `scalar_for_field` passes it through; an empty index yields a typed
+            // `NULL` (SQL `MIN`/`MAX` over no non-null rows).
+            Self::Min { index, .. } => scalar_for_field(field, index.min_scalar()),
+            Self::Max { index, .. } => scalar_for_field(field, index.max_scalar()),
+        }
+    }
+}
+
+/// Whether an `AggregateExec`'s shape (independent of its aggregation mode) is one
+/// the maintained-aggregate machinery can serve: no LIMIT folded into the aggregate,
+/// no per-aggregate FILTER, and at most one non-`GROUPING SET` grouping. A `GROUP
+/// BY` plans one grouping; an aggregate without one plans none
+/// (`PhysicalGroupBy::new(vec![], vec![], vec![], false)`). The accepted
+/// `AggregateMode`s differ by call site, so the mode gate is checked separately.
+pub(crate) fn aggregate_shape_is_maintainable(aggregate: &AggregateExec) -> bool {
+    aggregate.limit_options().is_none()
+        && aggregate.filter_expr().iter().all(Option::is_none)
+        && !aggregate.group_expr().has_grouping_set()
+        && aggregate.group_expr().groups().len() <= 1
+}
+
+/// The `Column` an aggregate input expression ultimately references, seeing
+/// through the numeric-widening `CAST` that `DataFusion`'s type coercion inserts
+/// for an aggregate over a narrow column (`SUM(Int32)` is planned as
+/// `SUM(CAST(col AS Int64))`). The maintained view widens the same way and
+/// `output_schema_matches` still guards the result type, so recovering the
+/// column name through the coercion cast is sound.
+fn aggregate_input_column(expr: &Arc<dyn PhysicalExpr>) -> Option<&Column> {
+    if let Some(column) = expr.downcast_ref::<Column>() {
+        return Some(column);
+    }
+    expr.downcast_ref::<CastExpr>()
+        .and_then(|cast| cast.expr().downcast_ref::<Column>())
+}
+
+fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateSpec> {
+    if !matches!(
+        aggregate.mode(),
+        AggregateMode::Single | AggregateMode::SinglePartitioned | AggregateMode::Partial
+    ) || !aggregate_shape_is_maintainable(aggregate)
+    {
+        return None;
+    }
+
+    let input_schema = aggregate.input().schema();
+    let mut group_by = Vec::with_capacity(aggregate.group_expr().expr().len());
+    for (expr, _) in aggregate.group_expr().expr() {
+        let column = expr.downcast_ref::<Column>()?;
+        group_by.push(input_column_name(&input_schema, column)?);
+    }
+
+    let mut aggregates = Vec::with_capacity(aggregate.aggr_expr().len());
+    for aggregate_expr in aggregate.aggr_expr() {
+        if aggregate_expr.is_distinct()
+            || !aggregate_expr.order_bys().is_empty()
+            || aggregate_expr.is_reversed()
+        {
+            return None;
+        }
+        let function = match aggregate_expr.fun().name().to_ascii_lowercase().as_str() {
+            "count" => MaintainedAggregateFunction::Count,
+            "sum" => MaintainedAggregateFunction::Sum,
+            "avg" => MaintainedAggregateFunction::Avg,
+            "min" => MaintainedAggregateFunction::Min,
+            "max" => MaintainedAggregateFunction::Max,
+            _ => return None,
+        };
+
+        let expressions = aggregate_expr.expressions();
+        let column = match function {
+            MaintainedAggregateFunction::Count => {
+                let column = count_column_for_query(&input_schema, &expressions)?;
+                match column {
+                    CountQueryColumn::AllRows => None,
+                    CountQueryColumn::Column(column) => Some(column),
+                }
+            }
+            MaintainedAggregateFunction::Sum
+            | MaintainedAggregateFunction::Avg
+            | MaintainedAggregateFunction::Min
+            | MaintainedAggregateFunction::Max => {
+                if expressions.len() != 1 {
+                    return None;
+                }
+                let expr = expressions.first()?;
+                let column = aggregate_input_column(expr)?;
+                Some(input_column_name(&input_schema, column)?)
+            }
+        };
+
+        aggregates.push(QueryAggregateExpr { function, column });
+    }
+
+    Some(QueryAggregateSpec {
+        group_by,
+        aggregates,
+        // The aggregate node carries no filter; the optimizer derives the
+        // predicate its input applied during plan descent and passes it to
+        // `batch_for_aggregate_with_output`.
+        filter: PredicateConjuncts::default(),
+    })
+}
+
+fn count_column_for_query(
+    input_schema: &SchemaRef,
+    expressions: &[Arc<dyn datafusion_physical_expr::PhysicalExpr>],
+) -> Option<CountQueryColumn> {
+    if expressions.len() > 1 {
+        return None;
+    }
+    let Some(expr) = expressions.first() else {
+        return Some(CountQueryColumn::AllRows);
+    };
+    if let Some(column) = expr.downcast_ref::<Column>() {
+        return Some(CountQueryColumn::Column(input_column_name(
+            input_schema,
+            column,
+        )?));
+    }
+    if let Some(literal) = expr.downcast_ref::<Literal>() {
+        return (!literal.value().is_null()).then_some(CountQueryColumn::AllRows);
+    }
+    None
+}
+
+fn input_column_name(input_schema: &SchemaRef, column: &Column) -> Option<String> {
+    input_schema
+        .fields()
+        .get(column.index())
+        .map(|field| field.name().clone())
+}
+
+fn exact_i64_to_f64(value: i64) -> DataFusionResult<f64> {
+    const MAX_EXACT_F64_INTEGER: i64 = 1_i64 << f64::MANTISSA_DIGITS;
+    if !(-MAX_EXACT_F64_INTEGER..=MAX_EXACT_F64_INTEGER).contains(&value) {
+        return Err(DataFusionError::Execution(format!(
+            "Maintained aggregate AVG count {value} exceeds the exact Float64 integer range"
+        )));
+    }
+
+    // `value` is now within ±2^53 (`f64::MANTISSA_DIGITS`), the range over which
+    // every integer is exactly representable as `f64`, so the cast is lossless.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "value is range-checked to ±2^53 above, where i64 -> f64 is exact"
+    )]
+    Ok(value as f64)
+}
+
+fn resolve_column(schema: &SchemaRef, name: &str) -> DataFusionResult<ResolvedColumn> {
+    let Some((index, field)) = schema.column_with_name(name) else {
+        return Err(DataFusionError::Plan(format!(
+            "Maintained aggregate column '{name}' was not found in table schema"
+        )));
+    };
+    Ok(ResolvedColumn {
+        name: name.to_string(),
+        index,
+        data_type: field.data_type().clone(),
+    })
+}
+
+fn is_supported_group_key_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Timestamp(_, _)
+    )
+}
+
+/// Floating-point types a maintained `SUM`/`AVG` can fold exactly into an
+/// `f64` accumulator. Deliberately NARROWER than arrow's `DataType::is_floating`
+/// (which also matches `Float16`): the accumulator path has no `Float16`
+/// support, so this must not admit it. (Signed/unsigned-integer acceptance uses
+/// arrow's `DataType::is_signed_integer`/`is_unsigned_integer` directly.)
+fn is_maintainable_float(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Float32 | DataType::Float64)
+}
+
+/// Temporal types a maintained `MIN`/`MAX` can order via the integer order key:
+/// `Date32` (days), `Date64` (millis), and every `Timestamp` unit (instant) are
+/// monotonic in their backing integer, so `scalar_order_key` extracts that integer
+/// and the `i128` key sorts them exactly. `Time`/`Duration`/`Interval` are omitted
+/// (an `Interval` is not a single monotonic integer).
+fn is_maintainable_temporal(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
+    )
+}
+
+/// Coerce a non-null signed-integer input scalar to `i64`, widening the
+/// `Int8`/`Int16`/`Int32`/`Int64` family losslessly. SQL `SUM(int)` widens to
+/// `BIGINT` (`DataFusion`'s `Int64` sum output), so a narrower CDC column
+/// (Postgres `INTEGER` → arrow `Int32`) is summed exactly without overflow.
+fn scalar_as_i64(scalar: &ScalarValue) -> DataFusionResult<i64> {
+    match scalar {
+        ScalarValue::Int64(Some(v)) => Ok(*v),
+        ScalarValue::Int32(Some(v)) => Ok(i64::from(*v)),
+        ScalarValue::Int16(Some(v)) => Ok(i64::from(*v)),
+        ScalarValue::Int8(Some(v)) => Ok(i64::from(*v)),
+        _ => Err(type_mismatch("a signed integer", scalar)),
+    }
+}
+
+/// Coerce a non-null unsigned-integer input scalar to `u64`, widening the
+/// `UInt8`/`UInt16`/`UInt32`/`UInt64` family losslessly.
+fn scalar_as_u64(scalar: &ScalarValue) -> DataFusionResult<u64> {
+    match scalar {
+        ScalarValue::UInt64(Some(v)) => Ok(*v),
+        ScalarValue::UInt32(Some(v)) => Ok(u64::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Ok(u64::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Ok(u64::from(*v)),
+        _ => Err(type_mismatch("an unsigned integer", scalar)),
+    }
+}
+
+/// Coerce a non-null integer input scalar to `i128`, widening the whole
+/// signed (`Int8`..`Int64`) and unsigned (`UInt8`..`UInt64`) family losslessly
+/// (`u64` fits in `i128`). Used by maintained `AVG(int)`, whose `i128` running
+/// sum has ample headroom to average many values near `i64::MAX`/`u64::MAX`.
+fn scalar_as_i128(scalar: &ScalarValue) -> DataFusionResult<i128> {
+    match scalar {
+        ScalarValue::Int64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int8(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Ok(i128::from(*v)),
+        _ => Err(type_mismatch("an integer", scalar)),
+    }
+}
+
+/// Extract a non-null `Decimal128` input scalar's `i128` backing value. The
+/// column carries one fixed scale, so maintained `SUM`/`AVG` fold the backing
+/// values directly: at a shared scale, decimal addition IS integer addition on
+/// the backing values, exactly invertible on the retract path.
+fn scalar_as_decimal_i128(scalar: &ScalarValue) -> DataFusionResult<i128> {
+    match scalar {
+        ScalarValue::Decimal128(Some(v), _, _) => Ok(*v),
+        _ => Err(type_mismatch("a decimal128", scalar)),
+    }
+}
+
+/// Coerce a non-null floating-point input scalar to `f64`, widening `Float32`
+/// to `Float64` losslessly (`DataFusion`'s float sum/avg output type).
+fn scalar_as_f64(scalar: &ScalarValue) -> DataFusionResult<f64> {
+    match scalar {
+        ScalarValue::Float64(Some(v)) => Ok(*v),
+        ScalarValue::Float32(Some(v)) => Ok(f64::from(*v)),
+        _ => Err(type_mismatch("a floating-point", scalar)),
+    }
+}
+
+/// The order key for a maintained `MIN`/`MAX` value: a lossless `i128` over the
+/// signed (`Int8`..`Int64`) and unsigned (`UInt8`..`UInt64`) integer families and
+/// the integer-backed temporal types (`Date32` days, `Date64` millis, and every
+/// `Timestamp` unit's instant). `i128` holds every `i64` and every `u64`, and its
+/// natural order matches SQL ordering within a single fixed-type column — a column
+/// carries one temporal unit + timezone, so the backing integers are directly
+/// comparable — so it is a correct total order for the `BTreeMap`. The exact
+/// input-typed `ScalarValue` is stored alongside the key, preserving the unit and
+/// timezone on output. Float `MIN`/`MAX` (NaN ordering) is a deliberate follow-up
+/// and errors here — the view then simply does not build, and the query falls back
+/// to a base-table scan (correct, not accelerated).
+#[expect(
+    clippy::match_same_arms,
+    reason = "each integer/temporal arm binds a different-width value (&i64, &i32, &i8, &u64, ...) so the identical-looking i128::from(*v) bodies cannot be merged into one | pattern"
+)]
+fn scalar_order_key(scalar: &ScalarValue) -> DataFusionResult<i128> {
+    match scalar {
+        ScalarValue::Int64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Int8(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Ok(i128::from(*v)),
+        // Integer-backed temporal types share the ordering — a column carries a
+        // single unit/timezone, so the backing integers are directly comparable.
+        ScalarValue::Date32(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::Date64(Some(v)) => Ok(i128::from(*v)),
+        ScalarValue::TimestampSecond(Some(v), _) => Ok(i128::from(*v)),
+        ScalarValue::TimestampMillisecond(Some(v), _) => Ok(i128::from(*v)),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => Ok(i128::from(*v)),
+        ScalarValue::TimestampNanosecond(Some(v), _) => Ok(i128::from(*v)),
+        // `Decimal128`'s backing value IS an `i128`; a column carries one fixed
+        // scale, so ordering by that integer orders by the decimal value.
+        ScalarValue::Decimal128(Some(v), _, _) => Ok(*v),
+        _ => Err(type_mismatch(
+            "a signed/unsigned integer, temporal, or decimal128",
+            scalar,
+        )),
+    }
+}
+
+fn scalar_for_field(
+    field: &FieldRef,
+    scalar: Option<ScalarValue>,
+) -> DataFusionResult<ScalarValue> {
+    let scalar = match scalar {
+        Some(scalar) => scalar,
+        None => ScalarValue::try_from(field.data_type())?,
+    };
+    if scalar.data_type() == *field.data_type() {
+        return Ok(scalar);
+    }
+    Err(DataFusionError::Internal(format!(
+        "Maintained aggregate scalar type {} did not match output field type {}",
+        scalar.data_type(),
+        field.data_type()
+    )))
+}
+
+/// What a maintenance pass does with the delta of its epoch.
+enum Pass {
+    /// Apply it to the fresh views.
+    Apply,
+    /// Drop it: the registry is stale, or the delta is already in the
+    /// snapshot a rebuild reads or installed.
+    Skip,
+    /// Hold it for the rebuild in progress, whose snapshot predates it.
+    Hold,
+}
+
+/// Admit the delta of `epoch`. Deltas must arrive in strict visibility-epoch
+/// order: a skipped or out-of-order epoch would leave the views missing or
+/// double-counting a write, so it marks the registry stale, clears it, and
+/// abandons any rebuild.
+///
+/// A rebuild in progress is the exception for epochs at or below its
+/// `hold_from`: those writes are already in the snapshot it reads — including
+/// deltas still queued when a full apply queue called `mark_stale` at
+/// `hold_from`. They are skipped without treating the jump as a gap, so later
+/// epochs stay held.
+fn begin_maintenance_pass(state: &mut RegistryState, epoch: u64) -> Pass {
+    if epoch <= state.rebuilt_through {
+        return Pass::Skip;
+    }
+    if let Some(rebuild) = &state.rebuild
+        && epoch <= rebuild.hold_from
+    {
+        if epoch == state.epoch.saturating_add(1) {
+            state.epoch = epoch;
+        }
+        return Pass::Skip;
+    }
+    if epoch != state.epoch.saturating_add(1) {
+        state.epoch = state.epoch.max(epoch);
+        state.status = RegistryStatus::Stale;
+        state.rebuild = None;
+        reset_retained_state(state);
+        return Pass::Skip;
+    }
+    state.epoch = epoch;
+    if state.rebuild.is_some() {
+        Pass::Hold
+    } else if state.status == RegistryStatus::Stale || state.views.is_empty() {
+        Pass::Skip
+    } else {
+        Pass::Apply
+    }
+}
+
+/// Holds `delta` for the rebuild in progress. A rebuild whose held deltas
+/// would reference more than `max_held_bytes` is abandoned, releasing them; the
+/// registry stays stale and a later rebuild tries again.
+fn hold_delta(state: &mut RegistryState, epoch: u64, delta: PendingDelta, max_held_bytes: usize) {
+    let Some(rebuild) = &mut state.rebuild else {
+        return;
+    };
+    rebuild.bytes = rebuild.bytes.saturating_add(delta.memory_size());
+    if rebuild.bytes > max_held_bytes {
+        state.rebuild = None;
+        return;
+    }
+    rebuild.deltas.push((epoch, delta));
+}
+
+/// Applies `batches` as upserts, checking the byte budget after every batch so
+/// a multi-batch CDC envelope (or a rebuild) cannot accumulate unbounded
+/// retained state before the final check.
+fn apply_upsert_batches(
+    state: &mut RegistryState,
+    batches: &[RecordBatch],
+    max_index_bytes: usize,
+) -> DataFusionResult<()> {
+    for batch in batches {
+        apply_upserts(&mut state.views, state.index.as_mut(), batch)?;
+        let retained = retained_index_bytes(state);
+        if retained > max_index_bytes {
+            return Err(index_cap_exceeded(
+                retained_index_entries(state),
+                retained,
+                max_index_bytes,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_delete_batch(state: &mut RegistryState, pk_batch: &RecordBatch) -> DataFusionResult<()> {
+    let Some(index) = state.index.as_mut() else {
+        return Err(DataFusionError::Internal(
+            "maintained aggregate retraction requires a configured primary key".to_string(),
+        ));
+    };
+    apply_deletes(&mut state.views, index, pk_batch)
+}
+
+/// Clears every view and the retraction index, releasing their memory.
+fn reset_retained_state(state: &mut RegistryState) {
+    for view in &mut state.views {
+        view.clear();
+    }
+    if let Some(index) = &mut state.index {
+        index.reset();
+    }
+}
+
+/// Finalize a maintenance pass: if `failure` is set, or the retained indexes now
+/// exceed `max_index_bytes`, clear every index, mark the registry stale, and
+/// return the reason (so the write-path applier can log it); otherwise the
+/// registry stays fresh. Centralizes the fail-safe across the insert, PK-delete,
+/// and rebuild paths so memory is bounded on every mutating path.
+fn finalize_maintenance_pass(
+    state: &mut RegistryState,
+    max_index_bytes: usize,
+    failure: Option<DataFusionError>,
+) -> DataFusionResult<()> {
+    let retained_bytes = retained_index_bytes(state);
+    let over_cap = retained_bytes > max_index_bytes;
+    if failure.is_some() || over_cap {
+        // Capture the size of what is being discarded BEFORE clearing, so the
+        // error names what the index actually cost.
+        let retained_entries = retained_index_entries(state);
+        reset_retained_state(state);
+        state.status = RegistryStatus::Stale;
+        state.rebuild = None;
+        return Err(failure.unwrap_or_else(|| {
+            index_cap_exceeded(retained_entries, retained_bytes, max_index_bytes)
+        }));
+    }
+    Ok(())
+}
+
+/// Total approximate resident bytes retained by the registry — the quantity
+/// the cap bounds. O(views), not O(rows).
+fn retained_index_bytes(state: &RegistryState) -> usize {
+    retained_bytes(&state.views, state.index.as_ref())
+}
+
+/// Total retained index entries: one per primary-key record plus each
+/// `MIN`/`MAX` multiset node. Reported alongside the byte total when the cap
+/// trips, so an operator can see both what was retained and what it cost.
+fn retained_index_entries(state: &RegistryState) -> usize {
+    retained_entries(&state.views, state.index.as_ref())
+}
+
+fn retained_bytes(views: &[MaintainedAggregateView], index: Option<&RetractionIndex>) -> usize {
+    views.iter().fold(
+        index.map_or(0, RetractionIndex::approx_bytes),
+        |total, view| total.saturating_add(view.approx_multiset_bytes()),
+    )
+}
+
+fn retained_entries(views: &[MaintainedAggregateView], index: Option<&RetractionIndex>) -> usize {
+    views
+        .iter()
+        .fold(index.map_or(0, RetractionIndex::len), |total, view| {
+            total.saturating_add(view.retained_multiset_entries)
+        })
+}
+
+/// A retained-entry counter overflowed `usize`. Distinct from
+/// [`index_cap_exceeded`]: that is the budget doing its job, this is arithmetic
+/// that cannot happen on a 64-bit host and is handled rather than panicked on.
+fn index_entry_overflow() -> DataFusionError {
+    DataFusionError::Execution(
+        "Maintained aggregate retained-entry count overflowed; falling back to base table scan"
+            .to_string(),
+    )
+}
+
+/// Names what the index held and what it was allowed to hold, so an operator can
+/// tell "the budget is too small" from "this table is too big to maintain" without
+/// reading the code.
+fn index_cap_exceeded(
+    retained_entries: usize,
+    retained_bytes: usize,
+    max_index_bytes: usize,
+) -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "Maintained aggregate indexes exceeded their memory budget ({retained_entries} retained entries, ~{retained_bytes} bytes, budget {max_index_bytes} bytes); falling back to base table scan. Raise 'runtime.query.memory_limit' or narrow the maintained aggregate's filter."
+    ))
+}
+
+fn count_overflow() -> DataFusionError {
+    DataFusionError::Execution(
+        "Maintained aggregate COUNT overflowed Int64; falling back to base table scan".to_string(),
+    )
+}
+
+fn sum_overflow() -> DataFusionError {
+    DataFusionError::Execution(
+        "Maintained aggregate SUM overflowed its output type; falling back to base table scan"
+            .to_string(),
+    )
+}
+
+fn retract_underflow() -> DataFusionError {
+    DataFusionError::Execution(
+        "Maintained aggregate retraction underflowed its state; falling back to base table scan"
+            .to_string(),
+    )
+}
+
+/// The `AVG(int)` running sum overflowed its `i128` accumulator on the insert
+/// path. AVG-specific (not [`sum_overflow`], whose "SUM" text would misreport the
+/// failing aggregate); with `i128` headroom this is effectively unreachable, but
+/// it fails safe. The retract path reuses [`retract_underflow`], matching
+/// `COUNT`/`SUM(UInt64)`.
+fn avg_overflow() -> DataFusionError {
+    DataFusionError::Execution(
+        "Maintained aggregate AVG running sum overflowed its i128 accumulator; falling back to base table scan"
+            .to_string(),
+    )
+}
+
+fn type_mismatch(expected: &'static str, scalar: &ScalarValue) -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "Maintained aggregate expected {expected} input but received {scalar:?}"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    use arrow::array::{
+        Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
+        TimestampMicrosecondArray, UInt64Array,
+    };
+    use arrow_schema::{Field, Schema, TimeUnit};
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion::physical_expr::expressions::{binary, cast, col, lit};
+    use datafusion::physical_plan::aggregates::PhysicalGroupBy;
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+    use datafusion_common::cast::{
+        as_float64_array, as_int64_array, as_string_array, as_uint64_array,
+    };
+    use datafusion_functions_aggregate::average::avg_udaf;
+    use datafusion_functions_aggregate::count::count_udaf;
+    use datafusion_functions_aggregate::min_max::{max_udaf, min_udaf};
+    use datafusion_functions_aggregate::sum::sum_udaf;
+    use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("i", DataType::Int64, true),
+            Field::new("u", DataType::UInt64, true),
+            Field::new("f", DataType::Float64, true),
+        ]))
+    }
+
+    fn batch() -> RecordBatch {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("a"),
+                    Some("b"),
+                    None,
+                ])),
+                Arc::new(Int64Array::from(vec![Some(10), None, Some(-2), Some(3)])),
+                Arc::new(UInt64Array::from(vec![Some(10), None, Some(2), Some(3)])),
+                Arc::new(Float64Array::from(vec![
+                    Some(1.0),
+                    None,
+                    Some(2.5),
+                    Some(4.5),
+                ])),
+            ],
+        )
+        .expect("test batch should be valid")
+    }
+
+    /// A hash join's runtime filter keeps different rows as the join runs, so a
+    /// predicate that carries one has no conjuncts a maintained view can match.
+    #[test]
+    fn a_predicate_with_a_dynamic_filter_has_no_conjuncts() -> DataFusionResult<()> {
+        let schema = schema();
+        let static_filter = binary(col("i", &schema)?, Operator::Gt, lit(0i64), &schema)?;
+        let static_conjuncts =
+            PredicateConjuncts::try_from_predicate(&static_filter).map(|conjuncts| {
+                conjuncts
+                    .0
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            });
+        assert_eq!(static_conjuncts, Some(vec!["i@0 > 0".to_string()]));
+
+        // `name` is column 0 already, so the conjunct would pass through
+        // `name_columns_only` unchanged if the dynamic filter were not refused.
+        let dynamic_filter: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![col("name", &schema)?],
+            lit(true),
+        ));
+        let with_dynamic_filter = binary(static_filter, Operator::And, dynamic_filter, &schema)?;
+        assert_eq!(
+            PredicateConjuncts::try_from_predicate(&with_dynamic_filter),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn applies_null_aware_count_sum_and_avg() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: Some("i".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("i".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Avg,
+                    column: Some("f".to_string()),
+                },
+            ],
+        };
+        let registry = MaintainedAggregateRegistry::try_new(&[spec], &schema())?;
+        registry.apply_insert_batches(1, &[batch()])?;
+
+        let aggregate = aggregate_exec_for(&[
+            ("count(*)", MaintainedAggregateFunction::Count, None),
+            ("count(i)", MaintainedAggregateFunction::Count, Some("i")),
+            ("sum(i)", MaintainedAggregateFunction::Sum, Some("i")),
+            ("avg(f)", MaintainedAggregateFunction::Avg, Some("f")),
+        ])?;
+        let result = registry
+            .batch_for_aggregate(&aggregate, 1)?
+            .expect("maintained aggregate should match");
+
+        assert_eq!(result.num_rows(), 3);
+        let groups = as_string_array(result.column(0))?;
+        let count_all = as_int64_array(result.column(1))?;
+        let count_i = as_int64_array(result.column(2))?;
+        let sum_i = as_int64_array(result.column(3))?;
+        let avg = as_float64_array(result.column(4))?;
+        let mut rows = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            let key = if groups.is_null(row) {
+                None
+            } else {
+                Some(groups.value(row).to_string())
+            };
+            rows.insert(
+                key,
+                (
+                    count_all.value(row),
+                    count_i.value(row),
+                    (!sum_i.is_null(row)).then_some(sum_i.value(row)),
+                    (!avg.is_null(row)).then_some(avg.value(row)),
+                ),
+            );
+        }
+        assert_eq!(
+            rows.get(&Some("a".to_string())),
+            Some(&(2, 1, Some(10), Some(1.0)))
+        );
+        assert_eq!(
+            rows.get(&Some("b".to_string())),
+            Some(&(1, 1, Some(-2), Some(2.5)))
+        );
+        assert_eq!(rows.get(&None), Some(&(1, 1, Some(3), Some(4.5))));
+        Ok(())
+    }
+
+    /// The rewrite replaces an immutable scan snapshot, so it may serve only the
+    /// registry state taken at that snapshot's epoch. A reused CDC scan view can
+    /// trail the registry; serving the newer state would count writes the scan
+    /// does not contain (`base_scan_count_at_epoch_1=4`,
+    /// `maintained_count_at_epoch_2=8`).
+    #[test]
+    fn serves_only_the_matching_scan_epoch() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Count,
+                column: None,
+            }],
+        };
+        let registry = MaintainedAggregateRegistry::try_new(&[spec], &schema())?;
+        registry.apply_insert_batches(1, &[batch()])?;
+        registry.apply_insert_batches(2, &[batch()])?;
+        let aggregate =
+            aggregate_exec_for(&[("count(*)", MaintainedAggregateFunction::Count, None)])?;
+
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 1)?.is_none(),
+            "a registry ahead of the scan snapshot must not serve it"
+        );
+        let served = registry
+            .batch_for_aggregate(&aggregate, 2)?
+            .expect("a registry at the scan snapshot serves it");
+        let counts = as_int64_array(served.column(1))?;
+        assert_eq!(
+            counts.iter().flatten().sum::<i64>(),
+            8,
+            "the matching epoch includes both batches"
+        );
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 3)?.is_none(),
+            "a registry behind the scan snapshot must not serve it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_epoch_does_not_serve_and_releases_retained_state() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Count,
+                column: None,
+            }],
+        };
+        let registry = MaintainedAggregateRegistry::try_new(&[spec], &schema())?;
+        registry.apply_insert_batches(1, &[batch()])?;
+        assert!(
+            !registry.state.read().views[0].groups.is_empty(),
+            "fresh registry retains group state"
+        );
+        registry.mark_stale(2);
+
+        let state = registry.state.read();
+        assert!(
+            state.views[0].groups.is_empty(),
+            "stale registry must release group state"
+        );
+        assert!(
+            state.index.as_ref().is_none_or(|index| index.len() == 0),
+            "stale registry must release PK contributions"
+        );
+        assert_eq!(state.views[0].retained_multiset_entries, 0);
+        drop(state);
+
+        let aggregate =
+            aggregate_exec_for(&[("count(*)", MaintainedAggregateFunction::Count, None)])?;
+        assert!(registry.batch_for_aggregate(&aggregate, 2)?.is_none());
+        assert!(registry.batch_for_aggregate(&aggregate, 1)?.is_none());
+        Ok(())
+    }
+
+    /// The off-write-path background applier drains deltas in strict epoch order
+    /// (channel FIFO). The registry enforces that contract as its safety net: an
+    /// in-order epoch chain stays fresh and serves, but a skipped/out-of-order
+    /// epoch (as a reordered or dropped delta would produce) fails safe to stale
+    /// — queries fall back to the base table rather than serve a partial result.
+    #[test]
+    fn out_of_order_apply_epoch_falls_back_to_stale() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Count,
+                column: None,
+            }],
+        };
+        let registry = MaintainedAggregateRegistry::try_new(&[spec], &schema())?;
+        let aggregate =
+            aggregate_exec_for(&[("count(*)", MaintainedAggregateFunction::Count, None)])?;
+
+        // In-order epoch 1 applies and serves.
+        registry.apply_insert_batches(1, &[batch()])?;
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 1)?.is_some(),
+            "in-order epoch 1 serves"
+        );
+
+        // Skipping epoch 2 and applying epoch 3 is a gap; the registry fails safe
+        // to stale and serves nothing at any epoch.
+        registry.apply_insert_batches(3, &[batch()])?;
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 3)?.is_none(),
+            "gapped epoch 3 must not serve"
+        );
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 1)?.is_none(),
+            "registry is stale after the gap"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn count_null_literal_is_not_rewritten_as_count_all() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Count,
+                column: None,
+            }],
+        };
+        let schema = schema();
+        let registry = MaintainedAggregateRegistry::try_new(&[spec], &schema)?;
+        registry.apply_insert_batches(1, &[batch()])?;
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch()]], Arc::clone(&schema), None)?;
+        let group_by =
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]);
+        let aggregate_expr =
+            AggregateExprBuilder::new(count_udaf(), vec![lit(ScalarValue::Int64(None))])
+                .schema(Arc::clone(&schema))
+                .alias("count(NULL)".to_string())
+                .build()?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            group_by,
+            vec![Arc::new(aggregate_expr)],
+            vec![None],
+            input,
+            schema,
+        )?;
+
+        assert!(registry.batch_for_aggregate(&aggregate, 1)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn global_empty_aggregate_returns_sql_row() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec![],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("u".to_string()),
+                },
+            ],
+        };
+        let registry = MaintainedAggregateRegistry::try_new(&[spec], &schema())?;
+        let aggregate = aggregate_exec_for(&[
+            ("count(*)", MaintainedAggregateFunction::Count, None),
+            ("sum(u)", MaintainedAggregateFunction::Sum, Some("u")),
+        ])?;
+
+        let result = registry
+            .batch_for_aggregate(&aggregate, 0)?
+            .expect("global empty aggregate should be served");
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(
+            ScalarValue::try_from_array(result.column(0), 0)?,
+            ScalarValue::Int64(Some(0))
+        );
+        assert!(result.column(1).is_null(0));
+        Ok(())
+    }
+
+    #[test]
+    fn sum_overflow_returns_error() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec![],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Sum,
+                column: Some("i".to_string()),
+            }],
+        };
+        let registry = MaintainedAggregateRegistry::try_new(&[spec], &schema())?;
+        let overflow_batch = RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
+                Arc::new(Int64Array::from(vec![Some(i64::MAX), Some(1)])),
+                Arc::new(UInt64Array::from(vec![Some(1), Some(1)])),
+                Arc::new(Float64Array::from(vec![Some(1.0), Some(1.0)])),
+            ],
+        )
+        .expect("test batch should be valid");
+
+        assert!(registry.apply_insert_batches(1, &[overflow_batch]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_group_key_type_is_rejected() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "group_key",
+            DataType::Float64,
+            true,
+        )]));
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["group_key".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Count,
+                column: None,
+            }],
+        };
+
+        let err = MaintainedAggregateRegistry::try_new(&[spec], &schema)
+            .expect_err("unsupported group key type should be rejected");
+        // The group-key type guard is what refused it, not a column-resolution failure.
+        assert!(
+            matches!(
+                &err,
+                DataFusionError::Plan(message) if message
+                    == "Maintained aggregate GROUP BY column 'group_key' uses unsupported type Float64"
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn maintained_aggregate_exec_exposes_inner_child() -> DataFusionResult<()> {
+        let exec = Arc::new(MaintainedAggregateExec::try_new(batch())?);
+
+        assert_eq!(exec.children().len(), 1);
+        let required_distribution = exec.input_distribution_requirements().into_per_child();
+        assert_eq!(required_distribution.len(), 1);
+        assert!(matches!(
+            required_distribution.as_slice(),
+            [Distribution::UnspecifiedDistribution]
+        ));
+        let required_ordering = exec.required_input_ordering();
+        assert_eq!(required_ordering.len(), 1);
+        assert!(required_ordering[0].is_none());
+        assert_eq!(exec.maintains_input_order(), vec![true]);
+        assert_eq!(exec.benefits_from_input_partitioning(), vec![false]);
+        let recompute = ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute);
+        Arc::clone(&exec)
+            .replace_children(Vec::new(), recompute)
+            .expect_err("missing maintained aggregate child should be rejected");
+
+        let replacement = MemorySourceConfig::try_new_exec(&[vec![batch()]], schema(), None)?;
+        let rewritten = exec.replace_children(vec![replacement], recompute)?;
+
+        assert_eq!(rewritten.children().len(), 1);
+
+        Ok(())
+    }
+
+    fn aggregate_exec_for(
+        aggregate_defs: &[(&str, MaintainedAggregateFunction, Option<&str>)],
+    ) -> DataFusionResult<AggregateExec> {
+        let schema = schema();
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch()]], Arc::clone(&schema), None)?;
+        let group_by = if aggregate_defs.len() == 2
+            && aggregate_defs[0].0 == "count(*)"
+            && aggregate_defs[1].0 == "sum(u)"
+        {
+            PhysicalGroupBy::new_single(vec![])
+        } else {
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())])
+        };
+        let aggregate_exprs = aggregate_defs
+            .iter()
+            .map(|(alias, function, column)| {
+                let aggregate_args = match (function, column) {
+                    (_, Some(column)) => vec![col(column, schema.as_ref())?],
+                    _ => vec![lit(1_i8)],
+                };
+                let udaf = match function {
+                    MaintainedAggregateFunction::Count => count_udaf(),
+                    MaintainedAggregateFunction::Sum => sum_udaf(),
+                    MaintainedAggregateFunction::Avg => avg_udaf(),
+                    MaintainedAggregateFunction::Min => min_udaf(),
+                    MaintainedAggregateFunction::Max => max_udaf(),
+                };
+                AggregateExprBuilder::new(udaf, aggregate_args)
+                    .schema(Arc::clone(&schema))
+                    .alias((*alias).to_string())
+                    .build()
+                    .map(Arc::new)
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        let filters = vec![None; aggregate_exprs.len()];
+        AggregateExec::try_new(
+            AggregateMode::Single,
+            group_by,
+            aggregate_exprs,
+            filters,
+            input,
+            schema,
+        )
+    }
+
+    // --- retraction (apply_pk_deletes + per-PK index) ---
+    //
+    // Column layout for these tests (reusing the module `schema()`):
+    //   name (Utf8)  -> GROUP BY key
+    //   i    (Int64) -> SUM target  (output parses via `as_int64_array`)
+    //   u    (UInt64)-> PRIMARY KEY (pk_columns = [2])
+    // Each test row is `(name, pk, value)`.
+
+    fn group_batch(rows: &[(&str, u64, i64)]) -> RecordBatch {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, _, value)| *value).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|(_, pk, _)| *pk).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|_| None).collect::<Vec<Option<f64>>>(),
+                )),
+            ],
+        )
+        .expect("group batch should be valid")
+    }
+
+    fn sum_i_spec() -> MaintainedAggregateSpec {
+        MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Sum,
+                column: Some("i".to_string()),
+            }],
+        }
+    }
+
+    /// A retraction rebuilds each input from the words its record holds, and the
+    /// accumulators subtract exactly what they added only if that is the same
+    /// scalar, of the same type, that the row contributed.
+    #[test]
+    fn a_stored_input_decodes_to_the_scalar_it_was() -> DataFusionResult<()> {
+        let utc: Option<Arc<str>> = Some(Arc::from("UTC"));
+        for scalar in [
+            ScalarValue::Int8(Some(i8::MIN)),
+            ScalarValue::Int16(Some(-1)),
+            ScalarValue::Int32(Some(i32::MIN)),
+            ScalarValue::Int64(Some(i64::MIN)),
+            ScalarValue::Int64(Some(i64::MAX)),
+            ScalarValue::UInt8(Some(u8::MAX)),
+            ScalarValue::UInt16(Some(u16::MAX)),
+            ScalarValue::UInt32(Some(u32::MAX)),
+            ScalarValue::UInt64(Some(u64::MAX)),
+            ScalarValue::Float32(Some(-2.25)),
+            ScalarValue::Float32(Some(f32::MAX)),
+            ScalarValue::Float64(Some(-1.5e300)),
+            ScalarValue::Decimal128(Some(-999_999), 6, 2),
+            ScalarValue::Decimal128(Some(-999_999_999_999_999_999), 18, 0),
+            ScalarValue::Decimal128(Some(-(10_i128.pow(37))), 38, 0),
+            ScalarValue::Decimal128(Some(i128::MAX), 38, 10),
+            ScalarValue::Date32(Some(-1)),
+            ScalarValue::Date64(Some(1_700_000_000_000)),
+            ScalarValue::TimestampSecond(Some(-5), None),
+            ScalarValue::TimestampMillisecond(Some(1), utc.clone()),
+            ScalarValue::TimestampMicrosecond(Some(-1_167_696_000_000_000), utc),
+            ScalarValue::TimestampNanosecond(Some(i64::MAX), None),
+        ] {
+            let data_type = scalar.data_type();
+            let words = value_words(&data_type).expect("every aggregate input type is storable");
+            let encoded = encode_value(&scalar)?;
+            let decoded = decode_value(&encoded[..words], &data_type)?;
+            assert_eq!(
+                decoded, scalar,
+                "{data_type} must decode to the stored value"
+            );
+            assert_eq!(decoded.data_type(), data_type);
+        }
+        Ok(())
+    }
+
+    /// `SUM(i) GROUP BY name WHERE i > 0`.
+    fn positive_sum_i_spec() -> DataFusionResult<MaintainedAggregateSpec> {
+        let schema = schema();
+        Ok(MaintainedAggregateSpec {
+            filter: Some(datafusion_physical_expr::expressions::binary(
+                col("i", schema.as_ref())?,
+                datafusion::logical_expr::Operator::Gt,
+                lit(0_i64),
+                schema.as_ref(),
+            )?),
+            ..sum_i_spec()
+        })
+    }
+
+    fn global_count_spec() -> MaintainedAggregateSpec {
+        MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec![],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Count,
+                column: None,
+            }],
+        }
+    }
+
+    /// The served `(name, SUM(i))` rows of `positive_sum_i_spec`, and the
+    /// served `COUNT(*)` of `global_count_spec`.
+    fn shared_record_views(
+        registry: &MaintainedAggregateRegistry,
+    ) -> DataFusionResult<(BTreeMap<String, i64>, i64)> {
+        let epoch = registry.state.read().epoch;
+        let sums = registry
+            .batch_for_spec(
+                &positive_sum_i_spec()?,
+                epoch,
+                Arc::new(Schema::new(vec![
+                    Field::new("name", DataType::Utf8, true),
+                    Field::new("sum(i)", DataType::Int64, true),
+                ])),
+            )?
+            .expect("the filtered view serves");
+        let names = as_string_array(sums.column(0))?;
+        let values = as_int64_array(sums.column(1))?;
+        let sums = (0..sums.num_rows())
+            .map(|row| (names.value(row).to_string(), values.value(row)))
+            .collect();
+        let count = registry
+            .batch_for_spec(
+                &global_count_spec(),
+                epoch,
+                Arc::new(Schema::new(vec![Field::new(
+                    "count(*)",
+                    DataType::Int64,
+                    false,
+                )])),
+            )?
+            .expect("the unfiltered view serves");
+        Ok((sums, as_int64_array(count.column(0))?.value(0)))
+    }
+
+    /// Two views share one record per key. A row can belong to one view and not
+    /// the other, and an update can move it between them: each view must
+    /// retract only what the row gave it.
+    #[test]
+    fn views_sharing_a_record_retract_only_their_own_contribution() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[positive_sum_i_spec()?, global_count_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+
+        registry.apply_insert_batches(
+            1,
+            &[group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, -5)])],
+        )?;
+        assert_eq!(
+            shared_record_views(&registry)?,
+            (BTreeMap::from([("a".to_string(), 30)]), 3)
+        );
+
+        // pk 2 leaves the filter and pk 3 enters it; the count is unchanged.
+        registry.apply_insert_batches(2, &[group_batch(&[("a", 2, -1), ("b", 3, 7)])])?;
+        assert_eq!(
+            shared_record_views(&registry)?,
+            (
+                BTreeMap::from([("a".to_string(), 10), ("b".to_string(), 7)]),
+                3
+            )
+        );
+
+        // Deleting pk 1 empties group `a` of the filtered view.
+        registry.apply_pk_deletes(3, &group_batch(&[("", 1, 0)]).project(&[2])?)?;
+        assert_eq!(
+            shared_record_views(&registry)?,
+            (BTreeMap::from([("b".to_string(), 7)]), 2)
+        );
+        assert_eq!(retained_index_entries(&registry.state.read()), 2);
+        Ok(())
+    }
+
+    /// A rebuild starts holding deltas, then reads a snapshot of the table while
+    /// writes keep landing. Installing it applies the held deltas after the
+    /// snapshot's epoch and drops those the snapshot already contains; the deltas
+    /// of epochs before the hold, which can still be queued behind the rebuild,
+    /// are skipped rather than counted twice.
+    #[test]
+    fn a_rebuild_takes_in_the_writes_made_while_it_reads() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+
+        // Holding starts after epoch 1. Epochs 2 and 3 land before the snapshot
+        // is taken (so it contains them), epochs 4 and 5 after it.
+        let mut rebuilder = registry.begin_rebuild(1)?;
+        assert!(
+            registry.is_stale(),
+            "a registry being rebuilt does not serve"
+        );
+        registry.apply_insert_batches(2, &[group_batch(&[("a", 2, 20)])])?;
+        registry.apply_insert_batches(3, &[group_batch(&[("b", 3, 5)])])?;
+        assert!(rebuilder.set_snapshot_epoch(3));
+        let snapshot = group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, 5)]);
+        rebuilder.apply_projected(&snapshot, &[0, 1, 2, 3])?;
+        registry.apply_insert_batches(4, &[group_batch(&[("a", 1, 100)])])?;
+        registry.apply_pk_deletes(5, &group_batch(&[("", 2, 0)]).project(&[2])?)?;
+        assert!(registry.rebuild_is_current(&rebuilder));
+
+        assert!(registry.finish_rebuild(rebuilder)?, "the rebuild installs");
+        assert!(!registry.is_stale());
+        assert_eq!(registry.epoch_for_test(), 5);
+        assert_eq!(
+            sum_i_by_name(&registry)?,
+            BTreeMap::from([("a".to_string(), 100), ("b".to_string(), 5)]),
+            "the rebuilt views include the writes after the snapshot, once each"
+        );
+
+        // Deltas keep applying after it.
+        registry.apply_insert_batches(6, &[group_batch(&[("b", 4, 1)])])?;
+        assert_eq!(
+            sum_i_by_name(&registry)?,
+            BTreeMap::from([("a".to_string(), 100), ("b".to_string(), 6)])
+        );
+        Ok(())
+    }
+
+    /// A rebuild installed before the applier reached its snapshot's epoch: the
+    /// deltas of those epochs are already in the snapshot and must not be
+    /// applied again.
+    #[test]
+    fn deltas_the_installed_snapshot_already_holds_are_skipped() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        let mut rebuilder = registry.begin_rebuild(2)?;
+        assert!(rebuilder.set_snapshot_epoch(2));
+        rebuilder.apply_projected(&group_batch(&[("a", 1, 10), ("a", 2, 20)]), &[0, 1, 2, 3])?;
+        assert!(registry.finish_rebuild(rebuilder)?);
+        assert_eq!(registry.epoch_for_test(), 2);
+
+        // The queued deltas of epochs 1 and 2 arrive after the install.
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+        registry.apply_insert_batches(2, &[group_batch(&[("a", 2, 20)])])?;
+        registry.apply_insert_batches(3, &[group_batch(&[("a", 3, 1)])])?;
+
+        assert!(!registry.is_stale(), "a skipped delta is not an epoch gap");
+        assert_eq!(
+            sum_i_by_name(&registry)?,
+            BTreeMap::from([("a".to_string(), 31)])
+        );
+        Ok(())
+    }
+
+    /// A full apply queue can `mark_stale(N)` while N-1 is still queued
+    /// (`feed_staged_ivm_under_fence`). The rebuild that recovers starts holding
+    /// at N; the queued earlier delta is already in that snapshot and must not
+    /// be treated as an epoch gap that abandons the rebuild and drops later
+    /// writes.
+    #[test]
+    fn a_queued_delta_behind_a_stale_mark_does_not_abandon_the_rebuild() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+        registry.mark_stale(10);
+        let mut rebuilder = registry.begin_rebuild(10)?;
+        assert!(
+            registry.rebuild_is_current(&rebuilder),
+            "begin_rebuild must leave a current rebuild"
+        );
+
+        registry.apply_insert_batches(9, &[group_batch(&[("a", 2, 20)])])?;
+        assert!(
+            registry.rebuild_is_current(&rebuilder),
+            "a queued delta at or below hold_from must not abandon the rebuild"
+        );
+
+        registry.apply_insert_batches(11, &[group_batch(&[("b", 3, 5)])])?;
+        assert!(
+            registry.rebuild_is_current(&rebuilder),
+            "the first epoch after hold_from must be held for the rebuild"
+        );
+
+        assert!(rebuilder.set_snapshot_epoch(10));
+        rebuilder.apply_projected(&group_batch(&[("a", 1, 10), ("a", 2, 20)]), &[0, 1, 2, 3])?;
+        assert!(registry.finish_rebuild(rebuilder)?, "the rebuild installs");
+        assert!(!registry.is_stale());
+        assert_eq!(registry.epoch_for_test(), 11);
+        assert_eq!(
+            sum_i_by_name(&registry)?,
+            BTreeMap::from([("a".to_string(), 30), ("b".to_string(), 5)]),
+            "the rebuilt views include the write held after the snapshot"
+        );
+        Ok(())
+    }
+
+    /// Epochs assigned and queued before `begin_rebuild`, with no stale mark
+    /// jumping the registry epoch, must still leave later holds dense: skip
+    /// them as already in the snapshot, then hold the first epoch after
+    /// `hold_from`.
+    #[test]
+    fn queued_deltas_before_hold_from_keep_later_holds_dense() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+        let mut rebuilder = registry.begin_rebuild(3)?;
+        registry.apply_insert_batches(2, &[group_batch(&[("a", 2, 20)])])?;
+        registry.apply_insert_batches(3, &[group_batch(&[("b", 3, 5)])])?;
+        registry.apply_insert_batches(4, &[group_batch(&[("b", 4, 1)])])?;
+        assert!(
+            registry.rebuild_is_current(&rebuilder),
+            "queued deltas at or below hold_from must not abandon a later hold"
+        );
+
+        assert!(rebuilder.set_snapshot_epoch(3));
+        rebuilder.apply_projected(
+            &group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, 5)]),
+            &[0, 1, 2, 3],
+        )?;
+        assert!(registry.finish_rebuild(rebuilder)?, "the rebuild installs");
+        assert!(!registry.is_stale());
+        assert_eq!(registry.epoch_for_test(), 4);
+        assert_eq!(
+            sum_i_by_name(&registry)?,
+            BTreeMap::from([("a".to_string(), 30), ("b".to_string(), 6)]),
+            "the rebuilt views include the write held after the snapshot"
+        );
+        Ok(())
+    }
+
+    /// A stale mark, an epoch gap, held deltas over budget, or a snapshot older
+    /// than the hold abandon the rebuild: it installs nothing and the registry
+    /// stays stale.
+    #[test]
+    fn an_abandoned_rebuild_installs_nothing() -> DataFusionResult<()> {
+        // Marked stale while it reads.
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        let mut rebuilder = registry.begin_rebuild(0)?;
+        assert!(rebuilder.set_snapshot_epoch(0));
+        registry.mark_stale(1);
+        assert!(!registry.rebuild_is_current(&rebuilder));
+        assert!(!registry.finish_rebuild(rebuilder)?);
+        assert!(registry.is_stale());
+
+        // A delta skipped an epoch.
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        let mut rebuilder = registry.begin_rebuild(0)?;
+        assert!(rebuilder.set_snapshot_epoch(0));
+        registry.apply_insert_batches(2, &[group_batch(&[("a", 1, 10)])])?;
+        assert!(!registry.finish_rebuild(rebuilder)?);
+        assert!(registry.is_stale());
+
+        // More held deltas than a quarter of the budget.
+        let budget = group_batch(&[("a", 1, 10)]).get_array_memory_size() * 2;
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], budget)?;
+        let mut rebuilder = registry.begin_rebuild(0)?;
+        assert!(rebuilder.set_snapshot_epoch(0));
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+        assert!(!registry.rebuild_is_current(&rebuilder));
+        assert!(!registry.finish_rebuild(rebuilder)?);
+        assert!(registry.is_stale());
+
+        // A snapshot older than the hold: the deltas in between were dropped
+        // before the hold began, so the rebuild cannot be completed.
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        let mut rebuilder = registry.begin_rebuild(3)?;
+        assert!(!rebuilder.set_snapshot_epoch(2));
+        assert!(
+            !registry.finish_rebuild(rebuilder)?,
+            "a rebuild without a usable snapshot epoch installs nothing"
+        );
+        assert!(registry.is_stale());
+        Ok(())
+    }
+
+    /// A scan plan carries its table's registry and gets formatted with `Debug`
+    /// while planning, so the format must not grow with the retained rows.
+    #[test]
+    fn debug_formatting_does_not_print_retained_rows() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        let rows = (0..10_000_u64)
+            .map(|pk| ("a", pk, 1_i64))
+            .collect::<Vec<_>>();
+        registry.apply_insert_batches(1, &[group_batch(&rows)])?;
+
+        let formatted = format!("{registry:?}");
+        assert!(
+            formatted.len() < 256,
+            "the registry's Debug must be a summary, but it is {} bytes",
+            formatted.len()
+        );
+        Ok(())
+    }
+
+    /// A rebuild scans only the columns the views read.
+    #[test]
+    fn a_rebuild_reads_the_key_and_the_columns_the_views_use() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[positive_sum_i_spec()?, global_count_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        // name (group), i (sum and filter), u (key); never f.
+        assert_eq!(registry.rebuild_columns(), vec![0, 1, 2]);
+        Ok(())
+    }
+
+    fn sum_i_by_name(
+        registry: &MaintainedAggregateRegistry,
+    ) -> DataFusionResult<BTreeMap<String, i64>> {
+        let aggregate =
+            aggregate_exec_for(&[("sum(i)", MaintainedAggregateFunction::Sum, Some("i"))])?;
+        let epoch = registry.state.read().epoch;
+        let result = registry
+            .batch_for_aggregate(&aggregate, epoch)?
+            .expect("registry should be fresh");
+        let names = as_string_array(result.column(0))?;
+        let sums = as_int64_array(result.column(1))?;
+        let mut out = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            if !sums.is_null(row) {
+                out.insert(names.value(row).to_string(), sums.value(row));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The retained-index cap is a BYTE budget, not an entry count: entry width
+    /// varies by orders of magnitude with key and aggregate-input types, so a
+    /// count cap bounds memory for exactly one schema shape. A budget too small
+    /// to hold the index must fail safe to stale rather than grow past it.
+    #[test]
+    fn retained_index_cap_is_enforced_in_bytes() -> DataFusionResult<()> {
+        // One entry cannot fit in 8 bytes, so the very first batch trips the cap.
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], 8)?;
+        let result = registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])]);
+
+        assert!(
+            result.is_err(),
+            "an index that cannot fit its byte budget must fail safe, not grow past it"
+        );
+        assert!(
+            registry.is_stale(),
+            "tripping the byte cap must leave the registry stale so queries fall back to base scans"
+        );
+        let (retained, budget) = registry.retained_bytes_and_budget();
+        assert_eq!(retained, 0, "failing safe must clear all retained state");
+        assert_eq!(budget, 8, "the configured byte budget is reported as-is");
+        Ok(())
+    }
+
+    /// The budget is charged for the memory the index holds, which a retraction
+    /// keeps for reuse rather than returning, so churn must not grow the charge:
+    /// retracting every row and indexing as many again lands where the first load
+    /// did. A charge that grew with churn would leak budget until a steady-state
+    /// upsert workload tripped the cap and disabled the view for no reason.
+    #[test]
+    fn retained_index_bytes_hold_steady_across_retract_and_reload() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        let (empty_bytes, _) = registry.retained_bytes_and_budget();
+        assert_eq!(empty_bytes, 0, "an empty index holds no memory");
+
+        registry.apply_insert_batches(
+            1,
+            &[group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, 5)])],
+        )?;
+        let (loaded_bytes, _) = registry.retained_bytes_and_budget();
+        assert!(
+            loaded_bytes > empty_bytes,
+            "indexing rows must charge bytes (was {loaded_bytes}, empty {empty_bytes})"
+        );
+
+        // Retract every indexed row, then index three other keys.
+        registry.apply_pk_deletes(
+            2,
+            &group_batch(&[("", 1, 0), ("", 2, 0), ("", 3, 0)]).project(&[2])?,
+        )?;
+        let (drained_bytes, _) = registry.retained_bytes_and_budget();
+        assert!(
+            drained_bytes <= loaded_bytes,
+            "retracting rows must not charge more ({drained_bytes} > {loaded_bytes})"
+        );
+        registry.apply_insert_batches(
+            3,
+            &[group_batch(&[("a", 4, 10), ("a", 5, 20), ("b", 6, 5)])],
+        )?;
+        let (reloaded_bytes, _) = registry.retained_bytes_and_budget();
+        assert_eq!(
+            reloaded_bytes, loaded_bytes,
+            "re-indexing as many rows must reuse what the retractions released"
+        );
+        Ok(())
+    }
+
+    /// Repeatedly upserting the SAME primary key must not accumulate byte charges:
+    /// each upsert retracts the prior entry before re-indexing. A leak here is the
+    /// realistic way a long-running CDC table would drift into a false cap trip.
+    #[test]
+    fn repeated_upsert_of_one_pk_does_not_leak_index_bytes() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+        let (after_first, _) = registry.retained_bytes_and_budget();
+
+        for epoch in 2..=16_u64 {
+            registry.apply_insert_batches(
+                epoch,
+                &[group_batch(&[("a", 1, i64::try_from(epoch).unwrap_or(0))])],
+            )?;
+        }
+        let (after_many, _) = registry.retained_bytes_and_budget();
+
+        assert_eq!(
+            after_many, after_first,
+            "re-upserting one PK must hold steady state, not accumulate byte charges"
+        );
+        assert!(!registry.is_stale(), "steady-state upserts must stay fresh");
+        Ok(())
+    }
+
+    /// `is_stale` is what drives the provider's rebuild-to-recover path, so it must
+    /// report the state transitions that path keys on.
+    #[test]
+    fn is_stale_tracks_the_registry_lifecycle() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        assert!(!registry.is_stale(), "a fresh registry is not stale");
+
+        registry.mark_stale(1);
+        assert!(registry.is_stale(), "mark_stale must be observable");
+
+        // A rebuild is the only path back to fresh — this is what the provider's
+        // re-arm calls, and why staleness must not be terminal.
+        registry.rebuild_from_batches(2, &[group_batch(&[("a", 1, 10)])])?;
+        assert!(
+            !registry.is_stale(),
+            "rebuilding must clear staleness so maintained state serves again"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retracts_a_subset_of_a_group_by_pk() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(
+            1,
+            &[group_batch(&[
+                ("a", 1, 10),
+                ("a", 2, 20),
+                ("b", 3, 5),
+                ("b", 4, 7),
+            ])],
+        )?;
+        // Delete pk=2 (group a) and pk=3 (group b) via a PK-projected batch.
+        registry.apply_pk_deletes(2, &group_batch(&[("", 2, 0), ("", 3, 0)]).project(&[2])?)?;
+
+        let sums = sum_i_by_name(&registry)?;
+        assert_eq!(sums.get("a"), Some(&10), "a retains only pk=1 (i=10)");
+        assert_eq!(sums.get("b"), Some(&7), "b retains only pk=4 (i=7)");
+        Ok(())
+    }
+
+    /// `apply_pk_deletes` retracts using a batch whose columns ARE the primary
+    /// key in `pk_columns` order (positions `0..n`) — NOT the table-schema
+    /// layout. This is the path the provider uses after projecting a CDC delete
+    /// batch by name, so retraction matches the right keys regardless of the
+    /// delete batch's source-schema column order. PK = column index 2 (`u`).
+    #[test]
+    fn apply_pk_deletes_retracts_by_projected_pk() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(
+            1,
+            &[group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, 5)])],
+        )?;
+
+        // A PK-only batch: one `u` (UInt64) column at position 0 — the table
+        // layout has the PK at column 2, so a positional read of the full table
+        // batch would pick the wrong column. apply_pk_deletes reads positions
+        // `0..n`, matching the index keys built from the table PK column.
+        let pk_only = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("u", DataType::UInt64, true)])),
+            vec![Arc::new(UInt64Array::from(vec![2_u64, 3_u64]))],
+        )
+        .expect("pk batch should be valid");
+        registry.apply_pk_deletes(2, &pk_only)?;
+
+        let sums = sum_i_by_name(&registry)?;
+        assert_eq!(
+            sums.get("a"),
+            Some(&10),
+            "a keeps only pk=1 (i=10) after pk=2 retracted"
+        );
+        assert_eq!(
+            sums.get("b"),
+            None,
+            "b fully retracted (pk=3 was its only row)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn handles_update_as_retract_then_insert() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])])?;
+        // UPDATE pk=2 in place: i 20 -> 5, so group a = 10 + 5 = 15.
+        registry.apply_insert_batches(2, &[group_batch(&[("a", 2, 5)])])?;
+        assert_eq!(sum_i_by_name(&registry)?.get("a"), Some(&15));
+
+        // UPDATE pk=1 moving group a -> c, i 10 -> 100.
+        registry.apply_insert_batches(3, &[group_batch(&[("c", 1, 100)])])?;
+        let sums = sum_i_by_name(&registry)?;
+        assert_eq!(sums.get("a"), Some(&5), "a keeps only pk=2 (i=5)");
+        assert_eq!(sums.get("c"), Some(&100), "c gains pk=1 (i=100)");
+        Ok(())
+    }
+
+    #[test]
+    fn retracting_last_row_drops_the_group() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("b", 2, 20)])])?;
+        registry.apply_pk_deletes(2, &group_batch(&[("", 1, 0)]).project(&[2])?)?;
+        let sums = sum_i_by_name(&registry)?;
+        assert_eq!(
+            sums.get("a"),
+            None,
+            "group a disappears once its last row is retracted"
+        );
+        assert_eq!(sums.get("b"), Some(&20));
+        Ok(())
+    }
+
+    #[test]
+    fn exceeding_index_cap_falls_back_to_stale() -> DataFusionResult<()> {
+        // A 1-entry cap: inserting two distinct PKs overflows the index, so the
+        // registry fails safe to Stale and serves nothing (base-table fallback).
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], 1)?;
+        // Exceeding the cap surfaces a concrete error (not a silent Ok) so the
+        // write-path applier can log the reason.
+        let result =
+            registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])]);
+        assert!(result.is_err(), "over-cap apply must return an error");
+        let aggregate =
+            aggregate_exec_for(&[("sum(i)", MaintainedAggregateFunction::Sum, Some("i"))])?;
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 1)?.is_none(),
+            "over-cap registry must not serve"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn min_max_multiset_entries_count_toward_cap_without_pk() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Min,
+                column: Some("i".to_string()),
+            }],
+            filter: None,
+        };
+        // No PK index, but two distinct extremum values still retain two BTreeMap
+        // entries and must exceed this one-entry cap.
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(&[spec], &schema(), &[], 1)?;
+        let result =
+            registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])]);
+        assert!(
+            result.is_err(),
+            "MIN multiset entries must be bounded even without a PK index"
+        );
+        let aggregate =
+            aggregate_exec_for(&[("min(i)", MaintainedAggregateFunction::Min, Some("i"))])?;
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 1)?.is_none(),
+            "over-cap MIN registry must fall back to the base scan"
+        );
+        Ok(())
+    }
+
+    /// PK contribution records and `MIN`/`MAX` multiset nodes must share ONE
+    /// budget — an accounting that charged only the PK index would let a
+    /// `MIN`/`MAX` view grow past the operator's memory limit unmeasured.
+    ///
+    /// Expressed in bytes rather than entries: entry width varies by key and
+    /// aggregate-input type, so bytes are what actually bound memory. The test
+    /// derives the boundary from the measured footprint instead of hard-coding
+    /// one, so it stays honest if `ScalarValue`'s layout changes.
+    #[test]
+    fn pk_and_min_max_bytes_all_count_toward_cap() -> DataFusionResult<()> {
+        let rows = group_batch(&[("a", 1, 10), ("a", 2, 20)]);
+
+        // Measure what two rows of a MIN/MAX view actually retain.
+        let unbounded = MaintainedAggregateRegistry::try_new_with_pk(
+            &[min_max_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        unbounded.apply_insert_batches(1, std::slice::from_ref(&rows))?;
+        let (retained_bytes, _) = unbounded.retained_bytes_and_budget();
+        // Two rows retain two PK contribution records plus two `MIN` and two
+        // `MAX` multiset nodes: six entries, all charged.
+        assert_eq!(
+            retained_index_entries(&unbounded.state.read()),
+            6,
+            "two rows retain 2 PK records + 2 MIN + 2 MAX multiset nodes"
+        );
+        assert!(
+            retained_bytes > 0,
+            "retained state must be charged in bytes, not silently free"
+        );
+
+        // Exactly enough budget: the same load fits and stays fresh.
+        let at_cap = MaintainedAggregateRegistry::try_new_with_pk(
+            &[min_max_i_spec()],
+            &schema(),
+            &[2],
+            retained_bytes,
+        )?;
+        at_cap.apply_insert_batches(1, std::slice::from_ref(&rows))?;
+        assert!(
+            !at_cap.is_stale(),
+            "a load that exactly fits its budget must stay fresh"
+        );
+
+        // One byte short: the multiset nodes are what push it over, proving they
+        // are charged alongside the PK records rather than ignored.
+        let over_cap = MaintainedAggregateRegistry::try_new_with_pk(
+            &[min_max_i_spec()],
+            &schema(),
+            &[2],
+            retained_bytes.saturating_sub(1),
+        )?;
+        let result = over_cap.apply_insert_batches(1, &[rows]);
+        assert!(
+            result.is_err(),
+            "PK records and ordered-multiset nodes must share one byte budget"
+        );
+        assert!(over_cap.is_stale(), "an over-budget load must fail safe");
+        Ok(())
+    }
+
+    /// Build a (name, i=PK, u, f) batch — exercises every aggregate-input type
+    /// so retraction covers all accumulator inverses. Float values are
+    /// exact-representable in f64 so retraction stays bit-exact.
+    fn typed_batch(rows: &[(&str, i64, u64, f64)]) -> RecordBatch {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(n, _, _, _)| Some(*n)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, i, _, _)| *i).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|(_, _, u, _)| *u).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|(_, _, _, f)| *f).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("typed batch should be valid")
+    }
+
+    /// Retraction exercises EVERY accumulator inverse: `COUNT(*)` (`CountAll`),
+    /// `COUNT(u)` (`CountColumn`), `SUM(u)` (`SumUInt64`), `SUM(f)` (`SumFloat64`),
+    /// `AVG(f)` (`AvgFloat64`). `SUM(i)` (`SumInt64`) is covered by
+    /// `retracts_a_subset_of_a_group_by_pk`. PK = column `i`.
+    #[test]
+    fn retracts_all_aggregate_types() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: Some("u".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("u".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("f".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Avg,
+                    column: Some("f".to_string()),
+                },
+            ],
+        };
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[spec], &schema(), &[1], usize::MAX)?;
+        registry.apply_insert_batches(
+            1,
+            &[typed_batch(&[
+                ("a", 1, 10, 2.0),
+                ("a", 2, 20, 4.0),
+                ("b", 3, 5, 8.0),
+            ])],
+        )?;
+        // Delete pk i=2 from group a via a PK-projected batch (PK = column 1).
+        registry.apply_pk_deletes(2, &typed_batch(&[("", 2, 0, 0.0)]).project(&[1])?)?;
+
+        let aggregate = aggregate_exec_for(&[
+            ("count(*)", MaintainedAggregateFunction::Count, None),
+            ("count(u)", MaintainedAggregateFunction::Count, Some("u")),
+            ("sum(u)", MaintainedAggregateFunction::Sum, Some("u")),
+            ("sum(f)", MaintainedAggregateFunction::Sum, Some("f")),
+            ("avg(f)", MaintainedAggregateFunction::Avg, Some("f")),
+        ])?;
+        let result = registry
+            .batch_for_aggregate(&aggregate, 2)?
+            .expect("registry should be fresh");
+        assert_eq!(result.num_rows(), 2, "two groups survive");
+
+        let names = as_string_array(result.column(0))?;
+        let count_all = as_int64_array(result.column(1))?;
+        let count_u = as_int64_array(result.column(2))?;
+        let sum_u = as_uint64_array(result.column(3))?;
+        let sum_f = as_float64_array(result.column(4))?;
+        let avg_f = as_float64_array(result.column(5))?;
+        for row in 0..result.num_rows() {
+            match names.value(row) {
+                // group a kept only pk=1 (u=10, f=2.0) after the retraction.
+                "a" => {
+                    assert_eq!(count_all.value(row), 1, "CountAll retracted");
+                    assert_eq!(count_u.value(row), 1, "CountColumn retracted");
+                    assert_eq!(sum_u.value(row), 10, "SumUInt64 retracted");
+                    assert!(
+                        (sum_f.value(row) - 2.0).abs() < 1e-9,
+                        "SumFloat64 retracted"
+                    );
+                    assert!(
+                        (avg_f.value(row) - 2.0).abs() < 1e-9,
+                        "AvgFloat64 retracted"
+                    );
+                }
+                // group b untouched (pk=3, u=5, f=8.0).
+                "b" => {
+                    assert_eq!(count_all.value(row), 1);
+                    assert_eq!(sum_u.value(row), 5);
+                    assert!((sum_f.value(row) - 8.0).abs() < 1e-9);
+                    assert!((avg_f.value(row) - 8.0).abs() < 1e-9);
+                }
+                other => panic!("unexpected group {other}"),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retracting_last_non_null_sum_restores_sql_null() -> DataFusionResult<()> {
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("i", DataType::Int64, true),
+            Field::new("u", DataType::UInt64, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("pk", DataType::Int64, false),
+        ]));
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("i".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("u".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("f".to_string()),
+                },
+            ],
+        };
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            std::slice::from_ref(&spec),
+            &input_schema,
+            &[4],
+            usize::MAX,
+        )?;
+        let input = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a"])),
+                Arc::new(Int64Array::from(vec![None, Some(7)])),
+                Arc::new(UInt64Array::from(vec![None, Some(8)])),
+                Arc::new(Float64Array::from(vec![None, Some(1.5)])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ],
+        )?;
+        registry.apply_insert_batches(1, &[input])?;
+
+        let delete_pk = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("pk", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![2]))],
+        )?;
+        registry.apply_pk_deletes(2, &delete_pk)?;
+
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("sum_i", DataType::Int64, true),
+            Field::new("sum_u", DataType::UInt64, true),
+            Field::new("sum_f", DataType::Float64, true),
+        ]));
+        let result = registry
+            .batch_for_spec(&spec, 2, output_schema)?
+            .expect("fresh sum view should serve");
+        assert_eq!(result.num_rows(), 1, "the all-NULL row keeps group a live");
+        assert_eq!(as_string_array(result.column(0))?.value(0), "a");
+        assert!(as_int64_array(result.column(1))?.is_null(0));
+        assert!(as_uint64_array(result.column(2))?.is_null(0));
+        assert!(as_float64_array(result.column(3))?.is_null(0));
+        Ok(())
+    }
+
+    #[test]
+    fn avg_resets_running_sum_after_last_non_null_retraction() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("f".to_string()),
+            }],
+        };
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            std::slice::from_ref(&spec),
+            &schema(),
+            &[1],
+            usize::MAX,
+        )?;
+        let float_batch = |rows: &[(i64, Option<f64>)]| {
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a"); rows.len()])),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(pk, _)| *pk).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(UInt64Array::from(vec![None::<u64>; rows.len()])),
+                    Arc::new(Float64Array::from(
+                        rows.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+        };
+        registry.apply_insert_batches(
+            1,
+            &[float_batch(&[
+                (1, None),
+                (2, Some(1.0e16)),
+                (3, Some(1.0)),
+            ])?],
+        )?;
+        registry.apply_pk_deletes(2, &float_batch(&[(2, None)])?.project(&[1])?)?;
+        registry.apply_pk_deletes(3, &float_batch(&[(3, None)])?.project(&[1])?)?;
+        registry.apply_insert_batches(4, &[float_batch(&[(4, Some(2.0))])?])?;
+
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("avg_f", DataType::Float64, true),
+        ]));
+        let result = registry
+            .batch_for_spec(&spec, 4, output_schema)?
+            .expect("fresh average view should serve");
+        let average = as_float64_array(result.column(1))?.value(0);
+        assert!((average - 2.0).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    /// Serve `MIN(i)`, `MAX(i)` GROUP BY `name` from the registry, returning the
+    /// per-group extrema (NULL extrema are omitted). `i` is the module schema's
+    /// `Int64` column; the group key is `name`.
+    fn min_max_by_name(
+        registry: &MaintainedAggregateRegistry,
+    ) -> DataFusionResult<(BTreeMap<String, i64>, BTreeMap<String, i64>)> {
+        let aggregate = aggregate_exec_for(&[
+            ("min(i)", MaintainedAggregateFunction::Min, Some("i")),
+            ("max(i)", MaintainedAggregateFunction::Max, Some("i")),
+        ])?;
+        let epoch = registry.state.read().epoch;
+        let result = registry
+            .batch_for_aggregate(&aggregate, epoch)?
+            .expect("registry should be fresh");
+        let names = as_string_array(result.column(0))?;
+        let mins = as_int64_array(result.column(1))?;
+        let maxs = as_int64_array(result.column(2))?;
+        let mut min_out = BTreeMap::new();
+        let mut max_out = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            let name = names.value(row).to_string();
+            if !mins.is_null(row) {
+                min_out.insert(name.clone(), mins.value(row));
+            }
+            if !maxs.is_null(row) {
+                max_out.insert(name, maxs.value(row));
+            }
+        }
+        Ok((min_out, max_out))
+    }
+
+    fn min_max_i_spec() -> MaintainedAggregateSpec {
+        MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Min,
+                    column: Some("i".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Max,
+                    column: Some("i".to_string()),
+                },
+            ],
+        }
+    }
+
+    /// The retraction-hard core: deleting the current group MIN or MAX must
+    /// expose the next value from the maintained ordered multiset — the exact
+    /// case `COUNT`/`SUM` (invert-by-subtract) cannot do and the reason MIN/MAX
+    /// needs the kept ordered structure. PK = `u` (column 2).
+    #[test]
+    fn maintains_min_max_with_retraction() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[min_max_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        // group a: i = {10(pk1), 20(pk2), 5(pk3)} -> min 5, max 20.
+        // group b: i = {7(pk4)}                    -> min 7, max 7.
+        registry.apply_insert_batches(
+            1,
+            &[group_batch(&[
+                ("a", 1, 10),
+                ("a", 2, 20),
+                ("a", 3, 5),
+                ("b", 4, 7),
+            ])],
+        )?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(min.get("a"), Some(&5));
+        assert_eq!(max.get("a"), Some(&20));
+        assert_eq!(min.get("b"), Some(&7));
+        assert_eq!(max.get("b"), Some(&7));
+
+        // Delete pk=3 (the current MIN of a, value 5): MIN falls back to 10, MAX unchanged.
+        registry.apply_pk_deletes(2, &group_batch(&[("", 3, 0)]).project(&[2])?)?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(
+            min.get("a"),
+            Some(&10),
+            "MIN exposes the next value after the extremum is retracted"
+        );
+        assert_eq!(max.get("a"), Some(&20));
+
+        // Delete pk=2 (the current MAX of a, value 20): a = {10}, min == max == 10.
+        registry.apply_pk_deletes(3, &group_batch(&[("", 2, 0)]).project(&[2])?)?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(min.get("a"), Some(&10));
+        assert_eq!(
+            max.get("a"),
+            Some(&10),
+            "MAX exposes the next value after the extremum is retracted"
+        );
+        Ok(())
+    }
+
+    /// NULLs never feed an extremum, but a row still counts toward the group's
+    /// existence: an entirely-NULL group survives with NULL MIN/MAX, and a
+    /// partially-NULL group reports the extremum of its non-null values.
+    #[test]
+    fn min_max_ignores_nulls_and_keeps_all_null_group() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[min_max_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        // group a: i = {NULL(pk1), 3(pk2), NULL(pk3)} -> min == max == 3.
+        // group b: i = {NULL(pk4)}                    -> min == max == NULL (group present).
+        let null_i_batch = RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("a"),
+                    Some("a"),
+                    Some("b"),
+                ])),
+                Arc::new(Int64Array::from(vec![None, Some(3_i64), None, None])),
+                Arc::new(UInt64Array::from(vec![1_u64, 2, 3, 4])),
+                Arc::new(Float64Array::from(
+                    vec![None, None, None, None] as Vec<Option<f64>>
+                )),
+            ],
+        )
+        .expect("null-i batch should be valid");
+        registry.apply_insert_batches(1, &[null_i_batch])?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(min.get("a"), Some(&3));
+        assert_eq!(max.get("a"), Some(&3));
+        assert_eq!(min.get("b"), None, "all-NULL group b has NULL MIN");
+        assert_eq!(max.get("b"), None, "all-NULL group b has NULL MAX");
+
+        // Retract pk=2 (a's only non-null i): a is now entirely NULL -> NULL MIN/MAX, group still live.
+        registry.apply_pk_deletes(2, &group_batch(&[("", 2, 0)]).project(&[2])?)?;
+        let (min, max) = min_max_by_name(&registry)?;
+        assert_eq!(min.get("a"), None, "a is now all-NULL i -> NULL MIN");
+        assert_eq!(max.get("a"), None);
+        Ok(())
+    }
+
+    /// The dominant real-world MIN/MAX pattern is temporal — "earliest / latest
+    /// event per group". `Date`/`Timestamp` are integer-backed and monotonic, so
+    /// they reuse the integer order key (no NaN complexity) and preserve the exact
+    /// unit/timezone on output. Retraction-hard case included: deleting the current
+    /// earliest or latest exposes the next. PK = `pk` (column 2).
+    #[test]
+    fn maintains_min_max_over_timestamps() -> DataFusionResult<()> {
+        let ts_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let ts_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("ts", ts_type.clone(), true),
+            Field::new("pk", DataType::Int64, false),
+        ]));
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Min,
+                    column: Some("ts".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Max,
+                    column: Some("ts".to_string()),
+                },
+            ],
+        };
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            std::slice::from_ref(&spec),
+            &ts_schema,
+            &[2],
+            usize::MAX,
+        )?;
+        // (ts_micros, pk); all rows are group "a".
+        let ts_batch = |rows: &[(i64, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&ts_schema),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a"); rows.len()])),
+                    Arc::new(TimestampMicrosecondArray::from(
+                        rows.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("timestamp batch should be valid")
+        };
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("min_ts", ts_type.clone(), true),
+            Field::new("max_ts", ts_type, true),
+        ]));
+        let serve = |epoch: u64| -> DataFusionResult<(i64, i64)> {
+            let batch = registry
+                .batch_for_spec(&spec, epoch, Arc::clone(&out_schema))?
+                .expect("registry fresh and view matches");
+            assert_eq!(batch.num_rows(), 1, "single group 'a'");
+            let mins = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("min_ts is TimestampMicrosecond");
+            let maxs = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("max_ts is TimestampMicrosecond");
+            Ok((mins.value(0), maxs.value(0)))
+        };
+
+        // ts {100(pk1), 300(pk2), 200(pk3)} -> min 100, max 300.
+        registry.apply_insert_batches(1, &[ts_batch(&[(100, 1), (300, 2), (200, 3)])])?;
+        assert_eq!(serve(1)?, (100, 300));
+
+        // Delete pk2 (ts=300, current MAX) -> MAX exposes the next-latest, 200.
+        registry.apply_pk_deletes(2, &ts_batch(&[(0, 2)]).project(&[2])?)?;
+        assert_eq!(
+            serve(2)?,
+            (100, 200),
+            "MAX exposes the next-latest timestamp"
+        );
+
+        // Delete pk1 (ts=100, current MIN) -> MIN exposes the next-earliest, 200.
+        registry.apply_pk_deletes(3, &ts_batch(&[(0, 1)]).project(&[2])?)?;
+        assert_eq!(
+            serve(3)?,
+            (200, 200),
+            "MIN exposes the next-earliest timestamp"
+        );
+        Ok(())
+    }
+
+    /// Financial MIN/MAX (min/max amount per group) over `Decimal128`, whose
+    /// backing value is an `i128` — the order key IS that integer (a column has
+    /// one fixed scale, so no scaling is needed). Also covers a duplicated value
+    /// (the multiset keeps a count, so one retraction of a value seen twice does
+    /// not drop it). `Decimal256` (i256) stays a follow-up. PK = `pk` (column 2).
+    #[test]
+    fn maintains_min_max_over_decimal128() -> DataFusionResult<()> {
+        let dec_type = DataType::Decimal128(12, 2);
+        let dec_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", dec_type.clone(), true),
+            Field::new("pk", DataType::Int64, false),
+        ]));
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Min,
+                    column: Some("amt".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Max,
+                    column: Some("amt".to_string()),
+                },
+            ],
+        };
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            std::slice::from_ref(&spec),
+            &dec_schema,
+            &[2],
+            usize::MAX,
+        )?;
+        // (raw i128 at scale 2, pk); all rows are group "a".
+        let dec_batch = |rows: &[(i128, i64)]| {
+            let amounts = Decimal128Array::from(rows.iter().map(|(a, _)| *a).collect::<Vec<_>>())
+                .with_precision_and_scale(12, 2)
+                .expect("valid decimal precision/scale");
+            RecordBatch::try_new(
+                Arc::clone(&dec_schema),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a"); rows.len()])),
+                    Arc::new(amounts),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("decimal batch should be valid")
+        };
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("min_amt", dec_type.clone(), true),
+            Field::new("max_amt", dec_type, true),
+        ]));
+        let serve = |epoch: u64| -> DataFusionResult<(i128, i128)> {
+            let batch = registry
+                .batch_for_spec(&spec, epoch, Arc::clone(&out_schema))?
+                .expect("registry fresh and view matches");
+            assert_eq!(batch.num_rows(), 1, "single group 'a'");
+            let mins = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("min_amt is Decimal128");
+            let maxs = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("max_amt is Decimal128");
+            Ok((mins.value(0), maxs.value(0)))
+        };
+
+        // amt {1.50(pk1), 9.99(pk2), 1.50(pk3, dup), -0.50(pk4)} -> min -50, max 999 (raw).
+        registry
+            .apply_insert_batches(1, &[dec_batch(&[(150, 1), (999, 2), (150, 3), (-50, 4)])])?;
+        assert_eq!(serve(1)?, (-50, 999));
+
+        // Delete pk2 (9.99, current MAX) -> MAX falls back to 1.50 (raw 150).
+        registry.apply_pk_deletes(2, &dec_batch(&[(0, 2)]).project(&[2])?)?;
+        assert_eq!(serve(2)?, (-50, 150), "MAX exposes the next-largest amount");
+
+        // Delete pk4 (-0.50, current MIN) -> MIN falls back to 1.50; the dup (pk1,pk3)
+        // keeps the value 150 present with count 2, so the group stays non-empty.
+        registry.apply_pk_deletes(3, &dec_batch(&[(0, 4)]).project(&[2])?)?;
+        assert_eq!(
+            serve(3)?,
+            (150, 150),
+            "MIN exposes the next-smallest amount"
+        );
+        Ok(())
+    }
+
+    // --- decimal SUM/AVG (Postgres NUMERIC → arrow Decimal128, the CDC money
+    // column case). Column layout for these tests:
+    //   name (Utf8)            -> GROUP BY key
+    //   amt  (Decimal128(6,2)) -> SUM/AVG target
+    //   pk   (Int64)           -> PRIMARY KEY (pk_columns = [2])
+
+    fn decimal_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", DataType::Decimal128(6, 2), true),
+            Field::new("pk", DataType::Int64, false),
+        ]))
+    }
+
+    /// Rows are `(group, raw backing value at scale 2, pk)`.
+    fn decimal_batch(rows: &[(&str, Option<i128>, i64)]) -> RecordBatch {
+        let amounts = Decimal128Array::from(rows.iter().map(|(_, a, _)| *a).collect::<Vec<_>>())
+            .with_precision_and_scale(6, 2)
+            .expect("valid decimal precision/scale");
+        RecordBatch::try_new(
+            decimal_schema(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                )),
+                Arc::new(amounts),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("decimal batch should be valid")
+    }
+
+    fn decimal_sum_avg_spec() -> MaintainedAggregateSpec {
+        MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("amt".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Avg,
+                    column: Some("amt".to_string()),
+                },
+            ],
+        }
+    }
+
+    /// Serve `SUM(amt)`/`AVG(amt) GROUP BY name` through a real `DataFusion`
+    /// `AggregateExec` (so the output field types are `DataFusion`'s own decimal
+    /// `SUM`/`AVG` return types, not ones this module computed for itself) and
+    /// return `group -> (sum raw, avg raw)` backing values, skipping NULLs.
+    #[expect(clippy::type_complexity, reason = "test helper return map")]
+    fn decimal_sum_avg_by_name(
+        registry: &MaintainedAggregateRegistry,
+        epoch: u64,
+    ) -> DataFusionResult<BTreeMap<String, (Option<i128>, Option<i128>)>> {
+        let schema = decimal_schema();
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![decimal_batch(&[])]],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let aggregate_exprs = [("sum(amt)", sum_udaf()), ("avg(amt)", avg_udaf())]
+            .into_iter()
+            .map(|(alias, udaf)| {
+                AggregateExprBuilder::new(udaf, vec![col("amt", schema.as_ref())?])
+                    .schema(Arc::clone(&schema))
+                    .alias(alias.to_string())
+                    .build()
+                    .map(Arc::new)
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]),
+            aggregate_exprs,
+            vec![None, None],
+            input,
+            schema,
+        )?;
+        // DataFusion's decimal SUM/AVG output types, computed by DataFusion.
+        assert_eq!(
+            aggregate.schema().field(1).data_type(),
+            &DataType::Decimal128(16, 2),
+            "sum(Decimal128(6, 2)) widens precision by 10"
+        );
+        assert_eq!(
+            aggregate.schema().field(2).data_type(),
+            &DataType::Decimal128(10, 6),
+            "avg(Decimal128(6, 2)) widens precision and scale by 4"
+        );
+        let result = registry
+            .batch_for_aggregate(&aggregate, epoch)?
+            .expect("registry should be fresh");
+        let names = as_string_array(result.column(0))?;
+        let sums = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("sum(amt) is Decimal128");
+        let avgs = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("avg(amt) is Decimal128");
+        let mut out = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            out.insert(
+                names.value(row).to_string(),
+                (
+                    (!sums.is_null(row)).then(|| sums.value(row)),
+                    (!avgs.is_null(row)).then(|| avgs.value(row)),
+                ),
+            );
+        }
+        Ok(out)
+    }
+
+    /// `SUM`/`AVG` over a `Decimal128` money column (Postgres `NUMERIC(6, 2)`,
+    /// the CH-benCH `SUM(ol_amount)` case) must (a) be accepted at registry
+    /// construction and (b) serve exact values through a real `DataFusion`
+    /// aggregate, whose decimal output types the maintained view must
+    /// reproduce. Before decimal support this failed dataset registration with
+    /// "Sum maintained aggregate does not support column type Decimal128(6, 2)".
+    #[test]
+    fn maintains_sum_avg_over_decimal128() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[decimal_sum_avg_spec()],
+            &decimal_schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        // a: 1.50 + 9.99 + NULL; b: -0.50.
+        registry.apply_insert_batches(
+            1,
+            &[decimal_batch(&[
+                ("a", Some(150), 1),
+                ("a", Some(999), 2),
+                ("a", None, 3),
+                ("b", Some(-50), 4),
+            ])],
+        )?;
+        let by_name = decimal_sum_avg_by_name(&registry, 1)?;
+        // a: SUM = 11.49 (raw 1149 at scale 2); AVG = 11.49 / 2 = 5.745000
+        // (raw 1149 * 10^4 / 2 = 5_745_000 at scale 6) — NULL contributes nothing.
+        assert_eq!(by_name.get("a"), Some(&(Some(1149), Some(5_745_000))));
+        // b: SUM = -0.50; AVG = -0.500000.
+        assert_eq!(by_name.get("b"), Some(&(Some(-50), Some(-500_000))));
+        Ok(())
+    }
+
+    /// The decimal `AVG` quotient truncates toward zero — exactly `DataFusion`'s
+    /// `DecimalAverager` (`div_wrapping`), not floor: `0.04 / 3` is `0.013333`
+    /// and `-0.04 / 3` is `-0.013333` (floor would give `-0.013334`).
+    #[test]
+    fn avg_over_decimal128_truncates_toward_zero_like_datafusion() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[decimal_sum_avg_spec()],
+            &decimal_schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(
+            1,
+            &[decimal_batch(&[
+                ("pos", Some(1), 1),
+                ("pos", Some(1), 2),
+                ("pos", Some(2), 3),
+                ("neg", Some(-1), 4),
+                ("neg", Some(-1), 5),
+                ("neg", Some(-2), 6),
+            ])],
+        )?;
+        let by_name = decimal_sum_avg_by_name(&registry, 1)?;
+        assert_eq!(by_name.get("pos"), Some(&(Some(4), Some(13_333))));
+        assert_eq!(by_name.get("neg"), Some(&(Some(-4), Some(-13_333))));
+        Ok(())
+    }
+
+    /// Decimal `SUM`/`AVG` must retract exactly (the `i128` backing-value sum
+    /// is exactly invertible): in-place update, delete, retracting the final
+    /// non-null contribution restoring SQL `NULL` while a null-valued row keeps
+    /// the group alive, and dropping the group with its last row.
+    #[test]
+    fn retracts_decimal128_sum_avg_by_pk() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[decimal_sum_avg_spec()],
+            &decimal_schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        // a: 1.50(pk1) + 2.50(pk2) + NULL(pk3).
+        registry.apply_insert_batches(
+            1,
+            &[decimal_batch(&[
+                ("a", Some(150), 1),
+                ("a", Some(250), 2),
+                ("a", None, 3),
+            ])],
+        )?;
+        // UPDATE pk2 in place (retract-old-then-apply-new): 2.50 -> 0.25.
+        registry.apply_insert_batches(2, &[decimal_batch(&[("a", Some(25), 2)])])?;
+        assert_eq!(
+            decimal_sum_avg_by_name(&registry, 2)?.get("a"),
+            Some(&(Some(175), Some(875_000))),
+            "1.50 + 0.25 = 1.75; AVG = 0.875000"
+        );
+        // DELETE pk1, then pk2: only the NULL row remains, so the group stays
+        // alive and both aggregates restore SQL NULL.
+        registry.apply_pk_deletes(3, &decimal_batch(&[("", None, 1)]).project(&[2])?)?;
+        registry.apply_pk_deletes(4, &decimal_batch(&[("", None, 2)]).project(&[2])?)?;
+        assert_eq!(
+            decimal_sum_avg_by_name(&registry, 4)?.get("a"),
+            Some(&(None, None)),
+            "all non-null contributions retracted -> SQL NULL"
+        );
+        // DELETE pk3 (the NULL row): the group is now empty and disappears.
+        registry.apply_pk_deletes(5, &decimal_batch(&[("", None, 3)]).project(&[2])?)?;
+        assert_eq!(decimal_sum_avg_by_name(&registry, 5)?.get("a"), None);
+        Ok(())
+    }
+
+    /// A decimal `SUM` whose exact `i128` running sum overflows fails the apply
+    /// pass (the registry falls safe to stale) instead of silently wrapping.
+    #[test]
+    fn sum_over_decimal128_overflow_fails_safe_to_stale() -> DataFusionResult<()> {
+        let wide_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", DataType::Decimal128(38, 0), true),
+        ]));
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec![],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Sum,
+                column: Some("amt".to_string()),
+            }],
+        };
+        let registry = MaintainedAggregateRegistry::try_new(&[spec], &wide_schema)?;
+        // 10^38 - 1 is the largest Decimal128(38, 0) value; two of them exceed
+        // i128::MAX (~1.7 * 10^38), so the second insert must fail, not wrap.
+        let max_decimal = 10_i128.pow(38) - 1;
+        let wide_batch = || {
+            RecordBatch::try_new(
+                Arc::clone(&wide_schema),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a")])),
+                    Arc::new(
+                        Decimal128Array::from(vec![Some(max_decimal)])
+                            .with_precision_and_scale(38, 0)
+                            .expect("valid decimal precision/scale"),
+                    ),
+                ],
+            )
+            .expect("test batch should be valid")
+        };
+        registry.apply_insert_batches(1, &[wide_batch()])?;
+        assert!(registry.apply_insert_batches(2, &[wide_batch()]).is_err());
+        Ok(())
+    }
+
+    /// A maintained `AVG(Decimal128)` whose serve-time rescale overflows errors
+    /// the query — exactly what `DataFusion`'s `DecimalAverager` does for a
+    /// base-table scan of the same data, so this is not a divergence.
+    #[test]
+    fn avg_over_decimal128_result_overflow_errors_like_datafusion() -> DataFusionResult<()> {
+        let wide_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", DataType::Decimal128(38, 0), true),
+        ]));
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec![],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("amt".to_string()),
+            }],
+        };
+        let registry =
+            MaintainedAggregateRegistry::try_new(std::slice::from_ref(&spec), &wide_schema)?;
+        // The running sum (10^37) fits i128, but the serve-time rescale to the
+        // AVG output scale multiplies by 10^4 and overflows.
+        let big_batch = RecordBatch::try_new(
+            Arc::clone(&wide_schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a")])),
+                Arc::new(
+                    Decimal128Array::from(vec![Some(10_i128.pow(37))])
+                        .with_precision_and_scale(38, 0)
+                        .expect("valid decimal precision/scale"),
+                ),
+            ],
+        )
+        .expect("test batch should be valid");
+        registry.apply_insert_batches(1, &[big_batch])?;
+        let out_schema = Arc::new(Schema::new(vec![Field::new(
+            "avg(amt)",
+            DataType::Decimal128(38, 4),
+            true,
+        )]));
+        let error = registry
+            .batch_for_spec(&spec, 1, out_schema)
+            .expect_err("serve-time rescale must overflow");
+        // DataFusion's own `DecimalAverager` error — the maintained serve fails
+        // with exactly what a base-table re-scan of the same data raises.
+        assert!(
+            error
+                .to_string()
+                .contains("Arithmetic Overflow in AvgAccumulator"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    /// `AVG` over a negative-scale decimal stays unsupported (the serve-time
+    /// rescale is only meaningful for non-negative input scales), while `SUM` —
+    /// which keeps the input scale — accepts it.
+    #[test]
+    fn avg_over_negative_scale_decimal128_is_rejected() {
+        let neg_scale_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", DataType::Decimal128(6, -2), true),
+        ]));
+        let avg_spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec![],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("amt".to_string()),
+            }],
+        };
+        let error = MaintainedAggregateRegistry::try_new(&[avg_spec], &neg_scale_schema)
+            .expect_err("negative-scale decimal AVG is unsupported");
+        assert!(
+            error
+                .to_string()
+                .contains("does not support column type Decimal128(6, -2)"),
+            "unexpected error: {error}"
+        );
+
+        let sum_spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec![],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Sum,
+                column: Some("amt".to_string()),
+            }],
+        };
+        MaintainedAggregateRegistry::try_new(&[sum_spec], &neg_scale_schema)
+            .expect("negative-scale decimal SUM keeps the input scale and is supported");
+    }
+
+    /// Postgres `INTEGER` → arrow `Int32`, the common CDC case (not `BIGINT` →
+    /// `Int64`). `SUM` over a narrow signed-integer column must (a) be accepted
+    /// at registry construction and (b) widen to `Int64` on both the insert and
+    /// the retraction path. Regression guard for the `CH-benCH` `district`
+    /// `SUM(d_next_o_id)` config, where `d_next_o_id` is `Int32` — this combo
+    /// previously failed planning with "Sum maintained aggregate does not
+    /// support column type Int32".
+    #[test]
+    fn sum_over_int32_widens_on_insert_and_retract() -> DataFusionResult<()> {
+        let i32_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int32, true),
+            Field::new("pk", DataType::Int64, true),
+        ]));
+        let i32_batch = |rows: &[(&str, i32, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&i32_schema),
+                vec![
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int32Array::from(
+                        rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("int32 batch should be valid")
+        };
+
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Sum,
+                column: Some("v".to_string()),
+            }],
+        };
+        // PK = column index 2 (`pk`). Construction must succeed for Int32 SUM.
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[spec], &i32_schema, &[2], usize::MAX)?;
+
+        registry
+            .apply_insert_batches(1, &[i32_batch(&[("a", 10, 1), ("a", 20, 2), ("b", 5, 3)])])?;
+        // UPDATE pk=2 in place (retract-old-then-apply-new): v 20 -> 7, so a = 17.
+        registry.apply_insert_batches(2, &[i32_batch(&[("a", 7, 2)])])?;
+        // DELETE pk=3 via a PK-projected batch (PK = column 2): retracts group b.
+        registry.apply_pk_deletes(3, &i32_batch(&[("", 0, 3)]).project(&[2])?)?;
+
+        // Serve via a real AggregateExec. DataFusion's type coercion plans
+        // `SUM(Int32)` as `SUM(CAST(v AS Int64))`, so the aggregate input is a
+        // cast over the column — the serve path must see through it.
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![i32_batch(&[])]],
+            Arc::clone(&i32_schema),
+            None,
+        )?;
+        let sum_arg = cast(
+            col("v", i32_schema.as_ref())?,
+            i32_schema.as_ref(),
+            DataType::Int64,
+        )?;
+        let sum_v = AggregateExprBuilder::new(sum_udaf(), vec![sum_arg])
+            .schema(Arc::clone(&i32_schema))
+            .alias("sum(v)")
+            .build()
+            .map(Arc::new)?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(
+                col("name", i32_schema.as_ref())?,
+                "name".to_string(),
+            )]),
+            vec![sum_v],
+            vec![None],
+            input,
+            Arc::clone(&i32_schema),
+        )?;
+        let result = registry
+            .batch_for_aggregate(&aggregate, 3)?
+            .expect("registry should be fresh");
+        // Output widened to Int64 (matches DataFusion's `sum(Int32)` = `Int64`).
+        let names = as_string_array(result.column(0))?;
+        let sums = as_int64_array(result.column(1))?;
+        let mut by_name = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            if !sums.is_null(row) {
+                by_name.insert(names.value(row).to_string(), sums.value(row));
+            }
+        }
+        assert_eq!(
+            by_name.get("a"),
+            Some(&17),
+            "group a = 10 + updated 7 (Int32 widened)"
+        );
+        assert_eq!(by_name.get("b"), None, "group b fully retracted by delete");
+        Ok(())
+    }
+
+    /// `AVG` over a narrow signed-integer column (Postgres `INTEGER` → arrow
+    /// `Int32`, the common CDC case) must (a) be accepted at registry
+    /// construction and (b) maintain an exact `i128` running sum + count across
+    /// insert, in-place update (retract-then-apply-new), and delete, dividing
+    /// down to the `Float64` AVG output. Mirrors
+    /// [`sum_over_int32_widens_on_insert_and_retract`] for `AvgInt128` — before
+    /// integer support this failed planning with "Avg maintained aggregate does
+    /// not support column type Int32".
+    #[test]
+    fn avg_over_int32_maintains_exactly_on_insert_and_retract() -> DataFusionResult<()> {
+        let i32_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int32, true),
+            Field::new("pk", DataType::Int64, true),
+        ]));
+        let i32_batch = |rows: &[(&str, i32, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&i32_schema),
+                vec![
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int32Array::from(
+                        rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("int32 batch should be valid")
+        };
+
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("v".to_string()),
+            }],
+        };
+        // PK = column index 2 (`pk`). Construction must succeed for Int32 AVG.
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[spec], &i32_schema, &[2], usize::MAX)?;
+
+        registry
+            .apply_insert_batches(1, &[i32_batch(&[("a", 10, 1), ("a", 20, 2), ("b", 5, 3)])])?;
+        // UPDATE pk=2 in place (retract-old-then-apply-new): v 20 -> 7, so
+        // group a averages (10 + 7) / 2 = 8.5.
+        registry.apply_insert_batches(2, &[i32_batch(&[("a", 7, 2)])])?;
+        // DELETE pk=3 via a PK-projected batch (PK = column 2): retracts group b.
+        registry.apply_pk_deletes(3, &i32_batch(&[("", 0, 3)]).project(&[2])?)?;
+
+        // Serve via a real AggregateExec. DataFusion's AVG over an integer column
+        // outputs `Float64`, so the maintained output field is `Float64` too.
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![i32_batch(&[])]],
+            Arc::clone(&i32_schema),
+            None,
+        )?;
+        let avg_arg = cast(
+            col("v", i32_schema.as_ref())?,
+            i32_schema.as_ref(),
+            DataType::Int64,
+        )?;
+        let avg_v = AggregateExprBuilder::new(avg_udaf(), vec![avg_arg])
+            .schema(Arc::clone(&i32_schema))
+            .alias("avg(v)")
+            .build()
+            .map(Arc::new)?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(
+                col("name", i32_schema.as_ref())?,
+                "name".to_string(),
+            )]),
+            vec![avg_v],
+            vec![None],
+            input,
+            Arc::clone(&i32_schema),
+        )?;
+        let result = registry
+            .batch_for_aggregate(&aggregate, 3)?
+            .expect("registry should be fresh");
+        let names = as_string_array(result.column(0))?;
+        let avgs = as_float64_array(result.column(1))?;
+        let mut by_name = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            if !avgs.is_null(row) {
+                by_name.insert(names.value(row).to_string(), avgs.value(row));
+            }
+        }
+        let avg_a = by_name.get("a").copied().expect("group a present");
+        assert!(
+            (avg_a - 8.5).abs() < 1e-9,
+            "group a = avg(10, updated 7) = 8.5, got {avg_a}"
+        );
+        assert_eq!(by_name.get("b"), None, "group b fully retracted by delete");
+        Ok(())
+    }
+
+    /// The `i128` running sum has the headroom `SumInt64`'s `i64` lacks: two
+    /// `Int64` rows at `i64::MAX` sum to ~1.8e19 (past `i64::MAX`), which would
+    /// overflow a `SUM`, but `AVG` accumulates in `i128` and returns their
+    /// average (`i64::MAX`) as `Float64` without erroring.
+    #[test]
+    fn avg_over_int64_near_max_does_not_overflow() -> DataFusionResult<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+            Field::new("pk", DataType::Int64, true),
+        ]));
+        let batch = |rows: &[(&str, i64, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("int64 batch should be valid")
+        };
+
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("v".to_string()),
+            }],
+        };
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[spec], &schema, &[2], usize::MAX)?;
+        // Sum = 2 * i64::MAX overflows i64 but fits comfortably in i128.
+        registry.apply_insert_batches(1, &[batch(&[("a", i64::MAX, 1), ("a", i64::MAX, 2)])])?;
+
+        let input =
+            MemorySourceConfig::try_new_exec(&[vec![batch(&[])]], Arc::clone(&schema), None)?;
+        let avg_v = AggregateExprBuilder::new(avg_udaf(), vec![col("v", schema.as_ref())?])
+            .schema(Arc::clone(&schema))
+            .alias("avg(v)")
+            .build()
+            .map(Arc::new)?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]),
+            vec![avg_v],
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+        let result = registry
+            .batch_for_aggregate(&aggregate, 1)?
+            .expect("registry should be fresh");
+        let avgs = as_float64_array(result.column(1))?;
+        let avg_a = avgs.value(0);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test-only reference value; avg of two i64::MAX is i64::MAX"
+        )]
+        let expected = i64::MAX as f64;
+        assert!(
+            (avg_a - expected).abs() / expected < 1e-15,
+            "avg of two i64::MAX values is i64::MAX, got {avg_a}"
+        );
+        Ok(())
+    }
+
+    /// Retracting a PK that was never inserted is an idempotent no-op (matches
+    /// tombstone semantics — an absent row contributed nothing).
+    #[test]
+    fn retracting_unseen_pk_is_a_noop() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("b", 2, 20)])])?;
+        // pk=999 was never inserted; the retraction must leave every group unchanged.
+        registry.apply_pk_deletes(2, &group_batch(&[("", 999, 0)]).project(&[2])?)?;
+        let sums = sum_i_by_name(&registry)?;
+        assert_eq!(sums.get("a"), Some(&10));
+        assert_eq!(sums.get("b"), Some(&20));
+        Ok(())
+    }
+}

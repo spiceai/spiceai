@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/source_unavailable/mod.rs
+expression: "arrow::util::pretty::pretty_format_batches(&batches)?"
+---
++----+---+
+| s  | n |
++----+---+
+| 15 | 3 |
++----+---+

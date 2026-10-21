@@ -17,12 +17,12 @@ limitations under the License.
 use std::sync::LazyLock;
 
 use opentelemetry::{
-    KeyValue, global,
+    KeyValue, Value, global,
     metrics::{Counter, Histogram, Meter},
 };
 
-use crate::timing::TimeMeasurement;
 use runtime_request_context::{AsyncMarker, RequestContext};
+use telemetry::timing::TimeMeasurement;
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("flight"));
 
@@ -33,26 +33,78 @@ pub(crate) static FLIGHT_REQUEST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLoc
     METER
         .f64_histogram("flight_request_duration_ms")
         .with_unit("ms")
+        // The OpenTelemetry default boundaries start at 5ms, so a point-lookup `do_get` would
+        // report a quantile drawn from that first bucket rather than from its own latency.
+        .with_boundaries(telemetry::DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
 
-pub async fn track_flight_request(method: &str, command: Option<&str>) -> TimeMeasurement {
+/// Track a Flight RPC. `command` is a static label for fixed RPC variants.
+///
+/// Record once per RPC, in the handler that knows the command — a second timer
+/// over the same RPC doubles the counter and the histogram. The returned
+/// [`TimeMeasurement`] records on drop: bind it for the span you want measured,
+/// or move it into a [`telemetry::timing::TimedStream`] to span a streamed
+/// response.
+///
+/// Await the call. `let _start = track_flight_request(..)` binds the future, not
+/// the measurement, and a future dropped unpolled records nothing at all —
+/// naming the binding suppresses `unused_must_use`, and
+/// `clippy::let_underscore_future` only fires on the `let _` form.
+pub async fn track_flight_request(
+    method: &'static str,
+    command: Option<&'static str>,
+) -> TimeMeasurement {
+    track_flight_request_value(method, command.map(Value::from)).await
+}
+
+/// Track a Flight RPC with an owned/shared command label (e.g. dynamic table path).
+pub(crate) async fn track_flight_request_value(
+    method: &'static str,
+    command: Option<Value>,
+) -> TimeMeasurement {
     let request_context = RequestContext::current(AsyncMarker::new().await);
 
-    let mut dimensions = vec![KeyValue::new("method", method.to_string())];
+    let mut dimensions = vec![KeyValue::new("method", method)];
 
-    if let Some(method) = command {
-        dimensions.push(KeyValue::new("command", method.to_string()));
+    if let Some(command) = command {
+        dimensions.push(KeyValue::new("command", command));
     }
 
-    dimensions.extend(request_context.to_dimensions().into_iter());
+    dimensions.extend(request_context.to_dimensions());
 
     FLIGHT_REQUESTS.add(1, dimensions.as_slice());
-    TimeMeasurement::new(&FLIGHT_REQUEST_DURATION_MS, dimensions.as_slice())
+    // Moved, not borrowed: `TimeMeasurement::new` takes `impl Into<Vec<KeyValue>>`,
+    // so a slice would deep-clone every label — including the owned `user_agent`
+    // string the request context contributes.
+    let mut measurement = TimeMeasurement::new(&FLIGHT_REQUEST_DURATION_MS, dimensions);
+    // A query RPC reports this very sample in its `server-timing` trailer.
+    if let Some(timing) = request_context.extension::<super::server_timing::QueryRpcTiming>() {
+        measurement.report_to(timing.sample());
+    }
+    measurement
 }
 
 pub(crate) static DO_EXCHANGE_DATA_UPDATES_SENT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("flight_do_exchange_data_updates_sent")
+        .build()
+});
+
+pub(crate) static DO_PUT_ROWS_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("flight_do_put_rows_written")
+        .with_description("Cumulative number of rows received and written via Flight DoPut.")
+        .with_unit("rows")
+        .build()
+});
+
+pub(crate) static DO_PUT_BYTES_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("flight_do_put_bytes_written")
+        .with_description(
+            "Cumulative number of bytes (Arrow in-memory size) received and written via Flight DoPut.",
+        )
+        .with_unit("By")
         .build()
 });

@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/metadata/mod.rs
+expression: formatted
+---
++---------------------------------------------------------------------------------------+
+| loc_upper                                                                             |
++---------------------------------------------------------------------------------------+
+| S3://SPICEAI-PUBLIC-DATASETS/TEST_DOCUMENTS_PARTITIONED/DAY=2022-01-01/DATA_0.PARQUET |
+| S3://SPICEAI-PUBLIC-DATASETS/TEST_DOCUMENTS_PARTITIONED/DAY=2022-03-15/DATA_0.PARQUET |
+| S3://SPICEAI-PUBLIC-DATASETS/TEST_DOCUMENTS_PARTITIONED/DAY=2022-01-01/DATA_0.PARQUET |
++---------------------------------------------------------------------------------------+

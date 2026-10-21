@@ -4,8 +4,41 @@ description: 'composite action'
 runs:
   using: 'composite'
   steps:
-    - name: Install cc
+    - name: Configure apt mirrors (Linux)
+      if: runner.os == 'Linux'
+      uses: ./.github/actions/configure-apt
+
+    - name: Install cc (Linux)
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential cmake pkg-config libssl-dev unixodbc unixodbc-dev protobuf-compiler libclang-dev
+        # Install mold linker for faster linking (20-30% faster link times)
+        sudo apt-get install -y build-essential cmake pkg-config libssl-dev unixodbc unixodbc-dev libclang-dev libnfs-dev mold lld clang zlib1g-dev
+
+    - name: Install cc (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      # The step lives in its own script so test_macos_toolchain.sh can drive it
+      # against a fake Homebrew prefix. It probes the Cellar and PATH before it
+      # touches `brew`: a formula whose keg is absent is installed, a keg that is
+      # present but unlinked or shadowed on PATH is put in front of PATH instead,
+      # so a runner whose `brew` cannot take its global lock only blocks when it
+      # genuinely has something to install (spiceai#13463, spiceai#13479).
+      run: bash "$GITHUB_ACTION_PATH/macos_toolchain.sh"
+
+    - name: Install cc (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        # Install Visual Studio Build Tools if not present (handled by setup-vs-buildtools action)
+        # Install additional dependencies via choco
+        if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+        }
+        choco install cmake pkgconfiglite llvm -y
+        echo "C:\Program Files\CMake\bin" >> $env:GITHUB_PATH
+        echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH

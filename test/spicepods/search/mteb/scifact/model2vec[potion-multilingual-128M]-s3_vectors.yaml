@@ -1,0 +1,50 @@
+version: v1
+kind: Spicepod
+name: model2vec[potion-multilingual-128M]-s3_vectors
+
+metadata:
+  benchmark_dataset: scifact_retrieval
+
+datasets:
+
+  # MTEB SciFact Retrieval, read straight from Hugging Face: https://huggingface.co/datasets/mteb/scifact
+
+  - from: https://huggingface.co/api/datasets/mteb/scifact/parquet/corpus/corpus/0.parquet
+    name: corpus
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+    vectors:
+      enabled: true
+      engine: s3_vectors
+      params:
+        s3_vectors_bucket: spice-ci-search-benchmarks-variant-001
+        s3_vectors_index: scifact
+        s3_vectors_aws_region: us-east-2
+        s3_vectors_aws_access_key_id: ${env:AWS_S3_VECTORS_KEY}
+        s3_vectors_aws_secret_access_key: ${env:AWS_S3_VECTORS_SECRET}
+    columns:
+      - name: text
+        embeddings:
+          - from: potion
+            row_id:
+              - _id
+
+  - from: https://huggingface.co/api/datasets/mteb/scifact/parquet/queries/queries/0.parquet
+    name: test_queries
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+
+  - from: https://huggingface.co/api/datasets/mteb/scifact/parquet/default/test/0.parquet
+    name: relevance_data
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+
+embeddings:
+  - from: model2vec:minishlab/potion-multilingual-128M
+    name: potion

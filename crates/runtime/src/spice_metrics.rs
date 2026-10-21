@@ -17,18 +17,19 @@ limitations under the License.
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use crate::datafusion::error::format_datafusion_error;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
-use opentelemetry_sdk::metrics::MetricError;
+use datafusion::common::TableReference;
+use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
 use crate::Runtime;
-use crate::accelerated_table::Retention;
-use crate::accelerated_table::refresh::Refresh;
+use crate::accelerated::Retention;
+use crate::accelerated::refresh::Refresh;
 use crate::component::dataset::TimeFormat;
-use crate::component::dataset::acceleration::Acceleration;
+use crate::component::dataset::acceleration::{Acceleration, Engine};
 use crate::datafusion::Error as DataFusionError;
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::dataupdate::{DataUpdate, UpdateType};
@@ -37,11 +38,18 @@ use crate::secrets::Secrets;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Error creating metrics table: {source}"))]
+    #[snafu(display("Failed to create the internal metrics table: {source}"))]
     UnableToCreateMetricsTable { source: InternalTableError },
 
-    #[snafu(display("Error registering metrics table: {source}"))]
-    UnableToRegisterToMetricsTable { source: DataFusionError },
+    #[snafu(display(
+        "Failed to register the internal metrics table: {}",
+        format_datafusion_error(source)
+    ))]
+    UnableToRegisterToMetricsTable {
+        // `datafusion::Error` alone is over clippy's `result_large_err` limit.
+        #[snafu(source(from(DataFusionError, Box::new)))]
+        source: Box<DataFusionError>,
+    },
 }
 
 /// Uses a `Weak` reference to `DataFusion` to prevent blocking its cleanup after runtime termination.
@@ -60,7 +68,7 @@ impl SpiceMetricsExporter {
 
 #[async_trait]
 impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
-    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError> {
+    async fn export(&self, metrics: RecordBatch) -> OTelSdkResult {
         let data_update = DataUpdate {
             schema: metrics.schema(),
             data: vec![metrics],
@@ -69,21 +77,21 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
 
         let Some(df) = self.datafusion.upgrade() else {
             // this should never happen as the exporter must be shutdown before the DataFusion instance is dropped
-            return Err(MetricError::Other(
-                "Failed to export metrics as the DataFusion instance has already been dropped.\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues".to_string(),
+            return Err(OTelSdkError::InternalFailure(
+                "Failed to export metrics as the DataFusion instance has already been dropped. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues".to_string(),
             ));
         };
 
         df.write_data(&get_metrics_table_reference(), data_update)
             .await
-            .map_err(|e| MetricError::Other(e.to_string()))
+            .map_err(|e| OTelSdkError::InternalFailure(e.to_string()))
     }
 
-    async fn force_flush(&self) -> Result<(), MetricError> {
+    fn force_flush(&self) -> OTelSdkResult {
         Ok(())
     }
 
-    fn shutdown(&self) -> Result<(), MetricError> {
+    fn shutdown(&self) -> OTelSdkResult {
         Ok(())
     }
 }
@@ -94,11 +102,11 @@ pub async fn register_metrics_table(
 ) -> Result<(), Error> {
     let metrics_table_reference = get_metrics_table_reference();
 
-    let retention = Retention::builder()
+    let retention = Retention::builder(metrics_table_reference.to_string())
         .time_column(Some("time_unix_nano"))
         .time_format(Some(TimeFormat::Timestamptz))
-        .time_period(Some(Duration::from_secs(1800))) // delete metrics older than 30 minutes
-        .check_interval(Some(Duration::from_secs(300))) // run retention every 5 minutes
+        .time_period(Some(Duration::from_mins(30))) // delete metrics older than 30 minutes
+        .check_interval(Some(Duration::from_mins(5))) // run retention every 5 minutes
         .enabled(true)
         .build();
 
@@ -107,7 +115,11 @@ pub async fn register_metrics_table(
         metrics_table_reference.clone(),
         otel_arrow::schema(),
         None,
-        Acceleration::default(),
+        // An internal table has no source, and Cayenne requires one.
+        Acceleration {
+            engine: Engine::Arrow,
+            ..Acceleration::default()
+        },
         Refresh::default(),
         retention,
         Arc::new(RwLock::new(Secrets::default())),
@@ -117,7 +129,7 @@ pub async fn register_metrics_table(
     .context(UnableToCreateMetricsTableSnafu)?;
 
     datafusion
-        .register_table_as_writable_and_with_schema(metrics_table_reference, table)
+        .register_table_as_writable_and_with_schema(metrics_table_reference, table.into_table())
         .context(UnableToRegisterToMetricsTableSnafu)?;
 
     Ok(())

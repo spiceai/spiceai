@@ -14,22 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::function_support::FunctionSupport;
+use crate::sql_expr::to_sql_preserving_precedence;
 use arrow::{
     array::{Array, RecordBatch, array},
+    compute::cast,
     datatypes::Schema,
 };
+use arrow_tools::map_entries;
 use async_stream::stream;
 use async_trait::async_trait;
-use datafusion_table_providers::sql::sql_provider_datafusion::expr;
 use flight_client::{
-    MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, tls::new_tls_flight_channel,
+    MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE,
+    cookie::{CookieService, CookieStore},
+    tls::new_tls_flight_channel,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use snafu::prelude::*;
-use std::{any::Any, fmt, sync::Arc, vec};
+use std::{fmt, sync::Arc, vec};
 
 use arrow_flight::{
     FlightEndpoint, IpcMessage,
+    decode::FlightRecordBatchStream,
     error::FlightError,
     flight_service_client::FlightServiceClient,
     sql::{CommandGetTables, client::FlightSqlServiceClient},
@@ -37,24 +43,37 @@ use arrow_flight::{
 use datafusion::{
     arrow::datatypes::SchemaRef,
     catalog::Session,
+    common::Statistics,
+    common::TableReference,
+    common::utils::quote_identifier,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
-    physical_expr::EquivalenceProperties,
+    physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-        SendableRecordBatchStream,
+        SendableRecordBatchStream, SortOrderPushdownResult,
         execution_plan::{Boundedness, EmissionType},
+        metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time},
         project_schema,
         stream::RecordBatchStreamAdapter,
     },
-    sql::TableReference,
 };
+use runtime_request_context::resolve_request_context;
 use tonic::codegen::Bytes;
 use tonic::transport::{Channel, channel};
 
 use crate::Read;
+
+/// Build a W3C `traceparent` header value (`00-{trace_id}-{span_id}-{flags}`)
+/// from the request context of the [`TaskContext`], if it has one. See
+/// [`resolve_request_context`] for where the context comes from.
+#[must_use]
+pub fn trace_parent_from_task_context(context: &TaskContext) -> Option<String> {
+    let request_context = resolve_request_context(context, false)?;
+    Some(request_context.trace_parent().as_ref()?.to_string())
+}
 
 pub mod federation;
 
@@ -68,7 +87,7 @@ pub enum Error {
     #[snafu(display(
         "Failed to create SQL query (flightsql). {source} An unexpected error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
-    UnableToGenerateSQL { source: expr::Error },
+    UnableToGenerateSQL { source: DataFusionError },
 
     #[snafu(display("Query execution failed (flightsql). {source}"))]
     UnableToQueryArrowFlight { source: FlightError },
@@ -101,20 +120,67 @@ pub enum Error {
         "Failed to detect table '{table_name}' schema (flightsql). Ensure the table exists and try again."
     ))]
     UnableToRetrieveSchema { table_name: String },
+
+    #[snafu(display("Invalid sort expression in sort pushdown: expected Column, got {expr}"))]
+    InvalidSortExpression { expr: String },
+
+    #[snafu(display(
+        "Failed to read query results from the Flight SQL server for table {table_name} ({source}), so the query cannot return rows. \
+        Cast the MAP column to a supported type in the query, or select it as a string with `to_json(<column>)`. \
+        See: https://spiceai.org/docs/components/data-connectors/flightsql"
+    ))]
+    MapEntriesNotNormalizable {
+        table_name: String,
+        source: map_entries::Error,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, Clone)]
+pub type FlightSqlClient = FlightSqlServiceClient<CookieService<Channel>>;
+
+#[derive(Clone)]
 pub struct FlightSQLFactory {
-    client: FlightSqlServiceClient<Channel>,
+    client: FlightSqlClient,
     endpoint: String,
+    cookie_store: Arc<CookieStore>,
+    function_support: Option<FunctionSupport>,
+    token: Option<String>,
 }
 
 impl FlightSQLFactory {
     #[must_use]
-    pub fn new(client: FlightSqlServiceClient<Channel>, endpoint: String) -> Self {
-        Self { client, endpoint }
+    pub fn new(client: FlightSqlClient, endpoint: String, cookie_store: Arc<CookieStore>) -> Self {
+        Self {
+            client,
+            endpoint,
+            cookie_store,
+            function_support: None,
+            token: None,
+        }
+    }
+
+    /// Install the federation function deny-list so Spice-only UDFs are evaluated
+    /// locally instead of pushed into the Flight SQL server (#10703).
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
+        self
+    }
+
+    #[must_use]
+    pub fn with_token(mut self, token: String) -> Self {
+        self.token = Some(token);
+        self
+    }
+}
+
+impl std::fmt::Debug for FlightSQLFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlightSQLFactory")
+            .field("endpoint", &self.endpoint)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
     }
 }
 
@@ -124,15 +190,19 @@ impl Read for FlightSQLFactory {
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let table_provider = Arc::new(
-            FlightSQLTable::create(
-                "flightsql",
-                &self.endpoint,
-                self.client.clone(),
-                table_reference,
-            )
-            .await?,
-        );
+        let mut table = FlightSQLTable::create(
+            "flightsql",
+            &self.endpoint,
+            self.client.clone(),
+            table_reference,
+            Arc::clone(&self.cookie_store),
+        )
+        .await?
+        .with_function_support(self.function_support.clone());
+        if let Some(token) = &self.token {
+            table = table.with_token(token.clone());
+        }
+        let table_provider = Arc::new(table);
 
         let table_provider = Arc::new(table_provider.create_federated_table_provider());
 
@@ -140,59 +210,114 @@ impl Read for FlightSQLFactory {
     }
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for FlightSQLTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlightSQLTable")
+            .field("name", &self.name)
+            .field("table_reference", &self.table_reference)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct FlightSQLTable {
     name: &'static str,
     join_push_down_context: String,
-    client: FlightSqlServiceClient<Channel>,
+    client: FlightSqlClient,
     table_reference: TableReference,
     schema: SchemaRef,
+    cookie_store: Arc<CookieStore>,
+    /// Optional statistics to attach to the scan this provider produces.
+    statistics: Option<Statistics>,
+    /// Federation function deny-list. Functions on the list (Spice-only UDFs such
+    /// as `json_get_str`) are evaluated locally instead of pushed into the SQL
+    /// sent to the Flight SQL server. See issue #10703.
+    function_support: Option<FunctionSupport>,
+    token: Option<String>,
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 impl FlightSQLTable {
     pub async fn create(
         name: &'static str,
         endpoint: &str,
-        client: FlightSqlServiceClient<Channel>,
+        client: FlightSqlClient,
         table_reference: impl Into<TableReference>,
+        cookie_store: Arc<CookieStore>,
     ) -> Result<Self> {
         let table_reference: TableReference = table_reference.into();
         let schema = Self::get_schema(client.clone(), table_reference.clone()).await?;
+        // A server is free to declare a MAP's `entries` field nullable, which the Arrow map
+        // layout forbids. Correcting it here keeps the schema this table reports to the planner
+        // in step with the batches `execute` hands back, which are normalized to the same shape.
+        let schema = map_entries::conforming_schema(schema);
         Ok(Self {
             name,
             client,
             table_reference,
             schema,
             join_push_down_context: format!("endpoint={endpoint}"),
+            cookie_store,
+            statistics: None,
+            function_support: None,
+            token: None,
         })
     }
 
     pub fn create_with_schema(
         name: &'static str,
         endpoint: &str,
-        client: FlightSqlServiceClient<Channel>,
+        client: FlightSqlClient,
         table_reference: impl Into<TableReference>,
         schema: SchemaRef,
+        cookie_store: Arc<CookieStore>,
     ) -> Self {
         let table_reference: TableReference = table_reference.into();
+        let schema = map_entries::conforming_schema(schema);
         Self {
             name,
             client,
             table_reference,
             schema,
             join_push_down_context: format!("endpoint={endpoint}"),
+            cookie_store,
+            statistics: None,
+            function_support: None,
+            token: None,
         }
+    }
+
+    /// Attach statistics to be reported by the scans this provider creates.
+    #[must_use]
+    pub fn with_statistics(mut self, statistics: Option<Statistics>) -> Self {
+        self.statistics = statistics;
+        self
+    }
+
+    /// Install the federation function deny-list (see [`FunctionSupport`]).
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: Option<FunctionSupport>) -> Self {
+        self.function_support = function_support;
+        self
+    }
+
+    /// Set the bearer token to propagate to per-endpoint `DoGet` clients.
+    #[must_use]
+    pub fn with_token(mut self, token: String) -> Self {
+        self.token = Some(token);
+        self
     }
 
     pub async fn from_static(
         s: &'static str,
         table_reference: impl Into<TableReference>,
     ) -> Result<Self> {
+        let cookie_store = Arc::new(CookieStore::new());
         let channel = channel::Endpoint::from_static(s)
             .connect()
             .await
             .context(UnableToConnectToServerSnafu)?;
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
 
         let flight_client = FlightServiceClient::new(channel)
             .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
@@ -203,6 +328,7 @@ impl FlightSQLTable {
             s,
             FlightSqlServiceClient::new_from_inner(flight_client),
             table_reference.into(),
+            cookie_store,
         )
         .await
     }
@@ -279,10 +405,11 @@ impl FlightSQLTable {
     }
 
     pub async fn get_schema(
-        mut client: FlightSqlServiceClient<Channel>,
+        mut client: FlightSqlClient,
         table_reference: TableReference,
     ) -> Result<SchemaRef> {
-        let flight_info = client
+        // Preferred path: the Flight SQL `GetTables` metadata RPC (best-effort).
+        if let Ok(flight_info) = client
             .get_tables(CommandGetTables {
                 catalog: table_reference.catalog().map(ToString::to_string),
                 db_schema_filter_pattern: table_reference.schema().map(ToString::to_string),
@@ -300,10 +427,32 @@ impl FlightSQLTable {
                 .collect(),
             })
             .await
-            .context(UnableToRetrieveSchemaArrowSnafu {
+        {
+            for tkt in flight_info
+                .endpoint
+                .iter()
+                .filter_map(|ep| ep.ticket.as_ref())
+            {
+                // Schema: https://github.com/apache/arrow/blob/44edc27e549d82db930421b0d4c76098941afd71/format/FlightSql.proto#L1182-L1190
+                if let Ok(stream) = client.do_get(tkt.clone()).await
+                    && let Ok(batch) = stream.try_collect::<Vec<_>>().await
+                    && let Some(schema) =
+                        Self::get_table_schema_if_present(batch, table_reference.clone())
+                {
+                    return Ok(schema);
+                }
+            }
+        }
+
+        // Fallback for Flight SQL servers that don't implement the `GetTables` metadata RPC
+        // (e.g. StarRocks' experimental Flight SQL, which returns `Unimplemented`): infer the
+        // schema from `SELECT * FROM <table> LIMIT 1`, served by the statement-execution path.
+        let flight_info = client
+            .execute(format!("SELECT * FROM {table_reference} LIMIT 1"), None)
+            .await
+            .context(UnableToRetrieveSchemaFlightSnafu {
                 table_name: table_reference.to_string(),
             })?;
-
         for tkt in flight_info
             .endpoint
             .iter()
@@ -313,19 +462,16 @@ impl FlightSQLTable {
                 client
                     .do_get(tkt.clone())
                     .await
-                    .context(UnableToRetrieveSchemaArrowSnafu {
+                    .context(UnableToRetrieveSchemaFlightSnafu {
                         table_name: table_reference.to_string(),
                     })?;
-            let batch = stream.try_collect::<Vec<_>>().await.context(
+            let batches = stream.try_collect::<Vec<_>>().await.context(
                 UnableToRetrieveSchemaFlightSnafu {
                     table_name: table_reference.to_string(),
                 },
             )?;
-
-            // Schema: https://github.com/apache/arrow/blob/44edc27e549d82db930421b0d4c76098941afd71/format/FlightSql.proto#L1182-L1190
-            if let Some(schema) = Self::get_table_schema_if_present(batch, table_reference.clone())
-            {
-                return Ok(schema);
+            if let Some(batch) = batches.first() {
+                return Ok(batch.schema());
             }
         }
 
@@ -342,23 +488,55 @@ impl FlightSQLTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(FlightSqlExec::new(
+        let exec = FlightSqlExec::new(
             projections,
             schema,
             &self.table_reference,
             self.client.clone(),
             filters,
             limit,
-        )?))
+            Arc::clone(&self.cookie_store),
+        )?;
+        let exec = exec.with_token(self.token.clone());
+        // Project the table-level statistics onto the scan's (projected) output
+        // schema so the column-statistics list lines up with the output columns.
+        //
+        // The stamped statistics describe the *whole* slice the executor reported
+        // (its row count and column bounds), so they only stay `Exact` for a scan
+        // that returns that whole slice. Both a pushed-down filter and a
+        // pushed-down limit narrow what the remote query returns:
+        //
+        // - Every pushdown-eligible filter is reported `Exact` (see
+        //   `supports_filters_pushdown`), so DataFusion drops the coordinator-side
+        //   `FilterExec`.
+        // - `LIMIT` is emitted into the remote SQL (see `FlightSqlExec::sql`), and
+        //   `supports_limit_pushdown` lets `LimitPushdown` drop the coordinator-side
+        //   `GlobalLimitExec`.
+        //
+        // Either way, leaving `num_rows`/bounds `Exact` lets the
+        // `aggregate_statistics` optimizer rule fold `COUNT(*)`/`MIN`/`MAX` to
+        // values the scan cannot produce — silently ignoring the predicate (a
+        // filtered `COUNT(*)` returning the full table count, issue #11599) or the
+        // limit (issue #12292). Marking the statistics inexact disables that fold
+        // while keeping the bounds usable for join sizing.
+        let exec = match &self.statistics {
+            Some(stats) => {
+                let stats = stats.clone().project(projections);
+                let stats = if filters.is_empty() && limit.is_none() {
+                    stats
+                } else {
+                    stats.to_inexact()
+                };
+                exec.with_statistics(stats)
+            }
+            None => exec,
+        };
+        Ok(Arc::new(exec))
     }
 }
 
 #[async_trait]
 impl TableProvider for FlightSQLTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -373,8 +551,10 @@ impl TableProvider for FlightSQLTable {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let mut filter_push_down = vec![];
         for filter in filters {
-            match expr::to_sql(filter) {
-                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
+            match to_sql_preserving_precedence(filter) {
+                Ok(_) => {
+                    filter_push_down.push(TableProviderFilterPushDown::Exact);
+                }
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
             }
         }
@@ -394,46 +574,139 @@ impl TableProvider for FlightSQLTable {
 }
 
 #[derive(Clone)]
-struct FlightSqlExec {
+pub struct FlightSqlExec {
     projected_schema: SchemaRef,
     table_reference: TableReference,
-    client: FlightSqlServiceClient<Channel>,
+    client: FlightSqlClient,
     filters: Vec<Expr>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    sort_exprs: Vec<PhysicalSortExpr>,
+    properties: Arc<PlanProperties>,
+    cookie_store: Arc<CookieStore>,
+    metrics: ExecutionPlanMetricsSet,
+    /// Optional W3C `traceparent` value (e.g. `00-{trace_id}-{span_id}-01`)
+    /// to attach as a gRPC metadata header on outgoing `execute()` and
+    /// `do_get()` calls. When `None`, `execute()` falls back to
+    /// [`trace_parent_from_task_context`].
+    trace_parent: Option<String>,
+    /// Statistics for the rows this scan produces. Defaults to unknown; the
+    /// planner that builds the scan can supply real statistics (e.g. row
+    /// counts sourced from cluster partition metadata) via
+    /// [`FlightSqlExec::with_statistics`] so downstream optimizer rules such as
+    /// hash-join build-side selection can use them.
+    statistics: Statistics,
+    token: Option<String>,
 }
 
 impl FlightSqlExec {
-    fn new(
+    pub fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
         table_reference: &TableReference,
-        client: FlightSqlServiceClient<Channel>,
+        client: FlightSqlClient,
         filters: &[Expr],
         limit: Option<usize>,
+        cookie_store: Arc<CookieStore>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema(schema, projections)?;
+        let statistics = Statistics::new_unknown(&projected_schema);
         Ok(Self {
             projected_schema: Arc::clone(&projected_schema),
             table_reference: table_reference.clone(),
             client,
             filters: filters.to_vec(),
             limit,
-            properties: PlanProperties::new(
+            sort_exprs: Vec::new(),
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
+            cookie_store,
+            metrics: ExecutionPlanMetricsSet::new(),
+            trace_parent: None,
+            statistics,
+            token: None,
         })
     }
 
-    fn sql(&self) -> Result<String> {
+    /// Attach statistics describing the rows this scan produces. The schema of
+    /// the statistics' column list is expected to match the (projected) output
+    /// schema; callers that only know the row count can use
+    /// `Statistics::new_unknown(schema).with_num_rows(...)`.
+    #[must_use]
+    pub fn with_statistics(mut self, statistics: Statistics) -> Self {
+        self.statistics = statistics;
+        self
+    }
+
+    /// Set an explicit W3C `traceparent` header value to forward on each
+    /// outgoing `FlightSQL` call. Useful when the plan-creation path has
+    /// access to an `Arc<RequestContext>` but the executor-side
+    /// `TaskContext` will not (e.g. when this `ExecutionPlan` is shipped
+    /// to a remote executor via Ballista codecs).
+    #[must_use]
+    pub fn with_trace_parent(mut self, trace_parent: Option<String>) -> Self {
+        self.trace_parent = trace_parent;
+        self
+    }
+
+    #[must_use]
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token;
+        self
+    }
+
+    /// Returns the currently configured W3C `traceparent` value, if any.
+    #[must_use]
+    pub fn trace_parent(&self) -> Option<&str> {
+        self.trace_parent.as_deref()
+    }
+
+    /// Returns a reference to the underlying `FlightSqlClient`.
+    #[must_use]
+    pub fn client(&self) -> &FlightSqlClient {
+        &self.client
+    }
+
+    /// Returns a reference to the table reference.
+    #[must_use]
+    pub fn table_reference(&self) -> &TableReference {
+        &self.table_reference
+    }
+
+    /// Returns a reference to the cookie store.
+    #[must_use]
+    pub fn cookie_store(&self) -> &Arc<CookieStore> {
+        &self.cookie_store
+    }
+
+    /// Returns a reference to the projected schema.
+    #[must_use]
+    pub fn projected_schema(&self) -> &SchemaRef {
+        &self.projected_schema
+    }
+
+    /// Returns the filter expressions.
+    #[must_use]
+    pub fn filters(&self) -> &[Expr] {
+        &self.filters
+    }
+
+    /// Returns the limit.
+    #[must_use]
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// Returns the SQL query that this exec will send to the `FlightSQL` endpoint.
+    pub fn sql(&self) -> Result<String> {
         let columns = self
             .projected_schema
             .fields()
             .iter()
-            .map(|f| format!("\"{}\"", f.name()))
+            .map(|f| quote_identifier(f.name()))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -448,15 +721,65 @@ impl FlightSqlExec {
             let filter_expr = self
                 .filters
                 .iter()
-                .map(expr::to_sql)
-                .collect::<expr::Result<Vec<_>>>()
+                .map(|f| {
+                    to_sql_preserving_precedence(f).map(|sql| {
+                        // Wrap each top-level filter in parentheses to preserve semantics when
+                        // joining with AND, and recursively parenthesize nested binary
+                        // expressions so mixed AND/OR trees inside a single filter keep the
+                        // original DataFusion meaning.
+                        format!("({sql})")
+                    })
+                })
+                .collect::<DataFusionResult<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
         };
-        Ok(format!(
-            "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
+        let order_expr = if self.sort_exprs.is_empty() {
+            String::new()
+        } else {
+            let sort_terms: Vec<String> =
+                self.sort_exprs
+                    .iter()
+                    .map(|sort| {
+                        let col = sort.expr.downcast_ref::<Column>().context(
+                            InvalidSortExpressionSnafu {
+                                expr: format!("{:?}", sort.expr),
+                            },
+                        )?;
+                        let dir = if sort.options.descending {
+                            "DESC"
+                        } else {
+                            "ASC"
+                        };
+                        let nulls = if sort.options.nulls_first {
+                            "NULLS FIRST"
+                        } else {
+                            "NULLS LAST"
+                        };
+                        Ok(format!("{} {dir} {nulls}", quote_identifier(col.name())))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            format!("ORDER BY {}", sort_terms.join(", "))
+        };
+
+        let mut sql = format!(
+            "SELECT {columns} FROM {table_reference}",
             table_reference = self.table_reference.to_quoted_string(),
-        ))
+        );
+        if !where_expr.is_empty() {
+            sql.push(' ');
+            sql.push_str(&where_expr);
+        }
+        if !order_expr.is_empty() {
+            sql.push(' ');
+            sql.push_str(&order_expr);
+        }
+        if !limit_expr.is_empty() {
+            sql.push(' ');
+            sql.push_str(&limit_expr);
+        }
+
+        Ok(sql)
     }
 }
 
@@ -479,16 +802,26 @@ impl ExecutionPlan for FlightSqlExec {
         "FlightSqlExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        datafusion::physical_plan::apply_expression_roots(
+            self.sort_exprs.iter().map(|sort_expr| &sort_expr.expr),
+            f,
+        )
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -502,24 +835,255 @@ impl ExecutionPlan for FlightSqlExec {
         Ok(self)
     }
 
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        for sort_expr in order {
+            if sort_expr.expr.downcast_ref::<Column>().is_none() {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            }
+        }
+
+        let sort_exprs = order.to_vec();
+        let mut eq_properties = EquivalenceProperties::new(Arc::clone(&self.projected_schema));
+        if let Some(ordering) = LexOrdering::new(sort_exprs.clone()) {
+            eq_properties.add_orderings([ordering]);
+        }
+
+        let new_plan = FlightSqlExec {
+            projected_schema: Arc::clone(&self.projected_schema),
+            table_reference: self.table_reference.clone(),
+            client: self.client.clone(),
+            filters: self.filters.clone(),
+            limit: self.limit,
+            sort_exprs,
+            properties: Arc::new(PlanProperties::new(
+                eq_properties,
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )),
+            cookie_store: Arc::clone(&self.cookie_store),
+            metrics: ExecutionPlanMetricsSet::new(),
+            trace_parent: self.trace_parent.clone(),
+            statistics: self.statistics.clone(),
+            token: self.token.clone(),
+        };
+
+        Ok(SortOrderPushdownResult::Exact {
+            inner: Arc::new(new_plan),
+        })
+    }
+
     fn execute(
         &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
+        partition: usize,
+        context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
+        let target_schema = self.schema();
 
-        let stream_adapter =
-            RecordBatchStreamAdapter::new(self.schema(), query_to_stream(self.client.clone(), sql));
+        let first_batch_time =
+            MetricBuilder::new(&self.metrics).subset_time("first_batch_time", partition);
+        let fetch_time = MetricBuilder::new(&self.metrics).subset_time("fetch_time", partition);
+
+        let baseline = datafusion::common::instant::Instant::now();
+
+        let mut client = self.client.clone();
+        let trace_parent = self
+            .trace_parent
+            .clone()
+            .or_else(|| trace_parent_from_task_context(&context));
+        if let Some(value) = trace_parent {
+            client.set_header("traceparent", value);
+        }
+        if let Some(token) = &self.token {
+            client.set_token(token.clone());
+        }
+
+        let inner = query_to_stream(
+            client,
+            sql,
+            Arc::clone(&self.cookie_store),
+            self.table_reference.to_quoted_string(),
+        )
+        .map(move |result| result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema)));
+
+        let timed_stream = stream! {
+            futures::pin_mut!(inner);
+            let mut stream_metrics = FlightSqlStreamMetrics::new(first_batch_time, fetch_time, baseline);
+
+            while let Some(item) = inner.next().await {
+                if item.is_ok() {
+                    stream_metrics.record_first_batch();
+                }
+                yield item;
+            }
+
+            // For empty/error-only streams, record a fallback first-batch timing at completion.
+            stream_metrics.record_first_batch_if_unset();
+            stream_metrics.record_fetch();
+        };
+
+        let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), timed_stream);
 
         Ok(Box::pin(stream_adapter))
     }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        // Single output partition (`UnknownPartitioning(1)`), so per-partition
+        // statistics for partition 0 are the whole scan's statistics.
+        match partition {
+            None | Some(0) => Ok(Arc::new(self.statistics.clone())),
+            Some(_) => Ok(Arc::new(Statistics::new_unknown(&self.projected_schema))),
+        }
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let merged_limit = match (self.limit, limit) {
+            (Some(existing), Some(new_limit)) => Some(existing.min(new_limit)),
+            (Some(existing), None) => Some(existing),
+            (None, Some(new_limit)) => Some(new_limit),
+            (None, None) => None,
+        };
+
+        // `LimitPushdown` calls this to move a `GlobalLimitExec` into the scan and
+        // then drops it, so the limited scan becomes the only thing describing the
+        // row count. `self.statistics` describes the *unlimited* slice, so it can
+        // only stay `Exact` while there is no limit — see `create_physical_plan` for
+        // the same reasoning about pushed-down filters (issues #11599, #12292).
+        let statistics = if merged_limit.is_some() {
+            self.statistics.clone().to_inexact()
+        } else {
+            self.statistics.clone()
+        };
+
+        let new_plan = FlightSqlExec {
+            projected_schema: Arc::clone(&self.projected_schema),
+            table_reference: self.table_reference.clone(),
+            client: self.client.clone(),
+            filters: self.filters.clone(),
+            limit: merged_limit,
+            sort_exprs: self.sort_exprs.clone(),
+            properties: Arc::clone(&self.properties),
+            cookie_store: Arc::clone(&self.cookie_store),
+            metrics: ExecutionPlanMetricsSet::new(),
+            trace_parent: self.trace_parent.clone(),
+            statistics,
+            token: self.token.clone(),
+        };
+
+        Some(Arc::new(new_plan))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.limit
+    }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn query_to_stream(
-    mut client: FlightSqlServiceClient<Channel>,
+struct FlightSqlStreamMetrics {
+    first_batch_time: Time,
+    fetch_time: Time,
+    baseline: datafusion::common::instant::Instant,
+    first_batch_recorded: bool,
+    fetch_recorded: bool,
+}
+
+impl FlightSqlStreamMetrics {
+    fn new(
+        first_batch_time: Time,
+        fetch_time: Time,
+        baseline: datafusion::common::instant::Instant,
+    ) -> Self {
+        Self {
+            first_batch_time,
+            fetch_time,
+            baseline,
+            first_batch_recorded: false,
+            fetch_recorded: false,
+        }
+    }
+
+    fn record_first_batch(&mut self) {
+        if !self.first_batch_recorded {
+            self.first_batch_time.add_elapsed(self.baseline);
+            self.first_batch_recorded = true;
+        }
+    }
+
+    fn record_first_batch_if_unset(&mut self) {
+        if !self.first_batch_recorded {
+            self.record_first_batch();
+        }
+    }
+
+    fn record_fetch(&mut self) {
+        if !self.fetch_recorded {
+            self.fetch_time.add_elapsed(self.baseline);
+            self.fetch_recorded = true;
+        }
+    }
+}
+
+impl Drop for FlightSqlStreamMetrics {
+    fn drop(&mut self) {
+        self.record_first_batch_if_unset();
+        self.record_fetch();
+    }
+}
+
+/// Coerce a [`RecordBatch`] to match a target schema by casting columns whose types
+/// differ but are compatible (e.g. `Utf8` → `Utf8View`). This handles cases where
+/// the Flight IPC layer returns data with slightly different types than the declared schema.
+fn coerce_batch_to_schema(
+    batch: &RecordBatch,
+    target_schema: &SchemaRef,
+) -> DataFusionResult<RecordBatch> {
+    if batch.num_columns() != target_schema.fields().len() {
+        return Err(DataFusionError::Execution(format!(
+            "FlightSQL batch column count mismatch: got {}, expected {}",
+            batch.num_columns(),
+            target_schema.fields().len()
+        )));
+    }
+
+    // Fast path: schemas already match.
+    if batch.schema().fields() == target_schema.fields() {
+        return Ok(batch.clone());
+    }
+
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(target_schema.fields())
+        .map(|(col, target_field)| {
+            if col.data_type() == target_field.data_type() {
+                Ok(Arc::clone(col))
+            } else {
+                cast(col, target_field.data_type())
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+            }
+        })
+        .collect::<DataFusionResult<Vec<_>>>()?;
+
+    RecordBatch::try_new(Arc::clone(target_schema), columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+pub fn query_to_stream(
+    mut client: FlightSqlClient,
     sql: String,
+    cookie_store: Arc<CookieStore>,
+    table_name: String,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
         let flight_info = client
@@ -529,37 +1093,1204 @@ fn query_to_stream(
 
         for ep in flight_info.endpoint {
             if let Some(tkt) = ep.clone().ticket {
-                match get_client_for_flight_endpoint(&client, ep).await
+                // The raw stream rather than `do_get`, which decodes internally: arrow 59 refuses
+                // a schema message that declares a map's `entries` nullable (#13495), so the
+                // message is replaced with the form that decodes before the decoder sees it, and
+                // the batches are put back as the maps the server declared.
+                match get_client_for_flight_endpoint(
+                    &client,
+                    ep,
+                    &cookie_store,
+                )
+                .await
                     .map_err(to_execution_error)?
-                    .do_get(tkt.clone()).await {
-                        Ok(mut flight_stream) => {
+                    .do_get_flight_data(tkt.clone()).await {
+                        Ok(response) => {
+                            let declared = DeclaredSchema::default();
+                            let repair = declared.clone();
+                            let (headers, flight_data, _) = response.into_parts();
+                            let flight_data = flight_data
+                                .map_ok(move |message| repair.repair(message))
+                                .map_err(FlightError::from);
+                            let mut flight_stream =
+                                FlightRecordBatchStream::new_from_flight_data(flight_data)
+                                    .with_headers(headers);
+                            let mut normalizer: Option<(SchemaRef, map_entries::MapEntriesNormalizer)> = None;
                             while let Some(batch) = flight_stream.next().await {
                                 match batch {
-                                    Ok(batch) => yield Ok(batch),
+                                    Ok(batch) => {
+                                        let schema = declared.get(batch.schema());
+                                        let resolved = match normalizer.take() {
+                                            Some((seen, resolved)) if Arc::ptr_eq(&seen, &schema) => resolved,
+                                            _ => map_entries::MapEntriesNormalizer::for_schema(&schema),
+                                        };
+                                        let outcome = resolved.normalize(batch).map_err(|source| {
+                                            to_execution_error(Error::MapEntriesNotNormalizable {
+                                                table_name: table_name.clone(),
+                                                source,
+                                            })
+                                        });
+                                        normalizer = Some((schema, resolved));
+                                        yield outcome;
+                                    }
                                     Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error }))
                                 }
                             }
                         },
-                        Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error.into()} ))
+                        Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error } ))
                 }
             }
         };
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+/// The schema a `DoGet` stream's server declared, recorded while its schema messages are
+/// replaced with the form arrow can decode (see [`map_entries::decodable_schema_message`]).
+///
+/// The decoder only ever reports the substituted form, and that is not what a
+/// [`map_entries::MapEntriesNormalizer`] must be built from to put the batches back as the maps
+/// they describe.
+#[derive(Clone, Default)]
+struct DeclaredSchema(Arc<parking_lot::Mutex<Option<SchemaRef>>>);
+
+impl DeclaredSchema {
+    /// Returns `message` with its schema message, if it is one that needs it, replaced by the
+    /// decodable form, recording what it declared. Any other message passes through untouched.
+    fn repair(&self, mut message: arrow_flight::FlightData) -> arrow_flight::FlightData {
+        if let Some((declared, header)) =
+            map_entries::decodable_schema_message(&message.data_header)
+        {
+            *self.0.lock() = Some(declared);
+            message.data_header = header.into();
+        }
+        message
+    }
+
+    /// What the server declared, or `decoded` when no schema message needed replacing.
+    fn get(&self, decoded: SchemaRef) -> SchemaRef {
+        self.0.lock().as_ref().map_or(decoded, Arc::clone)
+    }
+}
+
 fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
-    DataFusionError::Execution(format!("{}", e.into()).to_string())
+    DataFusionError::Execution(format!("{}", e.into()))
 }
 
 pub async fn get_client_for_flight_endpoint(
-    client: &FlightSqlServiceClient<Channel>,
+    client: &FlightSqlClient,
     ep: FlightEndpoint,
-) -> Result<FlightSqlServiceClient<Channel>, Box<dyn std::error::Error>> {
+    cookie_store: &Arc<CookieStore>,
+) -> Result<FlightSqlClient, Box<dyn std::error::Error>> {
     if ep.location.is_empty() {
         Ok(client.clone())
     } else {
-        let channel = new_tls_flight_channel(&ep.location[0].uri).await?;
-        Ok(FlightSqlServiceClient::new(channel))
+        // Some Flight SQL servers (e.g. StarRocks) advertise an internal/cluster-only address
+        // in the endpoint location that's unreachable from external clients. Per the Flight SQL
+        // spec, data served at the same address as the FlightInfo may carry an empty location;
+        // StarRocks instead returns its internal FE address. If we can't reach the advertised
+        // location, fall back to the original connection that served the FlightInfo.
+        match new_tls_flight_channel(&ep.location[0].uri, None).await {
+            Ok(channel) => {
+                let channel = CookieService::new(channel, Arc::clone(cookie_store));
+                let mut new_client = FlightSqlServiceClient::new(channel);
+                // Propagate auth token to avoid "invalid authentication credentials" on DoGet.
+                // Per-endpoint clients don't inherit the handshake session of the original client.
+                if let Some(t) = client.token().cloned() {
+                    new_client.set_token(t);
+                }
+                Ok(new_client)
+            }
+            Err(_) => Ok(client.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FlightSqlClient, query_to_stream};
+    use crate::flightsql::FlightSqlExec;
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
+    use arrow_flight::{
+        Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint,
+        FlightInfo, Location, PollInfo, PutResult, SchemaResult, Ticket,
+    };
+    use bytes::Bytes;
+    use datafusion::{
+        common::TableReference, execution::TaskContext, physical_expr::PhysicalSortExpr,
+        physical_plan::ExecutionPlan,
+    };
+    use flight_client::cookie::{CookieService, CookieStore};
+    use futures::{StreamExt, TryStreamExt};
+    use std::net::SocketAddr;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
+    use tokio_stream::Empty as EmptyStream;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Channel;
+    use tonic::{Request, Response, Status, async_trait};
+
+    const COOKIE_VALUE: &str = "AWSALB=abc123";
+
+    /// Builds a `MapArray` the way the Flight IPC reader does — straight from `ArrayData`, so
+    /// neither of `MapArray::try_new`'s `entries` checks runs and a server's non-conforming
+    /// declaration survives the decode.
+    fn map_column(entries_nullable: bool) -> (DataType, arrow::array::ArrayRef) {
+        use arrow::array::{Array, ArrayData, MapArray, StringArray, StructArray};
+        use arrow::buffer::Buffer;
+
+        let entry_fields: arrow::datatypes::Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                entries_nullable,
+            )),
+            false,
+        );
+
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["k0"])) as arrow::array::ArrayRef,
+                Arc::new(StringArray::from(vec![Some("v0")])) as arrow::array::ArrayRef,
+            ],
+            None,
+        )
+        .expect("entries struct");
+
+        let builder = ArrayData::builder(data_type.clone())
+            .len(1)
+            .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
+
+        (data_type, Arc::new(MapArray::from(data)))
+    }
+
+    fn map_batch(entries_nullable: bool) -> arrow::array::RecordBatch {
+        let (data_type, column) = map_column(entries_nullable);
+        arrow::array::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![column],
+        )
+        .expect("map batch")
+    }
+
+    /// Regression test for #13495: a server declaring a `MAP`'s `entries` nullable hands us a
+    /// column no kernel can rebuild. The table reports the corrected declaration, so the batch
+    /// this connector coerces against it is passed straight through — the same arrays, not a
+    /// per-batch cast of every column.
+    #[test]
+    fn a_normalized_map_batch_needs_no_coercion_against_the_conformed_table_schema() {
+        let wire_batch = map_batch(true);
+        let table_schema = arrow_tools::map_entries::conforming_schema(wire_batch.schema());
+
+        let normalized = arrow_tools::map_entries::StreamNormalizer::new()
+            .normalize(wire_batch)
+            .expect("a nullable entries declaration is relabelled, not refused");
+
+        let coerced = super::coerce_batch_to_schema(&normalized, &table_schema)
+            .expect("the normalized batch already matches the conformed table schema");
+        assert_eq!(coerced.schema(), table_schema);
+        assert!(
+            Arc::ptr_eq(coerced.column(0), normalized.column(0)),
+            "a batch that already matches must be handed on as-is, not cast column by column"
+        );
+    }
+
+    /// The declaration this table reports to the planner is the corrected one, so it describes
+    /// the batches `execute` hands back rather than the shape the server named.
+    #[tokio::test]
+    async fn a_servers_nullable_map_entries_declaration_is_corrected_on_the_table_it_builds() {
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        use datafusion::catalog::TableProvider;
+
+        let (declared_type, _) = map_column(true);
+        let (conforming_type, _) = map_column(false);
+        let declared: SchemaRef = Arc::new(Schema::new(vec![Field::new("m", declared_type, true)]));
+
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let client =
+            FlightSqlServiceClient::new(CookieService::new(channel, Arc::clone(&cookie_store)));
+
+        let table = super::FlightSQLTable::create_with_schema(
+            "flightsql",
+            "http://127.0.0.1:1",
+            client,
+            TableReference::bare("t"),
+            declared,
+            cookie_store,
+        );
+
+        assert_eq!(
+            TableProvider::schema(&table).field(0).data_type(),
+            &conforming_type
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum DoGetMode {
+        Empty,
+        Error,
+        /// Serves one batch holding a `MAP` column whose `entries` field the server declares
+        /// nullable — the shape the Arrow map layout forbids and the IPC reader lets through.
+        NullableMapEntries,
+        /// Serves a `MAP` column declaring its `entries` nullable between two dictionary columns,
+        /// with a dictionary nested in the map, numbered the way a server other than `arrow-rs`
+        /// may number them (see [`crate::flight::dictionary_id_fixture`]).
+        NullableMapEntriesWithReorderedDictionaryIds,
+    }
+
+    struct TestServer {
+        addr: SocketAddr,
+        shutdown: Option<oneshot::Sender<()>>,
+        handle: JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    impl TestServer {
+        async fn start(cookie_seen: Arc<AtomicBool>, do_get_mode: DoGetMode) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener should bind");
+            let addr = listener.local_addr().expect("listener should have addr");
+            let location = format!("http://{addr}");
+            let service = CookieFlightSqlService::new(cookie_seen, location, do_get_mode);
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let handle = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(FlightServiceServer::new(service))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+            Self {
+                addr,
+                shutdown: Some(shutdown_tx),
+                handle,
+            }
+        }
+
+        async fn shutdown(mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            self.handle
+                .await
+                .expect("server task should finish")
+                .expect("server should exit cleanly");
+        }
+    }
+
+    #[derive(Clone)]
+    struct CookieFlightSqlService {
+        cookie_required: Arc<AtomicBool>,
+        cookie_seen: Arc<AtomicBool>,
+        location: String,
+        do_get_mode: DoGetMode,
+    }
+
+    impl CookieFlightSqlService {
+        fn new(cookie_seen: Arc<AtomicBool>, location: String, do_get_mode: DoGetMode) -> Self {
+            Self {
+                cookie_required: Arc::new(AtomicBool::new(false)),
+                cookie_seen,
+                location,
+                do_get_mode,
+            }
+        }
+    }
+
+    type EmptyResponseStream<T> = EmptyStream<Result<T, Status>>;
+
+    #[async_trait]
+    impl FlightService for CookieFlightSqlService {
+        type HandshakeStream = EmptyResponseStream<arrow_flight::HandshakeResponse>;
+        type ListFlightsStream = EmptyResponseStream<FlightInfo>;
+        type DoGetStream =
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<FlightData, Status>> + Send>>;
+        type DoPutStream = EmptyResponseStream<PutResult>;
+        type DoExchangeStream = EmptyResponseStream<FlightData>;
+        type DoActionStream = EmptyResponseStream<arrow_flight::Result>;
+        type ListActionsStream = EmptyResponseStream<ActionType>;
+
+        async fn handshake(
+            &self,
+            _request: Request<tonic::Streaming<arrow_flight::HandshakeRequest>>,
+        ) -> Result<Response<Self::HandshakeStream>, Status> {
+            Err(Status::unimplemented("handshake"))
+        }
+
+        async fn list_flights(
+            &self,
+            _request: Request<Criteria>,
+        ) -> Result<Response<Self::ListFlightsStream>, Status> {
+            Err(Status::unimplemented("list_flights"))
+        }
+
+        async fn get_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<FlightInfo>, Status> {
+            self.cookie_required.store(true, Ordering::SeqCst);
+            let endpoint = FlightEndpoint {
+                ticket: Some(Ticket {
+                    ticket: Bytes::from_static(b"ticket"),
+                }),
+                location: vec![Location {
+                    uri: self.location.clone(),
+                }],
+                expiration_time: None,
+                app_metadata: Bytes::new(),
+            };
+
+            let mut response = Response::new(FlightInfo {
+                schema: Bytes::new(),
+                flight_descriptor: None,
+                endpoint: vec![endpoint],
+                total_records: -1,
+                total_bytes: -1,
+                ordered: false,
+                app_metadata: Bytes::new(),
+            });
+            response.metadata_mut().insert(
+                "set-cookie",
+                format!("{COOKIE_VALUE}; Path=/")
+                    .parse()
+                    .expect("cookie header should be valid"),
+            );
+            Ok(response)
+        }
+
+        async fn poll_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<PollInfo>, Status> {
+            Err(Status::unimplemented("poll_flight_info"))
+        }
+
+        async fn get_schema(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<SchemaResult>, Status> {
+            Err(Status::unimplemented("get_schema"))
+        }
+
+        async fn do_get(
+            &self,
+            request: Request<Ticket>,
+        ) -> Result<Response<Self::DoGetStream>, Status> {
+            if self.cookie_required.load(Ordering::SeqCst) {
+                let cookie_header = request
+                    .metadata()
+                    .get("cookie")
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| Status::unauthenticated("cookie missing"))?;
+                if !cookie_header.contains(COOKIE_VALUE) {
+                    return Err(Status::unauthenticated("cookie missing"));
+                }
+            }
+            self.cookie_seen.store(true, Ordering::SeqCst);
+            match self.do_get_mode {
+                DoGetMode::Empty => Ok(Response::new(Box::pin(tokio_stream::empty()))),
+                DoGetMode::Error => Err(Status::internal("do_get failed")),
+                DoGetMode::NullableMapEntries => {
+                    let batch = map_batch(true);
+                    let data = arrow_flight::utils::batches_to_flight_data(
+                        batch.schema().as_ref(),
+                        vec![batch],
+                    )
+                    .map_err(|e| Status::internal(format!("encoding the map batch: {e}")))?;
+                    Ok(Response::new(Box::pin(futures::stream::iter(
+                        data.into_iter().map(Ok),
+                    ))))
+                }
+                DoGetMode::NullableMapEntriesWithReorderedDictionaryIds => {
+                    let data = crate::flight::dictionary_id_fixture::reordered_ids_flight_data();
+                    Ok(Response::new(Box::pin(futures::stream::iter(
+                        data.into_iter().map(Ok),
+                    ))))
+                }
+            }
+        }
+
+        async fn do_put(
+            &self,
+            _request: Request<tonic::Streaming<FlightData>>,
+        ) -> Result<Response<Self::DoPutStream>, Status> {
+            Err(Status::unimplemented("do_put"))
+        }
+
+        async fn do_exchange(
+            &self,
+            _request: Request<tonic::Streaming<FlightData>>,
+        ) -> Result<Response<Self::DoExchangeStream>, Status> {
+            Err(Status::unimplemented("do_exchange"))
+        }
+
+        async fn do_action(
+            &self,
+            _request: Request<Action>,
+        ) -> Result<Response<Self::DoActionStream>, Status> {
+            Err(Status::unimplemented("do_action"))
+        }
+
+        async fn list_actions(
+            &self,
+            _request: Request<Empty>,
+        ) -> Result<Response<Self::ListActionsStream>, Status> {
+            Err(Status::unimplemented("list_actions"))
+        }
+    }
+
+    #[tokio::test]
+    async fn query_to_stream_sends_cookie_to_endpoint_client() {
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(Arc::clone(&cookie_seen), DoGetMode::Empty).await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let batches = query_to_stream(
+            client,
+            "SELECT 1".to_string(),
+            Arc::clone(&cookie_store),
+            "\"t\"".to_string(),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("query should succeed");
+        assert!(batches.is_empty());
+        assert!(cookie_seen.load(Ordering::SeqCst));
+
+        server.shutdown().await;
+    }
+
+    fn has_metric(metrics: &datafusion::physical_plan::metrics::MetricsSet, name: &str) -> bool {
+        metrics.sum_by_name(name).is_some()
+    }
+
+    /// A `FlightSqlClient` connected lazily to a non-routable address: enough to
+    /// build a `FlightSQLTable`/scan plan without ever attempting a connection.
+    fn lazy_client() -> FlightSqlClient {
+        use arrow_flight::flight_service_client::FlightServiceClient;
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        use tonic::transport::Endpoint;
+
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let cookie_channel = CookieService::new(channel, Arc::new(CookieStore::new()));
+        FlightSqlServiceClient::new_from_inner(FlightServiceClient::new(cookie_channel))
+    }
+
+    /// Regression test for #11599: a cluster leaf scan carries the executor's
+    /// *unfiltered* row-count/bounds as stamped statistics. Because pushed-down
+    /// filters are reported `Exact` (dropping the `FilterExec`), leaving those
+    /// statistics `Exact` lets `aggregate_statistics` fold a filtered `COUNT(*)`
+    /// to the unfiltered total. The scan must therefore mark its statistics
+    /// inexact whenever a filter is pushed to it, while leaving them exact for an
+    /// unfiltered scan.
+    #[tokio::test]
+    async fn scan_marks_stamped_statistics_inexact_when_filter_pushed() {
+        use datafusion::catalog::TableProvider;
+        use datafusion::common::stats::Precision;
+        use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
+        use datafusion::prelude::{SessionContext, col, lit};
+
+        let table = stamped_table();
+        let session = SessionContext::new().state();
+
+        // No filter → stamped statistics stay exact (folding a bare COUNT(*) is correct).
+        let plan = table
+            .scan(&session, None, &[], None)
+            .await
+            .expect("unfiltered scan should build");
+        let unfiltered = StatisticsContext::new()
+            .compute(&*plan, &StatisticsArgs::new())
+            .expect("statistics should be available");
+        assert_eq!(
+            unfiltered.num_rows,
+            Precision::Exact(150_000),
+            "unfiltered scan must keep exact num_rows"
+        );
+
+        // With a pushed-down filter → statistics must be inexact so the
+        // aggregate-statistics rule cannot fold the (now filtered) COUNT(*).
+        let filter = col("v").eq(lit(0_i64));
+        let plan = table
+            .scan(&session, None, std::slice::from_ref(&filter), None)
+            .await
+            .expect("filtered scan should build");
+        let filtered = StatisticsContext::new()
+            .compute(&*plan, &StatisticsArgs::new())
+            .expect("statistics should be available");
+        assert_eq!(
+            filtered.num_rows,
+            Precision::Inexact(150_000),
+            "filtered scan must degrade num_rows to inexact (issue #11599)"
+        );
+        assert!(
+            matches!(
+                filtered.column_statistics[0].max_value,
+                Precision::Inexact(_)
+            ),
+            "filtered scan must degrade column bounds to inexact so MIN/MAX are not folded"
+        );
+    }
+
+    /// Regression test for #12292, the limit twin of #11599: `LIMIT` is emitted
+    /// into the remote SQL, so a scan built with one cannot produce the stamped
+    /// slice's row count or column bounds and must not report them `Exact`.
+    #[tokio::test]
+    async fn scan_marks_stamped_statistics_inexact_when_limit_pushed() {
+        use datafusion::catalog::TableProvider;
+        use datafusion::common::stats::Precision;
+        use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
+        use datafusion::prelude::SessionContext;
+
+        let table = stamped_table();
+        let session = SessionContext::new().state();
+
+        let plan = table
+            .scan(&session, None, &[], Some(10))
+            .await
+            .expect("limited scan should build");
+        let limited = StatisticsContext::new()
+            .compute(&*plan, &StatisticsArgs::new())
+            .expect("statistics should be available");
+        assert_eq!(
+            limited.num_rows,
+            Precision::Inexact(150_000),
+            "a scan whose SQL carries LIMIT 10 must not claim an exact 150000-row count"
+        );
+        assert!(
+            matches!(
+                limited.column_statistics[0].max_value,
+                Precision::Inexact(_)
+            ),
+            "the limited scan's rows are a subset, so its bounds must be inexact too"
+        );
+    }
+
+    /// Regression test for #12292: `LimitPushdown` introduces the limit through
+    /// `with_fetch` and then drops the `GlobalLimitExec`, so the statistics the
+    /// new plan carries are the only ones left describing the row count.
+    #[tokio::test]
+    async fn with_fetch_marks_stamped_statistics_inexact() {
+        use datafusion::common::stats::Precision;
+        use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
+
+        let exec = build_exec(lazy_client(), Arc::new(CookieStore::new()))
+            .with_statistics(stamped_statistics());
+
+        // No limit anywhere: the scan returns the whole stamped slice.
+        assert_eq!(
+            StatisticsContext::new()
+                .compute(&exec, &StatisticsArgs::new())
+                .expect("statistics should be available")
+                .num_rows,
+            Precision::Exact(150_000),
+            "an unlimited scan must keep exact num_rows"
+        );
+
+        let limited = exec
+            .with_fetch(Some(10))
+            .expect("with_fetch should produce a plan");
+        let stats = StatisticsContext::new()
+            .compute(&*limited, &StatisticsArgs::new())
+            .expect("statistics should be available");
+        assert_eq!(
+            stats.num_rows,
+            Precision::Inexact(150_000),
+            "a limit pushed in through with_fetch must degrade num_rows to inexact"
+        );
+        assert!(
+            matches!(stats.column_statistics[0].max_value, Precision::Inexact(_)),
+            "a limit pushed in through with_fetch must degrade column bounds too"
+        );
+
+        // `with_fetch(None)` on an unlimited scan leaves the limit unset, so the
+        // statistics stay exact.
+        let unchanged = exec
+            .with_fetch(None)
+            .expect("with_fetch should produce a plan");
+        assert_eq!(
+            StatisticsContext::new()
+                .compute(&*unchanged, &StatisticsArgs::new())
+                .expect("statistics should be available")
+                .num_rows,
+            Precision::Exact(150_000),
+            "with_fetch(None) on an unlimited scan must not degrade statistics"
+        );
+    }
+
+    /// Schema the stamped-statistics fixtures describe.
+    fn stamped_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]))
+    }
+
+    /// A cluster leaf table carrying the statistics one executor reported for its
+    /// whole slice — the shape `get_partitions_from_store` stamps onto each leaf.
+    fn stamped_table() -> super::FlightSQLTable {
+        super::FlightSQLTable::create_with_schema(
+            "flightsql",
+            "executor-1",
+            lazy_client(),
+            TableReference::bare("customer"),
+            stamped_schema(),
+            Arc::new(CookieStore::new()),
+        )
+        .with_statistics(Some(stamped_statistics()))
+    }
+
+    /// Statistics as an executor reports them for its whole table slice: an exact
+    /// row count and exact column bounds over every row it holds.
+    fn stamped_statistics() -> datafusion::common::Statistics {
+        use datafusion::common::stats::Precision;
+        use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
+
+        Statistics {
+            num_rows: Precision::Exact(150_000),
+            total_byte_size: Precision::Exact(1_200_000),
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                max_value: Precision::Exact(ScalarValue::Int64(Some(149_999))),
+                min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Exact(1_200_000),
+            }],
+        }
+    }
+
+    fn build_exec(client: FlightSqlClient, cookie_store: Arc<CookieStore>) -> FlightSqlExec {
+        let schema = stamped_schema();
+        FlightSqlExec::new(
+            None,
+            &schema,
+            &TableReference::bare("metrics_table"),
+            client,
+            &[],
+            None,
+            cookie_store,
+        )
+        .expect("exec should build")
+    }
+
+    fn build_exec_multi_col(
+        client: FlightSqlClient,
+        cookie_store: Arc<CookieStore>,
+    ) -> FlightSqlExec {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        FlightSqlExec::new(
+            None,
+            &schema,
+            &TableReference::bare("test_table"),
+            client,
+            &[],
+            None,
+            cookie_store,
+        )
+        .expect("exec should build")
+    }
+
+    #[tokio::test]
+    async fn flight_sql_exec_metrics_recorded_for_empty_stream() {
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(Arc::clone(&cookie_seen), DoGetMode::Empty).await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let exec = build_exec(client, Arc::clone(&cookie_store));
+        let stream = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute should succeed");
+        let output = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should succeed");
+        assert!(output.is_empty());
+
+        let metrics = exec.metrics().expect("metrics should exist");
+        assert!(has_metric(&metrics, "first_batch_time"));
+        assert!(has_metric(&metrics, "fetch_time"));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn flight_sql_exec_metrics_handle_error_item_and_early_drop() {
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(Arc::clone(&cookie_seen), DoGetMode::Error).await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let exec = build_exec(client, Arc::clone(&cookie_store));
+        let mut stream = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute should succeed");
+
+        let first = stream.next().await;
+        assert!(first.is_some());
+        first
+            .expect("item should exist")
+            .expect_err("item should be an error");
+
+        drop(stream);
+
+        let metrics = exec.metrics().expect("metrics should exist");
+        assert!(has_metric(&metrics, "first_batch_time"));
+        assert!(has_metric(&metrics, "fetch_time"));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn try_pushdown_sort_returns_unsupported_for_non_column_expr() {
+        use arrow::compute::SortOptions;
+        use datafusion::common::ScalarValue;
+        use datafusion::physical_expr::expressions::Literal;
+        use datafusion::physical_plan::SortOrderPushdownResult;
+
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(Arc::clone(&cookie_seen), DoGetMode::Empty).await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let exec = build_exec(client, Arc::clone(&cookie_store));
+        let sort_expr = PhysicalSortExpr {
+            expr: Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
+            options: SortOptions::default(),
+        };
+        let result = exec
+            .try_pushdown_sort(&[sort_expr])
+            .expect("try_pushdown_sort should not error");
+        assert!(
+            matches!(result, SortOrderPushdownResult::Unsupported),
+            "expected Unsupported for non-column sort expression"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn try_pushdown_sort_returns_exact_for_column_expr() {
+        use arrow::compute::SortOptions;
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::SortOrderPushdownResult;
+
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(Arc::clone(&cookie_seen), DoGetMode::Empty).await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let exec = build_exec_multi_col(client, Arc::clone(&cookie_store));
+        let sort_expr = PhysicalSortExpr {
+            expr: Arc::new(Column::new("a", 0)),
+            options: SortOptions::default(),
+        };
+        let result = exec
+            .try_pushdown_sort(&[sort_expr])
+            .expect("try_pushdown_sort should not error");
+        assert!(
+            matches!(result, SortOrderPushdownResult::Exact { .. }),
+            "expected Exact for column sort expression"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sql_includes_order_by_after_sort_pushdown() {
+        use arrow::compute::SortOptions;
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::SortOrderPushdownResult;
+
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(Arc::clone(&cookie_seen), DoGetMode::Empty).await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let exec = build_exec_multi_col(client, Arc::clone(&cookie_store));
+        let sort_exprs = vec![
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("a", 0)),
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("b", 1)),
+                options: SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                },
+            },
+        ];
+        let result = exec
+            .try_pushdown_sort(&sort_exprs)
+            .expect("try_pushdown_sort should not error");
+        let SortOrderPushdownResult::Exact { inner } = result else {
+            panic!("expected Exact result from try_pushdown_sort");
+        };
+        let pushed_exec = inner
+            .downcast_ref::<FlightSqlExec>()
+            .expect("inner should be FlightSqlExec");
+        let sql = pushed_exec.sql().expect("sql should succeed");
+        assert!(
+            sql.contains("ORDER BY a ASC NULLS FIRST, b DESC NULLS LAST"),
+            "expected ORDER BY clause in SQL, got: {sql}"
+        );
+
+        server.shutdown().await;
+    }
+
+    /// Regression test for #13495 over the whole connector read path: a Flight SQL server that
+    /// declares a `MAP`'s `entries` field nullable — which the Arrow map layout forbids — yields a
+    /// column that no kernel can rebuild. `query_to_stream` corrects the declaration as each batch
+    /// is decoded, so the column that reaches the plan is one a kernel can touch.
+    ///
+    /// It runs through `FlightSqlServiceClient::do_get_flight_data`, a method the
+    /// `spiceai/arrow-rs` fork adds: the stock `do_get` decodes internally, leaving no place to
+    /// replace the schema message before arrow refuses it.
+    #[tokio::test]
+    async fn query_to_stream_corrects_a_servers_nullable_map_entries_declaration() {
+        use arrow::array::MapArray;
+
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server =
+            TestServer::start(Arc::clone(&cookie_seen), DoGetMode::NullableMapEntries).await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let batches = query_to_stream(
+            client,
+            "SELECT m FROM t".to_string(),
+            cookie_store,
+            "\"t\"".to_string(),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("a nullable entries declaration is relabelled, not refused");
+
+        let [batch] = batches.as_slice() else {
+            panic!("the server serves exactly one batch, got {}", batches.len());
+        };
+        match batch.schema().field(0).data_type() {
+            DataType::Map(entries, _) => assert!(
+                !entries.is_nullable(),
+                "the decoded batch still carries the server's non-conforming declaration"
+            ),
+            other => panic!("expected a Map column, got {other:?}"),
+        }
+
+        // The property the declaration controls: every kernel that touches a map column rebuilds
+        // it through this constructor, and a nullable `entries` field is refused there outright.
+        let map = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("a Map column");
+        let (field, offsets, entries, nulls, ordered) = map.clone().into_parts();
+        MapArray::try_new(field, offsets, entries, nulls, ordered)
+            .expect("the corrected column can be rebuilt by a kernel");
+
+        server.shutdown().await;
+    }
+
+    /// Regression test: correcting the map declaration must keep the server's dictionary ids.
+    /// The correction re-encoded the schema message, which numbered the dictionaries afresh, so a
+    /// server numbering its dictionaries in another order had each dictionary column decoded
+    /// against another column's dictionary — wrong values, and no error.
+    #[tokio::test]
+    async fn query_to_stream_keeps_the_servers_dictionary_ids_when_correcting_a_map() {
+        use crate::flight::dictionary_id_fixture::{expected_values, values};
+
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(
+            Arc::clone(&cookie_seen),
+            DoGetMode::NullableMapEntriesWithReorderedDictionaryIds,
+        )
+        .await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let batches = query_to_stream(
+            client,
+            "SELECT a, m, c FROM t".to_string(),
+            cookie_store,
+            "\"t\"".to_string(),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("a nullable entries declaration is relabelled, not refused");
+
+        let [batch] = batches.as_slice() else {
+            panic!("the server serves exactly one batch, got {}", batches.len());
+        };
+        assert_eq!(values(batch), expected_values());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn query_to_stream_propagates_token_to_endpoint_client() {
+        // Verify that a bearer token set on the main client is propagated to the
+        // per-endpoint client created when following FlightEndpoint.location.
+        // Servers like StarRocks enforce authentication on every connection.
+        const TOKEN_VALUE: &str = "test-bearer-token";
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let token_seen = Arc::new(AtomicBool::new(false));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have addr");
+        let location = format!("http://{addr}");
+        let service = {
+            let token_seen = Arc::clone(&token_seen);
+            TokenFlightSqlService {
+                cookie_seen: Arc::clone(&cookie_seen),
+                token_seen,
+                location: location.clone(),
+                expected_token: TOKEN_VALUE.to_string(),
+            }
+        };
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(FlightServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let mut client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+        client.set_token(TOKEN_VALUE.to_string());
+
+        let _batches = query_to_stream(
+            client,
+            "SELECT 1".to_string(),
+            Arc::clone(&cookie_store),
+            "\"t\"".to_string(),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("query should succeed");
+
+        assert!(
+            token_seen.load(Ordering::SeqCst),
+            "bearer token should have been forwarded to the per-endpoint DoGet client"
+        );
+
+        let _ = shutdown_tx.send(());
+        handle
+            .await
+            .expect("server should finish")
+            .expect("server should exit cleanly");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test server that enforces bearer-token auth on DoGet.
+    // Used by `query_to_stream_propagates_token_to_endpoint_client`.
+    // -----------------------------------------------------------------------
+    struct TokenFlightSqlService {
+        cookie_seen: Arc<AtomicBool>,
+        token_seen: Arc<AtomicBool>,
+        location: String,
+        expected_token: String,
+    }
+    #[async_trait]
+    impl FlightService for TokenFlightSqlService {
+        type HandshakeStream = EmptyResponseStream<arrow_flight::HandshakeResponse>;
+        type ListFlightsStream = EmptyResponseStream<FlightInfo>;
+        type DoGetStream = EmptyResponseStream<FlightData>;
+        type DoPutStream = EmptyResponseStream<PutResult>;
+        type DoExchangeStream = EmptyResponseStream<FlightData>;
+        type DoActionStream = EmptyResponseStream<arrow_flight::Result>;
+        type ListActionsStream = EmptyResponseStream<ActionType>;
+
+        async fn handshake(
+            &self,
+            _request: Request<tonic::Streaming<arrow_flight::HandshakeRequest>>,
+        ) -> Result<Response<Self::HandshakeStream>, Status> {
+            Err(Status::unimplemented("handshake"))
+        }
+
+        async fn list_flights(
+            &self,
+            _request: Request<Criteria>,
+        ) -> Result<Response<Self::ListFlightsStream>, Status> {
+            Err(Status::unimplemented("list_flights"))
+        }
+
+        async fn get_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<FlightInfo>, Status> {
+            // Return an endpoint pointing back at this server so the client
+            // must create a per-endpoint FlightSqlServiceClient and call DoGet on it.
+            let endpoint = FlightEndpoint {
+                ticket: Some(Ticket {
+                    ticket: Bytes::from_static(b"tok-ticket"),
+                }),
+                location: vec![Location {
+                    uri: self.location.clone(),
+                }],
+                expiration_time: None,
+                app_metadata: Bytes::new(),
+            };
+            Ok(Response::new(FlightInfo {
+                schema: Bytes::new(),
+                flight_descriptor: None,
+                endpoint: vec![endpoint],
+                total_records: -1,
+                total_bytes: -1,
+                ordered: false,
+                app_metadata: Bytes::new(),
+            }))
+        }
+
+        async fn poll_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<PollInfo>, Status> {
+            Err(Status::unimplemented("poll_flight_info"))
+        }
+
+        async fn get_schema(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<SchemaResult>, Status> {
+            Err(Status::unimplemented("get_schema"))
+        }
+
+        async fn do_get(
+            &self,
+            request: Request<Ticket>,
+        ) -> Result<Response<Self::DoGetStream>, Status> {
+            // Enforce bearer-token auth: reject if the token is missing or wrong.
+            let auth = request
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| Status::unauthenticated("missing authorization header"))?;
+            if auth != format!("Bearer {}", self.expected_token) {
+                return Err(Status::unauthenticated("invalid bearer token"));
+            }
+            self.cookie_seen.store(true, Ordering::SeqCst);
+            self.token_seen.store(true, Ordering::SeqCst);
+            Ok(Response::new(tokio_stream::empty()))
+        }
+
+        async fn do_put(
+            &self,
+            _request: Request<tonic::Streaming<FlightData>>,
+        ) -> Result<Response<Self::DoPutStream>, Status> {
+            Err(Status::unimplemented("do_put"))
+        }
+
+        async fn do_exchange(
+            &self,
+            _request: Request<tonic::Streaming<FlightData>>,
+        ) -> Result<Response<Self::DoExchangeStream>, Status> {
+            Err(Status::unimplemented("do_exchange"))
+        }
+
+        async fn do_action(
+            &self,
+            _request: Request<Action>,
+        ) -> Result<Response<Self::DoActionStream>, Status> {
+            Err(Status::unimplemented("do_action"))
+        }
+
+        async fn list_actions(
+            &self,
+            _request: Request<Empty>,
+        ) -> Result<Response<Self::ListActionsStream>, Status> {
+            Err(Status::unimplemented("list_actions"))
+        }
     }
 }

@@ -29,9 +29,11 @@ use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSou
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use futures::Stream;
 
+use crate::function_support::contains_unsupported_functions;
 use crate::spark_connect::map_error_to_datafusion_err;
+use datafusion::logical_expr::LogicalPlan;
 
-use super::SparkConnectTableProvider;
+use super::{SparkConnect, SparkConnectTableProvider};
 
 impl SparkConnectTableProvider {
     fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
@@ -70,18 +72,33 @@ impl SQLExecutor for SparkConnectTableProvider {
             CustomDialectBuilder::new()
                 .with_interval_style(datafusion::sql::unparser::dialect::IntervalStyle::SQLStandard)
                 .with_identifier_quote_style('`')
+                .with_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
+                .with_large_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
                 .build(),
         )
+    }
+
+    /// Refuses to federate a plan naming a function Spark cannot evaluate, so
+    /// `DataFusion` runs it locally instead of unparsing it into the statement
+    /// sent to Spark -- which answers `[UNRESOLVED_ROUTINE]` for every
+    /// Spice-only UDF (#13664).
+    ///
+    /// Fails safe, as `SqlTable` does: a support check that itself errors is
+    /// read as "unsupported", so a plan is never sent on the strength of a
+    /// check that did not complete.
+    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+        !contains_unsupported_functions(plan, self.spark_connect.function_support()).unwrap_or(true)
     }
 
     fn execute(
         &self,
         query: &str,
         schema: SchemaRef,
+        _filters: &[Arc<dyn datafusion::physical_plan::PhysicalExpr>],
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            spark_query_to_stream(self.dataframe.clone().sparkSession(), query.to_string()),
+            spark_query_to_stream(self.spark_connect.clone(), query.to_string()),
         )))
     }
 
@@ -92,33 +109,36 @@ impl SQLExecutor for SparkConnectTableProvider {
     }
 
     async fn get_table_schema(&self, table_name: &str) -> DataFusionResult<SchemaRef> {
-        Ok(self
-            .dataframe
-            .clone()
-            .sparkSession()
-            .table(table_name)
-            .map_err(map_error_to_datafusion_err)?
-            .limit(0)
-            .collect()
+        let table_name = table_name.to_string();
+        self.spark_connect
+            .with_session_retry(move |session| {
+                let table_name = table_name.clone();
+                async move {
+                    Ok(session
+                        .table(&table_name)?
+                        .limit(0)
+                        .collect()
+                        .await?
+                        .schema())
+                }
+            })
             .await
-            .map_err(map_error_to_datafusion_err)?
-            .schema())
+            .map_err(map_error_to_datafusion_err)
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+/// Builds a record-batch stream for a federated SQL query, rerunning the query
+/// against a freshly rebuilt session if the current one has gone stale/broken.
 fn spark_query_to_stream(
-    session: Arc<spark_connect_rs::SparkSession>,
+    spark_connect: SparkConnect,
     query: String,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-    let session = Arc::clone(&session);
-
     stream! {
-        let data = session
-            .sql(&query)
-            .await
-            .map_err(map_error_to_datafusion_err)?
-            .collect()
+        let data = spark_connect
+            .with_session_retry(|session| {
+                let query = query.clone();
+                async move { session.sql(&query).await?.collect().await }
+            })
             .await
             .map_err(map_error_to_datafusion_err)?;
         yield (Ok(data))

@@ -15,45 +15,59 @@ limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
 
+use crate::embeddings::params as embedding_params;
 use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
 use bytes::Bytes;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
+#[cfg(feature = "models")]
 use itertools::Itertools;
 use llms::HealthCheck;
 #[cfg(feature = "bedrock")]
 use llms::bedrock::{
     self,
-    embed::cohere::{CohereEmbeddingInputType, CohereEmbeddingTruncate, CohereEmbeddingType},
+    embed::{
+        cohere::{CohereEmbeddingTruncate, CohereEmbeddingType},
+        nova::NovaTruncationMode,
+    },
 };
+use runtime_parameters_typed::TypedParams;
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
-use llms::embeddings::{
-    Embed, Error as EmbedError,
-    candle::{download_hf_file, tei::TeiEmbed},
-};
+use object_store::ObjectStoreExt;
+
+#[cfg(feature = "models")]
+use llms::embeddings::candle::{download_hf_file, tei::TeiEmbed};
+use llms::embeddings::{Embed, Error as EmbedError};
+#[cfg(feature = "models")]
 use llms::model2vec::Model2Vec;
+use llms::openai::DEFAULT_EMBEDDING_MODEL;
 use llms::openai::embed::OpenaiEmbed;
-use llms::openai::{DEFAULT_EMBEDDING_MODEL, UsageTier};
-use secrecy::{ExposeSecret, SecretBox, SecretString};
+use secrecy::{ExposeSecret, SecretString};
 use snafu::ResultExt;
+#[cfg(feature = "models")]
+use spicepod::component::embeddings::pinned_revision;
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "models")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::result::Result;
 use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
+#[cfg(feature = "models")]
 use tokio::fs;
 use tokio::sync::RwLock;
 use url::Url;
 
 pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
 
-/// Extract a secret from a hashmap of secrets, if it exists.
-macro_rules! extract_secret {
-    ($params:expr, $key:expr) => {
-        $params.get($key).map(secrecy::ExposeSecret::expose_secret)
-    };
+/// Wraps a typed-params deserialization failure the same way `Parameters`
+/// errors were surfaced for embeddings.
+fn params_err(e: runtime_parameters_typed::ParamsError) -> EmbedError {
+    EmbedError::FailedToInstantiateEmbeddingModel {
+        source: Box::new(e),
+    }
 }
 
 pub async fn try_to_embedding(
@@ -76,65 +90,147 @@ pub async fn try_to_embedding(
         })
         .collect();
 
-    let params = get_params_with_secrets(Arc::clone(&secrets), &string_params).await;
     let model_id = component.get_model_id();
     let prefix = component
         .get_prefix()
         .ok_or(EmbedError::UnknownModelSource {
             from: component.from.clone(),
         })?;
+    let params = get_params_with_secrets(Arc::clone(&secrets), &string_params).await;
+    let component_name = format!("embedding {}", component.name);
 
     match prefix {
-        EmbeddingPrefix::Azure => azure(
-            model_id,
-            component.name.as_str(),
-            &params,
-            embeddings_cache.clone(),
-        ),
+        EmbeddingPrefix::Azure => {
+            let typed = embedding_params::azure::AzureEmbeddingParams::try_from_params(
+                &component_name,
+                params,
+                &secrets,
+            )
+            .await
+            .map_err(params_err)?;
+            azure(
+                model_id,
+                component.name.as_str(),
+                &typed,
+                embeddings_cache.clone(),
+            )
+        }
         EmbeddingPrefix::OpenAi => {
+            let typed = embedding_params::openai::OpenAiEmbeddingParams::try_from_params(
+                &component_name,
+                params,
+                &secrets,
+            )
+            .await
+            .map_err(params_err)?;
             openai(
                 model_id,
                 component,
-                &params,
+                &typed,
                 secrets,
                 embeddings_cache.clone(),
             )
             .await
         }
+        #[cfg(feature = "models")]
         EmbeddingPrefix::File => {
+            let typed = embedding_params::file::FileEmbeddingParams::try_from_params(
+                &component_name,
+                params,
+                &secrets,
+            )
+            .await
+            .map_err(params_err)?;
             file(
                 model_id.as_deref(),
                 component,
-                &params,
+                &typed,
                 embeddings_cache.clone(),
             )
             .await
         }
+        #[cfg(not(feature = "models"))]
+        EmbeddingPrefix::File => Err(EmbedError::UnknownModelSource {
+            from: "file".to_string(),
+        }),
+        #[cfg(feature = "models")]
         EmbeddingPrefix::HuggingFace => {
-            huggingface(&component.name, model_id, &params, embeddings_cache.clone()).await
+            let typed = embedding_params::huggingface::HuggingFaceEmbeddingParams::try_from_params(
+                &component_name,
+                params,
+                &secrets,
+            )
+            .await
+            .map_err(params_err)?;
+            huggingface(&component.name, model_id, &typed, embeddings_cache.clone()).await
+        }
+        #[cfg(not(feature = "models"))]
+        EmbeddingPrefix::HuggingFace => Err(EmbedError::UnknownModelSource {
+            from: "huggingface".to_string(),
+        }),
+        EmbeddingPrefix::Google => {
+            let typed = embedding_params::google::GoogleEmbeddingParams::try_from_params(
+                &component_name,
+                params,
+                &secrets,
+            )
+            .await
+            .map_err(params_err)?;
+            google(model_id, &typed, embeddings_cache.clone()).await
         }
         EmbeddingPrefix::Databricks => {
+            let typed = embedding_params::databricks::DatabricksEmbeddingParams::try_from_params(
+                &component_name,
+                params,
+                &secrets,
+            )
+            .await
+            .map_err(params_err)?;
             databricks(
                 model_id,
-                &params,
+                &typed,
                 Arc::clone(&token_provider_registry),
                 embeddings_cache.clone(),
             )
             .await
         }
         #[cfg(feature = "bedrock")]
-        EmbeddingPrefix::Bedrock => bedrock(model_id, &params, embeddings_cache.clone()).await,
+        EmbeddingPrefix::Bedrock => {
+            let typed = embedding_params::bedrock::BedrockEmbeddingParams::try_from_params(
+                &component_name,
+                params,
+                &secrets,
+            )
+            .await
+            .map_err(params_err)?;
+            bedrock(model_id, &typed, embeddings_cache.clone()).await
+        }
         #[cfg(not(feature = "bedrock"))]
         EmbeddingPrefix::Bedrock => Err(EmbedError::UnknownModelSource {
             from: "bedrock".to_string(),
         }),
-        EmbeddingPrefix::Model2Vec => model2vec(model_id, &params, embeddings_cache.clone()),
+        #[cfg(feature = "models")]
+        EmbeddingPrefix::Model2Vec => {
+            let typed = embedding_params::model2vec::Model2VecEmbeddingParams::try_from_params(
+                &component_name,
+                params,
+                &secrets,
+            )
+            .await
+            .map_err(params_err)?;
+            model2vec(model_id, &typed, embeddings_cache.clone())
+        }
+        #[cfg(not(feature = "models"))]
+        EmbeddingPrefix::Model2Vec => Err(EmbedError::UnknownModelSource {
+            from: "model2vec".to_string(),
+        }),
     }
 }
 
+#[cfg(feature = "models")]
 fn model2vec(
     model_id: Option<String>,
-    params: &HashMap<String, SecretString>,
+    params: &embedding_params::model2vec::Model2VecEmbeddingParams,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_id) = model_id else {
@@ -143,38 +239,41 @@ fn model2vec(
         });
     };
 
-    let hf_token = params
-        .get("hf_token")
-        .map(secrecy::ExposeSecret::expose_secret);
-
-    let subfolder = params
-        .get("subfolder")
-        .map(secrecy::ExposeSecret::expose_secret);
-
-    let normalize = params
-        .get("normalize")
-        .and_then(|ss| ss.expose_secret().parse::<bool>().ok());
-
-    let parallelism = params
-        .get("parallelism")
-        .and_then(|ss| ss.expose_secret().parse::<usize>().ok());
-
-    let embed_max_token_length = params
-        .get("embed_max_token_length")
-        .and_then(|ss| ss.expose_secret().parse::<usize>().ok());
-
-    let embed_custom_batch_size = params
-        .get("embed_custom_batch_size")
-        .and_then(|ss| ss.expose_secret().parse::<usize>().ok());
+    // `model2vec:` has no revision plumbing: `EmbeddingPrefix::Model2Vec` is a bare
+    // `strip_prefix`, so a trailing `:rev` stays glued to the model id, and
+    // `StaticModel::from_pretrained` takes no revision argument to hand it to. The id
+    // therefore reaches the Hub as part of the *repository name*, which 401s — a bare
+    // auth error for what is really an unsupported-configuration mistake (#12445).
+    //
+    // Say so instead. `pinned_revision` defers to the same regex the `huggingface:`
+    // arm uses rather than splitting on the last ':', so the two agree about what a
+    // revision is: only an `org/model:rev` shape has one, and a local path — the other
+    // thing `from_pretrained` accepts, including a Windows `C:/…` — passes through.
+    //
+    // The `exists()` guard mirrors `from_pretrained`'s own precedence, which tries the
+    // id as a local path before treating it as a repo name. Without it, a directory
+    // that happened to match the `org/model:rev` shape would be rejected here even
+    // though the loader would have opened it — so this only ever rejects ids that
+    // really would have gone to the Hub and 401'd.
+    if let Some(revision) = pinned_revision(&model_id)
+        .filter(|_| !Path::new(&model_id).exists())
+        .map(ToString::to_string)
+    {
+        return Err(EmbedError::RevisionPinningUnsupported {
+            model_source: "model2vec".to_string(),
+            model_id,
+            revision,
+        });
+    }
 
     Model2Vec::from_params(
         &model_id,
-        hf_token,
-        normalize,
-        subfolder,
-        parallelism,
-        embed_max_token_length,
-        embed_custom_batch_size,
+        params.hf_token.as_ref().map(ExposeSecret::expose_secret),
+        params.normalize,
+        params.subfolder.as_deref(),
+        params.parallelism,
+        params.embed_max_token_length,
+        params.embed_custom_batch_size,
     )
     .map(|m| Arc::new(m.set_cache(embeddings_cache)) as Arc<dyn Embed>)
     .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
@@ -182,10 +281,44 @@ fn model2vec(
     })
 }
 
+async fn google(
+    model_id: Option<String>,
+    params: &embedding_params::google::GoogleEmbeddingParams,
+    embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+) -> Result<Arc<dyn Embed>, EmbedError> {
+    let Some(model_id) = model_id else {
+        return Err(EmbedError::ModelNotProvided {
+            model_source: "google".to_string(),
+        });
+    };
+
+    let client = llms::google::auth::build_client(
+        llms::google::auth::VertexAuthParams {
+            project: params.project.as_deref(),
+            location: params.location.as_deref(),
+            service_account_path: params.service_account_path.as_deref(),
+            service_account_key: params.service_account_key.as_ref(),
+            application_default_credentials: params
+                .application_default_credentials
+                .unwrap_or(false),
+        },
+        "embeddings.params",
+    )
+    .await
+    .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
+        source: Box::new(std::io::Error::other(e.to_string())),
+    })?;
+
+    let google = llms::google::Google::from_client(client, model_id)
+        .into_embeddings(params.dimensions, embeddings_cache);
+
+    Ok(Arc::new(google) as Arc<dyn Embed>)
+}
+
 #[cfg(feature = "bedrock")]
 async fn bedrock(
     model_id: Option<String>,
-    params: &HashMap<String, SecretString>,
+    params: &embedding_params::bedrock::BedrockEmbeddingParams,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_id) = model_id else {
@@ -194,28 +327,15 @@ async fn bedrock(
         });
     };
 
-    let client = super::util::create_bedrock_client(params, "bedrock-embed")
+    let runtime_params = params.runtime_params();
+    let client = super::util::create_bedrock_client(&runtime_params, "bedrock-embed")
         .await
         .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?;
 
     if model_id.starts_with("amazon.titan-embed") {
-        let normalize = params
-            .get("normalize")
-            .map(|s| s.expose_secret().parse::<bool>())
-            .transpose()
-            .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-                source: format!("Failed to parse 'normalize' parameter: {e}").into(),
-            })?
-            .unwrap_or(true);
+        let normalize = params.normalize.unwrap_or(true);
 
-        let Some(dimensions) = params
-            .get("dimensions")
-            .map(|s| s.expose_secret().parse::<u32>())
-            .transpose()
-            .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-                source: format!("Failed to parse 'dimensions' parameter: {e}").into(),
-            })?
-        else {
+        let Some(dimensions) = params.dimensions else {
             return Err(EmbedError::MissingParamError {
                 param_key: "dimensions",
             });
@@ -234,28 +354,10 @@ async fn bedrock(
             bedrock::embed::new_titan_v2(client, normalize, dimensions).set_cache(embeddings_cache),
         ) as Arc<dyn Embed>)
     } else if model_id.starts_with("cohere.embed") {
-        let truncate = if let Some(truncate_str) = extract_secret!(params, "truncate") {
-            CohereEmbeddingTruncate::from_str(truncate_str)
-                .boxed()
-                .map_err(|e| EmbedError::InvalidParamError {
-                    param_key: "truncate",
-                    value: truncate_str.to_string(),
-                    reason: e.to_string(),
-                })?
-        } else {
-            CohereEmbeddingTruncate::default()
-        };
-        let input_type = if let Some(input_type_str) = extract_secret!(params, "input_type") {
-            CohereEmbeddingInputType::from_str(input_type_str).map_err(|e| {
-                EmbedError::InvalidParamError {
-                    param_key: "input_type",
-                    value: input_type_str.to_string(),
-                    reason: e.to_string(),
-                }
-            })?
-        } else {
-            CohereEmbeddingInputType::default()
-        };
+        let truncate = params
+            .truncate_mode
+            .map_or_else(CohereEmbeddingTruncate::default, Into::into);
+        let input_type = params.input_type.clone().unwrap_or_default();
         Ok(Arc::new(
             bedrock::embed::new_cohere(
                 client,
@@ -266,6 +368,36 @@ async fn bedrock(
             )
             .set_cache(embeddings_cache),
         ) as Arc<dyn Embed>)
+    } else if model_id.starts_with("amazon.nova-2-multimodal-embeddings") {
+        let Some(dimensions) = params.dimensions else {
+            return Err(EmbedError::MissingParamError {
+                param_key: "dimensions",
+            });
+        };
+
+        if !matches!(dimensions, 256 | 384 | 1024 | 3072) {
+            return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!(
+                    "Invalid dimensions '{dimensions}' for Nova model. Must be 256, 384, 1024, or 3072"
+                )
+                .into(),
+            });
+        }
+
+        let embedding_purpose = params.embedding_purpose.clone().unwrap_or_default();
+
+        let truncate = params
+            .truncate_mode
+            .map_or_else(NovaTruncationMode::default, Into::into);
+        Ok(Arc::new(
+            bedrock::embed::new_text_only_nova_multimodal(
+                client,
+                dimensions,
+                embedding_purpose,
+                truncate,
+            )
+            .set_cache(embeddings_cache),
+        ) as Arc<dyn Embed>)
     } else {
         Err(EmbedError::ModelDoesNotExist {
             model_name: model_id,
@@ -273,21 +405,35 @@ async fn bedrock(
     }
 }
 
+#[cfg(feature = "models")]
 async fn huggingface(
     name: &String,
     model_id: Option<String>,
-    params: &HashMap<String, SecretString>,
+    params: &embedding_params::huggingface::HuggingFaceEmbeddingParams,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
-    let hf_token = extract_secret!(params, "hf_token");
-    let pooling = extract_secret!(params, "pooling");
-    let max_seq_len = max_seq_length_from_params(params)?;
+    let hf_token = params.hf_token.as_ref().map(ExposeSecret::expose_secret);
+    let pooling = params.pooling.map(embedding_params::Pooling::as_str);
+    let truncation = params.truncate.unwrap_or_default().direction();
     if let Some(id) = model_id {
+        // `get_model_id` joins a pinned revision onto the repo id as `org/model:revision`, so
+        // the two halves have to be recovered before the repo id reaches the Hub. Passing the
+        // joined string through requests a repo named `org/model:revision`, which does not
+        // exist, and leaves the revision defaulted to `main`. `chat` splits the same
+        // convention back out; this path did not.
+        let (repo_id, revision) = spicepod::component::model::split_hf_model_id(&id);
         Ok(Arc::new(
-            TeiEmbed::from_hf(&id, None, hf_token, pooling, max_seq_len)
-                .await?
-                .set_cache(embeddings_cache)
-                .set_cache_model_id(name),
+            TeiEmbed::from_hf(
+                repo_id,
+                revision,
+                hf_token,
+                pooling,
+                params.max_seq_length,
+                truncation,
+            )
+            .await?
+            .set_cache(embeddings_cache)
+            .set_cache_model_id(name),
         ))
     } else {
         Err(EmbedError::ModelNotProvided {
@@ -298,24 +444,23 @@ async fn huggingface(
 
 async fn databricks(
     model_id: Option<String>,
-    params: &HashMap<String, SecretString>,
+    params: &embedding_params::databricks::DatabricksEmbeddingParams,
     token_provider_registry: Arc<TokenProviderRegistry>,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
-    let Some(endpoint) = extract_secret!(params, "databricks_endpoint") else {
-        return Err(EmbedError::MissingParamError {
-            param_key: "databricks_endpoint",
-        });
-    };
+    let endpoint = params.endpoint.as_str();
     let Some(model_id) = model_id else {
         return Err(EmbedError::ModelNotProvided {
             model_source: "databricks".to_string(),
         });
     };
 
-    let token_opt = extract_secret!(params, "databricks_token");
-    let client_id = extract_secret!(params, "databricks_client_id");
-    let client_secret = extract_secret!(params, "databricks_client_secret");
+    let token_opt = params.token.as_ref().map(ExposeSecret::expose_secret);
+    let client_id = params.client_id.as_deref();
+    let client_secret = params
+        .client_secret
+        .as_ref()
+        .map(ExposeSecret::expose_secret);
 
     #[cfg(feature = "databricks")]
     let user_agent = Some(data_components::databricks::user_agent());
@@ -347,7 +492,7 @@ async fn databricks(
 
         (None, Some(client_id), Some(client_secret)) => {
             let token_provider = token_provider_registry
-                .get_or_create_provider(format!("databricks_m2m_{client_id}"), || async {
+                .get_or_create_provider(format!("databricks_m2m_{endpoint}_{client_id}"), || async {
                     DatabricksM2MTokenProvider::try_new(
                         endpoint.to_string(),
                         client_id.to_string(),
@@ -373,7 +518,7 @@ async fn databricks(
         }
         (None, Some(client_id), None) => {
             let token_provider = token_provider_registry
-                .get_or_create_provider::<DatabricksU2MTokenProvider, std::convert::Infallible, _, _>(format!("databricks_u2m_{client_id}"), || async {
+                .get_or_create_provider::<DatabricksU2MTokenProvider, std::convert::Infallible, _, _>(format!("databricks_u2m_{endpoint}_{client_id}"), || async {
                     Ok(DatabricksU2MTokenProvider::new(
                         endpoint.to_string(),
                         client_id.to_string(),
@@ -398,10 +543,11 @@ async fn databricks(
     }
 }
 
+#[cfg(feature = "models")]
 async fn file(
     model_id: Option<&str>,
     component: &spicepod::component::embeddings::Embeddings,
-    params: &HashMap<String, SecretString>,
+    params: &embedding_params::file::FileEmbeddingParams,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let weights_path = model_id
@@ -424,17 +570,17 @@ async fn file(
         })?
         .clone();
     let pooling = params
-        .get("pooling")
-        .map(SecretBox::expose_secret)
-        .map(String::from);
-    let max_seq_len = max_seq_length_from_params(params)?;
+        .pooling
+        .map(|p| embedding_params::Pooling::as_str(p).to_string());
+    let truncation = params.truncate.unwrap_or_default().direction();
     Ok(Arc::new(
         TeiEmbed::from_local(
             Path::new(&weights_path),
             Path::new(&config_path),
             Path::new(&tokenizer_path),
             pooling,
-            max_seq_len,
+            params.max_seq_length,
+            truncation,
         )
         .await?
         .set_cache(embeddings_cache)
@@ -445,7 +591,7 @@ async fn file(
 fn azure(
     model_id: Option<String>,
     model_name: &str,
-    params: &HashMap<String, SecretString>,
+    params: &embedding_params::azure::AzureEmbeddingParams,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_name) = model_id else {
@@ -453,11 +599,8 @@ fn azure(
             source: format!("For embedding model '{model_name}', model id must be specified in `from:azure:<model_id>`.").into(),
         });
     };
-    let api_base = extract_secret!(params, "endpoint");
-    let api_version = extract_secret!(params, "azure_api_version");
-    let deployment_name = extract_secret!(params, "azure_deployment_name");
-    let api_key = extract_secret!(params, "azure_api_key");
-    let entra_token = extract_secret!(params, "azure_entra_token");
+    let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
+    let entra_token = params.entra_token.as_ref().map(ExposeSecret::expose_secret);
     if api_key.is_some() && entra_token.is_some() {
         return Err(EmbedError::FailedToInstantiateEmbeddingModel {
             source: format!(
@@ -480,9 +623,9 @@ fn azure(
         OpenaiEmbed::new(
             llms::openai::new_azure_client(
                 model_name,
-                api_base,
-                api_version,
-                deployment_name,
+                params.endpoint.as_deref(),
+                params.api_version.as_deref(),
+                params.deployment_name.as_deref(),
                 entra_token,
                 api_key,
             ),
@@ -495,37 +638,22 @@ fn azure(
 async fn openai(
     model_id: Option<String>,
     component: &spicepod::component::embeddings::Embeddings,
-    params: &HashMap<String, SecretString>,
+    params: &embedding_params::openai::OpenAiEmbeddingParams,
     secrets: Arc<RwLock<Secrets>>,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
-    // If parameter is from secret store, it will have `openai_` prefix
-    let openai_usage_tier = params
-        .get("usage_tier")
-        .or(params.get("openai_usage_tier"))
-        .map(secrecy::ExposeSecret::expose_secret)
-        .map(UsageTier::from_str)
-        .transpose()?;
+    let usage_tier = params.usage_tier;
 
     let mut embed = OpenaiEmbed::new(
         llms::openai::new_openai_client(
             model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
-            extract_secret!(params, "endpoint"),
-            params
-                .get("api_key")
-                .or(params.get("openai_api_key"))
-                .map(secrecy::ExposeSecret::expose_secret),
-            params
-                .get("org_id")
-                .or(params.get("openai_org_id"))
-                .map(secrecy::ExposeSecret::expose_secret),
-            params
-                .get("project_id")
-                .or(params.get("openai_project_id"))
-                .map(secrecy::ExposeSecret::expose_secret),
-            openai_usage_tier,
+            Some(params.endpoint.as_str()),
+            params.api_key.as_ref().map(ExposeSecret::expose_secret),
+            params.org_id.as_deref(),
+            params.project_id.as_deref(),
+            Some(usage_tier),
         ),
-        openai_usage_tier.map(Into::into),
+        Some(usage_tier.into()),
     )
     .set_cache(embeddings_cache);
 
@@ -562,92 +690,100 @@ async fn get_bytes_for_file(
     url: &str,
     params: &HashMap<String, SecretString>,
 ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-    match url.split('/').collect_vec().as_slice() {
-        [
-            "https:",
-            "",
-            "huggingface.co",
-            org_id,
-            model_id,
-            "blob",
-            branch,
-            file @ ..,
-        ] => {
-            get_file_from_hf(
-                None,
-                org_id,
-                model_id,
-                Some(branch),
-                file.join("/").as_str(),
-                params
-                    .get("hf_token")
-                    .map(secrecy::ExposeSecret::expose_secret),
-            )
-            .await
-        }
-        ["hf:", "", "datasets", org_id, model_id_revision, file @ ..] => {
-            let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
+    #[cfg(not(feature = "models"))]
+    let _ = params;
 
-            get_file_from_hf(
-                Some("datasets"),
+    #[cfg(feature = "models")]
+    {
+        match url.split('/').collect_vec().as_slice() {
+            [
+                "https:",
+                "",
+                "huggingface.co",
                 org_id,
                 model_id,
+                "blob",
                 branch,
-                file.join("/").as_str(),
-                params
-                    .get("hf_token")
-                    .map(secrecy::ExposeSecret::expose_secret),
-            )
-            .await
-        }
-        ["hf:", "", "spaces", org_id, model_id_revision, file @ ..] => {
-            let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-            get_file_from_hf(
-                Some("spaces"),
-                org_id,
-                model_id,
-                branch,
-                file.join("/").as_str(),
-                params
-                    .get("hf_token")
-                    .map(secrecy::ExposeSecret::expose_secret),
-            )
-            .await
-        }
-        ["hf:", "", "models", org_id, model_id_revision, file @ ..]
-        | ["hf:", "", org_id, model_id_revision, file @ ..] => {
-            let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-            get_file_from_hf(
-                Some("models"),
-                org_id,
-                model_id,
-                branch,
-                file.join("/").as_str(),
-                params
-                    .get("hf_token")
-                    .map(secrecy::ExposeSecret::expose_secret),
-            )
-            .await
-        }
-        _ => {
-            // Need to add `file://` for file paths
-            let final_url = match PathBuf::from_str(url).map(|p| p.canonicalize()) {
-                Ok(Ok(ref p)) if p.exists() => {
-                    format!("file://{}", p.to_string_lossy())
-                }
-                _ => url.to_string(),
-            };
-            let url = Url::parse(final_url.as_str()).boxed()?;
-            let (store, path) = object_store::parse_url(&url).boxed()?;
-            store.get(&path).await.boxed()?.bytes().await.boxed()
+                file @ ..,
+            ] => {
+                return get_file_from_hf(
+                    None,
+                    org_id,
+                    model_id,
+                    Some(branch),
+                    file.join("/").as_str(),
+                    params
+                        .get("hf_token")
+                        .map(secrecy::ExposeSecret::expose_secret),
+                )
+                .await;
+            }
+            ["hf:", "", "datasets", org_id, model_id_revision, file @ ..] => {
+                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
+
+                return get_file_from_hf(
+                    Some("datasets"),
+                    org_id,
+                    model_id,
+                    branch,
+                    file.join("/").as_str(),
+                    params
+                        .get("hf_token")
+                        .map(secrecy::ExposeSecret::expose_secret),
+                )
+                .await;
+            }
+            ["hf:", "", "spaces", org_id, model_id_revision, file @ ..] => {
+                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
+                return get_file_from_hf(
+                    Some("spaces"),
+                    org_id,
+                    model_id,
+                    branch,
+                    file.join("/").as_str(),
+                    params
+                        .get("hf_token")
+                        .map(secrecy::ExposeSecret::expose_secret),
+                )
+                .await;
+            }
+            ["hf:", "", "models", org_id, model_id_revision, file @ ..]
+            | ["hf:", "", org_id, model_id_revision, file @ ..] => {
+                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
+                return get_file_from_hf(
+                    Some("models"),
+                    org_id,
+                    model_id,
+                    branch,
+                    file.join("/").as_str(),
+                    params
+                        .get("hf_token")
+                        .map(secrecy::ExposeSecret::expose_secret),
+                )
+                .await;
+            }
+            _ => {}
         }
     }
+
+    // Fallback: non-HuggingFace URLs or when models feature is disabled
+    // Need to add `file://` for file paths
+    let final_url = match PathBuf::from_str(url).map(|p| p.canonicalize()) {
+        Ok(Ok(ref p)) if p.exists() => {
+            format!("file://{}", p.to_string_lossy())
+        }
+        _ => url.to_string(),
+    };
+    let url = Url::parse(final_url.as_str()).boxed()?;
+    let (store, path) = object_store::parse_url(&url).boxed()?;
+    store.get(&path).await.boxed()?.bytes().await.boxed()
 }
 
 /// From `hf://` spec, parse the `model_id` that may have a revision attached `all-MiniLM-L6-v2@main`.
 ///
 /// `all-MiniLM-L6-v2` -> (`all-MiniLM-L6-v2`, None)
 /// `all-MiniLM-L6-v2@main` -> (`all-MiniLM-L6-v2`, Some(`main`))
+#[cfg(feature = "models")]
 fn parse_model_id_w_revision(model_w_revision: &str) -> (&str, Option<&str>) {
     match model_w_revision.split_once('@') {
         Some((model_id, revision)) => (model_id, Some(revision)),
@@ -655,6 +791,7 @@ fn parse_model_id_w_revision(model_w_revision: &str) -> (&str, Option<&str>) {
     }
 }
 
+#[cfg(feature = "models")]
 async fn get_file_from_hf(
     repo_type: Option<&str>,
     org_id: &str,
@@ -680,20 +817,4 @@ async fn get_file_from_hf(
             "Downloaded HF url, but failed to get local path. Error: {e:?}"
         ))),
     }
-}
-
-fn max_seq_length_from_params(
-    params: &HashMap<String, SecretString>,
-) -> Result<Option<usize>, EmbedError> {
-    params
-        .get("max_seq_length")
-        .map(|s| {
-            secrecy::ExposeSecret::expose_secret(s)
-                .parse()
-                .boxed()
-                .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: format!("Failed to parse 'max_seq_length' parameter: {e}").into(),
-                })
-        })
-        .transpose()
 }

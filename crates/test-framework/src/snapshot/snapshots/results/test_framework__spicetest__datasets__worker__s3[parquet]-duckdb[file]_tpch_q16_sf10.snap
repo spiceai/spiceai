@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q16"
+---
++----------+--------------------------+--------+--------------+
+| p_brand  | p_type                   | p_size | supplier_cnt |
++----------+--------------------------+--------+--------------+
+| Brand#44 | STANDARD PLATED TIN      | 9      | 120          |
+| Brand#12 | STANDARD POLISHED COPPER | 14     | 100          |
+| Brand#11 | LARGE BRUSHED STEEL      | 36     | 96           |
+| Brand#23 | PROMO BURNISHED STEEL    | 14     | 96           |
+| Brand#34 | MEDIUM BRUSHED STEEL     | 23     | 96           |
+| Brand#53 | PROMO BURNISHED BRASS    | 36     | 96           |
+| Brand#54 | STANDARD BRUSHED COPPER  | 19     | 96           |
+| Brand#32 | LARGE POLISHED COPPER    | 14     | 95           |
+| Brand#43 | LARGE PLATED COPPER      | 19     | 95           |
+| Brand#11 | SMALL BRUSHED STEEL      | 9      | 92           |
++----------+--------------------------+--------+--------------+

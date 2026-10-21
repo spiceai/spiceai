@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
+expression: __plan
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                              |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: pkcat.myschema.users.id, CAST(pkcat.myschema.users.name AS LargeUtf8) AS name, CAST(pkcat.myschema.users.email AS LargeUtf8) AS email |
+|               |   Sort: pkcat.myschema.users.id ASC NULLS LAST                                                                                                    |
+|               |     SubqueryAlias: pkcat.myschema.users                                                                                                           |
+|               |       TableScan: pkcat.myschema.users projection=[id, name, email]                                                                                |
+| physical_plan | ProjectionExec: expr=[id@0 as id, CAST(name@1 AS LargeUtf8) as name, CAST(email@2 AS LargeUtf8) as email]                                         |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1, maintains_sort_order=true                                                 |
+|               |     CooperativeExec                                                                                                                               |
+|               |       BytesProcessedExec                                                                                                                          |
+|               |         FlightSqlExec sql=SELECT id, name, email FROM pkcat.myschema.users ORDER BY id ASC NULLS LAST                                             |
+|               |                                                                                                                                                   |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+

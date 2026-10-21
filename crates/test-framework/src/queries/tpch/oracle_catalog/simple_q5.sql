@@ -1,0 +1,1 @@
+select SUM("O"."O_TOTALPRICE") as "TOTAL_PRICE", "L"."L_LINESTATUS" from oracle_tpch."TPCH_SF1"."ORDERS" "O" JOIN oracle_tpch."TPCH_SF1"."LINEITEM" "L" ON "O"."O_ORDERKEY" = "L"."L_ORDERKEY" group by "L"."L_LINESTATUS" order by "TOTAL_PRICE" desc;

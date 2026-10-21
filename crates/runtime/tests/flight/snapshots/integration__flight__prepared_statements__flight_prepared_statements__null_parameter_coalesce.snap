@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/flight/prepared_statements.rs
+expression: results_str
+---
++---------------+
+| result        |
++---------------+
+| default_value |
++---------------+

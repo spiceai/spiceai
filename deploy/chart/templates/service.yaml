@@ -28,8 +28,6 @@ spec:
       name: metrics
     - port: 50051
       name: flight
-    - port: 50052
-      name: otel
     {{- end }}
   selector:
     {{- if .Values.service.selector }}

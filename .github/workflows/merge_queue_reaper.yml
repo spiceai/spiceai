@@ -1,0 +1,82 @@
+---
+name: Merge Queue Reaper
+
+# Cancels workflow runs left behind when the merge queue re-forms a batch. See
+# .github/scripts/reap_superseded_merge_queue_runs.py for why workflow-level
+# `concurrency` cannot do this.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report what would be cancelled without cancelling it'
+        type: boolean
+        default: false
+  schedule:
+    # Off the hour, where scheduled runs are most likely to be delayed.
+    - cron: '7,22,37,52 * * * *'
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+    paths:
+      - '.github/scripts/reap_superseded_merge_queue_runs.py'
+      - '.github/scripts/test_reap_superseded_merge_queue_runs.py'
+      - '.github/workflows/merge_queue_reaper.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/scripts/reap_superseded_merge_queue_runs.py'
+      - '.github/scripts/test_reap_superseded_merge_queue_runs.py'
+      - '.github/workflows/merge_queue_reaper.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  test:
+    name: Unit tests for reap_superseded_merge_queue_runs.py
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Run tests
+        run: python .github/scripts/test_reap_superseded_merge_queue_runs.py -v
+
+  reap:
+    name: Cancel superseded merge-queue runs
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # A GitHub-hosted runner on purpose: the pool this reclaims capacity in is
+    # the self-hosted one.
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cancel superseded merge-queue runs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          python .github/scripts/reap_superseded_merge_queue_runs.py ${DRY_RUN}

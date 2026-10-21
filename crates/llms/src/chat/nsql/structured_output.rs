@@ -13,7 +13,7 @@ limitations under the License.
 
 use async_openai::{
     error::OpenAIError,
-    types::{
+    types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
         CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
         ResponseFormat, ResponseFormatJsonSchema,
@@ -66,7 +66,7 @@ impl SqlGeneration for StructuredOutputSqlGeneration {
                     name: "sql_mode".to_string(),
                     description: None,
                     strict: Some(true),
-                    schema: Some(structured_output_schema),
+                    schema: structured_output_schema,
                 },
             })
             .messages(messages)
@@ -84,7 +84,10 @@ impl SqlGeneration for StructuredOutputSqlGeneration {
         {
             Some(message) => match serde_json::from_str(message) {
                 Ok(StructuredNsqlOutput { sql }) => Ok(Some(sql)),
-                Err(e) => Err(OpenAIError::JSONDeserialize(e)),
+                Err(e) => Err(OpenAIError::JSONDeserialize(
+                    e,
+                    "Failed to parse structured output".to_string(),
+                )),
             },
             None => Ok(None),
         }

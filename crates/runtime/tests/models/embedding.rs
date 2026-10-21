@@ -21,7 +21,7 @@ use crate::{
     utils::{runtime_ready_check, runtime_ready_check_with_timeout},
 };
 use app::AppBuilder;
-use async_openai::types::{CreateEmbeddingResponse, EmbeddingInput};
+use async_openai::types::embeddings::{CreateEmbeddingResponse, EmbeddingInput};
 use core::time;
 use runtime::{Runtime, auth::EndpointAuth};
 use spicepod::component::embeddings::Embeddings;
@@ -196,7 +196,7 @@ async fn start_runtime_with_embedding(
     });
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = Arc::clone(&rt).load_components() => {}

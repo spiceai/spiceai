@@ -8,8 +8,11 @@ datasets:
       enabled: true
       engine: duckdb
       mode: file
+      params:
+        connection_pool_size: 25
     params: &spicecloud_params
       spiceai_api_key: ${secrets:SPICEAI_TEST_TPCDS_API_KEY}
+      spiceai_region: us-east-1
       spiceai_endpoint: ${secrets:SPICEAI_TEST_ENDPOINT}
   - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.catalog_returns
     name: catalog_returns

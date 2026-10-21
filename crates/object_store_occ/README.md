@@ -1,0 +1,170 @@
+# object_store_occ
+
+A Rust library for storing and retrieving serializable structs in object storage with **Optimistic Concurrency Control (OCC)** using conditional writes (ETags/If-Match headers). This enables linearizable writes for multiple writers without locks or coordination services.
+
+## Features
+
+- **Type-safe object storage**: Store any `Serialize + Deserialize` Rust struct as JSON in object stores
+- **Optimistic concurrency control**: Uses ETags and conditional writes to detect concurrent modifications
+- **Conflict detection**: Clear API for handling insert vs update vs conflict scenarios
+- **Local caching**: Optional in-memory cache with refresh capabilities
+- **Zero external state**: No database or coordination service required—uses object store as source of truth
+- **Transactional WAL and MVCC**: The internal `wal::WalStateStore` API commits atomic K/V batches, reads stable snapshots, checkpoints state, and resolves uncertain commits from retained history. See [the transactional state contract](WAL.md) for limits and backend requirements.
+
+## Quick Start
+
+```rust
+use object_store_occ::{Change, ConflictRetry, ObjectState};
+use object_store::aws::AmazonS3Builder;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct Transaction {
+    foo: String,
+    bar: i32,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create object store (S3, GCS, Azure, local filesystem, etc.)
+    let store = AmazonS3Builder::from_env()
+        .with_bucket_name("my-state-bucket")
+        .build()?;
+
+    // Create typed object state manager with a key prefix
+    let state: ObjectState<Transaction> = ObjectState::new(Arc::new(store))
+        .with_prefix("v1/transactions/");
+
+    // Read, change and write back. When another writer changes the object
+    // first, the change is applied again to what that writer stored.
+    let total = state
+        .modify("customer_42", &ConflictRetry::default(), |current| {
+            let mut tx = current.unwrap_or(Transaction { foo: "hello".into(), bar: 0 });
+            tx.bar += 1;
+            let total = tx.bar;
+            Ok::<_, std::convert::Infallible>(Change::Write(tx, total))
+        })
+        .await?;
+    println!("bar is now {total}");
+
+    // Read directly from object store (always fresh)
+    let current: Option<Transaction> = state.get("customer_42").await?;
+
+    // Read from local cache (fast, may be stale)
+    let cached: Option<&Transaction> = state.get_cached("customer_42");
+
+    // Refresh cache from object store
+    state.refresh().await?;
+
+    Ok(())
+}
+```
+
+## API Reference
+
+### `ObjectState<T>`
+
+The main entry point for typed object storage with OCC.
+
+#### Construction
+
+```rust
+// Basic construction
+let state: ObjectState<T> = ObjectState::new(store);
+
+// With key prefix (recommended for namespacing)
+let state = ObjectState::new(store).with_prefix("v1/mytype/");
+```
+
+#### Writing
+
+```rust
+/// Insert a new object. Fails if key already exists.
+async fn insert(&self, key: &str, value: &T) -> Result<InsertResult>;
+
+/// Update an object only if it is still at `version`, from `get_with_version`.
+async fn update_with_version(&self, key: &str, value: &T, version: UpdateVersion) -> Result<UpdateResult<T>>;
+
+/// Read, change and conditionally write back, retrying under `policy` when
+/// another writer changed the object first.
+async fn modify<R, E, F>(&self, key: &str, policy: &ConflictRetry, change: F) -> Result<R, ModifyError<E>>
+where
+    F: FnMut(Option<T>) -> Result<Change<T, R>, E>;
+```
+
+#### Reading
+
+```rust
+/// Get object from directly from object store (fresh read)
+async fn get(&self, key: &str) -> Result<Option<T>>;
+
+/// Get object and the version to pass to `update_with_version`
+async fn get_with_version(&self, key: &str) -> Result<Option<(T, UpdateVersion)>>;
+
+/// Get object from local cache (fast, may be stale). 
+fn get_cached(&self, key: &str) -> Option<&T>;
+
+/// List all keys with the configured prefix
+async fn list_keys(&self) -> Result<Vec<String>>;
+
+/// Refresh local cache from object store. Retrieves all keys, not just those currently cached. 
+async fn refresh(&self) -> Result<()>;
+```
+
+### `InsertResult`
+
+Result of an `insert()` operation:
+
+```rust
+pub enum InsertResult {
+    /// Object was created
+    Ok,
+    
+    /// Object already exists
+    AlreadyExists,
+}
+```
+
+### `UpdateResult<T>`
+
+Result of an `update_with_version()` operation:
+
+```rust
+pub enum UpdateResult<T> {
+    /// Update succeeded (ETag matched)
+    Ok,
+    
+    /// Object doesn't exist
+    NotFound,
+    
+    /// Concurrent modification - contains current value
+    Conflict { current: T },
+}
+```
+
+## Concurrency Control
+
+This crate uses **optimistic concurrency control** via conditional writes:
+
+1. **On read**: Store the ETag (entity tag) from the response
+2. **On write**: Send `If-Match: <etag>` with remote stores, or take a local advisory lock and re-check the ETag for `file://` stores
+3. **On conflict**: Object store returns `412 Precondition Failed`, or the local wrapper returns an equivalent precondition error
+
+This provides **linearizable writes** without external coordination services.
+
+### Supported Object Stores
+
+| Store                | OCC Support | Notes                                                                     |
+| -------------------- | ----------- | ------------------------------------------------------------------------- |
+| Amazon S3            | ✅ Full      | Native conditional writes                                                 |
+| Google Cloud Storage | ✅ Full      | Generation-based versioning                                               |
+| Azure Blob Storage   | ✅ Full      | ETag-based                                                                |
+| Local Filesystem     | ✅ Local     | Simulates conditional writes with an advisory lock file and ETag re-check |
+
+## Design Principles
+
+1. **Correctness over performance**: OCC ensures data integrity even under concurrent access
+2. **No hidden state**: All state lives in the object store; cache is explicitly managed
+3. **Explicit conflict handling**: Conflicts surface to the caller for domain-specific resolution
+4. **No external coordination**: Remote stores use native conditional writes; local files use a lock file in the state directory

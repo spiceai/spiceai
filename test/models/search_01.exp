@@ -1,14 +1,20 @@
 #!/usr/bin/expect -f
 
-# spiced runtime response timeout
-set timeout 5
+source [file join [file dirname [info script]] repl_helpers.exp]
 
-spawn spice search
+# How long the runtime may go silent before the script calls it stalled — see
+# repl_idle_timeout. A search answers in one piece once the embedding model has
+# run, and its spinner writes no newline (see repl_helpers.exp), so for a search
+# this is the whole time the runtime has to answer (job 112954591167 failed a
+# fixed 5s budget on a search that was still running).
+set timeout [repl_idle_timeout]
+
+spawn spice search {*}[repl_endpoint_args]
 
 proc perform_search {search_term expected_term} {
     global timeout
 
-    send "$search_term\r"
+    repl_send "$search_term\r"
 
     expect {
         -re $expected_term {
@@ -23,19 +29,52 @@ proc perform_search {search_term expected_term} {
             send_user "Error detected\n"
             exit 1
         }
+        -re {[^\n]*\n} {
+            # A line the REPL printed before the result — the echoed query, a
+            # table header — so it is still at work: restart the wait. Whole
+            # lines only, for the reason given in repl_helpers.exp.
+            exp_continue
+        }
+        eof {
+            repl_died "Searching for \"$search_term\""
+        }
         timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
+            repl_stalled "Searching for \"$search_term\""
         }
     }
 }
-expect "search>"
-perform_search "Spice runtime error" {\| 1 .*\| .* \| [0-9]+\.[0-9]+ \| spice\.public\.issues +\|}
 
-expect "search>"
-perform_search "friends" {\| 1 .*\| .* \| [0-9]+\.[0-9]+ \| spice\.public\.catalog_page +\|}
+proc expect_search_prompt {} {
+    global timeout
+
+    expect {
+        "search>" {
+            # runtime is ready for input
+        }
+        -re {[^\n]*\n} {
+            # Banner and connection lines the CLI prints on its way to the prompt.
+            exp_continue
+        }
+        eof {
+            repl_died "Waiting for the search prompt"
+        }
+        timeout {
+            repl_stalled "Waiting for the search prompt"
+        }
+    }
+}
+
+expect_search_prompt
+perform_search "Spice runtime error" {1 +\S+ +.* +[0-9]+\.[0-9]+ +spice\.public\.issues}
+
+expect_search_prompt
+perform_search "friends" {1 +\S+ +.* +[0-9]+\.[0-9]+ +spice\.public\.catalog_page}
+
+# Every search returned its expected result, so the REPL must still be sitting at
+# its prompt.
+repl_assert_running "Checking the search REPL is still running"
 
 # Signal to exit (Ctrl+C)
-send \x03
+repl_send \x03
 
 exit 0

@@ -14,45 +14,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::{ChatCompletionStreamOptions, CreateChatCompletionRequest};
+#![allow(clippy::expect_used)]
+
+use async_openai::{
+    error::OpenAIError,
+    types::chat::{
+        ChatCompletionMessageToolCalls, ChatCompletionStreamOptions, CreateChatCompletionRequest,
+        CreateChatCompletionResponse,
+    },
+};
 use jsonpath_rust::JsonPath;
 use llms::{accumulate::accumulate, chat::Chat};
+use rstest::rstest;
 use serde_json::{Value, json};
 use std::{
+    future::Future,
     str::FromStr,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
+use tokio::runtime::Runtime;
+use tokio::sync::oneshot;
 
 use crate::{TEST_ARGS, init_tracing};
 
 mod create;
+mod responses;
 mod streaming_tests;
-
-#[derive(Clone)]
-pub struct TestCase {
-    pub name: &'static str,
-    pub req: CreateChatCompletionRequest,
-
-    /// Maps (id, `JSONPath` selector), where the selector is into the [`CreateChatCompletionResponse`].
-    /// This is used in snapshot testing to assert certain properties of the response.
-    pub json_path: Vec<(&'static str, &'static str)>,
-}
-
-/// Creates [`TestCase`] instances from request/response that JSON serialize to
-/// [`CreateChatCompletionRequest`] and [`CreateChatCompletionResponse`].
-#[macro_export]
-macro_rules! test_case {
-    ($name:expr, $req:expr, $jsonpaths:expr) => {{
-        let mut r = $req.clone();
-        r["model"] = Value::String("not_needed".to_string());
-        TestCase {
-            name: $name,
-            req: serde_json::from_value(r)
-                .expect(&format!("Failed to parse request in test case '{}'", $name)),
-            json_path: $jsonpaths,
-        }
-    }};
-}
 
 /// Async function that creates a model instance
 type AsyncModelCreator = Box<
@@ -63,399 +54,425 @@ type AsyncModelCreator = Box<
 >;
 
 /// A given model to test - cached after first creation
-type ModelDef = (&'static str, Mutex<Option<Arc<dyn Chat>>>);
+type ModelCache = Mutex<Option<Arc<dyn Chat>>>;
 
-#[allow(clippy::expect_used)]
-static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = LazyLock::new(
-    || {
-        vec![
-            (
-                "bedrock",
-                Box::new(|| {
-                    Box::pin(async {
-                        create::create_bedrock("us.amazon.nova-lite-v1:0")
-                            .await
-                            .map_err(|e| anyhow::anyhow!("failed to create bedrock model: {e}"))
-                    })
-                }),
-            ),
-            (
-                "anthropic",
-                Box::new(|| {
-                    Box::pin(async {
-                        create::create_anthropic(None)
-                            .map_err(|e| anyhow::anyhow!("failed to create anthropic model: {e}"))
-                    })
-                }),
-            ),
-            (
-                "openai",
-                Box::new(|| Box::pin(async { Ok(create::create_openai("gpt-4o-mini")) })),
-            ),
-            (
-                "xai",
-                Box::new(|| {
-                    Box::pin(async {
-                        create::create_xai("grok-3")
-                            .map_err(|e| anyhow::anyhow!("failed to create 'grok-3' from xAI: {e}"))
-                    })
-                }),
-            ),
-            (
-                "hf_phi3",
-                Box::new(|| {
-                    Box::pin(async {
-                        create::create_hf("microsoft/Phi-3-mini-4k-instruct")
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to create 'microsoft/Phi-3-mini-4k-instruct' from HF: {e}"))
-                    })
-                }),
-            ),
-            (
-                "local_phi3",
-                Box::new(|| {
-                    Box::pin(async {
-                        create::create_local("microsoft/Phi-3-mini-4k-instruct")
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to create 'microsoft/Phi-3-mini-4k-instruct' from local system: {e}"))
-                    })
-                }),
-            ),
-            (
-                "perplexity",
-                Box::new(|| {
-                    Box::pin(async {
-                        create::create_perplexity()
-                            .map_err(|e| anyhow::anyhow!("failed to create perplexity model: {e}"))
-                    })
-                }),
-            ),
-        ]
-    },
-);
+/// A model fixture: the name tests select it by, how to create it, and the artifact repository
+/// its creation fetches from.
+struct TestModel {
+    /// Name tests select this fixture by.
+    name: &'static str,
+    /// Hugging Face repository this fixture's creation downloads artifacts from, if any.
+    ///
+    /// `hf_hub` guards each blob it downloads with a lock file and fails outright rather than
+    /// waiting for a download already in flight, so two creations fetching the same repository
+    /// concurrently lose the race. [`MODEL_CACHES`] cannot serialize them: it keys a mutex per
+    /// fixture, and `hf_phi3` and `local_phi3` are two fixtures over one repository. Naming the
+    /// repository here is what puts both fixtures on one [`TestModel::creation_key`], and so on
+    /// one creation lock (#13560).
+    fetch_repo: Option<&'static str>,
+    create: AsyncModelCreator,
+}
 
-static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
-    TEST_MODEL_CREATORS
+impl TestModel {
+    /// The resource this fixture's creation must not share with a concurrent creation.
+    ///
+    /// Its artifact repository when it downloads one, since two fixtures over one repository
+    /// contend for its blob locks; otherwise the fixture itself, so two callers of one fixture
+    /// still cannot create it twice.
+    fn creation_key(&self) -> &'static str {
+        self.fetch_repo.unwrap_or(self.name)
+    }
+}
+
+/// A multi-thread runtime that lives for as long as the test binary.
+///
+/// Every test here is a `#[tokio::test]`, so each owns a runtime that is dropped when that test
+/// ends, while [`MODEL_CACHES`] hands the same model — and so the same HTTP client — to later
+/// tests. A client's connection task is spawned by whichever runtime first drove a request over
+/// it, so once that runtime is gone the pooled connection is dead and the next test to reuse the
+/// client fails with `hyper::Error(User(DispatchGone), "runtime dropped the dispatch task")`.
+/// Building and driving every cached client here keeps those connection tasks alive for as long
+/// as the cache that hands them out.
+static SHARED_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build the shared test runtime")
+});
+
+/// Drives `future` on [`SHARED_RUNTIME`] and awaits its result from the caller's runtime.
+///
+/// A panic inside `future` is re-raised here, so it reaches the test with its own message rather
+/// than as an opaque join error.
+async fn on_shared_runtime<F>(future: F) -> F::Output
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match SHARED_RUNTIME.spawn(future).await {
+        Ok(output) => output,
+        Err(err) => match err.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(err) => panic!("shared test runtime task did not complete: {err}"),
+        },
+    }
+}
+
+/// Loads `.env` once per process; repeated loads would re-run `set_var` while
+/// other test threads are active.
+static DOTENV: LazyLock<()> = LazyLock::new(|| {
+    // SAFETY: `.env` loading mutates the process environment; it happens once,
+    // and tests only read these variables afterwards.
+    let _ = unsafe { dotenv::from_filename(".env") }.expect("failed to load .env file");
+});
+
+/// Hugging Face repository behind both phi3 fixtures.
+///
+/// Named once so the two fixtures cannot drift onto different spellings of the repository they
+/// share, which is what their [`TestModel::fetch_repo`] serialization keys on.
+const PHI3_REPO: &str = "microsoft/Phi-3-mini-4k-instruct";
+
+/// The `OpenAI` model the chat and Responses tests run against.
+const OPENAI_MODEL: &str = "gpt-4o-mini";
+
+/// The xAI model the chat and Responses tests run against.
+const XAI_MODEL: &str = "grok-4.3";
+
+static TEST_MODELS: LazyLock<Vec<TestModel>> = LazyLock::new(|| {
+    vec![
+        TestModel {
+            name: "bedrock",
+            fetch_repo: None,
+            create: Box::new(|| {
+                Box::pin(async {
+                    create::create_bedrock("us.amazon.nova-lite-v1:0")
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to create bedrock model: {e}"))
+                })
+            }),
+        },
+        TestModel {
+            name: "anthropic",
+            fetch_repo: None,
+            create: Box::new(|| {
+                Box::pin(async {
+                    create::create_anthropic(None)
+                        .map_err(|e| anyhow::anyhow!("failed to create anthropic model: {e}"))
+                })
+            }),
+        },
+        TestModel {
+            name: "google",
+            fetch_repo: None,
+            create: Box::new(|| {
+                Box::pin(async {
+                    create::create_google("gemini-2.0-flash")
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to create google model: {e}"))
+                })
+            }),
+        },
+        TestModel {
+            name: "openai",
+            fetch_repo: None,
+            create: Box::new(|| Box::pin(async { Ok(create::create_openai(OPENAI_MODEL)) })),
+        },
+        TestModel {
+            name: "xai",
+            fetch_repo: None,
+            create: Box::new(|| {
+                Box::pin(async {
+                    create::create_xai(XAI_MODEL).map_err(|e| {
+                        anyhow::anyhow!("failed to create '{XAI_MODEL}' from xAI: {e}")
+                    })
+                })
+            }),
+        },
+        TestModel {
+            name: "hf_phi3",
+            fetch_repo: Some(PHI3_REPO),
+            create: Box::new(|| {
+                Box::pin(async {
+                    create::create_hf(PHI3_REPO)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to create '{PHI3_REPO}' from HF: {e}"))
+                })
+            }),
+        },
+        TestModel {
+            name: "local_phi3",
+            fetch_repo: Some(PHI3_REPO),
+            create: Box::new(|| {
+                Box::pin(async {
+                    create::create_local(PHI3_REPO).await.map_err(|e| {
+                        anyhow::anyhow!("failed to create '{PHI3_REPO}' from local system: {e}")
+                    })
+                })
+            }),
+        },
+    ]
+});
+
+static MODEL_CACHES: LazyLock<Vec<(&'static str, ModelCache)>> = LazyLock::new(|| {
+    TEST_MODELS
         .iter()
-        .filter_map(|(name, _)| {
-            if TEST_ARGS.skip_model(name) {
+        .filter_map(|model| {
+            if TEST_ARGS.skip_model(model.name) {
                 None
             } else {
-                Some((*name, Mutex::new(None)))
+                Some((model.name, Mutex::new(None)))
             }
         })
         .collect()
 });
 
-/// A mapping of model names (in [`TEST_MODELS`]) and test names (in [`TEST_CASES`]) to skip.
-static TEST_DENY_LIST: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
-    vec![
-        ("hf_phi3", "tool_use"),
-        ("local_phi3", "tool_use"),
-        ("perplexity", "tool_use"),
-        ("perplexity", "system_prompt"),
-        ("perplexity", "supports_basic_message_roles"),
-        ("perplexity", "supports_all_message_roles"),
-        ("perplexity", "tool_use"),
-    ]
-});
+/// Whether the model is served in-process by mistral.rs rather than by a hosted provider.
+fn is_local_model(model_name: &str) -> bool {
+    matches!(model_name, "local_phi3" | "hf_phi3")
+}
 
-static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
-    vec![
-        test_case!(
-            "basic",
-            json!({
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "Say Hello"
-                    }
-                ]
-            }),
-            vec![(
-                "replied_appropriately",
-                "$.choices[*].message[?(@.content ~= 'Hello')].length()"
-            )]
-        ),
-        test_case!(
-            "usage",
-            json!({
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "Say Hello"
-                    }
-                ]
-            }),
-            vec![
-                (
-                    "has_prompt_tokens",
-                    "$.usage[?(@.prompt_tokens > 0)].length()"
-                ),
-                (
-                    "has_completion_tokens",
-                    "$.usage[?(@.completion_tokens > 0)].length()"
-                ),
-                (
-                    "has_total_tokens",
-                    "$.usage[?(@.total_tokens > 0)].length()"
-                ),
-                (
-                    "total_tokens_gt_prompt_tokens",
-                    "$.usage[?(@.total_tokens >= @.prompt_tokens)].length()"
-                ),
-                (
-                    "total_tokens_gt_completion_tokens",
-                    "$.usage[?(@.total_tokens >= @.completion_tokens)].length()"
-                )
-            ]
-        ),
-        test_case!(
-            "system_prompt",
-            json!({
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Quote back the exact message from the user"
-                    },
-                    {
-                        "role": "user",
-                        "content": "pong"
-                    }
-                ],
-                "max_completion_tokens": 100,
-            }),
-            vec![
-                (
-                    "assistant_response",
-                    "$.choices[*].message[?(@.role == 'assistant' && @.content ~= 'pong')].length()"
-                ),
-                (
-                    "replied_appropriately",
-                    "$.choices[*].message[?(@.content ~= '(?i)pong')].length()"
-                )
-            ]
-        ),
-        test_case!(
-            "supports_basic_message_roles",
-            json!({
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Quote back the exact message from the user"
-                    },
-                    {
-                        "role": "user",
-                        "content": "call a tool"
-                    },
-                    {
-                        "role": "assistant",
-                        "content": "Sorry I, can't call a tool. ",
-                    },
-                    {
-                        "role": "user",
-                        "content": "That's fine. Tell me a joke."
-                    }
-                ],
-            }),
-            // This test is just to ensure that the model can handle all message roles.
-            // We don't need to check the response.
-            vec![]
-        ),
-        test_case!(
-            "supports_all_message_roles",
-            json!({
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Quote back the exact message from the user"
-                    },
-                    {
-                        "role": "user",
-                        "content": "call a tool"
-                    },
-                    {
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": "1",
-                                "type": "function",
-                                "function": {
-                                    "name": "get_current_weather",
-                                    "arguments": "{\"location\": \"San Francisco, CA\"}"
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        "role": "tool",
-                        "content": "72",
-                        "tool_call_id": "1"
-                    }
-                ],
-                "tools": [
-                  {
-                    "type": "function",
-                    "function": {
-                      "name": "get_current_weather",
-                      "parameters": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                      }
-                    }
-                  }
-                ]
-            }),
-            // This test is just to ensure that the model can handle all message roles.
-            // We don't need to check the response.
-            vec![]
-        ),
-        test_case!(
-            "tool_use",
-            json!({
-                "messages": [
-                    {
-                      "role": "user",
-                      "content": "What'\''s the weather like in Boston today?"
-                    }
-                ],
-                "tool_choice": {"type": "function", "function": {"name": "get_current_weather"}},
-                "tools": [
-                  {
-                    "type": "function",
-                    "function": {
-                      "name": "get_current_weather",
-                      "description": "Get the current weather in a given location, in Celsius",
-                      "parameters": {
-                        "type": "object",
-                        "properties": {
-                          "location": {
-                            "type": "string",
-                            "description": "The city and state, e.g. San Francisco."
-                          },
-                          "unit": {
-                            "type": "string",
-                            "enum": ["celsius", "fahrenheit"]
-                          }
-                        },
-                        "required": ["location", "unit"]
-                      }
-                    }
-                  }
-                ]
-            }),
-            vec![
-                ("finish_reason", "$.choices[0].finish_reason"),
-                (
-                    "tool_choice",
-                    "$.choices[0].message.tool_calls[0].function.name"
-                ),
-                (
-                    "valid_function_args",
-                    "$.choices[0].message.tool_calls[0].function.arguments"
-                )
-            ]
-        ),
-    ]
-});
+/// Matches any non-empty content.
+///
+/// A small local model cannot be relied on to follow an instruction: asked to quote back
+/// `pong`, Phi-3-mini answers with the wrong word or with an essay about the arcade game.
+/// Its reply is therefore asserted for shape, not for wording — the same split
+/// `normalize_chat_completion_response` draws in `crates/runtime/tests/models/mod.rs`,
+/// where local models pass `normalize_message_content: true` and hosted models `false`.
+/// See <https://github.com/spiceai/spiceai/issues/3426>.
+const ANY_CONTENT: &str = "(?s).";
+
+/// The content regex a check should use for `model_name`: what a hosted provider was asked
+/// to say, or mere presence for a local model.
+fn content_pattern<'a>(model_name: &str, hosted: &'a str) -> &'a str {
+    if is_local_model(model_name) {
+        ANY_CONTENT
+    } else {
+        hosted
+    }
+}
+
+/// One lock per [`TestModel::creation_key`], shared by every fixture with that key.
+static CREATION_LOCKS: LazyLock<Vec<(&'static str, tokio::sync::Mutex<()>)>> =
+    LazyLock::new(|| {
+        let mut keys: Vec<&'static str> = TEST_MODELS.iter().map(TestModel::creation_key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.into_iter()
+            .map(|key| (key, tokio::sync::Mutex::new(())))
+            .collect()
+    });
+
+/// The lock serializing creations under `creation_key`.
+fn creation_lock(creation_key: &str) -> Result<&'static tokio::sync::Mutex<()>, anyhow::Error> {
+    CREATION_LOCKS
+        .iter()
+        .find(|(key, _)| *key == creation_key)
+        .map(|(_, lock)| lock)
+        .ok_or_else(|| anyhow::anyhow!("no creation lock registered for {creation_key}"))
+}
+
+/// Returns `cache`'s value, awaiting `create` and caching the result if it is empty.
+///
+/// Creations sharing a `creation_key` run one at a time, and each caches its result *before*
+/// releasing the lock. Both halves matter: the lock keeps two fixtures over one Hugging Face
+/// repository from contending for its blob locks, and caching inside it means a caller that
+/// waited finds the value the winner cached rather than creating a second copy of the same model
+/// (#13560).
+async fn get_or_create_cached<T: Clone>(
+    cache: &Mutex<Option<T>>,
+    lock: &tokio::sync::Mutex<()>,
+    create: impl Future<Output = Result<T, anyhow::Error>>,
+) -> Result<T, anyhow::Error> {
+    if let Some(cached) = cached(cache)? {
+        return Ok(cached);
+    }
+
+    let creation_guard = lock.lock().await;
+
+    // Re-checked under the lock: whoever held it before may have been creating this very value.
+    if let Some(cached) = cached(cache)? {
+        return Ok(cached);
+    }
+
+    let created = create.await?;
+    store_under_creation_lock(&creation_guard, cache, &created)?;
+
+    Ok(created)
+}
+
+/// Caches `value`, taking the creation guard by reference so that it cannot be cached outside the
+/// lock.
+///
+/// The ordering is the whole point of the lock — see [`get_or_create_cached`] — and no test can
+/// establish it. `#[tokio::test]` builds a current-thread runtime and there is no `.await` between
+/// releasing the guard and storing, so a store moved after the release still lands before the
+/// waiting caller is polled: it finds the value either way and the run count is 1 either way. Nor
+/// does a probe at the store site help, because tokio's mutex is fair — releasing a guard with a
+/// caller already queued hands the permit straight to that caller, so the lock never *looks* free
+/// from here even when the store has escaped it.
+///
+/// So the guarantee is carried by this signature instead. Moving the store after the guard is
+/// dropped leaves nothing to pass, and it stops compiling rather than silently regressing.
+fn store_under_creation_lock<T: Clone>(
+    _creation_guard: &tokio::sync::MutexGuard<'_, ()>,
+    cache: &Mutex<Option<T>>,
+    value: &T,
+) -> Result<(), anyhow::Error> {
+    *cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("cache could not be locked"))? = Some(value.clone());
+    Ok(())
+}
+
+/// Reads `cache` without holding its lock past the read, so it is never held across an `.await`.
+fn cached<T: Clone>(cache: &Mutex<Option<T>>) -> Result<Option<T>, anyhow::Error> {
+    let guard = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("cache could not be locked"))?;
+    Ok(guard.clone())
+}
 
 /// Get or create a model instance for the given name
 async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
-    // Find the model in TEST_MODELS
-    let (_, model_cache) = TEST_MODELS
+    let (_, model_cache) = MODEL_CACHES
         .iter()
         .find(|(name, _)| *name == model_name)
-        .ok_or_else(|| anyhow::anyhow!("model {model_name} not found in TEST_MODELS"))?;
+        .ok_or_else(|| anyhow::anyhow!("model {model_name} not found in MODEL_CACHES"))?;
 
-    // Check if model is already cached
-    {
-        let guard = model_cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("model cache could not be unlocked"))?;
-        if let Some(model) = guard.as_ref() {
-            return Ok(Arc::clone(model));
-        }
-    }
-
-    // Model not cached, create it
-    let (_, creator) = TEST_MODEL_CREATORS
+    let model_fixture = TEST_MODELS
         .iter()
-        .find(|(name, _)| *name == model_name)
+        .find(|model| model.name == model_name)
         .ok_or_else(|| anyhow::anyhow!("model creator {model_name} not found"))?;
 
-    let model = creator().await?;
-
-    // Cache the model
-    {
-        let mut guard = model_cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("model cache could not be locked"))?;
-        *guard = Some(Arc::clone(&model));
-    }
-
-    Ok(model)
+    get_or_create_cached(
+        model_cache,
+        creation_lock(model_fixture.creation_key())?,
+        (model_fixture.create)(),
+    )
+    .await
 }
 
-#[allow(clippy::expect_used, clippy::expect_fun_call)]
-async fn run_single_test(
-    test_name: &str,
-    model_name: &str,
-    as_stream: bool,
-) -> Result<(), anyhow::Error> {
-    let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
-    init_tracing(None);
+/// Times a test sends one request before a provider's transient refusal fails the test.
+const REQUEST_ATTEMPTS: u32 = 5;
 
-    // Check if we should skip this test; either because user specified to skip it, or this
-    // combination is not supported.
-    if TEST_DENY_LIST
-        .iter()
-        .any(|(m, t)| *m == model_name && *t == test_name)
-    {
-        return Ok(());
+/// Wait before the first retry. It doubles before each later retry.
+const FIRST_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Error codes with which a provider refuses a request only for now.
+///
+/// xAI sends `resource-exhausted` when the model is at capacity, and fails a started Responses
+/// stream with `server_error` for the same cause. `resource_exhausted` is the same code in the
+/// snake case of `OpenAI` error codes.
+const TRANSIENT_ERROR_CODES: &[&str] =
+    &["resource-exhausted", "resource_exhausted", "server_error"];
+
+fn is_transient_code(code: &str) -> bool {
+    TRANSIENT_ERROR_CODES.contains(&code)
+}
+
+/// Whether `error` is a refusal that the same request can get past later.
+///
+/// Reads only the provider's error code, never its message. `async-openai` cannot parse an xAI
+/// error body, so it hands one over as [`OpenAIError::JSONDeserialize`] with the raw body.
+fn is_transient(error: &OpenAIError) -> bool {
+    match error {
+        OpenAIError::ApiError(error) => error.code.as_deref().is_some_and(is_transient_code),
+        OpenAIError::JSONDeserialize(_, body) => {
+            serde_json::from_str::<Value>(body).is_ok_and(|body| {
+                [&body["code"], &body["error"]["code"]]
+                    .into_iter()
+                    .filter_map(Value::as_str)
+                    .any(is_transient_code)
+            })
+        }
+        _ => false,
     }
+}
 
-    let test = TEST_CASES
-        .iter()
-        .find(|t| t.name == test_name)
-        .expect("test case not found");
+/// Sends `request` until it succeeds, fails with an error that is not [`is_transient`], or has
+/// been refused [`REQUEST_ATTEMPTS`] times.
+///
+/// Hosted providers shed load by refusing a part of their requests, and a retry some seconds
+/// later gets through. The test checks Spice's handling of a model's answer, not that the
+/// provider has capacity when the test runs.
+async fn retry_transient<T, Fut>(
+    label: &str,
+    mut request: impl FnMut() -> Fut,
+) -> Result<T, OpenAIError>
+where
+    Fut: Future<Output = Result<T, OpenAIError>>,
+{
+    let mut delay = FIRST_RETRY_DELAY;
+    let mut attempt = 1;
+    loop {
+        match request().await {
+            Err(error) if attempt < REQUEST_ATTEMPTS && is_transient(&error) => {
+                tracing::warn!(
+                    "{label}: attempt {attempt} of {REQUEST_ATTEMPTS} was refused for now, retrying in {delay:?}: {error}"
+                );
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn run_test(
+    model_name: &str,
+    test_name: &str,
+    req: CreateChatCompletionRequest,
+    as_stream: bool,
+    json_path_checks: Vec<(&str, &str)>,
+) -> Result<Option<CreateChatCompletionResponse>, anyhow::Error> {
+    LazyLock::force(&DOTENV);
+    // Hold the guard for the body: `set_default` installs the subscriber only for the
+    // guard's lifetime, so dropping it here would discard every event this test logs.
+    let _tracing_guard = init_tracing(None);
 
     if TEST_ARGS.skip_model(model_name) {
         tracing::debug!("Skipping test {model_name}/{test_name}");
-        return Ok(());
+        return Ok(None);
     }
 
-    // Get and run model
-    let model = get_or_create_model(model_name)
-        .await
-        .unwrap_or_else(|e| panic!("failed to get or create model {model_name}: {e}"));
+    let model = on_shared_runtime({
+        let model_name = model_name.to_string();
+        async move { get_or_create_model(&model_name).await }
+    })
+    .await
+    .unwrap_or_else(|e| panic!("failed to get or create model {model_name}: {e}"));
 
-    tracing::info!("Running test {test_name}/{model_name} with {:?}", test.req);
+    tracing::info!("Running test {test_name}/{model_name} with {req:?}");
 
-    let actual_resp = if as_stream {
-        let mut req = test.req.clone();
-        req.stream = Some(true);
-        req.stream_options = Some(ChatCompletionStreamOptions {
-            include_usage: true,
-        });
-        accumulate(model.chat_stream(req).await.unwrap_or_else(|e| {
-            panic!("For test {test_name}/{model_name}, chat_request failed. Error: {e:#?}")
-        }))
-        .await
+    let label = format!("{test_name}/{model_name}");
+    let method = if as_stream {
+        "chat_stream"
     } else {
-        model
-            .chat_request(test.req.clone())
-            .await
-            .unwrap_or_else(|e| {
-                panic!("For test {test_name}/{model_name}, chat_request failed. Error: {e:#?}")
-            })
+        "chat_request"
     };
+    let actual_resp = retry_transient(&label, || {
+        let (model, mut req) = (Arc::clone(&model), req.clone());
+        on_shared_runtime(async move {
+            if as_stream {
+                req.stream = Some(true);
+                req.stream_options = Some(ChatCompletionStreamOptions {
+                    include_usage: Some(true),
+                    include_obfuscation: None,
+                });
+                accumulate(model.chat_stream(req).await?).await
+            } else {
+                model.chat_request(req).await
+            }
+        })
+    })
+    .await
+    .unwrap_or_else(|e| panic!("For test {label}, {method} failed. Error: {e:#?}"));
     tracing::debug!("Response for {test_name}/{model_name}: {actual_resp:?}");
 
-    // Perform snapshot test from JSONPaths into the response.
     let resp_value =
         serde_json::to_value(&actual_resp).expect("failed to serialize response to JSON");
-    for (id, json_ptr) in &test.json_path {
+    for (id, json_ptr) in &json_path_checks {
         let resp_ptr = JsonPath::from_str(json_ptr)
             .expect("invalid JSONPath selector")
             .find(&resp_value);
@@ -464,134 +481,756 @@ async fn run_single_test(
             serde_json::to_string_pretty(&resp_ptr).expect("Failed to serialize snapshot")
         );
     }
-    Ok(())
+    Ok(Some(actual_resp))
 }
 
-// Macro to create test module and functions
-#[macro_export]
-macro_rules! generate_model_tests {
-    () => {
-        macro_rules! test_model_case {
-            ($model_name_expr:expr, $test_case_expr:expr, true) => {
-                paste::paste! {
-                    #[tokio::test]
-                    async fn [<test_ $model_name_expr _ $test_case_expr _stream>]() {
-                        run_single_test(
-                            stringify!($test_case_expr),
-                            stringify!($model_name_expr),
-                            true
-                        ).await.expect("test failed");
-                    }
-                }
-            };
-            ($model_name_expr:expr, $test_case_expr:expr) => {
-                paste::paste! {
-                    #[tokio::test]
-                    async fn [<test_ $model_name_expr _ $test_case_expr>]() {
-                        run_single_test(
-                            stringify!($test_case_expr),
-                            stringify!($model_name_expr),
-                            false
-                        ).await.expect("test failed");
-                    }
-                }
-            };
-        }
+/// Drives a body that spawns a background task, drops the runtime the test itself owns, and
+/// reports whether the task then ran to completion.
+///
+/// The background task stands in for a connection task: spawned as a side effect of driving a
+/// request, and needed again by whichever test reuses the cached client next. With
+/// `via_shared_runtime` the body runs on [`SHARED_RUNTIME`], as [`run_test`] now drives every
+/// request; otherwise it runs on the per-test runtime, which is what produced #13575.
+fn spawned_work_outlives_per_test_runtime(via_shared_runtime: bool) -> bool {
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel::<()>();
+    let per_test = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build the per-test runtime");
 
-        // Non-Criteria test
-        test_model_case!(perplexity, basic);
-        test_model_case!(perplexity, usage);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
 
-        // Alpha Criteria
-        test_model_case!(anthropic, basic);
-        test_model_case!(anthropic, system_prompt);
-        test_model_case!(anthropic, supports_basic_message_roles);
-        test_model_case!(anthropic, basic, true);
-        test_model_case!(anthropic, system_prompt, true);
-        test_model_case!(anthropic, supports_basic_message_roles, true);
-
-        test_model_case!(openai, basic);
-        test_model_case!(openai, system_prompt);
-        test_model_case!(openai, supports_basic_message_roles);
-        test_model_case!(openai, basic, true);
-        test_model_case!(openai, system_prompt, true);
-        test_model_case!(openai, supports_basic_message_roles, true);
-
-        test_model_case!(xai, basic);
-        test_model_case!(xai, system_prompt);
-        test_model_case!(xai, supports_basic_message_roles);
-        test_model_case!(xai, basic, true);
-        test_model_case!(xai, system_prompt, true);
-        test_model_case!(xai, supports_basic_message_roles, true);
-
-        test_model_case!(local_phi3, basic);
-        test_model_case!(local_phi3, system_prompt);
-        test_model_case!(local_phi3, supports_basic_message_roles);
-        test_model_case!(local_phi3, basic, true);
-        test_model_case!(local_phi3, system_prompt, true);
-        test_model_case!(local_phi3, supports_basic_message_roles, true);
-
-        test_model_case!(hf_phi3, basic);
-        test_model_case!(hf_phi3, system_prompt);
-        test_model_case!(hf_phi3, supports_basic_message_roles);
-        test_model_case!(hf_phi3, basic, true);
-        test_model_case!(hf_phi3, system_prompt, true);
-        test_model_case!(hf_phi3, supports_basic_message_roles, true);
-
-        test_model_case!(bedrock, basic);
-        test_model_case!(bedrock, supports_basic_message_roles);
-        test_model_case!(bedrock, basic, true);
-        test_model_case!(bedrock, supports_basic_message_roles, true);
-        // Cannot comply with responding with just `pong`.
-        // test_model_case!(bedrock, system_prompt);
-        // test_model_case!(bedrock, system_prompt, true);
-
-        // Beta
-        test_model_case!(anthropic, tool_use);
-        test_model_case!(anthropic, usage);
-        test_model_case!(anthropic, supports_all_message_roles);
-        test_model_case!(anthropic, tool_use, true);
-        test_model_case!(anthropic, usage, true);
-        test_model_case!(anthropic, supports_all_message_roles, true);
-
-        test_model_case!(bedrock, tool_use);
-        test_model_case!(bedrock, usage);
-        test_model_case!(bedrock, supports_all_message_roles);
-        test_model_case!(bedrock, tool_use, true);
-        test_model_case!(bedrock, usage, true);
-        test_model_case!(bedrock, supports_all_message_roles, true);
-
-        test_model_case!(openai, tool_use);
-        test_model_case!(openai, tool_use, true);
-        test_model_case!(openai, usage);
-        test_model_case!(openai, usage, true);
-        test_model_case!(openai, supports_all_message_roles);
-        test_model_case!(openai, supports_all_message_roles, true);
-
-        test_model_case!(xai, tool_use);
-        test_model_case!(xai, tool_use, true);
-        test_model_case!(xai, usage);
-        test_model_case!(xai, usage, true);
-        test_model_case!(xai, supports_all_message_roles);
-        test_model_case!(xai, supports_all_message_roles, true);
-
-        test_model_case!(local_phi3, tool_use);
-        test_model_case!(local_phi3, tool_use, true);
-        test_model_case!(local_phi3, usage);
-        test_model_case!(local_phi3, usage, true);
-        // test_model_case!(local_phi3, supports_all_message_roles);
-        // test_model_case!(local_phi3, supports_all_message_roles, true);
-
-        test_model_case!(hf_phi3, tool_use);
-        test_model_case!(hf_phi3, tool_use, true);
-        test_model_case!(hf_phi3, usage);
-        test_model_case!(hf_phi3, usage, true);
-        // test_model_case!(hf_phi3, supports_all_message_roles);
-        // test_model_case!(hf_phi3, supports_all_message_roles, true);
+    let body = async move {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = started_tx.send(());
+            // Wait to be released rather than for a fixed time. The release is sent only after
+            // the per-test runtime is dropped, so the drop always happens first however the test
+            // thread is scheduled; a timer here would let a preempted thread finish the task
+            // early and report the control case as surviving.
+            let _ = release_rx.await;
+            let _ = finished_tx.send(());
+        });
+        // Both cases must measure survival rather than whether the task ever got going, so let
+        // it start before the runtime that spawned it can go away.
+        started_rx.await.expect("the background task never started");
     };
+
+    if via_shared_runtime {
+        per_test.block_on(on_shared_runtime(body));
+    } else {
+        per_test.block_on(body);
+    }
+    drop(per_test);
+    // Released only now: a task that died with the runtime can never observe this, so the two
+    // cases are separated by what survives the drop rather than by elapsed time.
+    let _ = release_tx.send(());
+
+    // Dropping a runtime drops its tasks, which drops `finished_tx` and disconnects the channel,
+    // so a task that died is reported immediately rather than by waiting out the timeout.
+    finished_rx.recv_timeout(Duration::from_secs(30)).is_ok()
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    generate_model_tests!();
+
+/// Work driven through [`on_shared_runtime`] must survive the test that started it, because the
+/// model cache hands the same client to a later test whose own runtime did not create it.
+///
+/// Regression test for #13575.
+#[test]
+fn shared_runtime_keeps_spawned_work_alive_past_the_test_that_started_it() {
+    // Control first: on the per-test runtime the task does not survive. Without this the
+    // assertion below would pass even if `on_shared_runtime` did nothing at all.
+    assert!(
+        !spawned_work_outlives_per_test_runtime(false),
+        "a task spawned on the per-test runtime outlived it, so this test can no longer tell whether the shared runtime is doing anything"
+    );
+
+    assert!(
+        spawned_work_outlives_per_test_runtime(true),
+        "work driven through `on_shared_runtime` died with the per-test runtime; a cached client's connection task would die with it too, failing the next test with `DispatchGone` (#13575)"
+    );
+}
+
+/// A panic while a request runs must reach the test with its own message, so
+/// [`on_shared_runtime`] has to re-raise that panic rather than replace it with a join error.
+#[test]
+fn on_shared_runtime_re_raises_the_original_panic() {
+    let per_test = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build the per-test runtime");
+
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        per_test.block_on(on_shared_runtime(async {
+            panic!("For test basic/xai, chat_request failed.");
+        }));
+    }))
+    .expect_err("the panic did not propagate out of `on_shared_runtime`");
+
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_else(|| panic!("the propagated panic carried no string payload"));
+    assert!(
+        message.contains("For test basic/xai, chat_request failed."),
+        "the panic reached the test as {message:?}, losing its diagnostic"
+    );
+}
+
+/// A refusal xAI sent while its model was at capacity is retried. A refusal of the request itself
+/// is not, so a request that Spice builds wrong still fails the test at once.
+#[test]
+fn only_transient_refusals_are_retried() {
+    // `async-openai` reads an error body as `WrappedError` and gives up on xAI's shape.
+    let unparsed = |body: &str| {
+        let error = serde_json::from_str::<async_openai::error::WrappedError>(body)
+            .expect_err("an xAI error body is not in the `OpenAI` shape");
+        OpenAIError::JSONDeserialize(error, body.to_string())
+    };
+    let parsed = |code: &str| {
+        OpenAIError::ApiError(async_openai::error::ApiError {
+            message: String::new(),
+            r#type: None,
+            param: None,
+            code: Some(code.to_string()),
+        })
+    };
+
+    assert!(is_transient(&unparsed(
+        r#"{"code":"resource-exhausted","error":"The model is currently at capacity due to high demand. Please try again in a few minutes, or use a higher service tier for priority processing: https://docs.x.ai/developers/advanced-api-usage/priority-processing"}"#
+    )));
+    assert!(is_transient(&parsed("resource_exhausted")));
+
+    assert!(!is_transient(&unparsed(
+        r#"{"code":"invalid-argument","error":"Temperature must be less than 2 but temperature = 9"}"#
+    )));
+    assert!(!is_transient(&parsed("invalid_argument")));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_basic(
+    #[values(
+        "anthropic",
+        "openai",
+        "xai",
+        "local_phi3",
+        "hf_phi3",
+        "bedrock",
+        "google"
+    )]
+    model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Say Hello"
+            }
+        ]
+    }))
+    .expect("failed to create request");
+
+    let replied_appropriately = format!(
+        "$.choices[*].message[?(@.content ~= '{}')].length()",
+        content_pattern(model_name, "Hello")
+    );
+
+    let resp = run_test(
+        model_name,
+        "basic",
+        req,
+        as_stream,
+        vec![("replied_appropriately", replied_appropriately.as_str())],
+    )
+    .await
+    .expect("test failed");
+
+    // A reply that answers is not a refusal: as in `OpenAI`'s API, `refusal` is unset unless the
+    // model declined, and the `ai_*` decision functions fail a request whose reply refuses.
+    if let Some(resp) = resp {
+        for choice in &resp.choices {
+            assert_eq!(
+                choice.message.refusal, None,
+                "{model_name} (stream: {as_stream}) answered and still reported a refusal"
+            );
+        }
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_usage(
+    #[values(
+        "anthropic",
+        "openai",
+        "xai",
+        "local_phi3",
+        "hf_phi3",
+        "bedrock",
+        "google"
+    )]
+    model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Say Hello"
+            }
+        ]
+    }))
+    .expect("failed to create request");
+
+    run_test(
+        model_name,
+        "usage",
+        req,
+        as_stream,
+        vec![
+            (
+                "has_prompt_tokens",
+                "$.usage[?(@.prompt_tokens > 0)].length()",
+            ),
+            (
+                "has_completion_tokens",
+                "$.usage[?(@.completion_tokens > 0)].length()",
+            ),
+            (
+                "has_total_tokens",
+                "$.usage[?(@.total_tokens > 0)].length()",
+            ),
+            (
+                "total_tokens_gt_prompt_tokens",
+                "$.usage[?(@.total_tokens >= @.prompt_tokens)].length()",
+            ),
+            (
+                "total_tokens_gt_completion_tokens",
+                "$.usage[?(@.total_tokens >= @.completion_tokens)].length()",
+            ),
+        ],
+    )
+    .await
+    .expect("test failed");
+}
+
+/// A reasoning model's usage counts its reasoning inside `completion_tokens`, as `OpenAI`
+/// does, so `total_tokens` is `prompt_tokens + completion_tokens`. xAI reports reasoning
+/// outside `completion_tokens`; the provider has to count it in.
+#[rstest]
+#[tokio::test]
+async fn test_reasoning_usage(
+    #[values("xai")] model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is 1234 * 5678? Answer with the number only."
+            }
+        ]
+    }))
+    .expect("failed to create request");
+
+    let Some(resp) = run_test(model_name, "reasoning_usage", req, as_stream, vec![])
+        .await
+        .expect("test failed")
+    else {
+        return;
+    };
+    let usage = resp
+        .usage
+        .unwrap_or_else(|| panic!("{model_name} (stream: {as_stream}) returned no usage"));
+    let reasoning = usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens)
+        .unwrap_or_default();
+    assert!(
+        reasoning > 0,
+        "{model_name} (stream: {as_stream}) reported no reasoning, so the check below proves nothing: {usage:?}"
+    );
+    assert!(
+        reasoning <= usage.completion_tokens,
+        "{model_name} (stream: {as_stream}) reported more reasoning tokens than completion tokens: {usage:?}"
+    );
+    assert_eq!(
+        usage.total_tokens,
+        usage.prompt_tokens + usage.completion_tokens,
+        "{model_name} (stream: {as_stream}) total is not prompt + completion: {usage:?}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_system_prompt(
+    #[values("anthropic", "openai", "xai", "local_phi3", "hf_phi3", "google")] model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Quote back the exact message from the user"
+            },
+            {
+                "role": "user",
+                "content": "pong"
+            }
+        ],
+        "max_completion_tokens": 100,
+    }))
+    .expect("failed to create request");
+    let assistant_response = format!(
+        "$.choices[*].message[?(@.role == 'assistant' && @.content ~= '{}')].length()",
+        content_pattern(model_name, "pong")
+    );
+    let replied_appropriately = format!(
+        "$.choices[*].message[?(@.content ~= '{}')].length()",
+        content_pattern(model_name, "(?i)pong")
+    );
+
+    run_test(
+        model_name,
+        "system_prompt",
+        req,
+        as_stream,
+        vec![
+            ("assistant_response", assistant_response.as_str()),
+            ("replied_appropriately", replied_appropriately.as_str()),
+        ],
+    )
+    .await
+    .expect("test failed");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_supports_basic_message_roles(
+    #[values(
+        "anthropic",
+        "openai",
+        "xai",
+        "local_phi3",
+        "hf_phi3",
+        "bedrock",
+        "google"
+    )]
+    model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Quote back the exact message from the user"
+            },
+            {
+                "role": "user",
+                "content": "call a tool"
+            },
+            {
+                "role": "assistant",
+                "content": "Sorry I, can't call a tool. ",
+            },
+            {
+                "role": "user",
+                "content": "That's fine. Tell me a joke."
+            }
+        ],
+    }))
+    .expect("failed to create request");
+
+    run_test(
+        model_name,
+        "supports_basic_message_roles",
+        req,
+        as_stream,
+        vec![],
+    )
+    .await
+    .expect("test failed");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_supports_all_message_roles(
+    #[values("anthropic", "openai", "xai", "bedrock", "google")] model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Quote back the exact message from the user"
+            },
+            {
+                "role": "user",
+                "content": "call a tool"
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_current_weather",
+                            "arguments": "{\"location\": \"San Francisco, CA\"}"
+                        }
+                    }
+                ]
+            },
+            {
+                "role": "tool",
+                "content": "72",
+                "tool_call_id": "1"
+            }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_current_weather",
+              "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              }
+            }
+          }
+        ]
+    }))
+    .expect("failed to create request");
+
+    run_test(
+        model_name,
+        "supports_all_message_roles",
+        req,
+        as_stream,
+        vec![],
+    )
+    .await
+    .expect("test failed");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_tool_use(
+    #[values("anthropic", "openai", "google", "xai", "bedrock")] model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    // serde_json::from_value(
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+              "role": "user",
+              "content": "What's the weather like in Boston today?"
+            }
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "get_current_weather"}},
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_current_weather",
+              "description": "Get the current weather in a given location, in Celsius",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "The city and state, e.g. San Francisco."
+                  },
+                  "unit": {
+                    "type": "string",
+                    "enum": ["celsius", "fahrenheit"]
+                  }
+                },
+                "required": ["location", "unit"]
+              }
+            }
+          }
+        ]
+    }))
+    .expect("failed to create request");
+
+    let resp = run_test(
+        model_name,
+        "tool_use",
+        req,
+        as_stream,
+        vec![
+            ("finish_reason", "$.choices[0].finish_reason"),
+            (
+                "tool_choice",
+                "$.choices[0].message.tool_calls[0].function.name",
+            ),
+        ],
+    )
+    .await
+    .expect("test failed");
+
+    let Some(resp) = resp else {
+        // Test was skipped
+        return;
+    };
+
+    let tool_calls = resp
+        .choices
+        .first()
+        .expect("no choices in response")
+        .message
+        .tool_calls
+        .as_ref()
+        .expect("no tool calls in message");
+
+    let first_tool_call = tool_calls.first().expect("no tool calls");
+    let function = match first_tool_call {
+        ChatCompletionMessageToolCalls::Function(f) => &f.function,
+        ChatCompletionMessageToolCalls::Custom(_) => panic!("unexpected custom tool call"),
+    };
+
+    // The arguments are model-written, so check them against the tool's schema rather than one
+    // model's wording: providers differ on `"Boston"` vs `"Boston, MA"` and on which unit to pick.
+    let args: WeatherArgs = serde_json::from_str(&function.arguments).unwrap_or_else(|e| {
+        panic!(
+            "tool_use/{model_name}: arguments {:?} do not match the get_current_weather schema: {e}",
+            function.arguments
+        )
+    });
+    assert!(
+        args.location.to_lowercase().contains("boston"),
+        "tool_use/{model_name}: location {:?} does not name the city asked about",
+        args.location
+    );
+}
+
+/// The parameters `test_tool_use` declares for `get_current_weather`. Deserializing into this is
+/// the schema check: both fields are required, and `unit` must be one of its enum values.
+#[derive(Debug, serde::Deserialize)]
+struct WeatherArgs {
+    location: String,
+    #[serde(rename = "unit")]
+    _unit: TemperatureUnit,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TemperatureUnit {
+    Celsius,
+    Fahrenheit,
+}
+
+/// The creation lock fixture `name` resolves to.
+fn fixture_creation_lock(name: &str) -> &'static tokio::sync::Mutex<()> {
+    let key = TEST_MODELS
+        .iter()
+        .find(|model| model.name == name)
+        .unwrap_or_else(|| panic!("fixture {name} is not registered in TEST_MODELS"))
+        .creation_key();
+    creation_lock(key).unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+}
+
+/// `hf_phi3` and `local_phi3` fetch one Hugging Face repository, so they must resolve to one
+/// creation lock: `hf_hub` fails a blob whose lock file is already taken instead of waiting for
+/// the download in flight, so two unserialized creations race and the loser panics.
+///
+/// Regression test for #13560.
+#[test]
+fn the_two_phi3_fixtures_share_one_creation_lock() {
+    // Control first: a fixture that downloads nothing gets a lock of its own, so this is not
+    // merely observing that every fixture shares one global lock.
+    assert!(
+        !std::ptr::eq(
+            fixture_creation_lock("hf_phi3"),
+            fixture_creation_lock("openai")
+        ),
+        "'hf_phi3' and 'openai' share a creation lock; they fetch nothing in common, so this test can no longer tell whether the lock is keyed on the artifact repository at all"
+    );
+
+    assert!(
+        std::ptr::eq(
+            fixture_creation_lock("hf_phi3"),
+            fixture_creation_lock("local_phi3")
+        ),
+        "'hf_phi3' and 'local_phi3' resolve to different creation locks, so their creations can run concurrently; they fetch one Hugging Face repository, and both would race on its blob lock (#13560)"
+    );
+}
+
+/// A stand-in creation that reports when it runs, counts its runs on `runs`, and waits to be
+/// released before returning `value`.
+///
+/// Returns the "it ran" receiver, the release sender, and the creation itself. A creation that
+/// should not block is released before it is spawned; a `oneshot` delivers a value sent ahead of
+/// the receiver, so the creation returns as soon as it runs.
+fn probe_creation(
+    runs: Arc<AtomicUsize>,
+    value: &'static str,
+) -> (
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+    impl Future<Output = Result<&'static str, anyhow::Error>>,
+) {
+    let (ran_tx, ran) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+
+    let create = async move {
+        runs.fetch_add(1, Ordering::SeqCst);
+        let _ = ran_tx.send(());
+        let _ = release_rx.await;
+        Ok(value)
+    };
+
+    (ran, release, create)
+}
+
+/// Waits, bounded, for the creation behind `ran` to start, and reports whether it did.
+///
+/// Bounded rather than polled because one caller below is establishing the *absence* of a
+/// creation, which can only be established by waiting for one. The caller that expects the
+/// creation returns as soon as it runs, so the timeout is only ever spent proving a negative.
+async fn creation_starts(ran: oneshot::Receiver<()>) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), ran)
+        .await
+        .is_ok_and(|started| started.is_ok())
+}
+
+/// A caller that waits for the creation lock must find the value the winner cached, not create a
+/// second copy — for `local_phi3` a second copy is another set of model weights resident in the
+/// test process. That holds only because the value is cached *before* the lock is released.
+///
+/// This test does not establish that ordering, and cannot: see
+/// [`store_under_creation_lock`], whose signature is what holds it. What this covers is the
+/// behaviour on top of it — that a caller which waits is served the cached value rather than
+/// creating its own, and that it is served the *same* value.
+///
+/// Uses a lock of its own rather than a fixture's: the registry's locks are shared with the model
+/// creations the rest of this binary performs, and blocking one for the duration of this test
+/// would stall them.
+#[tokio::test]
+async fn a_caller_that_waits_for_a_creation_takes_its_cached_value() {
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let cache = Arc::new(Mutex::new(None));
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let (first_ran, first_release, first_create) = probe_creation(Arc::clone(&runs), "created");
+    let (second_ran, second_release, second_create) =
+        probe_creation(Arc::clone(&runs), "created again");
+    // The second creation is under test for whether it *starts*, so it must not block once it has.
+    let _ = second_release.send(());
+
+    let (first_cache, first_lock) = (Arc::clone(&cache), Arc::clone(&lock));
+    let first_call =
+        tokio::spawn(
+            async move { get_or_create_cached(&first_cache, &first_lock, first_create).await },
+        );
+
+    // Also the control for the assertion below: it shows `creation_starts` can observe a creation
+    // that does start, so the negative there is not vacuous.
+    assert!(
+        creation_starts(first_ran).await,
+        "the first creation never started"
+    );
+
+    // Spawned while the first still holds the lock, so it reaches the cache only after the first
+    // has released — which is the handoff under test.
+    let (second_cache, second_lock) = (Arc::clone(&cache), Arc::clone(&lock));
+    let second_call = tokio::spawn(async move {
+        get_or_create_cached(&second_cache, &second_lock, second_create).await
+    });
+
+    // If the second caller could get past the lock now, it would observe the empty cache and
+    // create its own copy.
+    assert!(
+        !creation_starts(second_ran).await,
+        "a second creation started while the first held the creation lock, so the two are not serialized at all"
+    );
+
+    let _ = first_release.send(());
+    let first_value = first_call
+        .await
+        .expect("the first call panicked")
+        .expect("the first creation failed");
+    let second_value = second_call
+        .await
+        .expect("the second call panicked")
+        .expect("the second call failed");
+
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the waiting caller created a second value instead of taking the one already cached; caching happens inside the creation lock precisely so it cannot (#13560)"
+    );
+    assert_eq!(
+        second_value, first_value,
+        "the waiting caller returned a different value than the one that was cached"
+    );
+}
+
+/// The built-in Anthropic default has to satisfy two things no unit test can check: Anthropic
+/// still serves it, and it still accepts the sampling controls the adapter forwards. Anthropic's
+/// newest generation answers ``temperature` is deprecated for this model.` and rejects the request
+/// outright (#13564), so a default bumped onto such a model would turn every configuration that
+/// sets `temperature` into a guaranteed 400 — while every test that sets none of these stays green.
+/// This is the guard for that, and it is why the default trails Anthropic's newest model.
+///
+/// One control per request: every Claude 4+ model rejects `temperature` and `top_p` set *together*,
+/// so a request carrying both asserts nothing about the default — it 400s on any model this constant
+/// may name. #13579 tracks the adapter forwarding that combination.
+///
+/// This builds its own model rather than going through `run_test`/`get_or_create_model`, which is
+/// the one deviation from every other test in this file and is load-bearing. That cache holds one
+/// client per provider for the whole binary while each `#[tokio::test]` owns its own runtime, so a
+/// request can be issued on a client whose hyper dispatch task was spawned on a runtime that has
+/// since been dropped — it then fails with `User(DispatchGone)` before reaching Anthropic (#13575).
+/// Measured, not assumed: that is what took this guard in
+/// [run 32982484882](https://github.com/spiceai/spiceai/actions/runs/32982484882) and again in
+/// [run 33017678054](https://github.com/spiceai/spiceai/actions/runs/33017678054) after it had been
+/// narrowed to a single test, because the exposure comes from *which* runtime created the cached
+/// client, not from how many tests or requests use it. Owning the client keeps its dispatch task on
+/// this test's runtime, so a failure here is Anthropic's answer rather than a dead client.
+///
+/// No snapshots: the assertion is that each request was accepted at all. Passing `None` as the model
+/// id is what makes this exercise whatever the default currently is rather than a pinned copy of it.
+#[tokio::test]
+async fn default_anthropic_model_accepts_forwarded_sampling_controls() {
+    LazyLock::force(&DOTENV);
+    let _tracing = init_tracing(None);
+
+    if TEST_ARGS.skip_model("anthropic") {
+        tracing::debug!("Skipping test anthropic/default_sampling_controls");
+        return;
+    }
+
+    let model = create::create_anthropic(None)
+        .unwrap_or_else(|e| panic!("failed to build the default Anthropic model: {e}"));
+
+    // Every control `crates/llms/src/anthropic/chat.rs` forwards to Anthropic. `top_logprobs` is
+    // not one: the adapter refuses it before any request is sent (#13581), so it is covered by that
+    // file's unit tests rather than here.
+    for (control, value) in [("temperature", json!(0.5)), ("top_p", json!(0.9))] {
+        let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "not_needed",
+            "messages": [{"role": "user", "content": "Say Hello"}],
+            "max_completion_tokens": 16,
+            control: value,
+        }))
+        .unwrap_or_else(|e| panic!("failed to create the {control} request: {e}"));
+
+        model
+            .chat_request(req)
+            .await
+            .unwrap_or_else(|e| panic!("the default model rejected {control}: {e:#?}"));
+    }
 }

@@ -23,12 +23,13 @@ use std::{
 
 use crate::{
     metrics::QueryStatus,
-    queries::{self, QueryOverrides, QuerySet},
+    queries::{self, QuerySet},
 };
 use anyhow::{Context, Result};
 use futures::future::join_all;
 use indicatif::{MultiProgress, ProgressBar};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use super::{
     SpiceTest, TestNotStarted, TestState,
@@ -39,7 +40,65 @@ mod worker;
 use worker::{AppendConfig, AppendWorker};
 
 mod sources;
+use crate::queries::QueryOverrides;
 use sources::FileAppendableSource;
+
+/// Every conflicting row has its marker column set at or below this value. No
+/// TPC-H row holds one: the only column that can be negative, an account
+/// balance, bottoms out at -999.99.
+const TPCH_CONFLICT_MARKER_CEILING: i64 = -1_000_000;
+
+/// A non-key numeric column per TPC-H table, each one read by at least one TPC-H
+/// query. Setting it below every real value in a conflicting row makes that row's
+/// survival visible to the query results, so an `on_conflict` that keeps the
+/// superseded row fails the benchmark's own answers rather than passing
+/// unnoticed, and lets a check count the conflicting rows still present.
+const TPCH_CONFLICT_MARKER_COLUMNS: &[(&str, &str)] = &[
+    ("customer", "c_acctbal"),
+    ("lineitem", "l_extendedprice"),
+    ("orders", "o_totalprice"),
+    ("part", "p_size"),
+    ("partsupp", "ps_supplycost"),
+    ("supplier", "s_acctbal"),
+];
+
+/// The marker column of a TPC-H table's conflicting rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictMarker {
+    pub table: &'static str,
+    pub column: &'static str,
+}
+
+impl ConflictMarker {
+    /// The `SET` clause that marks a conflicting copy of a row.
+    #[must_use]
+    pub fn assignment(&self) -> String {
+        let column = self.column;
+        format!(
+            "{column} = -ABS({column}) - {}",
+            -TPCH_CONFLICT_MARKER_CEILING
+        )
+    }
+
+    /// The predicate matching only marked rows: those an upsert must have replaced.
+    #[must_use]
+    pub fn predicate(&self) -> String {
+        format!("{} <= {TPCH_CONFLICT_MARKER_CEILING}", self.column)
+    }
+}
+
+/// The marker of every TPC-H table whose conflicting rows carry one.
+pub fn tpch_conflict_markers() -> impl Iterator<Item = ConflictMarker> {
+    TPCH_CONFLICT_MARKER_COLUMNS
+        .iter()
+        .map(|&(table, column)| ConflictMarker { table, column })
+}
+
+/// The marker of a TPC-H table's conflicting rows, if it has one.
+#[must_use]
+pub fn tpch_conflict_marker(table: &str) -> Option<ConflictMarker> {
+    tpch_conflict_markers().find(|marker| marker.table == table)
+}
 
 #[derive(Default)]
 pub struct NotStarted {
@@ -49,6 +108,10 @@ pub struct NotStarted {
     parallel_count: usize,
     end_duration: Duration,
     tempdir_path: Option<PathBuf>,
+    load_interval: Option<Duration>,
+    load_steps: Option<u16>,
+    with_conflict_data: bool,
+    with_retention_test_data: bool,
 }
 
 impl NotStarted {
@@ -63,16 +126,18 @@ impl NotStarted {
         self
     }
 
-    #[must_use]
-    pub fn with_query_set(
+    pub async fn with_query_set(
         mut self,
         query_set: QuerySet,
         overrides: Option<QueryOverrides>,
-    ) -> Self {
-        self.queries = query_set.get_queries(overrides);
+        scale_factor: Option<f64>,
+    ) -> Result<Self> {
+        self.queries = query_set
+            .get_queries(overrides, None, None, scale_factor)
+            .await?;
         self.query_count = self.queries.len();
         self.query_set = query_set;
-        self
+        Ok(self)
     }
 
     #[must_use]
@@ -87,6 +152,30 @@ impl NotStarted {
         self
     }
 
+    #[must_use]
+    pub fn with_load_interval(mut self, load_interval: Duration) -> Self {
+        self.load_interval = Some(load_interval);
+        self
+    }
+
+    #[must_use]
+    pub fn with_load_steps(mut self, load_steps: u16) -> Self {
+        self.load_steps = Some(load_steps);
+        self
+    }
+
+    #[must_use]
+    pub fn with_conflict_data(mut self, with_conflict_data: bool) -> Self {
+        self.with_conflict_data = with_conflict_data;
+        self
+    }
+
+    #[must_use]
+    pub fn with_retention_test_data(mut self, with_retention_test_data: bool) -> Self {
+        self.with_retention_test_data = with_retention_test_data;
+        self
+    }
+
     pub fn get_tempdir_path(&self) -> Result<&PathBuf> {
         self.tempdir_path
             .as_ref()
@@ -96,7 +185,8 @@ impl NotStarted {
 
 pub struct AppendStarted {
     queries: Vec<queries::Query>,
-    append_worker: JoinHandle<Result<()>>,
+    append_worker: AppendWorker,
+    query_shutdown: CancellationToken,
     query_count: usize,
     parallel_count: usize,
     end_duration: Duration,
@@ -107,6 +197,7 @@ pub struct Running {
     end_duration: Duration,
     query_workers: SpiceTestQueryWorkers,
     append_worker: JoinHandle<Result<()>>,
+    query_shutdown: CancellationToken,
     progress_bar: Option<MultiProgress>,
     query_count: usize,
     parallel_count: usize,
@@ -128,16 +219,25 @@ impl SpiceTest<NotStarted> {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
-        let append_config = AppendConfig::new(
+        let mut append_config = AppendConfig::new(
             self.state.end_duration,
-            self.state.query_set,
+            self.state.query_set.clone(),
             self.state.get_tempdir_path()?.clone(),
-        );
+        )
+        .with_conflict_data(self.state.with_conflict_data)
+        .with_retention_test_data(self.state.with_retention_test_data);
+
+        if let Some(load_interval) = self.state.load_interval {
+            append_config = append_config.with_load_interval(load_interval);
+        }
+
+        if let Some(load_steps) = self.state.load_steps {
+            append_config = append_config.with_load_steps(load_steps);
+        }
         let append_source = FileAppendableSource::new(&append_config);
 
-        let append_worker = AppendWorker::new(append_config, Box::new(append_source))
-            .start()
-            .await?;
+        let append_worker = AppendWorker::new(append_config, Box::new(append_source));
+        append_worker.setup().await?;
 
         Ok(SpiceTest {
             name: self.name,
@@ -147,9 +247,11 @@ impl SpiceTest<NotStarted> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: AppendStarted {
                 queries: self.state.queries.clone(),
                 append_worker,
+                query_shutdown: CancellationToken::new(),
                 query_count: self.state.query_count,
                 parallel_count: self.state.parallel_count,
                 end_duration: self.state.end_duration,
@@ -175,17 +277,26 @@ impl SpiceTest<AppendStarted> {
             .spice_client(self.api_key.clone(), false)
             .await?;
 
+        let executor: Box<dyn crate::execution::QueryExecutor> = Box::new(
+            crate::execution::FlightExecutor::new(Arc::new(spice_client)),
+        );
+
         let query_workers = (0..self.state.parallel_count)
             .map(|id| {
+                // Queries run until the append worker finishes, which is after both
+                // the test duration and the last load, so every load lands while
+                // queries are running.
                 let worker = SpiceTestQueryWorker::new(
                     id,
                     self.state.queries.clone(),
-                    EndCondition::Duration(self.state.end_duration),
-                    spice_client.clone(),
+                    EndCondition::Unlimited,
                     self.name.clone(),
+                    executor.clone(),
                 )
+                .with_shutdown_token(self.state.query_shutdown.clone())
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)
-                .with_results_snapshot(self.results_snapshot_predicate);
+                .with_results_snapshot(self.results_snapshot_predicate)
+                .with_validate_row_count(self.validate_row_count);
 
                 if let Some(multi) = &multi {
                     worker.with_progress_bar(multi.add(self.get_new_progress_bar()))
@@ -204,6 +315,7 @@ impl SpiceTest<AppendStarted> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
@@ -211,7 +323,8 @@ impl SpiceTest<AppendStarted> {
                 query_count: self.state.query_count,
                 parallel_count: self.state.parallel_count,
                 end_duration: self.state.end_duration,
-                append_worker: self.state.append_worker,
+                append_worker: self.state.append_worker.start_loads(),
+                query_shutdown: self.state.query_shutdown,
             },
         })
     }
@@ -229,17 +342,18 @@ impl SpiceTest<Running> {
                     worker.abort();
                 });
 
-                return Err(anyhow::anyhow!("Append worker failed: {}", e));
+                return Err(anyhow::anyhow!("Append worker failed: {e}"));
             }
             Ok(Err(e)) => {
                 self.state.query_workers.iter().for_each(|worker| {
                     worker.abort();
                 });
 
-                return Err(anyhow::anyhow!("Append worker failed: {}", e));
+                return Err(anyhow::anyhow!("Append worker failed: {e}"));
             }
             _ => {}
         }
+        self.state.query_shutdown.cancel();
 
         for worker_result in join_all(self.state.query_workers).await {
             let worker_result = worker_result??;
@@ -295,6 +409,7 @@ impl SpiceTest<Running> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: datasets::Completed {
                 query_durations,
                 query_iteration_durations,

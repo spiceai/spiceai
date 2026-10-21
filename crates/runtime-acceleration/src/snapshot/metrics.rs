@@ -18,6 +18,11 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 
+// The `telemetry::` records in each `record_*` below bind to a provider that shares no exporter
+// with the global one, so their quantiles only compare with these while both name the same
+// boundaries. Hence the shared constant rather than a copy, which is what let the two sets drift.
+use telemetry::DURATION_MS_HISTOGRAM_BUCKETS;
+
 static METER: LazyLock<Meter> =
     LazyLock::new(|| global::meter("dataset_acceleration_snapshot_metrics"));
 
@@ -67,6 +72,7 @@ static SNAPSHOT_WRITE_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
             "Time in milliseconds taken to write the latest snapshot to object storage.",
         )
         .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
 
@@ -84,12 +90,26 @@ static SNAPSHOT_WRITE_CHECKSUM: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .build()
 });
 
+static SNAPSHOT_SKIPPED_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_snapshot_skipped_count")
+        .with_description("Number of snapshot creations skipped due to no data updates.")
+        .build()
+});
+
 fn dataset_label(dataset: &str) -> KeyValue {
     KeyValue::new("dataset", dataset.to_string())
 }
 
 pub fn record_bootstrap_metrics(dataset: &str, duration_ms: f64, bytes: u64, checksum: &str) {
     let dataset_attr = dataset_label(dataset);
+
+    telemetry::record_snapshot_bootstrap_metrics(
+        duration_ms,
+        bytes,
+        std::slice::from_ref(&dataset_attr),
+    );
+
     let duration_labels = [dataset_attr.clone()];
     SNAPSHOT_BOOTSTRAP_DURATION_MS.add(duration_ms, &duration_labels);
 
@@ -105,7 +125,19 @@ pub fn record_bootstrap_metrics(dataset: &str, duration_ms: f64, bytes: u64, che
 
 pub fn record_snapshot_failure(dataset: &str) {
     let labels = [dataset_label(dataset)];
+    telemetry::record_snapshot_failure(&labels);
     SNAPSHOT_FAILURE_COUNT.add(1, &labels);
+}
+
+/// Publishes `dataset`'s snapshot failure count at zero, so a dataset that creates
+/// snapshots reports the series before its first failure and an alert can fire on
+/// the rise. Call it only for a dataset that creates snapshots: one that does not
+/// has no failure count to report.
+///
+/// This adds zero to the cumulative count, so failures already counted for the
+/// dataset are kept: it creates the series, it never resets it.
+pub fn publish_snapshot_failure_count_at_zero(dataset: &str) {
+    SNAPSHOT_FAILURE_COUNT.add(0, &[dataset_label(dataset)]);
 }
 
 pub fn record_write_metrics(
@@ -116,6 +148,12 @@ pub fn record_write_metrics(
     checksum: &str,
 ) {
     let dataset_attr = dataset_label(dataset);
+
+    telemetry::record_snapshot_write_metrics(
+        duration_ms,
+        bytes,
+        std::slice::from_ref(&dataset_attr),
+    );
 
     let timestamp_labels = [dataset_attr.clone()];
     SNAPSHOT_WRITE_TIMESTAMP.record(timestamp_secs, &timestamp_labels);
@@ -131,4 +169,10 @@ pub fn record_write_metrics(
         KeyValue::new("checksum", checksum.to_string()),
     ];
     SNAPSHOT_WRITE_CHECKSUM.record(1.0, &checksum_labels);
+}
+
+pub fn record_snapshot_skipped(dataset: &str) {
+    let labels = [dataset_label(dataset)];
+    telemetry::record_snapshot_skipped(&labels);
+    SNAPSHOT_SKIPPED_COUNT.add(1, &labels);
 }

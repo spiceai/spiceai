@@ -1,3 +1,5 @@
+# AWS Glue bills per use, so this runs on the weekly schedule instead of daily.
+schedule: weekly
 tests:
   bench:
     spicepod_path: federated/glue[catalog].yaml
@@ -5,3 +7,7 @@ tests:
     query_overrides: glue-catalog
     runner_type: spiceai-dev-runners
     validate_results: true
+  schema:
+    spicepod_path: federated/glue[catalog].yaml
+    runner_type: spiceai-dev-runners
+    min_tables: 1

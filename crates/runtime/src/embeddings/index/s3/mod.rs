@@ -21,7 +21,7 @@ use aws_config::timeout::TimeoutConfigBuilder;
 use data_components::s3_vectors::{
     MetadataColumn as S3MetadataColumn, S3VectorIdentifier, S3VectorsTable,
 };
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_expr::Expr;
 use llms::embeddings::get_or_infer_size;
 use s3_vectors::{Client, S3Vectors};
@@ -41,15 +41,19 @@ use crate::{
     model::EmbeddingModelStore,
     parameters::{ParameterSpec, Parameters},
 };
-use retry_client::S3VectorRetryClientBuilder;
+use runtime_parameters_typed::TypedParams as _;
+use runtime_search::store_params::s3::{S3DistanceMetric, S3VectorsParams};
 use runtime_secrets::{Secrets, get_params_with_secrets};
+use secrecy::ExposeSecret;
 mod client;
 mod metrics;
-use client::S3VectorClient;
+use client::S3VectorsTelemetryMiddleware;
 mod retry_client;
+use retry_client::S3VectorsRetryMiddlewareBuilder;
 
-const DEFAULT_BATCH_WRITE_ROWS: usize = 100_000;
-
+/// Feeds the AWS credential resolver (`initiate_config_with_credentials`), which is shared
+/// with the Glue and Iceberg connectors and reads a [`Parameters`]. Type/enum validation,
+/// aliases, and typo warnings for the whole component live on [`S3VectorsParams`].
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("bucket")
         .description("The S3 bucket name to use for the S3 Vectors index.")
@@ -81,12 +85,19 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_session_token")
         .description("The AWS session token to use.")
         .secret(),
+    ParameterSpec::component("aws_iam_role_source")
+        .description("IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
+        .one_of(&["auto", "metadata", "env"]),
+    ParameterSpec::component("index_poll_interval")
+        .description("Cache duration for listing S3 vector indexes (minimum: 5s). Defaults to list on every query."),
     ParameterSpec::component("batch_write_rows")
         .description("The number of rows to chunk record batches into for individual processing. Used to control memory usage during writes."),
+    ParameterSpec::component("spill_writes")
+        .description("If true, during periods where write throughput exceeds S3 vector rate limits, create and spill to an separate physical index. At query time, the spill index will also be queried. Incompatible with vector partitioning."),
 ];
 
 /// Attempt to construct an [`S3Vector`] for the provided dataset/view on the given column.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn try_from_table(
     ds_name: &TableReference,
     column: String,
@@ -114,21 +125,34 @@ pub async fn try_from_table(
 
     tracing::debug!("s3 vector index metadata columns: {metadata_columns:?}");
 
-    let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
+    let model = {
+        let model_read = embedding_models.read().await;
+        let Some(model) = model_read.get(&config.model) else {
+            return Err(Box::from(format!(
+                "Cannot make S3 vector index for table '{ds_name}' column '{column}'. Embedding model '{}' is not defined in the Spicepod or failed to load. Ensure it is defined under `embeddings` and loads successfully, then check earlier model-load errors or logs for details.",
+                config.model
+            )));
+        };
+        Arc::clone(model)
+    };
 
-    let batch_write_rows = string_from_params(&params, "batch_write_rows")
-        .and_then(|s| match s.parse::<usize>() {
-            Ok(val) => Some(val),
-            Err(e) => {
-                tracing::warn!("Invalid value for 's3_vectors_batch_write_rows': {s}. Error: {e}. Falling back to default: {DEFAULT_BATCH_WRITE_ROWS}");
-                None
-            },
-        })
-        .unwrap_or(DEFAULT_BATCH_WRITE_ROWS);
+    let (params, auth_params) = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
+    let batch_write_rows = params.batch_write_rows;
+    let spill_writes = match params.spill_writes {
+        Some(value) if partition_by.is_empty() => Some(value),
+        Some(_) => {
+            tracing::warn!(
+                "Spill writes are not supported with partitioned S3 vector indexes. Ignoring 's3_vectors_spill_writes' setting."
+            );
+            None
+        }
+        None => None,
+    };
     let table = try_vector_table(
         metadata_columns.clone(),
-        params,
+        &params,
+        &auth_params,
         format!("{}-{}-{}", ds_name, column, config.model)
             .replace('_', "-")
             .as_str(),
@@ -137,26 +161,24 @@ pub async fn try_from_table(
     )
     .await?;
 
-    let model_read = embedding_models.read().await;
-    let Some(model) = model_read.get(&config.model) else {
-        return Err(Box::from(format!(
-            "Cannot make S3 vector index for table '{}'. No embedding model named: '{}'.",
-            ds_name, config.model
-        )));
-    };
-
-    Ok(S3Vector::new(
+    let mut s3_vec = S3Vector::new(
         table,
         column.clone(),
         primary_key,
         metadata_columns,
-        Arc::clone(model),
+        model,
         partition_by,
         batch_write_rows,
-    ))
+    );
+
+    if spill_writes == Some(true) {
+        s3_vec = s3_vec.enable_spill_writes();
+    }
+
+    Ok(s3_vec)
 }
 
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_sign_loss)]
 async fn embedding_vector_size(
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     model_name: &str,
@@ -169,28 +191,20 @@ async fn embedding_vector_size(
 // Attempt to construct a S3 vector table from user-provided parameters.
 //
 // If no index name provided (either explicitly, or in ARN), use `default_s3_index_name`.
-#[allow(clippy::cast_possible_wrap)]
+#[expect(clippy::cast_possible_wrap)]
 async fn try_vector_table(
     columns: MetadataColumns,
-    params: Parameters,
+    params: &S3VectorsParams,
+    auth_params: &Parameters,
     default_s3_index_name: &str,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     model_name: &str,
 ) -> Result<S3VectorsTable, Box<dyn std::error::Error + Send + Sync>> {
-    let s3_vectors_arn = string_from_params(&params, "arn");
-    let s3_vectors_bucket = string_from_params(&params, "bucket");
-    let s3_vectors_index = string_from_params(&params, "index");
-    let client_timeout = string_from_params(&params, "client_timeout")
-        .map(fundu::parse_duration)
-        .transpose()
-        .map_err(|_| {
-            Box::from(format!(
-                "S3 vectors index configured with invalid 'client_timeout'= '{}'",
-                string_from_params(&params, "client_timeout").unwrap_or_default() // If missing, uses default ("").
-            )) as Box<dyn std::error::Error + Send + Sync>
-        })?;
-
-    let id = match (s3_vectors_arn, s3_vectors_bucket, s3_vectors_index) {
+    let id = match (
+        params.arn.as_ref().map(ExposeSecret::expose_secret),
+        params.bucket.as_ref().map(ExposeSecret::expose_secret),
+        params.index.as_ref().map(ExposeSecret::expose_secret),
+    ) {
         (Some(_), Some(_), Some(_)) => Err("Cannot specify both 's3_vectors_arn' and 's3_vectors_bucket'.".to_string()),
         (Some(arn), None, None) => Ok(S3VectorIdentifier::IndexArn(arn.to_string())),
         (None, Some(bucket), Some(index)) => Ok(S3VectorIdentifier::Index {
@@ -217,21 +231,26 @@ async fn try_vector_table(
         "aws_access_key_id",
         "aws_secret_access_key",
         "aws_session_token",
-        &params,
-    )?;
+        auth_params,
+        auth_params.get("aws_iam_role_source").expose().ok(),
+    )
+    .await?;
 
-    if let Some(dur) = client_timeout {
+    if let Some(dur) = params.client_timeout {
         config_bldr =
             config_bldr.timeout_config(TimeoutConfigBuilder::new().operation_timeout(dur).build());
     }
 
     let config = config_bldr.load().await;
 
-    let s3_vector_client = S3VectorClient::new(Client::new(&config));
-
-    let s3_vector_client =
-        Arc::new(S3VectorRetryClientBuilder::new(Arc::new(s3_vector_client)).build())
-            as Arc<dyn S3Vectors + Send + Sync>;
+    // Build S3Vectors middleware: retry(metrics_cache(base_client))
+    let base_client = Arc::new(Client::new(&config));
+    let with_metrics_cache = Arc::new(S3VectorsTelemetryMiddleware::new(
+        base_client,
+        params.index_poll_interval,
+    ));
+    let s3_vector_client: Arc<dyn S3Vectors + Send + Sync> =
+        Arc::new(S3VectorsRetryMiddlewareBuilder::new(with_metrics_cache).build());
 
     let Some(dimension) = embedding_vector_size(embedding_models, model_name).await else {
         return Err(Box::from(
@@ -251,7 +270,7 @@ async fn try_vector_table(
             })
             .collect::<Vec<_>>()
             .into(),
-        string_from_params(&params, "distance_metric"),
+        params.distance_metric.map(S3DistanceMetric::as_str),
     )
     .await?
     else {
@@ -262,18 +281,14 @@ async fn try_vector_table(
     Ok(vector_table)
 }
 
-// Attempt to get a certain string-value from the parameter.
-//
-// Returns `None` if the key does not exist
-fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
-    p.get(key).expose().ok()
-}
-
-/// Convert raw params configuration to parameters with secret support
+/// Convert raw params configuration to the typed [`S3VectorsParams`] plus the
+/// rawer [`Parameters`] that feeds the shared AWS auth resolver. Both parse the
+/// same secret-resolved map; the typed struct owns validation, the `Parameters`
+/// layer preserves the auth path's `.secret()` autoload behavior verbatim.
 async fn get_store_params(
     vector_store_config: &VectorStore,
     secrets: Arc<RwLock<Secrets>>,
-) -> Result<Parameters, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(S3VectorsParams, Parameters), Box<dyn std::error::Error + Send + Sync>> {
     let params = vector_store_config
         .params
         .as_ref()
@@ -282,7 +297,14 @@ async fn get_store_params(
 
     let params_with_secrets = get_params_with_secrets(Arc::clone(&secrets), &params).await;
 
-    let params = Parameters::try_new(
+    let typed = S3VectorsParams::try_from_params(
+        "AWS S3 Vectors store",
+        params_with_secrets.clone(),
+        &secrets,
+    )
+    .await?;
+
+    let auth_params = Parameters::try_new(
         "AWS S3 Vectors store",
         params_with_secrets.into_iter().collect(),
         "s3_vectors",
@@ -291,7 +313,7 @@ async fn get_store_params(
     )
     .await?;
 
-    Ok(params)
+    Ok((typed, auth_params))
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -340,4 +362,61 @@ fn s3_vector_metadata_columns(columns: &[Column], schema: &SchemaRef) -> Metadat
         })
         .collect();
     metadata_columns.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::common::TableReference;
+    use spicepod::{semantic::ColumnLevelEmbeddingConfig, vector::VectorStore};
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn missing_embedding_model_returns_specific_error_before_s3_setup() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("answer", DataType::Utf8, true),
+        ]));
+        let embedding_models = Arc::new(RwLock::new(EmbeddingModelStore::new()));
+        let secrets = Arc::new(RwLock::new(Secrets::default()));
+        let config = ColumnLevelEmbeddingConfig::model("missing_embeddings").with_row_id("id");
+        let params = spicepod::param::Params::from_string_map(HashMap::from([(
+            "s3_vectors_aws_iam_role_source".to_string(),
+            "invalid".to_string(),
+        )]));
+        let vector_store = VectorStore {
+            engine: Some("s3_vectors".to_string()),
+            params: Some(params),
+            ..Default::default()
+        };
+
+        let result = try_from_table(
+            &TableReference::bare("daily_journal"),
+            "answer".to_string(),
+            config,
+            &vector_store,
+            vec!["id".to_string()],
+            schema,
+            embedding_models,
+            vec![],
+            secrets,
+            vec![],
+        )
+        .await;
+
+        let Err(err) = result else {
+            panic!("missing embedding model should fail");
+        };
+        let message = err.to_string();
+
+        assert!(
+            message.contains("Embedding model 'missing_embeddings' is not defined"),
+            "unexpected error message: {message}"
+        );
+        assert!(
+            !message.contains("embedding dimension could not be inferred"),
+            "missing model should not fall through to dimension inference: {message}"
+        );
+    }
 }

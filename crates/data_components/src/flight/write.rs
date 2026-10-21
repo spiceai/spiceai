@@ -18,6 +18,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
+    common::TableReference,
     datasource::{
         TableProvider, TableType,
         sink::{DataSink, DataSinkExec},
@@ -26,14 +27,13 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, dml::InsertOp},
     physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, metrics::MetricsSet},
-    sql::TableReference,
 };
 use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 use flight_client::FlightClient;
 use futures::StreamExt;
 use snafu::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -64,10 +64,6 @@ impl FlightTableWriter {
 
 #[async_trait]
 impl TableProvider for FlightTableWriter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.read_provider.schema()
     }
@@ -117,10 +113,6 @@ struct FlightDataSink {
 
 #[async_trait]
 impl DataSink for FlightDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }

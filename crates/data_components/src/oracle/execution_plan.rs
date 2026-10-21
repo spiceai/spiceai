@@ -14,22 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use datafusion::{
+    common::TableReference,
+    common::utils::quote_identifier,
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
     logical_expr::Expr,
-    physical_expr::EquivalenceProperties,
+    physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-        SendableRecordBatchStream,
+        SendableRecordBatchStream, SortOrderPushdownResult,
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
     },
     sql::{
-        TableReference, sqlparser,
+        sqlparser,
         unparser::{
             Unparser,
             dialect::{CustomDialect, CustomDialectBuilder},
@@ -52,7 +54,8 @@ pub struct OracleExecPlan {
     pool: Arc<OracleConnectionPool>,
     filters: Vec<Expr>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    sort_exprs: Vec<PhysicalSortExpr>,
+    properties: Arc<PlanProperties>,
 }
 
 impl OracleExecPlan {
@@ -72,12 +75,13 @@ impl OracleExecPlan {
             pool,
             filters: filters.to_vec(),
             limit,
-            properties: PlanProperties::new(
+            sort_exprs: Vec::new(),
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         })
     }
 
@@ -85,18 +89,19 @@ impl OracleExecPlan {
         CustomDialectBuilder::new()
             .with_identifier_quote_style('"')
             // There is no 'DOUBLE' SQL type in Oracle: it can use 'FLOAT' for both single and double precision float values
-            .with_float64_ast_dtype(sqlparser::ast::DataType::Float(None))
+            .with_float64_ast_dtype(sqlparser::ast::DataType::Float(
+                sqlparser::ast::ExactNumberInfo::None,
+            ))
             .build()
     }
 
-    #[allow(clippy::unnecessary_wraps)]
     pub fn sql(&self) -> DataFusionResult<String> {
         let columns = self
             .projected_schema
             .fields()
             .iter()
             // columns must be quoted to handle spaces and special characters
-            .map(|f| format!("\"{col}\"", col = f.name()))
+            .map(|f| quote_identifier(f.name()))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -111,11 +116,39 @@ impl OracleExecPlan {
                 .map(|f| {
                     Unparser::new(&dialect)
                         .expr_to_sql(f)
-                        .map(|e| e.to_string())
+                        .map(|e| format!("({e})"))
                 })
                 .collect::<DataFusionResult<Vec<String>>>()?
                 .join(" AND ");
             format!("WHERE {filter_expr}")
+        };
+
+        let order_expr = if self.sort_exprs.is_empty() {
+            String::new()
+        } else {
+            let sort_terms: DataFusionResult<Vec<String>> = self
+                .sort_exprs
+                .iter()
+                .map(|sort| {
+                    let col = sort.expr.downcast_ref::<Column>().ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Sort pushdown contains non-column expressions".to_string(),
+                        )
+                    })?;
+                    let dir = if sort.options.descending {
+                        "DESC"
+                    } else {
+                        "ASC"
+                    };
+                    let nulls = if sort.options.nulls_first {
+                        "NULLS FIRST"
+                    } else {
+                        "NULLS LAST"
+                    };
+                    Ok(format!("{} {dir} {nulls}", quote_identifier(col.name())))
+                })
+                .collect();
+            format!("ORDER BY {}", sort_terms?.join(", "))
         };
 
         let limit_expr = if let Some(limit) = self.limit {
@@ -124,10 +157,24 @@ impl OracleExecPlan {
             String::new()
         };
 
-        Ok(format!(
-            "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
+        let mut sql = format!(
+            "SELECT {columns} FROM {table_reference}",
             table_reference = self.table_reference.to_quoted_string()
-        ))
+        );
+        if !where_expr.is_empty() {
+            sql.push(' ');
+            sql.push_str(&where_expr);
+        }
+        if !order_expr.is_empty() {
+            sql.push(' ');
+            sql.push_str(&order_expr);
+        }
+        if !limit_expr.is_empty() {
+            sql.push(' ');
+            sql.push_str(&limit_expr);
+        }
+
+        Ok(sql)
     }
 }
 
@@ -150,16 +197,26 @@ impl ExecutionPlan for OracleExecPlan {
         "OracleExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        datafusion::physical_plan::apply_expression_roots(
+            self.sort_exprs.iter().map(|sort_expr| &sort_expr.expr),
+            f,
+        )
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -171,6 +228,62 @@ impl ExecutionPlan for OracleExecPlan {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.limit
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        Some(Arc::new(OracleExecPlan {
+            projected_schema: Arc::clone(&self.projected_schema),
+            table_reference: self.table_reference.clone(),
+            pool: Arc::clone(&self.pool),
+            filters: self.filters.clone(),
+            limit,
+            sort_exprs: self.sort_exprs.clone(),
+            properties: Arc::clone(&self.properties),
+        }))
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        for sort_expr in order {
+            if sort_expr.expr.downcast_ref::<Column>().is_none() {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            }
+        }
+
+        let sort_exprs = order.to_vec();
+        let mut eq_properties = EquivalenceProperties::new(Arc::clone(&self.projected_schema));
+        if let Some(ordering) = LexOrdering::new(sort_exprs.clone()) {
+            eq_properties.add_orderings([ordering]);
+        }
+
+        let new_plan = OracleExecPlan {
+            projected_schema: Arc::clone(&self.projected_schema),
+            table_reference: self.table_reference.clone(),
+            pool: Arc::clone(&self.pool),
+            filters: self.filters.clone(),
+            limit: self.limit,
+            sort_exprs,
+            properties: Arc::new(PlanProperties::new(
+                eq_properties,
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )),
+        };
+
+        Ok(SortOrderPushdownResult::Exact {
+            inner: Arc::new(new_plan),
+        })
     }
 
     fn execute(
@@ -246,11 +359,10 @@ fn project_schema_safe(
     Ok(schema)
 }
 
-#[allow(clippy::needless_pass_by_value)]
 pub fn to_execution_error(
     e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
 ) -> DataFusionError {
-    DataFusionError::Execution(format!("{}", e.into()).to_string())
+    DataFusionError::Execution(format!("{}", e.into()))
 }
 
 fn to_datafusion_err(e: super::Error) -> datafusion::error::DataFusionError {

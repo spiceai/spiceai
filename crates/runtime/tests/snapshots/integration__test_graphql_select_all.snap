@@ -2,13 +2,12 @@
 source: crates/runtime/tests/integration.rs
 description: "Query: SELECT * FROM test_graphql"
 ---
-+---------------+--------------------------------------------------------+
-| plan_type     | plan                                                   |
-+---------------+--------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                     |
-|               |   TableScan: test_graphql projection=[id, name, posts] |
-| physical_plan | BytesProcessedExec                                     |
-|               |   CooperativeExec                                      |
-|               |     GraphQLTableProviderExec                           |
-|               |                                                        |
-+---------------+--------------------------------------------------------+
++---------------+------------------------------------------------------+
+| plan_type     | plan                                                 |
++---------------+------------------------------------------------------+
+| logical_plan  | TableScan: test_graphql projection=[id, name, posts] |
+| physical_plan | CooperativeExec                                      |
+|               |   BytesProcessedExec                                 |
+|               |     GraphQLTableProviderExec                         |
+|               |                                                      |
++---------------+------------------------------------------------------+

@@ -1,0 +1,32 @@
+version: v1
+kind: Spicepod
+name: cdc-debezium-ingest
+
+# Dual-path CDC: Debezium source plugins POST JSON/Avro change events
+# directly to Spice — no Kafka required.
+#
+#   POST /v1/datasets/orders/cdc
+#   Content-Type: application/json  (or application/vnd.debezium+avro)
+#
+# See docs/features/cdc-debezium-ingest.md and application.properties
+# for a Debezium Server sink example.
+
+datasets:
+  - from: cdc:orders
+    name: orders
+    columns:
+      - name: id
+        type: int64
+      - name: customer_id
+        type: int64
+      - name: amount
+        type: float64
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: changes
+      primary_key: id
+      on_conflict:
+        id: upsert
+    # params:
+    #   schema_registry_url: http://schema-registry:8081

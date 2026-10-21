@@ -17,10 +17,11 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 use async_openai::{
     error::OpenAIError,
-    types::{
+    types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionResponseStream, ChatCompletionStreamOptions, CreateChatCompletionRequest,
-        CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+        ChatCompletionResponseStream, ChatCompletionStreamOptions, ChatCompletionToolChoiceOption,
+        CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse,
+        CreateChatCompletionStreamResponse,
     },
 };
 use async_trait::async_trait;
@@ -37,7 +38,7 @@ use tera::Tera;
 use tokio::time::Instant;
 use tracing_futures::Instrument;
 
-use crate::model::metrics::handle_metrics;
+use crate::model::metrics::{handle_metrics, handle_token_metrics};
 
 use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
@@ -67,9 +68,9 @@ pub(crate) static OPENAI_DEFAULT_PARAM_KEYS: LazyLock<HashSet<&'static str>> =
             "stream_options",
             "temperature",
             "top_p",
-            "tools",
             "tool_choice",
             "parallel_tool_calls",
+            "prompt_cache_key",
             "user",
         ])
     });
@@ -85,25 +86,31 @@ pub struct ChatWrapper {
     pub defaults: Vec<(String, serde_json::Value)>,
 }
 
-/// Sets a certain field in a [`CreateChatCompletionRequest`] to a given value.
-/// Emit a warning if the value cannot be parsed, from a string to the respective field's type.
+/// Sets a field of a [`CreateChatCompletionRequest`] to the model's default for it when
+/// the request leaves it unset.
 macro_rules! set_default_w_warning {
     ($req:expr, $field:ident, $value:expr, $model:expr) => {
         $req.$field = $req
             .$field
-            .or_else(|| match serde_json::from_value($value.clone()) {
-                Ok(val) => Some(val),
-                Err(_) => {
-                    tracing::warn!(
-                        "Failed to parse `openai_{}` override for model='{}'. Ensure {:?} is of the correct format.",
-                        stringify!($field),
-                        $model,
-                        $value
-                    );
-                    None
-                }
-            })
+            .or_else(|| parse_default(stringify!($field), $value, &$model))
     };
+}
+
+/// `value` as the model's default for `field`, or `None`, with a warning, when it is not
+/// a valid value for that field.
+fn parse_default<T: serde::de::DeserializeOwned>(
+    field: &str,
+    value: &serde_json::Value,
+    model: &str,
+) -> Option<T> {
+    if let Ok(parsed) = T::deserialize(value) {
+        Some(parsed)
+    } else {
+        tracing::warn!(
+            "Failed to parse `{field}` model parameter override for model='{model}'. Ensure {value:?} is of the correct format."
+        );
+        None
+    }
 }
 
 impl ChatWrapper {
@@ -163,12 +170,14 @@ impl ChatWrapper {
         ) {
             // Template existing system prompt
             (Some(prompt), true) => {
-                let ctx = match req.metadata.as_ref() {
-                    Some(serde_json::Value::Object(m)) => {
-                        m.clone()
-                            .into_iter()
-                            .collect::<HashMap<String, serde_json::Value>>()
-                    }
+                let ctx = match req
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| serde_json::to_value(m).ok())
+                {
+                    Some(serde_json::Value::Object(m)) => m
+                        .into_iter()
+                        .collect::<HashMap<String, serde_json::Value>>(),
                     Some(_) | None => HashMap::new(),
                 };
 
@@ -208,11 +217,12 @@ impl ChatWrapper {
         if req.stream.is_some_and(|s| s) {
             req.stream_options = match req.stream_options {
                 Some(mut opts) => {
-                    opts.include_usage = true;
+                    opts.include_usage = Some(true);
                     Some(opts)
                 }
                 None => Some(ChatCompletionStreamOptions {
-                    include_usage: true,
+                    include_obfuscation: None,
+                    include_usage: Some(true),
                 }),
             };
         }
@@ -220,13 +230,41 @@ impl ChatWrapper {
     }
 
     /// For [`None`] valued fields in a [`CreateChatCompletionRequest`], if the chat model has non-`None` defaults, use those instead.
+    #[expect(deprecated)] // seed and user fields are deprecated in async-openai
     fn with_model_defaults(
         &self,
         mut req: CreateChatCompletionRequest,
     ) -> CreateChatCompletionRequest {
-        for (key, v) in &self.defaults {
-            let value = v.clone();
+        let offers_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+        for (key, value) in &self.defaults {
             match key.as_str() {
+                // These defaults are only checked, so a malformed one is still reported at
+                // startup. Whether to stream is decided by the call, `chat_request` or
+                // `chat_stream`, and `chat_request` fails on a request marked as streaming.
+                // `stream_options` is only valid when `stream` is true; applying it after
+                // the `stream` default is ignored would send a non-streaming request that
+                // providers reject. A tool choice or parallel-call setting means nothing
+                // to a request that offers no tools, and providers reject one sent alone.
+                "stream" => {
+                    parse_default::<bool>("stream", value, &self.public_name);
+                }
+                "stream_options" if !req.stream.is_some_and(|s| s) => {
+                    parse_default::<ChatCompletionStreamOptions>(
+                        "stream_options",
+                        value,
+                        &self.public_name,
+                    );
+                }
+                "tool_choice" if !offers_tools => {
+                    parse_default::<ChatCompletionToolChoiceOption>(
+                        "tool_choice",
+                        value,
+                        &self.public_name,
+                    );
+                }
+                "parallel_tool_calls" if !offers_tools => {
+                    parse_default::<bool>("parallel_tool_calls", value, &self.public_name);
+                }
                 "frequency_penalty" => {
                     set_default_w_warning!(req, frequency_penalty, value, self.public_name);
                 }
@@ -252,16 +290,17 @@ impl ChatWrapper {
                 }
                 "seed" => set_default_w_warning!(req, seed, value, self.public_name),
                 "stop" => set_default_w_warning!(req, stop, value, self.public_name),
-                "stream" => set_default_w_warning!(req, stream, value, self.public_name),
                 "stream_options" => {
                     set_default_w_warning!(req, stream_options, value, self.public_name);
                 }
                 "temperature" => set_default_w_warning!(req, temperature, value, self.public_name),
                 "top_p" => set_default_w_warning!(req, top_p, value, self.public_name),
-                "tools" => set_default_w_warning!(req, tools, value, self.public_name),
                 "tool_choice" => set_default_w_warning!(req, tool_choice, value, self.public_name),
                 "parallel_tool_calls" => {
                     set_default_w_warning!(req, parallel_tool_calls, value, self.public_name);
+                }
+                "prompt_cache_key" => {
+                    set_default_w_warning!(req, prompt_cache_key, value, self.public_name);
                 }
                 "user" => set_default_w_warning!(req, user, value, self.public_name),
                 _ => {
@@ -273,6 +312,7 @@ impl ChatWrapper {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl Chat for ChatWrapper {
     /// Expect `captured_output` to be instrumented by the underlying chat model (to not reopen/parse streams). i.e.
@@ -288,7 +328,7 @@ impl Chat for ChatWrapper {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
 
         if let Some(metadata) = &req.metadata {
-            tracing::info!(target: "task_history", metadata = %metadata);
+            tracing::info!(target: "task_history", metadata = ?metadata);
         }
 
         let labels = request_labels(&req);
@@ -332,13 +372,14 @@ impl Chat for ChatWrapper {
 
         let labels = request_labels(&req);
         if let Some(metadata) = &req.metadata {
-            tracing::info!(target: "task_history", parent: &span, metadata = %metadata, "labels");
+            tracing::info!(target: "task_history", parent: &span, metadata = ?metadata, "labels");
         }
 
         let result = match self.chat.chat_request(req).instrument(span.clone()).await {
             Ok(mut resp) => {
                 if let Some(usage) = resp.usage.clone() {
-                    tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, id=resp.id, "labels");
+                    tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, cached_tokens = %cached_tokens(&usage), id=resp.id, "labels");
+                    handle_token_metrics(usage.prompt_tokens, usage.completion_tokens, &labels);
                 }
                 let captured_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
                 match serde_json::to_string(&captured_output) {
@@ -373,6 +414,16 @@ impl Chat for ChatWrapper {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         self.chat.as_sql()
     }
+}
+
+/// The prompt tokens of `usage` that the provider read from its prompt cache: 0 when it reports
+/// none.
+fn cached_tokens(usage: &CompletionUsage) -> u32 {
+    usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| details.cached_tokens)
+        .unwrap_or_default()
 }
 
 /// [`TracedChatCompletionStream`] wraps a [`ChatCompletionResponseStream`]-like stream and provides metrics and `task_history` tracing. Importantly, when aggregrating the output, it does not need to block until the full stream is consumed.
@@ -420,18 +471,25 @@ where
                     fold_completion_stream(&mut acc, &item);
                 }
 
-                // Log usage info if available.
+                // Record usage, if available, as labels of the completion's task.
                 if let Some(usage) = item.usage.clone() {
                     tracing::info!(
                         target: "task_history",
+                        parent: &self.span,
                         completion_tokens = %usage.completion_tokens,
                         total_tokens = %usage.total_tokens,
                         prompt_tokens = %usage.prompt_tokens,
-                        "Usage info"
+                        cached_tokens = %cached_tokens(&usage),
+                        "labels"
                     );
 
                     // Usage should be on last message, so we can add latency metrics here.
                     handle_metrics(self.started.elapsed(), false, &self.labels);
+                    handle_token_metrics(
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        &self.labels,
+                    );
                 }
                 Poll::Ready(Some(Ok(item)))
             }
@@ -484,4 +542,183 @@ fn system_prompt_is_template_with_variables(prompt: &str) -> bool {
         return false;
     };
     ast::has_variables_in_ast(&tt.ast)
+}
+
+/// Guards the null-suppression patch the `spiceai/async-openai` fork carries:
+/// `ChatCompletionStreamOptions` skips `include_usage` and `include_obfuscation`
+/// when they are `None`.
+///
+/// [`ChatWrapper::with_stream_usage`] sets `include_usage` on every streaming
+/// request and leaves `include_obfuscation` unset, so this shape is what Spice puts
+/// on the wire for *all* streamed chat completions. Without the patch each of them
+/// carries `"include_obfuscation": null`, and the `OpenAI`-compatible servers that
+/// reject fields they do not know — NVIDIA NIM is the one the fork names — refuse
+/// the request outright rather than degrading.
+///
+/// The fork's own `ser_de.rs` test leaves with the branch at the next re-cut, which
+/// is why the guard lives here. `docs/dev/fork_patches.md` is the ledger it is named
+/// in.
+#[cfg(test)]
+mod stream_options_null_suppression {
+    use async_openai::types::chat::{ChatCompletionStreamOptions, CreateChatCompletionRequestArgs};
+    use serde_json::json;
+
+    use super::ChatWrapper;
+
+    /// The request Spice actually streams: `with_stream_usage` fills in
+    /// `include_usage` and nothing else, so the serialized options must carry that
+    /// one field and no null beside it.
+    #[test]
+    fn a_streamed_request_carries_no_null_stream_option() {
+        let request = CreateChatCompletionRequestArgs::default()
+            .model("test-model")
+            .messages(Vec::new())
+            .stream(true)
+            .build()
+            .expect("a streaming request with no stream options");
+        assert!(
+            request.stream_options.is_none(),
+            "the fixture has to start with no stream options, or it is not the shape `with_stream_usage` fills in"
+        );
+
+        let request = ChatWrapper::with_stream_usage(request);
+        let options = request
+            .stream_options
+            .expect("a streaming request gets stream options");
+
+        assert_eq!(
+            serde_json::to_value(options).expect("stream options serialize"),
+            json!({ "include_usage": true }),
+            "a field left unset must be absent, not null: a server that rejects fields it does not know refuses the whole request"
+        );
+    }
+
+    /// The same property at the type, so the guard still holds if the wrapper stops
+    /// being the only place stream options are built.
+    #[test]
+    fn unset_stream_options_serialize_to_an_empty_object() {
+        let options = ChatCompletionStreamOptions {
+            include_usage: None,
+            include_obfuscation: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&options).expect("stream options serialize"),
+            "{}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod call_dependent_defaults {
+    use std::sync::Arc;
+
+    use async_openai::types::chat::{
+        ChatCompletionToolChoiceOption, CreateChatCompletionRequest, ToolChoiceOptions,
+    };
+    use async_trait::async_trait;
+    use llms::chat::{Chat, nsql::SqlGeneration};
+    use serde_json::json;
+
+    use super::ChatWrapper;
+
+    struct NoModel;
+
+    #[async_trait]
+    impl Chat for NoModel {
+        fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+            None
+        }
+    }
+
+    fn wrapper() -> ChatWrapper {
+        ChatWrapper::new(
+            Arc::new(NoModel),
+            "judge",
+            None,
+            vec![
+                ("stream".to_string(), json!(true)),
+                ("stream_options".to_string(), json!({"include_usage": true})),
+                ("tool_choice".to_string(), json!("auto")),
+                ("parallel_tool_calls".to_string(), json!(false)),
+                ("temperature".to_string(), json!(0.5)),
+            ],
+        )
+    }
+
+    fn request(tools: &serde_json::Value) -> CreateChatCompletionRequest {
+        serde_json::from_value(json!({"model": "judge", "messages": [], "tools": tools}))
+            .expect("chat request")
+    }
+
+    /// A `stream` default would turn a non-streaming call into one `chat_request`
+    /// refuses (`When stream is true, use Chat::create_stream`); the call decides.
+    #[test]
+    fn a_stream_default_is_never_applied() {
+        let prepared = wrapper().with_model_defaults(request(&serde_json::Value::Null));
+
+        assert_eq!(prepared.stream, None);
+    }
+
+    /// `stream_options` is only valid when `stream` is true. A companion default
+    /// must not ride onto a non-streaming call after the `stream` default is ignored
+    /// (evaluation and other `chat_request` paths).
+    #[test]
+    fn a_stream_options_default_is_not_applied_unless_streaming() {
+        let prepared = wrapper().with_model_defaults(request(&serde_json::Value::Null));
+
+        assert_eq!(prepared.stream, None);
+        assert_eq!(
+            prepared.stream_options, None,
+            "stream_options on a non-streaming request is rejected by providers"
+        );
+
+        let streaming = serde_json::from_value(json!({
+            "model": "judge",
+            "messages": [],
+            "stream": true
+        }))
+        .expect("streaming chat request");
+        let prepared = wrapper().with_model_defaults(streaming);
+
+        assert_eq!(prepared.stream, Some(true));
+        assert_eq!(
+            prepared.stream_options,
+            Some(async_openai::types::chat::ChatCompletionStreamOptions {
+                include_usage: Some(true),
+                include_obfuscation: None,
+            })
+        );
+    }
+
+    /// A request with no tools, such as an evaluation's, must not be sent a tool choice
+    /// on its own: providers reject it, and a `required` choice asks for a call that
+    /// cannot be made.
+    #[test]
+    fn a_request_without_tools_gets_no_tool_defaults() {
+        let prepared = wrapper().with_model_defaults(request(&serde_json::Value::Null));
+
+        assert_eq!(prepared.tool_choice, None);
+        assert_eq!(prepared.parallel_tool_calls, None);
+        assert_eq!(
+            prepared.temperature,
+            Some(0.5),
+            "other defaults still apply"
+        );
+    }
+
+    #[test]
+    fn a_request_with_tools_gets_the_tool_defaults() {
+        let prepared = wrapper().with_model_defaults(request(&json!([{
+            "type": "function",
+            "function": {"name": "sql", "parameters": {"type": "object"}}
+        }])));
+
+        assert_eq!(
+            prepared.tool_choice,
+            Some(ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Auto
+            ))
+        );
+        assert_eq!(prepared.parallel_tool_calls, Some(false));
+    }
 }

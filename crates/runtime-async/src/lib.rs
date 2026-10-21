@@ -16,6 +16,8 @@ use std::{future::Future, sync::Arc};
 use snafu::prelude::*;
 use tokio::{runtime::Handle, sync::Notify};
 
+pub mod cancellable_task;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(transparent)]
@@ -70,14 +72,109 @@ impl ManagedTokioRuntime {
     ///
     /// Returns [`Error::RuntimeCreation`] if the Tokio runtime cannot be constructed.
     pub fn try_new() -> Result<Self> {
-        let cpu_cores = num_cpus::get();
-        let worker_threads = std::cmp::max(cpu_cores.saturating_sub(1), 1);
+        Self::builder().build()
+    }
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+    /// Create a builder for configuring the runtime.
+    #[must_use]
+    pub fn builder() -> ManagedTokioRuntimeBuilder {
+        ManagedTokioRuntimeBuilder::new()
+    }
+
+    /// Return a handle suitable for spawning tasks
+    #[must_use]
+    pub fn handle(&self) -> &Handle {
+        &self.handle
+    }
+}
+
+/// Builder for [`ManagedTokioRuntime`] with configuration options.
+pub struct ManagedTokioRuntimeBuilder {
+    nice: Option<i32>,
+    thread_name: Option<String>,
+    worker_threads: Option<usize>,
+}
+
+impl Default for ManagedTokioRuntimeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManagedTokioRuntimeBuilder {
+    /// Create a new builder with default settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            nice: None,
+            thread_name: None,
+            worker_threads: None,
+        }
+    }
+
+    /// Set worker threads to run at lower priority (nice value 10 on Unix).
+    /// This is useful for background tasks that shouldn't compete with latency-sensitive work.
+    #[must_use]
+    pub fn with_low_priority(self) -> Self {
+        self.with_nice(10)
+    }
+
+    /// Run worker threads at nice value `nice` on Unix (0 is the default; higher
+    /// values yield the CPU to threads at lower ones). On Linux the value applies to
+    /// each worker thread; on macOS `setpriority` sets it for the whole process.
+    #[must_use]
+    pub fn with_nice(mut self, nice: i32) -> Self {
+        self.nice = Some(nice);
+        self
+    }
+
+    /// Set a custom thread name prefix for worker threads.
+    #[must_use]
+    pub fn with_thread_name(mut self, name: impl Into<String>) -> Self {
+        self.thread_name = Some(name.into());
+        self
+    }
+
+    /// Run `threads` worker threads instead of the dedicated-runtime default
+    /// (`cpu_budget().dedicated_runtime_worker_threads()`). Size it from a
+    /// [`cpu_budget::CpuBudget`] method, never from a count taken here.
+    #[must_use]
+    pub fn with_worker_threads(mut self, threads: usize) -> Self {
+        self.worker_threads = Some(threads.max(1));
+        self
+    }
+
+    /// Build the runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RuntimeCreation`] if the Tokio runtime cannot be constructed.
+    pub fn build(self) -> Result<ManagedTokioRuntime> {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
             // Reserve one core for the primary Tokio runtime handling HTTP and control-plane work.
-            .worker_threads(worker_threads)
-            .enable_all()
-            .build()?;
+            .worker_threads(
+                self.worker_threads
+                    .unwrap_or_else(|| cpu_budget::cpu_budget().dedicated_runtime_worker_threads()),
+            )
+            .enable_all();
+
+        if let Some(name) = &self.thread_name {
+            builder.thread_name(name);
+        }
+
+        // Set the worker threads' nice value if requested (Unix only)
+        #[cfg(unix)]
+        if let Some(nice) = self.nice {
+            builder.on_thread_start(move || {
+                // SAFETY: setpriority is safe to call with PRIO_PROCESS and 0 (current thread)
+                unsafe {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+                }
+            });
+        }
+
+        let runtime = builder.build()?;
         let handle = runtime.handle().clone();
         let notify_shutdown = Arc::new(Notify::new());
         let notify_shutdown_captured = Arc::clone(&notify_shutdown);
@@ -90,17 +187,11 @@ impl ManagedTokioRuntime {
             // Note: runtime is dropped here
         });
 
-        Ok(Self {
+        Ok(ManagedTokioRuntime {
             handle,
             notify_shutdown,
             thread_join_handle: Some(thread_join_handle),
         })
-    }
-
-    /// Return a handle suitable for spawning tasks
-    #[must_use]
-    pub fn handle(&self) -> &Handle {
-        &self.handle
     }
 }
 
@@ -121,35 +212,94 @@ where
     }
 }
 
+/// True when a failure is the runtime shutting down under a task on the
+/// blocking pool, rather than the operation itself failing.
+///
+/// A sidecar helper that runs on the blocking pool surfaces a shutdown as a
+/// cancelled [`tokio::task::JoinError`] wrapped in [`Error::External`], which
+/// callers see only as an opaque `"Acceleration error: task ... was cancelled"` —
+/// hence classifying by type rather than by message. The task never started, so
+/// there is nothing to retry and nothing an operator can act on; a caller that
+/// reports its failures at `warn` should report this one below the default level.
+///
+/// Prefer this over the `RuntimeStatus::is_shutdown()` guard the refresh task uses
+/// for the same purpose: `is_shutdown()` is only *coincidental* — every failure that
+/// races a shutdown gets quietened, including real ones — whereas the `JoinError`
+/// is a *causal* statement that this specific work did not run.
+///
+/// The condition it reads is "the task was cancelled", and the shutdown reading
+/// holds because a `spawn_blocking` task is cancelled only when the runtime is
+/// dropped with the task still queued; nothing here calls `JoinHandle::abort`. A
+/// caller that starts aborting sidecar tasks (a per-operation timeout, say) has to
+/// revisit that.
+///
+/// The whole source chain is walked, so it holds however deeply the caller has
+/// boxed or wrapped the error. A *panicked* task is deliberately not matched: that
+/// is a bug and must stay loud.
+#[must_use]
+pub fn is_shutdown_cancellation(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| std::error::Error::source(*error)).any(|error| {
+        error
+            .downcast_ref::<tokio::task::JoinError>()
+            .is_some_and(tokio::task::JoinError::is_cancelled)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tokio::task::JoinSet;
     use tokio::time::sleep;
 
-    /// Waits for all tasks in the `JoinSet` to complete and reports any errors that
-    /// occurred.
-    ///
-    /// If we don't do this, any errors that occur in the task (such as IO errors)
-    /// are not reported.
-    async fn drain_join_set(mut join_set: JoinSet<Result<()>>) {
-        // retrieve any errors from the tasks
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Ok(())) => {}                                   // task completed successfully
-                Ok(Err(e)) => tracing::debug!("Task failed: {e}"), // task failed
-                Err(e) => tracing::debug!("JoinSet error: {e}"),   // JoinSet error
-            }
-        }
+    /// A worker thread reads its own nice value: on Linux each worker sets it as
+    /// it starts, which leaves the test's own thread untouched.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_threads_run_at_the_requested_nice_value() {
+        // SAFETY: getpriority with PRIO_PROCESS and 0 reads the calling thread's value.
+        let nice_of_this_thread = || unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let before = nice_of_this_thread();
+        let runtime = ManagedTokioRuntime::builder()
+            .with_nice(5)
+            .with_worker_threads(1)
+            .build()
+            .expect("Failed to create runtime");
+        let worker_nice = futures::executor::block_on(
+            runtime
+                .handle()
+                // SAFETY: as above, on the worker thread.
+                .spawn(async { unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) } }),
+        )
+        .expect("the worker reads its nice value");
+        assert_eq!(
+            (worker_nice, nice_of_this_thread()),
+            (5, before),
+            "the worker runs at nice 5 and the thread that built the runtime keeps its own"
+        );
     }
 
+    /// Drop joins the runtime's thread, and that thread drops the runtime, so by
+    /// the time `drop` returns every task still pending on it has been cancelled
+    /// — the shutdown cancellation `is_shutdown_cancellation` classifies.
     #[test]
-    fn test_managed_tokio_runtime_creation() {
-        let runtime = ManagedTokioRuntime::try_new();
-        assert!(runtime.is_ok());
+    fn dropping_the_runtime_cancels_its_pending_tasks_before_returning() {
+        let runtime = ManagedTokioRuntime::try_new().expect("Failed to create runtime");
+        let pending = runtime.handle().spawn(std::future::pending::<()>());
+        assert!(!pending.is_finished(), "the task cannot finish on its own");
 
-        let _runtime = runtime.expect("Failed to create ManagedTokioRuntime");
+        drop(runtime);
+        assert!(
+            pending.is_finished(),
+            "drop returns only once the runtime has shut down and cancelled its tasks"
+        );
+
+        let join_error = futures::executor::block_on(pending)
+            .expect_err("a task on a dropped runtime cannot complete");
+        assert!(
+            join_error.is_cancelled(),
+            "expected a cancellation, got: {join_error}"
+        );
+        assert!(is_shutdown_cancellation(&join_error));
     }
 
     #[test]
@@ -247,34 +397,5 @@ mod tests {
 
         let results = results.expect("Failed to collect concurrent task results");
         assert_eq!(results, vec![0, 2, 4, 6, 8]);
-    }
-
-    #[tokio::test]
-    async fn test_drain_join_set_with_successful_tasks() {
-        let mut join_set = JoinSet::new();
-
-        // Add some successful tasks
-        for i in 0..3 {
-            join_set.spawn(async move {
-                sleep(Duration::from_millis(i * 10)).await;
-                Ok(()) as Result<()>
-            });
-        }
-
-        // This should complete without panicking
-        drain_join_set(join_set).await;
-    }
-
-    #[tokio::test]
-    async fn test_drain_join_set_with_failed_tasks() {
-        let mut join_set = JoinSet::new();
-
-        // Add a mix of successful and failed tasks
-        join_set.spawn(async { Ok(()) as Result<()> });
-        join_set.spawn(async { Err(Error::TaskExecution) });
-        join_set.spawn(async { Ok(()) as Result<()> });
-
-        // This should complete without panicking, even with failed tasks
-        drain_join_set(join_set).await;
     }
 }

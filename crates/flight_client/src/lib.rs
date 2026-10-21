@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -40,14 +40,44 @@ use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::error::Error as StdError;
+use std::time::Duration;
 use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
+pub mod arrow_flight_factory;
+pub mod cookie;
 pub mod tls;
 
 pub const MAX_ENCODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 pub const MAX_DECODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+pub const HTTP2_INITIAL_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+pub const HTTP2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
+
+/// How often to send an HTTP/2 PING on a pooled Flight channel.
+pub const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long to wait for a PING ack before treating the channel as dead.
+pub const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Applies shared HTTP/2 flow-control and keepalive settings for Flight channels.
+///
+/// The keepalive pings matter because these channels are pooled and long-lived. A load
+/// balancer between the client and a Flight endpoint resets connections that go idle,
+/// and the client is not told: the reset only surfaces when the next request is written,
+/// which then fails while the replacement connection is established for the request
+/// after it. Pinging while idle keeps the connection from being reaped in the first
+/// place, so a query or availability probe arriving after a quiet period still lands on
+/// a live channel.
+#[must_use]
+pub fn configure_endpoint_for_high_throughput(endpoint: Endpoint) -> Endpoint {
+    endpoint
+        .initial_stream_window_size(HTTP2_INITIAL_STREAM_WINDOW_SIZE)
+        .initial_connection_window_size(HTTP2_INITIAL_CONNECTION_WINDOW_SIZE)
+        .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
+}
 
 #[derive(Debug)]
 pub struct TonicStatusError(Box<tonic::Status>);
@@ -175,6 +205,11 @@ pub enum Error {
 
     #[snafu(display("Connection is reset by the server. Please retry the request. {source}"))]
     ConnectionReset { source: TonicStatusError },
+
+    #[snafu(display("Flight connection error: {source}"))]
+    ArrowFlightError {
+        source: arrow_flight::error::FlightError,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -252,8 +287,11 @@ impl FlightClient {
     ///
     /// # Arguments
     ///
-    /// * `username` - The username to use.
-    /// * `password` - The password to use.
+    /// * `url` - The URL to connect to.
+    /// * `credentials` - The credentials to use for authentication.
+    /// * `metadata` - Optional metadata to include with requests.
+    /// * `ca_certificate_path` - Optional path to a CA certificate file (PEM format)
+    ///   for TLS verification. If not provided, system certificates will be used.
     ///
     /// # Errors
     ///
@@ -262,8 +300,27 @@ impl FlightClient {
         url: Arc<str>,
         credentials: Credentials,
         metadata: Option<tonic::metadata::MetadataMap>,
+        ca_certificate_path: Option<&std::path::Path>,
     ) -> Result<Self> {
-        let flight_channel = tls::new_tls_flight_channel(&url)
+        let opts =
+            tls::ClientTlsOptions::ca_only(ca_certificate_path.map(std::path::PathBuf::from));
+        Self::try_new_with_tls_options(url, credentials, metadata, &opts).await
+    }
+
+    /// Creates a new instance of `FlightClient` with full TLS options,
+    /// including an optional client certificate + key for mutual TLS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if unable to create the `FlightClient` (TLS
+    /// material could not be loaded or the upstream connection failed).
+    pub async fn try_new_with_tls_options(
+        url: Arc<str>,
+        credentials: Credentials,
+        metadata: Option<tonic::metadata::MetadataMap>,
+        tls_options: &tls::ClientTlsOptions,
+    ) -> Result<Self> {
+        let flight_channel = tls::new_tls_flight_channel_with_options(&url, tls_options)
             .await
             .context(UnableToConnectToServerSnafu)?;
 
@@ -298,6 +355,28 @@ impl FlightClient {
         self
     }
 
+    fn apply_request_metadata<T>(
+        &self,
+        req: &mut tonic::Request<T>,
+        token: Option<&Token>,
+    ) -> Result<()> {
+        if let Some(token) = token {
+            let auth_header_value = token.to_string().parse().context(InvalidMetadataSnafu)?;
+            req.metadata_mut()
+                .insert("authorization", auth_header_value);
+        }
+
+        if let Some(metadata) = &self.metadata {
+            for key_and_value in metadata.iter() {
+                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
+                    req.metadata_mut().insert(key, value.clone());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Queries the flight service for the schema of the path.
     ///
     /// # Arguments
@@ -312,22 +391,7 @@ impl FlightClient {
 
         let descriptor = FlightDescriptor::new_path(path);
         let mut req = tonic::Request::new(descriptor);
-
-        let auth_header_value = match &token {
-            Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
-            None => {
-                return UnauthorizedSnafu.fail();
-            }
-        };
-        req.metadata_mut()
-            .insert("authorization", auth_header_value);
-        if let Some(metadata) = &self.metadata {
-            for key_and_value in metadata.iter() {
-                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
-                    req.metadata_mut().insert(key, value.clone());
-                }
-            }
-        }
+        self.apply_request_metadata(&mut req, token.as_ref())?;
 
         let schema_result = self
             .client
@@ -354,22 +418,7 @@ impl FlightClient {
 
         let descriptor = FlightDescriptor::new_cmd(sql.into_owned());
         let mut req = descriptor.into_request();
-
-        let auth_header_value = match &token {
-            Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
-            None => {
-                return UnauthorizedSnafu.fail();
-            }
-        };
-        req.metadata_mut()
-            .insert("authorization", auth_header_value);
-        if let Some(metadata) = &self.metadata {
-            for key_and_value in metadata.iter() {
-                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
-                    req.metadata_mut().insert(key, value.clone());
-                }
-            }
-        }
+        self.apply_request_metadata(&mut req, token.as_ref())?;
 
         let schema_result = self
             .client
@@ -396,22 +445,7 @@ impl FlightClient {
 
         let descriptor = FlightDescriptor::new_cmd(query.to_string());
         let mut req = descriptor.into_request();
-
-        let auth_header_value = match &token {
-            Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
-            None => {
-                return UnauthorizedSnafu.fail();
-            }
-        };
-        req.metadata_mut()
-            .insert("authorization", auth_header_value);
-        if let Some(metadata) = &self.metadata {
-            for key_and_value in metadata.iter() {
-                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
-                    req.metadata_mut().insert(key, value.clone());
-                }
-            }
-        }
+        self.apply_request_metadata(&mut req, token.as_ref())?;
 
         let info = self
             .client
@@ -424,21 +458,7 @@ impl FlightClient {
         let ep = info.endpoint[0].clone();
         if let Some(ticket) = ep.ticket {
             let mut req = ticket.into_request();
-            let auth_header_value = match token {
-                Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
-                None => {
-                    return UnauthorizedSnafu.fail();
-                }
-            };
-            req.metadata_mut()
-                .insert("authorization", auth_header_value);
-            if let Some(metadata) = &self.metadata {
-                for key_and_value in metadata.iter() {
-                    if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
-                        req.metadata_mut().insert(key, value.clone());
-                    }
-                }
-            }
+            self.apply_request_metadata(&mut req, token.as_ref())?;
 
             let (md, response_stream, _ext) = self
                 .client
@@ -449,7 +469,9 @@ impl FlightClient {
                 .into_parts();
 
             return Ok(FlightRecordBatchStream::new_from_flight_data(
-                response_stream.map_err(|status| FlightError::Tonic(Box::new(status))),
+                response_stream
+                    .map_ok(conforming_map_entries)
+                    .map_err(|status| FlightError::Tonic(Box::new(status))),
             )
             .with_headers(md));
         }
@@ -471,24 +493,10 @@ impl FlightClient {
 
         let flight_descriptor = FlightDescriptor::new_path(vec![dataset_path.to_string()]);
         let subscription_request =
-            stream::iter(vec![FlightData::new().with_descriptor(flight_descriptor)].into_iter());
+            stream::iter(vec![FlightData::new().with_descriptor(flight_descriptor)]);
 
         let mut req = subscription_request.into_streaming_request();
-        let auth_header_value = match token {
-            Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
-            None => {
-                return UnauthorizedSnafu.fail();
-            }
-        };
-        req.metadata_mut()
-            .insert("authorization", auth_header_value);
-        if let Some(metadata) = &self.metadata {
-            for key_and_value in metadata.iter() {
-                if let tonic::metadata::KeyAndValueRef::Ascii(key, value) = key_and_value {
-                    req.metadata_mut().insert(key, value.clone());
-                }
-            }
-        }
+        self.apply_request_metadata(&mut req, token.as_ref())?;
 
         let (_md, response_stream, _ext) = self
             .client
@@ -499,7 +507,9 @@ impl FlightClient {
             .into_parts();
 
         Ok(FlightDataDecoder::new(
-            response_stream.map_err(|status| FlightError::Tonic(Box::new(status))),
+            response_stream
+                .map_ok(conforming_map_entries)
+                .map_err(|status| FlightError::Tonic(Box::new(status))),
         ))
     }
 
@@ -549,13 +559,7 @@ impl FlightClient {
         });
 
         let mut publish_request = request_stream.into_streaming_request();
-        if let Some(token) = token {
-            let auth_header_value = token.to_string().parse().context(InvalidMetadataSnafu)?;
-
-            publish_request
-                .metadata_mut()
-                .insert("authorization", auth_header_value);
-        }
+        self.apply_request_metadata(&mut publish_request, token.as_ref())?;
 
         let resp = match self.client.clone().do_put(publish_request).await {
             Ok(resp) => resp,
@@ -592,7 +596,7 @@ impl FlightClient {
         };
 
         let mut req = tonic::Request::new(stream::iter(vec![cmd]));
-        let val = BASE64_STANDARD.encode(format!("{username}:{password}",));
+        let val = BASE64_STANDARD.encode(format!("{username}:{password}"));
 
         let val = format!("Basic {val}")
             .parse()
@@ -609,8 +613,6 @@ impl FlightClient {
                 }
             }
         })?;
-
-        let mut token: Option<Token> = None;
 
         // Consume the response stream before reading the metadata
         let stream = resp.get_mut();
@@ -634,10 +636,11 @@ impl FlightClient {
             let auth = auth
                 .to_str()
                 .context(UnableToConvertMetadataToStringSnafu)?;
-            token = Some(Token::new(&auth["Bearer ".len()..], true));
+            let token = auth.strip_prefix("Bearer ").unwrap_or(auth);
+            return Ok(Some(Token::new(token, true)));
         }
 
-        Ok(token)
+        UnauthorizedSnafu.fail()
     }
 
     pub fn url(&self) -> &str {
@@ -656,7 +659,6 @@ impl FlightClient {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn map_tonic_error_to_message(e: tonic::Status) -> Error {
     if is_connection_reset_error(&e) {
         return Error::ConnectionReset {
@@ -668,6 +670,7 @@ fn map_tonic_error_to_message(e: tonic::Status) -> Error {
     }
 }
 
+#[must_use]
 pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
     match error.code() {
         tonic::Code::Internal | tonic::Code::Cancelled | tonic::Code::Unknown => {
@@ -685,4 +688,20 @@ pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
         }
         _ => false,
     }
+}
+
+/// Returns `message` with a schema message that declares a `Map` whose `entries` field is
+/// nullable replaced by the conforming declaration; any other message passes through untouched.
+///
+/// The Arrow IPC decoder validates the map layout, so a server that declares nullable `entries`
+/// would otherwise fail every batch it sends with an error that names no column. The decoder
+/// hands its batches straight to the caller, so they have to come out of the decode already
+/// conforming (see `arrow_tools::map_entries::conforming_schema_message`); entries that do hold
+/// nulls are still refused by the decode.
+fn conforming_map_entries(mut message: FlightData) -> FlightData {
+    if let Some(header) = arrow_tools::map_entries::conforming_schema_message(&message.data_header)
+    {
+        message.data_header = header.into();
+    }
+    message
 }

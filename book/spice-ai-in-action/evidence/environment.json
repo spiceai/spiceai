@@ -1,0 +1,10 @@
+{
+  "prepared_local_date": "2026-09-07",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "architecture": "arm64",
+  "source_commit": "16c436f7b8a76ce161a07c0288277ced0ada4a07",
+  "stable_binary": "v2.1.1+models.metal",
+  "development_binary": "v2.3.0-unstable-build.b286009302+models",
+  "docs_commit": "e30ef3d3dd84f7ba32c1eb32fc7f7f5d5dc6f375",
+  "cookbook_commit": "a76a26add6545c7edf986791e23966eafcb09a7b"
+}

@@ -18,7 +18,7 @@ use crate::embeddings::{
     Error, FailedToInstantiateEmbeddingModelSnafu, FailedWithHFApiSnafu, Result,
     candle::ModelConfig,
 };
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use hf_hub::{
     Repo, RepoType,
     api::tokio::{ApiBuilder, ApiRepo},
@@ -29,11 +29,12 @@ use std::{
     collections::HashMap,
     fs,
     path::{self, Path, PathBuf},
+    sync::Arc,
 };
 use tei_backend::{Pool, download_safetensors};
 use tei_core::{
     download::{ST_CONFIG_NAMES, download_artifacts},
-    tokenization::EncodingInput,
+    tokenization::{EncodingInput, Tokenization},
 };
 
 use tempfile::tempdir;
@@ -44,7 +45,14 @@ pub(crate) fn load_tokenizer(model_root: &Path) -> Result<Tokenizer> {
         "Loading model tokenizer from {:?}",
         model_root.join("tokenizer.json")
     );
-    let tokenizer = Tokenizer::from_file(model_root.join("tokenizer.json"))
+    let mut tokenizer = Tokenizer::from_file(model_root.join("tokenizer.json"))
+        .context(FailedToInstantiateEmbeddingModelSnafu)?;
+
+    // Some Sentence-Transformers tokenizers bake a fixed-length padding and truncation into `tokenizer.json`.
+    // Clear both here so TEI is the single source of truth, matching upstream text-embeddings-inference.
+    tokenizer.with_padding(None);
+    tokenizer
+        .with_truncation(None)
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
     Ok(tokenizer)
@@ -70,6 +78,70 @@ pub(crate) fn load_config(model_root: &Path) -> Result<ModelConfig> {
     Ok(config)
 }
 
+/// Result of [`load_tokenization`]: the parsed tokenizer, the model config, and
+/// the derived [`Tokenization`] settings needed to build a TEI `Infer` pipeline.
+pub(crate) struct LoadedTokenization {
+    pub tokenizer: Tokenizer,
+    pub config: ModelConfig,
+    pub tokenization: Tokenization,
+}
+
+/// Loads the tokenizer, config, and derives the [`Tokenization`] settings needed to build a TEI
+/// `Infer` pipeline from a directory of model artifacts. Shared by
+/// [`crate::embeddings::candle::tei::TeiEmbed::from_dir`] and
+/// [`crate::rerank::tei::TeiRerank::from_dir`], which both instantiate the same backend and would
+/// otherwise duplicate this setup.
+///
+/// Runs the synchronous load — reading `config.json`, the sentence-transformers
+/// config, and parsing `tokenizer.json` — on a blocking thread. For a large
+/// tokenizer the parse alone can exceed the runtime's per-task latency budget,
+/// so keeping it off the Tokio worker thread prevents it from stalling other
+/// tasks (and `/health`) during model registration.
+pub(crate) async fn load_tokenization(
+    root: &Path,
+    max_seq_length_overwrite: Option<usize>,
+) -> Result<LoadedTokenization> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let tokenizer = load_tokenizer(&root)?;
+        let config = load_config(&root)?;
+        let position_offset = position_offset(&config);
+
+        let max_input_length = if let Some(max_seq_length) = max_seq_length_overwrite {
+            max_seq_length
+        } else {
+            // Some models will have `sentence_*_config.json` file defining a specific `max_seq_length`.
+            match max_seq_length_from_st_config(&root) {
+                Ok(max_seq_length_opt) => {
+                    max_seq_length_opt.unwrap_or(config.max_position_embeddings - position_offset)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load max_seq_length from ST config: {e}");
+                    config.max_position_embeddings - position_offset
+                }
+            }
+        };
+
+        let tokenization = Tokenization::new(
+            1,
+            tokenizer.clone(),
+            max_input_length,
+            position_offset,
+            None,
+            None,
+        );
+
+        Ok(LoadedTokenization {
+            tokenizer,
+            config,
+            tokenization,
+        })
+    })
+    .await
+    .boxed()
+    .context(FailedToInstantiateEmbeddingModelSnafu)?
+}
+
 pub(crate) fn position_offset(config: &ModelConfig) -> usize {
     // Position IDs offset. Used for Roberta and camembert.
     if config.model_type == "xlm-roberta"
@@ -85,7 +157,7 @@ pub(crate) fn position_offset(config: &ModelConfig) -> usize {
 /// Converts the `OpenAI` format to the TEI format
 pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
     match input {
-        EmbeddingInput::String(s) => vec![EncodingInput::Single(s.to_string())],
+        EmbeddingInput::String(s) => vec![EncodingInput::Single(s.clone())],
         EmbeddingInput::StringArray(arr) => arr
             .iter()
             .map(|s| EncodingInput::Single(s.clone()))
@@ -98,10 +170,22 @@ pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
     }
 }
 
-fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Result<ApiRepo> {
-    let mut builder = ApiBuilder::new()
-        .with_progress(false)
-        .with_token(hf_token.map(ToString::to_string));
+/// Builds a `HuggingFace` API client, honouring `HF_HUB_CACHE` and applying `hf_token`
+/// only when it actually carries a value.
+///
+/// `ApiBuilder::with_token` *overwrites* the builder's token, and `ApiBuilder::new`
+/// pre-populates it from the Hub's own credential file (`~/.cache/huggingface/token`,
+/// written by `huggingface-cli login`). Passing `None` through therefore discards a
+/// credential the machine already has, leaving every download anonymous and at the
+/// mercy of the Hub's unauthenticated access rules. An empty string is worse than
+/// `None`: it is sent as an empty bearer token and rejected with 401. So both are
+/// treated as "no token supplied — keep whatever the Hub cache provided".
+fn hf_api_builder(hf_token: Option<&str>) -> ApiBuilder {
+    let mut builder = ApiBuilder::new().with_progress(false);
+
+    if let Some(token) = hf_token.map(str::trim).filter(|t| !t.is_empty()) {
+        builder = builder.with_token(Some(token.to_string()));
+    }
 
     if let Ok(cache_dir) = std::env::var("HF_HUB_CACHE") {
         let cache_path: PathBuf = cache_dir.into();
@@ -116,7 +200,11 @@ fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Re
         }
     }
 
-    let api = builder
+    builder
+}
+
+fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Result<ApiRepo> {
+    let api = hf_api_builder(hf_token)
         .build()
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
@@ -126,7 +214,7 @@ fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Re
     } else {
         Repo::new(model_id.to_string(), RepoType::Model)
     };
-    let api_repo = api.repo(repo.clone());
+    let api_repo = api.repo(repo);
 
     Ok(api_repo)
 }
@@ -138,11 +226,7 @@ pub async fn download_hf_file(
     file: &str,
     hf_token: Option<&str>,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let api = ApiBuilder::new()
-        .with_progress(false)
-        .with_token(hf_token.map(ToString::to_string))
-        .build()
-        .boxed()?;
+    let api = hf_api_builder(hf_token).build().boxed()?;
 
     let repo_type = match repo_type_opt {
         Some("datasets") => RepoType::Dataset,
@@ -164,7 +248,7 @@ pub(crate) async fn download_hf_artifacts(
     revision: Option<&str>,
     hf_token: Option<&str>,
 ) -> Result<PathBuf> {
-    let api_repo = get_api(model_id, revision, hf_token)?;
+    let api_repo = Arc::new(get_api(model_id, revision, hf_token)?);
     let repo_url = api_repo.url("");
 
     tracing::trace!("Downloading artifacts for {repo_url}");
@@ -172,9 +256,17 @@ pub(crate) async fn download_hf_artifacts(
         .await
         .context(FailedWithHFApiSnafu)?;
 
-    let _ = download_safetensors(&api_repo)
-        .await
-        .context(FailedWithHFApiSnafu)?;
+    // Fallback to `pytorch_model.bin` if no safetensors.
+    // Supported by text-embedding-inference, but must be kept in sync manually (if new weight formats).
+    if download_safetensors(Arc::clone(&api_repo)).await.is_err() {
+        tracing::warn!(
+            "safetensors weights not found; falling back to `pytorch_model.bin`. Model loading is significantly slower."
+        );
+        api_repo
+            .get("pytorch_model.bin")
+            .await
+            .context(FailedWithHFApiSnafu)?;
+    }
 
     Ok(root_dir)
 }
@@ -217,7 +309,7 @@ pub(crate) fn max_seq_length_from_st_config(
 ///
 /// ```
 ///
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub fn link_files_into_tmp_dir(files: HashMap<String, PathBuf>) -> Result<PathBuf> {
     let temp_dir = tempdir()
         .boxed()
@@ -242,6 +334,16 @@ pub fn link_files_into_tmp_dir(files: HashMap<String, PathBuf>) -> Result<PathBu
     }
 
     Ok(temp_dir)
+}
+
+/// Async wrapper around [`link_files_into_tmp_dir`] that runs the synchronous
+/// hard-linking filesystem I/O on a blocking thread, so it never stalls a Tokio
+/// worker thread (and `/health`) during model registration.
+pub async fn link_files_into_tmp_dir_blocking(files: HashMap<String, PathBuf>) -> Result<PathBuf> {
+    tokio::task::spawn_blocking(move || link_files_into_tmp_dir(files))
+        .await
+        .boxed()
+        .context(FailedToInstantiateEmbeddingModelSnafu)?
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -274,5 +376,52 @@ pub(crate) fn pool_from_str(p: &str) -> Option<Pool> {
         "splade" => Some(Pool::Splade),
         "last_token" => Some(Pool::LastToken),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_tokenizer;
+    use tempfile::tempdir;
+    use tokenizers::models::bpe::BPE;
+    use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+
+    // Regression test for #13415: a tokenizer.json that bakes in a fixed-length padding and
+    // truncation must not keep them. TEI owns padding/masking; a leaked fixed padding pads every
+    // input to that width and the padding then corrupts mean-pooled embeddings (near-random
+    // retrieval). `load_tokenizer` must strip both so TEI is the single source of truth.
+    #[test]
+    fn load_tokenizer_clears_baked_in_padding_and_truncation() {
+        let mut tokenizer = Tokenizer::new(BPE::default());
+        tokenizer.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::Fixed(128),
+            ..Default::default()
+        }));
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: 128,
+                ..Default::default()
+            }))
+            .expect("failed to set truncation on fixture tokenizer");
+
+        // Sanity check that the fixture actually carries the settings we intend to strip.
+        assert!(tokenizer.get_padding().is_some());
+        assert!(tokenizer.get_truncation().is_some());
+
+        let dir = tempdir().expect("failed to create temp dir");
+        tokenizer
+            .save(dir.path().join("tokenizer.json"), false)
+            .expect("failed to save fixture tokenizer");
+
+        let loaded = load_tokenizer(dir.path()).expect("failed to load tokenizer");
+
+        assert!(
+            loaded.get_padding().is_none(),
+            "load_tokenizer must clear the baked-in padding"
+        );
+        assert!(
+            loaded.get_truncation().is_none(),
+            "load_tokenizer must clear the baked-in truncation"
+        );
     }
 }

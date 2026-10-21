@@ -8,13 +8,16 @@ All criteria must be met for the model to be considered Alpha. As Alpha signifie
 
 | Model Type              | Alpha Quality | DRI Sign-off    |
 | ----------------------- | ------------- | --------------- |
-| File                    | ✅            | @Jeadie         |
-| Hugging Face            | ✅            | @Jeadie         |
-| Spice.ai Cloud Platform | ➖            |                 |
-| OpenAI                  | ✅            | @ewgenius       |
-| Azure Openai            | ➖            |                 |
 | Anthropic               | ➖            |                 |
+| Amazon Bedrock          | ➖            |                 |
+| Azure OpenAI            | ➖            |                 |
+| Databricks              | ➖            |                 |
+| File                    | ✅            | @Jeadie         |
+| Google (Gemini)         | ➖            |                 |
+| Hugging Face            | ✅            | @Jeadie         |
 | Nvidia NIM              | ✅            | @phillipleblanc |
+| OpenAI                  | ✅            | @ewgenius       |
+| Spice.ai Cloud Platform | ➖            |                 |
 | xAI (Grok)              | ✅            | @Sevenannn      |
 
 ## Alpha Release Criteria

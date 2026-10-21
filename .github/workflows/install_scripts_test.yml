@@ -1,0 +1,685 @@
+---
+name: Install Scripts Test
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+    paths:
+      - 'install/**'
+      - 'test/scripts/install-scripts-test.sh'
+      - 'test/scripts/install-download-test.py'
+      - '.github/workflows/install_scripts_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'install/**'
+      - 'test/scripts/install-scripts-test.sh'
+      - 'test/scripts/install-download-test.py'
+      - '.github/workflows/install_scripts_test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  # Unit tests for install script logic
+  test-install-scripts:
+    name: Test Install Scripts (${{ matrix.os }}, ${{ matrix.shell }})
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }} {0}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - os: linux-x64
+            runner: ubuntu-24.04
+            shell: bash
+          - os: linux-x64
+            runner: ubuntu-24.04
+            shell: zsh
+          - os: linux-x64
+            runner: ubuntu-24.04
+            shell: sh
+          # Linux ARM64
+          - os: linux-arm64
+            runner: ubuntu-24.04-arm
+            shell: bash
+          - os: linux-arm64
+            runner: ubuntu-24.04-arm
+            shell: zsh
+          # macOS ARM64 (Apple Silicon)
+          - os: macos-arm64
+            runner: macos-latest
+            shell: bash
+          - os: macos-arm64
+            runner: macos-latest
+            shell: zsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install zsh (Ubuntu)
+        if: contains(matrix.os, 'linux') && matrix.shell == 'zsh'
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Run install script tests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x test/scripts/install-scripts-test.sh
+          bash test/scripts/install-scripts-test.sh --live
+
+  # Test shell detection and PATH configuration
+  test-shell-detection:
+    name: Shell Detection (${{ matrix.os }}, ${{ matrix.shell }})
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }} {0}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - os: linux-x64
+            runner: ubuntu-24.04
+            shell: bash
+          - os: linux-x64
+            runner: ubuntu-24.04
+            shell: zsh
+          # Linux ARM64
+          - os: linux-arm64
+            runner: ubuntu-24.04-arm
+            shell: bash
+          # macOS ARM64
+          - os: macos-arm64
+            runner: macos-latest
+            shell: bash
+          - os: macos-arm64
+            runner: macos-latest
+            shell: zsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install zsh (Ubuntu)
+        if: contains(matrix.os, 'linux') && matrix.shell == 'zsh'
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Create shell profile
+        run: |
+          if [ "${{ matrix.shell }}" = "bash" ]; then
+            touch ~/.bashrc
+            touch ~/.bash_profile
+          elif [ "${{ matrix.shell }}" = "zsh" ]; then
+            touch ~/.zshrc
+          fi
+
+      - name: Test install.sh with shell detection
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHELL: /bin/${{ matrix.shell }}
+        run: |
+          chmod +x install/install.sh
+          ./install/install.sh
+
+          # Verify binary was installed
+          if [ ! -f "$HOME/.spice/bin/spice" ]; then
+            echo "ERROR: spice binary not found at $HOME/.spice/bin/spice"
+            exit 1
+          fi
+
+          # Verify binary is executable
+          if [ ! -x "$HOME/.spice/bin/spice" ]; then
+            echo "ERROR: spice binary is not executable"
+            exit 1
+          fi
+
+          # Verify it runs
+          unset GITHUB_TOKEN
+          "$HOME/.spice/bin/spice" version
+
+      - name: Verify PATH instructions
+        run: |
+          # Check that the shell profile was updated with PATH
+          profile_file=""
+          if [ "${{ matrix.shell }}" = "bash" ]; then
+            if [ -f ~/.bash_profile ]; then
+              profile_file=~/.bash_profile
+            elif [ -f ~/.bashrc ]; then
+              profile_file=~/.bashrc
+            fi
+          elif [ "${{ matrix.shell }}" = "zsh" ]; then
+            profile_file=~/.zshrc
+          fi
+
+          if [ -n "$profile_file" ] && [ -f "$profile_file" ]; then
+            if grep -q ".spice/bin" "$profile_file"; then
+              echo "✓ PATH configuration found in $profile_file"
+            else
+              echo "⚠ PATH configuration not found in $profile_file (may require manual setup)"
+            fi
+          fi
+
+  # Test custom install directories
+  test-custom-install-dir:
+    name: Custom Install Dir (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux-x64
+            runner: ubuntu-24.04
+          - os: linux-arm64
+            runner: ubuntu-24.04-arm
+          - os: macos-arm64
+            runner: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test install.sh with custom directory
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export SPICE_CLI_INSTALL_DIR="${{ github.workspace }}/custom-spice-bin"
+          mkdir -p "$SPICE_CLI_INSTALL_DIR"
+          chmod +x install/install.sh
+          ./install/install.sh
+
+          # Verify binary location
+          if [ ! -f "$SPICE_CLI_INSTALL_DIR/spice" ]; then
+            echo "ERROR: spice not installed to custom directory"
+            ls -la "$SPICE_CLI_INSTALL_DIR" || true
+            exit 1
+          fi
+
+          unset GITHUB_TOKEN
+          "$SPICE_CLI_INSTALL_DIR/spice" version
+
+      - name: Test install-spiced.sh with custom directory
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_INSTALL_DIR: ${{ github.workspace }}/custom-spiced-bin
+        run: |
+          mkdir -p "$SPICED_INSTALL_DIR"
+          chmod +x install/install-spiced.sh
+          ./install/install-spiced.sh
+
+          # Verify binary location
+          if [ ! -f "$SPICED_INSTALL_DIR/spiced" ]; then
+            echo "ERROR: spiced not installed to custom directory"
+            ls -la "$SPICED_INSTALL_DIR" || true
+            exit 1
+          fi
+
+          unset GITHUB_TOKEN
+          "$SPICED_INSTALL_DIR/spiced" --version
+
+  # Test all spiced variants across architectures
+  test-spiced-variants:
+    name: Spiced Variant (${{ matrix.os }}, ${{ matrix.variant }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 variants
+          - os: linux-x64
+            runner: ubuntu-24.04
+            variant: ''
+          # Linux ARM64 variants
+          - os: linux-arm64
+            runner: ubuntu-24.04-arm
+            variant: ''
+          # macOS ARM64 variants
+          - os: macos-arm64
+            runner: macos-latest
+            variant: ''
+          - os: macos-arm64
+            runner: macos-latest
+            variant: metal
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test install-spiced.sh with variant '${{ matrix.variant }}'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VARIANT: ${{ matrix.variant }}
+          SPICED_INSTALL_DIR: ${{ runner.temp }}/spiced-bin
+        run: |
+          mkdir -p "$SPICED_INSTALL_DIR"
+          chmod +x install/install-spiced.sh
+          ./install/install-spiced.sh
+          unset GITHUB_TOKEN
+          "$SPICED_INSTALL_DIR/spiced" --version
+
+  # Test specific version installation
+  test-specific-version:
+    name: Specific Version Install (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux-x64
+            runner: ubuntu-24.04
+          - os: linux-arm64
+            runner: ubuntu-24.04-arm
+          - os: macos-arm64
+            runner: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Get a known release version
+        id: get_version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get the latest release tag and strip the 'v' prefix (scripts add it back)
+          VERSION=$(gh api repos/spiceai/spiceai/releases/latest --jq '.tag_name')
+          VERSION=${VERSION#v}
+          test -n "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Testing with version: $VERSION"
+
+      - name: Test install.sh with specific version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_CLI_INSTALL_DIR: ${{ github.workspace }}/bin-cli
+          RELEASE_VERSION: ${{ steps.get_version.outputs.version }}
+        run: |
+          mkdir -p "$SPICE_CLI_INSTALL_DIR"
+          chmod +x install/install.sh
+          ./install/install.sh "$RELEASE_VERSION"
+          unset GITHUB_TOKEN
+          "$SPICE_CLI_INSTALL_DIR/spice" version
+
+      - name: Test install-spiced.sh with specific version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_INSTALL_DIR: ${{ github.workspace }}/bin-spiced
+          RELEASE_VERSION: ${{ steps.get_version.outputs.version }}
+        run: |
+          mkdir -p "$SPICED_INSTALL_DIR"
+          chmod +x install/install-spiced.sh
+          ./install/install-spiced.sh "$RELEASE_VERSION"
+          unset GITHUB_TOKEN
+          "$SPICED_INSTALL_DIR/spiced" --version
+
+  # Test HTTP client fallback (curl vs wget)
+  test-http-clients:
+    name: HTTP Client (${{ matrix.client }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        client: [curl, wget]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Remove alternative HTTP client
+        run: |
+          if [ "${{ matrix.client }}" = "curl" ]; then
+            alternate=wget
+          else
+            alternate=curl
+          fi
+          while command -v "$alternate" >/dev/null 2>&1; do
+            client_path=$(command -v "$alternate")
+            sudo mv "$client_path" "$client_path.install-test-backup"
+            echo "$client_path" >> "${{ runner.temp }}/hidden-http-clients"
+            hash -r
+          done
+
+      - name: Verify only ${{ matrix.client }} is available
+        run: |
+          if [ "${{ matrix.client }}" = "curl" ]; then
+            command -v curl
+            alternate=wget
+          else
+            command -v wget
+            alternate=curl
+          fi
+          if command -v "$alternate"; then
+            echo "ERROR: Alternative HTTP client is still available"
+            exit 1
+          fi
+
+      - name: Test runtime download retries with ${{ matrix.client }}
+        run: python3 test/scripts/install-download-test.py --client "${{ matrix.client }}"
+
+      - name: Test install.sh with ${{ matrix.client }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_CLI_INSTALL_DIR: ${{ runner.temp }}/spice-bin
+        run: |
+          mkdir -p "$SPICE_CLI_INSTALL_DIR"
+          chmod +x install/install.sh
+          ./install/install.sh
+          unset GITHUB_TOKEN
+          "$SPICE_CLI_INSTALL_DIR/spice" version
+
+      - name: Reject invalid release credentials with ${{ matrix.client }}
+        env:
+          GITHUB_TOKEN: invalid-installer-test-token
+          LC_ALL: C
+          SPICED_INSTALL_DIR: ${{ runner.temp }}/spiced-bin
+        run: |
+          if bash install/install-spiced.sh > "${{ runner.temp }}/invalid-token.log" 2>&1; then
+            echo "ERROR: Runtime installer accepted invalid release credentials"
+            exit 1
+          fi
+          cat "${{ runner.temp }}/invalid-token.log"
+          grep -E '(^|[^0-9])401([^0-9]|$)|Username/Password Authentication Failed\.' "${{ runner.temp }}/invalid-token.log"
+          grep -F "Failed to get latest release information" "${{ runner.temp }}/invalid-token.log"
+
+      - name: Test install-spiced.sh with ${{ matrix.client }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_INSTALL_DIR: ${{ runner.temp }}/spiced-bin
+        run: |
+          mkdir -p "$SPICED_INSTALL_DIR"
+          bash install/install-spiced.sh
+          unset GITHUB_TOKEN
+          "$SPICED_INSTALL_DIR/spiced" --version
+
+      - name: Restore HTTP clients
+        if: always()
+        run: |
+          if [ -f "${{ runner.temp }}/hidden-http-clients" ]; then
+            while IFS= read -r client_path; do
+              sudo mv "$client_path.install-test-backup" "$client_path"
+            done < "${{ runner.temp }}/hidden-http-clients"
+          fi
+
+  # Test error handling
+  test-error-handling:
+    name: Error Handling (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test invalid version handling
+        run: |
+          chmod +x install/install-spiced.sh
+          export SPICED_INSTALL_DIR="${{ runner.temp }}/spiced-bin"
+          mkdir -p "$SPICED_INSTALL_DIR"
+
+          # This should fail gracefully with a non-existent version
+          if ./install/install-spiced.sh 0.0.0-nonexistent 2>&1; then
+            echo "ERROR: Script should have failed for non-existent version"
+            exit 1
+          else
+            echo "✓ Script correctly failed for non-existent version"
+          fi
+
+      - name: Test invalid CUDA variant on non-Linux
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x install/install-spiced.sh
+          export SPICED_INSTALL_DIR="${{ runner.temp }}/spiced-bin"
+          export VARIANT="cuda"
+          export CUDA_VERSION="90"
+          mkdir -p "$SPICED_INSTALL_DIR"
+
+          # This should fail on macOS
+          if ./install/install-spiced.sh > "${{ runner.temp }}/cuda-rejection.log" 2>&1; then
+            echo "ERROR: CUDA variant should not be allowed on macOS"
+            exit 1
+          else
+            cat "${{ runner.temp }}/cuda-rejection.log"
+            grep -F "CUDA variants are only supported on Linux" "${{ runner.temp }}/cuda-rejection.log"
+            echo "✓ Script correctly rejected CUDA variant on macOS"
+          fi
+
+  # Test on Windows with WSL
+  test-windows-wsl:
+    name: Windows WSL (${{ matrix.distro }})
+    runs-on: windows-latest
+    env:
+      WSLENV: GITHUB_TOKEN/u
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [Ubuntu-24.04]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup WSL
+        uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7
+        with:
+          distribution: ${{ matrix.distro }}
+          additional-packages: curl wget python3
+
+      - name: Run install script tests in WSL
+        shell: wsl-bash {0}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x test/scripts/install-scripts-test.sh
+          ./test/scripts/install-scripts-test.sh --live
+
+      - name: Test install.sh in WSL
+        shell: wsl-bash {0}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x install/install.sh
+          export SPICE_CLI_INSTALL_DIR="$HOME/.spice/bin"
+          ./install/install.sh
+
+          if [ ! -f "$SPICE_CLI_INSTALL_DIR/spice" ]; then
+            echo "ERROR: spice binary not found"
+            exit 1
+          fi
+
+          unset GITHUB_TOKEN
+          "$SPICE_CLI_INSTALL_DIR/spice" version
+
+      - name: Test install-spiced.sh in WSL
+        shell: wsl-bash {0}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x install/install-spiced.sh
+          export SPICED_INSTALL_DIR="$HOME/bin"
+          mkdir -p "$SPICED_INSTALL_DIR"
+          ./install/install-spiced.sh
+
+          if [ ! -f "$SPICED_INSTALL_DIR/spiced" ]; then
+            echo "ERROR: spiced binary not found"
+            exit 1
+          fi
+
+          unset GITHUB_TOKEN
+          "$SPICED_INSTALL_DIR/spiced" --version
+
+  # Test native Windows with PowerShell
+  test-windows-native:
+    name: Windows Native (PowerShell)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test Install.ps1
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Run the PowerShell installer
+          .\install\Install.ps1
+
+          # Verify the binary was installed
+          $spicePath = Join-Path $HOME ".spice\bin\spice.exe"
+          if (-not (Test-Path $spicePath)) {
+            Write-Error "ERROR: spice.exe not found at $spicePath"
+            exit 1
+          }
+
+          # Verify it runs
+          Remove-Item Env:GITHUB_TOKEN
+          & $spicePath version
+
+      - name: Verify PATH was updated
+        shell: pwsh
+        run: |
+          $userPath = [Environment]::GetEnvironmentVariable("PATH", [EnvironmentVariableTarget]::User)
+          $spiceBinDir = Join-Path $HOME ".spice\bin"
+
+          if ($userPath -like "*$spiceBinDir*") {
+            Write-Host "✓ PATH was updated to include $spiceBinDir"
+          } else {
+            Write-Host "⚠ PATH does not contain $spiceBinDir"
+            Write-Host "Current User PATH: $userPath"
+          }
+
+  # Test Windows PowerShell with custom directory
+  test-windows-custom-dir:
+    name: Windows Custom Dir (PowerShell)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test Install.ps1 with custom directory
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create custom install directory
+          $customDir = Join-Path $env:GITHUB_WORKSPACE "custom-spice-bin"
+          New-Item -Path $customDir -ItemType Directory -Force | Out-Null
+
+          # Modify script to use custom directory (inline for testing)
+          $content = Get-Content .\install\Install.ps1 -Raw
+          $content = $content -replace '\$spiceCliInstallDir = Join-Path \$HOME \$spiceBin', "`$spiceCliInstallDir = `"$customDir`""
+          $content | Set-Content .\install\Install-Custom.ps1
+
+          # Run the modified script
+          .\install\Install-Custom.ps1
+
+          # Verify binary location
+          $spicePath = Join-Path $customDir "spice.exe"
+          if (-not (Test-Path $spicePath)) {
+            Write-Error "ERROR: spice.exe not found at $spicePath"
+            Get-ChildItem $customDir
+            exit 1
+          }
+
+          # Verify it runs
+          Remove-Item Env:GITHUB_TOKEN
+          & $spicePath version
+
+  # Test Windows PowerShell error handling
+  test-windows-errors:
+    name: Windows Error Handling (PowerShell)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test PowerShell script syntax
+        shell: pwsh
+        run: |
+          # Check for syntax errors using AST
+          $errors = $null
+          $tokens = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD "install\Install.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+
+          if ($errors.Count -gt 0) {
+            Write-Error "PowerShell syntax errors found:"
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+          Write-Host "✓ No syntax errors in Install.ps1"
+
+      - name: Test PSScriptAnalyzer (if available)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          # Install and run PSScriptAnalyzer
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          $results = Invoke-ScriptAnalyzer -Path .\install\Install.ps1 -Severity Error
+
+          if ($results.Count -gt 0) {
+            Write-Warning "PSScriptAnalyzer found issues:"
+            $results | Format-Table -AutoSize
+          } else {
+            Write-Host "✓ No critical issues found by PSScriptAnalyzer"
+          }
+
+  # Validate scripts with shellcheck
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run shellcheck on install.sh
+        run: |
+          shellcheck -e SC2034,SC2086,SC2155,SC2223,SC1090 install/install.sh
+
+      - name: Run shellcheck on install-spiced.sh
+        run: |
+          shellcheck -e SC2034,SC2086,SC2155,SC2223,SC1090 install/install-spiced.sh
+
+      - name: Run shellcheck on test script
+        run: |
+          shellcheck -e SC2034,SC2086,SC2155 test/scripts/install-scripts-test.sh

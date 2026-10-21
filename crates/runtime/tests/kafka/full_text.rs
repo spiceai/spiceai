@@ -15,21 +15,20 @@ limitations under the License.
 */
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use app::AppBuilder;
 use runtime::Runtime;
 use spicepod::semantic::{Column, FullTextSearchConfig};
 
 use super::bootstrap::{make_kafka_dataset, send_messages_to_kafka, start_kafka_docker_container};
-use tokio::time::sleep;
 
-use super::run_and_snapshot_query;
+use super::{run_and_snapshot_query, wait_for_query_rows};
 use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check;
-use crate::{init_tracing, utils::test_request_context};
-
-const KAFKA_PORT: u16 = 19094;
+use crate::{
+    init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 #[tokio::test]
 async fn kafka_full_text_index() -> anyhow::Result<()> {
@@ -38,7 +37,8 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
     test_request_context()
         .scope(async {
             let (running_container, producer) =
-                start_kafka_docker_container(KAFKA_PORT, &["stack_qa"]).await?;
+                start_kafka_docker_container(&["stack_qa"]).await?;
+            let port = running_container.host_port(19092)?;
 
             tracing::debug!("Container started");
 
@@ -46,7 +46,7 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
             let stack_qa_json: Vec<serde_json::Value> = stack_qa_json();
             send_messages_to_kafka(&producer, "stack_qa", &stack_qa_json).await?;
 
-            let mut ds = make_kafka_dataset("stack_qa", "stack_qa", KAFKA_PORT, None);
+            let mut ds = make_kafka_dataset("stack_qa", "stack_qa", port, None);
             ds.columns =
                 vec![Column::new("title").with_full_text_search(
                     FullTextSearchConfig::enabled().with_row_id("question_id"),
@@ -56,12 +56,13 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -69,18 +70,14 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
 
             runtime_ready_check(&rt).await;
 
-            // Ensure all messages are processed
-            sleep(Duration::from_secs(2)).await;
-
             let table = "stack_qa";
             let data_snapshot = format!("{table}_data");
+            let query = format!(
+                "SELECT question_id, title FROM text_search({table}, 'gitignore untracked') ORDER BY _score DESC LIMIT 10"
+            );
 
-            run_and_snapshot_query(
-                &rt,
-                &format!("SELECT question_id, title FROM text_search({table}, 'gitignore untracked') ORDER BY score DESC LIMIT 10"),
-                &data_snapshot,
-            )
-            .await?;
+            wait_for_query_rows(&rt, &query, 1).await?;
+            run_and_snapshot_query(&rt, &query, &data_snapshot).await?;
 
             rt.shutdown().await;
             drop(rt);
@@ -96,7 +93,7 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
         .await
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn stack_qa_json() -> Vec<serde_json::Value> {
     include_str!("./test_data/stack_qa.json")
         .lines()

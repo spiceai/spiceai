@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
-use aws_config::{BehaviorVersion, SdkConfig};
+use aws_config::SdkConfig;
 
 use aws_credential_types::Credentials;
 use aws_runtime::auth::sigv4::SigV4AuthScheme;
@@ -35,15 +35,12 @@ use aws_smithy_runtime_api::client::{
     identity::SharedIdentityResolver,
     runtime_components::{RuntimeComponents, RuntimeComponentsBuilder},
 };
-use iceberg::io::{
-    AwsCredential as IcebergAwsCredential, AwsCredentialLoad, CustomAwsCredentialLoader,
-};
+use iceberg_storage_opendal::{AwsCredential as IcebergAwsCredential, CustomAwsCredentialLoader};
 use object_store::{CredentialProvider, aws::AwsCredential as ObjectStoreAwsCredential};
+use reqsign_core::{Context, Error as ReqsignError, ProvideCredential, Result as ReqsignResult};
 use snafu::prelude::*;
 
-use crate::{
-    Error, FailedToBuildAWSRuntimeComponentsSnafu, FailedToResolveIcebergCredentialsSnafu, Result,
-};
+use crate::{Error, FailedToBuildAWSRuntimeComponentsSnafu, Result};
 
 #[derive(Debug)]
 pub struct S3CredentialProvider {
@@ -59,7 +56,16 @@ impl S3CredentialProvider {
     ///
     /// Returns an error if the credentials cannot be loaded from the environment.
     pub async fn from_env() -> Result<(Self, SdkConfig)> {
-        let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+        Self::from_env_with_region(None).await
+    }
+
+    /// Loads credentials from the environment with an explicit region when available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credentials cannot be loaded from the environment.
+    pub async fn from_env_with_region(region: Option<&str>) -> Result<(Self, SdkConfig)> {
+        let config = super::default_aws_config_for_region(region).load().await;
 
         Ok((Self::from_config(&config)?, config))
     }
@@ -112,12 +118,10 @@ impl S3CredentialProvider {
     }
 }
 
-#[async_trait]
-impl AwsCredentialLoad for S3CredentialProvider {
-    async fn load_credential(
-        &self,
-        _client: reqwest::Client,
-    ) -> anyhow::Result<Option<IcebergAwsCredential>> {
+impl ProvideCredential for S3CredentialProvider {
+    type Credential = IcebergAwsCredential;
+
+    async fn provide_credential(&self, _ctx: &Context) -> ReqsignResult<Option<Self::Credential>> {
         // `resolve_cached_identity` will first check the cache for valid, unexpired credentials, and fetch new credentials if needed.
         // The identity resolver and runtime components are required parameters for this function, which is why they're fields of this struct.
         let wrapped_credentials = self
@@ -128,21 +132,60 @@ impl AwsCredentialLoad for S3CredentialProvider {
                 &ConfigBag::base(),
             )
             .await
-            .context(FailedToResolveIcebergCredentialsSnafu)?;
+            .map_err(|err| {
+                tracing::error!(
+                    error = %err,
+                    "Failed to resolve AWS credentials from identity cache"
+                );
+                ReqsignError::credential_invalid(format!(
+                    "Failed to find valid credentials from the AWS credential provider chain for the S3 connection: {err}. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
+                ))
+            })?;
 
         let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
-            Error::FailedToResolveIcebergCredentials {
-                source: "No valid credentials found".into(),
-            }
+            tracing::error!("Resolved identity does not contain AWS credentials");
+            ReqsignError::credential_invalid("Failed to find valid credentials from the AWS credential provider chain for the S3 connection. The resolved identity does not contain credential data. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain")
         })?;
 
         Ok(Some(IcebergAwsCredential {
             access_key_id: credentials.access_key_id().to_string(),
             secret_access_key: credentials.secret_access_key().to_string(),
             session_token: credentials.session_token().map(ToString::to_string),
-            expires_in: credentials.expiry().map(Into::into),
+            expires_in: credential_expiry(credentials)?,
         }))
     }
+}
+
+fn credential_expiry(
+    credentials: &Credentials,
+) -> ReqsignResult<Option<reqsign_core::time::Timestamp>> {
+    let Some(expiry) = credentials.expiry() else {
+        return Ok(None);
+    };
+
+    let duration = expiry
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|err| {
+            ReqsignError::credential_invalid(
+                "Resolved AWS credential expiry is before the Unix epoch",
+            )
+            .with_source(err)
+        })?;
+    let millis = i64::try_from(duration.as_millis()).map_err(|err| {
+        ReqsignError::credential_invalid(
+            "Resolved AWS credential expiry exceeds the supported timestamp range",
+        )
+        .with_source(err)
+    })?;
+
+    reqsign_core::time::Timestamp::from_millisecond(millis)
+        .map(Some)
+        .map_err(|err| {
+            ReqsignError::credential_invalid(
+                "Resolved AWS credential expiry is outside the supported timestamp range",
+            )
+            .with_source(err)
+        })
 }
 
 #[async_trait]
@@ -160,15 +203,22 @@ impl CredentialProvider for S3CredentialProvider {
                 &ConfigBag::base(),
             )
             .await
-            .map_err(|_| object_store::Error::Generic {
-                store: "S3",
-                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
+            .map_err(|err| {
+                tracing::error!(
+                    error = %err,
+                    "Failed to resolve AWS credentials from identity cache"
+                );
+                object_store::Error::Generic {
+                    store: "S3",
+                    source: format!("Failed to find valid credentials from the AWS credential provider chain for the S3 connection: {err}. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain").into(),
+                }
             })?;
 
         let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
+            tracing::error!("Resolved identity does not contain AWS credentials");
             object_store::Error::Generic {
                 store: "S3",
-                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
+                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. The resolved identity does not contain credential data. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
             }
         })?;
 

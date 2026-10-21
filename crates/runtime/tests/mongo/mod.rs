@@ -17,23 +17,38 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::SystemTime;
 
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
+use arrow::array::{Array, Int32Array, StringArray};
+#[cfg(not(target_os = "windows"))]
+use common::make_mongodb_cayenne_change_stream_dataset;
 use common::{get_mongodb_client, make_mongodb_dataset, start_mongodb_docker_container};
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
+use common::{get_mongodb_replica_set_client, start_mongodb_replica_set_docker_container};
+#[cfg(feature = "duckdb")]
+use common::{
+    make_mongodb_change_stream_dataset, make_mongodb_change_stream_dataset_inferred,
+    make_mongodb_inference_dataset, make_mongodb_widen_dataset,
+};
+#[cfg(feature = "duckdb")]
+use datafusion::assert_batches_eq;
 use mongodb::{Collection, bson::doc};
 
 use chrono::{DateTime, Utc};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
-use crate::utils::test_request_context;
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
+use crate::utils::wait_until_true;
+use crate::utils::{register_test_connectors, run_query, test_request_context};
 
 pub mod common;
+mod pushdown_roundtrip;
+mod schema_registration;
 
 use super::*;
 use app::AppBuilder;
 use runtime::Runtime;
 use tracing::instrument;
-
-const MONGODB_PORT1: u16 = 27019;
 
 #[instrument]
 async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
@@ -107,24 +122,110 @@ async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Seed an `inventory` collection (documents plus a unique and a plain secondary
+/// index) for the non-CDC extended schema-inference test. The secondary indexes
+/// exercise the `listIndexes` inference path; the implicit `_id_` index must be
+/// dropped as the inferred primary key.
+#[cfg(feature = "duckdb")]
+async fn init_mongodb_inventory_db(port: u16) -> Result<(), anyhow::Error> {
+    let client = get_mongodb_client(port).await?;
+    let database = client.database("testdb");
+    let _ = database
+        .collection::<mongodb::bson::Document>("inventory")
+        .drop()
+        .await;
+    let collection: Collection<mongodb::bson::Document> = database.collection("inventory");
+    collection
+        .insert_many(vec![
+            doc! { "_id": 1, "sku": "A", "name": "Widget", "quantity": 10 },
+            doc! { "_id": 2, "sku": "B", "name": "Gadget", "quantity": 5 },
+            doc! { "_id": 3, "sku": "C", "name": "Gizmo", "quantity": 7 },
+        ])
+        .await?;
+    database
+        .run_command(doc! {
+            "createIndexes": "inventory",
+            "indexes": [
+                { "key": { "sku": 1 }, "name": "uq_sku", "unique": true },
+                { "key": { "quantity": 1 }, "name": "idx_quantity" },
+            ],
+        })
+        .await?;
+    Ok(())
+}
+
+#[instrument]
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
+async fn init_mongodb_change_stream_db(port: u16) -> Result<(), anyhow::Error> {
+    tracing::debug!("INIT CHANGE STREAM DB: test");
+    let client = get_mongodb_replica_set_client(port).await?;
+    let database = client.database("testdb");
+
+    let _ = database
+        .collection::<mongodb::bson::Document>("change_stream_users")
+        .drop()
+        .await;
+
+    let collection: Collection<mongodb::bson::Document> =
+        database.collection("change_stream_users");
+    collection
+        .insert_many(vec![
+            doc! { "_id": 1, "name": "Ada" },
+            doc! { "_id": 2, "name": "Grace" },
+        ])
+        .await?;
+
+    Ok(())
+}
+
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
+async fn change_stream_rows(rt: &Arc<Runtime>) -> Result<Vec<(i32, String)>, anyhow::Error> {
+    let batches = run_query(rt, "SELECT _id, name FROM change_stream_users ORDER BY _id").await?;
+    let mut rows = Vec::new();
+
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| anyhow::anyhow!("_id column should be Int32"))?;
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow::anyhow!("name column should be Utf8"))?;
+
+        for row_index in 0..batch.num_rows() {
+            if names.is_null(row_index) {
+                return Err(anyhow::anyhow!("name should not be null"));
+            }
+            rows.push((ids.value(row_index), names.value(row_index).to_string()));
+        }
+    }
+
+    Ok(rows)
+}
+
 #[tokio::test]
 async fn mongodb_integration_test() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
-            let running_container = start_mongodb_docker_container(MONGODB_PORT1)
-                .await
-                .map_err(|e| {
-                    tracing::error!("start_mongodb_docker_container: {e}");
-                    e.to_string()
-                })?;
+            let running_container = start_mongodb_docker_container().await.map_err(|e| {
+                tracing::error!("start_mongodb_docker_container: {e}");
+                e.to_string()
+            })?;
+            let port = running_container
+                .host_port(27017)
+                .map_err(|e| e.to_string())?;
             tracing::debug!("Container started");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mongodb_db(MONGODB_PORT1).await.map_err(|e| {
-                    tracing::error!("Failed transiently  to initialize MongoDB database: {e}");
+                init_mongodb_db(port).await.map_err(|e| {
+                    tracing::error!("Failed transiently to initialize MongoDB database: {e}");
                     RetryError::transient(e)
                 })
             })
@@ -134,7 +235,7 @@ async fn mongodb_integration_test() -> Result<(), String> {
                 e.to_string()
             })?;
             let app = AppBuilder::new("mongodb_integration_test")
-                .with_dataset(make_mongodb_dataset("test", "test", MONGODB_PORT1, false))
+                .with_dataset(make_mongodb_dataset("test", "test", port, false))
                 .build();
 
             configure_test_datafusion();
@@ -144,7 +245,7 @@ async fn mongodb_integration_test() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -163,7 +264,7 @@ async fn mongodb_integration_test() -> Result<(), String> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("MongoDB Integration Test Results"),
+                        description => "MongoDB Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
@@ -188,6 +289,570 @@ async fn mongodb_integration_test() -> Result<(), String> {
                 e.to_string()
             })?;
 
+            Ok(())
+        })
+        .await
+}
+
+/// Seed a `nested` collection whose documents carry, beyond `_id`/`name`, extra
+/// scalar (`email`, `age`), nested-document (`address`), and array (`tags`)
+/// fields — everything a `json_object` catch-all must fold in.
+#[instrument]
+async fn init_mongodb_json_nesting_db(port: u16) -> Result<(), anyhow::Error> {
+    let client = get_mongodb_client(port).await?;
+    let database = client.database("testdb");
+    let collection: Collection<mongodb::bson::Document> = database.collection("nested");
+    collection.drop().await.ok();
+    collection
+        .insert_many(vec![
+            doc! {
+                "_id": 1,
+                "name": "Alice",
+                "email": "alice@example.com",
+                "age": 30,
+                "address": { "city": "NYC", "zip": "10001" },
+            },
+            doc! {
+                "_id": 2,
+                "name": "Bob",
+                "email": "bob@example.com",
+                "age": 25,
+                "tags": ["x", "y"],
+            },
+        ])
+        .await?;
+    Ok(())
+}
+
+/// JSON nesting (`json_object: "*"`) on a federated `MongoDB` dataset: the declared
+/// static columns (`_id`, `name`) stay top-level, and every other document field
+/// is folded into one sorted-JSON catch-all `Utf8` column (`data`). Asserts both
+/// that non-declared fields (scalar, nested, array) land in the catch-all and
+/// that static columns do **not** leak into it.
+#[tokio::test]
+async fn mongodb_json_nesting_folds_into_catch_all() -> Result<(), anyhow::Error> {
+    use arrow::array::{Array, StringArray};
+    use serde_json::json;
+    use spicepod::semantic::Column;
+    use std::collections::HashMap;
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let running_container = start_mongodb_docker_container().await?;
+            let port = running_container.host_port(27017)?;
+
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_mongodb_json_nesting_db(port)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await?;
+
+            let mut metadata = HashMap::new();
+            metadata.insert("json_object".to_string(), json!("*"));
+            let mut dataset = make_mongodb_dataset("nested", "nested", port, false);
+            dataset.columns = vec![
+                Column::new("_id"),
+                Column::new("name"),
+                Column::new("data").with_metadata(metadata),
+            ];
+
+            let app = AppBuilder::new("mongodb_json_nesting")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&cloned_rt).load_components() => {}
+            }
+
+            let batches =
+                run_query(&cloned_rt, "SELECT name, data FROM nested ORDER BY _id").await?;
+
+            let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
+            for batch in &batches {
+                let names = batch
+                    .column_by_name("name")
+                    .ok_or_else(|| anyhow::anyhow!("missing `name` column"))?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| anyhow::anyhow!("`name` should be a static Utf8 column"))?;
+                let data = batch
+                    .column_by_name("data")
+                    .ok_or_else(|| anyhow::anyhow!("missing catch-all `data` column"))?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("catch-all `data` should be a Utf8 JSON string")
+                    })?;
+                for row in 0..batch.num_rows() {
+                    let catch_all: serde_json::Value = serde_json::from_str(data.value(row))
+                        .map_err(|e| anyhow::anyhow!("catch-all must be valid JSON: {e}"))?;
+                    rows.push((names.value(row).to_string(), catch_all));
+                }
+            }
+
+            assert_eq!(rows.len(), 2, "expected two documents, got {}", rows.len());
+
+            // Row 0 (_id=1, Alice): declared statics stay top-level; every other
+            // field (scalar, nested doc, array) is folded into the catch-all, and
+            // no static key leaks into it.
+            let (name0, data0) = &rows[0];
+            assert_eq!(name0, "Alice");
+            assert_eq!(data0["email"], json!("alice@example.com"));
+            assert!(
+                data0.get("age").is_some(),
+                "scalar `age` must be in the catch-all"
+            );
+            assert!(
+                data0["address"].is_object(),
+                "nested `address` must be preserved as JSON in the catch-all"
+            );
+            assert!(
+                data0.get("name").is_none(),
+                "static `name` must not leak into the catch-all"
+            );
+            assert!(
+                data0.get("_id").is_none(),
+                "static `_id` must not leak into the catch-all"
+            );
+
+            // Row 1 (_id=2, Bob): array field also folds in.
+            let (name1, data1) = &rows[1];
+            assert_eq!(name1, "Bob");
+            assert_eq!(data1["email"], json!("bob@example.com"));
+            assert!(
+                data1["tags"].is_array(),
+                "array `tags` must be preserved in the catch-all"
+            );
+            assert!(data1.get("name").is_none());
+
+            running_container.remove().await?;
+            Ok(())
+        })
+        .await
+}
+
+/// Non-CDC counterpart to `mongodb_change_streams_infer_primary_key`: a `DuckDB`
+/// full-refresh dataset loads end-to-end against a real `MongoDB` with always-on
+/// schema inference. The catalog query (`listIndexes`/`collStats`) runs on the server
+/// and the inferred settings applied for `DuckDB` + full refresh (the `_id` sort
+/// order; physical constraints are intentionally skipped for this engine/mode) are
+/// accepted by the accelerator — a correct row count proves none of those steps
+/// errored. (Precise value-level mapping is covered by unit tests.)
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn mongodb_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,connector_mongodb=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let running_container = start_mongodb_docker_container().await?;
+            let port = running_container.host_port(27017)?;
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_mongodb_inventory_db(port)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await?;
+
+            let app = AppBuilder::new("mongodb_schema_inference")
+                .with_dataset(make_mongodb_inference_dataset(
+                    "inventory",
+                    "inventory",
+                    port,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!(
+                        "Timed out waiting for MongoDB extended-inference dataset to load"
+                    ));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+            crate::utils::runtime_ready_check(&rt).await;
+
+            // The full extended-inference pipeline must succeed end-to-end: the MongoDB
+            // catalog query runs against the real server, and the inferred `_id`
+            // primary key, secondary indexes, and `_id` sort are all accepted by the
+            // DuckDB accelerator. A correct row count proves the dataset loaded.
+            let results = run_query(&rt, "SELECT COUNT(*) AS n FROM inventory").await?;
+            assert_batches_eq!(
+                &[
+                    "+---+", //
+                    "| n |", //
+                    "+---+", //
+                    "| 3 |", //
+                    "+---+", //
+                ],
+                &results
+            );
+
+            running_container
+                .remove()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to remove container: {e}"))?;
+            Ok(())
+        })
+        .await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyhow::Error> {
+    assert_change_streams_apply_insert_update_delete(
+        "mongodb_change_streams_apply_insert_update_delete",
+        make_mongodb_change_stream_dataset,
+    )
+    .await
+}
+
+/// Cayenne applies Change Streams with `primary_key: _id` and no `on_conflict`: it keeps
+/// one row per primary key on its own.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_change_streams_cayenne_primary_key_only() -> Result<(), anyhow::Error> {
+    assert_change_streams_apply_insert_update_delete(
+        "mongodb_change_streams_cayenne_primary_key_only",
+        make_mongodb_cayenne_change_stream_dataset,
+    )
+    .await
+}
+
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
+async fn assert_change_streams_apply_insert_update_delete(
+    app_name: &str,
+    make_dataset: fn(&str, &str, u16) -> spicepod::component::dataset::Dataset,
+) -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,connector_mongodb=debug,data_components=debug,info",
+    ));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let running_container =
+                start_mongodb_replica_set_docker_container().await?;
+            let port = running_container.host_port(27017)?;
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_mongodb_change_stream_db(port)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await?;
+
+            let app = AppBuilder::new(app_name)
+                .with_dataset(make_dataset(
+                    "change_stream_users",
+                    "change_stream_users",
+                    port,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for MongoDB Change Streams dataset to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            crate::utils::runtime_ready_check(&rt).await;
+            let rt = Arc::new(rt);
+
+            let initial_rows_loaded = wait_until_true(std::time::Duration::from_secs(30), || {
+                let rt = Arc::clone(&rt);
+                async move {
+                    change_stream_rows(&rt)
+                        .await
+                        .is_ok_and(|rows| rows == vec![(1, "Ada".to_string()), (2, "Grace".to_string())])
+                }
+            })
+            .await;
+            assert!(initial_rows_loaded, "initial MongoDB snapshot should load");
+
+            let client = get_mongodb_replica_set_client(port).await?;
+            let collection: Collection<mongodb::bson::Document> = client
+                .database("testdb")
+                .collection("change_stream_users");
+            collection
+                .insert_one(doc! { "_id": 3, "name": "Katherine" })
+                .await?;
+            collection
+                .update_one(
+                    doc! { "_id": 2 },
+                    doc! { "$set": { "name": "Grace Hopper" } },
+                )
+                .await?;
+            collection.delete_one(doc! { "_id": 1 }).await?;
+
+            let changes_applied = wait_until_true(std::time::Duration::from_secs(30), || {
+                let rt = Arc::clone(&rt);
+                async move {
+                    change_stream_rows(&rt).await.is_ok_and(|rows| {
+                        rows == vec![
+                            (2, "Grace Hopper".to_string()),
+                            (3, "Katherine".to_string()),
+                        ]
+                    })
+                }
+            })
+            .await;
+
+            assert!(
+                changes_applied,
+                "MongoDB Change Streams should apply insert, update, and delete events"
+            );
+
+            rt.shutdown().await;
+            running_container.remove().await?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// `MongoDB` Streams (`refresh_mode: changes`) work with always-on schema inference
+/// and no explicit `primary_key`/`on_conflict`: inference supplies `_id` as the
+/// primary key plus the matching upsert, which the change-stream path requires.
+#[cfg(feature = "duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_change_streams_infer_primary_key() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,connector_mongodb=debug,data_components=debug,info",
+    ));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let running_container =
+                start_mongodb_replica_set_docker_container()
+                    .await?;
+            let port = running_container.host_port(27017)?;
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_mongodb_change_stream_db(port)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await?;
+
+            let app = AppBuilder::new("mongodb_change_streams_infer_primary_key")
+                .with_dataset(make_mongodb_change_stream_dataset_inferred(
+                    "change_stream_users",
+                    "change_stream_users",
+                    port,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for MongoDB Change Streams dataset to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            crate::utils::runtime_ready_check(&rt).await;
+            let rt = Arc::new(rt);
+
+            // The change stream only starts if `resolve_primary_keys` succeeds, which
+            // requires `primary_key: _id` plus an `_id` upsert. Both come from extended
+            // schema inference here, not explicit configuration.
+            let initial_rows_loaded = wait_until_true(std::time::Duration::from_secs(30), || {
+                let rt = Arc::clone(&rt);
+                async move {
+                    change_stream_rows(&rt).await.is_ok_and(|rows| {
+                        rows == vec![(1, "Ada".to_string()), (2, "Grace".to_string())]
+                    })
+                }
+            })
+            .await;
+            assert!(
+                initial_rows_loaded,
+                "MongoDB change stream should start and snapshot via the inferred `_id` primary key"
+            );
+
+            // An UPDATE should upsert in place (inferred on_conflict), not append.
+            let client =
+                get_mongodb_replica_set_client(port).await?;
+            let collection: Collection<mongodb::bson::Document> =
+                client.database("testdb").collection("change_stream_users");
+            collection
+                .update_one(doc! { "_id": 2 }, doc! { "$set": { "name": "Grace Hopper" } })
+                .await?;
+
+            let update_applied = wait_until_true(std::time::Duration::from_secs(30), || {
+                let rt = Arc::clone(&rt);
+                async move {
+                    change_stream_rows(&rt).await.is_ok_and(|rows| {
+                        rows == vec![(1, "Ada".to_string()), (2, "Grace Hopper".to_string())]
+                    })
+                }
+            })
+            .await;
+            assert!(
+                update_applied,
+                "the inferred `_id` upsert should apply UPDATE events in place"
+            );
+
+            rt.shutdown().await;
+            running_container.remove().await?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// Seed the `widen` collection with two documents carrying only `{_id, name}`,
+/// then (when `with_country`) add a third document that also has a `country`
+/// field — the additive change the restart re-infers and evolves.
+#[cfg(feature = "duckdb")]
+async fn seed_mongodb_widen_collection(port: u16, with_country: bool) -> Result<(), anyhow::Error> {
+    let client = get_mongodb_client(port).await?;
+    let database = client.database("testdb");
+    if with_country {
+        let collection: Collection<mongodb::bson::Document> = database.collection("widen");
+        collection
+            .insert_one(doc! { "_id": 3, "name": "Carlos", "country": "Canada" })
+            .await?;
+    } else {
+        let _ = database
+            .collection::<mongodb::bson::Document>("widen")
+            .drop()
+            .await;
+        let collection: Collection<mongodb::bson::Document> = database.collection("widen");
+        collection
+            .insert_many(vec![
+                doc! { "_id": 1, "name": "Alice" },
+                doc! { "_id": 2, "name": "Bob" },
+            ])
+            .await?;
+    }
+    Ok(())
+}
+
+/// Builds and loads a runtime for the `MongoDB` widening dataset (file-backed
+/// `DuckDB` so the acceleration survives the restart). Re-registers connectors
+/// each call since a prior `shutdown()` clears them.
+#[cfg(feature = "duckdb")]
+async fn build_mongodb_widen_runtime(
+    port: u16,
+    duckdb_file: &str,
+) -> Result<Arc<Runtime>, anyhow::Error> {
+    register_test_connectors().await;
+    let app = AppBuilder::new("mongodb_schema_evolution_widening")
+        .with_dataset(make_mongodb_widen_dataset(
+            "widen",
+            "widen",
+            port,
+            duckdb_file,
+        ))
+        .build();
+    configure_test_datafusion();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for MongoDB widening dataset to load"));
+        }
+        () = Arc::clone(&rt).load_components() => {}
+    }
+    crate::utils::runtime_ready_check(&rt).await;
+    Ok(rt)
+}
+
+/// Restart-time widening for a `MongoDB` source: a `country` field that appears in
+/// newly inserted documents is re-inferred on restart and adopted into the
+/// file-backed `DuckDB` acceleration under `on_schema_change: sync_all_columns`
+/// (additive widening), instead of the dataset deferring on the prior schema
+/// (the `block` default). `MongoDB` schema inference unions fields across the
+/// sampled documents, so the field surfaces as a nullable column.
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn mongodb_schema_evolution_widening_adds_column() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,connector_mongodb=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = tempfile::tempdir()?;
+            let duckdb_file = temp_dir
+                .path()
+                .join("mongo_widen.duckdb")
+                .to_string_lossy()
+                .to_string();
+
+            let running_container = start_mongodb_docker_container().await?;
+            let port = running_container.host_port(27017)?;
+
+            // Seed two documents with only {_id, name}.
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                seed_mongodb_widen_collection(port, false)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await?;
+
+            // Phase 1: initial load infers {_id, name}.
+            let rt = build_mongodb_widen_runtime(port, &duckdb_file).await?;
+            let batches = run_query(&rt, "SELECT _id, name FROM widen ORDER BY _id").await?;
+            let rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
+            assert_eq!(rows, 2, "expected 2 rows in the initial MongoDB load");
+            rt.shutdown().await;
+            drop(rt);
+
+            // A document carrying the new `country` field arrives.
+            seed_mongodb_widen_collection(port, true).await?;
+
+            // Phase 2: restart re-infers the wider schema and adopts `country` into the
+            // acceleration under sync_all_columns. The restart evolves the schema in place
+            // (existing rows preserved) rather than re-fetching, so the proof is that the
+            // column is now in the registered schema and queryable — under `block` this
+            // query would error (the column would not be registered).
+            let rt = build_mongodb_widen_runtime(port, &duckdb_file).await?;
+            let batches =
+                run_query(&rt, "SELECT _id, name, country FROM widen ORDER BY _id").await?;
+            let has_country = batches
+                .first()
+                .is_some_and(|b| b.schema().field_with_name("country").is_ok());
+            assert!(
+                has_country,
+                "the `country` column should be adopted into the registered schema after the widening restart"
+            );
+            let rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
+            assert!(
+                rows >= 2,
+                "existing documents should be preserved across the widening restart (got {rows})"
+            );
+            rt.shutdown().await;
+            drop(rt);
+
+            running_container.remove().await?;
             Ok(())
         })
         .await

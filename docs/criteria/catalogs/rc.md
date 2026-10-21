@@ -7,11 +7,20 @@ All criteria must be met for the Catalog to be considered [RC](../definitions.md
 ## RC Quality Catalogs
 
 | Catalog       | RC Quality | DRI Sign-off |
-| ------------- | ------------ | ------------ |
-| Databricks    | ➖           |              |
-| Iceberg       | ➖           |              |
-| Spice.ai      | ➖           |              |
-| Unity Catalog | ✅           | @Sevenannn   |
+| ------------- | ---------- | ------------ |
+| ADBC          | ➖         |              |
+| Cayenne       | ➖         |              |
+| Databricks    | ➖         |              |
+| DuckLake      | ➖         |              |
+| Glue          | ✅         | @lukekim     |
+| Iceberg       | ➖         |              |
+| MS SQL        | ➖         |              |
+| MySQL         | ➖         |              |
+| Oracle        | ➖         |              |
+| PostgreSQL    | ➖         |              |
+| Snowflake     | ➖         |              |
+| Spice.ai      | ✅         | @peasee      |
+| Unity Catalog | ✅         | @Sevenannn   |
 
 ## RC Criteria
 

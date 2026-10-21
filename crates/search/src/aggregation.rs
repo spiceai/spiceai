@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion::{common::Column, execution::SendableRecordBatchStream};
 use serde_json::{Value, json};
 use snafu::{ResultExt, Snafu};
 
@@ -42,12 +42,12 @@ pub enum Error {
 
     #[snafu(display(
         "Generated candidates have inconsistent columns. From {:?}. And {:?}.",
-        s1.fields().iter().map(|f| format!("{}: {}", f.name(), f.data_type())).collect::<Vec<_>>().join(", "),
-        s2.fields().iter().map(|f| format!("{}: {}", f.name(), f.data_type())).collect::<Vec<_>>().join(", "),
+        s1.fields().iter().map(|f| format!("{}: {} (nullable={})", f.name(), f.data_type(), f.is_nullable())).collect::<Vec<_>>().join(", "),
+        s2.fields().iter().map(|f| format!("{}: {} (nullable={})", f.name(), f.data_type(), f.is_nullable())).collect::<Vec<_>>().join(", "),
     ))]
     InconsistentColumns { s1: SchemaRef, s2: SchemaRef },
 
-    #[snafu(display("A database error occurred whilst aggregating search candidates: {source}"))]
+    #[snafu(display("Failed to aggregate search results: {source}"))]
     DatafusionError {
         source: datafusion::error::DataFusionError,
     },
@@ -74,13 +74,23 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Candidates (in `candidate_sets`) are expected to have columns as per [`super::generation::CandidateGeneration::search`] documentation. Any additional columns are expected to be common across all [`SendableRecordBatchStream`] in `candidate_sets`.
 #[async_trait]
 pub trait CandidateAggregation: Sync + Send {
+    /// Returns the number of candidates each input should provide before aggregation.
+    ///
+    /// Most aggregations only need the final result limit. Algorithms that can
+    /// improve recall by considering additional candidates, such as RRF, should
+    /// override this while the final `limit` remains the user-visible cap.
+    #[must_use]
+    fn candidate_pool_size(&self, limit: usize) -> usize {
+        limit
+    }
+
     /// Consumes `generation_results` and decides how to order the underlying [`SendableRecordBatchStream`] data into a single [`SendableRecordBatchStream`].
     ///
     /// Expect `data` to be non empty, and one [`VectorSearchGenerationResult::data`] to be non-empty.
     async fn aggregate(
         &self,
         mut data: Vec<VectorSearchGenerationResult>,
-        primary_keys: Vec<String>,
+        primary_keys: Vec<Column>,
         limit: usize,
     ) -> Result<AggregationResult>;
 }
@@ -99,7 +109,7 @@ pub struct AggregationResult {
     /// to all the columns in `data` that derived from it.
     ///
     /// Example
-    /// ```
+    /// ```json
     /// {
     ///   "body": ["body_fts", "body_similarity"]
     /// }
@@ -121,20 +131,19 @@ impl std::fmt::Debug for AggregationResult {
 
 fn from_single_input(
     input: VectorSearchGenerationResult,
-    primary_key: Vec<String>,
+    primary_key: Vec<Column>,
 ) -> AggregationResult {
     let VectorSearchGenerationResult {
         data,
         derived_from: derived_column,
     } = input;
 
+    let primary_key: Vec<_> = primary_key.into_iter().map(|c| c.flat_name()).collect();
+
     // Results from [`super::generation::CandidateGeneration::search`] outputs the matches as the
     // `SEARCH_VALUE_COLUMN_NAME` column, so we directly know the mapping.
     let mut matches = HashMap::new();
-    matches.insert(
-        derived_column.to_string(),
-        vec![SEARCH_VALUE_COLUMN_NAME.to_string()],
-    );
+    matches.insert(derived_column, vec![SEARCH_VALUE_COLUMN_NAME.to_string()]);
 
     // All remaining columns in the data are considered additional columns.
     let data_columns: Vec<_> = data
@@ -148,7 +157,7 @@ fn from_single_input(
             {
                 None
             } else {
-                Some(f.name().to_string())
+                Some(f.name().clone())
             }
         })
         .collect();
@@ -233,7 +242,7 @@ impl AggregationResult {
     }
 }
 
-pub(crate) fn write_to_json_string(
+pub fn write_to_json_string(
     data: &[RecordBatch],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let buf = Vec::new();

@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{borrow::Cow, ops::ControlFlow};
+use std::{borrow::Cow, ops::ControlFlow, sync::Arc};
 
-use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
+use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_flight::{
     FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, PutResult, Ticket,
     decode::{DecodedPayload, FlightDataDecoder},
@@ -26,76 +26,173 @@ use arrow_flight::{
     sql::{self, CommandPreparedStatementQuery, DoPutPreparedStatementResult, ProstMessageExt},
 };
 use arrow_schema::SchemaRef;
+use arrow_tools::map_entries::{self, MapEntriesNormalizer};
 use arrow_tools::record_batch::record_to_param_values;
 use bytes::Bytes;
+use datafusion::common::ParamValues;
 use datafusion::sql::sqlparser::{
     ast::{Expr, Statement, Value, VisitMut, VisitorMut},
     dialect::GenericDialect,
     parser::{Parser, ParserError},
 };
+use futures::StreamExt;
 use postcard::{from_bytes, to_stdvec};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
-use tokio_stream::{StreamExt, adapters::Peekable};
+use tokio_stream::adapters::Peekable;
 use tonic::{Request, Response, Status, Streaming};
 
+use super::DecodableSchema;
 use crate::{
-    datafusion::request_context_extension::get_current_datafusion,
+    datafusion::{
+        query::{run_transaction, schema_statement, transaction_statements},
+        request_context_extension::get_current_datafusion,
+    },
     flight::{
-        Service, metrics, to_tonic_err,
+        Service, is_auth_read_only, metrics, record_batches_to_flight_stream, to_tonic_err,
+        transaction_error_to_status,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
-    timing::TimedStream,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
+use telemetry::timing::TimedStream;
+
+/// Arrow `DataType` to SQL type name conversion for CAST expressions.
+///
+/// NOTE: String types (`Utf8`, `LargeUtf8`) are intentionally NOT included here.
+/// Adding CAST for strings (e.g., `CAST($1 AS VARCHAR)`) prevents `DataFusion`'s
+/// filter pushdown optimization from merging filters into `TableScan` as `full_filters`.
+/// This causes filters to remain as separate Filter nodes below `SubqueryAlias`, which
+/// then causes datafusion-federation to generate invalid SQL with unaliased table
+/// references (e.g., `nation.n_name` instead of `n1.n_name` when the table is aliased).
+/// String type inference works correctly without explicit CASTs.
+///
+/// Long-term fix: Update `DataFusion`'s optimizer to recognize that `CAST(Utf8 AS Utf8View)`
+/// is safe to push down. This would be the proper upstream fix, but until then we avoid
+/// the CAST for string types entirely.
+fn arrow_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Option<&'static str> {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Int8 => Some("TINYINT"),
+        DataType::Int16 => Some("SMALLINT"),
+        DataType::Int32 => Some("INT"),
+        DataType::Int64 => Some("BIGINT"),
+        DataType::UInt8 => Some("TINYINT UNSIGNED"),
+        DataType::UInt16 => Some("SMALLINT UNSIGNED"),
+        DataType::UInt32 => Some("INT UNSIGNED"),
+        DataType::UInt64 => Some("BIGINT UNSIGNED"),
+        DataType::Float32 => Some("FLOAT"),
+        DataType::Float64 => Some("DOUBLE"),
+        // String types intentionally omitted - CASTs break filter pushdown optimization
+        // DataType::Utf8 | DataType::LargeUtf8 => Some("VARCHAR"),
+        DataType::Boolean => Some("BOOLEAN"),
+        DataType::Date32 | DataType::Date64 => Some("DATE"),
+        DataType::Timestamp(_, _) => Some("TIMESTAMP"),
+        _ => None,
+    }
+}
+
+/// AST visitor that rewrites parameter placeholders to include CAST expressions.
+///
+/// This uses proper SQL parsing to avoid incorrectly replacing placeholders
+/// inside string literals or comments.
+struct ParameterCastRewriter<'a> {
+    param_types: &'a std::collections::HashMap<usize, &'static str>,
+}
+
+impl VisitorMut for ParameterCastRewriter<'_> {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        if let Expr::Value(value_with_span) = expr
+            && let Value::Placeholder(ref placeholder) = value_with_span.value
+        {
+            // Check if this is a $N style placeholder
+            if let Some(stripped) = placeholder.strip_prefix('$')
+                && let Ok(idx) = stripped.parse::<usize>()
+                && let Some(sql_type) = self.param_types.get(&idx)
+            {
+                // Replace $N with CAST($N AS type) by wrapping in a Cast expression
+                let original_placeholder = placeholder.clone();
+                let cast_expr = Expr::Cast {
+                    expr: Box::new(Expr::Value(Value::Placeholder(original_placeholder).into())),
+                    data_type: datafusion::sql::sqlparser::ast::DataType::Custom(
+                        datafusion::sql::sqlparser::ast::ObjectName(vec![
+                            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(
+                                datafusion::sql::sqlparser::ast::Ident::new(*sql_type),
+                            ),
+                        ]),
+                        vec![],
+                    ),
+                    array: false,
+                    format: None,
+                    kind: datafusion::sql::sqlparser::ast::CastKind::Cast,
+                };
+                *expr = cast_expr;
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Attempts to rewrite SQL to include explicit type casts for parameters.
+/// This helps `DataFusion` infer parameter types for queries like "SELECT $1 + $2".
+///
+/// Uses AST-based rewriting to avoid incorrectly modifying placeholders inside
+/// string literals or comments.
+///
+/// For each parameter $N, wraps it in a CAST($N AS <type>) based on the schema.
+fn rewrite_sql_with_type_casts(sql: &str, schema: &SchemaRef) -> String {
+    // Build a map from parameter index to SQL type string
+    let mut param_types = std::collections::HashMap::new();
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let param_num = idx + 1;
+        if let Some(sql_type) = arrow_type_to_sql_type(field.data_type()) {
+            param_types.insert(param_num, sql_type);
+        } else {
+            // Some types intentionally don't get CAST (e.g., strings - see arrow_type_to_sql_type docs)
+            tracing::debug!(
+                "Skipping CAST for parameter ${} with type: {:?}",
+                param_num,
+                field.data_type()
+            );
+        }
+    }
+
+    // Parse the SQL into an AST
+    let dialect = GenericDialect {};
+    let mut ast = match Parser::parse_sql(&dialect, sql) {
+        Ok(ast) => ast,
+        Err(e) => {
+            tracing::warn!("Failed to parse SQL for type cast rewriting: {e}");
+            return sql.to_string();
+        }
+    };
+
+    // Rewrite parameter placeholders in each statement
+    let mut rewriter = ParameterCastRewriter {
+        param_types: &param_types,
+    };
+    for stmt in &mut ast {
+        let _ = stmt.visit(&mut rewriter);
+    }
+
+    // Convert AST back to SQL string
+    ast.iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PreparedStatement {
-    query: String,
-    // Store parameter RecordBatch as IPC bytes for serialization
-    #[serde(with = "record_batch_serde")]
-    parameter_batch: Option<RecordBatch>,
-}
-
-mod record_batch_serde {
-    use arrow::array::RecordBatch;
-    use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::io::Cursor;
-
-    #[allow(clippy::ref_option)]
-    pub fn serialize<S>(batch: &Option<RecordBatch>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match batch {
-            None => Vec::<u8>::new().serialize(serializer),
-            Some(batch) => {
-                let mut writer = StreamWriter::try_new(Vec::new(), &batch.schema())
-                    .map_err(serde::ser::Error::custom)?;
-                writer.write(batch).map_err(serde::ser::Error::custom)?;
-                writer.finish().map_err(serde::ser::Error::custom)?;
-                let bytes = writer.into_inner().map_err(serde::ser::Error::custom)?;
-                bytes.serialize(serializer)
-            }
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<RecordBatch>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let bytes: Vec<u8> = Vec::deserialize(deserializer)?;
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-
-        let cursor = Cursor::new(bytes);
-        let mut reader = StreamReader::try_new(cursor, None).map_err(serde::de::Error::custom)?;
-
-        reader.next().transpose().map_err(serde::de::Error::custom)
-    }
+    pub(super) query: String,
+    pub(super) parameters: Vec<u8>,
+    /// Parameter schema - stores the Arrow schema of bound parameters from `DoPut`
+    /// This schema provides type information for each parameter (e.g., Int64, Utf8, etc.)
+    /// and is used to create a properly typed logical plan during execution
+    pub(super) parameter_schema: Option<Vec<u8>>,
 }
 
 /// Create a prepared statement from given SQL statement.
@@ -110,9 +207,39 @@ pub(crate) async fn do_action_create_prepared_statement(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
-    let (dataset_schema, parameter_schema) = Service::get_arrow_schema(datafusion, &query)
-        .await
-        .map_err(to_tonic_err)?;
+    // Try to get schema, but if it fails due to type inference issues with parameters,
+    // we'll return empty schemas. The actual type checking will happen when parameters are bound.
+    // For a `BEGIN … COMMIT` body, advertise the final statement's schema (the
+    // body is executed as a transaction at do_get, not planned as one here).
+    let schema_sql = schema_statement(&query);
+    let (dataset_schema, parameter_schema) = match Service::get_arrow_schema(
+        Arc::clone(&datafusion),
+        &schema_sql,
+    )
+    .await
+    {
+        Ok(schemas) => schemas,
+        Err(e) => {
+            // Check if this is a type inference error related to parameters
+            let err_msg = e.to_string();
+            if err_msg.contains("Cannot get result type")
+                || err_msg.contains("Invalid arithmetic operation")
+                || err_msg.contains("type inference")
+                || err_msg.contains("No field named")
+                // A table function can't plan until its parameters are bound.
+                || datafusion.has_table_function_placeholders(&schema_sql)
+            {
+                tracing::debug!(
+                    "Could not infer schema during prepare (will be determined at execution): {err_msg}"
+                );
+                // Return empty schema - types will be determined when parameters are bound
+                (arrow_schema::Schema::empty(), None)
+            } else {
+                // This is a real error (syntax error, unknown table, etc.), return it
+                return Err(e);
+            }
+        }
+    };
 
     let dataset_schema = Service::serialize_schema(&dataset_schema)?;
     let parameter_schema = if let Some(schema) = &parameter_schema {
@@ -123,7 +250,8 @@ pub(crate) async fn do_action_create_prepared_statement(
 
     let stmt = PreparedStatement {
         query: query.to_string(),
-        parameter_batch: None,
+        parameters: vec![],
+        parameter_schema: None,
     };
 
     let handle = to_stdvec(&stmt).map_err(error_to_status)?;
@@ -145,15 +273,81 @@ pub(crate) async fn get_flight_info(
 
     tracing::trace!("get_flight_info_prepared_statement");
 
+    // Decode the prepared statement to get the query and retrieve its schema
+    let PreparedStatement {
+        query: sql,
+        parameters,
+        parameter_schema,
+    } = from_bytes(&handle.prepared_statement_handle).map_err(error_to_status)?;
+
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
+    // Try to get schema, but if it fails due to type inference issues with parameters,
+    // we'll omit the schema from FlightInfo. The actual schema will be determined during execution.
+    // For a `BEGIN … COMMIT` body, advertise the final statement's schema.
+    //
+    // When parameters are already bound (DoPut before GetFlightInfo), plan with
+    // them exactly as `do_get` will: same type-cast rewrite, same bound values.
+    // Otherwise an output column that depends on a parameter is advertised as
+    // `Null`/nullable while the stream carries the bound, non-null type, and
+    // clients that check the endpoint schema (ADBC, arrow-go) reject it.
+    let schema_sql = schema_statement(&sql);
+    let schema_result = match decode_param_values(&parameters).map_err(param_error_to_status)? {
+        Some(param_values) if transaction_statements(&sql).is_none() => {
+            let sql_to_plan = match &parameter_schema {
+                Some(schema_bytes) => {
+                    let reader =
+                        StreamReader::try_new(&schema_bytes[..], None).map_err(error_to_status)?;
+                    rewrite_sql_with_type_casts(&sql, &reader.schema())
+                }
+                None => sql.clone(),
+            };
+            Service::get_arrow_schema_with_params(
+                Arc::clone(&datafusion),
+                &sql_to_plan,
+                Some(param_values),
+            )
+            .await
+        }
+        _ => Service::get_arrow_schema(Arc::clone(&datafusion), &schema_sql).await,
+    };
+    let maybe_arrow_schema = match schema_result {
+        Ok((schema, _)) => Some(schema),
+        Err(e) => {
+            let err_msg = e.to_string();
+            if err_msg.contains("Cannot get result type")
+                || err_msg.contains("Invalid arithmetic operation")
+                || err_msg.contains("type inference")
+                || err_msg.contains("No field named")
+                // A table function can't plan until its parameters are bound.
+                || datafusion.has_table_function_placeholders(&schema_sql)
+            {
+                tracing::debug!(
+                    "Could not infer schema for prepared statement (will be determined at execution): {err_msg}"
+                );
+                // Return None to indicate schema is unknown - it will be determined during execution
+                None
+            } else {
+                return Err(e);
+            }
+        }
+    };
+
     let fd = request.into_inner();
 
     let endpoint = FlightEndpoint::new().with_ticket(Ticket {
         ticket: handle.as_any().encode_to_vec().into(),
     });
 
-    let info = FlightInfo::new()
+    let mut info = FlightInfo::new()
         .with_endpoint(endpoint)
         .with_descriptor(fd);
+
+    // Only include schema if we were able to infer it
+    if let Some(schema) = maybe_arrow_schema {
+        info = info.try_with_schema(&schema).map_err(to_tonic_err)?;
+    }
 
     Ok(Response::new(info))
 }
@@ -171,27 +365,92 @@ pub(crate) async fn do_get(
 
     let PreparedStatement {
         query: sql,
-        parameter_batch,
+        parameters,
+        parameter_schema,
     } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
 
-    // Convert parameter batch to ParamValues if present
-    let parameters = if let Some(batch) = parameter_batch {
-        Some(record_to_param_values(&batch).map_err(error_to_status)?)
+    tracing::debug!(
+        "do_get: Query: {}, Parameters length: {}",
+        sql,
+        parameters.len()
+    );
+
+    let param_values = decode_param_values(&parameters).map_err(param_error_to_status)?;
+
+    tracing::debug!("do_get: Decoded parameters: {:?}", param_values);
+
+    // A `BEGIN … COMMIT` body runs through the shared transaction orchestrator
+    // (one atomic staged commit across every table it touches); stream the final
+    // statement's result. Scoped so the `CayenneTransaction` the orchestrator
+    // installs on the request context is the one the write path's sink reads.
+    if let Some(statements) = transaction_statements(&sql) {
+        let read_only = is_auth_read_only(&context);
+        let context_clone = Arc::clone(&context);
+        let outcome = context_clone
+            .scope(async {
+                run_transaction(&datafusion, &statements, param_values, read_only).await
+            })
+            .await
+            .map_err(transaction_error_to_status)?;
+        let batches = outcome
+            .result
+            .map(|(batches, _)| batches)
+            .unwrap_or_default();
+        let stream = record_batches_to_flight_stream(batches);
+        let timed = TimedStream::new(stream, move || start);
+        return Ok(Response::new(
+            Box::pin(timed) as <Service as FlightService>::DoGetStream
+        ));
+    }
+
+    // If we have parameter schema from DoPut, try to use it to help with type inference
+    // by rewriting the SQL to include explicit type casts
+    let sql_to_execute = if let Some(schema_bytes) = &parameter_schema {
+        tracing::debug!("do_get: Have parameter schema, attempting to rewrite SQL with type casts");
+
+        // Decode the parameter schema
+        let schema = {
+            let reader = arrow::ipc::reader::StreamReader::try_new(&schema_bytes[..], None)
+                .map_err(error_to_status)?;
+            reader.schema()
+        };
+
+        tracing::debug!("do_get: Parameter schema: {:?}", schema);
+
+        // Try to rewrite the SQL with type casts to help DataFusion infer types
+        let rewritten = rewrite_sql_with_type_casts(&sql, &schema);
+        tracing::debug!("do_get: Rewritten SQL: {}", rewritten);
+        Cow::Owned(rewritten)
     } else {
-        None
+        Cow::Borrowed(sql.as_str())
     };
 
-    // Execute the query through the standard path
-    // The logical plan will be created and cached on first execution
-    // via get_or_create_logical_plan in sql_to_flight_stream.
-    // Subsequent executions will reuse the cached plan (1 hour TTL, 512 entries max).
-    let (output, from_cache) =
-        Box::pin(Service::sql_to_flight_stream(datafusion, &sql, parameters)).await?;
+    // Use the standard flow with the (possibly rewritten) SQL
+    // Ensure the query execution happens within the request context scope
+    let pre_parsed_plan = super::super::check_read_only_sql(
+        &context,
+        &datafusion,
+        &sql_to_execute,
+        param_values.as_ref(),
+    )
+    .await?;
+    let context_clone = Arc::clone(&context);
+    let (output, from_cache) = context_clone
+        .scope(async {
+            Box::pin(Service::sql_to_flight_stream(
+                datafusion,
+                &sql_to_execute,
+                param_values,
+                pre_parsed_plan,
+            ))
+            .await
+        })
+        .await?;
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =
         Response::new(Box::pin(timed_output) as <Service as FlightService>::DoGetStream);
-    attach_cache_metadata(&mut response, from_cache);
+    attach_cache_metadata(&mut response, from_cache, &context);
     Ok(response)
 }
 
@@ -202,52 +461,47 @@ pub(crate) async fn do_put_query(
     query: CommandPreparedStatementQuery,
     streaming_flight: Peekable<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
-    let streaming_flight = streaming_flight
-        .map(|flight_data| flight_data.map_err(|status| FlightError::Tonic(Box::new(status))));
+    let _start = metrics::track_flight_request("do_put", Some("prepared_statement_query")).await;
+    tracing::debug!("do_put_query: Binding parameters to prepared statement");
+
+    let decodable = DecodableSchema::default();
+    let streaming_flight = streaming_flight.map({
+        let decodable = decodable.clone();
+        move |flight_data| {
+            flight_data
+                .map_err(|status| FlightError::Tonic(Box::new(status)))
+                .map(|message| decodable.repair(message))
+        }
+    });
 
     let mut decoder = FlightDataDecoder::new(streaming_flight);
 
     // Read the schema first - Arrow Flight always sends schema before batches
-    let schema = decode_schema(&mut decoder).await?;
+    let schema = decodable.declared(decode_schema(&mut decoder).await?);
 
-    // Collect all parameter batches
-    let mut batches = Vec::new();
-    let mut total_rows = 0;
-    while let Some(msg) = futures::TryStreamExt::try_next(&mut decoder).await? {
-        match msg.payload {
-            DecodedPayload::None => {}
-            DecodedPayload::Schema(_) => {
-                return Err(Status::invalid_argument(
-                    "parameter flight data must contain a single schema",
-                ));
-            }
-            DecodedPayload::RecordBatch(record_batch) => {
-                total_rows += record_batch.num_rows();
-                batches.push(record_batch);
-            }
-        }
-    }
-    if total_rows > 1 {
-        return Err(Status::invalid_argument(
-            "parameters should contain a single row",
-        ));
-    }
+    tracing::debug!("do_put_query: Parameter schema: {:?}", schema);
 
-    // Combine multiple batches if parameters span multiple batches
-    let parameter_batch = if batches.is_empty() {
-        None
-    } else if batches.len() == 1 {
-        batches.into_iter().next()
-    } else {
-        // Multiple batches received - combine them using the schema we already have
-        let combined = concat_batches(&schema, &batches)
-            .map_err(|e| Status::internal(format!("Failed to combine parameter batches: {e}")))?;
-        Some(combined)
+    // The parameters are stored as bytes and read back at execution time, so what is written
+    // here is what the query binds. A `MAP` whose `entries` the client declared nullable is
+    // brought into line before it is written, not after: the stored stream is the one the Arrow
+    // map layout allows, and a client that sent an entries array holding nulls is told so now,
+    // while the column can still be named, rather than at the next `DoGet`.
+    let normalizer = MapEntriesNormalizer::for_schema(&schema);
+    let parameters = encode_single_row_parameters(&mut decoder, &normalizer).await?;
+
+    // Serialize the parameter schema for later use in query planning
+    let schema_bytes = {
+        let mut bytes = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, normalizer.schema())
+            .map_err(error_to_status)?;
+        writer.finish().map_err(error_to_status)?;
+        bytes
     };
 
     let mut stmt: PreparedStatement =
         from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
-    stmt.parameter_batch = parameter_batch;
+    stmt.parameters = parameters;
+    stmt.parameter_schema = Some(schema_bytes);
     let handle = to_stdvec(&stmt).map_err(error_to_status)?;
 
     let result = DoPutPreparedStatementResult {
@@ -258,6 +512,47 @@ pub(crate) async fn do_put_query(
         app_metadata: result.encode_to_vec().into(),
     })]);
     Ok(Response::new(Box::pin(output)))
+}
+
+/// Reads parameter record batches from `decoder` (after the schema has been
+/// consumed) and returns the IPC-serialized parameters, enforcing that they
+/// contain at most a single row.
+///
+/// The single-row bound is checked *as each batch arrives*, before buffering
+/// more, so a client cannot stream unbounded parameter batches and OOM the
+/// process — the per-message size cap bounds one batch, not the stream length.
+pub(super) async fn encode_single_row_parameters(
+    decoder: &mut FlightDataDecoder,
+    normalizer: &MapEntriesNormalizer,
+) -> Result<Vec<u8>, Status> {
+    let mut parameters = Vec::new();
+    let mut encoder =
+        StreamWriter::try_new(&mut parameters, normalizer.schema()).map_err(error_to_status)?;
+    let mut total_rows = 0;
+    while let Some(msg) = futures::TryStreamExt::try_next(decoder).await? {
+        match msg.payload {
+            DecodedPayload::None => {}
+            DecodedPayload::Schema(_) => {
+                return Err(Status::invalid_argument(
+                    "parameter flight data must contain a single schema",
+                ));
+            }
+            DecodedPayload::RecordBatch(record_batch) => {
+                total_rows += record_batch.num_rows();
+                if total_rows > 1 {
+                    return Err(Status::invalid_argument(
+                        "parameters should contain a single row",
+                    ));
+                }
+                let record_batch = normalizer
+                    .normalize(record_batch)
+                    .map_err(|error| map_entries_to_status(&error))?;
+                encoder.write(&record_batch).map_err(error_to_status)?;
+            }
+        }
+    }
+    encoder.finish().map_err(error_to_status)?;
+    Ok(parameters)
 }
 
 async fn decode_schema(decoder: &mut FlightDataDecoder) -> Result<SchemaRef, Status> {
@@ -280,8 +575,64 @@ async fn decode_schema(decoder: &mut FlightDataDecoder) -> Result<SchemaRef, Sta
     ))
 }
 
-fn error_to_status<E: std::fmt::Debug>(err: E) -> Status {
+// Decode parameter ipc stream as ParamValues
+pub(super) fn decode_param_values(
+    parameters: &[u8],
+) -> Result<Option<ParamValues>, datafusion::error::DataFusionError> {
+    if parameters.is_empty() {
+        return Ok(None);
+    }
+    let declared = StreamReader::try_new(parameters, None)?.schema();
+    // A client is free to declare a MAP's `entries` field nullable, which the Arrow map layout
+    // forbids — and which the decode itself now refuses, over the one part of the column that
+    // holds no data, naming neither the column nor which of the two map rules was broken.
+    // Reading through `arrow_tools` decodes those buffers as the list they are laid out as and
+    // brings the parameter into line where the column can still be named.
+    let batches = map_entries::read_ipc_stream(parameters).map_err(param_decode_error)?;
+    let batch = concat_batches(&map_entries::conforming_schema(declared), batches.iter())?;
+    Ok(Some(record_to_param_values(&batch)?))
+}
+
+/// Reports a failure to read the Arrow IPC stream a client sent its parameters in.
+///
+/// Only the map failures carry the map remediation. A stream that does not decode at all fails
+/// for a reason of its own — truncated bytes, a header that will not parse — and telling its
+/// sender to check a MAP `entries` declaration names a column they may not even have sent.
+fn param_decode_error(error: map_entries::Error) -> datafusion::error::DataFusionError {
+    match error {
+        map_entries::Error::UndecodableStream { source } => source.into(),
+        named => datafusion::error::DataFusionError::Execution(format!(
+            "Failed to read the query parameters sent to the Flight SQL server ({named}), so the query cannot run. \
+             Send the MAP parameter with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
+             See: https://spiceai.org/docs/api/arrow-flight-sql"
+        )),
+    }
+}
+
+/// Reports a `MAP` parameter the Arrow map layout has no way to carry.
+///
+/// The client's own bytes are what is wrong, and no retry of them will succeed, so this is an
+/// argument error rather than the `Internal` a client would be entitled to retry.
+fn map_entries_to_status(error: &map_entries::Error) -> Status {
+    Status::invalid_argument(format!(
+        "Failed to bind the query parameters sent to the Flight SQL server ({error}), so the query cannot run. \
+         Send the MAP parameter with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
+         See: https://spiceai.org/docs/api/arrow-flight-sql"
+    ))
+}
+
+pub(super) fn error_to_status<E: std::fmt::Debug>(err: E) -> Status {
     Status::internal(format!("{err:?}"))
+}
+
+/// Reports a failure to decode the parameters a client sent with a prepared statement.
+///
+/// Every way [`decode_param_values`] can fail describes the client's own bytes — an IPC stream that
+/// does not parse, batches whose schemas disagree, a `MAP` declaration the Arrow layout forbids, or
+/// a value that is not representable as a scalar. None of them is a server fault, so none of them
+/// becomes more likely to succeed on a retry, which is what `Internal` would invite the client to do.
+pub(super) fn param_error_to_status<E: std::fmt::Display>(err: E) -> Status {
+    Status::invalid_argument(format!("{err}"))
 }
 
 #[derive(Debug, Snafu)]
@@ -353,6 +704,236 @@ impl VisitorMut for ConvertJdbcPlaceholdersVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    /// Helper to encode a `RecordBatch` into Arrow IPC format for parameters
+    fn encode_params_to_bytes(batch: &RecordBatch) -> Result<Vec<u8>, arrow::error::ArrowError> {
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &batch.schema())?;
+        writer.write(batch)?;
+        writer.finish()?;
+        writer.into_inner()
+    }
+
+    fn int64_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]))
+    }
+
+    fn one_col_batch(schema: &Arc<Schema>, values: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(Int64Array::from(values))])
+            .expect("record batch")
+    }
+
+    /// Encodes `batches` as a Flight stream and returns a decoder positioned
+    /// just past the schema message, along with the decoded schema.
+    async fn decoder_for(batches: Vec<RecordBatch>) -> (FlightDataDecoder, SchemaRef) {
+        use arrow_flight::encode::FlightDataEncoderBuilder;
+        let input = futures::stream::iter(batches.into_iter().map(Ok::<RecordBatch, FlightError>));
+        let flight_stream = FlightDataEncoderBuilder::new().build(input);
+        let mut decoder = FlightDataDecoder::new(flight_stream);
+        let schema = decode_schema(&mut decoder).await.expect("schema decoded");
+        (decoder, schema)
+    }
+
+    #[tokio::test]
+    async fn encode_single_row_parameters_accepts_one_row() {
+        let schema = int64_schema();
+        let (mut decoder, schema_ref) = decoder_for(vec![one_col_batch(&schema, vec![1])]).await;
+        let params = encode_single_row_parameters(
+            &mut decoder,
+            &MapEntriesNormalizer::for_schema(&schema_ref),
+        )
+        .await
+        .expect("a single row of parameters should be accepted");
+        // An IPC stream holds a schema and an end marker even with no batches,
+        // so read the row back rather than checking the bytes are non-empty.
+        let batches = StreamReader::try_new(params.as_slice(), None)
+            .expect("parameters should be an Arrow IPC stream")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parameter batches should decode");
+        assert_eq!(batches, vec![one_col_batch(&schema, vec![1])]);
+    }
+
+    #[tokio::test]
+    async fn encode_single_row_parameters_rejects_two_rows_in_one_batch() {
+        let schema = int64_schema();
+        let (mut decoder, schema_ref) = decoder_for(vec![one_col_batch(&schema, vec![1, 2])]).await;
+        let err = encode_single_row_parameters(
+            &mut decoder,
+            &MapEntriesNormalizer::for_schema(&schema_ref),
+        )
+        .await
+        .expect_err("more than one row must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn encode_single_row_parameters_rejects_multiple_batches() {
+        // Regression for the unbounded-buffering OOM: a stream of many
+        // single-row batches must be rejected as soon as the row count exceeds
+        // one, rather than buffering the whole stream before the check.
+        let schema = int64_schema();
+        let (mut decoder, schema_ref) = decoder_for(vec![
+            one_col_batch(&schema, vec![1]),
+            one_col_batch(&schema, vec![2]),
+        ])
+        .await;
+        let err = encode_single_row_parameters(
+            &mut decoder,
+            &MapEntriesNormalizer::for_schema(&schema_ref),
+        )
+        .await
+        .expect_err("multiple parameter batches must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn test_convert_query_with_single_parameter() {
+        // Test that JDBC placeholders are converted to Postgres style
+        let query = "SELECT ? + 1 AS result";
+        let result = convert_jdbc_parameter_placeholders(query);
+
+        assert!(result.is_ok());
+        if let Ok(converted) = result {
+            assert_eq!(converted, "SELECT $1 + 1 AS result");
+        }
+    }
+
+    #[test]
+    fn test_convert_query_with_multiple_parameters() {
+        // Test multiple placeholders
+        let query = "SELECT ? + ? AS sum, ? * ? AS product";
+        let result = convert_jdbc_parameter_placeholders(query);
+
+        assert!(result.is_ok());
+        if let Ok(converted) = result {
+            assert_eq!(converted, "SELECT $1 + $2 AS sum, $3 * $4 AS product");
+        }
+    }
+
+    #[test]
+    fn test_convert_query_with_string_parameters() {
+        let query = "SELECT ? || ' ' || ? AS greeting";
+        let result = convert_jdbc_parameter_placeholders(query);
+
+        assert!(result.is_ok());
+        if let Ok(converted) = result {
+            assert_eq!(converted, "SELECT $1 || ' ' || $2 AS greeting");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_decode_param_values_single_int() {
+        // Create a RecordBatch with a single int64 parameter
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "param1",
+            DataType::Int64,
+            false,
+        )]));
+        let array = Arc::new(Int64Array::from(vec![42]));
+        let batch = match RecordBatch::try_new(schema, vec![array]) {
+            Ok(b) => b,
+            Err(e) => panic!("Failed to create RecordBatch: {e}"),
+        };
+
+        // Encode to bytes
+        let bytes = match encode_params_to_bytes(&batch) {
+            Ok(b) => b,
+            Err(e) => panic!("Failed to encode params: {e}"),
+        };
+
+        // Decode
+        let result = decode_param_values(&bytes);
+        assert!(
+            result.is_ok(),
+            "Should decode successfully: {:?}",
+            result.err()
+        );
+
+        if let Ok(Some(_params)) = result {
+            // Successfully decoded parameters
+        } else {
+            panic!("Expected Some parameters");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_decode_param_values_multiple_types() {
+        // Create a RecordBatch with multiple parameter types
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("int_param", DataType::Int64, false),
+            Field::new("float_param", DataType::Float64, false),
+            Field::new("string_param", DataType::Utf8, false),
+            Field::new("bool_param", DataType::Boolean, false),
+        ]));
+
+        let batch = match RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![42])),
+                Arc::new(Float64Array::from(vec![3.5])),
+                Arc::new(StringArray::from(vec!["hello"])),
+                Arc::new(BooleanArray::from(vec![true])),
+            ],
+        ) {
+            Ok(b) => b,
+            Err(e) => panic!("Failed to create RecordBatch: {e}"),
+        };
+
+        let bytes = match encode_params_to_bytes(&batch) {
+            Ok(b) => b,
+            Err(e) => panic!("Failed to encode params: {e}"),
+        };
+        let result = decode_param_values(&bytes);
+
+        assert!(
+            result.is_ok(),
+            "Should decode successfully: {:?}",
+            result.err()
+        );
+        if let Ok(Some(_params)) = result {
+            // Successfully decoded parameters
+        } else {
+            panic!("Expected Some parameters");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_decode_param_values_empty() {
+        // Empty bytes should return None
+        let result = decode_param_values(&[]);
+        assert!(result.is_ok());
+        if let Ok(params) = result {
+            assert!(params.is_none(), "Empty bytes should return None");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prepared_statement_serialization() {
+        let stmt = PreparedStatement {
+            query: "SELECT ? + 1".to_string(),
+            parameters: vec![1, 2, 3],
+            parameter_schema: None,
+        };
+
+        // Serialize
+        let bytes = match to_stdvec(&stmt) {
+            Ok(b) => b,
+            Err(e) => panic!("Failed to serialize: {e}"),
+        };
+        assert!(!bytes.is_empty());
+
+        // Deserialize
+        let decoded: PreparedStatement = match from_bytes(&bytes) {
+            Ok(d) => d,
+            Err(e) => panic!("Failed to deserialize: {e}"),
+        };
+        assert_eq!(decoded.query, stmt.query);
+        assert_eq!(decoded.parameters, stmt.parameters);
+        assert_eq!(decoded.parameter_schema, stmt.parameter_schema);
+    }
 
     #[test]
     fn test_basic_query() {
@@ -470,9 +1051,7 @@ mod tests {
         let expected =
             "SELECT a, b FROM t WHERE x = $1 AND y = $2 GROUP BY a ORDER BY b DESC LIMIT $3";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -482,9 +1061,7 @@ mod tests {
         let input = "INSERT INTO users (name, age) VALUES (?, ?)";
         let expected = "INSERT INTO users (name, age) VALUES ($1, $2)";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -494,9 +1071,7 @@ mod tests {
         let input = "UPDATE users SET age = ? WHERE name = ?";
         let expected = "UPDATE users SET age = $1 WHERE name = $2";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -506,9 +1081,7 @@ mod tests {
         let input = "DELETE FROM users WHERE id = ?";
         let expected = "DELETE FROM users WHERE id = $1";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -518,9 +1091,7 @@ mod tests {
         let input = "SELECT COUNT(*) FROM users WHERE created_at > ? AND status = ?";
         let expected = "SELECT COUNT(*) FROM users WHERE created_at > $1 AND status = $2";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -530,9 +1101,7 @@ mod tests {
         let input = "SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products WHERE category = ?) AND stock > ?";
         let expected = "SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products WHERE category = $1) AND stock > $2";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -552,9 +1121,7 @@ mod tests {
         let input = "SELECT '?', name FROM users WHERE id = ? AND notes LIKE '%??%'";
         let expected = "SELECT '?', name FROM users WHERE id = $1 AND notes LIKE '%??%'";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -563,16 +1130,16 @@ mod tests {
     async fn test_prepared_statement_plan_cache_setup() {
         use crate::dataaccelerator::AcceleratorEngineRegistry;
         use crate::datafusion::builder::DataFusionBuilder;
-        use crate::status::RuntimeStatus;
         use cache::{Caching, SimpleCache};
+        use runtime_status::RuntimeStatus;
         use std::sync::Arc;
         use std::time::Duration;
 
         // Create a DataFusion instance with plan caching enabled (simulating Runtime setup)
         let plan_cache = Arc::new(SimpleCache::new(
             512,
-            Duration::from_secs(3600),
-            std::hash::RandomState::default(),
+            Duration::from_hours(1),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ))
         .as_tabled_provider();
 
@@ -594,7 +1161,7 @@ mod tests {
 
         // Verify it starts empty
         assert_eq!(
-            cache_provider.item_count(),
+            cache_provider.item_count().await,
             0,
             "Plan cache should be empty initially"
         );
@@ -609,26 +1176,92 @@ mod tests {
         // properly caches and reuses logical plans.
     }
 
+    /// `GetFlightInfo` for a prepared statement with bound parameters must
+    /// advertise exactly the schema `DoGet` streams, including for output
+    /// columns derived from a parameter. Otherwise ADBC / arrow-go clients fail
+    /// with "endpoint 0 returned inconsistent schema".
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn test_parameter_binding_with_plan_caching() {
+    async fn test_bound_param_schema_matches_stream() {
         use crate::dataaccelerator::AcceleratorEngineRegistry;
         use crate::datafusion::builder::DataFusionBuilder;
         use crate::datafusion::query::builder::QueryBuilder;
         use crate::status::RuntimeStatus;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::scalar::ScalarValue;
+        use futures::TryStreamExt;
+
+        let datafusion = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+
+        let int_param = (ScalarValue::Int64(Some(1)), DataType::Int64);
+        let str_param = (ScalarValue::Utf8(Some("a".to_string())), DataType::Utf8);
+        let cases = [
+            ("SELECT $1 AS x", int_param.clone()),
+            ("SELECT CAST($1 AS VARCHAR) AS x", int_param.clone()),
+            ("SELECT $1 || 'x' AS x", str_param),
+            ("SELECT 1 + $1 AS x", int_param),
+        ];
+
+        for (sql, (value, data_type)) in cases {
+            // Mirror do_get: rewrite with the bound parameter types, then bind.
+            let param_schema: SchemaRef =
+                Arc::new(Schema::new(vec![Field::new("$1", data_type, true)]));
+            let sql_to_run = rewrite_sql_with_type_casts(sql, &param_schema);
+            let params = ParamValues::from(vec![value]);
+
+            let (advertised, _) = Service::get_arrow_schema_with_params(
+                Arc::clone(&datafusion),
+                &sql_to_run,
+                Some(params.clone()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("schema for {sql}: {e}"));
+
+            let batches: Vec<_> = QueryBuilder::new(&sql_to_run, Arc::clone(&datafusion))
+                .parameters(Some(params))
+                .build()
+                .run()
+                .await
+                .unwrap_or_else(|e| panic!("run {sql}: {e}"))
+                .data
+                .try_collect()
+                .await
+                .unwrap_or_else(|e| panic!("collect {sql}: {e}"));
+            let streamed = batches[0].schema();
+
+            assert_eq!(advertised.fields().len(), streamed.fields().len(), "{sql}");
+            for (a, s) in advertised.fields().iter().zip(streamed.fields()) {
+                assert_eq!(a.data_type(), s.data_type(), "data type for {sql}");
+                assert_eq!(a.is_nullable(), s.is_nullable(), "nullability for {sql}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parameter_binding_with_plan_caching() {
+        use crate::dataaccelerator::AcceleratorEngineRegistry;
+        use crate::datafusion::builder::DataFusionBuilder;
+        use crate::datafusion::query::builder::QueryBuilder;
         use arrow::array::Int64Array;
         use cache::{Caching, SimpleCache};
         use datafusion::common::ParamValues;
         use datafusion::scalar::ScalarValue;
         use futures::TryStreamExt;
+        use runtime_status::RuntimeStatus;
         use std::sync::Arc;
         use std::time::Duration;
 
         // Create a DataFusion instance with plan caching enabled
         let plan_cache = Arc::new(SimpleCache::new(
             512,
-            Duration::from_secs(3600),
-            std::hash::RandomState::default(),
+            Duration::from_hours(1),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ))
         .as_tabled_provider();
 
@@ -648,7 +1281,7 @@ mod tests {
         let sql = "SELECT CAST($1 AS BIGINT) + CAST($2 AS BIGINT) AS sum, CAST($1 AS BIGINT) * CAST($2 AS BIGINT) AS product";
 
         // Execute the query with first set of parameters (2, 3)
-        let params1 = ParamValues::List(vec![
+        let params1 = ParamValues::from(vec![
             ScalarValue::Int64(Some(2)),
             ScalarValue::Int64(Some(3)),
         ]);
@@ -686,7 +1319,7 @@ mod tests {
         assert_eq!(product1.value(0), 6, "2 * 3 should equal 6");
 
         // Execute the same query with different parameters (4, 5)
-        let params2 = ParamValues::List(vec![
+        let params2 = ParamValues::from(vec![
             ScalarValue::Int64(Some(4)),
             ScalarValue::Int64(Some(5)),
         ]);
@@ -721,7 +1354,7 @@ mod tests {
         assert_eq!(product2.value(0), 20, "4 * 5 should equal 20");
 
         // Execute the same query with third set of parameters (10, 20)
-        let params3 = ParamValues::List(vec![
+        let params3 = ParamValues::from(vec![
             ScalarValue::Int64(Some(10)),
             ScalarValue::Int64(Some(20)),
         ]);
@@ -760,5 +1393,785 @@ mod tests {
         // 2. Each execution produces correct results based on the provided parameters
         // 3. Parameter binding works correctly with the query execution infrastructure
         // 4. The parameterized query pattern (used by prepared statements) functions properly
+    }
+
+    #[expect(clippy::similar_names, clippy::redundant_closure_for_method_calls)]
+    #[tokio::test]
+    async fn test_prepare_execute_with_dataframe_api() {
+        use arrow::array::{Int64Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::prelude::*;
+        use std::sync::Arc;
+
+        // Create a new SessionContext (DataFusion's main entry point)
+        let ctx = SessionContext::new();
+
+        // Create a simple table to query
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec![
+                    "Alice", "Bob", "Charlie", "Diana", "Eve",
+                ])),
+                Arc::new(Int64Array::from(vec![100, 200, 300, 400, 500])),
+            ],
+        )
+        .expect("should create record batch");
+
+        // Register the table
+        ctx.register_batch("users", batch)
+            .expect("should register table");
+
+        // Test 1: PREPARE a statement with parameters
+        let prepare_sql =
+            "PREPARE my_query AS SELECT id, name, value FROM users WHERE id = $1 AND value > $2";
+        let prepare_df = ctx.sql(prepare_sql).await.expect("PREPARE should succeed");
+
+        // Execute PREPARE (this creates the prepared statement but returns no data)
+        let prepare_result = prepare_df
+            .collect()
+            .await
+            .expect("PREPARE execution should succeed");
+        assert_eq!(prepare_result.len(), 0, "PREPARE should return no rows");
+
+        // Test 2: EXECUTE the prepared statement with parameters
+        let execute_sql = "EXECUTE my_query(2, 150)";
+        let execute_df = ctx.sql(execute_sql).await.expect("EXECUTE should succeed");
+        let execute_result = execute_df
+            .collect()
+            .await
+            .expect("EXECUTE should return results");
+
+        // Verify results: should return row with id=2 (Bob, value=200) since 200 > 150
+        assert_eq!(execute_result.len(), 1, "should return one batch");
+        let result_batch = &execute_result[0];
+        assert_eq!(result_batch.num_rows(), 1, "should return one row");
+
+        let id_col = result_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id should be Int64Array");
+        assert_eq!(id_col.value(0), 2, "id should be 2");
+
+        let name_col = result_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name should be StringArray");
+        assert_eq!(name_col.value(0), "Bob", "name should be Bob");
+
+        let value_col = result_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value should be Int64Array");
+        assert_eq!(value_col.value(0), 200, "value should be 200");
+
+        // Test 3: EXECUTE the same prepared statement with different parameters
+        let execute2_sql = "EXECUTE my_query(4, 350)";
+        let execute2_df = ctx.sql(execute2_sql).await.expect("EXECUTE should succeed");
+        let execute2_result = execute2_df
+            .collect()
+            .await
+            .expect("EXECUTE should return results");
+
+        // Verify results: should return row with id=4 (Diana, value=400) since 400 > 350
+        assert_eq!(execute2_result.len(), 1, "should return one batch");
+        let result2_batch = &execute2_result[0];
+        assert_eq!(result2_batch.num_rows(), 1, "should return one row");
+
+        let id2_col = result2_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id should be Int64Array");
+        assert_eq!(id2_col.value(0), 4, "id should be 4");
+
+        let name2_col = result2_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name should be StringArray");
+        assert_eq!(name2_col.value(0), "Diana", "name should be Diana");
+
+        let value2_col = result2_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value should be Int64Array");
+        assert_eq!(value2_col.value(0), 400, "value should be 400");
+
+        // Test 4: EXECUTE with parameters that return no rows
+        let execute3_sql = "EXECUTE my_query(3, 500)";
+        let execute3_df = ctx.sql(execute3_sql).await.expect("EXECUTE should succeed");
+        let execute3_result = execute3_df
+            .collect()
+            .await
+            .expect("EXECUTE should return results");
+
+        // Verify results: should return no rows (id=3 has value=300, which is not > 500)
+        let total_rows: usize = execute3_result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 0,
+            "should return no rows when filter doesn't match"
+        );
+
+        // Test 5: DEALLOCATE the prepared statement
+        let deallocate_sql = "DEALLOCATE my_query";
+        let deallocate_df = ctx
+            .sql(deallocate_sql)
+            .await
+            .expect("DEALLOCATE should succeed");
+        let deallocate_result = deallocate_df
+            .collect()
+            .await
+            .expect("DEALLOCATE should succeed");
+        assert_eq!(
+            deallocate_result.len(),
+            0,
+            "DEALLOCATE should return no rows"
+        );
+
+        // This test verifies:
+        // 1. PREPARE statement creates a prepared statement with parameters
+        // 2. EXECUTE can run the prepared statement multiple times with different parameters
+        // 3. Each execution returns correct results based on the provided parameters
+        // 4. DEALLOCATE properly cleans up the prepared statement
+        // 5. All operations work through the DataFusion DataFrame API (ctx.sql())
+    }
+
+    /// Tests that `rewrite_sql_with_type_casts` preserves table aliases when roundtripping
+    /// through the SQL parser.
+    ///
+    /// This is critical for queries like TPC-H Q7 which use the same table with multiple aliases:
+    /// `FROM nation n1, nation n2 WHERE n1.n_name = $1 AND n2.n_name = $2`
+    ///
+    /// The bug we're testing for: after parsing and regenerating SQL, the aliases could be lost
+    /// or the column references could incorrectly refer to the original table name instead of
+    /// the alias (e.g., `nation.n_name` instead of `n1.n_name`).
+    #[test]
+    fn test_rewrite_sql_preserves_table_aliases() {
+        // Query with table aliases similar to TPC-H Q7
+        let sql = r"SELECT n1.n_name, n2.n_name FROM nation n1, nation n2 WHERE n1.n_name = $1 AND n2.n_name = $2";
+
+        // Create a schema with two VARCHAR parameters
+        // Note: String types (Utf8) intentionally don't get CAST to avoid breaking filter pushdown
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("$1", DataType::Utf8, true),
+            Field::new("$2", DataType::Utf8, true),
+        ]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // The rewritten SQL should still reference n1 and n2 aliases, not "nation"
+        assert!(
+            rewritten.contains("n1.n_name"),
+            "Rewritten SQL should preserve n1 alias: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n2.n_name"),
+            "Rewritten SQL should preserve n2 alias: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("nation.n_name"),
+            "Rewritten SQL should not have unaliased nation.n_name: {rewritten}"
+        );
+
+        // Verify the table aliases are preserved in FROM clause
+        assert!(
+            rewritten.contains("nation AS n1") || rewritten.contains("nation n1"),
+            "Rewritten SQL should preserve table alias n1: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("nation AS n2") || rewritten.contains("nation n2"),
+            "Rewritten SQL should preserve table alias n2: {rewritten}"
+        );
+
+        // String parameters should NOT be wrapped in CAST (to avoid breaking filter pushdown)
+        // The parameters should remain as plain $1, $2
+        assert!(
+            !rewritten.contains("CAST($1 AS"),
+            "String parameter $1 should NOT be wrapped in CAST (breaks filter pushdown): {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("CAST($2 AS"),
+            "String parameter $2 should NOT be wrapped in CAST (breaks filter pushdown): {rewritten}"
+        );
+        // Verify parameters are still present
+        assert!(
+            rewritten.contains("$1") && rewritten.contains("$2"),
+            "Parameters should be present in rewritten SQL: {rewritten}"
+        );
+    }
+
+    /// Tests that `rewrite_sql_with_type_casts` preserves column aliases and complex expressions.
+    #[test]
+    fn test_rewrite_sql_preserves_column_aliases() {
+        let sql = r"SELECT a.id AS a_id, b.id AS b_id, a.value + b.value AS total FROM table1 a JOIN table2 b ON a.id = b.ref_id WHERE a.status = $1";
+
+        // String parameter - should NOT get CAST
+        let schema = Arc::new(Schema::new(vec![Field::new("$1", DataType::Utf8, true)]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Verify column aliases are preserved
+        assert!(
+            rewritten.contains("a_id") || rewritten.contains("AS a_id"),
+            "Column alias a_id should be preserved: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("b_id") || rewritten.contains("AS b_id"),
+            "Column alias b_id should be preserved: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("total") || rewritten.contains("AS total"),
+            "Column alias total should be preserved: {rewritten}"
+        );
+
+        // Verify table aliases are preserved in column references
+        assert!(
+            rewritten.contains("a.id") || rewritten.contains("a.\"id\""),
+            "Table alias a should be preserved in column reference: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("b.id") || rewritten.contains("b.\"id\""),
+            "Table alias b should be preserved in column reference: {rewritten}"
+        );
+
+        // String parameter should NOT be wrapped in CAST
+        assert!(
+            !rewritten.contains("CAST($1 AS"),
+            "String parameter should NOT be wrapped in CAST: {rewritten}"
+        );
+    }
+
+    /// Tests that `rewrite_sql_with_type_casts` handles subquery aliases correctly.
+    #[test]
+    fn test_rewrite_sql_preserves_subquery_aliases() {
+        let sql = r"SELECT sub.total FROM (SELECT SUM(value) AS total FROM orders WHERE status = $1) AS sub WHERE sub.total > $2";
+
+        // $1 is string (no CAST), $2 is Int64 (gets CAST)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("$1", DataType::Utf8, true),
+            Field::new("$2", DataType::Int64, true),
+        ]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Verify subquery alias is preserved
+        assert!(
+            rewritten.contains("sub.total") || rewritten.contains("sub.\"total\""),
+            "Subquery alias 'sub' should be preserved in column reference: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("AS sub") || rewritten.contains(") sub"),
+            "Subquery alias should be preserved: {rewritten}"
+        );
+
+        // String parameter ($1) should NOT be wrapped in CAST
+        assert!(
+            !rewritten.contains("CAST($1 AS"),
+            "String parameter $1 should NOT be wrapped in CAST: {rewritten}"
+        );
+        // Integer parameter ($2) SHOULD be wrapped in CAST
+        assert!(
+            rewritten.contains("CAST($2 AS"),
+            "Integer parameter $2 should be wrapped in CAST: {rewritten}"
+        );
+    }
+
+    /// Tests that `rewrite_sql_with_type_casts` handles no parameters gracefully.
+    #[test]
+    fn test_rewrite_sql_no_parameters() {
+        let sql = r"SELECT n1.n_name FROM nation n1 WHERE n1.n_name = 'FRANCE'";
+
+        // Empty schema - no parameters
+        let schema = Arc::new(Schema::empty());
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Should still preserve the alias
+        assert!(
+            rewritten.contains("n1.n_name"),
+            "Table alias n1 should be preserved: {rewritten}"
+        );
+    }
+
+    /// Tests that `rewrite_sql_with_type_casts` handles the failing Q7-style query pattern.
+    ///
+    /// This query pattern previously failed in federation when string parameters
+    /// were wrapped in CAST, which prevented filter pushdown optimization.
+    ///
+    /// The fix: String types are no longer wrapped in CAST, allowing `DataFusion` to
+    /// properly push down filters into `TableScan` as `full_filters`.
+    #[test]
+    fn test_rewrite_sql_table_alias_q7_pattern() {
+        // This is the exact pattern that was failing in TPC-H Q7 parameterized queries
+        let sql = r"
+            SELECT n1.n_name, n2.n_name
+            FROM nation n1, nation n2
+            WHERE (
+                (n1.n_name = $1 AND n2.n_name = $2)
+                OR (n1.n_name = $3 AND n2.n_name = $4)
+            )";
+
+        // All 4 parameters are strings - should NOT get CAST
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("$1", DataType::Utf8, true),
+            Field::new("$2", DataType::Utf8, true),
+            Field::new("$3", DataType::Utf8, true),
+            Field::new("$4", DataType::Utf8, true),
+        ]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Verify all n1 and n2 references are preserved
+        assert!(
+            rewritten.contains("n1.n_name"),
+            "Rewritten SQL should preserve n1.n_name references: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n2.n_name"),
+            "Rewritten SQL should preserve n2.n_name references: {rewritten}"
+        );
+
+        // The bug would cause "nation.n_name" to appear instead of alias references
+        assert!(
+            !rewritten.contains("nation.n_name"),
+            "Rewritten SQL should NOT have unaliased nation.n_name: {rewritten}"
+        );
+
+        // Verify table aliases are in FROM clause
+        assert!(
+            rewritten.contains("nation AS n1") || rewritten.contains("nation n1"),
+            "Table alias n1 should be in FROM clause: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("nation AS n2") || rewritten.contains("nation n2"),
+            "Table alias n2 should be in FROM clause: {rewritten}"
+        );
+
+        // String parameters should NOT be wrapped in CAST (the fix for the bug)
+        assert!(
+            !rewritten.contains("CAST($1 AS"),
+            "String parameter $1 should NOT be wrapped in CAST: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("CAST($2 AS"),
+            "String parameter $2 should NOT be wrapped in CAST: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("CAST($3 AS"),
+            "String parameter $3 should NOT be wrapped in CAST: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("CAST($4 AS"),
+            "String parameter $4 should NOT be wrapped in CAST: {rewritten}"
+        );
+        // Verify parameters are still present
+        assert!(
+            rewritten.contains("$1")
+                && rewritten.contains("$2")
+                && rewritten.contains("$3")
+                && rewritten.contains("$4"),
+            "All parameters should be present in rewritten SQL: {rewritten}"
+        );
+    }
+
+    /// Tests the CTE-based workaround pattern.
+    ///
+    /// This query pattern uses CTEs to create named subqueries:
+    /// `WITH n1 AS (SELECT * FROM nation), n2 AS (SELECT * FROM nation) SELECT ...`
+    ///
+    /// CTEs create proper named subqueries that avoid alias resolution issues.
+    /// Note: With the fix to not CAST string types, both patterns should now work.
+    #[test]
+    fn test_rewrite_sql_cte_workaround_pattern() {
+        // CTE pattern
+        let sql = r"
+            WITH n1 AS (SELECT * FROM nation),
+                 n2 AS (SELECT * FROM nation)
+            SELECT n1.n_name, n2.n_name
+            FROM n1, n2
+            WHERE (
+                (n1.n_name = $1 AND n2.n_name = $2)
+                OR (n1.n_name = $3 AND n2.n_name = $4)
+            )";
+
+        // All string parameters - should NOT get CAST
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("$1", DataType::Utf8, true),
+            Field::new("$2", DataType::Utf8, true),
+            Field::new("$3", DataType::Utf8, true),
+            Field::new("$4", DataType::Utf8, true),
+        ]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Verify CTE names are preserved
+        assert!(
+            rewritten.contains("n1 AS") || rewritten.contains("n1 AS ("),
+            "CTE n1 should be preserved: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n2 AS") || rewritten.contains("n2 AS ("),
+            "CTE n2 should be preserved: {rewritten}"
+        );
+
+        // Verify column references use CTE names
+        assert!(
+            rewritten.contains("n1.n_name"),
+            "Rewritten SQL should preserve n1.n_name references: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n2.n_name"),
+            "Rewritten SQL should preserve n2.n_name references: {rewritten}"
+        );
+
+        // String parameters should NOT be wrapped in CAST
+        assert!(
+            !rewritten.contains("CAST($1 AS"),
+            "String parameter $1 should NOT be wrapped in CAST: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("CAST($4 AS"),
+            "String parameter $4 should NOT be wrapped in CAST: {rewritten}"
+        );
+        // Verify parameters are present
+        assert!(
+            rewritten.contains("$1") && rewritten.contains("$4"),
+            "Parameters should be present in rewritten SQL: {rewritten}"
+        );
+    }
+
+    /// Tests without parameters - ensures aliases are preserved even when
+    /// no parameter rewriting happens.
+    #[test]
+    fn test_rewrite_sql_table_alias_no_params() {
+        // Query with table aliases but no parameters - should pass through unchanged
+        let sql = r"
+            SELECT n1.n_name, n2.n_name
+            FROM nation n1, nation n2
+            WHERE (
+                (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY')
+                OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')
+            )";
+
+        // Empty schema = no parameters
+        let schema = Arc::new(Schema::empty());
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Verify aliases are preserved
+        assert!(
+            rewritten.contains("n1.n_name"),
+            "Rewritten SQL should preserve n1.n_name references: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n2.n_name"),
+            "Rewritten SQL should preserve n2.n_name references: {rewritten}"
+        );
+
+        // Verify table aliases in FROM clause
+        assert!(
+            rewritten.contains("nation AS n1") || rewritten.contains("nation n1"),
+            "Table alias n1 should be in FROM clause: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("nation AS n2") || rewritten.contains("nation n2"),
+            "Table alias n2 should be in FROM clause: {rewritten}"
+        );
+
+        // No unaliased references
+        assert!(
+            !rewritten.contains("nation.n_name"),
+            "Rewritten SQL should NOT have unaliased nation.n_name: {rewritten}"
+        );
+    }
+
+    /// Tests CTE without parameters - the workaround pattern without parameter binding.
+    #[test]
+    fn test_rewrite_sql_cte_no_params() {
+        let sql = r"
+            WITH n1 AS (SELECT * FROM nation),
+                 n2 AS (SELECT * FROM nation)
+            SELECT n1.n_name, n2.n_name
+            FROM n1, n2
+            WHERE (
+                (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY')
+                OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')
+            )";
+
+        let schema = Arc::new(Schema::empty());
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Verify CTE structure is preserved
+        assert!(
+            rewritten.contains("WITH"),
+            "CTE WITH clause should be preserved: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n1.n_name"),
+            "CTE reference n1.n_name should be preserved: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n2.n_name"),
+            "CTE reference n2.n_name should be preserved: {rewritten}"
+        );
+    }
+
+    /// Tests that non-string types still get CAST expressions.
+    ///
+    /// Integer, float, boolean, and date/timestamp types still need CAST
+    /// for proper type inference in prepared statements like "SELECT $1 + $2".
+    #[test]
+    fn test_rewrite_sql_numeric_types_get_cast() {
+        let sql = r"SELECT $1 + $2 AS sum, $3 * $4 AS product";
+
+        // All numeric parameters - should get CAST
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("$1", DataType::Int64, true),
+            Field::new("$2", DataType::Int64, true),
+            Field::new("$3", DataType::Float64, true),
+            Field::new("$4", DataType::Float64, true),
+        ]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Integer parameters should be wrapped in CAST
+        assert!(
+            rewritten.contains("CAST($1 AS BIGINT)"),
+            "Int64 parameter $1 should be wrapped in CAST AS BIGINT: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("CAST($2 AS BIGINT)"),
+            "Int64 parameter $2 should be wrapped in CAST AS BIGINT: {rewritten}"
+        );
+
+        // Float parameters should be wrapped in CAST
+        assert!(
+            rewritten.contains("CAST($3 AS DOUBLE)"),
+            "Float64 parameter $3 should be wrapped in CAST AS DOUBLE: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("CAST($4 AS DOUBLE)"),
+            "Float64 parameter $4 should be wrapped in CAST AS DOUBLE: {rewritten}"
+        );
+    }
+
+    /// Tests mixed parameter types - strings should NOT get CAST, others should.
+    #[test]
+    fn test_rewrite_sql_mixed_types() {
+        let sql = r"SELECT * FROM users WHERE name = $1 AND age > $2 AND score < $3";
+
+        // Mixed types: string (no CAST), int (CAST), float (CAST)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("$1", DataType::Utf8, true),
+            Field::new("$2", DataType::Int32, true),
+            Field::new("$3", DataType::Float64, true),
+        ]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // String parameter should NOT be wrapped in CAST
+        assert!(
+            !rewritten.contains("CAST($1 AS"),
+            "String parameter $1 should NOT be wrapped in CAST: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("$1"),
+            "String parameter $1 should be present: {rewritten}"
+        );
+
+        // Int32 parameter should be wrapped in CAST
+        assert!(
+            rewritten.contains("CAST($2 AS INT)"),
+            "Int32 parameter $2 should be wrapped in CAST AS INT: {rewritten}"
+        );
+
+        // Float64 parameter should be wrapped in CAST
+        assert!(
+            rewritten.contains("CAST($3 AS DOUBLE)"),
+            "Float64 parameter $3 should be wrapped in CAST AS DOUBLE: {rewritten}"
+        );
+    }
+
+    /// Builds a `MapArray` the way an Arrow IPC reader does — straight from `ArrayData`, so
+    /// neither of `MapArray::try_new`'s `entries` checks runs and a producer's non-conforming
+    /// declaration survives the decode.
+    fn nullable_entries_map_batch() -> arrow::array::RecordBatch {
+        use arrow::array::{
+            Array, ArrayData, ArrayRef, MapArray, RecordBatch, StringArray, StructArray,
+        };
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+        use std::sync::Arc;
+
+        let entry_fields: Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                true,
+            )),
+            false,
+        );
+
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["k0"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("v0")])) as ArrayRef,
+            ],
+            None,
+        )
+        .expect("entries struct");
+
+        let builder = ArrayData::builder(data_type.clone())
+            .len(1)
+            .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch")
+    }
+
+    /// Serializes `batch` as an Arrow IPC stream, byte for byte what a client sends.
+    fn ipc_stream(batch: &arrow::array::RecordBatch) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
+                .expect("ipc writer");
+            writer.write(batch).expect("write batch");
+            writer.finish().expect("finish stream");
+        }
+        buf
+    }
+
+    /// Regression test for #13495: a client declaring a `MAP` parameter's `entries` nullable —
+    /// which the Arrow map layout forbids — is brought into line at the decode point instead of
+    /// failing later in whichever kernel first rebuilds the column.
+    #[test]
+    fn a_nullable_entries_map_parameter_decodes() {
+        use arrow::array::Array;
+
+        let bytes = ipc_stream(&nullable_entries_map_batch());
+        let values = decode_param_values(&bytes)
+            .expect("a nullable entries declaration is relabelled, not refused")
+            .expect("parameters were sent");
+
+        let datafusion::common::ParamValues::Map(named) = values else {
+            panic!("a named parameter batch decodes to a map of parameters");
+        };
+        let value = named.get("m").expect("the map parameter is present");
+        match &value.value {
+            datafusion::scalar::ScalarValue::Map(map) => match map.data_type() {
+                arrow::datatypes::DataType::Map(entries, _) => assert!(
+                    !entries.is_nullable(),
+                    "the decoded parameter must carry the corrected declaration"
+                ),
+                other => panic!("expected a Map parameter, got {other:?}"),
+            },
+            other => panic!("expected a Map parameter, got {other:?}"),
+        }
+    }
+
+    /// Builds the one `MAP` shape relabelling cannot repair: `entries` declared nullable *and*
+    /// carrying an actual null, which the Arrow map layout has no valid representation for.
+    fn entries_with_nulls_map_batch() -> arrow::array::RecordBatch {
+        use arrow::array::{
+            Array, ArrayData, ArrayRef, MapArray, RecordBatch, StringArray, StructArray,
+        };
+        use arrow::buffer::{Buffer, NullBuffer};
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+        use std::sync::Arc;
+
+        let entry_fields: Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                true,
+            )),
+            false,
+        );
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["k0", "k1"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("v0"), Some("v1")])) as ArrayRef,
+            ],
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .expect("entries struct");
+        let builder = ArrayData::builder(data_type.clone())
+            .len(2)
+            .add_buffer(Buffer::from_slice_ref([0_i32, 1, 2]))
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch")
+    }
+
+    /// The one shape relabelling cannot fix is refused where the column can still be named,
+    /// rather than surfacing as `MapArray entries cannot contain nulls` from an unrelated kernel.
+    #[test]
+    fn a_map_parameter_whose_entries_carry_nulls_is_refused_by_name() {
+        let err = decode_param_values(&ipc_stream(&entries_with_nulls_map_batch()))
+            .expect_err("entries carrying nulls have no representation to relabel to");
+        let message = err.to_string();
+        assert!(
+            message.contains("'m'") && message.contains("arrow-flight-sql"),
+            "the refusal must name the column and point at the docs: {message}"
+        );
+    }
+
+    /// The query path and the update path both decode parameters with `decode_param_values` and
+    /// report a failure with `param_error_to_status`. Every failure that decode can produce
+    /// describes the client's own bytes, so it must reach the client as `InvalidArgument` — never
+    /// as an `Internal` the client would be entitled to retry — and must still name the column.
+    #[test]
+    fn a_malformed_map_parameter_is_reported_as_invalid_argument() {
+        let err = decode_param_values(&ipc_stream(&entries_with_nulls_map_batch()))
+            .expect_err("entries carrying nulls have no representation to relabel to");
+        let status = super::param_error_to_status(err);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("'m'"),
+            "the status must still name the column: {}",
+            status.message()
+        );
     }
 }

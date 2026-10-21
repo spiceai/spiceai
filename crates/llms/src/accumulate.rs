@@ -14,14 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::{
-    ChatChoice, ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionResponseMessage,
-    ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionToolType,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FunctionCall,
+use async_openai::{
+    error::OpenAIError,
+    types::chat::{
+        ChatChoice, ChatChoiceStream, ChatCompletionMessageToolCall,
+        ChatCompletionMessageToolCalls, ChatCompletionResponseMessage,
+        ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FunctionCall,
+    },
 };
-use futures::StreamExt;
+use futures::TryStreamExt;
 
 #[must_use]
+#[expect(deprecated)]
 pub fn empty_completion_response() -> CreateChatCompletionResponse {
     CreateChatCompletionResponse {
         id: String::new(),
@@ -38,18 +43,23 @@ pub fn empty_completion_response() -> CreateChatCompletionResponse {
 /// Accumulate a [`ChatCompletionResponseStream`] into a single [`CreateChatCompletionResponse`].
 ///
 /// This enables comparing the output from [`super::Chat::chat_stream`] as if it was a [`super::Chat::chat_request`].
-pub async fn accumulate(stream: ChatCompletionResponseStream) -> CreateChatCompletionResponse {
+///
+/// # Errors
+///
+/// Returns the first error the stream yields. A provider can refuse a request inside a stream
+/// that has already started, so a stream error is the request's failure, not a chunk to skip.
+pub async fn accumulate(
+    stream: ChatCompletionResponseStream,
+) -> Result<CreateChatCompletionResponse, OpenAIError> {
     stream
-        .fold(empty_completion_response(), |mut acc, item| async move {
-            if let Ok(stream) = item {
-                fold_completion_stream(&mut acc, &stream);
-            }
-            acc
+        .try_fold(empty_completion_response(), |mut acc, chunk| async move {
+            fold_completion_stream(&mut acc, &chunk);
+            Ok(acc)
         })
         .await
 }
 
-#[allow(deprecated, clippy::cast_possible_truncation)]
+#[expect(deprecated, clippy::cast_possible_truncation)]
 pub fn fold_completion_stream(
     acc: &mut CreateChatCompletionResponse,
     stream: &CreateChatCompletionStreamResponse,
@@ -77,11 +87,13 @@ pub fn fold_completion_stream(
                 finish_reason: None,
                 logprobs: None,
                 message: ChatCompletionResponseMessage {
+                    reasoning_content: None,
                     content: None,
                     refusal: None,
                     tool_calls: None,
+                    annotations: None,
                     function_call: None,
-                    role: async_openai::types::Role::User,
+                    role: async_openai::types::chat::Role::User,
                     audio: None,
                 },
             })
@@ -141,30 +153,29 @@ fn update_chat_choice(acc: &mut ChatChoice, update: &ChatChoiceStream) {
                 if acc_tools.get(i).is_none() {
                     acc_tools.insert(
                         i,
-                        ChatCompletionMessageToolCall {
+                        ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
                             id: String::new(),
-                            r#type: ChatCompletionToolType::Function,
                             function: FunctionCall {
                                 name: String::new(),
                                 arguments: String::new(),
                             },
-                        },
+                        }),
                     );
                 }
 
-                if let Some(id) = &tool.id {
-                    acc_tools[i].id.clone_from(id);
-                }
-                if let Some(r#type) = &tool.r#type {
-                    acc_tools[i].r#type = r#type.clone();
-                }
-
-                if let Some(fun) = &tool.function {
-                    if let Some(args) = &fun.arguments {
-                        acc_tools[i].function.arguments += args;
+                // Access the inner tool call through the enum variant
+                if let ChatCompletionMessageToolCalls::Function(ref mut inner_tool) = acc_tools[i] {
+                    if let Some(id) = &tool.id {
+                        inner_tool.id.clone_from(id);
                     }
-                    if let Some(name) = &fun.name {
-                        acc_tools[i].function.name += name;
+
+                    if let Some(fun) = &tool.function {
+                        if let Some(args) = &fun.arguments {
+                            inner_tool.function.arguments += args;
+                        }
+                        if let Some(name) = &fun.name {
+                            inner_tool.function.name += name;
+                        }
                     }
                 }
             }
@@ -175,12 +186,11 @@ fn update_chat_choice(acc: &mut ChatChoice, update: &ChatChoiceStream) {
 #[cfg(test)]
 pub mod tests {
 
-    use async_openai::error::OpenAIError;
     use serde_json::json;
 
     use super::*;
 
-    #[allow(clippy::missing_panics_doc)]
+    #[expect(clippy::missing_panics_doc)]
     #[tokio::test]
     pub async fn test_accumulate() {
         let parts = vec![
@@ -203,10 +213,12 @@ pub mod tests {
         let stream: ChatCompletionResponseStream =
             Box::pin(futures::stream::iter(parts.into_iter().map(|s| {
                 serde_json::from_str::<CreateChatCompletionStreamResponse>(s)
-                    .map_err(OpenAIError::from)
+                    .map_err(|e| OpenAIError::JSONDeserialize(e, s.to_string()))
             })));
 
-        let resp = accumulate(stream).await;
+        let resp = accumulate(stream)
+            .await
+            .expect("every chunk of the stream is valid");
         assert_eq!(
             serde_json::to_value(&resp)
                 .expect("Output of `accumulate` should be serializable to serde_json::Value"),

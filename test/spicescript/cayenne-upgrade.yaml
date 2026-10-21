@@ -1,0 +1,103 @@
+name: cayenne-upgrade
+description: >
+  Cayenne state written by an older spiced (`--from <older spiced>`; without
+  it, a restart) is served by the binary under test: a partitioned file
+  acceleration, an append acceleration that keeps appending after the
+  upgrade, and an indexed acceleration answering point lookups; full
+  refreshes on the new binary then replace what the old one wrote.
+  (Snapshots are not in release builds, so they are not covered here.)
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-upgrade
+  datasets:
+    - from: postgres:public.items
+      name: part
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        refresh_check_interval: 1h
+        partition_by: [{ bucket: 'bucket(4, id)' }]
+        params: { cayenne_file_path: '${instance.dir}/part', cayenne_metadata_dir: '${instance.dir}/meta' }
+    - from: postgres:public.events
+      name: app
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: append
+        refresh_check_interval: 1h
+        params: { cayenne_file_path: '${instance.dir}/app', cayenne_metadata_dir: '${instance.dir}/meta' }
+    - from: postgres:public.items
+      name: idx
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        refresh_check_interval: 1h
+        primary_key: id
+        indexes: { kind: enabled, price: enabled }
+        params: { cayenne_file_path: '${instance.dir}/idx', cayenne_metadata_dir: '${instance.dir}/meta' }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE items (id int PRIMARY KEY, kind text, price numeric(10, 2));
+        INSERT INTO items SELECT g, CASE WHEN g % 3 = 0 THEN 'a' ELSE 'b' END, g * 1.5 FROM generate_series(1, 3000) g;
+        CREATE TABLE events (id int PRIMARY KEY, ts timestamptz NOT NULL, v int);
+        INSERT INTO events SELECT g, TIMESTAMPTZ '2100-01-01 00:00Z' + g * INTERVAL '1 minute', g FROM generate_series(1, 1000) g;
+  - start: {}
+  - query: SELECT * FROM part
+    oracle-sql: SELECT * FROM items
+    id: part-before
+  - query: SELECT * FROM app
+    oracle-sql: SELECT * FROM events
+  - query: SELECT id, kind, price FROM idx WHERE id = 1234
+    oracle-sql: SELECT id, kind, price FROM items WHERE id = 1234
+
+  # Up on the binary under test, over the same files.
+  - stop: {}
+  - upgrade: {}
+  - query: SELECT * FROM part
+    oracle-sql: SELECT * FROM items
+    expect: { same-as: part-before }
+  - query: SELECT count(*) AS n FROM part WHERE id % 4 = 1
+    oracle-sql: SELECT count(*) AS n FROM items WHERE id % 4 = 1
+  - query: SELECT id, kind, price FROM idx WHERE id = 1234
+    oracle-sql: SELECT id, kind, price FROM items WHERE id = 1234
+  - query: SELECT id, kind, price FROM idx WHERE id IN (1, 2999, 5000)
+    oracle-sql: SELECT id, kind, price FROM items WHERE id IN (1, 2999, 5000)
+  - query: SELECT count(*) AS n FROM idx WHERE kind = 'a' AND price > 4000
+    oracle-sql: SELECT count(*) AS n FROM items WHERE kind = 'a' AND price > 4000
+
+  # Appending continues from what the old binary loaded, once each.
+  - source-exec: { src: "INSERT INTO events SELECT g, TIMESTAMPTZ '2100-01-01 00:00Z' + g * INTERVAL '1 minute', g FROM generate_series(1001, 1200) g" }
+  - refresh: app
+  - query: SELECT * FROM app
+    oracle-sql: SELECT * FROM events
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM app
+    oracle-sql: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM events
+
+  # The source changes; full refreshes on the new binary replace the old data.
+  - source-exec: { src: "UPDATE items SET price = 0 WHERE id <= 100; DELETE FROM items WHERE id > 2900" }
+  - refresh: part
+  - refresh: idx
+  - query: SELECT * FROM part
+    oracle-sql: SELECT * FROM items
+  - query: SELECT id, kind, price FROM idx WHERE id IN (50, 2950)
+    oracle-sql: SELECT id, kind, price FROM items WHERE id IN (50, 2950)

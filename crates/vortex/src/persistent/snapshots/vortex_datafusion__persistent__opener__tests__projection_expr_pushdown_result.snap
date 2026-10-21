@@ -1,0 +1,12 @@
+---
+source: crates/vortex/src/persistent/opener.rs
+expression: "pretty_format_batches_with_options(&data,\n&FormatOptions::new().with_types_info(true))? .to_string()"
+---
++--------+
+| result |
+| Int32  |
++--------+
+| 21     |
+| 42     |
+| 63     |
++--------+

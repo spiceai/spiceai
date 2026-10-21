@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,23 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN, concat_arrays};
-use crate::parameters::ParameterSpec;
+use runtime_parameters::TypedParams;
+use secrecy::SecretString;
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
-    ParameterSpec,
-    ANTHROPIC_PARAM_LEN,
-    PARAM_WITH_DEPRE_LEN,
-    { ANTHROPIC_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
->(
-    ANTHROPIC_PARAMETERS,
-    COMMON_MODEL_PARAMETERS_WITH_DEPRECATED,
-);
-
-const ANTHROPIC_PARAM_LEN: usize = 3;
-
-pub(crate) const ANTHROPIC_PARAMETERS: [ParameterSpec; ANTHROPIC_PARAM_LEN] = [
-    ParameterSpec::runtime("endpoint").description("The Anthropic API base endpoint."),
-    ParameterSpec::component("api_key").description("The Anthropic API key."),
-    ParameterSpec::component("auth_token").description("The Anthropic Auth Token."),
-];
+/// Parameters for `from: anthropic` chat models.
+#[derive(TypedParams)]
+#[params(
+    prefix = "anthropic",
+    passthrough = crate::model::params::common::PREFIXED_COMMON,
+    emit_specs
+)]
+pub struct AnthropicModelParams {
+    /// The Anthropic API base endpoint.
+    #[param(runtime)]
+    pub endpoint: Option<String>,
+    /// The Anthropic API key.
+    pub api_key: Option<SecretString>,
+    /// The Anthropic Auth Token.
+    pub auth_token: Option<SecretString>,
+    /// The Anthropic workspace ID, sent as the `anthropic-workspace-id` header. Required when the API key is not scoped to a workspace.
+    pub workspace_id: Option<String>,
+    /// Anthropic usage tier (1-4). Used for rate limit defaults.
+    pub usage_tier: Option<String>,
+}

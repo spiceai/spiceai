@@ -1,0 +1,77 @@
+---
+source: crates/evaluate-chat/src/schema.rs
+expression: "serde_json::to_string_pretty(&reply_schema(&sample_questions(),\nAnswerMode::Probabilities)).expect(\"schema serializes\")"
+---
+{
+  "additionalProperties": false,
+  "properties": {
+    "answers": {
+      "additionalProperties": false,
+      "description": "Exactly one answer per property below. Use these property names verbatim and do not add, rename, or nest them under any other key.",
+      "properties": {
+        "is_urgent": {
+          "description": "Probability that the answer is yes or the assertion is true. 0 means no or false, 0.5 means uncertain, and 1 means yes or true.\nQuestion: Does this convey urgency?\nTrue criteria: Money or access is blocked now\nFalse criteria: No additional instructions.",
+          "type": "number"
+        },
+        "team": {
+          "additionalProperties": false,
+          "description": "Each property maps an option to the probability that it is the best answer.\nQuestion: [\"Route the ticket\",\"Prefer technical when ambiguous\"]",
+          "properties": {
+            "billing": {
+              "description": "Payments and invoices",
+              "type": "number"
+            },
+            "sales": {
+              "description": "No additional instructions.",
+              "type": "number"
+            },
+            "technical": {
+              "description": "{\"area\":\"bugs\"}",
+              "type": "number"
+            }
+          },
+          "required": [
+            "billing",
+            "sales",
+            "technical"
+          ],
+          "type": "object"
+        },
+        "tone": {
+          "additionalProperties": false,
+          "description": "Each property maps a rubric level to the probability that the document matches it.\nQuestion: No additional instructions.",
+          "properties": {
+            "0": {
+              "description": "calm",
+              "type": "number"
+            },
+            "1": {
+              "description": "annoyed",
+              "type": "number"
+            },
+            "2": {
+              "description": "furious",
+              "type": "number"
+            }
+          },
+          "required": [
+            "0",
+            "1",
+            "2"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "is_urgent",
+        "team",
+        "tone"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "answers"
+  ],
+  "type": "object"
+}

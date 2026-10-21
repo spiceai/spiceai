@@ -1,0 +1,147 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Cache backend abstraction for pluggable cache implementations.
+//!
+//! `LruCache` always uses [`SpiceBackend`]. [`MokaBackend`] and (when compiled)
+//! [`PingoraBackend`] remain for benches and for call sites that have not yet
+//! migrated.
+
+use async_trait::async_trait;
+use std::sync::Arc;
+use std::time::Duration;
+
+pub mod moka;
+pub mod spice;
+
+#[cfg(all(test, feature = "pingora"))]
+#[expect(
+    dead_code,
+    reason = "the shared harness builds all three engines; a given test uses a subset"
+)]
+mod differential;
+
+#[cfg(feature = "pingora")]
+pub mod pingora;
+
+use crate::Sizeable;
+
+pub use self::moka::MokaBackend;
+pub use self::spice::SpiceBackend;
+
+#[cfg(feature = "pingora")]
+pub use self::pingora::PingoraBackend;
+
+/// Builder for cache backends with common configuration.
+pub struct CacheBackendBuilder {
+    max_capacity: u64,
+    ttl: Duration,
+}
+
+impl CacheBackendBuilder {
+    #[must_use]
+    pub fn new(max_capacity: u64, ttl: Duration) -> Self {
+        Self { max_capacity, ttl }
+    }
+
+    #[must_use]
+    pub fn max_capacity(&self) -> u64 {
+        self.max_capacity
+    }
+
+    #[must_use]
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+}
+
+/// Trait for cache backend implementations.
+///
+/// [`LruCache`](`crate::LruCache`) uses [`SpiceBackend`] only. [`MokaBackend`]
+/// remains for leftover call sites and the engine bakeoff. `PingoraBackend` is
+/// compiled only with the `pingora` feature.
+#[async_trait]
+pub trait CacheBackend<V: Sizeable>: Send + Sync {
+    /// Insert a value into the cache with the given key and size
+    async fn insert(&self, key: u64, value: V);
+
+    /// Replace the value at `key` with `value` only when `should_replace`
+    /// accepts the value currently stored.
+    ///
+    /// Used to rewrite a resident results-cache entry in place (record a
+    /// decode hit, or promote Encoded → Raw after the second decode): the key,
+    /// TTL and generation stay put, and only the in-memory form (and so the
+    /// weigher) change. Returns whether the replace ran. A concurrent store of
+    /// a newer result must make this return `false`.
+    ///
+    /// Implementations must not restart the entry's remaining TTL when the new
+    /// value asks to keep it ([`crate::Sizeable::keep_remaining_ttl`]).
+    ///
+    /// `should_replace` is called only when an entry is resident under `key`.
+    async fn replace_if(
+        &self,
+        key: u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool;
+
+    /// Get a shared handle for a value by key.
+    ///
+    /// Returns `None` if the key is missing or expired. Backends that store
+    /// residents behind an `Arc` (Spice) return that handle without deep-cloning
+    /// `V`; callers that need an owned value use [`Arc::unwrap_or_clone`].
+    async fn get(&self, key: &u64) -> Option<Arc<V>>;
+
+    /// Remove a value from the cache by key
+    /// Returns the removed value if it existed
+    async fn remove(&self, key: &u64) -> Option<V>;
+
+    /// Clear all entries from the cache
+    async fn clear(&self);
+
+    /// Iterate over all keys in the cache
+    ///
+    /// Note: For some backends (e.g., pingora-lru), this may have race conditions
+    /// where a key is returned but the value has expired by the time it's accessed.
+    async fn iter_keys(&self) -> Vec<u64>;
+
+    /// Get the number of entries in the cache
+    ///
+    /// Note: This may include expired entries that haven't been evicted yet.
+    async fn len(&self) -> usize;
+
+    /// Check if the cache is empty
+    async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
+
+    /// Get the weighted size (total memory usage) of the cache
+    async fn weighted_size(&self) -> u64;
+
+    /// Run any pending maintenance tasks (e.g., evictions)
+    async fn run_pending_tasks(&self);
+
+    /// Drop every entry whose value satisfies `predicate`.
+    ///
+    /// Must not promote survivors. Returns how many entries were removed.
+    ///
+    /// Wrappers must forward this; a default no-op would silently skip table
+    /// invalidation on a wrapped backend.
+    async fn invalidate_matching(
+        &self,
+        predicate: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> usize;
+}

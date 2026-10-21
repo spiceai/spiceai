@@ -27,22 +27,28 @@ use arrow_flight::{
     FlightClient, FlightDescriptor, PutResult, encode::FlightDataEncoderBuilder, error::FlightError,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::{Stream, TryStreamExt as _};
-use rand::Rng as _;
+use rand::RngExt as _;
 use runtime::{
-    Runtime, accelerated_table::refresh::Refresh, auth::EndpointAuth,
-    component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
-    flight::RateLimits, internal_table::create_internal_accelerated_table, secrets::Secrets,
+    Runtime,
+    accelerated::refresh::Refresh,
+    auth::EndpointAuth,
+    component::dataset::acceleration::{Acceleration, Engine},
+    config::Config,
+    datafusion::DataFusion,
+    flight::RateLimits,
+    internal_table::create_internal_accelerated_table,
 };
 use runtime_auth::FlightBasicAuth;
-use spicepod::component::dataset::Dataset;
+use runtime_secrets::Secrets;
+use spicepod::component::{caching::SQLResultsCacheConfig, dataset::Dataset};
 use tokio::{sync::RwLock, time::sleep};
 use tonic::transport::Channel;
 
 use crate::{
     configure_test_datafusion,
-    utils::{runtime_ready_check, wait_until_true},
+    utils::{register_test_connectors, runtime_ready_check, wait_until_true},
 };
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -50,26 +56,55 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 mod do_get;
 mod do_put;
 mod prepared_statements;
+mod query_errors;
+mod server_timing;
+mod statement_substrait_plan;
+mod statement_update;
+mod trace_id;
 
 async fn start_spice_test_app(
     flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
     rate_limits: Option<RateLimits>,
     test_dataset: Option<Dataset>,
 ) -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
+    let (channel, df, _metrics_port) =
+        start_spice_test_app_with_metrics_port(flight_auth, rate_limits, test_dataset, None)
+            .await?;
+    Ok((channel, df))
+}
+
+/// Starts an app whose SQL results cache is configured.
+///
+/// Without a config the app has no cache provider at all and every query
+/// reports `CacheDisabled`, which is what the tests that do not care about
+/// caching want — so they keep passing `None` through the helpers above.
+async fn start_spice_test_app_with_cache(
+    flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+    sql_cache: SQLResultsCacheConfig,
+) -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
+    let (channel, df, _metrics_port) =
+        start_spice_test_app_with_metrics_port(flight_auth, None, None, Some(sql_cache)).await?;
+    Ok((channel, df))
+}
+
+async fn start_spice_test_app_with_metrics_port(
+    flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+    rate_limits: Option<RateLimits>,
+    test_dataset: Option<Dataset>,
+    sql_cache: Option<SQLResultsCacheConfig>,
+) -> Result<(Channel, Arc<DataFusion>, u16), anyhow::Error> {
     let mut rng = rand::rng();
     let http_port: u16 = rng.random_range(50000..60000);
     let flight_port: u16 = http_port + 1;
-    let otel_port: u16 = http_port + 2;
-    let metrics_port: u16 = http_port + 3;
+    let metrics_port: u16 = http_port + 2;
 
-    tracing::debug!(
-        "Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
-    );
+    tracing::debug!("Ports: http: {http_port}, flight: {flight_port}, metrics: {metrics_port}");
+
+    register_test_connectors().await;
 
     let api_config = Config::new()
         .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-        .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
 
     let registry = prometheus::Registry::new();
 
@@ -81,18 +116,19 @@ async fn start_spice_test_app(
         rt_builder = rt_builder.with_rate_limits(rate_limits);
     }
 
-    let app = if let Some(dataset) = test_dataset {
-        app::AppBuilder::new("test_app")
-            .with_dataset(dataset)
-            .build()
-    } else {
-        app::AppBuilder::new("test_app").build()
-    };
+    let mut app_builder = app::AppBuilder::new("test_app");
+    if let Some(dataset) = test_dataset {
+        app_builder = app_builder.with_dataset(dataset);
+    }
+    if let Some(sql_cache) = sql_cache {
+        app_builder = app_builder.with_sql_cache(sql_cache);
+    }
+    let app = app_builder.build();
     let rt = Arc::new(rt_builder.with_app(app).build().await);
 
     let cloned_rt = Arc::clone(&rt);
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
             return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
         }
         () = cloned_rt.load_components() => {}
@@ -156,7 +192,7 @@ async fn start_spice_test_app(
         }
     };
 
-    Ok((channel, df))
+    Ok((channel, df, metrics_port))
 }
 
 fn test_record_batch() -> Result<RecordBatch, anyhow::Error> {
@@ -223,7 +259,10 @@ async fn register_test_table(
         table_name.clone(),
         schema,
         None,
-        Acceleration::default(),
+        Acceleration {
+            engine: Engine::Arrow,
+            ..Acceleration::default()
+        },
         Refresh::default(),
         None,
         Arc::new(RwLock::new(Secrets::default())),
@@ -233,7 +272,7 @@ async fn register_test_table(
     .map_err(anyhow::Error::from)?;
 
     datafusion
-        .register_table_as_writable_and_with_schema(table_name, table)
+        .register_table_as_writable_and_with_schema(table_name, table.into_table())
         .map_err(anyhow::Error::from)?;
 
     Ok(())
@@ -244,6 +283,9 @@ async fn write_record_batches(
     batches: impl IntoIterator<Item = RecordBatch>,
 ) -> Result<Vec<PutResult>, FlightError> {
     let flight_descriptor = FlightDescriptor::new_path(vec!["my_table".to_string()]);
+
+    // collecting avoids a lifetime issue with the stream sending between threads
+    #[expect(clippy::needless_collect)]
     let flight_data_stream = FlightDataEncoderBuilder::new()
         .with_flight_descriptor(Some(flight_descriptor))
         .build(futures::stream::iter(

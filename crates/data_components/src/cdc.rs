@@ -14,22 +14,298 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Display, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fmt::Display,
+    sync::{Arc, LazyLock, OnceLock},
+    time::{Duration, SystemTime},
+};
+
+use parking_lot::Mutex;
+
+pub mod config;
+pub use config::{
+    DEFAULT_READY_LAG, InitialSnapshotMode, InvalidCheckpointBehavior, heartbeat_interval,
+};
 
 use arrow::error::ArrowError;
 use arrow::{
-    array::{Array, ArrayRef, ListArray, RecordBatch, StringArray, StructArray},
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    array::{Array, ArrayRef, BooleanArray, ListArray, RecordBatch, StringArray, StructArray},
+    compute::kernels::nullif::nullif,
+    datatypes::{DataType, Field, Fields, Schema, SchemaRef},
 };
 use arrow_buffer::OffsetBuffer;
+use async_trait::async_trait;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
+/// Process-wide CDC shutdown signal, as a monotonically increasing *epoch*.
+///
+/// Raised by the runtime at the *start* of graceful shutdown — before the
+/// (potentially long) connection-drain phase — so CDC sources can release
+/// their upstream resources immediately: a Postgres replication connection
+/// holds a single-consumer slot, and releasing it at SIGTERM (instead of at
+/// process exit) lets a replacement instance attach during a rolling deploy
+/// rather than retrying against "replication slot is active".
+///
+/// An epoch (rather than a one-way flag) keeps multi-`Runtime` processes
+/// working: test suites construct and shut down several `Runtime` instances
+/// in one process, and streams started *after* a shutdown capture the new
+/// epoch and are unaffected. A stream stops when the epoch advances past the
+/// value it captured at start.
+///
+/// Carried by a `watch` channel rather than a bare atomic so a source can wait
+/// for the signal ([`shutdown_signalled`]) instead of polling for it.
+static CDC_SHUTDOWN_EPOCH: LazyLock<tokio::sync::watch::Sender<u64>> =
+    LazyLock::new(|| tokio::sync::watch::Sender::new(0));
+
+/// Signal every currently-running CDC source in the process to stop and
+/// release its upstream resources. Sources started afterwards are unaffected.
+///
+/// Signalling is half of a shutdown. A source that still has state to record —
+/// how far its accelerations were advanced — needs the process to stay up until
+/// it has recorded it, so the runtime follows this with [`drain_shutdown`] and
+/// waits for that before it closes the accelerations.
+///
+/// The epoch advances under the guard registry's lock, the lock
+/// [`ShutdownDrainGuard::hold`] reads the epoch and registers under, so a guard
+/// is always registered under the epoch that was current when it was counted.
+/// Without that, a guard could read the old epoch, lose the lock to this
+/// signal, and register after the drain had already found nothing to wait for —
+/// a source the signal reached, stopping and recording after the accelerations
+/// had closed, which is the missed flush the drain exists to prevent.
+pub fn begin_shutdown() {
+    let _registry = SHUTDOWN_DRAIN.held.lock();
+    CDC_SHUTDOWN_EPOCH.send_modify(|epoch| *epoch += 1);
+}
+
+/// The current shutdown epoch. Long-running CDC sources capture this at
+/// stream start and stop once it changes.
+#[must_use]
+pub fn shutdown_epoch() -> u64 {
+    *CDC_SHUTDOWN_EPOCH.borrow()
+}
+
+/// Resolves once the shutdown epoch has advanced past `epoch`, the value the
+/// caller captured when it started — immediately, if it already has.
+///
+/// For a source to select against while it waits on its upstream or on its own
+/// delays ([`until_shutdown`]), so it stops as shutdown is signalled rather than
+/// at its next poll: the runtime is waiting for it ([`drain_shutdown`]), and
+/// every poll interval spent not noticing is added to the shutdown.
+pub async fn shutdown_signalled(epoch: u64) {
+    let mut epochs = CDC_SHUTDOWN_EPOCH.subscribe();
+    // `wait_for` checks the current value before waiting, so a shutdown signalled
+    // between the caller's capture and this call is not missed. The sender is a
+    // static that is never dropped, so the only `Err` this can return needs that
+    // to change — treated as signalled rather than as a wait that can never end.
+    let _ = epochs.wait_for(|current| *current != epoch).await;
+}
+
+/// Run `wait` to completion unless shutdown is signalled first.
+///
+/// For a source's own delays — a reconnect backoff, a poll interval — which
+/// would otherwise hold the source, and the runtime waiting for it, until they
+/// elapse. The caller re-checks the epoch afterwards either way.
+pub async fn until_shutdown<F: Future<Output = ()>>(epoch: u64, wait: F) {
+    tokio::select! {
+        () = wait => {}
+        () = shutdown_signalled(epoch) => {}
+    }
+}
+
+/// The [`ShutdownDrainGuard`]s alive, counted by the shutdown epoch each
+/// holder captured, and a wakeup for when one is dropped.
+struct ShutdownDrain {
+    held: Mutex<BTreeMap<u64, usize>>,
+    released: tokio::sync::Notify,
+}
+
+static SHUTDOWN_DRAIN: ShutdownDrain = ShutdownDrain {
+    held: Mutex::new(BTreeMap::new()),
+    released: tokio::sync::Notify::const_new(),
+};
+
+/// Holds the process's shutdown open for a CDC source that records state on its
+/// way out.
+///
+/// The shared `PostgreSQL` and `MySQL` pumps persist how far each of their
+/// accelerations has been advanced when they stop: a source's acknowledgement
+/// moves on every keepalive, while the recorded position follows on a timer,
+/// and the stop is what reconciles the two. [`begin_shutdown`] alone does not
+/// give them the chance: without a wait, the runtime closes the accelerations
+/// those positions are written into and exits within milliseconds of the signal,
+/// the recorded position is left behind the acknowledged one, and the next start
+/// reads that as changes acknowledged but never applied and rebuilds the
+/// acceleration from the source (#14523). A pump holds one of these for its
+/// whole life, and [`drain_shutdown`] waits until every guard has been dropped.
+///
+/// The guard captures the shutdown epoch when it is taken, and that is the
+/// epoch its holder stops on: a source started after a shutdown was signalled
+/// captures the newer epoch, is not stopped by that shutdown, and is not waited
+/// for by it either. The capture and the registration happen under the one
+/// lock [`begin_shutdown`] advances the epoch under, so the two cannot
+/// interleave: a guard is either counted by a signal or started after it.
+#[must_use = "the drain is held only while the guard is alive"]
+pub struct ShutdownDrainGuard {
+    epoch: u64,
+}
+
+impl ShutdownDrainGuard {
+    /// Hold the shutdown open until the guard is dropped. Take it before the
+    /// source's task is spawned, so a source the runtime has started but not
+    /// yet polled is already counted.
+    pub fn hold() -> Self {
+        let mut held = SHUTDOWN_DRAIN.held.lock();
+        // Read the epoch under the lock, not before taking it: see
+        // `begin_shutdown`, which advances it under the same lock.
+        let epoch = shutdown_epoch();
+        *held.entry(epoch).or_insert(0) += 1;
+        Self { epoch }
+    }
+
+    /// The shutdown epoch the holder captured, for it to stop on.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+impl Drop for ShutdownDrainGuard {
+    fn drop(&mut self) {
+        {
+            let mut held = SHUTDOWN_DRAIN.held.lock();
+            if let Some(count) = held.get_mut(&self.epoch) {
+                *count -= 1;
+                if *count == 0 {
+                    held.remove(&self.epoch);
+                }
+            }
+        }
+        SHUTDOWN_DRAIN.released.notify_waiters();
+    }
+}
+
+/// How many guards are held by sources a shutdown has been signalled to: those
+/// whose captured epoch is older than the current one.
+fn signalled_guards_held() -> usize {
+    let held = SHUTDOWN_DRAIN.held.lock();
+    let current = shutdown_epoch();
+    held.range(..current).map(|(_, count)| count).sum()
+}
+
+/// Wait until every [`ShutdownDrainGuard`] held by a source the shutdown was
+/// signalled to has been dropped, or `timeout` has elapsed.
+///
+/// Returns how many such guards were still held when it gave up: `0` means every
+/// signalled source has finished recording, and the accelerations can be
+/// closed. Call it after [`begin_shutdown`]; a guard taken since then belongs
+/// to a source that shutdown did not stop, and is not waited for.
+pub async fn drain_shutdown(timeout: Duration) -> usize {
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        // Register for the wakeup before reading the count, so a guard dropped
+        // between the read and the wait still wakes this: `notify_waiters`
+        // reaches only the waiters registered when it is called.
+        let released = SHUTDOWN_DRAIN.released.notified();
+        tokio::pin!(released);
+        released.as_mut().enable();
+        if signalled_guards_held() == 0 {
+            return 0;
+        }
+        tokio::select! {
+            () = &mut released => {}
+            () = &mut deadline => return signalled_guards_held(),
+        }
+    }
+}
+
+/// A stream of [`ChangeEnvelope`] items produced by a CDC connector.
+///
+/// # Readiness contract
+///
+/// It is the responsibility of each connector implementation to indicate when
+/// the dataset can be considered ready for queries by producing at least one
+/// [`ChangeEnvelope`] with [`ChangeEnvelope::is_dataset_ready`] returning
+/// `true`. The runtime treats the dataset as not ready and rejects queries
+/// (with `AccelerationNotReady`) until that signal arrives.
+///
+/// Connectors MUST emit a ready signal even when the source has no new data
+/// (e.g. on restart with an already-populated accelerator, or against a quiet
+/// topic). For sources that may stay quiet indefinitely, use
+/// [`build_ready_signal_envelope`] to emit a zero-row, no-op envelope as soon
+/// as the connector determines it has caught up to the source (for example,
+/// when Kafka consumer lag reaches zero, or when a Postgres logical
+/// replication slot resumes from an existing position).
+///
+/// Failing to honor this contract causes the runtime to wait for an event
+/// that may never arrive — see <https://github.com/spiceai/spiceai/issues/5201>.
 pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
+
+/// What the accelerator already holds at the moment its changes stream is built.
+///
+/// A CDC source that cannot prove where an acceleration's contents left off has
+/// to assume the worst: rows may have been deleted at the source while the
+/// acceleration was away, and no change row will ever arrive for them, so only
+/// re-reading the table removes them. That assumption is what makes an
+/// unprovable position expensive — it forces a rebuild.
+///
+/// An acceleration that holds no rows escapes the assumption outright, and it is
+/// the one case that can be settled by observation rather than inference: no row
+/// is present, so no row can be stale and no deletion can be missing. Only
+/// [`Self::Empty`] carries that proof.
+///
+/// [`Self::Unknown`] means the question was not answered, so it is never proof of
+/// anything and never licenses skipping work. It is deliberately *not* a synonym
+/// for any other variant: which observed state it has to behave like depends on
+/// which way the caller reads emptiness, and the two readings disagree. Where
+/// emptiness licenses skipping a rebuild, an unanswered probe has to behave like
+/// [`Self::NonEmpty`] and keep it; where emptiness is instead *evidence of a gap*
+/// — a recorded position asserting rows are applied that are not there — it has
+/// to behave like [`Self::Empty`] and cause one. Both readings resolve the same
+/// way, toward the rebuild; only the variant they coincide with differs.
+///
+/// So callers match on the variant rather than collapsing it to a bool: see
+/// [`Self::is_provably_empty`] for the licensing direction, and
+/// `postgres_replication::rebuild_cause` for the gap direction, which
+/// distinguishes the two states in the cause it reports rather than merging them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AccelerationContents {
+    /// Observed to hold no rows, so there is nothing that could be stale.
+    Empty,
+    /// Observed to hold at least one row.
+    NonEmpty,
+    /// Not determined — the probe failed, or the caller never ran one.
+    #[default]
+    Unknown,
+}
+
+impl AccelerationContents {
+    /// Whether the acceleration is *proven* to hold no rows.
+    ///
+    /// The safe direction for a caller that reads emptiness as licence to skip
+    /// work: everything that is not a positive proof of emptiness — including
+    /// [`Self::Unknown`] — answers `false`, so a failed probe degrades to the
+    /// conservative behavior instead of silently skipping work that protects
+    /// correctness.
+    ///
+    /// Deliberately not offered as a pair with an inverted `may_be_empty`. A
+    /// caller reading emptiness as *evidence of a gap* needs the opposite answer
+    /// for [`Self::Unknown`], and a second bool accessor makes the two directions
+    /// look interchangeable at the call site — swapping one for the other still
+    /// compiles and still passes a test suite that checks each in isolation,
+    /// while silently restoring the unsafe resume. That caller matches on the
+    /// variant instead, so the compiler holds it to all three states.
+    #[must_use]
+    pub fn is_provably_empty(self) -> bool {
+        matches!(self, Self::Empty)
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum CommitError {
-    #[snafu(display("Unable to commit change: {source}"))]
+    #[snafu(display("Failed to commit CDC change to dataset: {source}"))]
     UnableToCommitChange {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -39,8 +315,22 @@ pub enum CommitError {
 pub enum ChangeBatchError {
     #[snafu(display("Schema didn't match expected change batch format {detail} schema={schema}"))]
     SchemaMismatch { detail: String, schema: SchemaRef },
-    #[snafu(display("Encountered an Arrow error while updating change batch data: {source}"))]
+    #[snafu(display("Failed to process change data capture update: {source}"))]
     Arrow { source: ArrowError },
+    #[snafu(display(
+        "Deferred change batch is no longer available: it was already consumed, \
+         or an earlier build attempt failed. If a build failed, the preceding \
+         'Failed to build deferred change batch' error carries the underlying cause"
+    ))]
+    DeferredBatchConsumed,
+    #[snafu(display("Failed to build deferred change batch: {message}"))]
+    DeferredBuild { message: String },
+    #[snafu(display(
+        "Cannot project change batch for index maintenance: unknown change operation '{op}'. \
+         An index cannot tell whether to add or remove the row, so it is not applied. This is a \
+         connector bug — the change stream emitted an operation code outside c/u/d/r/t"
+    ))]
+    UnknownOperation { op: String },
 }
 
 #[derive(Debug)]
@@ -56,9 +346,39 @@ pub enum StreamError {
     Arrow(String),
     /// External error not originating from `ChangesStream` core logic, such as index processing failure.
     External(String),
+    /// Error surfaced by a data-source connector's change stream: the connector
+    /// names itself (`connector`) and attaches its own concrete error as the boxed
+    /// `source` cause, keeping this CDC contract connector-agnostic.
+    Connector {
+        /// Static name of the connector that produced the error (e.g. `"DynamoDB"`),
+        /// so logs that print only `{err}` still identify the source connector.
+        connector: &'static str,
+        /// The connector's concrete error, preserved as the chained cause.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
-impl std::error::Error for StreamError {}
+impl std::error::Error for StreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(any(feature = "debezium", feature = "kafka"))]
+            StreamError::Kafka(e) => Some(e),
+            StreamError::Connector { source, .. } => Some(&**source),
+            // String-carrying variants have no underlying `Error` source.
+            _ => None,
+        }
+    }
+}
+
+impl From<ChangeBatchError> for StreamError {
+    fn from(e: ChangeBatchError) -> Self {
+        // A change-batch build failure (including a deferred build) is not a
+        // core stream-transport error; surface it as an external error carrying
+        // the actionable message so the dataset's stream fails visibly rather
+        // than dropping the batch.
+        StreamError::External(e.to_string())
+    }
+}
 
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -69,48 +389,991 @@ impl std::fmt::Display for StreamError {
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
             StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
             StreamError::External(e) => write!(f, "External error: {e}"),
+            StreamError::Connector { connector, source } => {
+                write!(f, "{connector} error: {source}")
+            }
         }
     }
 }
 
 /// Allows to commit a change that has been processed.
+#[async_trait]
 pub trait CommitChange {
-    fn commit(&self) -> Result<(), CommitError>;
+    async fn commit(&self) -> Result<(), CommitError>;
+
+    /// Whether deferring this commit is crash-safe: the source can re-stream from
+    /// its last durable checkpoint after a crash, so the source offset is advanced
+    /// only after downstream durability. Defaults to `false` (conservative — never
+    /// defer); overridden `true` only by committers backed by a replayable source
+    /// checkpoint (e.g. a Postgres replication slot). Consumers that defer the
+    /// commit behind a later durability fence (in-memory CDC tier) MUST gate that
+    /// deferral on this returning `true`, or a crash could lose data that the
+    /// source can no longer re-stream.
+    fn supports_deferral(&self) -> bool {
+        false
+    }
+
+    /// Fold `other` into `self`, returning whether it was absorbed. Used to
+    /// coalesce a run of consecutive commits that target the same stream
+    /// position into one before they are run (see the consumer's burst-apply and
+    /// deferred-checkpoint drain). An implementor MUST be **infallible** and
+    /// **order-insensitive** in [`Self::commit`] for this to be sound: absorbing
+    /// re-orders and drops intermediate commits, keeping only the folded result.
+    /// Order-sensitive or fallible committers (per-partition offsets, resume
+    /// tokens) MUST NOT override this — the default refuses to fold, so they stay
+    /// byte-identical.
+    fn try_absorb(&mut self, _other: &dyn CommitChange) -> bool {
+        false
+    }
+
+    /// Downcast hook enabling [`Self::try_absorb`] to recognise a compatible
+    /// sibling. Default `None` = "not coalesce-identifiable"; only committers
+    /// that override `try_absorb` need override this (to `Some(self)`).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
+    /// Whether [`Self::commit`] is statically known to do nothing — there is no
+    /// source position, token, or checkpoint to acknowledge. Consumers may run
+    /// or drop such a committer at any point without ordering or durability
+    /// constraints; the runtime relies on this to keep zero-row readiness
+    /// heartbeats out of the CDC write/durability path (see
+    /// [`ChangeEnvelope::is_no_op_heartbeat`]). Defaults to `false`
+    /// (conservative: assume the commit has effects, preserving ordering); only
+    /// genuinely effect-free committers such as [`NoOpCommitter`] should
+    /// override this to `true`.
+    fn is_no_op(&self) -> bool {
+        false
+    }
+}
+
+/// Destination-passing-style source of the change rows carried by a
+/// [`ChangeEnvelope`].
+///
+/// A CDC source that can render its wire format straight into Arrow (e.g.
+/// Postgres pgoutput) implements this so a multiplexed reader can *route* an
+/// event to the right dataset without paying the O(rows × columns) Arrow-typing
+/// and UTF-8 cost on its shared hot path: [`ChangeRows::build`] runs later, on
+/// the per-dataset consumer. An already-built [`ChangeBatch`] implements it
+/// trivially (blanket impl below) so existing connectors are unchanged.
+///
+/// The metadata methods (`num_rows_hint`, `encoded_len`, `source_commit_ts_ms`,
+/// `is_heartbeat`) MUST be answerable *without* building, so the consumer can
+/// make coalescing/metric decisions cheaply and pay the build only once.
+pub trait ChangeRows: Send {
+    /// Whether there are zero output rows. MUST be exact (never an over- or
+    /// under-estimate), so callers can safely branch or assert on it — e.g.
+    /// ready-signal / heartbeat detection, or skip-empty. Answerable without
+    /// building.
+    fn is_empty(&self) -> bool;
+
+    /// Upper bound on the number of output rows, for builder sizing, coalescing
+    /// counts, and metrics. MAY exceed the exact count (a primary-key-changing
+    /// UPDATE expands to two rows, which is only known precisely after
+    /// decoding); over-estimating affects pre-allocation only, never
+    /// correctness. Use [`Self::is_empty`], not `num_rows_hint() == 0`, when the
+    /// zero case must be exact.
+    fn num_rows_hint(&self) -> usize;
+
+    /// Best-effort encoded byte size, for the consumer's coalescing byte
+    /// budget, computed without building the Arrow batch (e.g. the buffered
+    /// wire size for a raw source).
+    fn encoded_len(&self) -> usize;
+
+    /// Newest source COMMIT timestamp among these rows (ms since the Unix
+    /// epoch), or `None` if the source provides none.
+    fn source_commit_ts_ms(&self) -> Option<i64>;
+
+    /// Whether these rows are a zero-row heartbeat carrying only a fresher
+    /// source timestamp (see [`ChangeBatch::is_heartbeat`]).
+    fn is_heartbeat(&self) -> bool;
+
+    /// Render the rows into a [`ChangeBatch`]. Consumes `self` — runs at most
+    /// once, off the source's hot path. Fallible: per-row value typing can fail
+    /// (e.g. an unmergeable unchanged-TOAST column under `REPLICA IDENTITY
+    /// DEFAULT`), and the failure MUST surface on the dataset's stream rather
+    /// than dropping or corrupting data.
+    fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError>;
+}
+
+/// Trivial [`ChangeRows`] for an already-built batch: metadata reads the batch,
+/// `build` returns it. Keeps every existing (non-deferred) connector working
+/// through the same envelope interface.
+impl ChangeRows for ChangeBatch {
+    fn is_empty(&self) -> bool {
+        self.record.num_rows() == 0
+    }
+    fn num_rows_hint(&self) -> usize {
+        self.record.num_rows()
+    }
+    fn encoded_len(&self) -> usize {
+        self.record.get_array_memory_size()
+    }
+    fn source_commit_ts_ms(&self) -> Option<i64> {
+        self.source_commit_ts_ms
+    }
+    fn is_heartbeat(&self) -> bool {
+        ChangeBatch::is_heartbeat(self)
+    }
+    fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+        Ok(*self)
+    }
+}
+
+/// Holds the change rows as a lazily-built batch: a [`ChangeRows`] source plus a
+/// one-time cache of the built [`ChangeBatch`].
+///
+/// Metadata queries are served from the source *without* building; the first
+/// `get`/`into_built` runs [`ChangeRows::build`] and caches the result. A build
+/// failure is terminal for the batch (the source is consumed); a retry reports
+/// the consumed source as an error rather than silently yielding no data.
+pub struct LazyChangeBatch {
+    built: OnceLock<ChangeBatch>,
+    /// `Some` until consumed by the first (successful or failed) build. The
+    /// mutex guards only the take/build handoff and is never held across an
+    /// `.await`. (The build itself is synchronous CPU work; a caller that runs
+    /// it on an async task still occupies that worker for the build's duration —
+    /// see the `build` doc — this just means the *lock* adds no await-blocking.)
+    source: Mutex<Option<Box<dyn ChangeRows>>>,
+    /// Set by [`Self::prebuild`], which builds ahead of consumption. Boxed
+    /// so [`ChangeBatchError::Arrow`] is not laid out in every envelope —
+    /// an inline [`Prebuilt`] made the `ChangeSink` `Command::Apply` variant
+    /// trip `clippy::large_enum_variant`. See [`Prebuilt`].
+    prebuilt: Option<Box<Prebuilt>>,
+}
+
+/// What [`LazyChangeBatch::prebuild`] keeps from the source it consumed.
+struct Prebuilt {
+    /// The source's own answers to the no-build metadata queries. They keep
+    /// being served after the build, so every coalescing decision and metric
+    /// reads an envelope built ahead of consumption exactly as it would have
+    /// read it unbuilt, and a failed build loses none of them.
+    metadata: RowsMetadata,
+    /// The build's error, for [`LazyChangeBatch::into_built`] to return so the
+    /// consumer sees the error the build raised.
+    error: Option<ChangeBatchError>,
+}
+
+/// A [`ChangeRows`] source's answers to the no-build metadata queries.
+struct RowsMetadata {
+    is_empty: bool,
+    num_rows_hint: usize,
+    encoded_len: usize,
+    source_commit_ts_ms: Option<i64>,
+    is_heartbeat: bool,
+}
+
+impl RowsMetadata {
+    fn of(rows: &dyn ChangeRows) -> Self {
+        Self {
+            is_empty: rows.is_empty(),
+            num_rows_hint: rows.num_rows_hint(),
+            encoded_len: rows.encoded_len(),
+            source_commit_ts_ms: rows.source_commit_ts_ms(),
+            is_heartbeat: rows.is_heartbeat(),
+        }
+    }
+}
+
+/// An owned equivalent of a build error that has to stay with the batch: the
+/// same variant where its fields can be copied, else the same message.
+fn reported_again(error: &ChangeBatchError) -> ChangeBatchError {
+    match error {
+        ChangeBatchError::SchemaMismatch { detail, schema } => ChangeBatchError::SchemaMismatch {
+            detail: detail.clone(),
+            schema: Arc::clone(schema),
+        },
+        ChangeBatchError::DeferredBatchConsumed => ChangeBatchError::DeferredBatchConsumed,
+        ChangeBatchError::DeferredBuild { message } => ChangeBatchError::DeferredBuild {
+            message: message.clone(),
+        },
+        ChangeBatchError::UnknownOperation { op } => {
+            ChangeBatchError::UnknownOperation { op: op.clone() }
+        }
+        ChangeBatchError::Arrow { .. } => ChangeBatchError::DeferredBuild {
+            message: error.to_string(),
+        },
+    }
+}
+
+impl std::fmt::Debug for LazyChangeBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyChangeBatch")
+            .field("materialized", &self.is_materialized())
+            .field("encoded_len", &self.encoded_len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LazyChangeBatch {
+    #[must_use]
+    pub fn from_rows(source: Box<dyn ChangeRows>) -> Self {
+        Self {
+            built: OnceLock::new(),
+            source: Mutex::new(Some(source)),
+            prebuilt: None,
+        }
+    }
+
+    #[must_use]
+    pub fn ready(batch: ChangeBatch) -> Self {
+        // Pre-populate `built` so an eagerly-built envelope (every non-deferred
+        // connector — Kafka/MongoDB/DynamoDB/Debezium/MySQL, ready signals) reads
+        // metadata and the batch itself lock-free via `built.get()`, never boxing
+        // the batch or dispatching through `source`.
+        let built = OnceLock::new();
+        let _ = built.set(batch);
+        Self {
+            built,
+            source: Mutex::new(None),
+            prebuilt: None,
+        }
+    }
+
+    /// Run the deferred build now, ahead of consumption. A built batch is
+    /// cached exactly as a first [`Self::get`] would cache it; a failure is
+    /// kept for [`Self::into_built`]. Either way the source's metadata is kept
+    /// (see [`Prebuilt`]). A no-op once built or consumed.
+    fn prebuild(&mut self) {
+        if self.built.get().is_some() {
+            return;
+        }
+        let Some(source) = self.source.get_mut().take() else {
+            return;
+        };
+        let metadata = RowsMetadata::of(source.as_ref());
+        let error = match source.build() {
+            Ok(batch) => {
+                let _ = self.built.set(batch);
+                None
+            }
+            // Keep the form both `get` and `into_built` will return: `get`
+            // clones via [`reported_again`], and an `Arrow` error cannot be
+            // cloned, so store that already-reported equivalent now. A
+            // borrowed lookup and a consuming one then cannot disagree on the
+            // variant for the same failed prebuild.
+            Err(e) => Some(reported_again(&e)),
+        };
+        self.prebuilt = Some(Box::new(Prebuilt { metadata, error }));
+    }
+
+    /// Return the built batch, running the deferred build on first access.
+    /// Idempotent: a second call returns the cached batch.
+    fn get(&self) -> Result<&ChangeBatch, ChangeBatchError> {
+        if let Some(batch) = self.built.get() {
+            return Ok(batch);
+        }
+        if let Some(error) = self.prebuilt.as_ref().and_then(|p| p.error.as_ref()) {
+            return Err(reported_again(error));
+        }
+        let mut source = self.source.lock();
+        // Another caller may have built it while we waited on the lock.
+        if let Some(batch) = self.built.get() {
+            return Ok(batch);
+        }
+        let src = source.take().context(DeferredBatchConsumedSnafu)?;
+        let batch = src.build()?;
+        // `set` cannot fail: we hold the source lock and re-checked `built` is
+        // empty above, so no other thread can have set it.
+        let _ = self.built.set(batch);
+        self.built.get().context(DeferredBatchConsumedSnafu)
+    }
+
+    /// Whether the batch is already built — an eager envelope, or a deferred
+    /// one whose build has already run — so [`Self::into_built`] and the
+    /// metadata accessors resolve without running a (possibly expensive)
+    /// deferred build. Lets callers skip a `spawn_blocking` offload they'd
+    /// only pay overhead for.
+    #[must_use]
+    pub fn is_materialized(&self) -> bool {
+        self.built.get().is_some()
+    }
+
+    /// Borrow a materialized batch without triggering a deferred build.
+    #[must_use]
+    pub fn as_built(&self) -> Option<&ChangeBatch> {
+        self.built.get()
+    }
+
+    /// Consume into the owned built batch, building if needed.
+    /// Deferred builds are CPU work and must be offloaded by async callers.
+    pub fn into_built(self) -> Result<ChangeBatch, ChangeBatchError> {
+        if let Some(batch) = self.built.into_inner() {
+            return Ok(batch);
+        }
+        if let Some(error) = self.prebuilt.and_then(|p| p.error) {
+            return Err(error);
+        }
+        let src = self
+            .source
+            .into_inner()
+            .context(DeferredBatchConsumedSnafu)?;
+        src.build()
+    }
+
+    // No-build metadata accessors: answer from what a build ahead of
+    // consumption kept, else the built batch directly (lock-free) if present,
+    // else the not-yet-built source; the `default` covers the consumed state
+    // (post-failed-build). Kept as separate methods rather than a shared
+    // higher-order helper — the built and source branches borrow at different
+    // lifetimes, which a single `FnOnce(&dyn ChangeRows)` helper can't satisfy.
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.is_empty;
+        }
+        if let Some(b) = self.built.get() {
+            return b.record.num_rows() == 0;
+        }
+        // `is_some_and`, not `is_none_or`: a `None` source is only reachable
+        // after a failed deferred build (a successful build populates `built`
+        // and short-circuits above). That's an error state, not an empty batch —
+        // report not-empty so a caller can't treat a failed envelope as a
+        // skippable empty one and swallow the error.
+        self.source
+            .lock()
+            .as_deref()
+            .is_some_and(ChangeRows::is_empty)
+    }
+
+    #[must_use]
+    pub fn num_rows_hint(&self) -> usize {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.num_rows_hint;
+        }
+        if let Some(b) = self.built.get() {
+            return b.record.num_rows();
+        }
+        self.source
+            .lock()
+            .as_deref()
+            .map_or(0, ChangeRows::num_rows_hint)
+    }
+
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.encoded_len;
+        }
+        if let Some(b) = self.built.get() {
+            return b.record.get_array_memory_size();
+        }
+        self.source
+            .lock()
+            .as_deref()
+            .map_or(0, ChangeRows::encoded_len)
+    }
+
+    #[must_use]
+    pub fn source_commit_ts_ms(&self) -> Option<i64> {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.source_commit_ts_ms;
+        }
+        if let Some(b) = self.built.get() {
+            return b.source_commit_ts_ms();
+        }
+        self.source
+            .lock()
+            .as_deref()
+            .and_then(ChangeRows::source_commit_ts_ms)
+    }
+
+    #[must_use]
+    pub fn is_heartbeat(&self) -> bool {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.is_heartbeat;
+        }
+        if let Some(b) = self.built.get() {
+            return b.is_heartbeat();
+        }
+        self.source
+            .lock()
+            .as_deref()
+            .is_some_and(ChangeRows::is_heartbeat)
+    }
 }
 
 pub struct ChangeEnvelope {
-    change_committer: Box<dyn CommitChange + Send>,
-    pub change_batch: ChangeBatch,
+    change_committer: Box<dyn CommitChange + Send + Sync>,
+    change_batch: LazyChangeBatch,
+    is_dataset_ready: bool,
+    history_unavailable: bool,
 }
 
 impl ChangeEnvelope {
     #[must_use]
-    pub fn new(change_committer: Box<dyn CommitChange + Send>, change_batch: ChangeBatch) -> Self {
+    pub fn new(
+        change_committer: Box<dyn CommitChange + Send + Sync>,
+        change_batch: ChangeBatch,
+        is_dataset_ready: bool,
+    ) -> Self {
         Self {
             change_committer,
-            change_batch,
+            change_batch: LazyChangeBatch::ready(change_batch),
+            is_dataset_ready,
+            history_unavailable: false,
         }
     }
 
-    pub fn commit(self) -> Result<(), CommitError> {
-        self.change_committer.commit()
+    /// Construct an envelope whose [`ChangeBatch`] is produced lazily from a
+    /// [`ChangeRows`] source the first time it is accessed (via
+    /// [`Self::change_batch`], [`Self::materialize`], or [`Self::into_parts`]),
+    /// rather than built up front.
+    ///
+    /// Use this from a multiplexed CDC source to keep the shared read/route
+    /// path free of per-row Arrow-typing cost; the build then runs on the
+    /// per-dataset consumer. `rows` must own its inputs.
+    #[must_use]
+    pub fn new_from_rows(
+        change_committer: Box<dyn CommitChange + Send + Sync>,
+        rows: Box<dyn ChangeRows>,
+        is_dataset_ready: bool,
+    ) -> Self {
+        Self {
+            change_committer,
+            change_batch: LazyChangeBatch::from_rows(rows),
+            is_dataset_ready,
+            history_unavailable: false,
+        }
     }
 
+    /// Whether there are zero output rows, exactly, without forcing a build.
+    /// See [`ChangeRows::is_empty`].
     #[must_use]
-    pub fn into_parts(self) -> (Box<dyn CommitChange + Send>, ChangeBatch) {
-        (self.change_committer, self.change_batch)
+    pub fn is_empty(&self) -> bool {
+        self.change_batch.is_empty()
+    }
+
+    /// Upper-bound output-row count without forcing a build, for sizing/metrics.
+    /// See [`ChangeRows::num_rows_hint`].
+    #[must_use]
+    pub fn num_rows_hint(&self) -> usize {
+        self.change_batch.num_rows_hint()
+    }
+
+    /// Encoded byte size without forcing a build, for the consumer's coalescing
+    /// budget. See [`ChangeRows::encoded_len`].
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        self.change_batch.encoded_len()
+    }
+
+    /// Newest source commit timestamp (ms since Unix epoch) without forcing a
+    /// build. See [`ChangeRows::source_commit_ts_ms`].
+    #[must_use]
+    pub fn source_commit_ts_ms(&self) -> Option<i64> {
+        self.change_batch.source_commit_ts_ms()
+    }
+
+    /// Whether this is a zero-row heartbeat, without forcing a build. See
+    /// [`ChangeRows::is_heartbeat`].
+    #[must_use]
+    pub fn is_heartbeat(&self) -> bool {
+        self.change_batch.is_heartbeat()
+    }
+
+    /// Whether this envelope is a pure readiness heartbeat: a zero-row change
+    /// batch whose committer is a no-op ([`CommitChange::is_no_op`]).
+    ///
+    /// CDC connectors emit these ([`build_heartbeat_envelope`],
+    /// [`build_ready_signal_envelope`]) only to carry `is_dataset_ready` and a
+    /// source freshness timestamp; they hold no data and acknowledge no source
+    /// position, so a consumer may honor the ready flag and drop the envelope
+    /// without writing, committing, or forcing any durability transition. A
+    /// zero-row envelope whose committer has real effects (e.g. a `MySQL`
+    /// snapshot-boundary envelope that persists the initial resume token) is
+    /// NOT a heartbeat under this predicate and must keep normal
+    /// durability-then-commit ordering.
+    #[must_use]
+    pub fn is_no_op_heartbeat(&self) -> bool {
+        self.change_committer.is_no_op() && self.is_heartbeat()
+    }
+
+    pub async fn commit(self) -> Result<(), CommitError> {
+        self.change_committer.commit().await
+    }
+
+    /// Borrow the change batch, building a deferred batch on first access.
+    ///
+    /// Returns an error if the deferred build fails (e.g. a per-row value that
+    /// cannot be typed to the dataset schema); callers MUST surface it on the
+    /// dataset's changes stream rather than skipping the batch.
+    pub fn change_batch(&self) -> Result<&ChangeBatch, ChangeBatchError> {
+        self.change_batch.get()
+    }
+
+    /// Separate source acknowledgement and control from row storage without
+    /// decoding. The source retains the committer and both control flags.
+    #[must_use]
+    pub fn into_lazy_parts(self) -> LazyChangeEnvelopeParts {
+        (
+            self.change_committer,
+            self.change_batch,
+            self.is_dataset_ready,
+            self.history_unavailable,
+        )
+    }
+
+    /// Consume the envelope into its parts, building a deferred batch if needed.
+    ///
+    /// The build is synchronous CPU work — for a deferred envelope under a
+    /// large burst it can run well past the async runtime's ~100µs-per-await
+    /// budget. Prefer [`Self::into_parts_offloaded`] from an async task; reserve
+    /// this for synchronous contexts or already-materialized envelopes.
+    pub fn into_parts(self) -> Result<ChangeEnvelopeParts, ChangeBatchError> {
+        let batch = self.change_batch.into_built()?;
+        Ok((
+            self.change_committer,
+            batch,
+            self.is_dataset_ready,
+            self.history_unavailable,
+        ))
+    }
+
+    /// [`Self::into_parts`] for async callers: a *deferred* envelope's
+    /// synchronous Arrow build is offloaded to a blocking thread so it cannot
+    /// stall the async worker (and, with it, `/health`) under a large burst.
+    ///
+    /// An already-materialized (eager) envelope resolves inline — its build is
+    /// a no-op, and `spawn_blocking` dispatch would only add overhead to that
+    /// hot path.
+    pub async fn into_parts_offloaded(self) -> Result<ChangeEnvelopeParts, ChangeBatchError> {
+        let materialized = self.change_batch.is_materialized();
+        offload_build(materialized, move || self.into_parts()).await
+    }
+
+    /// Whether the change batch is already built, so [`Self::into_parts`]
+    /// resolves without running a deferred build.
+    #[must_use]
+    pub fn is_materialized(&self) -> bool {
+        self.change_batch.is_materialized()
+    }
+
+    /// Run a deferred build now; see [`prebuild_offloaded`].
+    fn prebuild(&mut self) {
+        self.change_batch.prebuild();
     }
 
     #[must_use]
     pub fn from_parts(
-        change_committer: Box<dyn CommitChange + Send>,
+        change_committer: Box<dyn CommitChange + Send + Sync>,
         change_batch: ChangeBatch,
+        is_dataset_ready: bool,
+        history_unavailable: bool,
     ) -> Self {
         Self {
             change_committer,
-            change_batch,
+            change_batch: LazyChangeBatch::ready(change_batch),
+            is_dataset_ready,
+            history_unavailable,
         }
     }
+
+    /// Whether the accelerator must be rebuilt from the source before this
+    /// envelope's changes — and everything after it — can be applied.
+    ///
+    /// Set by a source that has lost the incremental history it was resuming
+    /// from, and therefore cannot describe what changed while it was away: a
+    /// `PostgreSQL` replication slot that was dropped or invalidated, and by
+    /// extension any equivalent (a purged binlog, an expired stream shard). The
+    /// changes that were missed are gone from the source's log, so no sequence
+    /// of change rows can reconstruct them — only re-reading the table can.
+    ///
+    /// The consumer answers this by re-reading the source into the accelerator
+    /// as a single atomic replacement (the `refresh_mode: full` write path)
+    /// before resuming the stream. It must not be answered by clearing the
+    /// table and letting the stream refill it: that is observable to queries as
+    /// an empty, then partially-filled, table.
+    ///
+    /// Carried as its own zero-row envelope (see
+    /// [`build_history_unavailable_envelope`]) so it is ordered in the stream
+    /// rather than racing it.
+    ///
+    /// A source may raise it mid-stream, not only at the head. The consumer
+    /// treats it as a **barrier**: it coalesces envelopes into runs and performs
+    /// one rebuild per run, so everything the run carried ahead of the signal is
+    /// discarded rather than applied on top of the replacement — applying it
+    /// would write values the re-read has already moved past. Two obligations
+    /// follow for a source that raises this: the committers it emitted before
+    /// the signal must be safely droppable (they are dropped unacked), and the
+    /// position it resumes from afterwards must be at or after them, so the
+    /// re-read genuinely subsumes what was discarded.
+    ///
+    /// A source that already holds the replacement snapshot (the same listing
+    /// it will record as applied) sets [`ChangeBatch::rebuild_from_this_batch`]
+    /// so the consumer overwrites from those rows instead of scanning the
+    /// source a second time. A later scan can see objects the captured listing
+    /// did not, which would duplicate on the next backfill; an earlier scan can
+    /// miss objects the listing then marks applied, which would drop them
+    /// forever if their notification is missed.
+    #[must_use]
+    pub fn history_unavailable(&self) -> bool {
+        self.history_unavailable
+    }
+
+    /// Whether the consumer should overwrite from this envelope's batch instead
+    /// of re-reading the federated table. See [`ChangeBatch::rebuild_from_this_batch`].
+    #[must_use]
+    pub fn rebuild_from_this_batch(&self) -> bool {
+        self.change_batch()
+            .is_ok_and(ChangeBatch::rebuild_from_this_batch)
+    }
+
+    /// Returns `true` if processing this envelope means the dataset can be
+    /// marked ready for queries.
+    ///
+    /// See the [`ChangesStream`] documentation for the connector readiness
+    /// contract.
+    #[must_use]
+    pub fn is_dataset_ready(&self) -> bool {
+        self.is_dataset_ready
+    }
+}
+
+/// The parts of a consumed [`ChangeEnvelope`]: committer, built change batch,
+/// dataset-ready flag, and rebuild-required flag.
+///
+/// Every field is carried explicitly rather than defaulted on reconstruction:
+/// a consumer that decomposes an envelope and rebuilds it (indexing, embedding,
+/// full-text wrapping) must forward the flags, and dropping one is a silent
+/// correctness bug rather than a compile error if the tuple hides it. See
+/// [`ChangeEnvelope::history_unavailable`].
+pub type ChangeEnvelopeParts = (Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool, bool);
+
+/// Source acknowledgement, lazy row payload, readiness, and rebuild control.
+pub type LazyChangeEnvelopeParts = (
+    Box<dyn CommitChange + Send + Sync>,
+    LazyChangeBatch,
+    bool,
+    bool,
+);
+
+/// Run a CDC batch build off the async worker, but only when it would actually
+/// block: an already-materialized build is a no-op, and `spawn_blocking`
+/// dispatch would be pure overhead on that hot path.
+///
+/// Shared by both entry points so the offload policy — when to hand off, and how
+/// a lost blocking task maps onto [`ChangeBatchError`] — is decided in one place.
+async fn offload_build<T: Send + 'static>(
+    materialized: bool,
+    build: impl FnOnce() -> Result<T, ChangeBatchError> + Send + 'static,
+) -> Result<T, ChangeBatchError> {
+    if materialized {
+        return build();
+    }
+    match tokio::task::spawn_blocking(build).await {
+        Ok(parts) => parts,
+        Err(join_err) => Err(ChangeBatchError::DeferredBuild {
+            message: format!("deferred CDC batch build task failed: {join_err}"),
+        }),
+    }
+}
+
+/// [`ChangeEnvelope::into_parts_offloaded`] for a whole drained burst: one
+/// blocking-pool handoff for the burst instead of one per envelope.
+///
+/// The decode work is unchanged; what is amortized is the `spawn_blocking` round
+/// trip, so the win scales with envelopes-per-burst. A burst of
+/// already-materialized envelopes resolves inline, with no handoff at all.
+///
+/// The first failed build discards the rest of the burst — callers MUST treat
+/// the error as terminal for the dataset. The burst's committers are dropped
+/// unacked, so the source re-streams from the last acked position.
+pub async fn into_parts_offloaded_burst(
+    envelopes: Vec<ChangeEnvelope>,
+) -> Result<Vec<ChangeEnvelopeParts>, ChangeBatchError> {
+    // `all` short-circuits, so a deferred source (the case this exists for) reads
+    // exactly one envelope; only a fully-eager burst walks it.
+    let materialized = envelopes.iter().all(ChangeEnvelope::is_materialized);
+    offload_build(materialized, move || {
+        envelopes
+            .into_iter()
+            .map(ChangeEnvelope::into_parts)
+            .collect()
+    })
+    .await
+}
+
+/// Build a group of envelopes' deferred batches ahead of their consumption, on
+/// one blocking-pool handoff, and hand the group back in order.
+///
+/// For a reader that queues envelopes for a consumer still busy applying earlier
+/// ones: the build then overlaps that work instead of adding to it, and
+/// [`into_parts_offloaded_burst`] later finds the batches built. Each envelope
+/// keeps its build's outcome, so a failed build is returned by
+/// [`ChangeEnvelope::into_parts`] with the error it raised, and keeps answering
+/// the no-build metadata queries as its source did. A group with nothing to
+/// build comes back untouched, without the handoff.
+///
+/// If the blocking task itself fails, the group is replaced by one envelope
+/// whose build fails with the reason, so the consumer stops the dataset as it
+/// would for any failed build. The group's committers are dropped unacked, so
+/// the source re-streams its changes.
+pub async fn prebuild_offloaded(
+    mut items: Vec<Result<ChangeEnvelope, StreamError>>,
+) -> Vec<Result<ChangeEnvelope, StreamError>> {
+    let needs_build = items.iter().any(|item| {
+        item.as_ref()
+            .is_ok_and(|envelope| !envelope.is_materialized())
+    });
+    if !needs_build {
+        return items;
+    }
+    match tokio::task::spawn_blocking(move || {
+        for envelope in items.iter_mut().flatten() {
+            envelope.prebuild();
+        }
+        items
+    })
+    .await
+    {
+        Ok(items) => items,
+        Err(join_err) => vec![Ok(ChangeEnvelope::new_from_rows(
+            Box::new(NoOpCommitter),
+            Box::new(FailedBuild {
+                message: format!("deferred CDC batch build task failed: {join_err}"),
+            }),
+            false,
+        ))],
+    }
+}
+
+/// Stands in for a group whose build [`prebuild_offloaded`] lost: it is not
+/// empty and not a heartbeat, so the consumer cannot skip it, and its build
+/// fails with the reason.
+struct FailedBuild {
+    message: String,
+}
+
+impl ChangeRows for FailedBuild {
+    fn is_empty(&self) -> bool {
+        false
+    }
+
+    fn num_rows_hint(&self) -> usize {
+        0
+    }
+
+    fn encoded_len(&self) -> usize {
+        0
+    }
+
+    fn source_commit_ts_ms(&self) -> Option<i64> {
+        None
+    }
+
+    fn is_heartbeat(&self) -> bool {
+        false
+    }
+
+    fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+        DeferredBuildSnafu {
+            message: self.message,
+        }
+        .fail()
+    }
+}
+
+/// A [`CommitChange`] implementation that does nothing. Useful when emitting
+/// synthetic envelopes (e.g. ready signals) that have no underlying source
+/// offset to commit.
+pub struct NoOpCommitter;
+
+#[async_trait]
+impl CommitChange for NoOpCommitter {
+    async fn commit(&self) -> Result<(), CommitError> {
+        Ok(())
+    }
+
+    fn is_no_op(&self) -> bool {
+        true
+    }
+}
+
+/// Emit one uniform log line when a CDC committer durably acks source progress,
+/// showing the source-commit timestamp of the data it commits and the
+/// end-to-end lag (`now − source_commit_ts_ms`). Every connector's committer
+/// calls this so `refresh_mode: changes` freshness and lag-based readiness can
+/// be verified from the logs with a single filter (`spice_cdc::commit`).
+///
+/// `source_commit_ts_ms` is `None` for snapshot-boundary / no-timestamp commits
+/// (lag is then reported as `None`).
+/// Convert a [`SystemTime`] to milliseconds since the Unix epoch, or `None` if it
+/// predates the epoch or overflows `i64`.
+#[must_use]
+pub fn system_time_to_unix_ms(t: SystemTime) -> Option<i64> {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+}
+
+/// Current wall-clock time as milliseconds since the Unix epoch, or `None` if the
+/// clock is unavailable.
+#[must_use]
+pub fn now_unix_ms() -> Option<i64> {
+    system_time_to_unix_ms(SystemTime::now())
+}
+
+/// Replication lag in milliseconds: wall-clock now minus the source-commit
+/// timestamp, clamped to `>= 0`. `None` when the source timestamp is unknown or
+/// the clock is unavailable. Shared by the `spice_cdc::*` log lines and the lag
+/// gauge so every CDC connector computes lag identically.
+#[must_use]
+pub fn replication_lag_ms(source_commit_ts_ms: Option<i64>) -> Option<i64> {
+    match (now_unix_ms(), source_commit_ts_ms) {
+        (Some(now), Some(ts)) => Some(now.saturating_sub(ts).max(0)),
+        _ => None,
+    }
+}
+
+pub fn log_committer_progress(
+    connector: &str,
+    dataset: &str,
+    position: &str,
+    source_commit_ts_ms: Option<i64>,
+) {
+    let lag_ms = replication_lag_ms(source_commit_ts_ms);
+    tracing::debug!(
+        target: "spice_cdc::commit",
+        connector,
+        dataset,
+        position,
+        source_commit_ts_ms = ?source_commit_ts_ms,
+        lag_ms = ?lag_ms,
+        "CDC committer acked source position"
+    );
+}
+
+/// Construct a zero-row "heartbeat" [`ChangeEnvelope`] stamped with a
+/// source-attested `source_commit_ts_ms` and carrying `is_dataset_ready`.
+///
+/// CDC connectors emit these to keep **lag-based readiness** live on an idle
+/// source: a caught-up but quiet source has no rows to carry a freshness
+/// timestamp, so without a heartbeat its measured lag would climb forever and
+/// the dataset would never flip Ready. Periodically emitting a zero-row
+/// envelope stamped with the source's own clock (a Postgres keepalive time, a
+/// `MongoDB` cluster time, a `MySQL` server clock) lets the runtime observe
+/// `now - source_commit_ts_ms` and mark the dataset Ready once that lag is
+/// within the connector's `ready_lag`.
+///
+/// The batch has zero rows and a no-op committer — idle progress is
+/// acknowledged through the connector's own keepalive/position handling, not
+/// through this envelope's committer.
+pub fn build_heartbeat_envelope(
+    schema: &SchemaRef,
+    source_commit_ts_ms: Option<i64>,
+    is_dataset_ready: bool,
+) -> Result<ChangeEnvelope, ChangeBatchError> {
+    // Normalize fields to all-nullable so this empty barrier batch's struct type
+    // matches the truncate/snapshot/live change batches it coalesces with. The
+    // dataset schema may declare non-null columns (e.g. a `nullable: false`
+    // primary key in the spicepod), but every other change batch uses the
+    // nullable schema; without this, concat fails ("arrays of different data
+    // types") when the heartbeat is coalesced with real data.
+    let nullable_schema = Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| Arc::new(f.as_ref().clone().with_nullable(true)))
+            .collect::<Vec<_>>(),
+    );
+
+    // Build zero-row versions of each dataset column.
+    let empty_data_columns: Vec<ArrayRef> = nullable_schema
+        .fields()
+        .iter()
+        .map(|f| arrow::array::new_empty_array(f.data_type()))
+        .collect();
+    let data_struct = StructArray::new(nullable_schema.fields().clone(), empty_data_columns, None);
+
+    let op_array: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
+    let pk_field = Arc::new(Field::new("item", DataType::Utf8, false));
+    let pk_list = ListArray::new(
+        Arc::clone(&pk_field),
+        OffsetBuffer::new(vec![0i32].into()),
+        Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
+        None,
+    );
+
+    let wrapper_schema = Arc::new(changes_schema(&nullable_schema));
+    let record = RecordBatch::try_new(
+        wrapper_schema,
+        vec![op_array, Arc::new(pk_list), Arc::new(data_struct)],
+    )
+    .context(ArrowSnafu)?;
+    let batch = ChangeBatch::try_new(record)?.with_source_commit_ts_ms(source_commit_ts_ms);
+
+    Ok(ChangeEnvelope::new(
+        Box::new(NoOpCommitter),
+        batch,
+        is_dataset_ready,
+    ))
+}
+
+/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
+/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
+/// committer.
+///
+/// For sources with a binary caught-up-or-not readiness signal (e.g. Kafka
+/// consumer lag reaching zero). Sources with a continuous freshness clock use
+/// [`build_heartbeat_envelope`] with [`source_commit_within_ready_lag`] for
+/// lag-based readiness instead. See the [`ChangesStream`] documentation for
+/// the readiness contract.
+pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
+    build_heartbeat_envelope(schema, None, true)
+}
+
+/// Construct a zero-row [`ChangeEnvelope`] that asks the consumer to rebuild the
+/// accelerator from the source before applying anything further — see
+/// [`ChangeEnvelope::history_unavailable`] for when a source must emit one.
+///
+/// Zero rows and a no-op committer, like the readiness and heartbeat signals:
+/// it carries no data and acknowledges no source position. It is emitted
+/// *before* the changes it precedes, so the rebuild is ordered ahead of them
+/// rather than racing them, and `is_dataset_ready` is false because a dataset
+/// whose accelerator is about to be replaced is not ready to serve.
+///
+/// **The no-op committer is the catch**, and why neither shipped source uses
+/// this: a rebuild that acknowledges no position leaves nothing behind saying it
+/// happened, so the next start finds the same unusable position and re-reads the
+/// whole table again — on every restart of a dataset whose source is quiet. A
+/// source with a position to record should build the envelope itself around its
+/// own committer (`ChangeEnvelope::from_parts(committer, batch, false, true)`),
+/// which also keeps it out of the consumer's zero-row heartbeat stripping. Use
+/// this only when there is genuinely no position to persist.
+pub fn build_history_unavailable_envelope(
+    schema: &SchemaRef,
+) -> Result<ChangeEnvelope, ChangeBatchError> {
+    let (committer, batch, is_dataset_ready, _) =
+        build_heartbeat_envelope(schema, None, false)?.into_parts()?;
+    Ok(ChangeEnvelope::from_parts(
+        committer,
+        batch,
+        is_dataset_ready,
+        true,
+    ))
+}
+
+/// Lag-based readiness predicate shared by CDC connectors: returns `true` when
+/// `source_commit_ts_ms` is within `ready_lag` of now (wall clock). `None` (the
+/// connector has no upstream timestamp yet) is **not** ready — there is no
+/// freshness signal proving the stream has caught up. A source clock slightly
+/// ahead of ours (small skew) clamps to zero lag and reads as ready.
+///
+/// This is the single definition of "caught up" behind every connector's
+/// `{connector}_replication_ready_lag`: connectors stamp each envelope's
+/// `is_dataset_ready` with it (mirroring `DynamoDB`'s poll-cycle lag gate), and a
+/// [`build_heartbeat_envelope`] on an idle source carries the same verdict.
+#[must_use]
+pub fn source_commit_within_ready_lag(
+    source_commit_ts_ms: Option<i64>,
+    ready_lag: Duration,
+) -> bool {
+    let Some(lag_ms) = replication_lag_ms(source_commit_ts_ms) else {
+        return false;
+    };
+    u128::from(lag_ms.unsigned_abs()) < ready_lag.as_millis()
 }
 
 /// The Arrow schema that represents a `ChangeEvent`
@@ -131,12 +1394,76 @@ pub fn changes_schema(table_schema: &Schema) -> Schema {
     ])
 }
 
+/// The change-event schema extended with the row's **before-image**: the values
+/// the row held prior to an `UPDATE`/`DELETE`.
+///
+/// A source that can supply it builds its batches in this schema; every other
+/// source keeps [`changes_schema`] and behaves exactly as before.
+/// [`ChangeBatch`] accepts both, so this is additive. The sources that can:
+/// `MySQL`, which Spice pins to `binlog_row_image = FULL`, and `PostgreSQL`
+/// under `REPLICA IDENTITY FULL`.
+///
+/// Carrying the before-image lets a downstream incremental-aggregate maintainer
+/// retract a row's prior contribution directly from the change event. Without
+/// it, the maintainer has to retain every live row's values just to reconstruct
+/// them on update, which makes its state O(live rows) instead of O(groups).
+///
+/// The `before` struct's fields are all nullable even where the table declares
+/// them non-null, because a before-image is partial by nature: `PostgreSQL`
+/// under `REPLICA IDENTITY DEFAULT` sends only the identity columns and leaves
+/// the rest null. Reusing the table's own nullability would make that batch
+/// unconstructible — `StructArray::try_new` rejects a null under a non-nullable
+/// field — so a source could not express what its replication stream actually
+/// carries. `data` keeps the table's nullability: it is a complete row.
+#[must_use]
+pub fn changes_schema_with_before(table_schema: &Schema) -> Schema {
+    let mut fields = changes_schema(table_schema).fields().to_vec();
+    fields.push(Arc::new(Field::new(
+        "before",
+        DataType::Struct(nullable_fields(table_schema.fields()).into()),
+        true,
+    )));
+    Schema::new(fields)
+}
+
+/// The before-image's fields, every one marked nullable.
+///
+/// A before-image is partial by nature: an `INSERT` has none at all, and a
+/// source may send only the identity columns — `PostgreSQL` under
+/// `REPLICA IDENTITY DEFAULT` sends exactly those, leaving the rest null even
+/// where the table declares them non-null. Both accessors derive their schema
+/// here so neither hands back a batch whose schema claims a non-nullability its
+/// values do not honour.
+fn nullable_fields(fields: &Fields) -> Vec<Arc<Field>> {
+    fields
+        .iter()
+        .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct ChangeBatch {
     pub record: RecordBatch,
     op_idx: usize,
     primary_keys_idx: usize,
     data_idx: usize,
+    /// Column index of the optional before-image struct ([`changes_schema_with_before`]).
+    /// `None` for batches in the base [`changes_schema`], whose sources cannot
+    /// supply the row's prior values.
+    before_idx: Option<usize>,
+    /// Newest upstream COMMIT timestamp in this batch (milliseconds since the Unix
+    /// epoch — a wall clock, NOT a monotonic `Instant`), when the source provides
+    /// one; `None` otherwise. Lets a downstream consumer compute true end-to-end
+    /// replication lag as `now_ms - source_commit_ts_ms`. Populated by CDC
+    /// connectors that carry a source timestamp (Debezium, Postgres logical
+    /// replication, `MongoDB` change streams); left `None` by sources that don't.
+    source_commit_ts_ms: Option<i64>,
+    /// When set with [`ChangeEnvelope::history_unavailable`], the consumer must
+    /// replace the accelerator from this batch's `data` (atomic overwrite) rather
+    /// than re-reading the federated table. That keeps the replacement rows and
+    /// the source's applied-key / position commit on the same snapshot. Copied
+    /// by [`replace_change_batch_data`] so wrappers cannot drop it.
+    rebuild_from_this_batch: bool,
 }
 
 pub enum ChangeOperation {
@@ -188,13 +1515,65 @@ impl ChangeBatch {
         let Some((data_idx, _)) = schema.column_with_name("data") else {
             unreachable!("The schema is validated to have a 'data' field")
         };
+        // Absent for the base `changes_schema`; validation already accepted both.
+        let before_idx = schema.column_with_name("before").map(|(idx, _)| idx);
 
         Ok(Self {
             record,
             op_idx,
             primary_keys_idx,
             data_idx,
+            before_idx,
+            source_commit_ts_ms: None,
+            rebuild_from_this_batch: false,
         })
+    }
+
+    /// Attach the newest upstream commit timestamp (ms since the Unix epoch) for
+    /// this batch. Connectors that carry a source timestamp set it here; the value
+    /// rides the batch into the accelerator write path, where it feeds the
+    /// replication-lag signal. `None` leaves the batch without lag information.
+    #[must_use]
+    pub fn with_source_commit_ts_ms(mut self, source_commit_ts_ms: Option<i64>) -> Self {
+        self.source_commit_ts_ms = source_commit_ts_ms;
+        self
+    }
+
+    /// The newest upstream commit timestamp (ms since the Unix epoch) in this
+    /// batch, or `None` when the source does not provide one.
+    #[must_use]
+    pub fn source_commit_ts_ms(&self) -> Option<i64> {
+        self.source_commit_ts_ms
+    }
+
+    /// Mark this batch as the replacement snapshot for a
+    /// [`ChangeEnvelope::history_unavailable`] signal. The consumer overwrites
+    /// the accelerator from [`Self::data_batch`] instead of scanning the source.
+    #[must_use]
+    pub fn with_rebuild_from_this_batch(mut self, rebuild_from_this_batch: bool) -> Self {
+        self.rebuild_from_this_batch = rebuild_from_this_batch;
+        self
+    }
+
+    /// Whether [`ChangeEnvelope::history_unavailable`] should overwrite from
+    /// this batch rather than re-read the federated table.
+    #[must_use]
+    pub fn rebuild_from_this_batch(&self) -> bool {
+        self.rebuild_from_this_batch
+    }
+
+    /// Whether this is a zero-row envelope — a keepalive/heartbeat carrying only a
+    /// `source_commit_ts_ms` to keep the idle lag gauge fresh, not an actual change.
+    /// No source currently emits these (the Postgres heartbeat fan-out was reverted),
+    /// so this is a defensive guard: consumers that derive *received/applied progress
+    /// frontiers* must exclude such envelopes, because they are stamped with the server
+    /// clock on a "keepalive ⇒ caught up" premise that is FALSE mid-backlog (keepalives
+    /// interleave between transactions) — counting them advances the frontier past data
+    /// not yet received/applied and corrupts the progress-rate ladder. It also correctly
+    /// excludes empty-transaction envelopes from the data frontier.
+    #[must_use]
+    pub fn is_heartbeat(&self) -> bool {
+        self.record.num_rows() == 0
     }
 
     #[must_use]
@@ -238,6 +1617,27 @@ impl ChangeBatch {
         primary_keys
     }
 
+    /// Whether `row` carries any primary key, without allocating the key list.
+    ///
+    /// [`Self::primary_keys`] materializes a `Vec<String>` (cloning every key)
+    /// just to return the names; callers that only need to know whether a row is
+    /// keyed (e.g. the CDC delete path partitioning keyed vs keyless rows) should
+    /// use this — it reads the list length straight off the `ListArray` offsets.
+    #[must_use]
+    pub fn has_primary_keys(&self, row: usize) -> bool {
+        let Some(primary_keys_col) = self
+            .record
+            .column(self.primary_keys_idx)
+            .as_any()
+            .downcast_ref::<ListArray>()
+        else {
+            unreachable!(
+                "The schema is validated to have a 'primary_keys' field which is a ListArray"
+            );
+        };
+        primary_keys_col.value_length(row) > 0
+    }
+
     #[must_use]
     pub fn data(&self, row: usize) -> RecordBatch {
         let Some(data_col) = self
@@ -257,18 +1657,184 @@ impl ChangeBatch {
         let Some(data_array) = data_col.as_any().downcast_ref::<StructArray>() else {
             unreachable!("The schema is validated to have a 'data' field which is a StructArray");
         };
-        let DataType::Struct(fields) = data_array.data_type() else {
-            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
-        };
-        let Ok(record_batch) = RecordBatch::try_new(
-            Arc::new(Schema::new(fields.clone())),
-            data_array.columns().to_vec(),
-        ) else {
+        let Ok(record_batch) =
+            RecordBatch::try_new(self.data_schema(), data_array.columns().to_vec())
+        else {
             unreachable!("The schema is validated to have a 'data' field which is a StructArray");
         };
         record_batch
     }
 
+    /// The schema of the row data this batch carries, without building the batch.
+    ///
+    /// [`Self::data_batch`] allocates a `Schema`, a `Vec` of column `Arc`s and a
+    /// `RecordBatch` on every call. A caller that only reads the schema — the CDC
+    /// write path compares it against the acceleration's before applying a burst
+    /// — should use this instead, so a burst that is only being classified costs
+    /// no batch. The two can never disagree: [`Self::data_batch`] builds its
+    /// batch from this value.
+    #[must_use]
+    pub fn data_schema(&self) -> SchemaRef {
+        let data_col = self.record.column(self.data_idx);
+        let Some(data_array) = data_col.as_any().downcast_ref::<StructArray>() else {
+            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
+        };
+        let DataType::Struct(fields) = data_array.data_type() else {
+            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
+        };
+        Arc::new(Schema::new(fields.clone()))
+    }
+
+    /// Whether this batch carries a before-image column
+    /// ([`changes_schema_with_before`]). Callers that can exploit prior row
+    /// values must branch on this rather than assuming it — most sources cannot
+    /// supply one.
+    #[must_use]
+    pub fn has_before_image(&self) -> bool {
+        self.before_idx.is_some()
+    }
+
+    /// The row's before-image — the values it held prior to an `UPDATE`/`DELETE`
+    /// — as a single-row `RecordBatch`.
+    ///
+    /// `None` when the batch carries no before-image column, and also when this
+    /// row's before-image is null (an `INSERT` has no prior values, and a source
+    /// may omit it per-row). A `Some` batch may still hold nulls in individual
+    /// columns where the source sent only key columns — `PostgreSQL` under
+    /// `REPLICA IDENTITY DEFAULT` does exactly that — so a caller needing
+    /// complete prior values must check the columns it reads;
+    /// [`changes_schema_with_before`] declares every before-image field nullable
+    /// so such a batch is representable at all.
+    #[must_use]
+    pub fn before(&self, row: usize) -> Option<RecordBatch> {
+        let before_idx = self.before_idx?;
+        let before_col = self.record.column(before_idx);
+        if before_col.is_null(row) {
+            return None;
+        }
+        let Some(before_array) = before_col.as_any().downcast_ref::<StructArray>() else {
+            unreachable!("The schema is validated to have a 'before' field which is a StructArray");
+        };
+        let DataType::Struct(fields) = before_array.data_type() else {
+            unreachable!("The schema is validated to have a 'before' field which is a StructArray");
+        };
+        let row_slice = before_array.slice(row, 1);
+        let Ok(record_batch) = RecordBatch::try_new(
+            Arc::new(Schema::new(fields.clone())),
+            row_slice.columns().to_vec(),
+        ) else {
+            unreachable!("A one-row slice's columns all have exactly one row");
+        };
+        Some(record_batch)
+    }
+
+    /// The whole before-image column as a `RecordBatch` aligned row-for-row with
+    /// [`Self::data_batch`]. `None` when the batch carries no before-image.
+    ///
+    /// Rows without prior values (inserts) read back as null in every column, so
+    /// a caller can retract from this batch alone; pairing each row with its `op`
+    /// still tells it which rows are *meant* to retract.
+    ///
+    /// So `op` is the only authority on what a row is. Do NOT infer the operation
+    /// from this batch: an all-null row means "the source sent no prior values"
+    /// *or* "every prior value was NULL", and the two are indistinguishable here
+    /// once the struct's validity has been pushed into the columns. `op` is
+    /// non-nullable in both change schemas precisely so this question never has
+    /// to be answered from the before-image.
+    ///
+    /// Every field is reported nullable regardless of how the table declares it:
+    /// a before-image is absent on insert, and a source may send only the key
+    /// columns (`PostgreSQL` under `REPLICA IDENTITY DEFAULT` does exactly that),
+    /// so nulls are expected in columns the table itself marks non-null.
+    #[must_use]
+    pub fn before_batch(&self) -> Option<RecordBatch> {
+        let before_idx = self.before_idx?;
+        let before_col = self.record.column(before_idx);
+        let Some(before_array) = before_col.as_any().downcast_ref::<StructArray>() else {
+            unreachable!("The schema is validated to have a 'before' field which is a StructArray");
+        };
+        let DataType::Struct(fields) = before_array.data_type() else {
+            unreachable!("The schema is validated to have a 'before' field which is a StructArray");
+        };
+
+        // A `RecordBatch` has no struct-level validity to carry, and Arrow lets a
+        // null struct slot hold arbitrary values underneath it. Returning the
+        // child arrays as-is would therefore let a row the source marked as
+        // having *no* prior values read back as real ones — and a maintained
+        // aggregate would retract a contribution that was never made. Push the
+        // struct's nulls down into every column so the batch says what the struct
+        // said.
+        let columns = if let Some(struct_nulls) = before_array.nulls() {
+            let row_is_null = BooleanArray::new(!struct_nulls.inner(), None);
+            before_array
+                .columns()
+                .iter()
+                .map(|column| {
+                    let Ok(masked) = nullif(column.as_ref(), &row_is_null) else {
+                        unreachable!(
+                            "The mask is this struct's own validity, so it shares the column's row count"
+                        );
+                    };
+                    masked
+                })
+                .collect()
+        } else {
+            before_array.columns().to_vec()
+        };
+
+        let Ok(record_batch) = RecordBatch::try_new(Arc::new(Schema::new(fields.clone())), columns)
+        else {
+            unreachable!("The 'before' struct's columns are validated to share one row count");
+        };
+        Some(record_batch)
+    }
+
+    /// Project this change batch into the operations an [`spice_table::Index`]
+    /// maintains: the upsert rows (create/update/read), the delete rows, and
+    /// whether the batch truncates — in original row order.
+    ///
+    /// `op` is the sole authority on what a row is (see [`Self::before_batch`]);
+    /// an unknown op is a typed error rather than a guess, because misclassifying
+    /// it would index a row that should be deleted, or the reverse.
+    ///
+    /// Rows are not coalesced per key: the upsert and delete rows keep their
+    /// original positions so the caller can materialize the upsert data and the
+    /// delete keys, and scatter the augmented output back into the full change
+    /// batch for the accelerator.
+    ///
+    /// # Errors
+    /// Returns [`ChangeBatchError::UnknownOperation`] for an op outside c/u/d/r/t.
+    pub fn index_change_set(&self) -> Result<IndexChangeSet, ChangeBatchError> {
+        let num_rows = self.record.num_rows();
+
+        let pk_columns: Arc<[String]> = if num_rows == 0 {
+            Arc::from(Vec::<String>::new())
+        } else {
+            Arc::from(self.primary_keys(0))
+        };
+
+        let mut truncated = false;
+        let mut upsert_rows: Vec<usize> = Vec::new();
+        let mut delete_rows: Vec<usize> = Vec::new();
+        for row in 0..num_rows {
+            match classify_op(&self.op(row))? {
+                RowClass::Upsert => upsert_rows.push(row),
+                RowClass::Delete => delete_rows.push(row),
+                RowClass::Truncate => truncated = true,
+            }
+        }
+
+        Ok(IndexChangeSet::new(
+            pk_columns,
+            Arc::from(upsert_rows),
+            Arc::from(delete_rows),
+            truncated,
+        ))
+    }
+
+    /// Accepts both the base [`changes_schema`] and the before-image-carrying
+    /// [`changes_schema_with_before`], so a source that gains before-images does
+    /// not break consumers (or sources) that never had them.
     fn validate_schema(schema: SchemaRef) -> Result<(), ChangeBatchError> {
         let Some(data_col) = schema.fields().iter().find(|field| field.name() == "data") else {
             return SchemaMismatchSnafu {
@@ -289,8 +1855,9 @@ impl ChangeBatch {
             }
         };
 
-        let expected_schema = changes_schema(&data_schema);
-        if *schema != expected_schema {
+        if *schema != changes_schema(&data_schema)
+            && *schema != changes_schema_with_before(&data_schema)
+        {
             return SchemaMismatchSnafu {
                 detail: "Schema didn't match expected change batch format",
                 schema,
@@ -299,6 +1866,102 @@ impl ChangeBatch {
         }
 
         Ok(())
+    }
+}
+
+/// A CDC change batch split into the operations an `spice_table::Index`
+/// maintains: which rows to (re)index, which rows to delete, and whether to
+/// truncate.
+///
+/// It is pure *metadata*: the row positions of the upserts and the deletes, the
+/// primary-key columns, and the truncate flag. It holds no row data — the caller
+/// owns the change batch and materializes the upsert data and the delete keys
+/// from these indices, so there is one materialization site and upserts and
+/// deletes are described the same way.
+///
+/// Rows are partitioned by `op` — create/update/read are upserts, delete is a
+/// delete, truncate sets the flag — in the change batch's original row order,
+/// *not* coalesced per key: the upsert rows keep their positions so the augmented
+/// output can be scattered back into the full change batch for the accelerator.
+#[derive(Clone, Debug)]
+pub struct IndexChangeSet {
+    primary_key_columns: Arc<[String]>,
+    upsert_rows: Arc<[usize]>,
+    delete_rows: Arc<[usize]>,
+    truncated: bool,
+}
+
+impl IndexChangeSet {
+    /// Construct a change set from already-partitioned parts.
+    /// [`ChangeBatch::index_change_set`] is the sole caller.
+    #[must_use]
+    pub fn new(
+        primary_key_columns: Arc<[String]>,
+        upsert_rows: Arc<[usize]>,
+        delete_rows: Arc<[usize]>,
+        truncated: bool,
+    ) -> Self {
+        Self {
+            primary_key_columns,
+            upsert_rows,
+            delete_rows,
+            truncated,
+        }
+    }
+
+    /// The primary-key column names (uniform for the batch), for projecting the
+    /// delete rows down to the keys `Index::delete_by_keys` expects.
+    #[must_use]
+    pub fn primary_key_columns(&self) -> &Arc<[String]> {
+        &self.primary_key_columns
+    }
+
+    /// Original row indices of the upsert rows. The caller seeds the augmentation
+    /// accumulator by taking these rows from the change batch's data, and scatters
+    /// the augmented result back to these same positions.
+    #[must_use]
+    pub fn upsert_rows(&self) -> &Arc<[usize]> {
+        &self.upsert_rows
+    }
+
+    /// Original row indices of the delete rows. The caller takes these rows,
+    /// projected to [`Self::primary_key_columns`], as the delete keys.
+    #[must_use]
+    pub fn delete_rows(&self) -> &Arc<[usize]> {
+        &self.delete_rows
+    }
+
+    /// Whether the batch truncated the table (clear the index first).
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Whether this change set carries no index work at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.truncated && self.upsert_rows.is_empty() && self.delete_rows.is_empty()
+    }
+}
+
+/// How a change row maps onto the operation classes an index maintains.
+enum RowClass {
+    /// Create / Update / Read (snapshot): the after-image must be (re)indexed.
+    Upsert,
+    /// Delete: the key must be removed from the index.
+    Delete,
+    /// Truncate: the whole index must be cleared.
+    Truncate,
+}
+
+fn classify_op(op: &ChangeOperation) -> Result<RowClass, ChangeBatchError> {
+    match op {
+        ChangeOperation::Create | ChangeOperation::Update | ChangeOperation::Read => {
+            Ok(RowClass::Upsert)
+        }
+        ChangeOperation::Delete => Ok(RowClass::Delete),
+        ChangeOperation::Truncate => Ok(RowClass::Truncate),
+        ChangeOperation::Unknown(op) => UnknownOperationSnafu { op: op.clone() }.fail(),
     }
 }
 
@@ -370,14 +2033,401 @@ pub fn replace_change_batch_data(
     RecordBatch::try_new(schema.into(), cols)
         .map_err(|source| ChangeBatchError::Arrow { source })
         .and_then(ChangeBatch::try_new)
+        .map(|batch| {
+            batch
+                .with_source_commit_ts_ms(change.source_commit_ts_ms())
+                .with_rebuild_from_this_batch(change.rebuild_from_this_batch())
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
     use arrow_array::{Int32Array, StringArray};
     use std::sync::Arc;
+
+    fn before_image_test_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("amount", DataType::Int32, true),
+        ])
+    }
+
+    /// Builds a two-row change batch in the before-image schema: row 0 is an
+    /// INSERT (no prior values), row 1 an UPDATE carrying its before-image.
+    fn before_image_batch() -> ChangeBatch {
+        use arrow_array::StructArray;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        let table = before_image_test_schema();
+        let wrapper = changes_schema_with_before(&table);
+
+        let data = StructArray::from(vec![
+            (
+                Arc::new(Field::new("id", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("amount", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![10, 25])) as arrow_array::ArrayRef,
+            ),
+        ]);
+        // Row 0 (insert) has no before-image; row 1 (update) held amount=20.
+        let before = StructArray::try_new(
+            table.fields().clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![None, Some(2)])),
+                Arc::new(Int32Array::from(vec![None, Some(20)])),
+            ],
+            Some(vec![false, true].into()),
+        )
+        .expect("before-image struct should be valid");
+
+        // `primary_keys` is List<Utf8> with a non-null item field; both rows carry
+        // a single key name.
+        let mut pk_builder = ListBuilder::new(StringBuilder::new())
+            .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+        for _ in 0..2 {
+            pk_builder.values().append_value("id");
+            pk_builder.append(true);
+        }
+
+        let record = RecordBatch::try_new(
+            Arc::new(wrapper),
+            vec![
+                Arc::new(StringArray::from(vec!["c", "u"])),
+                Arc::new(pk_builder.finish()) as arrow_array::ArrayRef,
+                Arc::new(data),
+                Arc::new(before),
+            ],
+        )
+        .expect("before-image test batch must match the wrapper schema");
+        ChangeBatch::try_new(record).expect("before-image batch should validate")
+    }
+
+    /// The base schema must keep validating unchanged: sources that cannot supply
+    /// a before-image (and the connectors that build batches for them) must not
+    /// break when the field is added.
+    #[test]
+    fn base_change_schema_still_validates_without_before_image() {
+        let table = before_image_test_schema();
+        let record = RecordBatch::new_empty(Arc::new(changes_schema(&table)));
+        let batch = ChangeBatch::try_new(record).expect("base schema must still validate");
+        assert!(
+            !batch.has_before_image(),
+            "a base-schema batch carries no before-image"
+        );
+        assert!(
+            batch.before_batch().is_none(),
+            "before_batch must be None when the column is absent"
+        );
+    }
+
+    #[test]
+    fn before_image_schema_validates_and_exposes_prior_values() {
+        let batch = before_image_batch();
+        assert!(batch.has_before_image(), "the before column must be seen");
+
+        // Row 0 is an insert: no prior values to retract.
+        assert!(
+            batch.before(0).is_none(),
+            "an insert has no before-image, so retraction must have nothing to read"
+        );
+
+        // Row 1 is an update: the prior amount is what a maintained aggregate
+        // subtracts, and it is exactly what the per-row index existed to store.
+        let before = batch.before(1).expect("an update carries its before-image");
+        assert_eq!(before.num_rows(), 1);
+        let amount = before
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("amount column is Int32");
+        assert_eq!(
+            amount.value(0),
+            20,
+            "the before-image must carry the row's prior value, not the new one"
+        );
+
+        // And the new value still arrives through `data`, unchanged.
+        let data = batch.data(1);
+        let new_amount = data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("amount column is Int32");
+        assert_eq!(new_amount.value(0), 25, "data still carries the new value");
+    }
+
+    #[test]
+    fn before_batch_aligns_row_for_row_with_data_batch() {
+        let batch = before_image_batch();
+        let data = batch.data_batch();
+        let before = batch
+            .before_batch()
+            .expect("a before-image batch exposes the whole column");
+        assert_eq!(
+            data.num_rows(),
+            before.num_rows(),
+            "before-image rows must align with data rows so each row pairs with its op"
+        );
+        assert_eq!(
+            data.schema().fields().len(),
+            before.schema().fields().len(),
+            "before-image and data share the table schema"
+        );
+    }
+
+    /// `data_schema` lets a caller that only reads the schema — the CDC write
+    /// path's per-burst schema-evolution preflight — skip building a
+    /// `RecordBatch` it never uses. That is only sound while it reports exactly
+    /// the fields the data column holds: a preflight that classified a burst
+    /// against invented or reordered fields would admit a widening the write then
+    /// applies under a different schema.
+    ///
+    /// Both accessors are checked against the `data` column read straight off the
+    /// record, not against each other — `data_batch` derives its schema from
+    /// `data_schema`, so comparing the two only ever compares a value with
+    /// itself. Pinned across both wrapper shapes, which place `data` at different
+    /// column indices.
+    #[test]
+    fn data_schema_reports_the_data_columns_own_fields() {
+        let table = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let rows = RecordBatch::try_new(
+            Arc::clone(&table),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .expect("data batch should match the table schema");
+
+        for (shape, batch) in [
+            ("changes_schema_with_before", before_image_batch()),
+            (
+                "changes_schema",
+                wrap_data_as_change_batch(&table, &rows).expect("to create change batch"),
+            ),
+        ] {
+            let data_col = batch
+                .record
+                .column_by_name("data")
+                .expect("the wrapper schema has a 'data' column");
+            let DataType::Struct(fields) = data_col.data_type() else {
+                panic!("{shape}: 'data' is validated to be a StructArray");
+            };
+
+            assert_eq!(
+                batch.data_schema().fields(),
+                fields,
+                "{shape}: data_schema must report the 'data' column's own fields"
+            );
+            assert_eq!(
+                batch.data_batch().schema().fields(),
+                fields,
+                "{shape}: data_batch must carry the 'data' column's own fields"
+            );
+        }
+    }
+
+    /// A null struct slot means "this row has no prior values", but Arrow lets the
+    /// child arrays hold anything underneath it. `before_batch` flattens the
+    /// struct into a `RecordBatch`, which has no struct-level validity to carry,
+    /// so it must push that null down into every column — otherwise a maintained
+    /// aggregate reads the values hiding under an insert as real prior values and
+    /// retracts a contribution that was never made.
+    ///
+    /// The table also declares `id` non-null, so this covers the second half: the
+    /// mask introduces nulls into a column the table marks non-nullable, and the
+    /// returned schema has to admit them.
+    #[test]
+    fn before_batch_masks_columns_hidden_under_a_null_struct_slot() {
+        use arrow_array::StructArray;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        let table = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("amount", DataType::Int32, true),
+        ]);
+        let wrapper = changes_schema_with_before(&table);
+
+        let data = StructArray::try_new(
+            table.fields().clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(vec![10, 25])) as arrow_array::ArrayRef,
+            ],
+            None,
+        )
+        .expect("data struct should be valid");
+
+        // Row 0 is an insert: its struct slot is null, yet its child arrays are
+        // fully populated — legal Arrow, and exactly what a source that reuses a
+        // scratch buffer produces. The before-image's fields come from the
+        // wrapper, which declares them nullable however the table declares them.
+        let before = StructArray::try_new(
+            Fields::from(nullable_fields(table.fields())),
+            vec![
+                Arc::new(Int32Array::from(vec![999, 2])) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(vec![777, 20])) as arrow_array::ArrayRef,
+            ],
+            Some(vec![false, true].into()),
+        )
+        .expect("before-image struct should be valid");
+
+        let mut pk_builder = ListBuilder::new(StringBuilder::new())
+            .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+        for _ in 0..2 {
+            pk_builder.values().append_value("id");
+            pk_builder.append(true);
+        }
+
+        let record = RecordBatch::try_new(
+            Arc::new(wrapper),
+            vec![
+                Arc::new(StringArray::from(vec!["c", "u"])),
+                Arc::new(pk_builder.finish()) as arrow_array::ArrayRef,
+                Arc::new(data),
+                Arc::new(before),
+            ],
+        )
+        .expect("before-image test batch must match the wrapper schema");
+        let batch = ChangeBatch::try_new(record).expect("before-image batch should validate");
+
+        let before_batch = batch
+            .before_batch()
+            .expect("a before-image batch exposes the whole column");
+        for (column, name) in [(0, "id"), (1, "amount")] {
+            let values = before_batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("before-image columns are Int32");
+            assert!(
+                values.is_null(0),
+                "{name} must read back null for the insert, not the value hidden under the null struct slot"
+            );
+        }
+
+        // The update's prior values still survive the mask.
+        let amount = before_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("amount column is Int32");
+        assert_eq!(
+            amount.value(1),
+            20,
+            "the update's before-image must be untouched by the mask"
+        );
+
+        // Per-row access agrees with the flattened batch.
+        assert!(
+            batch.before(0).is_none(),
+            "the insert has no before-image at all"
+        );
+
+        // And the per-row accessor reports the same nullability as the
+        // flattened one, so a partial before-image is representable either way.
+        let row = batch
+            .before(1)
+            .expect("the update carries its before-image");
+        assert!(
+            row.schema().field(0).is_nullable(),
+            "before() must report 'id' nullable even though the table declares it non-null"
+        );
+        assert_eq!(
+            row.schema().fields().len(),
+            before_batch.schema().fields().len(),
+            "both accessors expose the same columns"
+        );
+    }
+
+    /// `PostgreSQL` under `REPLICA IDENTITY DEFAULT` sends only the identity
+    /// columns, so a before-image legitimately holds nulls in columns the table
+    /// declares non-null. Building the single-row batch against the table's own
+    /// nullability would misrepresent that.
+    #[test]
+    fn before_row_admits_nulls_in_a_table_non_null_column() {
+        use arrow_array::StructArray;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        let table = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("amount", DataType::Int32, false),
+        ]);
+        let wrapper = changes_schema_with_before(&table);
+
+        let data = StructArray::try_new(
+            table.fields().clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2])) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(vec![25])) as arrow_array::ArrayRef,
+            ],
+            None,
+        )
+        .expect("data struct should be valid");
+
+        // Identity column present, non-identity column absent — the shape
+        // REPLICA IDENTITY DEFAULT produces.
+        let before = StructArray::try_new(
+            Fields::from(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("amount", DataType::Int32, true),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(2)])) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(vec![Option::<i32>::None])) as arrow_array::ArrayRef,
+            ],
+            None,
+        )
+        .expect("partial before-image struct should be valid");
+
+        let mut pk_builder = ListBuilder::new(StringBuilder::new())
+            .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+        pk_builder.values().append_value("id");
+        pk_builder.append(true);
+
+        let record = RecordBatch::try_new(
+            Arc::new(wrapper),
+            vec![
+                Arc::new(StringArray::from(vec!["u"])),
+                Arc::new(pk_builder.finish()) as arrow_array::ArrayRef,
+                Arc::new(data),
+                Arc::new(before),
+            ],
+        )
+        .expect("partial before-image batch must match the wrapper schema");
+        let batch = ChangeBatch::try_new(record).expect("batch should validate");
+
+        let row = batch.before(0).expect("the update carries a before-image");
+        let amount = row
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("amount column is Int32");
+        assert!(
+            amount.is_null(0),
+            "the column the source omitted stays null rather than being misreported"
+        );
+        assert!(
+            row.schema().field(1).is_nullable(),
+            "the returned schema must admit that null"
+        );
+    }
+
+    #[test]
+    fn noop_committer_does_not_support_deferral() {
+        // The conservative default: a committer with no replayable source offset
+        // (`NoOpCommitter` carries synthetic ready-signal envelopes) must NOT be
+        // deferred — deferring it advances nothing and there is nothing to
+        // re-stream, so an in-memory durability tier must never arm on it.
+        assert!(!NoOpCommitter.supports_deferral());
+    }
 
     #[test]
     fn test_wrap_batch_as_change_batch() {
@@ -435,5 +2485,1026 @@ mod tests {
             .expect("data column is StructArray");
         assert_eq!(data_column.len(), 3);
         assert_eq!(data_column.num_columns(), 2);
+    }
+
+    /// A base-schema change batch whose single `id` column is both the primary
+    /// key and the data, one row per `(op, id)`.
+    fn keyed_change_batch(rows: &[(&str, i32)]) -> ChangeBatch {
+        use arrow_array::StructArray;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        let table = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+        let wrapper = changes_schema(&table);
+
+        let data = StructArray::from(vec![(
+            Arc::new(Field::new("id", DataType::Int32, true)),
+            Arc::new(Int32Array::from(
+                rows.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            )) as arrow_array::ArrayRef,
+        )]);
+
+        let mut pk_builder = ListBuilder::new(StringBuilder::new())
+            .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+        for _ in rows {
+            pk_builder.values().append_value("id");
+            pk_builder.append(true);
+        }
+
+        let record = RecordBatch::try_new(
+            Arc::new(wrapper),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(op, _)| *op).collect::<Vec<_>>(),
+                )),
+                Arc::new(pk_builder.finish()) as arrow_array::ArrayRef,
+                Arc::new(data),
+            ],
+        )
+        .expect("keyed change batch must match the base wrapper schema");
+        ChangeBatch::try_new(record).expect("keyed change batch should validate")
+    }
+
+    #[test]
+    fn index_change_set_splits_ops_by_operation() {
+        // create id=1, update id=2, delete id=3, create id=1 again.
+        let batch = keyed_change_batch(&[("c", 1), ("u", 2), ("d", 3), ("c", 1)]);
+        let cs = batch.index_change_set().expect("projection succeeds");
+
+        assert_eq!(
+            cs.primary_key_columns().as_ref(),
+            &["id".to_string()],
+            "primary key columns come from the change batch"
+        );
+
+        // Rows keep their original positions — not coalesced — so the
+        // create/update/create rows are the upserts and the delete row (index 2)
+        // is the delete. The caller materializes data and keys from these indices.
+        assert_eq!(cs.upsert_rows().as_ref(), &[0usize, 1, 3]);
+        assert_eq!(
+            cs.delete_rows().as_ref(),
+            &[2usize],
+            "only id=3 (row 2) deletes"
+        );
+        assert!(!cs.truncated());
+    }
+
+    #[test]
+    fn index_change_set_rejects_unknown_operation() {
+        let batch = keyed_change_batch(&[("x", 1)]);
+        let err = batch
+            .index_change_set()
+            .expect_err("an unknown op cannot be classified");
+        assert!(
+            matches!(err, ChangeBatchError::UnknownOperation { .. }),
+            "unknown op must be a typed error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn index_change_set_projects_before_image_batches() {
+        // `before_image_batch`: row 0 create (id=1), row 1 update (id=2). Both are
+        // upserts; the before-image column does not change the projection.
+        let batch = before_image_batch();
+        let cs = batch.index_change_set().expect("projection succeeds");
+
+        assert_eq!(cs.upsert_rows().as_ref(), &[0usize, 1]);
+        assert!(cs.delete_rows().is_empty(), "no deletes in the batch");
+    }
+}
+
+#[cfg(test)]
+mod deferred_tests {
+    //! Behavior of a deferred (destination-passing) [`ChangeEnvelope`]: metadata
+    //! is answered without building, the build runs at most once on first
+    //! access, and a build failure surfaces as a typed error (never a dropped or
+    //! empty batch) that converts to a `StreamError` for the dataset's stream.
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::error::ArrowError;
+    use arrow_array::Int32Array;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn sample_batch(rows: i32) -> ChangeBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from((0..rows).collect::<Vec<_>>()))],
+        )
+        .expect("data batch");
+        wrap_data_as_change_batch(&schema, &data).expect("wrap change batch")
+    }
+
+    /// A [`ChangeRows`] source whose build we can observe (count) and control
+    /// (succeed with a batch, or fail).
+    struct MockRows {
+        result: Option<ChangeBatch>,
+        builds: Arc<AtomicUsize>,
+        rows_hint: usize,
+        empty: bool,
+        ts: Option<i64>,
+    }
+
+    impl ChangeRows for MockRows {
+        fn is_empty(&self) -> bool {
+            self.empty
+        }
+        fn num_rows_hint(&self) -> usize {
+            self.rows_hint
+        }
+        fn encoded_len(&self) -> usize {
+            0
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            self.ts
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            self.result.ok_or(ChangeBatchError::DeferredBuild {
+                message: "mock build failure".to_string(),
+            })
+        }
+    }
+
+    fn deferred(rows: MockRows, ready: bool) -> ChangeEnvelope {
+        ChangeEnvelope::new_from_rows(Box::new(NoOpCommitter), Box::new(rows), ready)
+    }
+
+    #[test]
+    fn metadata_answered_without_building() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let env = deferred(
+            MockRows {
+                result: Some(sample_batch(3)),
+                builds: Arc::clone(&builds),
+                rows_hint: 3,
+                empty: false,
+                ts: Some(42),
+            },
+            false,
+        );
+        assert!(!env.is_empty());
+        assert_eq!(env.num_rows_hint(), 3);
+        assert_eq!(env.source_commit_ts_ms(), Some(42));
+        assert!(!env.is_heartbeat());
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            0,
+            "no-build metadata must not trigger the deferred build"
+        );
+    }
+
+    #[test]
+    fn change_batch_builds_once_and_caches() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let env = deferred(
+            MockRows {
+                result: Some(sample_batch(2)),
+                builds: Arc::clone(&builds),
+                rows_hint: 2,
+                empty: false,
+                ts: None,
+            },
+            false,
+        );
+        assert_eq!(env.change_batch().expect("build ok").record.num_rows(), 2);
+        // Second access returns the cached batch without rebuilding.
+        assert_eq!(env.change_batch().expect("cached").record.num_rows(), 2);
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "deferred build runs exactly once"
+        );
+    }
+
+    #[test]
+    fn into_parts_builds_deferred_batch() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let env = deferred(
+            MockRows {
+                result: Some(sample_batch(1)),
+                builds: Arc::clone(&builds),
+                rows_hint: 1,
+                empty: false,
+                ts: None,
+            },
+            true,
+        );
+        let (_committer, batch, ready, _) = env.into_parts().expect("into_parts builds ok");
+        assert_eq!(batch.record.num_rows(), 1);
+        assert!(ready);
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn deferred_build_failure_surfaces_as_typed_error() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let env = deferred(
+            MockRows {
+                result: None, // build fails
+                builds: Arc::clone(&builds),
+                rows_hint: 1,
+                empty: false,
+                ts: None,
+            },
+            false,
+        );
+        let err = env.change_batch().expect_err("build should fail");
+        assert!(
+            matches!(err, ChangeBatchError::DeferredBuild { .. }),
+            "build failure must be a typed ChangeBatchError, got {err:?}"
+        );
+        // The consumer converts it to a stream error surfaced on the dataset's
+        // stream — the batch is never silently dropped or applied empty.
+        let stream_err: StreamError = err.into();
+        assert!(matches!(stream_err, StreamError::External(_)));
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn eager_envelope_is_ready_and_reports_exact_metadata() {
+        // The blanket `ChangeRows for ChangeBatch` path: an eagerly-built
+        // envelope reports exact metadata and needs no deferred build.
+        let env = ChangeEnvelope::new(Box::new(NoOpCommitter), sample_batch(0), true);
+        assert!(env.is_empty(), "zero-row batch is empty");
+        assert_eq!(env.num_rows_hint(), 0);
+        assert!(env.is_dataset_ready());
+        assert_eq!(
+            env.change_batch().expect("already built").record.num_rows(),
+            0
+        );
+    }
+
+    // ----- burst-wide deferred build -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn burst_builds_every_deferred_envelope_in_order() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let envelopes: Vec<ChangeEnvelope> = [1i32, 2, 3]
+            .into_iter()
+            .map(|rows| {
+                deferred(
+                    MockRows {
+                        result: Some(sample_batch(rows)),
+                        builds: Arc::clone(&builds),
+                        rows_hint: usize::try_from(rows).expect("positive row count"),
+                        empty: false,
+                        ts: None,
+                    },
+                    false,
+                )
+            })
+            .collect();
+
+        let parts = into_parts_offloaded_burst(envelopes)
+            .await
+            .expect("burst builds ok");
+
+        assert_eq!(
+            parts
+                .iter()
+                .map(|(_, batch, _, _)| batch.record.num_rows())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "burst order must be preserved — committers pair with their batches"
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn burst_of_materialized_envelopes_resolves_inline() {
+        // Eager sources materialize on delivery, so the whole burst must resolve
+        // through the no-handoff path and still return every part in order.
+        let envelopes = vec![
+            ChangeEnvelope::new(Box::new(NoOpCommitter), sample_batch(2), false),
+            ChangeEnvelope::new(Box::new(NoOpCommitter), sample_batch(4), true),
+        ];
+        assert!(envelopes.iter().all(ChangeEnvelope::is_materialized));
+
+        let parts = into_parts_offloaded_burst(envelopes)
+            .await
+            .expect("materialized burst resolves");
+
+        assert_eq!(
+            parts
+                .iter()
+                .map(|(_, batch, ready, _)| (batch.record.num_rows(), *ready))
+                .collect::<Vec<_>>(),
+            vec![(2, false), (4, true)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn burst_surfaces_a_failed_build_as_a_typed_error() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let envelopes = vec![
+            deferred(
+                MockRows {
+                    result: Some(sample_batch(1)),
+                    builds: Arc::clone(&builds),
+                    rows_hint: 1,
+                    empty: false,
+                    ts: None,
+                },
+                false,
+            ),
+            deferred(
+                MockRows {
+                    result: None, // build fails
+                    builds: Arc::clone(&builds),
+                    rows_hint: 1,
+                    empty: false,
+                    ts: None,
+                },
+                false,
+            ),
+        ];
+
+        // `expect_err` is unavailable: the Ok side holds a `Box<dyn CommitChange>`,
+        // which is not `Debug`.
+        match into_parts_offloaded_burst(envelopes).await {
+            Ok(_) => panic!("a failed build must fail the burst"),
+            Err(err) => assert!(
+                matches!(err, ChangeBatchError::DeferredBuild { .. }),
+                "expected a typed DeferredBuild error, got {err:?}"
+            ),
+        }
+    }
+
+    // ----- build ahead of consumption -----
+
+    #[test]
+    fn prebuilt_stays_behind_a_pointer_so_the_arrow_error_is_not_in_every_envelope() {
+        // An inline `Option<Prebuilt>` on every `LazyChangeBatch` grew the
+        // ChangeSink `Command::Apply` variant past `clippy::large_enum_variant`
+        // (sign-off 37368765686). Boxing keeps unbuilt envelopes at the
+        // source-only size.
+        let lazy = std::mem::size_of::<LazyChangeBatch>();
+        let once = std::mem::size_of::<OnceLock<ChangeBatch>>();
+        let mutex = std::mem::size_of::<Mutex<Option<Box<dyn ChangeRows>>>>();
+        let boxed = std::mem::size_of::<Option<Box<Prebuilt>>>();
+        let inline = std::mem::size_of::<Option<Prebuilt>>();
+        assert!(
+            lazy <= once + mutex + boxed + 16,
+            "LazyChangeBatch is {lazy} bytes; boxed Prebuilt should keep it near {} \
+             (OnceLock {once} + Mutex {mutex} + pointer {boxed})",
+            once + mutex + boxed
+        );
+        assert!(
+            lazy < once + mutex + inline,
+            "LazyChangeBatch is {lazy} bytes; an inline Prebuilt would be at least {} \
+             and re-inflates Command::Apply",
+            once + mutex + inline
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prebuilt_envelopes_reach_the_consumer_built_once_and_in_order() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group: Vec<Result<ChangeEnvelope, StreamError>> = [1i32, 2, 3]
+            .into_iter()
+            .map(|rows| {
+                Ok(deferred(
+                    MockRows {
+                        result: Some(sample_batch(rows)),
+                        builds: Arc::clone(&builds),
+                        rows_hint: usize::try_from(rows).expect("positive row count"),
+                        empty: false,
+                        ts: None,
+                    },
+                    false,
+                ))
+            })
+            .collect();
+
+        let envelopes: Vec<ChangeEnvelope> = prebuild_offloaded(group)
+            .await
+            .into_iter()
+            .map(|item| item.expect("an envelope"))
+            .collect();
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+        assert!(envelopes.iter().all(ChangeEnvelope::is_materialized));
+
+        let parts = into_parts_offloaded_burst(envelopes)
+            .await
+            .expect("prebuilt burst resolves");
+        assert_eq!(
+            parts
+                .iter()
+                .map(|(_, batch, _, _)| batch.record.num_rows())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "group order must be preserved — committers pair with their batches"
+        );
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            3,
+            "the consumer must not build a prebuilt envelope again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prebuilt_envelope_answers_metadata_as_its_source_did() {
+        // The source's hint (7) deliberately differs from the built batch's 3
+        // rows, and its encoded length (0) from the batch's Arrow size, so a
+        // metadata read served from the built batch would show.
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group = vec![Ok(deferred(
+            MockRows {
+                result: Some(sample_batch(3)),
+                builds: Arc::clone(&builds),
+                rows_hint: 7,
+                empty: false,
+                ts: Some(42),
+            },
+            false,
+        ))];
+
+        let envelope = prebuild_offloaded(group)
+            .await
+            .pop()
+            .expect("one item back")
+            .expect("still an envelope");
+
+        assert!(envelope.is_materialized());
+        assert_eq!(envelope.num_rows_hint(), 7);
+        assert_eq!(envelope.encoded_len(), 0);
+        assert_eq!(envelope.source_commit_ts_ms(), Some(42));
+        assert!(!envelope.is_empty());
+        assert!(!envelope.is_heartbeat());
+        assert_eq!(
+            envelope
+                .change_batch()
+                .expect("built batch")
+                .record
+                .num_rows(),
+            3
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_prebuild_fails_the_consumer_with_the_build_error() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group = vec![Ok(deferred(
+            MockRows {
+                result: None, // build fails
+                builds: Arc::clone(&builds),
+                rows_hint: 5,
+                empty: false,
+                ts: Some(42),
+            },
+            false,
+        ))];
+
+        let mut group = prebuild_offloaded(group).await;
+        let envelope = group
+            .pop()
+            .expect("one item back")
+            .expect("still an envelope");
+        assert!(group.is_empty());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert!(!envelope.is_materialized());
+        assert!(
+            !envelope.is_empty() && !envelope.is_heartbeat(),
+            "a failed envelope must not read as skippable"
+        );
+        assert_eq!(
+            (envelope.num_rows_hint(), envelope.source_commit_ts_ms()),
+            (5, Some(42)),
+            "a failed build keeps its source's metadata"
+        );
+        let borrowed = envelope
+            .change_batch()
+            .expect_err("a failed prebuild has no batch");
+        assert!(
+            matches!(
+                &borrowed,
+                ChangeBatchError::DeferredBuild { message } if message == "mock build failure"
+            ),
+            "expected the build's own error, not the consumed source, got {borrowed:?}"
+        );
+
+        match into_parts_offloaded_burst(vec![envelope]).await {
+            Ok(_) => panic!("a failed prebuild must fail the consumer"),
+            Err(err) => assert!(
+                matches!(
+                    &err,
+                    ChangeBatchError::DeferredBuild { message } if message == "mock build failure"
+                ),
+                "expected the build's own error, not the consumed source, got {err:?}"
+            ),
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "no second build");
+    }
+
+    /// A [`ChangeRows`] whose build fails as [`ChangeBatchError::Arrow`], the
+    /// variant [`reported_again`] cannot clone by value.
+    struct ArrowFailingRows;
+
+    impl ChangeRows for ArrowFailingRows {
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn num_rows_hint(&self) -> usize {
+            1
+        }
+        fn encoded_len(&self) -> usize {
+            0
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            None
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+            Err(ChangeBatchError::Arrow {
+                source: ArrowError::ExternalError(Box::new(std::io::Error::other(
+                    "synthetic arrow failure",
+                ))),
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prebuild_arrow_failure_is_the_same_variant_on_borrow_and_consume() {
+        let group = vec![Ok(ChangeEnvelope::new_from_rows(
+            Box::new(NoOpCommitter),
+            Box::new(ArrowFailingRows),
+            false,
+        ))];
+        let mut group = prebuild_offloaded(group).await;
+        let envelope = group
+            .pop()
+            .expect("one item back")
+            .expect("still an envelope");
+        assert!(group.is_empty());
+
+        let borrowed = envelope
+            .change_batch()
+            .expect_err("a failed prebuild has no batch");
+        let ChangeBatchError::DeferredBuild {
+            message: borrowed_message,
+        } = &borrowed
+        else {
+            panic!("borrowed lookup must report DeferredBuild, got {borrowed:?}");
+        };
+        assert!(
+            borrowed_message.contains("synthetic arrow failure"),
+            "borrowed error must keep the build's cause, got {borrowed_message}"
+        );
+
+        match into_parts_offloaded_burst(vec![envelope]).await {
+            Ok(_) => panic!("a failed prebuild must fail the consumer"),
+            Err(err) => {
+                let ChangeBatchError::DeferredBuild { message } = &err else {
+                    panic!("consuming lookup must report the same DeferredBuild, got {err:?}");
+                };
+                assert_eq!(
+                    message, borrowed_message,
+                    "borrowed and consuming lookups must report the same error"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prebuild_keeps_eager_envelopes_and_stream_errors_in_place() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group = vec![
+            Ok(ChangeEnvelope::new(
+                Box::new(NoOpCommitter),
+                sample_batch(2),
+                false,
+            )),
+            Err(StreamError::External("transient".to_string())),
+            Ok(deferred(
+                MockRows {
+                    result: Some(sample_batch(3)),
+                    builds: Arc::clone(&builds),
+                    rows_hint: 3,
+                    empty: false,
+                    ts: None,
+                },
+                true,
+            )),
+        ];
+
+        let group = prebuild_offloaded(group).await;
+
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert_eq!(group.len(), 3);
+        assert!(matches!(&group[1], Err(StreamError::External(m)) if m == "transient"));
+        assert_eq!(
+            group
+                .iter()
+                .filter_map(|item| item.as_ref().ok())
+                .map(|e| (e.num_rows_hint(), e.is_materialized(), e.is_dataset_ready()))
+                .collect::<Vec<_>>(),
+            vec![(2, true, false), (3, true, true)]
+        );
+    }
+
+    /// A [`ChangeRows`] whose build panics, to lose the blocking build task.
+    struct PanickingRows;
+
+    impl ChangeRows for PanickingRows {
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn num_rows_hint(&self) -> usize {
+            1
+        }
+        fn encoded_len(&self) -> usize {
+            0
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            None
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+            panic!("build panicked");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_prebuild_task_fails_the_consumer_instead_of_dropping_the_group() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group = vec![
+            Ok(deferred(
+                MockRows {
+                    result: Some(sample_batch(1)),
+                    builds: Arc::clone(&builds),
+                    rows_hint: 1,
+                    empty: false,
+                    ts: None,
+                },
+                false,
+            )),
+            Ok(ChangeEnvelope::new_from_rows(
+                Box::new(NoOpCommitter),
+                Box::new(PanickingRows),
+                false,
+            )),
+        ];
+
+        let group = prebuild_offloaded(group).await;
+        assert_eq!(group.len(), 1, "the lost group is replaced by one envelope");
+        let envelopes: Vec<ChangeEnvelope> = group
+            .into_iter()
+            .map(|item| item.expect("an envelope"))
+            .collect();
+        assert!(
+            envelopes
+                .iter()
+                .all(|e| !e.is_no_op_heartbeat() && !e.is_empty()),
+            "the consumer must not be able to strip or skip it"
+        );
+
+        match into_parts_offloaded_burst(envelopes).await {
+            Ok(_) => panic!("a lost prebuild must fail the consumer"),
+            Err(err) => assert!(
+                matches!(
+                    &err,
+                    ChangeBatchError::DeferredBuild { message }
+                        if message.starts_with("deferred CDC batch build task failed")
+                ),
+                "expected the lost build's reason, got {err:?}"
+            ),
+        }
+    }
+
+    // ----- lag-based readiness helpers -----
+
+    #[test]
+    fn source_commit_within_ready_lag_gates_on_freshness() {
+        let now = now_unix_ms().expect("clock available");
+        let lag = Duration::from_secs(2);
+
+        // A commit 500ms in the past is within a 2s window -> caught up.
+        assert!(source_commit_within_ready_lag(Some(now - 500), lag));
+        // A commit 5s in the past is beyond the window -> still behind.
+        assert!(!source_commit_within_ready_lag(Some(now - 5_000), lag));
+        // No upstream timestamp is never ready: there is no freshness proof.
+        assert!(!source_commit_within_ready_lag(None, lag));
+        // A source clock slightly ahead of ours (small skew) clamps to zero lag
+        // and reads as ready rather than flapping.
+        assert!(source_commit_within_ready_lag(Some(now + 500), lag));
+    }
+
+    #[test]
+    fn source_commit_within_ready_lag_is_strict_at_the_boundary() {
+        // `ready_lag` of zero can never be satisfied (lag is always >= 0 and the
+        // comparison is strict `<`), so a zero threshold never marks Ready.
+        let now = now_unix_ms().expect("clock available");
+        assert!(!source_commit_within_ready_lag(
+            Some(now),
+            Duration::from_secs(0)
+        ));
+    }
+
+    #[test]
+    fn replication_lag_ms_clamps_and_handles_missing_ts() {
+        // No source timestamp -> no lag signal.
+        assert_eq!(replication_lag_ms(None), None);
+
+        let now = now_unix_ms().expect("clock available");
+        // A past commit reports a non-negative lag in the expected ballpark.
+        let lag = replication_lag_ms(Some(now - 1_000)).expect("some lag");
+        assert!((900..=60_000).contains(&lag), "unexpected lag: {lag}");
+
+        // A future commit (source clock ahead) clamps to zero, never negative.
+        assert_eq!(replication_lag_ms(Some(now + 10_000)), Some(0));
+    }
+
+    #[test]
+    fn heartbeat_envelope_is_empty_stamps_ts_and_propagates_ready_flag() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let ts = now_unix_ms().expect("clock available");
+
+        for ready in [true, false] {
+            let env = build_heartbeat_envelope(&schema, Some(ts), ready)
+                .expect("heartbeat envelope builds");
+            assert_eq!(env.is_dataset_ready(), ready);
+            let batch = env.change_batch().expect("already built");
+            assert_eq!(batch.record.num_rows(), 0, "heartbeat carries no rows");
+            assert!(
+                batch.is_heartbeat(),
+                "zero-row stamped batch is a heartbeat"
+            );
+            assert_eq!(
+                batch.source_commit_ts_ms(),
+                Some(ts),
+                "heartbeat carries the source-attested clock"
+            );
+        }
+    }
+
+    #[test]
+    fn heartbeat_envelope_builds_for_non_null_primary_key_schema() {
+        // A `nullable: false` column must not break the coalesce with real
+        // change batches: the heartbeat normalizes fields to nullable.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let env = build_heartbeat_envelope(&schema, None, false)
+            .expect("heartbeat builds with non-null columns");
+        assert_eq!(env.change_batch().expect("built").record.num_rows(), 0);
+    }
+
+    /// A committer whose `commit` happens to do nothing here but does NOT
+    /// override `is_no_op` — modeling a real committer (resume-token persist,
+    /// snapshot-boundary ack) attached to a zero-row envelope.
+    struct PositionCommitter;
+
+    #[async_trait]
+    impl CommitChange for PositionCommitter {
+        async fn commit(&self) -> Result<(), CommitError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn no_op_heartbeat_predicate_identifies_strippable_readiness_envelopes() {
+        assert!(NoOpCommitter.is_no_op());
+        assert!(
+            !PositionCommitter.is_no_op(),
+            "is_no_op must default to false: assume a commit has effects"
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+        // Connector idle heartbeats and ready signals: zero rows + no-op
+        // committer -> safe to drop from the write/durability path (#12007).
+        let heartbeat = build_heartbeat_envelope(&schema, now_unix_ms(), true)
+            .expect("heartbeat envelope builds");
+        assert!(heartbeat.is_no_op_heartbeat());
+        let ready = build_ready_signal_envelope(&schema).expect("ready envelope builds");
+        assert!(ready.is_no_op_heartbeat());
+
+        // The history-unavailable signal is ALSO a droppable heartbeat by this
+        // predicate — zero rows, no-op committer — which is why a consumer must
+        // read `history_unavailable` BEFORE stripping heartbeats from the write
+        // path. Asserted here so the overlap stays visible: silently stripping it
+        // would skip the rebuild and resume streaming onto stale rows.
+        let reload = build_history_unavailable_envelope(&schema)
+            .expect("history-unavailable envelope builds");
+        assert!(
+            reload.is_no_op_heartbeat(),
+            "the signal carries no rows and no committer, so heartbeat stripping would drop it"
+        );
+        assert!(reload.history_unavailable());
+        assert!(
+            !reload.is_dataset_ready(),
+            "a dataset whose accelerator is about to be replaced is not ready to serve"
+        );
+
+        // Every other envelope must leave the flag clear, so only a source that
+        // actually lost its history can trigger a full re-read.
+        assert!(!heartbeat.history_unavailable());
+        assert!(!ready.history_unavailable());
+
+        // A zero-row envelope re-wrapped with a REAL committer (the MySQL
+        // snapshot-boundary pattern) must NOT be treated as a heartbeat: its
+        // commit persists source progress and needs durability-then-commit
+        // ordering.
+        let (_, boundary_batch, _, _) = build_heartbeat_envelope(&schema, None, false)
+            .expect("boundary batch builds")
+            .into_parts()
+            .expect("already built");
+        let boundary = ChangeEnvelope::new(Box::new(PositionCommitter), boundary_batch, false);
+        assert!(boundary.is_heartbeat(), "zero-row batch");
+        assert!(
+            !boundary.is_no_op_heartbeat(),
+            "a real committer disqualifies the envelope from heartbeat stripping"
+        );
+
+        // A row-bearing (deferred, not yet built) envelope with a no-op
+        // committer is not a heartbeat either.
+        let rows = MockRows {
+            result: None,
+            builds: Arc::new(AtomicUsize::new(0)),
+            rows_hint: 1,
+            empty: false,
+            ts: None,
+        };
+        let data_bearing = deferred(rows, false);
+        assert!(!data_bearing.is_no_op_heartbeat());
+    }
+
+    /// Only a positive observation of emptiness may relax a rebuild, and the
+    /// failure mode this guards is silent: a probe that could not answer reads as
+    /// `Unknown`, and treating that as proof would skip the re-read an
+    /// acceleration needs to shed rows deleted at the source while it was away.
+    #[test]
+    fn only_an_observed_empty_acceleration_is_provably_empty() {
+        assert!(AccelerationContents::Empty.is_provably_empty());
+        assert!(!AccelerationContents::NonEmpty.is_provably_empty());
+        assert!(
+            !AccelerationContents::Unknown.is_provably_empty(),
+            "an unanswered probe is not proof of emptiness; treating it as one would skip a \
+             rebuild that protects against a missing deletion"
+        );
+        assert!(
+            !AccelerationContents::default().is_provably_empty(),
+            "the default must be the conservative answer, so a caller that never probes cannot \
+             accidentally opt out of the rebuild"
+        );
+    }
+
+    #[test]
+    fn replace_change_batch_data_preserves_rebuild_from_this_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .expect("data batch");
+        let original = wrap_data_as_change_batch(&schema, &data)
+            .expect("wrap")
+            .with_source_commit_ts_ms(Some(1_700_000_000_000))
+            .with_rebuild_from_this_batch(true);
+        let replaced =
+            replace_change_batch_data(&data, &original).expect("replace should copy batch flags");
+        assert!(
+            replaced.rebuild_from_this_batch(),
+            "wrappers that rewrite `data` must keep the listing-rebuild flag"
+        );
+        assert_eq!(replaced.source_commit_ts_ms(), Some(1_700_000_000_000));
+    }
+}
+
+#[cfg(test)]
+mod shutdown_drain_tests {
+    use super::*;
+
+    /// One test rather than several: the guard count and the epoch are
+    /// process-wide, so the phases must run in sequence, not in parallel with
+    /// each other.
+    #[tokio::test]
+    async fn drain_waits_for_the_signalled_guards_and_reports_what_it_gave_up_on() {
+        assert_eq!(
+            drain_shutdown(Duration::from_secs(1)).await,
+            0,
+            "nothing held: returns at once"
+        );
+
+        let epoch = shutdown_epoch();
+        let first = ShutdownDrainGuard::hold();
+        let second = ShutdownDrainGuard::hold();
+        assert_eq!(
+            first.epoch(),
+            epoch,
+            "a guard captures the epoch it is taken at"
+        );
+        assert_eq!(
+            drain_shutdown(Duration::from_millis(50)).await,
+            0,
+            "no shutdown has been signalled to the holders, so there is nothing to wait for"
+        );
+
+        // Signal: a source that was waiting for it wakes, and the two guards
+        // taken before it now hold the drain.
+        let waiter = tokio::spawn(shutdown_signalled(epoch));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "nothing has been signalled yet");
+        begin_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("signalled promptly")
+            .expect("waiter task");
+        assert_eq!(
+            drain_shutdown(Duration::from_millis(50)).await,
+            2,
+            "gave up with both signalled guards held"
+        );
+
+        // A source started after the signal captures the new epoch: it is not
+        // stopped by that shutdown, and not waited for by it.
+        let later = shutdown_epoch();
+        assert!(later > epoch, "the epoch advanced");
+        let unaffected = ShutdownDrainGuard::hold();
+        assert_eq!(unaffected.epoch(), later);
+        let later_waiter = tokio::spawn(shutdown_signalled(later));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!later_waiter.is_finished(), "a later source is unaffected");
+        later_waiter.abort();
+        assert_eq!(
+            drain_shutdown(Duration::from_millis(50)).await,
+            2,
+            "a guard taken after the signal is not counted"
+        );
+
+        drop(first);
+        assert_eq!(
+            drain_shutdown(Duration::from_millis(50)).await,
+            1,
+            "gave up with one signalled guard held"
+        );
+
+        let drained = tokio::spawn(drain_shutdown(Duration::from_secs(10)));
+        // Time is what is under test here: the drain must still be waiting after a
+        // delay long enough for it to have returned if it were not.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !drained.is_finished(),
+            "must wait while a signalled guard is held"
+        );
+        drop(second);
+        assert_eq!(
+            drained.await.expect("drain task"),
+            0,
+            "released by the last signalled guard's drop"
+        );
+        drop(unaffected);
+
+        // A delay races the signal, not the other way round.
+        let started = std::time::Instant::now();
+        until_shutdown(epoch, tokio::time::sleep(Duration::from_secs(30))).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "an already-signalled shutdown cuts the delay short"
+        );
+
+        // Registration and the signal are serialized (regression test for the
+        // interleaving raised on #14702): a guard taken while a shutdown is being
+        // signalled registers under the epoch the signal leaves behind, so the
+        // drain that follows the signal counts every source it reached. Hold the
+        // registry's lock from here, so both a signal and a registration started
+        // now have to wait for it; then advance the epoch underneath the waiting
+        // registration, which must read the epoch only once it holds the lock.
+        let before = shutdown_epoch();
+        let registry = SHUTDOWN_DRAIN.held.lock();
+        let signal = std::thread::spawn(begin_shutdown);
+        let registration = std::thread::spawn(ShutdownDrainGuard::hold);
+        // Time is under test: both threads must still be waiting after a delay
+        // long enough for either to have finished if it did not take the lock.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !signal.is_finished(),
+            "begin_shutdown must wait for the guard registry's lock"
+        );
+        assert!(
+            !registration.is_finished(),
+            "hold must wait for the guard registry's lock"
+        );
+        // The test's own advance, bypassing the lock it is itself holding.
+        CDC_SHUTDOWN_EPOCH.send_modify(|current| *current += 1);
+        drop(registry);
+        signal.join().expect("signal thread");
+        let registered = registration.join().expect("registration thread");
+        assert!(
+            registered.epoch() > before,
+            "a registration that waited for the lock captures the epoch current once it holds \
+             it ({} > {before}), never one read before the wait",
+            registered.epoch()
+        );
+        drop(registered);
     }
 }

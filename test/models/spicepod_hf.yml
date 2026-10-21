@@ -24,13 +24,13 @@ datasets:
       refresh_sql: "SELECT * FROM issues WHERE created_at='2024-11-09T22:47:45'"
     embeddings:
       - column: body
-        use: intfloat_e5
+        use: bge_base
         column_pk:
           - id
         chunking:
           enabled: true
           target_chunk_size: 512
-          overlap_size: 128
+          overlap_size: 64
           trim_whitespace: false
 
   - from: s3://spiceai-public-datasets/tpcds/catalog_page/
@@ -48,19 +48,25 @@ datasets:
         chunking:
           enabled: true
           target_chunk_size: 512
-          overlap_size: 128
+          overlap_size: 64
           trim_whitespace: false
-        use: intfloat_e5
+        use: bge_base
 
 models:
   - name: hf_local_model
     from: huggingface:huggingface.co/Qwen/Qwen2.5-3B-Instruct
     params:
+      # Bound Metal generation so a long lecture cannot consume the chat expect
+      # budget (https://github.com/spiceai/spiceai/actions/runs/34707044620/job/103597842965).
+      # `hf_*` is the Hugging Face form of the chat-completion overrides; the
+      # runtime applies them as `max_completion_tokens` / `temperature`.
+      hf_max_completion_tokens: 64
+      hf_temperature: 0
       system_prompt: |
         Instructions for Responses:
+          - Answer in one short sentence.
           - Do not include any private metadata provided to the model as context such as \"reference_url_template\" or \"instructions\" in your responses.
 
 embeddings:
-  - from: huggingface:huggingface.co/intfloat/e5-base-v2
-    name: intfloat_e5
-    metadata: {}
+  - from: huggingface:huggingface.co/BAAI/bge-base-en-v1.5
+    name: bge_base

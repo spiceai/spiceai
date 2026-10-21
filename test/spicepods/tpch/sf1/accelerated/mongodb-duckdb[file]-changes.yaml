@@ -1,0 +1,69 @@
+version: v1
+kind: Spicepod
+name: mongodb-duckdb[file]-changes
+
+definitions:
+  - &mongodb_params
+    # MongoDB Change Streams require MONGODB_HOST/MONGODB_PORT to point at a replica set or sharded cluster.
+    # For a single-node replica set, direct connection avoids topology discovery delays.
+    mongodb_host: ${env:MONGODB_HOST}
+    mongodb_port: 27017
+    mongodb_direct_connection: true
+    mongodb_auth_source: admin
+    mongodb_db: tpch_sf1
+    mongodb_user: root
+    mongodb_pass: ${env:MONGODB_PASSWORD}
+    mongodb_sslmode: disabled
+    change_stream_batch_max_size: 5000
+    change_stream_batch_max_duration: 1s
+    change_stream_max_await_time: 1s
+    change_stream_batch_size: 1000
+  - &acceleration
+    enabled: true
+    engine: duckdb
+    mode: file
+    refresh_mode: changes
+    primary_key: _id
+    on_conflict:
+      _id: upsert
+
+datasets:
+  - from: mongodb:customer
+    name: customer
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:lineitem
+    name: lineitem
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:nation
+    name: nation
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:orders
+    name: orders
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:part
+    name: part
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:partsupp
+    name: partsupp
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:region
+    name: region
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:supplier
+    name: supplier
+    params: *mongodb_params
+    acceleration: *acceleration

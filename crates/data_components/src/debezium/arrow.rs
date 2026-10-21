@@ -28,11 +28,11 @@ use arrow::{
         Time64MicrosecondType, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
     },
 };
+use arrow_tools::decimal;
 use base64::prelude::*;
 use chrono::{DateTime, NaiveTime, Timelike, Utc};
 use serde_json::Value as Json;
 use snafu::prelude::*;
-use std::cmp::Ordering::{Equal, Greater, Less};
 use std::sync::Arc;
 
 pub mod changes;
@@ -76,19 +76,22 @@ pub enum Error {
         schema: Schema,
     },
 
-    #[snafu(display("Unable to downcast ArrayBuilder"))]
+    #[snafu(display("Failed to process Debezium data: internal type conversion error"))]
     DowncastBuilder,
 
-    #[snafu(display("Unable to decode base64 string: {source}"))]
+    #[snafu(display("Invalid Debezium change event schema: {reason}"))]
+    InvalidChangeEventSchema { reason: &'static str },
+
+    #[snafu(display("Failed to decode base64-encoded column value: {source}"))]
     UnableToDecodeBase64 { source: base64::DecodeError },
 
     #[snafu(display("Decimal value is not 16 bytes. Got: {} bytes", value.len()))]
     Decimal128BytesNot16Bytes { value: Vec<u8> },
 
-    #[snafu(display("Unable to convert value to i64"))]
+    #[snafu(display("Failed to convert Debezium value to i64 integer"))]
     UnableToConvertToI64,
 
-    #[snafu(display("Unable to convert value to f64"))]
+    #[snafu(display("Failed to convert Debezium value to f64 floating point"))]
     UnableToConvertToF64,
 
     #[snafu(display("Timestamp type ({unit:?},{time_zone:?}) not supported yet",))]
@@ -112,6 +115,11 @@ pub enum Error {
     #[snafu(display("A deletion change was received without a 'before' field."))]
     DeleteOpWithoutBeforeField,
 
+    #[snafu(display(
+        "An update change without primary keys was received without a 'before' field. Configure Debezium to include the full before image for keyless updates."
+    ))]
+    UpdateOpWithoutBeforeField,
+
     #[snafu(display("Invalid decimal JSON: {reason}"))]
     InvalidDecimalJson { reason: String },
 
@@ -124,11 +132,18 @@ pub enum Error {
     #[snafu(display("Missing the `value` parameter for VariableScaleDecimal"))]
     MissingValueForVariableScaleDecimal,
 
-    #[snafu(display("VariableScaleDecimal expects either string or object"))]
-    UnsupportedTypeForVariableScaleDecimal,
+    #[snafu(display("VariableScaleDecimal expects either string or object, got: {actual_type}"))]
+    UnsupportedTypeForVariableScaleDecimal { actual_type: String },
 
     #[snafu(display("scale must be integer"))]
     NonIntegerScaleForVariableScaleDecimal,
+
+    #[snafu(display(
+        "Failed to ingest a change event: decimal value {value} is too wide for the column's declared precision {precision}. \
+        Widen the column's decimal precision in the source schema, or exclude the column. \
+        See: https://spiceai.org/docs/components/data-connectors/debezium"
+    ))]
+    DecimalPrecisionExceeded { value: i128, precision: u8 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -161,14 +176,21 @@ pub fn append_value_to_struct_builder(
     builder: &mut StructBuilder,
 ) -> Result<()> {
     builder.append(true);
+    let null_value = serde_json::Value::Null;
 
     for (idx, field) in builder.fields().iter().enumerate() {
-        let Some(field_value) = value.get(field.name()) else {
-            return MissingFieldInValueSnafu {
-                field_name: field.name().to_string(),
-                value,
+        // If the field is missing from the message (e.g. due to schema evolution),
+        // append null for nullable fields instead of failing.
+        let field_value = match value.get(field.name()) {
+            Some(v) => v,
+            None if field.is_nullable() => &null_value,
+            None => {
+                return MissingFieldInValueSnafu {
+                    field_name: field.name().clone(),
+                    value,
+                }
+                .fail();
             }
-            .fail();
         };
 
         let field_builder = builder.field_builder_array(idx);
@@ -179,8 +201,7 @@ pub fn append_value_to_struct_builder(
     Ok(())
 }
 
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::cast_possible_truncation)]
 fn append_field_value_to_builder(
     field_value: &serde_json::Value,
     field: &Arc<Field>,
@@ -212,9 +233,12 @@ fn append_field_value_to_builder(
             let bool_builder = downcast_builder::<BooleanBuilder>(builder)?;
             bool_builder.append_option(field_value.as_bool());
         }
-        DataType::Decimal128(_, scale) => {
+        DataType::Decimal128(precision, scale) => {
             let decimal_builder = downcast_builder::<Decimal128Builder>(builder)?;
-            decimal_builder.append_value(convert_json_to_decimal(field_value, *scale)?);
+            match convert_json_to_decimal(field_value, *precision, *scale)? {
+                Some(val) => decimal_builder.append_value(val),
+                None => decimal_builder.append_null(),
+            }
         }
         DataType::Timestamp(unit, time_zone) => match (unit, time_zone) {
             (TimeUnit::Microsecond, None) => {
@@ -420,90 +444,26 @@ pub(crate) fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) 
     Ok(builder)
 }
 
-fn convert_string_to_decimal(field_value: &str) -> Result<i128> {
-    let mut decimal_bytes = BASE64_STANDARD
-        .decode(field_value)
-        .context(UnableToDecodeBase64Snafu)?;
-
-    // Pad the bytes to 16 bytes, inserting 0s at the beginning
-    while decimal_bytes.len() < 16 {
-        decimal_bytes.insert(0, 0);
-    }
-
-    let decimal_slice: [u8; 16] = match decimal_bytes.try_into() {
-        Ok(slice) => slice,
-        Err(value) => {
-            return Decimal128BytesNot16BytesSnafu { value }.fail();
+/// Parse a decimal from a Debezium JSON field value.
+/// Delegates to [`arrow_tools::decimal::convert_json_to_decimal`].
+pub fn convert_json_to_decimal(v: &Json, precision: u8, target_scale: i8) -> Result<Option<i128>> {
+    decimal::convert_json_to_decimal(v, precision, target_scale).map_err(|e| match e {
+        decimal::Error::Overflow => Error::VariableScaleDecimalParsingOverflow,
+        decimal::Error::Invalid { reason } => Error::InvalidDecimalJson { reason },
+        decimal::Error::Base64Decode { source } => Error::UnableToDecodeBase64 { source },
+        decimal::Error::BytesLength { value } => Error::Decimal128BytesNot16Bytes { value },
+        decimal::Error::MissingScale => Error::MissingScaleForVariableScaleDecimal,
+        decimal::Error::NonIntegerScale => Error::NonIntegerScaleForVariableScaleDecimal,
+        decimal::Error::MissingValue => Error::MissingValueForVariableScaleDecimal,
+        decimal::Error::UnsupportedType { actual_type } => {
+            Error::UnsupportedTypeForVariableScaleDecimal {
+                actual_type: actual_type.to_string(),
+            }
         }
-    };
-
-    let decimal_i128 = i128::from_be_bytes(decimal_slice);
-
-    Ok(decimal_i128)
-}
-
-#[inline]
-fn pow10_i128(exp: i8) -> Option<i128> {
-    let mut acc: i128 = 1;
-    for _ in 0..exp {
-        acc = acc.checked_mul(10)?;
-    }
-    Some(acc)
-}
-
-fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128> {
-    match src_scale.cmp(&dst_scale) {
-        Equal => Ok(unscaled),
-        Less => {
-            let diff = dst_scale - src_scale;
-            let mul = pow10_i128(diff).context(VariableScaleDecimalParsingOverflowSnafu)?;
-            unscaled
-                .checked_mul(mul)
-                .context(VariableScaleDecimalParsingOverflowSnafu)
+        decimal::Error::PrecisionExceeded { value, precision } => {
+            Error::DecimalPrecisionExceeded { value, precision }
         }
-        Greater => {
-            let diff = src_scale - dst_scale;
-            let div = pow10_i128(diff).context(VariableScaleDecimalParsingOverflowSnafu)?;
-            Ok(unscaled / div)
-        }
-    }
-}
-
-/// Parse a decimal from JSON.
-/// Supported inputs:
-/// - JSON string: base64-encoded
-/// - JSON object: {"scale": <int>, "value": <base64>}
-pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<i128> {
-    if !(0..=38).contains(&target_scale) {
-        return InvalidDecimalJsonSnafu {
-            reason: "target_scale must be in 0..=38".to_string(),
-        }
-        .fail();
-    }
-
-    match v {
-        Json::String(s) => convert_string_to_decimal(s),
-
-        Json::Object(m) => {
-            #[allow(clippy::cast_possible_truncation)]
-            let src_scale =
-                m.get("scale")
-                    .context(MissingScaleForVariableScaleDecimalSnafu)?
-                    .as_i64()
-                    .context(NonIntegerScaleForVariableScaleDecimalSnafu)? as i8;
-
-            let value = m
-                .get("value")
-                .and_then(|x| x.as_str())
-                .context(MissingValueForVariableScaleDecimalSnafu)?;
-
-            let unscaled = convert_string_to_decimal(value)?;
-            let normalized = rescale_i128(unscaled, src_scale, target_scale)?;
-            Ok(normalized)
-        }
-
-        _ => UnsupportedTypeForVariableScaleDecimalSnafu.fail(),
-    }
+    })
 }
 
 fn convert_to_arrow_field(field: &ChangeEventField) -> Result<Field> {
@@ -606,78 +566,317 @@ mod tests {
     fn test_string_valid_no_scale() {
         let n: i128 = 12_345;
         let input = json!(i128_to_base64(n));
-        let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.expect("Parse decimal"), n);
+        let result = convert_json_to_decimal(&input, 38, 2);
+        assert_eq!(result.ok().flatten(), Some(n));
     }
 
     #[test]
     fn test_object_valid_same_scale() {
         let n: i128 = 12_345;
         let input = json!({"scale": 2, "value": i128_to_base64(n)});
-        let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.expect("Parse decimal"), 12_345);
+        let result = convert_json_to_decimal(&input, 38, 2);
+        assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
     #[test]
     fn test_object_rescale_up() {
         let n: i128 = 12345;
         let input = json!({"scale": 2, "value": i128_to_base64(n)});
-        let result = convert_json_to_decimal(&input, 4);
-        assert_eq!(result.expect("Parse decimal"), 1_234_500);
+        let result = convert_json_to_decimal(&input, 38, 4);
+        assert_eq!(result.ok().flatten(), Some(1_234_500));
     }
 
     #[test]
     fn test_object_rescale_down() {
         let n: i128 = 1_234_500;
         let input = json!({"scale": 4, "value": i128_to_base64(n)});
-        let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.expect("Parse decimal"), 12_345);
+        let result = convert_json_to_decimal(&input, 38, 2);
+        assert_eq!(result.ok().flatten(), Some(12_345));
+    }
+
+    /// Every `arrow_tools` decimal error must surface as its own Debezium error: the Debezium
+    /// message is what a CDC user sees for a malformed decimal value. The `arrow_tools` tests pin
+    /// which inputs fail; this pins what each failure says once it reaches the Debezium reader.
+    #[test]
+    fn decimal_errors_map_to_their_debezium_messages() {
+        let one = i128_to_base64(1);
+        let seventeen_bytes = BASE64_STANDARD.encode([0_u8; 17]);
+        let cases = [
+            (
+                "target scale below 0",
+                json!(one),
+                38,
+                -1,
+                "Invalid decimal JSON: target_scale must be in 0..=38",
+            ),
+            (
+                "target scale above 38",
+                json!(one),
+                38,
+                39,
+                "Invalid decimal JSON: target_scale must be in 0..=38",
+            ),
+            (
+                "decimal object without a scale",
+                json!({"value": one}),
+                38,
+                2,
+                "Missing the `scale` parameter for VariableScaleDecimal",
+            ),
+            (
+                "decimal object with a non-integer scale",
+                json!({"scale": "abc", "value": one}),
+                38,
+                2,
+                "scale must be integer",
+            ),
+            (
+                "decimal object without a value",
+                json!({"scale": 2}),
+                38,
+                2,
+                "Missing the `value` parameter for VariableScaleDecimal",
+            ),
+            (
+                "boolean",
+                json!(true),
+                38,
+                2,
+                "VariableScaleDecimal expects either string or object, got: boolean",
+            ),
+            (
+                "array",
+                json!([1, 2, 3]),
+                38,
+                2,
+                "VariableScaleDecimal expects either string or object, got: array",
+            ),
+            (
+                "source scale 127 cannot be rescaled to 38",
+                json!({"scale": 127, "value": one}),
+                38,
+                38,
+                "Overflow during decimal parsing",
+            ),
+            (
+                "value wider than 16 bytes",
+                json!(seventeen_bytes),
+                38,
+                2,
+                "Decimal value is not 16 bytes. Got: 17 bytes",
+            ),
+            (
+                "value too wide for the declared precision",
+                json!(i128_to_base64(12_345)),
+                4,
+                2,
+                "Failed to ingest a change event: decimal value 12345 is too wide for the column's declared precision 4. Widen the column's decimal precision in the source schema, or exclude the column. See: https://spiceai.org/docs/components/data-connectors/debezium",
+            ),
+        ];
+
+        for (case, input, precision, target_scale, expected) in cases {
+            let err = convert_json_to_decimal(&input, precision, target_scale).expect_err(case);
+            assert_eq!(err.to_string(), expected, "{case}");
+        }
+
+        // The decoder's own message is not ours to pin; the variant is.
+        let err = convert_json_to_decimal(&json!("not base64!"), 38, 2)
+            .expect_err("a value that is not base64 must be rejected");
+        assert!(
+            matches!(err, Error::UnableToDecodeBase64 { .. }),
+            "a value that is not base64 must surface as a base64 decode error, got: {err:?}"
+        );
+    }
+
+    // decimal.handling.mode=double — plain JSON numbers
+    #[test]
+    fn test_number_integer_value() {
+        // 123 with scale 2 → 12300
+        let input = json!(123);
+        let result = convert_json_to_decimal(&input, 38, 2);
+        assert_eq!(result.ok().flatten(), Some(12_300));
     }
 
     #[test]
-    fn test_target_scale_too_low() {
-        let n: i128 = 1;
-        let input = json!(i128_to_base64(n));
-        let result = convert_json_to_decimal(&input, -1);
-        assert!(result.is_err());
+    fn test_number_with_fractional_exact_scale() {
+        // 123.45 with scale 2 → 12345
+        let input = json!(123.45_f64);
+        let result = convert_json_to_decimal(&input, 38, 2);
+        assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
     #[test]
-    fn test_target_scale_too_high() {
-        let n: i128 = 1;
-        let input = json!(i128_to_base64(n));
-        let result = convert_json_to_decimal(&input, 39);
-        assert!(result.is_err());
+    fn test_number_with_fractional_fewer_digits_than_scale() {
+        // 123.4 with scale 2 → 12340
+        let input = json!(123.4_f64);
+        let result = convert_json_to_decimal(&input, 38, 2);
+        assert_eq!(result.ok().flatten(), Some(12_340));
     }
 
     #[test]
-    fn test_object_missing_scale() {
-        let n: i128 = 12_345;
-        let input = json!({"value": i128_to_base64(n)});
-        let result = convert_json_to_decimal(&input, 2);
-        assert!(result.is_err());
+    fn test_number_with_fractional_more_digits_than_scale() {
+        // 123.456 with scale 2 → 12345 (truncated)
+        let input = json!(123.456_f64);
+        let result = convert_json_to_decimal(&input, 38, 2);
+        assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
     #[test]
-    fn test_object_scale_not_integer() {
-        let n: i128 = 12_345;
-        let input = json!({"scale": "abc", "value": i128_to_base64(n)});
-        let result = convert_json_to_decimal(&input, 2);
-        assert!(result.is_err());
+    fn test_number_negative() {
+        // -123.45 with scale 2 → -12345
+        let input = json!(-123.45_f64);
+        let result = convert_json_to_decimal(&input, 38, 2);
+        assert_eq!(result.ok().flatten(), Some(-12_345));
     }
 
     #[test]
-    fn test_object_missing_value() {
-        let input = json!({"scale": 2});
-        let result = convert_json_to_decimal(&input, 2);
-        assert!(result.is_err());
+    fn test_number_zero() {
+        let input = json!(0);
+        let result = convert_json_to_decimal(&input, 38, 2);
+        assert_eq!(result.ok().flatten(), Some(0));
     }
 
     #[test]
-    fn test_wrong_json_type() {
-        let n: i128 = 12345;
-        let input = json!(n); // Not a string or object
-        let result = convert_json_to_decimal(&input, 2);
-        assert!(result.is_err());
+    fn test_plain_number_is_supported() {
+        // A plain JSON number is valid: treat it as the unscaled value and
+        // rescale to the target scale.  12345 at scale=2 → 1234500.
+        let result = convert_json_to_decimal(&json!(12345_i64), 38, 2);
+        assert_eq!(result.expect("number should be valid"), Some(1_234_500));
+    }
+
+    #[test]
+    fn test_append_value_missing_nullable_field_fills_null() {
+        use crate::arrow::struct_builder::StructBuilder;
+        use arrow::array::Array;
+
+        // Schema with one required and one nullable field
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
+
+        // Message is missing the nullable "name" field
+        let value = json!({"id": 42});
+        let result = append_value_to_struct_builder(value, &mut builder);
+        assert!(
+            result.is_ok(),
+            "Should succeed when nullable field is missing"
+        );
+
+        let struct_array = builder.finish();
+        let record_batch: RecordBatch = struct_array.into();
+        assert_eq!(record_batch.num_rows(), 1);
+
+        let id_col = record_batch
+            .column_by_name("id")
+            .expect("id column should exist")
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("id column should be Int32Array");
+        assert_eq!(id_col.value(0), 42);
+
+        let name_col = record_batch
+            .column_by_name("name")
+            .expect("name column should exist")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("name column should be StringArray");
+        assert!(name_col.is_null(0));
+    }
+
+    #[test]
+    fn test_append_value_missing_required_field_fails() {
+        use crate::arrow::struct_builder::StructBuilder;
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("status", DataType::Utf8, false), // not nullable
+        ]);
+
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
+
+        // Message is missing the required "status" field
+        let value = json!({"id": 42});
+        let err = append_value_to_struct_builder(value, &mut builder)
+            .expect_err("Should fail when required field is missing");
+        assert!(
+            matches!(
+                &err,
+                Error::MissingFieldInValue { field_name, value }
+                    if field_name == "status" && *value == json!({"id": 42})
+            ),
+            "the missing non-nullable `status` column must be named, with the message it was missing from, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_append_value_extra_fields_ignored() {
+        use crate::arrow::struct_builder::StructBuilder;
+
+        // Schema only has "id"
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
+
+        // Message has extra field "removed_column" not in schema
+        let value = json!({"id": 42, "removed_column": "old_value"});
+        let result = append_value_to_struct_builder(value, &mut builder);
+        assert!(result.is_ok(), "Extra fields in message should be ignored");
+
+        let struct_array = builder.finish();
+        let record_batch: RecordBatch = struct_array.into();
+        assert_eq!(record_batch.num_rows(), 1);
+        assert_eq!(record_batch.num_columns(), 1);
+    }
+
+    #[test]
+    fn test_append_value_multiple_missing_nullable_fields() {
+        use crate::arrow::struct_builder::StructBuilder;
+        use arrow::array::Array;
+
+        // Schema with multiple nullable fields added via schema evolution
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+            Field::new("active", DataType::Boolean, true),
+        ]);
+
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 2);
+
+        // Old message with only "id" (before schema evolution)
+        let old_value = json!({"id": 1});
+        append_value_to_struct_builder(old_value, &mut builder)
+            .expect("old message should process successfully");
+
+        // New message with all fields
+        let new_value = json!({"id": 2, "name": "Alice", "age": 30, "active": true});
+        append_value_to_struct_builder(new_value, &mut builder)
+            .expect("new message should process successfully");
+
+        let struct_array = builder.finish();
+        let record_batch: RecordBatch = struct_array.into();
+        assert_eq!(record_batch.num_rows(), 2);
+
+        // First row: id=1, rest null
+        let id_col = record_batch
+            .column_by_name("id")
+            .expect("id column should exist")
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("id column should be Int32Array");
+        assert_eq!(id_col.value(0), 1);
+        assert_eq!(id_col.value(1), 2);
+
+        let name_col = record_batch
+            .column_by_name("name")
+            .expect("name column should exist")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("name column should be StringArray");
+        assert!(name_col.is_null(0));
+        assert_eq!(name_col.value(1), "Alice");
     }
 }

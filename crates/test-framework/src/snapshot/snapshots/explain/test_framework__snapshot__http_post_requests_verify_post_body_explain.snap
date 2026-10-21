@@ -1,0 +1,17 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: verify_post_body"
+snapshot_kind: text
+---
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                                                                   |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                                                                                              |
+|               |  Projection: create_post.request_path, create_post.request_body                                                                                                                                                                                        |
+|               |   TableScan: create_post projection=[request_path, request_body], full_filters=[create_post.request_body = Utf8("{"title": "foo", "body": "bar", "userId": 1}")]                                                                                       |
+| physical_plan | SchemaCastScanExec                                                                                                                                                                                                                                     |
+|               |   CooperativeExec                                                                                                                                                                                                                                      |
+|               |     BytesProcessedExec                                                                                                                                                                                                                                 |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT "create_post"."request_path", "create_post"."request_body" FROM "create_post" WHERE ("create_post"."request_body" = '{"title": "foo", "body": "bar", "userId": 1}') |
+|               |                                                                                                                                                                                                                                                        |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -1,0 +1,10 @@
+---
+source: crates/runtime/tests/schema_evolution/mod.rs
+expression: "to_pretty_display(&record_batch).expect(\"pretty display\")"
+---
++----+-------+-----+---------------+-------+
+| id | name  | age | city          | lname |
++----+-------+-----+---------------+-------+
+| 1  | Alice | 30  | New York      | Smith |
+| 2  | Bob   | 25  | San Francisco | Jones |
++----+-------+-----+---------------+-------+

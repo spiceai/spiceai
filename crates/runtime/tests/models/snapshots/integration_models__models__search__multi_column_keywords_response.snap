@@ -1,50 +1,63 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
-snapshot_kind: text
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": "0.03",
       "dataset": "qs",
       "matches": {
-        "answer": "Since there are 50 equal numbers, each number is equal to \\("
+        "answer": [
+          "times 2 \\times 2 \\times 2 = 32\\)."
+        ],
+        "question": [
+          "Which base number, when raised to the fifth power, equals thirty-two?"
+        ]
       },
       "primary_key": {
-        "id": 507
-      },
-      "score": 0.01
+        "id": 1277
+      }
     },
     {
+      "_score": "0.03",
       "dataset": "qs",
       "matches": {
-        "question": "Find the number of groups of 7 in 21."
-      },
-      "primary_key": {
-        "id": 359
-      },
-      "score": 0.01
-    },
-    {
-      "dataset": "qs",
-      "matches": {
-        "question": "How many numbers between 0 and 60 are even multiples of 5?"
+        "answer": [
+          "The even multiples of 5 between 0 and 60 are the multiples of 10"
+        ],
+        "question": [
+          "How many numbers between 0 and 60 are even multiples of 5?"
+        ]
       },
       "primary_key": {
         "id": 470
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": "0.01",
       "dataset": "qs",
       "matches": {
-        "answer": "4, 2))^3 \\times 40}\\)"
+        "question": [
+          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        ]
       },
       "primary_key": {
-        "id": 450
+        "id": 361
+      }
+    },
+    {
+      "_score": "0.01",
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18)."
+        ]
       },
-      "score": 0.01
+      "primary_key": {
+        "id": 484
+      }
     }
   ]
 }

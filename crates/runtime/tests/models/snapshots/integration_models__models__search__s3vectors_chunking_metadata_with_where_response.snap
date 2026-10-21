@@ -1,50 +1,57 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
-snapshot_kind: text
+expression: normalize_search_response(resp, round_scores)
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": "0.34",
       "dataset": "qs",
       "matches": {
-        "answer": "The presence of fibrinolysin in the reagents can partially o"
+        "answer": [
+          "The presence of fibrinolysin in the reagents can partially o"
+        ]
       },
       "primary_key": {
         "id": 938
-      },
-      "score": 0.34
+      }
     },
     {
+      "_score": "0.30",
       "dataset": "qs",
       "matches": {
-        "answer": " properties, possibly due to their high tannin content"
+        "answer": [
+          " properties, possibly due to their high tannin content"
+        ]
       },
       "primary_key": {
         "id": 1015
-      },
-      "score": 0.3
+      }
     },
     {
+      "_score": "0.29",
       "dataset": "qs",
       "matches": {
-        "answer": " Late recurrences can occur beyond 10 years, so patients requir"
+        "answer": [
+          " Late recurrences can occur beyond 10 years, so patients requir"
+        ]
       },
       "primary_key": {
         "id": 551
-      },
-      "score": 0.29
+      }
     },
     {
+      "_score": "0.29",
       "dataset": "qs",
       "matches": {
-        "answer": "stemic vascular resistance (SVR) by causing vasodilation."
+        "answer": [
+          "stemic vascular resistance (SVR) by causing vasodilation."
+        ]
       },
       "primary_key": {
         "id": 1035
-      },
-      "score": 0.29
+      }
     }
   ]
 }

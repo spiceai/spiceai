@@ -1,0 +1,14 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: multi_object"
+snapshot_kind: text
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                               |
++---------------+------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | TableScan: httpbin_get projection=[request_path, request_query, content]                                                           |
+| physical_plan | CooperativeExec                                                                                                                    |
+|               |   BytesProcessedExec                                                                                                               |
+|               |     HttpExec: base_url=https://httpbin.org/get?param1=value1&param2=value2, format=auto, partitions=[(path="", query="", body="")] |
+|               |                                                                                                                                    |
++---------------+------------------------------------------------------------------------------------------------------------------------------------+

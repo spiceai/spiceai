@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,70 +13,87 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use arrow::record_batch::RecordBatch;
-use futures::TryStreamExt;
-use model_components::model::{Error as ModelError, Model};
-use std::result::Result;
-use std::sync::Arc;
+use model_capabilities::CapabilityStore;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::RwLock;
 
 mod chat;
 mod embed;
-pub(crate) mod eval;
-mod metrics;
+pub mod evaluate;
+pub(crate) mod metrics;
 mod model_context;
-pub(crate) mod params;
+pub(crate) mod nsql;
+pub mod params;
+pub(crate) mod provider_models;
+pub(crate) mod rate_limit;
+pub mod rerank;
 mod responses;
+mod responses_tool_history;
+mod tool_trace;
 mod tool_use;
 mod tool_use_responses;
 mod util;
 mod wrapper;
 
-pub use chat::{LLMChatCompletionsModelStore, try_to_chat_model};
+pub use chat::{LLMChatCompletionsModelStore, LoadedChatModel, try_to_chat_model};
 pub use embed::{EmbeddingModelStore, try_to_embedding};
-pub use eval::{
-    dataset::{DatasetInput, DatasetOutput},
-    handle_eval_run,
-    result::{
-        EVAL_RESULTS_TABLE_REFERENCE, EVAL_RESULTS_TABLE_SCHEMA, EVAL_RESULTS_TABLE_TIME_COLUMN,
-    },
-    runs::{
-        EVAL_RUNS_TABLE_PRIMARY_KEY, EVAL_RUNS_TABLE_REFERENCE, EVAL_RUNS_TABLE_SCHEMA,
-        EVAL_RUNS_TABLE_TIME_COLUMN, EvalRunResponse, sql_query_for, start_tracing_eval_run,
-    },
-    scorer::{EvalScorerRegistry, Scorer, builtin_scorer},
-};
+pub use evaluate::{EvaluateModelStore, try_to_evaluate_model};
 pub use model_context::{
     ModelContextExtension, ModelContextLayer, add_tools_used, track_ai_inferences_with_spice_count,
 };
+pub use rerank::{RerankerModelStore, try_to_rerank_model};
 pub use responses::{LLMResponsesModelStore, try_to_responses_model};
 pub use tool_use::ToolUsingChat;
 pub use tool_use_responses::ToolUsingResponses;
 
-use crate::DataFusion;
+#[derive(Clone)]
+pub struct LlmRuntimeStores {
+    completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
+    responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
+    evaluate_models: Arc<RwLock<EvaluateModelStore>>,
+    rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
+    capabilities: Arc<RwLock<CapabilityStore>>,
+}
 
-pub static ENABLE_MODEL_SUPPORT_MESSAGE: &str = "To enable model support, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.";
-
-pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
-    match df
-        .query_builder(
-            &(format!(
-                "select * from {SPICE_DEFAULT_CATALOG}.{SPICE_DEFAULT_SCHEMA}.{} order by ts asc",
-                m.model.datasets[0]
-            )),
-        )
-        .build()
-        .run()
-        .await
-    {
-        Ok(query_result) => match query_result.data.try_collect().await {
-            Ok(d) => m.run(d),
-            Err(e) => Err(ModelError::UnableToRunModel {
-                source: Box::new(e),
-            }),
-        },
-        Err(e) => Err(ModelError::UnableToRunModel {
-            source: Box::new(e),
-        }),
+impl Default for LlmRuntimeStores {
+    fn default() -> Self {
+        Self {
+            completion_llms: Arc::new(RwLock::new(HashMap::new())),
+            responses_llms: Arc::new(RwLock::new(HashMap::new())),
+            evaluate_models: Arc::new(RwLock::new(HashMap::new())),
+            rate_controllers: Arc::new(RwLock::new(HashMap::new())),
+            capabilities: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 }
+
+impl LlmRuntimeStores {
+    #[must_use]
+    pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
+        Arc::clone(&self.completion_llms)
+    }
+
+    #[must_use]
+    pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
+        Arc::clone(&self.responses_llms)
+    }
+
+    #[must_use]
+    pub fn evaluate_models(&self) -> Arc<RwLock<EvaluateModelStore>> {
+        Arc::clone(&self.evaluate_models)
+    }
+
+    #[must_use]
+    pub fn rate_controllers(
+        &self,
+    ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
+        Arc::clone(&self.rate_controllers)
+    }
+
+    #[must_use]
+    pub fn capabilities(&self) -> Arc<RwLock<CapabilityStore>> {
+        Arc::clone(&self.capabilities)
+    }
+}
+
+pub static ENABLE_MODEL_SUPPORT_MESSAGE: &str = "To enable model support, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.";

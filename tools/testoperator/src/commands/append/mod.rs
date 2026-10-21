@@ -15,82 +15,315 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{args::DatasetTestArgs, health::HealthMonitor, wait_test_and_memory};
-use std::time::Duration;
+use crate::{args::AppendTestArgs, health::HealthMonitor};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use test_framework::{
     TestType,
     anyhow::{self, Context},
     app::App,
-    arrow::{self, array::AsArray, util::pretty::print_batches},
+    arrow::{
+        self,
+        array::{AsArray, RecordBatch},
+        util::pretty::print_batches,
+    },
+    execution::{FlightExecutor, QueryExecutor},
     futures::TryStreamExt,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
-    queries::{QueryOverrides, QuerySet, TableWithRowCount},
+    opentelemetry::KeyValue,
+    opentelemetry_sdk::Resource,
+    queries::{
+        QueryOverrides, QuerySet, TableWithRowCount,
+        validation::{self, QueryValidationResult},
+    },
     spiced::SpicedInstance,
     spicepod::acceleration::RefreshMode,
-    spicetest::{SpiceTest, append::NotStarted},
+    spicetest::{
+        SpiceTest,
+        append::{NotStarted, tpch_conflict_markers},
+    },
+    telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
 };
 
-pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
-    let query_set = QuerySet::from(args.query_set.clone());
-    let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
+/// How long to wait for the tables to reach their expected contents. The last
+/// load's refresh can still be in flight when the loads finish.
+const VERIFICATION_SETTLE_TIMEOUT: Duration = Duration::from_mins(3);
 
-    let (app, start_request) = get_app_and_start_request(&args.common).await?;
+/// How often to re-count the tables while waiting for them to settle.
+const VERIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many rows of a failing query's result to print. A TPC-H answer can run to
+/// thousands of rows, and the failure reason names the first row that diverged.
+const MAX_PRINTED_FAILURE_ROWS: usize = 20;
+
+pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
+    if args.test_args.common.concurrency == 0 {
+        return Err(anyhow::anyhow!(
+            "Concurrency should be greater than 0 for an append test"
+        ));
+    }
+
+    let query_set = args.test_args.load_query_set()?;
+    let query_overrides = args
+        .test_args
+        .query_overrides
+        .clone()
+        .map(QueryOverrides::from);
+
+    let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
+
+    let test_metrics = AppendTestMetrics::new(app.name.clone(), query_set.to_string())
+        .with_spiced_commit_sha(
+            std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string()),
+        );
 
     check_app_is_appendable(&app)?;
 
     println!("Running append test");
 
-    let append_test = SpiceTest::new(
+    let append_test = match SpiceTest::new(
         app.name.clone(),
         NotStarted::new()
-            .with_query_set(query_set, query_overrides)
-            .with_parallel_count(1)
-            .with_end_duration(Duration::from_secs(60 * 60))
-            .with_tempdir_path(start_request.get_tempdir_path()),
+            .with_query_set(
+                query_set.clone(),
+                query_overrides,
+                args.test_args.scale_factor,
+            )
+            .await?
+            .with_parallel_count(args.test_args.common.concurrency)
+            .with_end_duration(Duration::from_secs(args.test_args.common.duration))
+            .with_tempdir_path(start_request.get_tempdir_path())
+            .with_load_interval(Duration::from_secs(args.load_interval))
+            .with_load_steps(args.load_steps)
+            .with_conflict_data(args.with_conflict_data)
+            .with_retention_test_data(args.with_retention_data),
     )
-    .with_progress_bars(false)
+    .with_progress_bars(!args.test_args.common.disable_progress_bars)
+    // Append tests start from a small data subset and load incrementally, so queries legitimately return 0 rows
+    .with_validate_row_count(false)
     .start_appending()
-    .await?;
+    .await
+    {
+        Ok(test) => test,
+        Err(e) => {
+            test_metrics.emit(TestStatus::Failed).await?;
+            return Err(e);
+        }
+    };
 
-    let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    let mut spiced_instance = match SpicedInstance::start(start_request).await {
+        Ok(instance) => instance,
+        Err(e) => {
+            test_metrics.emit(TestStatus::Failed).await?;
+            return Err(e);
+        }
+    };
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
+    let memory_readings = spiced_instance
+        .process()
+        .map(|process| process.watch_memory(&memory_token));
 
-    spiced_instance
-        .wait_for_ready(Duration::from_secs(args.common.ready_wait))
-        .await?;
+    if let Err(e) = spiced_instance
+        .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
+        .await
+    {
+        test_metrics.emit(TestStatus::Failed).await?;
+        return Err(e);
+    }
     let health_monitor = HealthMonitor::spawn()?;
 
     let append_test = append_test
         .with_spiced_instance(spiced_instance)
         .start_test()
         .await?;
-    let test = wait_test_and_memory!(append_test, memory_token, memory_readings);
-    let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
+    let test = match append_test.wait().await {
+        Ok(test) => test,
+        Err(e) => {
+            if let Some(handle) = memory_readings {
+                let _ = observe_memory(memory_token, handle).await;
+            }
+            return Err(e);
+        }
+    };
+    let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Append)?;
+    let test_succeeded = test.succeeded();
     let mut spiced_instance = test.end()?;
-    let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
+    let memory_usage = match memory_readings {
+        Some(handle) => Some(observe_memory(memory_token, handle).await?),
+        None => None,
+    };
 
-    let table_count_result = check_table_counts(
+    let mut test_metrics = test_metrics
+        .with_spiced_version(metrics.spiced_version.clone())
+        .with_testoperator_commit_sha(metrics.commit_sha.clone())
+        .with_branch_name(metrics.branch_name.clone());
+
+    if let Some((max_memory, median_memory)) = memory_usage {
+        test_metrics = test_metrics.with_memory(max_memory, median_memory);
+    }
+
+    let verification_result = verify_appended_data(
         &spiced_instance,
-        query_set,
-        args.scale_factor.unwrap_or(1.0),
+        &query_set,
+        query_overrides,
+        args.test_args.scale_factor.unwrap_or(1.0),
+        args.test_args.validate,
+        args.with_conflict_data,
     )
     .await;
 
-    let records = metrics.with_memory_usage(max_memory).build_records()?;
+    let metrics = match memory_usage {
+        Some((max_memory, _)) => metrics.with_memory_usage(max_memory),
+        None => metrics,
+    };
+    let records = metrics.build_records()?;
     print_batches(&records)?;
 
     let health_report = health_monitor.stop().await;
+
+    // Test passes only if the appended data verifies and every query succeeded.
+    let test_status: TestStatus = (verification_result.is_ok() && test_succeeded).into();
+    test_metrics.emit(test_status).await?;
+
     spiced_instance.stop()?;
     let health_report = health_report?;
 
-    table_count_result?;
+    verification_result?;
     if let Some(message) = health_report.failure_message() {
-        return Err(anyhow::anyhow!(message));
+        // Health check failures are logged as warnings but don't fail the test
+        eprintln!("Warning: {message}");
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestStatus {
+    /// Test completed successfully
+    Passed,
+    /// Test failed
+    Failed,
+}
+
+impl From<bool> for TestStatus {
+    fn from(passed: bool) -> Self {
+        if passed {
+            TestStatus::Passed
+        } else {
+            TestStatus::Failed
+        }
+    }
+}
+
+impl TestStatus {
+    /// Convert `TestStatus` to a u64 value for metrics recording (1 = passed, 0 = failed)
+    #[must_use]
+    pub fn to_u64(self) -> u64 {
+        match self {
+            TestStatus::Passed => 1,
+            TestStatus::Failed => 0,
+        }
+    }
+}
+
+/// Builder for emitting append test metrics.
+struct AppendTestMetrics {
+    app_name: String,
+    spiced_version: Option<String>,
+    query_set: String,
+    testoperator_commit_sha: Option<String>,
+    spiced_commit_sha: Option<String>,
+    branch_name: Option<String>,
+    max_memory: Option<f64>,
+    median_memory: Option<f64>,
+}
+
+impl AppendTestMetrics {
+    fn new(app_name: impl Into<String>, query_set: impl Into<String>) -> Self {
+        Self {
+            app_name: app_name.into(),
+            query_set: query_set.into(),
+            spiced_version: None,
+            testoperator_commit_sha: None,
+            spiced_commit_sha: None,
+            branch_name: None,
+            max_memory: None,
+            median_memory: None,
+        }
+    }
+
+    fn with_spiced_version(mut self, version: impl Into<String>) -> Self {
+        self.spiced_version = Some(version.into());
+        self
+    }
+
+    fn with_testoperator_commit_sha(mut self, sha: impl Into<String>) -> Self {
+        self.testoperator_commit_sha = Some(sha.into());
+        self
+    }
+
+    fn with_spiced_commit_sha(mut self, sha: impl Into<String>) -> Self {
+        self.spiced_commit_sha = Some(sha.into());
+        self
+    }
+
+    fn with_branch_name(mut self, name: impl Into<String>) -> Self {
+        self.branch_name = Some(name.into());
+        self
+    }
+
+    fn with_memory(mut self, max_memory: f64, median_memory: f64) -> Self {
+        self.max_memory = Some(max_memory);
+        self.median_memory = Some(median_memory);
+        self
+    }
+
+    /// Emit metrics and telemetry for the test result.
+    async fn emit(self, test_status: TestStatus) -> anyhow::Result<()> {
+        let resource = Resource::builder_empty()
+            .with_attributes(vec![
+                KeyValue::new("service.name", "testoperator"),
+                KeyValue::new("type", "append_test"),
+                KeyValue::new("name", self.app_name),
+                KeyValue::new(
+                    "spiced_version",
+                    self.spiced_version.unwrap_or_else(|| "unknown".to_string()),
+                ),
+                KeyValue::new("query_set", self.query_set),
+                KeyValue::new(
+                    "testoperator_commit_sha",
+                    self.testoperator_commit_sha
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+                KeyValue::new(
+                    "spiced_commit_sha",
+                    self.spiced_commit_sha
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+                KeyValue::new(
+                    "branch_name",
+                    self.branch_name.unwrap_or_else(|| "unknown".to_string()),
+                ),
+            ])
+            .build();
+
+        // Create telemetry with resource upfront, before recording any metrics
+        let telemetry = Telemetry::new_with_resource(&resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+
+        crate::metrics::STATUS.record(test_status.to_u64(), &[]);
+
+        if let Some(max_mem) = self.max_memory {
+            crate::metrics::PEAK_MEMORY_USAGE.record(max_mem * 1024.0, &[]);
+        }
+        if let Some(median_mem) = self.median_memory {
+            crate::metrics::MEDIAN_MEMORY_USAGE.record(median_mem * 1024.0, &[]);
+        }
+
+        telemetry.emit().await
+    }
 }
 
 fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
@@ -119,14 +352,49 @@ fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn check_table_counts(
+/// Verifies the data the append test left behind.
+///
+/// Row counts prove only that the right *amount* of data arrived. Comparing the
+/// query results against the expected answers proves the right *data* arrived:
+/// a duplicated append, a retention policy deleting the wrong row, or a
+/// corrupted column can all land on the expected row count.
+///
+/// Under `--with-conflict-data` it also covers conflict resolution: the copy an
+/// upsert must discard carries a negated queried column, so keeping it shows up
+/// in the query results.
+async fn verify_appended_data(
     spiced: &SpicedInstance,
-    query_set: QuerySet,
+    query_set: &QuerySet,
+    query_overrides: Option<QueryOverrides>,
     scale_factor: f64,
+    validate_results: bool,
+    with_conflict_data: bool,
 ) -> anyhow::Result<()> {
-    let spice_client = spiced.spice_client(None, false).await?;
+    println!("Verifying appended data");
 
-    let mut any_count_mismatch = false;
+    // The same queries ran throughout the test against partially loaded data, so
+    // a cached result would report an earlier load step.
+    let spice_client = Arc::new(spiced.spice_client(None, true).await?);
+
+    wait_for_appended_data(&spice_client, query_set, scale_factor, with_conflict_data).await?;
+
+    if !validate_results {
+        println!("Skipping query result verification, pass --validate to enable it");
+        return Ok(());
+    }
+
+    check_query_results(&spice_client, query_set, query_overrides, scale_factor).await
+}
+
+/// Counts every table in the query set, describing those outside a 0.01% margin
+/// of the expected count.
+async fn table_count_mismatches(
+    spice_client: &spiceai::Client,
+    query_set: &QuerySet,
+    scale_factor: f64,
+) -> anyhow::Result<Vec<String>> {
+    let mut mismatches = Vec::new();
+
     for TableWithRowCount {
         name,
         count: expected_count,
@@ -135,7 +403,7 @@ async fn check_table_counts(
         let expected_count = f64::from(expected_count) * scale_factor;
         let sql = format!("SELECT COUNT(*) FROM {name}");
         let batches = spice_client
-            .query(&sql)
+            .sql(&sql)
             .await?
             .try_collect::<Vec<_>>()
             .await?;
@@ -156,16 +424,195 @@ async fn check_table_counts(
         let upper_bound = expected_count * 1.0001;
         let lower_bound = expected_count * 0.9999;
         if !(count <= upper_bound && count >= lower_bound) {
-            println!("Table {name} has {count} rows, expected {expected_count}");
-            any_count_mismatch = true;
+            mismatches.push(format!(
+                "table {name} has {count} rows, expected {expected_count}"
+            ));
         }
     }
 
-    if any_count_mismatch {
+    Ok(mismatches)
+}
+
+/// Counts the conflicting rows still present in each table that has them. Each
+/// one is a copy the last load supersedes, so a table holding any has not yet
+/// applied that load's upsert. Row counts can't show this: a superseded copy
+/// takes up the same key, so the table already holds its final row count.
+async fn conflict_row_mismatches(spice_client: &spiceai::Client) -> anyhow::Result<Vec<String>> {
+    let mut mismatches = Vec::new();
+
+    for marker in tpch_conflict_markers() {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE {}",
+            marker.table,
+            marker.predicate()
+        );
+        let batches = spice_client
+            .sql(&sql)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let count = batches
+            .first()
+            .and_then(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive_opt::<arrow::datatypes::Int64Type>()
+            })
+            .context("Failed to get count as a Int64Type")?
+            .value(0);
+        if count > 0 {
+            mismatches.push(format!(
+                "table {} still has {count} superseded conflicting rows",
+                marker.table
+            ));
+        }
+    }
+
+    Ok(mismatches)
+}
+
+/// Waits, up to [`VERIFICATION_SETTLE_TIMEOUT`], for every table to reach its
+/// expected row count and, with conflict data, to hold no superseded rows, so
+/// verification runs against the fully loaded dataset.
+async fn wait_for_appended_data(
+    spice_client: &spiceai::Client,
+    query_set: &QuerySet,
+    scale_factor: f64,
+    with_conflict_data: bool,
+) -> anyhow::Result<()> {
+    let start = Instant::now();
+    let deadline = start + VERIFICATION_SETTLE_TIMEOUT;
+    let mismatches = loop {
+        let mut mismatches = table_count_mismatches(spice_client, query_set, scale_factor).await?;
+        if with_conflict_data && matches!(query_set, QuerySet::Tpch) {
+            mismatches.extend(conflict_row_mismatches(spice_client).await?);
+        }
+        if mismatches.is_empty() || Instant::now() >= deadline {
+            break mismatches;
+        }
+
+        println!(
+            "Waiting for appended data to settle ({:?} elapsed): {}",
+            start.elapsed(),
+            mismatches.join("; ")
+        );
+        tokio::time::sleep(VERIFICATION_POLL_INTERVAL).await;
+    };
+
+    if !mismatches.is_empty() {
         return Err(anyhow::anyhow!(
-            "Table row counts do not match expected values"
+            "Appended data did not settle within {VERIFICATION_SETTLE_TIMEOUT:?}: {}",
+            mismatches.join("; ")
         ));
     }
 
+    println!("Appended data settled after {:?}", start.elapsed());
     Ok(())
+}
+
+/// Runs each query once against the appended data and compares the result
+/// against its expected answer.
+async fn check_query_results(
+    spice_client: &Arc<spiceai::Client>,
+    query_set: &QuerySet,
+    query_overrides: Option<QueryOverrides>,
+    scale_factor: f64,
+) -> anyhow::Result<()> {
+    let queries = query_set
+        .get_queries(query_overrides, None, None, Some(scale_factor))
+        .await?;
+    let executor = FlightExecutor::new(Arc::clone(spice_client));
+
+    println!(
+        "Verifying {} query results against the expected answers",
+        queries.len()
+    );
+
+    let mut skipped = Vec::new();
+    let mut failures = Vec::new();
+
+    for query in &queries {
+        // Gate before running the query, so a query that can't be validated
+        // isn't executed for a result nothing compares.
+        if !validation::should_validate_with_static_tpch_answer(query, scale_factor) {
+            skipped.push(query.name.as_ref());
+            continue;
+        }
+
+        let batches = match executor.execute(query, true).await {
+            Ok(result) => result.batches.unwrap_or_default(),
+            Err(e) => {
+                eprintln!("Query '{}' failed to run: {e}", query.name);
+                failures.push(format!("{}: failed to run: {e}", query.name));
+                continue;
+            }
+        };
+
+        if let QueryValidationResult::Fail(reason) =
+            validation::validate_tpch_query(query, &batches)?
+        {
+            eprintln!("\nQuery '{}' returned unexpected results", query.name);
+            eprintln!("Query SQL: {}", query.sql);
+            eprintln!("Validation failure reason: {reason:?}");
+            eprintln!("\nActual results:");
+            print_result_head(&batches);
+            eprintln!();
+            failures.push(format!("{}: {reason:?}", query.name));
+        }
+    }
+
+    let validated = queries.len() - skipped.len() - failures.len();
+    println!(
+        "Verified {validated}/{total} query results ({skipped_count} skipped, {failed_count} failed)",
+        total = queries.len(),
+        skipped_count = skipped.len(),
+        failed_count = failures.len(),
+    );
+
+    if !failures.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Query results do not match expected values: {}",
+            failures.join("; ")
+        ));
+    }
+
+    if validated == 0 {
+        eprintln!(
+            "Warning: no {query_set} query has an expected answer at scale factor {scale_factor}, so the appended data was verified by row count only"
+        );
+    } else if !skipped.is_empty() {
+        println!(
+            "Skipped {count} queries with no expected answer at scale factor {scale_factor}: {names}",
+            count = skipped.len(),
+            names = skipped.join(", "),
+        );
+    }
+
+    Ok(())
+}
+
+/// Prints the first [`MAX_PRINTED_FAILURE_ROWS`] rows of a query result, so a
+/// large result doesn't bury the rest of the run's output.
+fn print_result_head(batches: &[RecordBatch]) {
+    let mut head = Vec::new();
+    let mut remaining = MAX_PRINTED_FAILURE_ROWS;
+    for batch in batches {
+        if remaining == 0 {
+            break;
+        }
+
+        let rows = remaining.min(batch.num_rows());
+        head.push(batch.slice(0, rows));
+        remaining -= rows;
+    }
+
+    match arrow::util::pretty::pretty_format_batches(&head) {
+        Ok(pretty) => eprintln!("{pretty}"),
+        Err(e) => eprintln!("Failed to format actual results: {e}"),
+    }
+
+    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    if total_rows > MAX_PRINTED_FAILURE_ROWS {
+        eprintln!("... {} more rows", total_rows - MAX_PRINTED_FAILURE_ROWS);
+    }
 }

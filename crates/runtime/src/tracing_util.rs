@@ -14,9 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::sql::TableReference;
-use opentelemetry::trace::TraceId;
-use rand::RngCore;
+use datafusion::common::TableReference;
 
 use crate::{
     component::dataset::{
@@ -34,7 +32,7 @@ pub fn dataset_registered_trace(
     ds: &Dataset,
     results_cache_enabled: bool,
 ) -> String {
-    let mut info = format!("Dataset {} registered ({})", &ds.name, &ds.from);
+    let mut info = format!("Dataset {} registered ({})", ds.name, ds.from);
     if let Some(acceleration) = &ds.acceleration
         && acceleration.enabled
     {
@@ -80,7 +78,10 @@ fn acceleration_info(
 ) -> String {
     let mut info: String = acceleration.engine.to_string();
 
-    if acceleration.mode == Mode::File {
+    if matches!(
+        acceleration.mode,
+        Mode::File | Mode::FileCreate | Mode::FileUpdate
+    ) {
         info.push_str(":file");
     }
 
@@ -98,6 +99,12 @@ fn acceleration_info(
         RefreshMode::Changes => {
             info.push_str(", changes");
         }
+        RefreshMode::Caching => {
+            info.push_str(", caching");
+        }
+        RefreshMode::Snapshot => {
+            info.push_str(", snapshot");
+        }
     }
 
     if let Some(refresh_interval) = &acceleration.refresh_check_interval {
@@ -114,22 +121,52 @@ fn acceleration_info(
     info
 }
 
-pub fn random_trace_id() -> TraceId {
-    let mut bytes = [0u8; 16];
-    let mut rng = rand::rng();
-    rng.fill_bytes(&mut bytes);
+/// Every line `tracing` writes at `WARN` or above while `f` runs on this thread.
+///
+/// A thread-local subscriber: enough for synchronous code, and it keeps the capture from
+/// seeing other tests' output. Returns the lines rather than a joined string so a caller can
+/// *count* an emission — a duplicate-log regression is exactly what a presence check passes.
+#[cfg(test)]
+pub(crate) fn warn_lines_emitted_by(f: impl FnOnce()) -> Vec<String> {
+    use std::sync::Arc;
 
-    // Ensure the TraceId is not all zeros
-    if bytes.iter().all(|&b| b == 0) {
-        return random_trace_id();
+    #[derive(Clone, Default)]
+    struct Capture(Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
-    TraceId::from_bytes(bytes)
+    let sink = Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+
+    let captured = sink.0.lock();
+    String::from_utf8_lossy(&captured)
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::DatasetSpec;
     use crate::component::dataset::acceleration::Engine;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::DataConnectorResult;
@@ -150,7 +187,8 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _context: &dyn crate::dataconnector::ConnectorContext,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!()
         }
@@ -175,6 +213,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_dataset_registered_trace_default_acceleration_cache() {
         let acceleration = Acceleration {
@@ -196,7 +235,7 @@ mod tests {
         let info = dataset_registered_trace(test_data_connector.as_ref(), &ds, true);
         assert_eq!(
             info,
-            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (arrow), results cache enabled."
+            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (cayenne), results cache enabled."
         );
     }
 
@@ -240,6 +279,7 @@ mod tests {
         assert_eq!(info, "View taxi_trips_vw registered.");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn test_view_registered_trace_with_default_acceleration() {
         let table_ref = TableReference::from("taxi_trips_vw");
@@ -248,7 +288,10 @@ mod tests {
             ..Default::default()
         });
         let info = view_registered_trace(&table_ref, acceleration.as_ref());
-        assert_eq!(info, "View taxi_trips_vw registered, acceleration (arrow).");
+        assert_eq!(
+            info,
+            "View taxi_trips_vw registered, acceleration (cayenne)."
+        );
     }
 
     #[test]

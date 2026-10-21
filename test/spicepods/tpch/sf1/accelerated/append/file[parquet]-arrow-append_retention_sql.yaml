@@ -1,0 +1,135 @@
+version: v1
+kind: Spicepod
+name: file[parquet]-arrow-append_retention_sql
+
+refresh_check_interval: &refresh_check_interval 30s
+retention_check_interval: &retention_check_interval 30s
+
+datasets:
+  - from: file:customer.parquet
+    name: customer
+    time_column: c_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      primary_key: c_custkey
+      on_conflict:
+        c_custkey: upsert
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_sql: DELETE FROM customer WHERE c_custkey >=  1000000000
+
+  - from: file:lineitem.parquet
+    name: lineitem
+    time_column: l_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      primary_key: '(l_orderkey, l_linenumber)'
+      on_conflict:
+        '(l_orderkey, l_linenumber)': upsert
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_sql: DELETE FROM lineitem WHERE l_orderkey >=  1000000000
+
+  - from: file:nation.parquet
+    name: nation
+    time_column: n_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      primary_key: n_nationkey
+      on_conflict:
+        n_nationkey: upsert
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_sql: DELETE FROM nation WHERE n_nationkey >=  1000000000
+
+  - from: file:orders.parquet
+    name: orders
+    time_column: o_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      primary_key: o_orderkey
+      on_conflict:
+        o_orderkey: upsert
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_sql: DELETE FROM orders WHERE o_orderkey >=  1000000000
+
+  - from: file:part.parquet
+    name: part
+    time_column: p_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      primary_key: p_partkey
+      on_conflict:
+        p_partkey: upsert
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_sql: DELETE FROM part WHERE p_partkey >=  1000000000
+
+  - from: file:partsupp.parquet
+    name: partsupp
+    time_column: ps_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      primary_key: '(ps_partkey, ps_suppkey)'
+      on_conflict:
+        '(ps_partkey, ps_suppkey)': upsert
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_sql: DELETE FROM partsupp WHERE ps_partkey >=  1000000000
+
+  - from: file:region.parquet
+    name: region
+    time_column: r_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      primary_key: r_regionkey
+      on_conflict:
+        r_regionkey: upsert
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_sql: DELETE FROM region WHERE r_regionkey >=  1000000000
+
+  - from: file:supplier.parquet
+    name: supplier
+    time_column: s_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      primary_key: s_suppkey
+      on_conflict:
+        s_suppkey: upsert
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_sql: DELETE FROM supplier WHERE s_suppkey >=  1000000000

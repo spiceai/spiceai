@@ -17,7 +17,7 @@ limitations under the License.
 #[cfg(feature = "bedrock")]
 pub(crate) mod embeddings {
     use super::super::embedding::{EmbeddingTestCase, run_embedding_tests};
-    use async_openai::types::EmbeddingInput;
+    use async_openai::types::embeddings::EmbeddingInput;
     use serde_json::Value;
     use spicepod::component::embeddings::Embeddings;
     use std::collections::HashMap;
@@ -438,5 +438,111 @@ pub(crate) mod embeddings {
         run_embedding_tests(models, tests)
             .await
             .expect("Titan dimension tests should pass");
+    }
+}
+
+#[cfg(feature = "bedrock")]
+pub(crate) mod chat {
+    use crate::{
+        init_tracing,
+        utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
+    };
+    use app::AppBuilder;
+    use arrow::util::display::array_value_to_string;
+    use futures::TryStreamExt;
+    use runtime::Runtime;
+    use spicepod::component::model::Model;
+    use std::{sync::Arc, time::Duration};
+
+    const MODEL_NAME: &str = "nova-lite";
+
+    fn create_nova_lite_model() -> Model {
+        let mut model = Model::new("bedrock:us.amazon.nova-lite-v1:0", MODEL_NAME);
+        model
+            .params
+            .insert("aws_region".to_string(), "us-east-1".into());
+        model.params.insert(
+            "aws_access_key_id".to_string(),
+            "${env:AWS_BEDROCK_KEY}".into(),
+        );
+        model.params.insert(
+            "aws_secret_access_key".to_string(),
+            "${env:AWS_BEDROCK_SECRET}".into(),
+        );
+        // Temporary credentials, such as those from an SSO login, carry a session token.
+        if std::env::var_os("AWS_BEDROCK_SESSION_TOKEN").is_some() {
+            model.params.insert(
+                "aws_session_token".to_string(),
+                "${env:AWS_BEDROCK_SESSION_TOKEN}".into(),
+            );
+        }
+        model
+    }
+
+    async fn query_value(rt: &Runtime, sql: &str) -> String {
+        let batches: Vec<_> = tokio::time::timeout(Duration::from_mins(1), async {
+            rt.datafusion()
+                .query_builder(sql)
+                .build()
+                .run()
+                .await
+                .unwrap_or_else(|e| panic!("{sql} failed to run: {e}"))
+                .data
+                .try_collect()
+                .await
+                .unwrap_or_else(|e| panic!("{sql} failed: {e}"))
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{sql} did not finish within a minute"));
+        let batch = batches
+            .iter()
+            .find(|batch| batch.num_rows() > 0)
+            .unwrap_or_else(|| panic!("{sql} returned no rows"));
+        array_value_to_string(batch.column(0).as_ref(), 0).expect("the value renders as text")
+    }
+
+    /// The `ai_*` decision functions read a Bedrock reply that answers as an answer.
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
+    async fn bedrock_test_ai_if_answers() {
+        let _tracing = init_tracing(None);
+        test_request_context()
+            .scope(async {
+                for secret in ["AWS_BEDROCK_KEY", "AWS_BEDROCK_SECRET"] {
+                    verify_env_secret_exists(secret)
+                        .await
+                        .unwrap_or_else(|e| panic!("{e}"));
+                }
+
+                let app = AppBuilder::new("bedrock_ai_if")
+                    .with_model(create_nova_lite_model())
+                    .build();
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+                tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
+                    .await
+                    .expect("components load within a minute");
+                runtime_ready_check(&rt).await;
+
+                assert_eq!(
+                    query_value(
+                        &rt,
+                        &format!("SELECT ai_if('ping', 'contains ping', '{MODEL_NAME}')")
+                    )
+                    .await,
+                    "true"
+                );
+                assert_eq!(
+                    query_value(
+                        &rt,
+                        &format!("SELECT ai_if('pong', 'contains ping', '{MODEL_NAME}')")
+                    )
+                    .await,
+                    "false"
+                );
+            })
+            .await;
     }
 }

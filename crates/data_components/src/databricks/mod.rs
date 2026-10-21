@@ -15,12 +15,17 @@ limitations under the License.
 */
 
 pub mod delta;
+pub mod dialect;
+#[cfg(feature = "spark_connect")]
 pub mod spark_connect;
 pub mod sql_warehouse;
+
+pub use dialect::DatabricksDialect;
 
 use std::sync::LazyLock;
 
 pub use delta::DatabricksDelta;
+#[cfg(feature = "spark_connect")]
 pub use spark_connect::DatabricksSparkConnect;
 pub use sql_warehouse::DatabricksSqlWarehouse;
 

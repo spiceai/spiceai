@@ -1,0 +1,24 @@
+tests:
+  # The 1.7 GB corpus now downloads from Hugging Face inside the ready wait, so allow 1 hour.
+  search:
+    - spicepod_path: test/spicepods/search/mteb/msmarco/full_text_search-duckdb[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 3600
+    - spicepod_path: test/spicepods/search/mteb/msmarco/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 3600
+    - spicepod_path: test/spicepods/search/mteb/msmarco/hf[all-minilm-l6-v2]-arrow.yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 3600
+    - spicepod_path: test/spicepods/search/mteb/msmarco/hybrid[model2vec[potion-multilingual-128M]]-duckdb[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 3600
+    - spicepod_path: test/spicepods/search/mteb/msmarco/model2vec[potion-multilingual-128M]-duckdb[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 3600
+    - spicepod_path: test/spicepods/search/mteb/msmarco/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 3600
+    - spicepod_path: test/spicepods/search/mteb/msmarco/model2vec[potion-multilingual-128M]-s3_vectors.yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 3600

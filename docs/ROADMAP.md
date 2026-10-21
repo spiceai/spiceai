@@ -2,67 +2,63 @@
 
 This roadmap details the planned features and priorities for Spice.ai Open Source, aligning with the mission to empower developers to build decision-making, data-driven AI applications. It is regularly refined based on community feedback, customer needs, and strategic goals.
 
-To propose features or report issues, please [file an issue](https://github.com/spiceai/spiceai/issues/new/choose) or connect with us on [Discord](https://github.com/spiceai/spiceai#-connect-with-us). Your input drives our direction.
+To propose features or report issues, please [file an issue](https://github.com/spiceai/spiceai/issues/new/choose) or connect with us on [Slack](https://spiceai.org/slack). Your input drives our direction.
 
 ---
 
 ## Known Issues
 
 - Track active bugs on [GitHub](https://github.com/spiceai/spiceai/labels/bug).
-- Report new bugs via [this issue template](https://github.com/spiceai/spiceai/issues/new?template=bug_report.md) and share details on Discord for faster resolution.
+- Report new bugs via [this issue template](https://github.com/spiceai/spiceai/issues/new?template=bug_report.md) and share details on Slack for faster resolution.
 
 ---
 
 ## Release Timeline
 
-### [v1.9 (November 2025)](https://github.com/spiceai/spiceai/milestone/78)
+### [v2.4](https://github.com/spiceai/spiceai/milestone/101) (October 2026)
 
-**Focus:** Real-Time Ingestion, Write, and Security.
+**Focus:** Schema Registry, Write-Back Acceleration, Distributed Search, Enterprise Security, Compliance, & Governance.
 
-- **Search**:
-  - Amazon S3 Vectors index spilling.
-  - Full-Text-Search Scalability.
-- **Security**:
-  - Authentication improvements.
-  - Security hardening.
-- **Data Connectors**:
-  - DynamoDB Streams Data Connector.
-- **Snapshots**:
-  - Resiliency improvements.
-  - Debezium and DynamoDB Streams support.
-- **DataFusion**: Upgrade to v50.
+**DataFusion:** v56
 
-### [v1.10 (December 2025)](https://github.com/spiceai/spiceai/milestone/79)
+- **Schema Registry (Initial)**: Versioning and backward compatibility checks.
+- **Write-Back Acceleration DML**: Full UPDATE/DELETE DML on write-through accelerated tables.
+- **Distributed Search (Alpha)**: Federated vector and full-text search across multiple nodes, with FTS indexes available in distributed query mode.
+- **Distributed Search Scale-Out**: Search query partitioning and relative score fusion across distributed nodes.
+- **Distributed Cayenne Catalog**: Cayenne catalog with full distributed query and acceleration support.
+- **Audit Logging**: Persistent, immutable query and access logs for compliance.
+- **Resource Quotas**: Per-user/tenant query limits and throttling.
 
-**Focus:** Lakehouse Architecture.
+### [v2.5](https://github.com/spiceai/spiceai/milestone/102) (November 2026)
 
-- **DuckDB**: Upgrade to v1.4.x.
-- **DataFusion**: Upgrade to v51.
+**Focus:** Extensibility & Plugin Architecture.
 
-### v1.1x (H1 2026)
+**DataFusion:** v57
 
-**Focus:** Lakehouse Architecture.
+- **Extensible Middleware**: Pluggable extensions for dynamic customization.
+- **Search at 100B+ Row Scale**: Vector and full-text search benchmarked and tuned for hundred-billion-row deployments, including S3 Vectors throughput improvements.
+- **Unified Connector Rate Control**: Extend the runtime-wide rate-control surface from HTTP connectors to database and file/object-store connectors for consistent per-origin concurrency and request-rate limits.
 
-- **DuckLake**: Initial support for DuckDB-based lakehouse architectures.
-- **Write Support**:
-  - Apache Iceberg write support (expanded).
-  - PostgreSQL write support (expanded).
-  - Spice Cloud write support (expanded).
-- **DataFusion**: Upgrade to v52.
+### [v2.6](https://github.com/spiceai/spiceai/milestone/103) (December 2026)
 
-**Focus:** Extensibility.
+**Focus:** Encryption.
 
-- **Resource Management**: Finer-grained runtime-wide control for optimized performance.
-- **Extensible Middleware**:
-  - Pluggable extensions for dynamic customization.
+**DataFusion:** v58
 
-### v2.0 (H2 2026)
+- **Customer-Managed Keys (BYOK)**: Encryption key management for sensitive workloads.
+- **Data-at-Rest Encryption**: Encrypted storage for accelerated datasets.
 
-**Focus:** Governance.
+### [v2.7](https://github.com/spiceai/spiceai/milestone/104) (January 2027)
 
-- **Policy Engine**:
-  - Role-based security for fine-grained access control.
-  - Data access policies to enforce compliance and governance.
+**DataFusion:** v59
+
+Scope is being planned. Candidates are drawn from [Features Under Consideration](#features-under-consideration) — tell us which matter most to you.
+
+### [v2.8](https://github.com/spiceai/spiceai/milestone/105) (February 2027)
+
+**DataFusion:** v60
+
+Scope is being planned. Candidates are drawn from [Features Under Consideration](#features-under-consideration) — tell us which matter most to you.
 
 ---
 
@@ -73,9 +69,6 @@ These are prioritized based on community demand and strategic alignment. Share y
 ### Data Connectors
 
 - **Delta Lake**: Write support for transactional data lakes.
-- **Elasticsearch**: Integration for search and analytics workloads.
-- **MotherDuck**: Hybrid cloud DuckDB connector.
-- **BigQuery**: Support for Google Cloud's data warehouse.
 - **Google Docs**: Experimental connector for collaborative data sources.
 
 ### APIs
@@ -87,13 +80,17 @@ These are prioritized based on community demand and strategic alignment. Share y
 ### AI & Analytics
 
 - **Vision Processing**: Support for image and video.
-- **Custom Model Integration**: Framework for user-defined ML models.
+- **Custom ML Model Integration**: Framework for user-defined ML models.
+- **Model Versioning & A/B Testing**: Canary deployments and version management for models.
+- **Hallucination Detection**: Fact-checking LLM responses against source data.
 
-### Platform Enhancements
+### Search & Retrieval
 
-- **Observability**: Comprehensive metrics, logging, and tracing.
-- **CLI & SDKs**: Streamlined developer experience with improved tooling.
-- **Data Accelerators**: Additional engines for specialized workloads.
+- **Faceted Search**: Native facet buckets and counts returned directly in the search API response — beyond today's `GROUP BY` over the `vector_search`/`text_search` SQL functions — for filter-sidebar enterprise search UX.
+
+### Data Platform
+
+- **Data Lineage**: Track data provenance and transformations across the pipeline.
 
 ---
 

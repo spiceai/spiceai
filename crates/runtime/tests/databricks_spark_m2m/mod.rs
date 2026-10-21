@@ -20,7 +20,7 @@ use app::AppBuilder;
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::test_request_context,
+    utils::{register_test_connectors, test_request_context},
 };
 
 use runtime::Runtime;
@@ -33,7 +33,7 @@ fn make_databricks_spark_dataset(path: &str, name: &str) -> Dataset {
     dataset
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn get_params() -> Params {
     // Verify that the environment variables are set
     let _ = std::env::var("NEW_DATABRICKS_HOST").expect("NEW_DATABRICKS_HOST is not set");
@@ -80,6 +80,7 @@ async fn databricks_spark_m2m_integration_test() -> Result<(), anyhow::Error> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -100,7 +101,7 @@ async fn databricks_spark_m2m_integration_test() -> Result<(), anyhow::Error> {
             // Set a timeout for the test
             tokio::select! {
                 // We may need to wait for the cluster to startup and become ready, so wait for up to 10 minutes
-                () = tokio::time::sleep(std::time::Duration::from_secs(600)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(10)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -119,11 +120,11 @@ async fn databricks_spark_m2m_integration_test() -> Result<(), anyhow::Error> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Databricks (mode: spark_connect_m2m) Integration Test Results"),
+                        description => "Databricks (mode: spark_connect_m2m) Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("databricks_spark_connect_m2m_select"), results);
+                        insta::assert_snapshot!("databricks_spark_connect_m2m_select", results);
                     });
                 })),
             )];

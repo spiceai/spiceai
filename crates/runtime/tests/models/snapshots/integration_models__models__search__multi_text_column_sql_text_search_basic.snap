@@ -6,22 +6,22 @@ snapshot_kind: text
 [
   {
     "cp_catalog_page_sk": 7,
-    "trunc(text_search().score,Int64(3))": 0.024,
+    "trunc(text_search().score,Int64(2))": 0.024,
     "cp_department": "DEPARTMENT"
   },
   {
     "cp_catalog_page_sk": 16,
-    "trunc(text_search().score,Int64(3))": 0.024,
+    "trunc(text_search().score,Int64(2))": 0.024,
     "cp_department": "DEPARTMENT"
   },
   {
     "cp_catalog_page_sk": 19,
-    "trunc(text_search().score,Int64(3))": 0.024,
+    "trunc(text_search().score,Int64(2))": 0.024,
     "cp_department": "DEPARTMENT"
   },
   {
     "cp_catalog_page_sk": 10,
-    "trunc(text_search().score,Int64(3))": 0.024,
+    "trunc(text_search().score,Int64(2))": 0.024,
     "cp_department": "DEPARTMENT"
   }
 ]

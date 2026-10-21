@@ -8,34 +8,48 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 
 | Connector                        | Alpha Quality | DRI Sign-off    |
 | -------------------------------- | ------------- | --------------- |
-| Clickhouse                       | ➖            |                 |
-| Databricks (mode: delta_lake)    | ✅            | @Sevenannn      |
-| Databricks (mode: spark_connect) | ✅            | @Sevenannn      |
-| Delta Lake                       | ✅            | @Sevenannn      |
-| Dremio                           | ✅            | @Sevenannn      |
-| DuckDB                           | ✅            | @peasee         |
-| File                             | ✅            | @peasee         |
-| FlightSQL                        | ➖            |                 |
-| FTP/SFTP                         | ➖            |                 |
-| GraphQL                          | ➖            |                 |
-| GitHub                           | ✅            | @peasee         |
-| Glue                             | ✅            | @kczimm         |
-| HTTP/HTTPS                       | ➖            |                 |
-| IMAP                             | ✅            | @peasee         |
-| Iceberg                          | ✅            | @phillipleblanc |
-| Kafka                            | ✅            | @sgrebnov       |
-| Localpod                         | ➖            |                 |
-| MS SQL                           | ✅            | @peasee         |
-| MySQL                            | ✅            | @peasee         |
-| ODBC                             | ➖            |                 |
-| Oracle                           | ✅            | @sgrebnov       |
-| PostgreSQL                       | ✅            | @Sevenannn      |
-| Sharepoint                       | ➖            |                 |
-| Snowflake                        | ✅            | @phillipleblanc |
-| Spice.ai Cloud Platform          | ✅            | @phillipleblanc |
-| S3                               | ✅            | @Sevenannn      |
-| Azure BlobFS                     | ➖            |                 |
-| Spark                            | ✅            | @ewgenius       |
+| ADBC                             | ✅             | @lukekim        |
+| Azure BlobFS                     | ➖             |                 |
+| Clickhouse                       | ➖             |                 |
+| Cosmos DB (NoSQL)                | ✅             | @lukekim        |
+| Databricks (mode: delta_lake)    | ✅             | @Sevenannn      |
+| Databricks (mode: spark_connect) | ✅             | @Sevenannn      |
+| Databricks (mode: sql_warehouse) | ✅             | @lukekim        |
+| Debezium                         | ➖             |                 |
+| CDC (Debezium push ingest)       | ➖             |                 |
+| Delta Lake                       | ✅             | @Sevenannn      |
+| Dremio                           | ✅             | @Sevenannn      |
+| DuckDB                           | ✅             | @peasee         |
+| DuckLake                         | ✅             | @sgrebnov       |
+| DynamoDB                         | ✅             | @krinart        |
+| File                             | ✅             | @peasee         |
+| FlightSQL                        | ✅             | @lukekim        |
+| FTP/SFTP                         | ➖             |                 |
+| GCS                              | ➖             |                 |
+| Git                              | ✅             | @lukekim        |
+| GitHub                           | ✅             | @peasee         |
+| Glue                             | ✅             | @kczimm         |
+| GraphQL                          | ✅             | @peasee         |
+| HTTP/HTTPS                       | ✅             | @lukekim        |
+| Hugging Face                     | ➖             |                 |
+| Iceberg                          | ✅             | @phillipleblanc |
+| IMAP                             | ✅             | @peasee         |
+| Kafka                            | ✅             | @sgrebnov       |
+| Localpod                         | ✅             | @lukekim        |
+| MongoDB                          | ✅             | @lukekim        |
+| MS SQL                           | ✅             | @peasee         |
+| MySQL                            | ✅             | @peasee         |
+| NFS                              | ➖             |                 |
+| ODBC                             | ✅             | @lukekim        |
+| Oracle                           | ✅             | @sgrebnov       |
+| PostgreSQL                       | ✅             | @Sevenannn      |
+| S3                               | ✅             | @Sevenannn      |
+| ScyllaDB                         | ➖             |                 |
+| Sharepoint                       | ✅             | @lukekim        |
+| SMB                              | ➖             |                 |
+| Snowflake                        | ✅             | @phillipleblanc |
+| Spark                            | ✅             | @ewgenius       |
+| Spice.ai Cloud Platform          | ✅             | @phillipleblanc |
 
 ## Alpha Release Criteria
 

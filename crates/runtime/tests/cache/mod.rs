@@ -52,7 +52,7 @@ async fn test_cache_control_no_cache() -> Result<(), anyhow::Error> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -71,11 +71,11 @@ async fn test_cache_control_no_cache() -> Result<(), anyhow::Error> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Cache Integration Test Results"),
+                        description => "Cache Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("cache_integration_test_select"), results);
+                        insta::assert_snapshot!("cache_integration_test_select", results);
                     });
                 })),
             )];

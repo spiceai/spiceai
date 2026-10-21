@@ -18,11 +18,11 @@ description: "Query: tpch_simple_q2"
 |               |     AggregateExec: mode=Final, gby=[], aggr=[max(hadoop.tpch.lineitem.l_linenumber)]                                                            |
 |               |       CoalescePartitionsExec                                                                                                                    |
 |               |         AggregateExec: mode=Partial, gby=[], aggr=[max(hadoop.tpch.lineitem.l_linenumber)]                                                      |
-|               |           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                 |
-|               |             BytesProcessedExec                                                                                                                  |
+|               |           BytesProcessedExec                                                                                                                    |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                               |
 |               |               IcebergTableScan projection:[l_linenumber] predicate:[]                                                                           |
-|               |     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                       |
-|               |       BytesProcessedExec                                                                                                                        |
+|               |     BytesProcessedExec                                                                                                                          |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                     |
 |               |         IcebergTableScan projection:[l_linenumber] predicate:[]                                                                                 |
 |               |                                                                                                                                                 |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -15,16 +15,15 @@ limitations under the License.
 */
 use crate::s3_vectors::{
     MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
-    S3VectorBuildSnafu, spill::MAX_SPILL_SEQUENCE,
+    S3VectorBuildSnafu,
+    query_provider::S3_VECTOR_DISTANCE_NAME,
+    spill::{current_index, next_index},
 };
 use arrow_tools::record_batch::replace_column_in_record;
 use std::{
     collections::HashMap,
     error::Error as StdError,
-    sync::{
-        Arc,
-        atomic::{AtomicU8, Ordering},
-    },
+    sync::{Arc, atomic::AtomicU8},
 };
 
 use super::{Error, Result, S3VectorIdentifier};
@@ -39,13 +38,15 @@ use aws_credential_types::provider::error::CredentialsError;
 use datafusion::{
     common::{Constraint, Constraints},
     error::DataFusionError,
+    logical_expr::TableProviderFilterPushDown,
+    prelude::Expr,
 };
 
 use s3_vectors::{
     CreateIndexError, CreateIndexInput, CreateVectorBucketError, CreateVectorBucketInput,
-    DistanceMetric, Document, GetIndexError, GetIndexInput, GetIndexOutput, GetVectorBucketError,
-    GetVectorBucketInput, MetadataConfiguration, PUT_VECTORS_MAX_ITEMS, PutInputVector,
-    PutVectorsError, PutVectorsInput, S3Vectors, SdkError, VectorData,
+    DeleteVectorsInput, DistanceMetric, Document, GetIndexError, GetIndexInput, GetIndexOutput,
+    GetVectorBucketError, GetVectorBucketInput, MetadataConfiguration, PUT_VECTORS_MAX_ITEMS,
+    PutInputVector, PutVectorsError, PutVectorsInput, S3Vectors, SdkError, VectorData,
 };
 use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
@@ -56,7 +57,6 @@ use tokio::sync::mpsc::Sender;
 #[derive(Clone)]
 pub struct S3VectorsTable {
     pub idx: Arc<S3VectorIdentifier>,
-    pub spill_index: Arc<AtomicU8>,
     pub client: Arc<dyn S3Vectors + Send + Sync>,
 
     // The SQL schema of the index. Expects to have:
@@ -77,7 +77,7 @@ impl std::fmt::Debug for S3VectorsTable {
         f.debug_struct("S3VectorsListTable")
             .field("schema", &self.schema)
             .field("constraints", &self.constraints)
-            .field("index_identifier", &self.current_index())
+            .field("index_identifier", &self.idx)
             .finish_non_exhaustive()
     }
 }
@@ -99,52 +99,6 @@ impl S3VectorTableResult {
 }
 
 impl S3VectorsTable {
-    /// Returns the current index identifier, accounting for spilling.
-    #[must_use]
-    pub fn current_index(&self) -> S3VectorIdentifier {
-        let spill_num = self.spill_index.load(Ordering::SeqCst);
-        if spill_num == 0 {
-            (*self.idx).clone()
-        } else {
-            match &*self.idx {
-                S3VectorIdentifier::Index {
-                    bucket_name,
-                    index_name,
-                } => {
-                    let spill_name = format!("{index_name}.{spill_num:02}");
-                    S3VectorIdentifier::Index {
-                        bucket_name: bucket_name.clone(),
-                        index_name: spill_name,
-                    }
-                }
-                S3VectorIdentifier::IndexArn(_) => (*self.idx).clone(),
-            }
-        }
-    }
-
-    /// Returns the next index identifier, incrementing the spill index
-    ///
-    /// # Errors
-    /// Returns an error if there is no next index
-    pub fn next_index(&self) -> Result<S3VectorIdentifier> {
-        let old_spill_index =
-            self.spill_index
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
-                    if x >= MAX_SPILL_SEQUENCE {
-                        None
-                    } else {
-                        Some(x + 1)
-                    }
-                });
-
-        let max_exceeded = old_spill_index.is_err();
-        if max_exceeded {
-            return Err(Error::MaxSpillAttemptsReached);
-        }
-
-        Ok(self.current_index())
-    }
-
     // Returns an [`S3VectorTableResult`] if the [`S3VectorIdentifier`] does not exist. Use [`Self::try_create_new_identifier`].
     pub async fn try_new_table(
         id: S3VectorIdentifier,
@@ -170,7 +124,6 @@ impl S3VectorsTable {
                 let constraints = Self::primary_key(&schema);
                 Ok(S3VectorTableResult::Table(Self {
                     idx: Arc::new(id),
-                    spill_index: Arc::new(AtomicU8::new(0)),
                     client,
                     schema,
                     constraints,
@@ -183,6 +136,12 @@ impl S3VectorsTable {
                 Ok(S3VectorTableResult::IndexDoesNotExist)
             }
         }
+    }
+
+    #[must_use]
+    pub fn with_new_id(mut self, id: S3VectorIdentifier) -> Self {
+        self.idx = Arc::new(id);
+        self
     }
 
     pub async fn try_create_new_table(
@@ -271,7 +230,7 @@ impl S3VectorsTable {
 
         match client
             .create_index(
-                CreateIndexInput::builder()
+                &CreateIndexInput::builder()
                     .data_type(s3_vectors::DataType::Float32)
                     .dimension(dimension.try_into().unwrap_or(i32::MAX))
                     .distance_metric(distance_metric.clone())
@@ -312,7 +271,7 @@ impl S3VectorsTable {
         };
         match client
             .create_vector_bucket(
-                CreateVectorBucketInput::builder()
+                &CreateVectorBucketInput::builder()
                     .vector_bucket_name(bucket_name.clone())
                     .build()
                     .context(S3VectorBuildSnafu)?,
@@ -347,10 +306,16 @@ impl S3VectorsTable {
         client: &Arc<dyn S3Vectors + Send + Sync>,
         id: &S3VectorIdentifier,
     ) -> Result<bool> {
+        // An index ARN identifies an existing index directly. It has no bucket name, so
+        // `GetVectorBucket` cannot validate it; `get_index_if_exists` performs that check next.
+        if matches!(id, S3VectorIdentifier::IndexArn(_)) {
+            return Ok(true);
+        }
+
         let bucket_name_opt = id.bucket_name().map(ToString::to_string);
         match client
             .get_vector_bucket(
-                GetVectorBucketInput::builder()
+                &GetVectorBucketInput::builder()
                     .set_vector_bucket_name(bucket_name_opt)
                     .build()
                     .context(S3VectorBuildSnafu)?,
@@ -394,7 +359,7 @@ impl S3VectorsTable {
         let (index_arn, vector_bucket_name, index_name) = index.index_identifier_variables();
         match client
             .get_index(
-                GetIndexInput::builder()
+                &GetIndexInput::builder()
                     .set_index_arn(index_arn)
                     .set_vector_bucket_name(vector_bucket_name)
                     .set_index_name(index_name)
@@ -476,21 +441,22 @@ impl S3VectorsTable {
         data: Vec<Option<Vec<f32>>>,
         key: Vec<Option<String>>,
         metadata: HashMap<String, Vec<Option<Value>>>,
+        spill_index: Option<Arc<AtomicU8>>,
     ) -> Result<()> {
         let start = std::time::Instant::now();
 
         let vectors: Vec<PutInputVector> = data
             .into_iter()
-            .zip(key.into_iter())
+            .zip(key)
             .enumerate()
             .filter_map(|(i, (data, key))| {
-                let key = key?.to_string();
+                let key = key?;
                 let data = data?;
                 let meta: HashMap<String, Document> = metadata
                     .iter()
                     .filter_map(|(k, v)| {
                         let value = v.get(i)?.as_ref()?;
-                        let meta = json_value_to_document(value.clone());
+                        let meta = json_value_to_document(value.clone()).ok()?;
 
                         if matches!(meta, Document::Null) {
                             return None;
@@ -516,14 +482,13 @@ impl S3VectorsTable {
             .collect();
 
         for chunk in vectors.chunks(PUT_VECTORS_MAX_ITEMS) {
-            self.write_chunk_with_spilling(chunk).await?;
+            self.write_chunk_with_spilling(chunk, spill_index.clone())
+                .await?;
         }
-
-        let current_index = self.current_index();
 
         tracing::info!(
             "S3 Vectors Index {index_name} updated; records={records}, duration={duration:?}",
-            index_name = &current_index,
+            index_name = &self.idx,
             records = vectors.len(),
             duration = start.elapsed()
         );
@@ -532,8 +497,16 @@ impl S3VectorsTable {
     }
 
     /// Writes a chunk of vectors, handling spilling to additional indexes when capacity is exceeded.
-    async fn write_chunk_with_spilling(&self, chunk: &[PutInputVector]) -> Result<()> {
-        let mut current_index = self.current_index();
+    async fn write_chunk_with_spilling(
+        &self,
+        chunk: &[PutInputVector],
+        spill_index: Option<Arc<AtomicU8>>,
+    ) -> Result<()> {
+        let mut current_index = if let Some(ref spill) = spill_index {
+            current_index(&self.idx, spill)
+        } else {
+            Arc::unwrap_or_clone(Arc::clone(&self.idx))
+        };
 
         loop {
             let (index_arn, vector_bucket_name, index_name) =
@@ -542,7 +515,7 @@ impl S3VectorsTable {
             let result = self
                 .client
                 .put_vectors(
-                    PutVectorsInput::builder()
+                    &PutVectorsInput::builder()
                         .set_index_arn(index_arn.clone())
                         .set_index_name(index_name.clone())
                         .set_vector_bucket_name(vector_bucket_name.clone())
@@ -557,13 +530,19 @@ impl S3VectorsTable {
                     return Ok(());
                 }
                 Err(SdkError::ServiceError(service_error)) => {
-                    if Self::is_capacity_exceeded_error(service_error.err()) {
+                    if matches!(
+                        service_error.err(),
+                        PutVectorsError::ServiceQuotaExceededException(_)
+                    ) {
                         // Increment spill index and try to create a new index
-                        current_index = self.next_index()?;
+                        if let Some(ref spill) = spill_index {
+                            current_index = next_index(&self.idx, spill)?;
+                        }
+
                         Self::create_index(
                             &self.client,
                             self.dimension,
-                            &current_index,
+                            &self.idx,
                             self.columns.non_filterable_names(),
                             &self.distance_metric,
                         )
@@ -583,8 +562,73 @@ impl S3VectorsTable {
         }
     }
 
-    fn is_capacity_exceeded_error(error: &PutVectorsError) -> bool {
-        matches!(error, PutVectorsError::ServiceQuotaExceededException(_))
+    /// Deletes vectors by key from this single physical index.
+    ///
+    /// Only reaches the index `self` is bound to — a caller managing multiple physical indexes
+    /// for one logical index (spillover, partitioning) is responsible for calling this once per
+    /// relevant target (see `search::index::s3_vectors::S3Vector::delete_target_tables`).
+    pub async fn delete_by_keys(&self, keys: Vec<String>) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let (index_arn, vector_bucket_name, index_name) = self.idx.index_identifier_variables();
+
+        for chunk in keys.chunks(PUT_VECTORS_MAX_ITEMS) {
+            self.client
+                .delete_vectors(
+                    &DeleteVectorsInput::builder()
+                        .set_index_arn(index_arn.clone())
+                        .set_index_name(index_name.clone())
+                        .set_vector_bucket_name(vector_bucket_name.clone())
+                        .set_keys(Some(chunk.to_vec()))
+                        .build()
+                        .context(S3VectorBuildSnafu)?,
+                )
+                .await
+                .map_err(|e| Error::S3VectorDeleteVectorError {
+                    source: Box::new(e.into_service_error()),
+                })?;
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn query_provider_schema(&self) -> SchemaRef {
+        let mut base_fields = self.schema.fields().iter().cloned().collect::<Vec<_>>();
+
+        base_fields.push(Arc::new(Field::new(
+            S3_VECTOR_DISTANCE_NAME,
+            DataType::Float64,
+            false,
+        )));
+
+        Arc::new(Schema::new(base_fields))
+    }
+
+    pub(super) fn query_provider_supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Vec<TableProviderFilterPushDown> {
+        // Filters can only possibly be pushed down for columns in underlying metadata (i.e. not derived columns like `S3_VECTOR_DISTANCE_NAME`).
+        let columns: Vec<_> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|c| self.is_filterable_column(c.as_str()))
+            .collect();
+
+        filters
+            .iter()
+            .map(|f| {
+                if s3_vectors_metadata_filter::supports_filter_expr(columns.as_slice(), f) {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect()
     }
 }
 
@@ -661,7 +705,6 @@ mod tests {
                 bucket_name: "test-bucket".to_string(),
                 index_name: index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             client,
             schema: Arc::new(Schema::new(vec![
                 Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
@@ -692,6 +735,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn index_arn_does_not_check_for_a_bucket() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let id = S3VectorIdentifier::IndexArn(
+            "arn:aws:s3vectors:us-east-2:123456789012:bucket/test-bucket/index/test-index"
+                .to_string(),
+        );
+
+        let exists = S3VectorsTable::check_if_bucket_exists(&client, &id)
+            .await
+            .expect("an index ARN must bypass bucket validation");
+
+        assert!(exists);
+        assert_eq!(mock_client.get_vector_bucket_call_count(), 0);
+    }
+
+    #[tokio::test]
     async fn test_write_chunk_without_spilling() -> Result<(), Box<dyn std::error::Error>> {
         let mock_client = Arc::new(MockClient::new());
         let table = create_test_table(
@@ -703,7 +763,7 @@ mod tests {
         table
             .client
             .create_vector_bucket(
-                CreateVectorBucketInput::builder()
+                &CreateVectorBucketInput::builder()
                     .vector_bucket_name("test-bucket")
                     .build()?,
             )
@@ -712,7 +772,7 @@ mod tests {
         table
             .client
             .create_index(
-                CreateIndexInput::builder()
+                &CreateIndexInput::builder()
                     .index_name("test-index")
                     .vector_bucket_name("test-bucket")
                     .data_type(S3DataType::Float32)
@@ -723,9 +783,9 @@ mod tests {
             .await?;
 
         let vectors = create_test_vectors(5);
-        let result = table.write_chunk_with_spilling(&vectors).await;
+        let result = table.write_chunk_with_spilling(&vectors, None).await;
 
-        assert!(result.is_ok());
+        result.expect("Should write without error");
         assert_eq!(mock_client.get_vector_count("test-index"), 5);
 
         Ok(())
@@ -748,7 +808,7 @@ mod tests {
         table
             .client
             .create_vector_bucket(
-                CreateVectorBucketInput::builder()
+                &CreateVectorBucketInput::builder()
                     .vector_bucket_name("test-bucket")
                     .build()?,
             )
@@ -757,7 +817,7 @@ mod tests {
         table
             .client
             .create_index(
-                CreateIndexInput::builder()
+                &CreateIndexInput::builder()
                     .index_name("test-index")
                     .vector_bucket_name("test-bucket")
                     .data_type(S3DataType::Float32)
@@ -767,15 +827,22 @@ mod tests {
             )
             .await?;
 
+        let spill_index = Arc::new(AtomicU8::new(0));
         let vectors = create_test_vectors(3);
-        let result = table.write_chunk_with_spilling(&vectors).await;
-        assert!(result.is_ok());
+        table
+            .write_chunk_with_spilling(&vectors, Some(Arc::clone(&spill_index)))
+            .await
+            .expect("Should write without error");
         let vectors = create_test_vectors(3);
-        let result = table.write_chunk_with_spilling(&vectors).await;
-        assert!(result.is_ok());
+        table
+            .write_chunk_with_spilling(&vectors, Some(Arc::clone(&spill_index)))
+            .await
+            .expect("Should write without error");
         let vectors = create_test_vectors(3);
-        let result = table.write_chunk_with_spilling(&vectors).await;
-        assert!(result.is_ok());
+        table
+            .write_chunk_with_spilling(&vectors, Some(Arc::clone(&spill_index)))
+            .await
+            .expect("Should write without error");
 
         assert_eq!(mock_client.get_vector_count("test-index"), 3);
         assert_eq!(mock_client.get_vector_count("test-index.01"), 3);
@@ -802,7 +869,7 @@ mod tests {
         table
             .client
             .create_vector_bucket(
-                CreateVectorBucketInput::builder()
+                &CreateVectorBucketInput::builder()
                     .vector_bucket_name("test-bucket")
                     .build()?,
             )
@@ -811,7 +878,7 @@ mod tests {
         table
             .client
             .create_index(
-                CreateIndexInput::builder()
+                &CreateIndexInput::builder()
                     .index_name("test-index")
                     .vector_bucket_name("test-bucket")
                     .data_type(S3DataType::Float32)
@@ -821,15 +888,112 @@ mod tests {
             )
             .await?;
 
+        let spill_index = Arc::new(AtomicU8::new(0));
         for _ in 0..100 {
             let vectors = create_test_vectors(1);
-            table.write_chunk_with_spilling(&vectors).await?;
+            table
+                .write_chunk_with_spilling(&vectors, Some(Arc::clone(&spill_index)))
+                .await?;
         }
 
-        let vectors = create_test_vectors(1);
-        let result = table.write_chunk_with_spilling(&vectors).await;
+        // Every write up to the boundary landed exactly once: one vector in the
+        // main index and one in each of the 99 spill indexes, none dropped.
+        assert_eq!(mock_client.get_vector_count("test-index"), 1);
+        for i in 1..=99 {
+            let index_name = format!("test-index.{i:02}");
+            assert_eq!(
+                mock_client.get_vector_count(&index_name),
+                1,
+                "spill index {index_name} must hold exactly the one vector written to it"
+            );
+        }
+        assert_eq!(
+            spill_index.load(std::sync::atomic::Ordering::SeqCst),
+            99,
+            "the hundredth write must land in the last spill index"
+        );
 
-        assert!(result.is_err());
+        let vectors = create_test_vectors(1);
+        let result = table
+            .write_chunk_with_spilling(&vectors, Some(Arc::clone(&spill_index)))
+            .await;
+
+        assert!(
+            matches!(result, Err(Error::MaxSpillAttemptsReached)),
+            "a write past the last spill index must fail with MaxSpillAttemptsReached, got {result:?}"
+        );
+        assert_eq!(
+            mock_client.get_vector_count("test-index.99"),
+            1,
+            "the rejected write must not land in the full last spill index"
+        );
+        assert_eq!(
+            spill_index.load(std::sync::atomic::Ordering::SeqCst),
+            99,
+            "an exhausted spill sequence must not advance past 99"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_by_keys_removes_only_the_targeted_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mock_client = Arc::new(MockClient::new());
+        let table = create_test_table(
+            Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>,
+            "test-index",
+        );
+
+        table
+            .client
+            .create_vector_bucket(
+                &CreateVectorBucketInput::builder()
+                    .vector_bucket_name("test-bucket")
+                    .build()?,
+            )
+            .await?;
+        table
+            .client
+            .create_index(
+                &CreateIndexInput::builder()
+                    .index_name("test-index")
+                    .vector_bucket_name("test-bucket")
+                    .data_type(S3DataType::Float32)
+                    .dimension(3)
+                    .distance_metric(DistanceMetric::Cosine)
+                    .build()?,
+            )
+            .await?;
+
+        table
+            .write_chunk_with_spilling(&create_test_vectors(3), None)
+            .await
+            .expect("seed write should succeed");
+        assert_eq!(
+            mock_client.vector_keys("test-index"),
+            vec!["key0", "key1", "key2"]
+        );
+
+        table
+            .delete_by_keys(vec!["key1".to_string()])
+            .await
+            .expect("delete should succeed");
+        assert_eq!(mock_client.vector_keys("test-index"), vec!["key0", "key2"]);
+
+        // Deleting a key that is not present is a no-op, matching the real `DeleteVectors`.
+        table
+            .delete_by_keys(vec!["absent".to_string()])
+            .await
+            .expect("deleting an absent key should succeed");
+        assert_eq!(mock_client.vector_keys("test-index"), vec!["key0", "key2"]);
+
+        // An empty key set short-circuits before any client call and changes nothing.
+        table
+            .delete_by_keys(vec![])
+            .await
+            .expect("empty delete should succeed");
+        assert_eq!(mock_client.vector_keys("test-index"), vec!["key0", "key2"]);
 
         Ok(())
     }

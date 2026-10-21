@@ -1,0 +1,160 @@
+# Shared helpers for the expect scripts that drive an interactive Spice REPL
+# (`spice chat`, `spice search`) over a pty.
+#
+# expect treats a spawned process going away as an ordinary end of input: when an
+# `expect` block has no `eof` pattern, the eof ends the block without running any
+# body, so the script continues as if the pattern had matched and reports success
+# for a response that never arrived. The dead process then only surfaces at the
+# next `send`, as "spawn id expN not open" — naming a line in the script instead
+# of the exit status of the process that died. See #12057.
+#
+# Every `expect` block in these scripts therefore needs an `eof` branch calling
+# `repl_died`, and every `send` goes through `repl_send`.
+#
+# A block waiting on a REPL response additionally needs a branch that consumes
+# the lines arriving before the terminator and `exp_continue`s, so the bound
+# below measures silence rather than total response time (#13711). That branch
+# must consume whole lines only: `expect` removes everything up to and including
+# a match, so a catch-all like `-re {.+}` will eat a terminator that arrived
+# split across two reads — `"…text\nch"` then `"at> "` — and then wait for a
+# prompt that has already gone by. Whole lines are also what separates the
+# REPL's output from its own spinner: the spinner redraws with a bare carriage
+# return and never writes a newline, so it does not count as progress and a
+# request that hangs behind a spinner still trips the bound.
+
+# Renders text passed to `repl_send` for a diagnostic message.
+proc repl_render {text} {
+    return [string map [list "\r" "" "\x03" "<Ctrl-C>"] $text]
+}
+
+# Describes how the spawned process terminated, reaping it in the process.
+proc repl_termination_description {} {
+    if {[catch {wait} status]} {
+        return "could not be waited for ($status)"
+    }
+
+    # `wait` returns {pid spawn_id os_error_flag value}, where a non-zero
+    # os_error_flag makes `value` an errno message rather than an exit status,
+    # optionally followed by {CHILDKILLED signal description}.
+    if {[lindex $status 2] != 0} {
+        return "could not be reaped: [lindex $status 3]"
+    }
+
+    set signal [lrange $status 4 end]
+    if {[llength $signal] > 0} {
+        return "was terminated abnormally: $signal"
+    }
+
+    return "exited with status [lindex $status 3]"
+}
+
+# Reports a spawned process that is no longer running, then fails the script.
+# `context` says what the script was doing when it noticed.
+proc repl_died {context {detail ""}} {
+    send_user "\n$context: the spawned process is no longer running.\n"
+
+    if {$detail ne ""} {
+        send_user "expect reported: $detail\n"
+    }
+
+    # Read anything the process printed on its way out — with `log_user` on that
+    # output is echoed as it arrives, and it is usually the only record of why
+    # the process left. The connection is already closed once an `expect` block
+    # has matched eof, which makes this a no-op.
+    catch {
+        set timeout 5
+        expect {
+            eof {}
+            timeout {}
+        }
+    }
+
+    send_user "Spawned process [repl_termination_description].\n"
+    exit 1
+}
+
+# `send`, reporting a process that has already gone away instead of raising
+# "spawn id expN not open".
+proc repl_send {text} {
+    if {[catch {send -- $text} send_error]} {
+        repl_died "Sending \"[repl_render $text]\"" $send_error
+    }
+}
+
+# The arguments that point a REPL at this job's runtime, or none at all.
+#
+# In CI each job binds its runtime to its own port, because the self-hosted
+# pools run several runner instances on one host and spiced's default 8090
+# cannot be shared (#12419). SPICE_HTTP_ENDPOINT carries that port. When it is
+# unset — running one of these scripts by hand against a local runtime — the
+# REPL keeps its own default, so nothing has to be set to reproduce a CI run.
+proc repl_endpoint_args {} {
+    if {[info exists ::env(SPICE_HTTP_ENDPOINT)] && $::env(SPICE_HTTP_ENDPOINT) ne ""} {
+        return [list --endpoint $::env(SPICE_HTTP_ENDPOINT)]
+    }
+
+    return [list]
+}
+
+# How many seconds of silence from a REPL count as a stall.
+#
+# A fixed bound on a whole response is not a property of a working runtime:
+# answer length is nondeterministic, a search's latency depends on the embedding
+# model behind it, and the self-hosted macOS pool is contended, so a REPL that
+# was still producing output tripped the bound and the failure ejected unrelated
+# PRs from the merge queue (#13711). Bounding silence instead measures something
+# the runtime controls — it has either produced output recently or it has
+# stopped. The guard against a genuinely wedged runtime stays the job's own
+# `timeout-minutes`.
+#
+# Progress is counted per line, because the prompt that ends a response carries
+# no newline (see the header). A chat answer streams its tokens without newlines
+# until the model emits one, so the default is sized for the longest paragraph a
+# CI model emits at its slowest rate, with room to spare: it is a stall bound,
+# not a latency target.
+#
+# SPICE_REPL_IDLE_TIMEOUT overrides the bound so expect_test.sh can exercise the
+# stall path without waiting the production value, and so a run against a slower
+# host can widen it without editing the scripts.
+proc repl_idle_timeout {} {
+    if {![info exists ::env(SPICE_REPL_IDLE_TIMEOUT)] || $::env(SPICE_REPL_IDLE_TIMEOUT) eq ""} {
+        return 90
+    }
+
+    # A bound that cannot be read is not a bound. Reject it here rather than
+    # letting the next `expect` call reject it, where the message names a line in
+    # one of these scripts instead of the variable that was set wrong.
+    set override [string trim $::env(SPICE_REPL_IDLE_TIMEOUT)]
+    if {![string is integer -strict $override] || $override <= 0} {
+        send_user "SPICE_REPL_IDLE_TIMEOUT must be a positive whole number of seconds, got \"$override\".\n"
+        exit 1
+    }
+
+    return $override
+}
+
+# Reports a REPL that stopped producing output, then fails the script. `context`
+# says what the script was waiting for.
+#
+# Says which of the two things happened, because the reader of a red merge-queue
+# check otherwise has to decide between "the runtime hung" and "the runner was
+# slow" with no evidence either way. This bound only fires on the former.
+proc repl_stalled {context} {
+    send_user "\n$context: no output from the REPL for [repl_idle_timeout]s.\n"
+    send_user "The wait is bounded on silence, not on total response time, so the REPL had stopped producing output rather than being slow to finish.\n"
+    exit 1
+}
+
+# Fails the script if the spawned process has exited. Writing to the pty of an
+# exited process succeeds silently, so a REPL that crashes while sitting idle at
+# its prompt is invisible to `repl_send` alone; reading finds the eof. Output
+# already buffered stays available to the next `expect`.
+proc repl_assert_running {context} {
+    set timeout 1
+    expect {
+        eof {
+            repl_died $context
+        }
+        timeout {}
+    }
+}

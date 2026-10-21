@@ -22,16 +22,35 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error};
 use serde_json::Value;
 
-use crate::component::embeddings::EmbeddingChunkConfig;
+use crate::{
+    component::embeddings::{EmbeddingAggregation, EmbeddingChunkConfig},
+    metadata::metadata_value_to_string,
+    param::Params,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct Column {
     pub name: String,
 
     /// Optional semantic details about the column
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// Optional column data type. Accepts Postgres-style names (e.g.
+    /// `bigint`, `timestamptz`, `text[]`, `numeric(18,4)`) and Arrow display
+    /// forms (e.g. `Int64`, `Utf8`, `Map<Utf8, Int64>`).
+    ///
+    /// Stored as a raw string at the spicepod layer; parsed into an Arrow
+    /// `DataType` by the runtime via `parse_declared_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "data_type")]
+    pub r#type: Option<String>,
+
+    /// Optional nullability for the column. When omitted, the runtime
+    /// defaults to nullable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nullable: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub embeddings: Vec<ColumnLevelEmbeddingConfig>,
@@ -49,6 +68,8 @@ impl Column {
         Self {
             name: name.to_string(),
             description: None,
+            r#type: None,
+            nullable: None,
             embeddings: Vec::new(),
             full_text_search: None,
             metadata: HashMap::new(),
@@ -58,6 +79,18 @@ impl Column {
     #[must_use]
     pub fn with_metadata(mut self, metadata: HashMap<String, Value>) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    #[must_use]
+    pub fn with_type(mut self, ty: impl Into<String>) -> Self {
+        self.r#type = Some(ty.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_nullable(mut self, nullable: bool) -> Self {
+        self.nullable = Some(nullable);
         self
     }
 
@@ -84,10 +117,10 @@ impl Column {
     pub fn metadata(&self) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
         if let Some(d) = self.description.as_ref() {
-            metadata.insert("description".to_string(), d.to_string());
+            metadata.insert("description".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
-            metadata.insert(k.to_string(), v.to_string());
+            metadata.insert(k.clone(), metadata_value_to_string(v));
         }
         metadata
     }
@@ -116,6 +149,7 @@ impl From<&str> for Column {
 ///
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct ColumnLevelEmbeddingConfig {
     #[serde(rename = "from", default)]
     pub model: String,
@@ -133,6 +167,24 @@ pub struct ColumnLevelEmbeddingConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_size: Option<usize>,
+
+    /// Optional search engine override for this embedding column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+
+    /// Optional engine parameters for this embedding column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+
+    /// Aggregation strategy for multi-vector embeddings. Only meaningful
+    /// when the underlying column is list-typed. Defaults to `max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregation: Option<EmbeddingAggregation>,
+
+    /// Maximum number of list elements embedded per row for multi-vector
+    /// columns. Defaults to `32`; hard-capped at `1024`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_elements_per_row: Option<usize>,
 }
 
 impl ColumnLevelEmbeddingConfig {
@@ -143,7 +195,23 @@ impl ColumnLevelEmbeddingConfig {
             chunking: None,
             row_ids: None,
             vector_size: None,
+            engine: None,
+            params: None,
+            aggregation: None,
+            max_elements_per_row: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_aggregation(mut self, aggregation: EmbeddingAggregation) -> Self {
+        self.aggregation = Some(aggregation);
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_elements_per_row(mut self, n: usize) -> Self {
+        self.max_elements_per_row = Some(n);
+        self
     }
 
     #[must_use]
@@ -183,12 +251,12 @@ fn deserialize_row_ids<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D
 where
     D: serde::Deserializer<'de>,
 {
-    match serde_yaml::Value::deserialize(deserializer)? {
-            serde_yaml::Value::Null => Ok(None),
-            serde_yaml::Value::String(s) => {
+    match yaml::Value::deserialize(deserializer)? {
+            yaml::Value::Null => Ok(None),
+            yaml::Value::String(s) => {
                 Ok(Some(s.split(',').map(|s| s.trim().to_string()).collect()))
             }
-            serde_yaml::Value::Sequence(seq) => {
+            yaml::Value::Sequence(seq) => {
                 seq.iter()
                     .map(|v| {
                         v.as_str().map(ToString::to_string).ok_or_else(|| {
@@ -204,6 +272,7 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct FullTextSearchConfig {
     pub enabled: bool,
 
@@ -219,6 +288,14 @@ pub struct FullTextSearchConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_directory: Option<String>,
+
+    /// Optional text search engine override for this column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+
+    /// Optional engine parameters for this text search column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -247,6 +324,8 @@ impl FullTextSearchConfig {
             row_ids: None,
             index_store: Some(IndexStore::default()),
             index_directory: None,
+            engine: None,
+            params: None,
         }
     }
 
@@ -257,6 +336,8 @@ impl FullTextSearchConfig {
             row_ids: None,
             index_store: Some(IndexStore::default()),
             index_directory: None,
+            engine: None,
+            params: None,
         }
     }
 
@@ -288,7 +369,7 @@ pub enum MetadataType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yaml;
+    use yaml;
 
     #[test]
     fn test_deserialize_row_ids_single_string() {
@@ -297,7 +378,7 @@ mod tests {
                 row_id: foo
             ";
         let parsed: ColumnLevelEmbeddingConfig =
-            serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
+            yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
         assert_eq!(parsed.row_ids, Some(vec!["foo".to_string()]));
     }
 
@@ -308,7 +389,7 @@ mod tests {
                 row_id: foo, bar
             ";
         let parsed: ColumnLevelEmbeddingConfig =
-            serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
+            yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
         assert_eq!(
             parsed.row_ids,
             Some(vec!["foo".to_string(), "bar".to_string()])
@@ -324,16 +405,26 @@ mod tests {
                  - bar
             ";
         let parsed: ColumnLevelEmbeddingConfig =
-            serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
+            yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
         assert_eq!(
             parsed.row_ids,
             Some(vec!["foo".to_string(), "bar".to_string()])
         );
     }
 
+    /// Test that invalid `row_id` formats produce appropriate error messages.
+    ///
+    /// Note: These tests use `contains()` for error message assertions rather than exact
+    /// matching because:
+    /// 1. The yaml crate wraps error messages with location information (line/column) that
+    ///    can vary based on whitespace and indentation in the test YAML
+    /// 2. The important assertion is that the correct semantic error is raised (e.g.,
+    ///    "Invalid format for `row_id`" for validation errors, or "expected ',' or ']'" for
+    ///    YAML syntax errors)
+    /// 3. Exact location matching would make tests fragile to formatting changes
     #[test]
     fn test_deserialize_row_ids_errors() {
-        match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
+        match yaml::from_str::<ColumnLevelEmbeddingConfig>(
             r"
                 from: foo
                 row_id:
@@ -341,35 +432,37 @@ mod tests {
             ",
         ) {
             Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
-            Err(e) => assert_eq!(
-                e.to_string(),
-                "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\")} at line 2 column 17"
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("Invalid format for row_id. Expected a string, or array of strings."),
+                "Expected row_id format error, got: {e}"
             ),
         }
 
-        match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
+        match yaml::from_str::<ColumnLevelEmbeddingConfig>(
             r"
                 from: foo
                 row_id: {foo: bar, extra: value}
             ",
         ) {
             Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
-            Err(e) => assert_eq!(
-                e.to_string(),
-                "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\"), \"extra\": String(\"value\")} at line 2 column 17"
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("Invalid format for row_id. Expected a string, or array of strings."),
+                "Expected row_id format error, got: {e}"
             ),
         }
 
-        match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
+        match yaml::from_str::<ColumnLevelEmbeddingConfig>(
             r"
                 from: foo
                 row_id: [foo, bar
             ",
         ) {
             Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
-            Err(e) => assert_eq!(
-                e.to_string(),
-                "did not find expected ',' or ']' at line 5 column 1, while parsing a flow sequence at line 3 column 25"
+            Err(e) => assert!(
+                e.to_string().contains("expected ',' or ']'"),
+                "Expected YAML parse error, got: {e}"
             ),
         }
     }
@@ -378,7 +471,93 @@ mod tests {
     fn test_deserialize_row_ids_missing() {
         let yaml = "from: model_name";
         let parsed: ColumnLevelEmbeddingConfig =
-            serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
+            yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
         assert_eq!(parsed.row_ids, None);
+    }
+
+    // Regression tests for #10972 — column-level configuration silently accepted
+    // typo'd/unknown fields. `Column`, `ColumnLevelEmbeddingConfig`, and
+    // `FullTextSearchConfig` now carry `#[serde(deny_unknown_fields)]`, matching
+    // their parent `Dataset` and the rest of the spicepod component structs.
+
+    #[test]
+    fn test_column_valid_fields_parse() {
+        let yaml = r"
+name: id
+type: bigint
+nullable: false
+description: primary key
+";
+        let column: Column = yaml::from_str(yaml).expect("Failed to parse Column");
+        assert_eq!(column.name, "id");
+        assert_eq!(column.r#type.as_deref(), Some("bigint"));
+        assert_eq!(column.nullable, Some(false));
+    }
+
+    #[test]
+    fn test_column_data_type_alias_still_parses() {
+        // `data_type` is an accepted alias for `type`; deny_unknown_fields must
+        // not reject aliased fields.
+        let yaml = r"
+name: id
+data_type: bigint
+";
+        let column: Column = yaml::from_str(yaml).expect("Failed to parse Column");
+        assert_eq!(column.r#type.as_deref(), Some("bigint"));
+    }
+
+    #[test]
+    fn test_column_unknown_field_rejected() {
+        // Issue #10972 case A: `typee`/`nulleble` were silently discarded.
+        let yaml = r"
+name: id
+typee: bigint
+nulleble: false
+";
+        let result: Result<Column, _> = yaml::from_str(yaml);
+        // The first misspelled key is named, followed by every key the user could
+        // have meant (the `type` alias `data_type` included).
+        assert_eq!(
+            result
+                .expect_err(
+                    "unknown fields on columns[] should be rejected due to deny_unknown_fields"
+                )
+                .to_string(),
+            "unknown field `typee`, expected one of `name`, `description`, `data_type`, `type`, `nullable`, `embeddings`, `full_text_search`, `metadata`"
+        );
+    }
+
+    #[test]
+    fn test_column_embedding_config_unknown_field_rejected() {
+        let yaml = r"
+from: model_name
+vector_sizee: 384
+";
+        let result: Result<ColumnLevelEmbeddingConfig, _> = yaml::from_str(yaml);
+        assert_eq!(
+            result
+                .expect_err(
+                    "unknown fields on columns[].embeddings[] should be rejected due to deny_unknown_fields"
+                )
+                .to_string(),
+            "unknown field `vector_sizee`, expected one of `from`, `chunking`, `row_id`, `vector_size`, `engine`, `params`, `aggregation`, `max_elements_per_row`"
+        );
+    }
+
+    #[test]
+    fn test_full_text_search_config_unknown_field_rejected() {
+        let yaml = r"
+enabled: true
+index_storee: memory
+";
+        let result: Result<FullTextSearchConfig, _> = yaml::from_str(yaml);
+        assert_eq!(
+            result
+                .expect_err(
+                    "unknown fields on columns[].full_text_search should be rejected due to deny_unknown_fields"
+                )
+                .to_string(),
+            "unknown field `index_storee`, expected one of `enabled`, `row_id`, `index_store`, `index_directory`, `engine`, `params`"
+        );
     }
 }

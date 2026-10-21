@@ -21,11 +21,11 @@ use arrow_schema::DataType;
 #[cfg(test)]
 use async_openai::error::ApiError;
 #[cfg(test)]
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatChoice, ChatCompletionResponseMessage, CompletionUsage, CreateChatCompletionResponse,
     CreateChatCompletionStreamResponse, FinishReason, Role,
 };
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions,
     CreateChatCompletionRequestArgs,
 };
@@ -41,12 +41,14 @@ use datafusion::{
 };
 use futures::StreamExt;
 use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_status::{RuntimeStatus, unavailable_model_message};
 use tracing::{Instrument, Level};
 
 use async_trait::async_trait;
 use llms::chat::Chat;
+use model_capabilities::{Capability, CapabilityStore, require};
+use runtime_rate_control::RateController;
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::{Arc, LazyLock};
@@ -55,9 +57,10 @@ use tokio::sync::RwLock;
 
 // Security and performance constants
 const MAX_MESSAGE_SIZE: usize = 1_000_000; // 1MB per message
-const MAX_BATCH_SIZE: usize = 100; // Maximum rows per batch (LLM calls are slow)
+const MAX_BATCH_SIZE: usize = 1000; // Maximum rows per batch
 
 pub static AI_UDF_NAME: &str = "ai";
+runtime_udfs_api::register_spice_function!(AI_SPICE_FUNCTION, AI_UDF_NAME);
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
     Documentation {
     doc_section: DocSection::default(),
@@ -89,9 +92,16 @@ pub static SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
 });
 
 pub type ChatModelStore = HashMap<String, Arc<dyn Chat>>;
+pub type RateControllerStore = HashMap<String, Arc<RateController>>;
 
 pub struct Ai {
     model_store: Arc<RwLock<ChatModelStore>>,
+    capabilities: Arc<RwLock<CapabilityStore>>,
+    rate_controllers: Arc<RwLock<RateControllerStore>>,
+    /// Explains a configured model that is missing from `model_store`. A model that failed to
+    /// load, or has not finished loading, is never inserted there, so without its status a lookup
+    /// miss reads as "no such model".
+    model_status: Arc<RuntimeStatus>,
     // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `RwLock<ChatModelStore>` implement them.
     ptr: u64,
 }
@@ -120,9 +130,31 @@ impl Hash for Ai {
 
 impl Ai {
     #[must_use]
-    pub fn new(model_store: Arc<RwLock<ChatModelStore>>) -> Self {
+    pub fn new(
+        model_store: Arc<RwLock<ChatModelStore>>,
+        capabilities: Arc<RwLock<CapabilityStore>>,
+        rate_controllers: Arc<RwLock<RateControllerStore>>,
+        model_status: Arc<RuntimeStatus>,
+    ) -> Self {
         let ptr = Arc::as_ptr(&model_store).addr() as u64;
-        Self { model_store, ptr }
+        Self {
+            model_store,
+            capabilities,
+            rate_controllers,
+            model_status,
+            ptr,
+        }
+    }
+
+    /// Why each configured model that cannot serve is absent from the model store, ordered by
+    /// model name.
+    fn unavailable_model_reasons(&self) -> Vec<String> {
+        let mut statuses: Vec<_> = self.model_status.get_model_statuses().into_iter().collect();
+        statuses.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        statuses
+            .into_iter()
+            .filter_map(|(name, model_status)| unavailable_model_message(&name, Some(model_status)))
+            .collect()
     }
 
     #[must_use]
@@ -135,7 +167,14 @@ impl Ai {
         let models: Vec<String> = model_store.keys().cloned().collect();
 
         match models.len() {
-            0 => exec_err!("{AI_UDF_NAME}: No chat models configured in Spicepod"),
+            0 => {
+                let reasons = self.unavailable_model_reasons();
+                if reasons.is_empty() {
+                    exec_err!("{AI_UDF_NAME}: No chat models configured in Spicepod")
+                } else {
+                    exec_err!("{AI_UDF_NAME}: {}", reasons.join("; "))
+                }
+            }
             1 => Ok(models[0].clone()),
             _ => exec_err!(
                 "{AI_UDF_NAME}: Multiple chat models configured. Please specify model name as second argument"
@@ -145,10 +184,6 @@ impl Ai {
 }
 
 impl ScalarUDFImpl for Ai {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         AI_UDF_NAME
     }
@@ -172,6 +207,12 @@ impl ScalarUDFImpl for Ai {
 
 #[async_trait]
 impl AsyncScalarUDFImpl for Ai {
+    /// `DataFusion` otherwise hands an async function whole input batches (8192 rows by
+    /// default), which the batch cap below would reject.
+    fn ideal_batch_size(&self) -> Option<usize> {
+        Some(MAX_BATCH_SIZE)
+    }
+
     async fn invoke_async_with_args(
         &self,
         args: ScalarFunctionArgs,
@@ -213,13 +254,25 @@ impl AsyncScalarUDFImpl for Ai {
             self.get_default_model_name().await?
         };
 
+        let capabilities = self.capabilities.read().await;
         let model_store = self.model_store.read().await;
-        let Some(model) = model_store.get(&model_name) else {
+        let Ok(model) = require(&capabilities, &model_store, &model_name, Capability::Chat) else {
+            if let Some(reason) = self.model_status.unavailable_model_reason(&model_name) {
+                return exec_err!("{AI_UDF_NAME}: {reason}");
+            }
             return exec_err!(
                 "{AI_UDF_NAME} cannot find model '{}'. Available models: {}",
                 model_name,
                 model_store.keys().cloned().collect::<Vec<_>>().join(", ")
             );
+        };
+        drop(model_store);
+        drop(capabilities);
+
+        // Look up per-model rate controller for concurrency control
+        let rate_controller = {
+            let rc_store = self.rate_controllers.read().await;
+            rc_store.get(&model_name).cloned()
         };
 
         // Only convert the message argument to array (not the model name)
@@ -229,8 +282,8 @@ impl AsyncScalarUDFImpl for Ai {
             ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(args.number_rows)?,
         };
 
-        // Use target_partitions from config for parallelism control
-        let max_parallelism = args.config_options.execution.target_partitions;
+        // Fallback parallelism from DataFusion config when no rate controller is configured
+        let fallback_parallelism = args.config_options.execution.target_partitions;
 
         // Format the input to show the full UDF call: ai('message', 'model')
         let input = if args.args.len() == 2 {
@@ -257,17 +310,18 @@ impl AsyncScalarUDFImpl for Ai {
 
         let result = self
             .process_messages(
-                Arc::clone(model),
+                model,
                 &model_name,
                 message_array,
-                max_parallelism,
+                rate_controller,
+                fallback_parallelism,
             )
             .instrument(ai_span)
             .await;
 
         // Emit timing metrics for explain analyze
         let elapsed = start_time.elapsed();
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let elapsed_compute_ns = elapsed.as_nanos() as u64;
 
         // Log metrics in a format consistent with DataFusion explain analyze
@@ -326,7 +380,8 @@ impl Ai {
                     ])
                     .stream(true)
                     .stream_options(ChatCompletionStreamOptions {
-                        include_usage: true,
+                        include_usage: Some(true),
+                        include_obfuscation: None,
                     })
                     .build()?,
             )
@@ -362,7 +417,7 @@ impl Ai {
         let model_call_elapsed = model_call_start.elapsed();
 
         // Emit per-row timing metrics for explain analyze
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let elapsed_ns = model_call_elapsed.as_nanos() as u64;
         tracing::debug!(
             target: "datafusion::physical_plan::metrics",
@@ -384,7 +439,8 @@ impl Ai {
         model: Arc<dyn Chat>,
         model_name: &str,
         message_array: ArrayRef,
-        max_parallelism: usize,
+        rate_controller: Option<Arc<RateController>>,
+        fallback_parallelism: usize,
     ) -> DataFusionResult<ArrayRef> {
         let message_array = as_string_array(&message_array)?;
         let array_len = message_array.len();
@@ -404,8 +460,14 @@ impl Ai {
 
         // Always use parallel processing - LLM calls are I/O heavy, not compute heavy
         // Parallel processing benefits even small batches due to I/O wait times
-        self.process_messages_parallel(&model, model_name, message_array, max_parallelism)
-            .await
+        self.process_messages_parallel(
+            &model,
+            model_name,
+            message_array,
+            rate_controller,
+            fallback_parallelism,
+        )
+        .await
     }
 
     // Performance: Optimized parallel processing - always used since LLM calls are I/O heavy
@@ -414,15 +476,21 @@ impl Ai {
         model: &Arc<dyn Chat>,
         model_name: &str,
         message_array: &StringArray,
-        max_parallelism: usize,
+        rate_controller: Option<Arc<RateController>>,
+        fallback_parallelism: usize,
     ) -> DataFusionResult<ArrayRef> {
         use futures::stream::{self, StreamExt};
 
         let array_len = message_array.len();
 
-        // Performance: Use configured parallelism from DataFusion config (target_partitions)
-        // Limit to batch size to avoid over-spawning
-        let parallelism = std::cmp::min(max_parallelism, array_len);
+        // When a rate controller is present, it handles backpressure via its semaphore
+        // and token bucket. Set buffer_unordered high and let the rate controller manage concurrency.
+        // Without a rate controller, fall back to DataFusion's target_partitions.
+        let parallelism = if rate_controller.is_some() {
+            array_len
+        } else {
+            std::cmp::min(fallback_parallelism, array_len)
+        };
 
         // Collect messages into owned strings to avoid lifetime issues with async
         let messages: Vec<(usize, Option<String>)> = message_array
@@ -439,10 +507,24 @@ impl Ai {
             .map(|(row_index, message_str)| {
                 let model = Arc::clone(model);
                 let model_name_str = model_name_str.clone();
+                let rate_controller = rate_controller.clone();
 
                 Arc::clone(&ctx).scope(async move {
                     // Yield to allow tokio to cancel this task if needed (e.g., query timeout or user cancellation)
                     tokio::task::yield_now().await;
+
+                    // Acquire rate limit permit before calling model.
+                    // The permit is held for the duration of the model call and
+                    // dropped automatically at the end of this closure.
+                    let _permit = if let Some(ref rc) = rate_controller {
+                        Some(
+                            rc.acquire()
+                                .await
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                        )
+                    } else {
+                        None
+                    };
 
                     let result = if let Some(message) = message_str {
                         // call_model internally calls chat_stream, which emits ai_completion spans
@@ -482,11 +564,14 @@ impl Ai {
         let ordered_results: Vec<Option<String>> =
             results.into_iter().map(|(_, result)| result).collect();
 
-        debug_assert_eq!(
-            ordered_results.len(),
-            array_len,
-            "Result array length must match input array length"
-        );
+        // debug assertion only
+        {
+            debug_assert_eq!(
+                ordered_results.len(),
+                array_len,
+                "Result array length must match input array length"
+            );
+        }
 
         Ok(Arc::new(StringArray::from(ordered_results)) as ArrayRef)
     }
@@ -495,17 +580,24 @@ impl Ai {
 #[cfg(test)]
 // Allow various lints in test code for simplicity and readability.
 // Test code prioritizes clarity over strict lint compliance.
-#[allow(
+#[expect(
     clippy::clone_on_ref_ptr,
     clippy::uninlined_format_args,
-    clippy::too_many_lines
+    // Test fixtures pick a concurrency for the mock model; nothing here is
+    // sized from spiced's CPU entitlement.
+    clippy::disallowed_methods
 )]
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
-    use async_openai::types::{ChatCompletionResponseStream, CreateChatCompletionRequest};
+    use async_openai::types::chat::{
+        ChatChoiceStream, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageContent,
+        ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream,
+        ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
+    };
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::{ScalarFunctionArgs, ScalarUDFImpl, Volatility};
+    use runtime_status::ComponentStatus;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -534,18 +626,18 @@ mod tests {
                 .messages
                 .first()
                 .and_then(|msg| match msg {
-                    async_openai::types::ChatCompletionRequestMessage::System(sys_msg) => {
-                        match &sys_msg.content {
-                            async_openai::types::ChatCompletionRequestSystemMessageContent::Text(text) => Some(text.clone()),
-                            async_openai::types::ChatCompletionRequestSystemMessageContent::Array(_) => Some("Array content".to_string()),
+                    ChatCompletionRequestMessage::System(sys_msg) => match &sys_msg.content {
+                        ChatCompletionRequestSystemMessageContent::Text(text) => Some(text.clone()),
+                        ChatCompletionRequestSystemMessageContent::Array(_) => {
+                            Some("Array content".to_string())
                         }
-                    }
-                    async_openai::types::ChatCompletionRequestMessage::User(user_msg) => {
-                        match &user_msg.content {
-                            async_openai::types::ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
-                            async_openai::types::ChatCompletionRequestUserMessageContent::Array(_) => Some("Array content".to_string()),
+                    },
+                    ChatCompletionRequestMessage::User(user_msg) => match &user_msg.content {
+                        ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
+                        ChatCompletionRequestUserMessageContent::Array(_) => {
+                            Some("Array content".to_string())
                         }
-                    }
+                    },
                     _ => None,
                 })
                 .unwrap_or_default();
@@ -576,18 +668,18 @@ mod tests {
                 .messages
                 .first()
                 .and_then(|msg| match msg {
-                    async_openai::types::ChatCompletionRequestMessage::System(sys_msg) => {
-                        match &sys_msg.content {
-                            async_openai::types::ChatCompletionRequestSystemMessageContent::Text(text) => Some(text.clone()),
-                            async_openai::types::ChatCompletionRequestSystemMessageContent::Array(_) => Some("Array content".to_string()),
+                    ChatCompletionRequestMessage::System(sys_msg) => match &sys_msg.content {
+                        ChatCompletionRequestSystemMessageContent::Text(text) => Some(text.clone()),
+                        ChatCompletionRequestSystemMessageContent::Array(_) => {
+                            Some("Array content".to_string())
                         }
-                    }
-                    async_openai::types::ChatCompletionRequestMessage::User(user_msg) => {
-                        match &user_msg.content {
-                            async_openai::types::ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
-                            async_openai::types::ChatCompletionRequestUserMessageContent::Array(_) => Some("Array content".to_string()),
+                    },
+                    ChatCompletionRequestMessage::User(user_msg) => match &user_msg.content {
+                        ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
+                        ChatCompletionRequestUserMessageContent::Array(_) => {
+                            Some("Array content".to_string())
                         }
-                    }
+                    },
                     _ => None,
                 })
                 .unwrap_or_default();
@@ -602,13 +694,15 @@ mod tests {
                 choices: vec![ChatChoice {
                     index: 0,
                     message: ChatCompletionResponseMessage {
+                        reasoning_content: None,
                         content: Some(response_text),
                         role: Role::Assistant,
-                        #[allow(deprecated)]
+                        #[expect(deprecated)]
                         function_call: None,
                         tool_calls: None,
                         refusal: None,
                         audio: None,
+                        annotations: None,
                     },
                     finish_reason: Some(FinishReason::Stop),
                     logprobs: None,
@@ -620,10 +714,15 @@ mod tests {
                     prompt_tokens_details: None,
                     completion_tokens_details: None,
                 }),
+                #[expect(deprecated)]
                 system_fingerprint: None,
                 service_tier: None,
             })
         }
+    }
+
+    fn empty_rate_controllers() -> Arc<RwLock<RateControllerStore>> {
+        Arc::new(RwLock::new(HashMap::new()))
     }
 
     fn create_test_model_store() -> Arc<RwLock<ChatModelStore>> {
@@ -638,7 +737,12 @@ mod tests {
     #[test]
     fn test_ai_udf_signature() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store);
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let sig = udf.signature();
         // Check that we have a OneOf signature with multiple options
@@ -658,7 +762,12 @@ mod tests {
     #[tokio::test]
     async fn test_default_model_selection() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store);
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let default_model = udf
             .get_default_model_name()
@@ -682,7 +791,12 @@ mod tests {
         store.insert("model2".to_string(), Arc::new(model2) as Arc<dyn Chat>);
 
         let model_store = Arc::new(RwLock::new(store));
-        let udf = Ai::new(model_store);
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let result = udf.get_default_model_name().await;
         assert!(result.is_err());
@@ -698,7 +812,12 @@ mod tests {
     async fn test_no_models_error() {
         let store = HashMap::new();
         let model_store = Arc::new(RwLock::new(store));
-        let udf = Ai::new(model_store);
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let result = udf.get_default_model_name().await;
         assert!(result.is_err());
@@ -710,10 +829,127 @@ mod tests {
         );
     }
 
+    /// An `ai()` UDF with no loaded chat model, whose configured models report `models`.
+    fn ai_with_model_statuses(models: &[(&str, ComponentStatus)]) -> Ai {
+        let status = RuntimeStatus::new();
+        for (name, model_status) in models {
+            status.update_model(name, model_status.clone());
+        }
+        Ai::new(
+            Arc::default(),
+            Arc::default(),
+            empty_rate_controllers(),
+            status,
+        )
+    }
+
+    fn scalar_args(message: &str, model: Option<&str>) -> ScalarFunctionArgs {
+        let mut args = vec![ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+            message.to_string(),
+        )))];
+        if let Some(model) = model {
+            args.push(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+                model.to_string(),
+            ))));
+        }
+        ScalarFunctionArgs {
+            args,
+            arg_fields: vec![],
+            number_rows: 1,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+            config_options: Arc::new(ConfigOptions::default()),
+        }
+    }
+
+    // regression test for #14394
+    #[tokio::test]
+    async fn model_that_failed_to_load_reports_its_load_failure() {
+        let udf = ai_with_model_statuses(&[(
+            "deepseek",
+            ComponentStatus::error_with_message("Insufficient Balance"),
+        )]);
+
+        // Named (`ai('hi', 'deepseek')`) and defaulted (`ai('hi')`) alike.
+        for model in [Some("deepseek"), None] {
+            let err = udf
+                .invoke_async_with_args(scalar_args("hi", model))
+                .await
+                .expect_err("a model that failed to load cannot serve the call");
+
+            assert_eq!(
+                err.to_string(),
+                "Execution error: ai: Model 'deepseek' failed to load, so it cannot serve requests. Cause: Insufficient Balance",
+                "model argument: {model:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn named_model_without_a_status_is_still_not_found() {
+        let status = RuntimeStatus::new();
+        status.update_model("test-model", ComponentStatus::Ready);
+        let udf = Ai::new(
+            create_test_model_store(),
+            Arc::default(),
+            empty_rate_controllers(),
+            status,
+        );
+
+        let err = udf
+            .invoke_async_with_args(scalar_args("hi", Some("unknown")))
+            .await
+            .expect_err("an unconfigured model cannot serve the call");
+
+        assert_eq!(
+            err.to_string(),
+            "Execution error: ai cannot find model 'unknown'. Available models: test-model"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_model_reports_every_configured_model_that_cannot_serve() {
+        let udf = ai_with_model_statuses(&[
+            ("zeta", ComponentStatus::Initializing),
+            ("alpha", ComponentStatus::error_with_message("boom")),
+            ("removed", ComponentStatus::Disabled),
+        ]);
+
+        let err = udf
+            .get_default_model_name()
+            .await
+            .expect_err("no loaded chat model can serve the call");
+
+        assert_eq!(
+            err.to_string(),
+            "Execution error: ai: Model 'alpha' failed to load, so it cannot serve requests. Cause: boom; Model 'zeta' is still loading. Retry once it is ready."
+        );
+    }
+
+    #[tokio::test]
+    async fn default_model_with_no_unavailable_model_keeps_the_not_configured_error() {
+        // A loaded evaluate-only model reports `Ready` but never enters the chat model store.
+        let udf = ai_with_model_statuses(&[("evaluator", ComponentStatus::Ready)]);
+
+        let err = udf
+            .get_default_model_name()
+            .await
+            .expect_err("no chat model is configured");
+
+        assert_eq!(
+            err.to_string(),
+            "Execution error: ai: No chat models configured in Spicepod"
+        );
+    }
+
     #[test]
     fn test_udf_name() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store);
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         assert_eq!(udf.name(), "ai");
     }
@@ -721,7 +957,12 @@ mod tests {
     #[test]
     fn test_documentation() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store);
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let docs = udf.documentation().expect("should have documentation");
         assert_eq!(
@@ -734,7 +975,12 @@ mod tests {
     #[test]
     fn test_return_type_variations() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store);
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         // Test with single Utf8 argument
         let return_type1 = udf
@@ -758,7 +1004,12 @@ mod tests {
     #[test]
     fn test_non_async_invoke_with_args_error() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store);
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let args = ScalarFunctionArgs {
             args: vec![],
@@ -845,20 +1096,21 @@ mod tests {
                     model: "null-model".to_string(),
                     object: "chat.completion.chunk".to_string(),
                     created: 0,
-                    choices: vec![async_openai::types::ChatChoiceStream {
+                    choices: vec![ChatChoiceStream {
                         index: 0,
-                        delta: async_openai::types::ChatCompletionStreamResponseDelta {
+                        delta: ChatCompletionStreamResponseDelta {
                             content: None, // Empty content
                             role: Some(Role::Assistant),
                             tool_calls: None,
                             refusal: None,
-                            #[allow(deprecated)]
+                            #[expect(deprecated)]
                             function_call: None,
                         },
                         finish_reason: None,
                         logprobs: None,
                     }],
                     usage: None,
+                    #[expect(deprecated)]
                     system_fingerprint: None,
                     service_tier: None,
                 });
@@ -877,6 +1129,7 @@ mod tests {
                         prompt_tokens_details: None,
                         completion_tokens_details: None,
                     }),
+                    #[expect(deprecated)]
                     system_fingerprint: None,
                     service_tier: None,
                 });
@@ -897,13 +1150,15 @@ mod tests {
                 choices: vec![ChatChoice {
                     index: 0,
                     message: ChatCompletionResponseMessage {
+                        reasoning_content: None,
                         content: None, // This represents a null/empty response
                         role: Role::Assistant,
-                        #[allow(deprecated)]
+                        #[expect(deprecated)]
                         function_call: None,
                         tool_calls: None,
                         refusal: None,
                         audio: None,
+                        annotations: None,
                     },
                     finish_reason: Some(FinishReason::Stop),
                     logprobs: None,
@@ -915,6 +1170,7 @@ mod tests {
                     prompt_tokens_details: None,
                     completion_tokens_details: None,
                 }),
+                #[expect(deprecated)]
                 system_fingerprint: None,
                 service_tier: None,
             })
@@ -951,7 +1207,12 @@ mod tests {
     #[tokio::test]
     async fn test_process_single_message() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store.clone());
+        let udf = Ai::new(
+            model_store.clone(),
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let model_store_guard = model_store.read().await;
         let model = model_store_guard
@@ -964,9 +1225,8 @@ mod tests {
                 Arc::clone(model),
                 "test-model",
                 messages,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                None,
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should process messages");
@@ -982,7 +1242,12 @@ mod tests {
     #[tokio::test]
     async fn test_process_multiple_messages() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store.clone());
+        let udf = Ai::new(
+            model_store.clone(),
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let model_store_guard = model_store.read().await;
         let model = model_store_guard
@@ -999,9 +1264,8 @@ mod tests {
                 Arc::clone(model),
                 "test-model",
                 messages,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                None,
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should invoke async");
@@ -1022,7 +1286,12 @@ mod tests {
     #[tokio::test]
     async fn test_process_messages_with_nulls() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store.clone());
+        let udf = Ai::new(
+            model_store.clone(),
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let model_store_guard = model_store.read().await;
         let model = model_store_guard
@@ -1039,9 +1308,8 @@ mod tests {
                 Arc::clone(model),
                 "test-model",
                 messages,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                None,
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should invoke async");
@@ -1059,7 +1327,12 @@ mod tests {
     #[tokio::test]
     async fn test_process_messages_with_model_error() {
         let model_store = create_multi_model_store();
-        let udf = Ai::new(model_store.clone());
+        let udf = Ai::new(
+            model_store.clone(),
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let model_store_guard = model_store.read().await;
         let model = model_store_guard
@@ -1072,9 +1345,8 @@ mod tests {
                 Arc::clone(model),
                 "error-model",
                 messages,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                None,
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await;
 
@@ -1090,7 +1362,12 @@ mod tests {
     #[tokio::test]
     async fn test_process_messages_with_null_response() {
         let model_store = create_multi_model_store();
-        let udf = Ai::new(model_store.clone());
+        let udf = Ai::new(
+            model_store.clone(),
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let model_store_guard = model_store.read().await;
         let model = model_store_guard
@@ -1103,9 +1380,8 @@ mod tests {
                 Arc::clone(model),
                 "null-model",
                 messages,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                None,
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should invoke async");
@@ -1121,7 +1397,12 @@ mod tests {
     #[test]
     fn test_debug_implementation() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store);
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let debug_str = format!("{:?}", udf);
         assert!(debug_str.contains("Ai"));
@@ -1131,7 +1412,12 @@ mod tests {
     #[test]
     fn test_into_async_udf() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store);
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let async_udf = udf.into_async_udf();
         let scalar_udf = async_udf.into_scalar_udf();
@@ -1142,7 +1428,12 @@ mod tests {
     #[test]
     fn test_signature_volatility() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store);
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let sig = udf.signature();
         assert_eq!(sig.volatility, Volatility::Volatile);
@@ -1186,7 +1477,12 @@ mod tests {
 
         // This test verifies that the AI UDF properly accepts and uses parent span context
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store.clone());
+        let udf = Ai::new(
+            model_store.clone(),
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let model_store_guard = model_store.read().await;
         let model = model_store_guard
@@ -1203,9 +1499,8 @@ mod tests {
                 Arc::clone(model),
                 "test-model",
                 messages,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                None,
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await;
 
@@ -1235,7 +1530,12 @@ mod tests {
         // is a columnar array and the second is a scalar model name.
 
         let model_store = create_multi_model_store();
-        let udf = Ai::new(model_store.clone());
+        let udf = Ai::new(
+            model_store.clone(),
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         // Simulate a query like: SELECT ai(title, 'gpt-4') FROM pulls LIMIT 3
         // where title is a column (array) and 'gpt-4' is a scalar literal
@@ -1287,7 +1587,12 @@ mod tests {
         // where both arguments are scalar literals but need to be applied to multiple rows
 
         let model_store = create_multi_model_store();
-        let udf = Ai::new(model_store.clone());
+        let udf = Ai::new(
+            model_store.clone(),
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         // Simulate: SELECT ai('hi', 'gpt-4') FROM table LIMIT 5
         // Both arguments are scalars, but the function is called for 5 rows
@@ -1332,7 +1637,12 @@ mod tests {
     #[tokio::test]
     async fn test_parallel_processing_with_multiple_messages() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store.clone());
+        let udf = Ai::new(
+            model_store.clone(),
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let model_store_guard = model_store.read().await;
         let model = model_store_guard
@@ -1352,9 +1662,8 @@ mod tests {
                 Arc::clone(model),
                 "test-model",
                 messages,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                None,
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should process messages in parallel");
@@ -1373,12 +1682,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    /// Time is paused, so the 10 s model calls and the 500 ms bound are exact rather than raced.
+    #[tokio::test(start_paused = true)]
     async fn test_cancellation_support() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::time::{Duration, sleep, timeout};
 
-        // Mock Chat that simulates long-running operations
-        struct SlowMockChat;
+        // Mock Chat that simulates long-running operations, counting the calls that start
+        // and the ones that run to completion.
+        struct SlowMockChat {
+            started: Arc<AtomicUsize>,
+            completed: Arc<AtomicUsize>,
+        }
 
         #[async_trait]
         impl Chat for SlowMockChat {
@@ -1387,7 +1702,9 @@ mod tests {
             }
 
             async fn run(&self, _prompt: String) -> llms::chat::Result<Option<String>> {
+                self.started.fetch_add(1, Ordering::SeqCst);
                 sleep(Duration::from_secs(10)).await;
+                self.completed.fetch_add(1, Ordering::SeqCst);
                 Ok(Some("Should be cancelled".to_string()))
             }
 
@@ -1398,6 +1715,8 @@ mod tests {
             {
                 use async_stream::stream;
 
+                self.started.fetch_add(1, Ordering::SeqCst);
+                let completed = Arc::clone(&self.completed);
                 let stream = stream! {
                     // Yield a chunk
                     yield Ok(CreateChatCompletionStreamResponse {
@@ -1405,26 +1724,28 @@ mod tests {
                         model: "slow-model".to_string(),
                         object: "chat.completion.chunk".to_string(),
                         created: 0,
-                        choices: vec![async_openai::types::ChatChoiceStream {
+                        choices: vec![ChatChoiceStream {
                             index: 0,
-                            delta: async_openai::types::ChatCompletionStreamResponseDelta {
+                            delta: ChatCompletionStreamResponseDelta {
                                 content: Some("Starting...".to_string()),
                                 role: Some(Role::Assistant),
                                 tool_calls: None,
                                 refusal: None,
-                                #[allow(deprecated)]
+                                #[expect(deprecated)]
                                 function_call: None,
                             },
                             finish_reason: None,
                             logprobs: None,
                         }],
                         usage: None,
+                        #[expect(deprecated)]
                         system_fingerprint: None,
                         service_tier: None,
                     });
 
                     // Simulate a long delay between chunks
                     sleep(Duration::from_secs(10)).await;
+                    completed.fetch_add(1, Ordering::SeqCst);
 
                     yield Ok(CreateChatCompletionStreamResponse {
                         id: "slow-id".to_string(),
@@ -1433,6 +1754,7 @@ mod tests {
                         created: 0,
                         choices: vec![],
                         usage: None,
+                        #[expect(deprecated)]
                         system_fingerprint: None,
                         service_tier: None,
                     });
@@ -1446,7 +1768,9 @@ mod tests {
                 _req: CreateChatCompletionRequest,
             ) -> Result<CreateChatCompletionResponse, async_openai::error::OpenAIError>
             {
+                self.started.fetch_add(1, Ordering::SeqCst);
                 sleep(Duration::from_secs(10)).await;
+                self.completed.fetch_add(1, Ordering::SeqCst);
                 Err(async_openai::error::OpenAIError::ApiError(ApiError {
                     message: "Should be cancelled".to_string(),
                     r#type: None,
@@ -1456,13 +1780,23 @@ mod tests {
             }
         }
 
+        let started = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
         let mut store = HashMap::new();
         store.insert(
             "slow-model".to_string(),
-            Arc::new(SlowMockChat) as Arc<dyn Chat>,
+            Arc::new(SlowMockChat {
+                started: Arc::clone(&started),
+                completed: Arc::clone(&completed),
+            }) as Arc<dyn Chat>,
         );
         let model_store = Arc::new(RwLock::new(store));
-        let udf = Ai::new(model_store.clone());
+        let udf = Ai::new(
+            model_store.clone(),
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let messages = Arc::new(StringArray::from(vec![
             Some("Message 1"),
@@ -1475,24 +1809,26 @@ mod tests {
             .get("slow-model")
             .expect("should get slow-model");
 
-        // Start the processing task with a timeout
+        // A bound far shorter than the model calls: dropping the timed-out future is the
+        // cancellation a query timeout or a user's cancel delivers.
         let result = timeout(
-            Duration::from_millis(500), // Short timeout to trigger cancellation
-            udf.process_messages(
-                Arc::clone(model),
-                "slow-model",
-                messages,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
-            ),
+            Duration::from_millis(500),
+            udf.process_messages(Arc::clone(model), "slow-model", messages, None, 3),
         )
         .await;
+        result.expect_err("10 s model calls cannot finish inside a 500 ms bound");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            3,
+            "every message's model call was in flight when the bound expired"
+        );
 
-        // Should timeout, demonstrating that long-running operations can be cancelled
-        assert!(
-            result.is_err(),
-            "Task should timeout (which is a form of cancellation)"
+        // Well past the calls' own 10 s: a call left running detached would finish now.
+        sleep(Duration::from_secs(20)).await;
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            0,
+            "cancelling the AI function must cancel its in-flight model calls, not detach them"
         );
     }
 
@@ -1548,7 +1884,12 @@ mod tests {
             Arc::new(LargeResponseMockChat) as Arc<dyn Chat>,
         );
         let model_store = Arc::new(RwLock::new(store));
-        let udf = Ai::new(model_store.clone());
+        let udf = Ai::new(
+            model_store.clone(),
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let messages = Arc::new(StringArray::from(vec![Some("test")]));
 
@@ -1562,9 +1903,8 @@ mod tests {
                 Arc::clone(model),
                 "large-model",
                 messages,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                None,
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await;
 
@@ -1582,7 +1922,12 @@ mod tests {
     #[tokio::test]
     async fn test_parallelism_calculation() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store.clone());
+        let udf = Ai::new(
+            model_store.clone(),
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         // Test with batch size larger than MIN_PARALLEL_THRESHOLD
         let messages = Arc::new(StringArray::from(vec![
@@ -1603,9 +1948,8 @@ mod tests {
                 Arc::clone(model),
                 "test-model",
                 messages,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                None,
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await;
 
@@ -1628,7 +1972,12 @@ mod tests {
     #[tokio::test]
     async fn test_mixed_null_and_valid_messages() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store.clone());
+        let udf = Ai::new(
+            model_store.clone(),
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         // Mix of valid messages and nulls
         let messages = Arc::new(StringArray::from(vec![
@@ -1649,9 +1998,8 @@ mod tests {
                 Arc::clone(model),
                 "test-model",
                 messages,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                None,
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await;
 
@@ -1677,7 +2025,12 @@ mod tests {
         // In a real environment with proper tracing setup, these would be captured by monitoring systems.
 
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store);
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let message_scalar =
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("Test metrics".to_string())));
@@ -1712,5 +2065,209 @@ mod tests {
         // Note: Metrics are emitted via tracing::debug! calls in invoke_async_with_args
         // and process_single_message_stream. These can be verified by enabling debug logging
         // and checking for events with target "datafusion::physical_plan::metrics"
+    }
+
+    // ---- Rate-limited concurrency tests ----
+
+    /// A mock Chat that tracks max concurrent calls.
+    struct ConcurrencyTrackingChat {
+        name: String,
+        concurrent: Arc<std::sync::atomic::AtomicUsize>,
+        max_concurrent: Arc<std::sync::atomic::AtomicUsize>,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait]
+    impl Chat for ConcurrencyTrackingChat {
+        fn as_sql(&self) -> Option<&dyn llms::chat::nsql::SqlGeneration> {
+            None
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: CreateChatCompletionRequest,
+        ) -> Result<ChatCompletionResponseStream, async_openai::error::OpenAIError> {
+            use std::sync::atomic::Ordering;
+
+            // Track concurrent calls
+            let current = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_concurrent.fetch_max(current, Ordering::SeqCst);
+
+            // Simulate LLM latency
+            tokio::time::sleep(self.delay).await;
+
+            self.concurrent.fetch_sub(1, Ordering::SeqCst);
+
+            let response_text = format!("Response from {}", self.name);
+            Ok(llms::streaming_utils::create_mock_streaming_response(
+                self.name.clone(),
+                vec![response_text],
+                None,
+            ))
+        }
+
+        async fn chat_request(
+            &self,
+            _req: CreateChatCompletionRequest,
+        ) -> Result<CreateChatCompletionResponse, async_openai::error::OpenAIError> {
+            Ok(CreateChatCompletionResponse {
+                id: "test".to_string(),
+                model: self.name.clone(),
+                object: "chat.completion".to_string(),
+                created: 0,
+                choices: vec![],
+                usage: None,
+                #[expect(deprecated)]
+                system_fingerprint: None,
+                service_tier: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_concurrency() {
+        use std::num::NonZeroU32;
+        use std::sync::atomic::Ordering;
+
+        let concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let model: Arc<dyn Chat> = Arc::new(ConcurrencyTrackingChat {
+            name: "rate-limited-model".to_string(),
+            concurrent: Arc::clone(&concurrent),
+            max_concurrent: Arc::clone(&max_concurrent),
+            delay: std::time::Duration::from_millis(100),
+        });
+
+        let mut store = HashMap::new();
+        store.insert("rate-limited-model".to_string(), Arc::clone(&model));
+        let model_store = Arc::new(RwLock::new(store));
+
+        // Create rate controller with max 2 concurrent requests
+        let rate_controller = RateController::builder()
+            .with_max_concurrent_requests(2)
+            .add_quota(governor::Quota::per_minute(
+                NonZeroU32::new(10000).expect("non-zero"),
+            ))
+            .build();
+
+        let mut rc_store = HashMap::new();
+        rc_store.insert("rate-limited-model".to_string(), rate_controller);
+        let rate_controllers = Arc::new(RwLock::new(rc_store));
+
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            rate_controllers,
+            RuntimeStatus::new(),
+        );
+
+        let messages = Arc::new(arrow::array::StringArray::from(vec![
+            Some("msg1"),
+            Some("msg2"),
+            Some("msg3"),
+            Some("msg4"),
+            Some("msg5"),
+            Some("msg6"),
+        ]));
+
+        let result = udf
+            .process_messages(
+                model,
+                "rate-limited-model",
+                messages,
+                Some(
+                    RateController::builder()
+                        .with_max_concurrent_requests(2)
+                        .add_quota(governor::Quota::per_minute(
+                            NonZeroU32::new(10000).expect("non-zero"),
+                        ))
+                        .build(),
+                ),
+                100, // high fallback - should not be the bottleneck
+            )
+            .await
+            .expect("should process messages");
+
+        let string_array = result
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("should cast to StringArray");
+
+        // All 6 messages should complete
+        assert_eq!(string_array.len(), 6);
+        for i in 0..6 {
+            assert!(
+                string_array
+                    .value(i)
+                    .contains("Response from rate-limited-model"),
+                "Row {} should have response",
+                i
+            );
+        }
+
+        // Max concurrency should be at most 2 (rate controller enforces this)
+        let observed_max = max_concurrent.load(Ordering::SeqCst);
+        assert!(
+            observed_max <= 2,
+            "Max concurrent calls should be <= 2, but was {}",
+            observed_max
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_rate_controller_uses_fallback_parallelism() {
+        let concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let model: Arc<dyn Chat> = Arc::new(ConcurrencyTrackingChat {
+            name: "no-rc-model".to_string(),
+            concurrent: Arc::clone(&concurrent),
+            max_concurrent: Arc::clone(&max_concurrent),
+            delay: std::time::Duration::from_millis(50),
+        });
+
+        let mut store = HashMap::new();
+        store.insert("no-rc-model".to_string(), Arc::clone(&model));
+        let model_store = Arc::new(RwLock::new(store));
+
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
+
+        let messages = Arc::new(arrow::array::StringArray::from(vec![
+            Some("msg1"),
+            Some("msg2"),
+            Some("msg3"),
+            Some("msg4"),
+        ]));
+
+        let result = udf
+            .process_messages(
+                model,
+                "no-rc-model",
+                messages,
+                None, // No rate controller
+                2,    // Fallback parallelism of 2
+            )
+            .await
+            .expect("should process messages");
+
+        let string_array = result
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("should cast to StringArray");
+        assert_eq!(string_array.len(), 4);
+
+        // Without rate controller, parallelism is min(fallback=2, batch=4) = 2
+        let observed_max = max_concurrent.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            observed_max <= 2,
+            "Max concurrent calls should be <= 2 (fallback parallelism), but was {}",
+            observed_max
+        );
     }
 }

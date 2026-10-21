@@ -16,8 +16,8 @@ snapshot_kind: text
     "role": "assistant",
     "tool_calls": [
       {
-        "id": "test_id",
         "type": "function",
+        "id": "test_id",
         "function": {
           "name": "list_datasets",
           "arguments": "{}"
@@ -34,8 +34,8 @@ snapshot_kind: text
     "role": "assistant",
     "tool_calls": [
       {
-        "id": "existing_id",
         "type": "function",
+        "id": "existing_id",
         "function": {
           "name": "other_tool",
           "arguments": "{}"

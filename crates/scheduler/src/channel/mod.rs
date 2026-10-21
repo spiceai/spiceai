@@ -36,6 +36,6 @@ pub trait TaskRequestChannel: Send + Sync {
     /// Sets the submission channel to send the task request.
     fn set_submission_channel(&mut self, tx: Arc<tokio::sync::mpsc::Sender<Arc<TaskRequest>>>);
     /// Starts the task request channel and returns a handle to the background task.
-    #[allow(clippy::missing_errors_doc)]
+    #[expect(clippy::missing_errors_doc)]
     fn start(&self) -> Result<JoinHandle<Result<()>>>;
 }

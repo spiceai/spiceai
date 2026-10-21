@@ -24,8 +24,9 @@ GITHUB_REPO=spiceai
 # Spice Runtime filename
 SPICED_FILENAME=spiced
 
-# Variant options: "" (no variant), "models", "cuda", "metal"
-: ${VARIANT:="models"}
+# Variant options: "" (default, includes models), "cuda", "metal"
+# The default distribution now includes models, so no separate variant suffix needed
+: ${VARIANT:=""}
 
 # CUDA version: "80", "86", "87", "89", "90"
 # Only used when VARIANT is "cuda"
@@ -45,7 +46,7 @@ getSystemInfo() {
         amd64) ARCH="x86_64";;
     esac
 
-    OS=$(echo $(uname)|tr '[:upper:]' '[:lower:]')
+    OS=$(uname | tr '[:upper:]' '[:lower:]')
     
     # Handle MINGW/MSYS/Cygwin on Windows
     case "$OS" in
@@ -59,7 +60,26 @@ getSystemInfo() {
 }
 
 verifySupported() {
-    local supported=(linux-x86_64 linux-aarch64 darwin-aarch64 windows-x86_64)
+    # Check for Windows first and provide helpful error message
+    if [ "$OS" == "windows" ]; then
+        echo ""
+        echo "Error: Native Windows is not supported for the Spice runtime (spiced) in the open source version."
+        echo ""
+        echo "Options:"
+        echo ""
+        echo "  1. Run the Spice runtime inside Windows Subsystem for Linux (WSL):"
+        echo "     - Install WSL: wsl --install"
+        echo "     - Open a WSL terminal (e.g., Ubuntu)"
+        echo "     - Run this install script again from within WSL"
+        echo "     - For more information: https://docs.microsoft.com/en-us/windows/wsl/install"
+        echo ""
+        echo "  2. Native Windows support is available with Spice.ai Enterprise."
+        echo "     - Learn more: https://spice.ai/pricing"
+        echo ""
+        exit 1
+    fi
+
+    local supported=(linux-x86_64 linux-aarch64 darwin-aarch64)
     local current_osarch="${OS}-${ARCH}"
 
     for osarch in "${supported[@]}"; do
@@ -97,7 +117,7 @@ runAsRoot() {
         CMD="sudo $CMD"
     fi
 
-    $CMD
+    eval "$CMD"
 }
 
 checkHttpRequestCLI() {
@@ -115,26 +135,33 @@ checkHttpRequestCLI() {
     fi
 }
 
-checkJqInstalled() {
-    if ! type "jq" 1> /dev/null 2>&1; then
-        echo "'jq' is required"
-        echo
-        echo "To install (OSX): 'brew install jq'"
-        echo "To install (Ubuntu): 'apt install jq'"
-        echo
-        exit 1
-    fi
-}
+
 
 getLatestRelease() {
     local spiceReleaseUrl="https://api.github.com/repos/${GITHUB_ORG}/${GITHUB_REPO}/releases/latest"
     local latest_release=""
+    local response=""
+    local headers=()
 
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-        latest_release=$(curl -s "$spiceReleaseUrl" | grep \"tag_name\" | awk 'NR==1{print $2}' |  sed -n 's/"\(.*\)",/\1/p')
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+            headers=(-H "Authorization: Bearer $GITHUB_TOKEN")
+        fi
+        response=$(curl -fsS "${headers[@]}" "$spiceReleaseUrl") || {
+            echo "Failed to get latest release information"
+            exit 1
+        }
     else
-        latest_release=$(wget -q --header="Accept: application/json" -O - "$spiceReleaseUrl" | grep \"tag_name\" | awk 'NR==1{print $2}' |  sed -n 's/"\(.*\)",/\1/p')
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+            headers=(--header="Authorization: Bearer $GITHUB_TOKEN")
+        fi
+        response=$(wget -nv "${headers[@]}" --header="Accept: application/json" -O - "$spiceReleaseUrl") || {
+            echo "Failed to get latest release information"
+            exit 1
+        }
     fi
+
+    latest_release=$(printf '%s\n' "$response" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 
     if [ -z "$latest_release" ]; then
         echo "Failed to get latest release information"
@@ -142,6 +169,22 @@ getLatestRelease() {
     fi
 
     ret_val=$latest_release
+}
+
+validateRuntimeArchive() {
+    local archive_contents archive_member archive_entry
+
+    archive_contents=$(tar -tzf "$1" 2>/dev/null) || return 1
+    archive_member=$(printf '%s\n' "$archive_contents" | grep -Fx -e "$SPICED_FILENAME" -e "./$SPICED_FILENAME") || return 1
+    # Require exactly one executable entry at the archive root.
+    case "$archive_member" in
+        "$SPICED_FILENAME"|"./$SPICED_FILENAME") ;;
+        *) return 1 ;;
+    esac
+
+    archive_entry=$(tar -tvzf "$1" "$archive_member" 2>/dev/null) || return 1
+    # GNU tar and BSD tar prefix regular files with '-', links with 'l' or 'h'.
+    [[ "$archive_entry" == -* && "$archive_entry" != *$'\n'* ]]
 }
 
 downloadWithRetry() {
@@ -153,19 +196,21 @@ downloadWithRetry() {
         echo "Download attempt $attempt of $MAX_RETRIES..."
         
         if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-            if curl -H "Accept:application/octet-stream" -SsL "$url" -o "$output" 2>/dev/null; then
-                if [ -f "$output" ]; then
+            if curl --fail -H "Accept:application/octet-stream" -SsL "$url" -o "$output" 2>/dev/null; then
+                if [ -f "$output" ] && validateRuntimeArchive "$output"; then
                     return 0
                 fi
             fi
         else
             if wget -q --auth-no-challenge --header='Accept:application/octet-stream' "$url" -O "$output" 2>/dev/null; then
-                if [ -f "$output" ]; then
+                if [ -f "$output" ] && validateRuntimeArchive "$output"; then
                     return 0
                 fi
             fi
         fi
         
+        rm -f "$output"
+
         if [ $attempt -lt $MAX_RETRIES ]; then
             echo "Download failed, retrying in ${RETRY_DELAY} seconds..."
             sleep $RETRY_DELAY
@@ -181,24 +226,22 @@ downloadWithRetry() {
 downloadFile() {
     LATEST_RELEASE_TAG=$1
 
-    # Build artifact name based on variant
+    # Build artifact name based on variant and OS
+    # Asset naming convention:
+    #   Default (VARIANT=""): spiced_{os}_{arch}.tar.gz (includes models)
+    #   Metal (VARIANT="metal"): spiced_metal_{os}_{arch}.tar.gz
+    #   CUDA (VARIANT="cuda"): spiced_cuda_{version}_{os}_{arch}.tar.gz
     local artifact_name="${SPICED_FILENAME}"
     
-    # Note: Windows artifacts don't include .exe in the archive name
-    # The .exe extension is only for the extracted binary
-    
-    # Add variant suffix
+    # Add variant suffix (only for non-default variants)
     if [ -n "$VARIANT" ]; then
         if [ "$VARIANT" == "cuda" ]; then
-            artifact_name="${artifact_name}_models_cuda_${CUDA_VERSION}"
+            artifact_name="${artifact_name}_cuda_${CUDA_VERSION}"
+        elif [ "$VARIANT" == "metal" ]; then
+            artifact_name="${artifact_name}_metal"
         else
             artifact_name="${artifact_name}_${VARIANT}"
         fi
-    fi
-    
-    # Add .exe suffix for Windows in the artifact name only
-    if [ "$OS" == "windows" ]; then
-        artifact_name="${artifact_name}.exe"
     fi
     
     SPICED_ARTIFACT="${artifact_name}_${OS}_${ARCH}.tar.gz"
@@ -211,27 +254,7 @@ downloadFile() {
 
     echo "Downloading $DOWNLOAD_URL ..."
 
-    # Get asset ID
-    local parser=". | map(select(.tag_name == \"$LATEST_RELEASE_TAG\"))[0].assets | map(select(.name == \"$SPICED_ARTIFACT\"))[0].id"
-    
-    local releases_url="https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases"
-    local asset_id
-    
-    if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-        asset_id=$(curl -H "Accept: application/vnd.github.v3.raw" -s "$releases_url" | jq "$parser")
-    else
-        asset_id=$(wget -q -O - "$releases_url" | jq "$parser")
-    fi
-    
-    if [ "$asset_id" = "null" ] || [ -z "$asset_id" ]; then
-        echo "ERROR: version not found $LATEST_RELEASE_TAG or artifact $SPICED_ARTIFACT not found"
-        echo "Available variants: default, models, cuda (Linux only, requires CUDA_VERSION), metal"
-        exit 1
-    fi
-
-    local download_url="https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$asset_id"
-    
-    if ! downloadWithRetry "$download_url" "$ARTIFACT_TMP_FILE"; then
+    if ! downloadWithRetry "$DOWNLOAD_URL" "$ARTIFACT_TMP_FILE"; then
         echo "Failed to download $DOWNLOAD_URL after $MAX_RETRIES attempts"
         exit 1
     fi
@@ -315,7 +338,6 @@ mkdir -p "$SPICED_INSTALL_DIR"
 getSystemInfo
 verifySupported
 checkHttpRequestCLI
-checkJqInstalled
 
 if [ -z "$1" ]; then
     echo "Getting the latest Spice.ai Runtime..."

@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "arrow_tools"
 repository.workspace = true
 rust-version.workspace = true
@@ -11,11 +11,28 @@ version.workspace = true
 [dependencies]
 arrow.workspace = true
 arrow-cast.workspace = true
-arrow-schema.workspace = true
+arrow-ipc.workspace = true
+# `serde` for the schema JSON encoding in `schema::schema_to_json`, which is a
+# durable on-disk format: declared here rather than inherited from another crate's
+# feature selection, so the encoding cannot lose its impls to a feature change
+# elsewhere in the graph.
+arrow-schema = { workspace = true, features = ["serde"] }
+base64 = "0.22.1"
+# The flatbuffer an Arrow IPC schema message is, read to correct a map declaration in place.
+flatbuffers.workspace = true
 snafu.workspace = true
-datafusion.workspace = true
+datafusion-common.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 insta = {workspace = true, features = ["json"]}
 arrow-json.workspace = true
-serde_json.workspace = true
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[[bench]]
+name = "truncate"
+harness = false
+
+[lints]
+workspace = true

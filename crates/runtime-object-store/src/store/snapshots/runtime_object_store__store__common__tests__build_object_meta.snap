@@ -1,0 +1,13 @@
+---
+source: crates/runtime-object-store/src/store/common.rs
+expression: meta
+---
+ObjectMeta {
+    location: Path {
+        raw: "test/file.parquet",
+    },
+    last_modified: 2023-11-14T22:13:20Z,
+    size: 4096,
+    e_tag: None,
+    version: None,
+}

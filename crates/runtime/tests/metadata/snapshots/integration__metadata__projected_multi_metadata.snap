@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/metadata/mod.rs
+expression: projected_multi_metadata
+---
++----+-------------------------------------------------------------------------------------------+-------+
+| id | _location                                                                                 | _size |
++----+-------------------------------------------------------------------------------------------+-------+
+| 10 | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
+| 11 | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
+| 12 | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
+| 13 | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
+| 14 | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
+| 15 | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
+| 16 | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
+| 17 | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
+| 18 | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
+| 19 | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319  |
++----+-------------------------------------------------------------------------------------------+-------+

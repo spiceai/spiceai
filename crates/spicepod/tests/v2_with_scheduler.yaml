@@ -1,0 +1,10 @@
+version: v2
+kind: Spicepod
+name: v2_with_scheduler
+runtime:
+  scheduler:
+    state_location: s3://my-bucket/scheduler-state
+    partition_assignment_interval: 15s
+    max_partition_assignments_per_interval: 50
+    max_partitions_per_executor: 500
+    partition_discovery_timeout: 120s

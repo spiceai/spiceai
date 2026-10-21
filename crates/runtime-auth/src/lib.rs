@@ -17,6 +17,8 @@ limitations under the License.
 pub mod api_key;
 pub mod error;
 pub mod layer;
+pub mod mtls;
 mod traits;
 
+pub use mtls::{ChannelIdentity, IdentitySource, MtlsPrincipal};
 pub use traits::*;

@@ -16,10 +16,18 @@ limitations under the License.
 
 use async_trait::async_trait;
 use keyring::Entry;
+use runtime_parameters_derive::TypedParams;
 use secrecy::SecretString;
 use snafu::Snafu;
 
 use crate::SecretStore;
+
+/// Typed `params:` for the `keyring` secret store. The keyring store has no
+/// configurable parameters; the empty struct with `deny_unknown` still rejects
+/// any supplied parameter so typos surface as errors rather than being ignored.
+#[derive(Debug, TypedParams)]
+#[params(prefix = "keyring", deny_unknown)]
+pub struct KeyringParams {}
 
 const KEYRING_SECRET_PREFIX: &str = "spice_";
 

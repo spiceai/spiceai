@@ -14,22 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::refresh::Refresh;
+use crate::accelerated::refresh::Refresh;
 use crate::component::dataset::acceleration::OnConflictBehavior;
-use crate::datafusion::DataFusion;
-use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::dataupdate::UpdateType;
 use crate::internal_table::create_internal_accelerated_table;
 use crate::{Runtime, status};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
-use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
+use crate::{
+    component::dataset::acceleration::{Acceleration, Engine},
+    datafusion::SPICE_RUNTIME_SCHEMA,
+};
 use arrow::array::{ArrayBuilder, MapBuilder, RecordBatch, StringArray, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow_schema::ArrowError;
 use data_components::arrow::struct_builder::StructBuilder;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use futures::TryStreamExt;
+use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use snafu::prelude::*;
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
@@ -37,17 +40,22 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
-use crate::accelerated_table::{AcceleratedTable, Retention};
+use crate::accelerated::{AcceleratedTable, Retention};
 
+pub mod correlation;
+pub mod federated;
 pub mod otel_exporter;
 
 pub const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
+/// Internal table name for the local (non-federated) task history table.
+/// Used by cluster RPC handlers to query local data without triggering federated fan-out.
+pub const LOCAL_TASK_HISTORY_TABLE: &str = "local_task_history";
 pub const DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS: u64 = 8 * 60 * 60; // 8 hours
 pub const DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS: u64 = 15 * 60; // 15 minutes
 
 /// [`TaskSpan`] records information about the execution of a given task. On [`finish`], it will write to the datafusion.
 #[derive(Clone)]
-pub(crate) struct TaskSpan {
+pub struct TaskSpan {
     pub(crate) trace_id: Arc<str>,
 
     /// A user-defined trace id that can be used to override the default trace id when exported.
@@ -75,6 +83,10 @@ pub(crate) struct TaskSpan {
     pub(crate) execution_duration_ms: f64,
     pub(crate) error_message: Option<Arc<str>>,
     pub(crate) labels: HashMap<Arc<str>, Arc<str>>,
+
+    /// The node ID (advertise address) of the node that executed this task.
+    /// Only populated in cluster mode.
+    pub(crate) node_id: Option<Arc<str>>,
     // For top-level HTTP tasks, have a label:
     // - "http_status" (200, 400)
 }
@@ -85,6 +97,7 @@ impl TaskSpan {
         retention_period_secs: u64,
         retention_check_interval_secs: u64,
         runtime: Arc<Runtime>,
+        is_cluster_mode: bool,
     ) -> Result<Arc<AcceleratedTable>, Error> {
         let time_column = Some("start_time".to_string());
         let time_format = Some(TimeFormat::UnixSeconds);
@@ -94,18 +107,25 @@ impl TaskSpan {
             "Task history retention check interval: {retention_check_interval_secs} seconds"
         );
 
-        let retention = Retention::builder()
-            .time_column(time_column.clone())
-            .time_format(time_format)
-            .time_period(Some(Duration::from_secs(retention_period_secs)))
-            .check_interval(Some(Duration::from_secs(retention_check_interval_secs)))
-            .enabled(true)
-            .build();
+        let retention = Retention::builder(
+            TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE).to_string(),
+        )
+        .time_column(time_column.clone())
+        .time_format(time_format)
+        .time_period(Some(Duration::from_secs(retention_period_secs)))
+        .check_interval(Some(Duration::from_secs(retention_check_interval_secs)))
+        .enabled(true)
+        .build();
 
         let tbl_reference =
             TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
 
-        let acceleration_settings = Acceleration::default().with_on_conflict(
+        // An internal table has no source, and Cayenne requires one.
+        let acceleration_settings = Acceleration {
+            engine: Engine::Arrow,
+            ..Acceleration::default()
+        }
+        .with_on_conflict(
             [(
                 ColumnReference::new(vec!["span_id".to_string()]),
                 OnConflictBehavior::Upsert(UpsertOptions::default()),
@@ -116,7 +136,7 @@ impl TaskSpan {
         create_internal_accelerated_table(
             status,
             tbl_reference,
-            Arc::new(TaskSpan::table_schema()),
+            Arc::new(TaskSpan::table_schema(is_cluster_mode)),
             Some(vec!["span_id".to_string()]),
             acceleration_settings,
             Refresh::default(),
@@ -129,8 +149,8 @@ impl TaskSpan {
         .context(UnableToRegisterTableSnafu)
     }
 
-    fn table_schema() -> Schema {
-        Schema::new(vec![
+    fn table_schema(is_cluster_mode: bool) -> Schema {
+        let mut fields = vec![
             Field::new("trace_id", DataType::Utf8, false),
             Field::new("span_id", DataType::Utf8, false),
             Field::new("parent_span_id", DataType::Utf8, true),
@@ -164,10 +184,17 @@ impl TaskSpan {
                 ),
                 false,
             ),
-        ])
+        ];
+
+        // Add node_id column only in cluster mode
+        if is_cluster_mode {
+            fields.push(Field::new("node_id", DataType::Utf8, false));
+        }
+
+        Schema::new(fields)
     }
 
-    pub async fn write(df: Arc<DataFusion>, spans: Vec<TaskSpan>) -> Result<(), Error> {
+    pub async fn write(df: Arc<dyn QueryEngine>, spans: Vec<TaskSpan>) -> Result<(), Error> {
         let overrides: Vec<_> = spans
             .iter()
             .filter_map(|s| {
@@ -177,23 +204,20 @@ impl TaskSpan {
             })
             .collect();
 
-        let data = Self::to_record_batch(spans)
+        // Get the schema from the registered table to ensure we use the correct schema
+        // (with or without node_id depending on cluster mode)
+        let table_ref = TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
+        let table_provider = df.get_table(&table_ref).await.context(TableNotFoundSnafu)?;
+        let schema = table_provider.schema();
+
+        let data = Self::to_record_batch(spans, schema.as_ref())
             .boxed()
             .context(UnableToWriteToTableSnafu)?;
 
-        let data_update = DataUpdate {
-            schema: Arc::new(Self::table_schema()),
-            data: vec![data],
-            update_type: crate::dataupdate::UpdateType::Append,
-        };
-
-        df.write_data(
-            &TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
-            data_update,
-        )
-        .await
-        .boxed()
-        .context(UnableToWriteToTableSnafu)?;
+        df.write_data(&table_ref, schema, vec![data], UpdateType::Append)
+            .await
+            .boxed()
+            .map_err(|source| Error::UnableToWriteToTable { source })?;
 
         // Override trace_ids if necessary. Must be after above write so that it also handles override this batch of spans.
         for (from, to) in overrides {
@@ -207,25 +231,21 @@ impl TaskSpan {
     }
 
     async fn override_trace_id(
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
         from: Arc<str>,
         to: Arc<str>,
     ) -> Result<(), Error> {
+        let table_ref = TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
+
+        let sql = format!(
+            "SELECT * FROM {} where trace_id = '{from}'",
+            table_ref.to_quoted_string()
+        );
         let overriden: Vec<_> = df
-            .query_builder(
-                format!(
-                    "SELECT * FROM {} where trace_id = '{from}'",
-                    TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE)
-                        .to_quoted_string()
-                )
-                .as_str(),
-            )
-            .build()
-            .run()
+            .execute_query(QueryRequest::new(sql))
             .await
             .boxed()
-            .context(UnableToUpdateTracesSnafu)?
-            .data
+            .map_err(|source| Error::UnableToUpdateTraces { source })?
             .try_collect::<Vec<RecordBatch>>()
             .await
             .boxed()
@@ -243,24 +263,20 @@ impl TaskSpan {
             .boxed()
             .context(UnableToUpdateTracesSnafu)?;
 
-        df.write_data(
-            &TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
-            DataUpdate {
-                schema: Arc::new(Self::table_schema()),
-                data: overriden,
-                update_type: UpdateType::Changes,
-            },
-        )
-        .await
-        .boxed()
-        .context(UnableToUpdateTracesSnafu)?;
+        // Get the schema from the registered table
+        let table_provider = df.get_table(&table_ref).await.context(TableNotFoundSnafu)?;
+        let schema = table_provider.schema();
+
+        df.write_data(&table_ref, schema, overriden, UpdateType::Changes)
+            .await
+            .boxed()
+            .map_err(|source| Error::UnableToUpdateTraces { source })?;
 
         Ok(())
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    fn to_record_batch(spans: Vec<TaskSpan>) -> Result<RecordBatch, Error> {
-        let schema = Self::table_schema();
+    #[expect(clippy::cast_possible_truncation)]
+    fn to_record_batch(spans: Vec<TaskSpan>, schema: &Schema) -> Result<RecordBatch, Error> {
         let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), spans.len());
 
         for span in spans {
@@ -350,6 +366,17 @@ impl TaskSpan {
                             .boxed()
                             .context(UnableToCreateRowSnafu)?;
                     }
+                    "node_id" => {
+                        let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
+                        match &span.node_id {
+                            Some(node_id) => str_builder.append_value(node_id),
+                            None => {
+                                return Err(Error::MissingColumnsInRow {
+                                    columns: "node_id".to_string(),
+                                });
+                            }
+                        }
+                    }
                     name => unreachable!("unexpected field name: {name}"),
                 }
             }
@@ -362,11 +389,12 @@ impl TaskSpan {
 pub(crate) fn downcast_builder<T: ArrayBuilder>(
     builder: &mut dyn ArrayBuilder,
 ) -> Result<&mut T, Error> {
-    let builder = builder
+    builder
         .as_any_mut()
         .downcast_mut::<T>()
-        .context(DowncastBuilderSnafu)?;
-    Ok(builder)
+        .ok_or_else(|| Error::DowncastBuilder {
+            expected: std::any::type_name::<T>(),
+        })
 }
 
 #[derive(Debug, Snafu)]
@@ -401,8 +429,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to downcast ArrayBuilder"))]
-    DowncastBuilder,
+    #[snafu(display("The `task_history` table was not found"))]
+    TableNotFound,
+
+    #[snafu(display("Unable to downcast ArrayBuilder to expected type {expected}"))]
+    DowncastBuilder { expected: &'static str },
 
     #[snafu(display("Invalid `task_history` configuration: {source}"))]
     InvalidConfiguration {

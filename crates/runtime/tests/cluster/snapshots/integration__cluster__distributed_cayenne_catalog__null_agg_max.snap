@@ -1,0 +1,15 @@
+---
+source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
+expression: __plan
+---
++---------------+-----------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                          |
++---------------+-----------------------------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[max(ncat.ns.metrics.value)]]                                  |
+|               |   SubqueryAlias: ncat.ns.metrics                                                              |
+|               |     TableScan: ncat.ns.metrics projection=[value]                                             |
+| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[max(ncat.ns.metrics.value)]                          |
+|               |   CoalescePartitionsExec                                                                      |
+|               |     PartialAggregationFlightSqlExec sql=SELECT MAX("value") AS "__agg_0" FROM ncat.ns.metrics |
+|               |                                                                                               |
++---------------+-----------------------------------------------------------------------------------------------+

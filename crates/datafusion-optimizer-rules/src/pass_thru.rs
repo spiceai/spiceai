@@ -23,7 +23,7 @@ use datafusion::{
         SendableRecordBatchStream,
     },
 };
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 type DisplayFormattingFn =
     dyn Fn(DisplayFormatType, &mut fmt::Formatter) -> fmt::Result + Send + Sync + 'static;
@@ -152,11 +152,20 @@ where
     fn name(&self) -> &'static str {
         self.name
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
+
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input_exec.properties()
+    }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+            DataFusionError,
+        >,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion, DataFusionError> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input_exec]

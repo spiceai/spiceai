@@ -2,35 +2,8 @@
 name: integration tests (models)
 
 on:
-  push:
-    branches:
-      - trunk
-      - release/*
-  pull_request_target:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-      - feature-*
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'README.md'
-      - 'Makefile'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
-      - 'LICENSE'
-      - '.github/**'
-      - 'version.txt'
-      - '.schema/**'
-      - '.vscode/**'
-      - 'deploy/**'
-      - 'install/**'
-      - 'media/**'
-      - 'monitoring/**'
-      - 'acknowledgements.md'
-      - 'Dockerfile*'
-      - 'bin/spice/**'
+  schedule:
+    - cron: '0 0 * * *' # Daily at midnight UTC
 
   workflow_dispatch:
     inputs:
@@ -57,25 +30,62 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  AI_INTEGRATION_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/ai-integration-test-archive/integration.tar.zst
+  AI_INTEGRATION_EXTENDED_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/ai-integration-test-archive-extended/integration-extended.tar.zst
 
+# The spiceio setup action exports AWS_ENDPOINT_URL (alongside SCCACHE_ENDPOINT) so that sccache
+# and the AWS CLI reach the local cache. The build jobs need it. The test jobs must not hand it to
+# spiced: it honours AWS_ENDPOINT_URL for every s3:// dataset and for the S3 Vectors API, so the
+# public fixtures these tests load resolve to the build cache instead of AWS and never become
+# ready. Every step below that runs the test binary drops it first.
 jobs:
   build:
-    name: Build Test Binary
-    runs-on: 'spiceai-macos'
+    name: Build Test Binary (macOS)
+    runs-on: spiceai-macos-large
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
           fetch-depth: 1 # Shallow clone for faster checkout
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
+
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
-          os: 'darwin'
-      
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+          immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
+
+      - name: Set up sccache
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       # Build the test binary without running tests
       - name: Build AI integration test binary
@@ -83,9 +93,12 @@ jobs:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
-          FEATURES="flightsql,models,metal,s3_vectors,kafka"
-          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
+          FEATURES="flightsql,models,metal,s3_vectors,kafka,duckdb"
+          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
           else
@@ -94,80 +107,124 @@ jobs:
 
           cargo nextest archive -p runtime --test integration_models --features ${FEATURES} --archive-file integration.tar.zst
 
-      # Upload the test archive as an artifact
+      - name: Preserve sccache spiceio log
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: cp "${{ runner.temp }}/spiceio.log" "${{ runner.temp }}/spiceio-sccache.log" || true
+
+      - name: Stop sccache spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Clean spiceio install directory
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        run: rm -rf "${{ runner.temp }}/spiceio-bin"
+
+      - name: Set up spiceio for build archive
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio-build
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
+
+      - name: Upload test archive to spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio-build.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to upload the AI integration test archive}"
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --upload-file ./integration.tar.zst "$archive_url"
+
       - name: Upload test archive
-        uses: actions/upload-artifact@v5
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ai-integration-test-archive
           path: ./integration.tar.zst
-          retention-days: 1
+          retention-days: 3
+          compression-level: 1
 
-  test-openai:
-    name: Test OpenAI Models
-    needs: build
-    runs-on: 'spiceai-macos'
-    steps:
-      - uses: actions/checkout@v5
+      - name: Kill build archive spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio-build.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio-build.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
-      
-      - name: Install Nextest
+          name: spiceio-models-build-logs
+          path: ${{ runner.temp }}/spiceio*.log
+          if-no-files-found: ignore
+
+  test-models:
+    name: Test Models, AI & Search
+    needs: build
+    # `spiceai-macos-large`, like every other job that runs this archive: the
+    # Mac minis behind `spiceai-macos` cannot reliably start the debug
+    # `integration_models` binary. dyld fails to map the shared cache into it
+    # (`dyld cache '(null)' not loaded: syscall to map cache into shared region
+    # failed`, then `Library not loaded: /usr/lib/libiconv.2.dylib`), so
+    # `nextest --list` and every test process abort with SIGABRT before any
+    # test code runs, while the same archive starts cleanly on the MacBook Pros.
+    runs-on: spiceai-macos-large
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_OPENAI_SECRET: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' }}
+      HAS_ANTHROPIC_SECRET: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY != '' }}
+      HAS_XAI_SECRET: ${{ secrets.SPICE_SECRET_XAI_API_KEY != '' }}
+      HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
+      HAS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_KEY != '' && secrets.AWS_S3_VECTORS_SECRET != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
+
+      - name: Download test archive from spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
         run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the AI integration test archive}"
+          mkdir -p ./integration_test
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --output ./integration_test/integration.tar.zst "$archive_url"
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
-        with:
-          name: ai-integration-test-archive
-          path: ./integration_test
-
-      - name: Set up Open.ai API Key
-        run: |
-          echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
-
-      - name: Run integration test
-        env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
-          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-        run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
-            exit 1
-          fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_test
-
-      - name: Run Beta functionality embeddings test
-        env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
-          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-        run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
-            exit 1
-          fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_embeddings_beta_requirements
-
-      - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
-        uses: ./.github/actions/push-snap-changes
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-  
-  test-ai-udf:
-    name: Test AI UDF
-    needs: build
-    runs-on: 'spiceai-macos'
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-      
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
-      - name: Download test archive
-        uses: actions/download-artifact@v6
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -178,272 +235,466 @@ jobs:
           echo 'SPICE_ANTHROPIC_API_KEY="${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}"' >> .env
           echo 'SPICE_XAI_API_KEY="${{ secrets.SPICE_SECRET_XAI_API_KEY }}"' >> .env
 
-      - name: Run AI UDF basic test
+      # OpenAI tests
+      - name: Run OpenAI integration test
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' }}
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_test
+
+      - name: Run OpenAI Beta functionality embeddings test
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' }}
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_embeddings_beta_requirements
+
+      # AI UDF tests
+      - name: Run AI UDF basic test
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' }}
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
         run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
           fi
-          if [ -z "$SPICE_SECRET_ANTHROPIC_API_KEY" ] ; then
-            echo "Error: Anthropic API key is not defined."
+          if [ -z "${SPICE_SECRET_ANTHROPIC_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_ANTHROPIC_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_basic
 
-      - name: Run AI UDF with dataset test
+      - name: Run Anthropic prompt caching test
+        if: ${{ !cancelled() && env.HAS_ANTHROPIC_SECRET == 'true' }}
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_SECRET_ANTHROPIC_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_ANTHROPIC_API_KEY is required but not set"
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- anthropic_prompt_caching_through_tool_calls
+
+      - name: Run AI UDF with dataset test
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' && env.HAS_XAI_SECRET == 'true' }}
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
           fi
-          if [ -z "$SPICE_SECRET_ANTHROPIC_API_KEY" ] ; then
-            echo "Error: Anthropic API key is not defined."
+          if [ -z "${SPICE_SECRET_ANTHROPIC_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_ANTHROPIC_API_KEY is required but not set"
             exit 1
           fi
-          if [ -z "$SPICE_SECRET_XAI_API_KEY" ] ; then
-            echo "Error: xAI API key is not defined."
+          if [ -z "${SPICE_SECRET_XAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_XAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_dataset
 
-      - name: Run AI UDF LEFT truncate test
+      # Tools that Spice runs for a model: the tool calls of earlier turns reach the provider, and
+      # each provider round reuses the prompt cache.
+      - name: Run Spice tool turns test
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' && env.HAS_XAI_SECRET == 'true' }}
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
           fi
-          if [ -z "$SPICE_SECRET_ANTHROPIC_API_KEY" ] ; then
-            echo "Error: Anthropic API key is not defined."
+          if [ -z "${SPICE_SECRET_ANTHROPIC_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_ANTHROPIC_API_KEY is required but not set"
             exit 1
           fi
-          if [ -z "$SPICE_SECRET_XAI_API_KEY" ] ; then
-            echo "Error: xAI API key is not defined."
+          if [ -z "${SPICE_SECRET_XAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_XAI_API_KEY is required but not set"
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- spice_tool_turns
+
+      # NOTE: Step-level `if:` conditionals on secret-requiring AI test steps (OpenAI, workers, search, xAI/HF UDFs, etc.) cause the step to report "skipped" (neutral, job succeeds) on PRs where secrets are intentionally unavailable for security (forks/external PRs). When a step *does* execute (schedule/workflow_dispatch with secrets present), an explicit fast-fail guard at the start of `run:` errors immediately if a required key is missing, preserving the original intent. This is intentional and confirmed for schedule + workflow_dispatch (incl. `run_all_tests`). See Copilot review threads for context; prevents spurious reds unrelated to code.
+      - name: Run AI UDF LEFT truncate test
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' && env.HAS_XAI_SECRET == 'true' }}
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+          SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_left_truncate
 
-      - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
-        uses: ./.github/actions/push-snap-changes
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  test-hf:
-    name: Test Huggingface Models
-    needs: build
-    if: ${{ github.event.inputs.run_all_tests == 'true' }}
-    runs-on: 'spiceai-macos'
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
-      - name: Download test archive
-        uses: actions/download-artifact@v6
-        with:
-          name: ai-integration-test-archive
-          path: ./integration_test
-
-      - name: Run integration test
+      # Local model tests
+      - name: Run local embeddings Beta functionality test
+        if: ${{ !cancelled() }}
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
-          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
         run: |
-          if [ -z "$SPICE_HF_TOKEN" ] ; then
-            echo "Error: Hugging Face API Token is not defined."
-            exit 1
-          fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- huggingface_test
-
-      - name: Run Beta functionality embedding tests
-        env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
-          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
-        run: |
-          if [ -z "$SPICE_HF_TOKEN" ] ; then
-            echo "Error: Hugging Face API Token is not defined."
-            exit 1
-          fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- hf_embeddings_beta_requirements
-
-      - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
-        uses: ./.github/actions/push-snap-changes
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  test-local:
-    name: Test Local Models
-    needs: build
-    runs-on: 'spiceai-macos'
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
-      - name: Download test archive
-        uses: actions/download-artifact@v6
-        with:
-          name: ai-integration-test-archive
-          path: ./integration_test
-
-      - name: Run Beta functionality embedding tests
-        env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
-        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- local_embeddings_beta_requirements
 
       - name: Run AI UDF with local model test
+        if: ${{ !cancelled() && env.HAS_HF_SECRET == 'true' }}
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
-          if [ -z "$SPICE_HF_TOKEN" ] ; then
-            echo "Error: Hugging Face API Token is not defined."
-            exit 1
-          fi
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_local_model
 
-      - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
-        uses: ./.github/actions/push-snap-changes
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  test-bedrock:
-    name: Test Bedrock Models
-    needs: build
-    if: ${{ github.event.inputs.run_all_tests == 'true' }}
-    runs-on: 'spiceai-macos'
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
-      - name: Download test archive
-        uses: actions/download-artifact@v6
-        with:
-          name: ai-integration-test-archive
-          path: ./integration_test
-
-      - name: Run Beta functionality embedding tests
+      # Workers tests
+      - name: Run workers integration test
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' }}
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
-          AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
-          AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
-        run: |
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test
-
-      - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
-        uses: ./.github/actions/push-snap-changes
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  test-workers:
-    name: Test Workers
-    needs: build
-    runs-on: 'spiceai-macos'
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
-      - name: Download test archive
-        uses: actions/download-artifact@v6
-        with:
-          name: ai-integration-test-archive
-          path: ./integration_test
-
-      - name: Set up Open.ai API Key
-        run: |
-          echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
-
-      - name: Run integration test
-        env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- workers
 
-      - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
-        uses: ./.github/actions/push-snap-changes
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  test-search:
-    name: Test Search
-    needs: build
-    runs-on: 'spiceai-macos'
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
-      - name: Download test archive
-        uses: actions/download-artifact@v6
-        with:
-          name: ai-integration-test-archive
-          path: ./integration_test
-
-      - name: Set up Open.ai API Key
-        run: |
-          echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
-
-      - name: Run integration test
+      # Search tests
+      - name: Run search integration test
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_S3_VECTORS_SECRET == 'true' }}
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
         run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- search
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
+        timeout-minutes: 10
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+  test-hf:
+    name: Test Hugging Face Models
+    needs: build
+    if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
+    runs-on: spiceai-macos-large
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
+
+      - name: Download test archive from spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the AI integration test archive}"
+          mkdir -p ./integration_test
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --output ./integration_test/integration.tar.zst "$archive_url"
+
+      - name: Download test archive
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ai-integration-test-archive
+          path: ./integration_test
+
+      - name: Run integration test
+        if: ${{ !cancelled() && env.HAS_HF_SECRET == 'true' }}
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_HF_TOKEN:-}" ]; then
+            echo "ERROR: SPICE_SECRET_HF_TOKEN is required but not set"
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- huggingface_test
+
+      - name: Run Beta functionality embedding tests
+        if: ${{ !cancelled() && env.HAS_HF_SECRET == 'true' }}
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_HF_TOKEN:-}" ]; then
+            echo "ERROR: SPICE_SECRET_HF_TOKEN is required but not set"
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- hf_embeddings_beta_requirements
+
+      - name: Push snapshots to branch
+        if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
+        timeout-minutes: 10
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+  test-bedrock:
+    name: Test Bedrock Models
+    needs: build
+    if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
+    # The large pool for the same reason as `test-models`: a Mac mini cannot
+    # reliably start this archive's test binary.
+    runs-on: spiceai-macos-large
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
+
+      - name: Download test archive from spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the AI integration test archive}"
+          mkdir -p ./integration_test
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --output ./integration_test/integration.tar.zst "$archive_url"
+
+      - name: Download test archive
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ai-integration-test-archive
+          path: ./integration_test
+
+      - name: Run Beta functionality embedding tests
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
+          AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test
+
+      - name: Push snapshots to branch
+        if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
+        timeout-minutes: 10
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+  build-extended:
+    name: Build Test Binary (Extended)
+    runs-on: spiceai-macos-large
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1 # Shallow clone for faster checkout
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+          immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
+
+      - name: Set up sccache
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      # Build the test binary without running tests
+      - name: Build AI integration test binary
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: |
+          FEATURES="flightsql,models,s3_vectors,kafka,duckdb"
+          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
+            FEATURES="${FEATURES},bedrock,extended_tests"
+            echo "Including extended_tests"
+          else
+            echo "Excluding extended_tests"
+          fi
+
+          cargo nextest archive -p runtime --test integration_models --features ${FEATURES} --archive-file integration-extended.tar.zst
+
+      - name: Preserve sccache spiceio log
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: cp "${{ runner.temp }}/spiceio.log" "${{ runner.temp }}/spiceio-sccache.log" || true
+
+      - name: Stop sccache spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Clean spiceio install directory
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        run: rm -rf "${{ runner.temp }}/spiceio-bin"
+
+      - name: Set up spiceio for build archive
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio-build
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
+
+      - name: Upload test archive to spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio-build.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to upload the extended AI integration test archive}"
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_EXTENDED_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --upload-file ./integration-extended.tar.zst "$archive_url"
+
+      - name: Upload test archive
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ai-integration-test-archive-extended
+          path: ./integration-extended.tar.zst
+          retention-days: 3
+          compression-level: 1
+
+      - name: Kill build archive spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio-build.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio-build.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spiceio-models-build-extended-logs
+          path: ${{ runner.temp }}/spiceio*.log
+          if-no-files-found: ignore

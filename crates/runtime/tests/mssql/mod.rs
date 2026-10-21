@@ -22,7 +22,7 @@ use data_components::mssql::connection_manager::SqlServerConnectionManager;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
-use crate::utils::test_request_context;
+use crate::utils::{register_test_connectors, test_request_context};
 
 pub mod common;
 
@@ -32,9 +32,7 @@ use runtime::Runtime;
 use tracing::instrument;
 
 const MSSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-types-mssql";
-const MSSQL_PORT: u16 = 11433;
 
-#[allow(clippy::too_many_lines)]
 #[instrument]
 async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
     let mut config = tiberius::Config::new();
@@ -173,20 +171,22 @@ async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
 async fn mssql_integration_test() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
             let running_container =
-                start_mssql_docker_container(MSSQL_DOCKER_CONTAINER, MSSQL_PORT)
+                start_mssql_docker_container(MSSQL_DOCKER_CONTAINER)
                     .await
                     .map_err(|e| {
                         tracing::error!("start_mssql_docker_container: {e}");
                         e.to_string()
                     })?;
+            let port = running_container.host_port(1433).map_err(|e| e.to_string())?;
             tracing::debug!("Container started");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mssql_db(MSSQL_PORT)
+                init_mssql_db(port)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -196,7 +196,7 @@ async fn mssql_integration_test() -> Result<(), String> {
                 e.to_string()
             })?;
             let app = AppBuilder::new("mssql_integration_test")
-                .with_dataset(make_mssql_dataset("test", "test", MSSQL_PORT))
+                .with_dataset(make_mssql_dataset("test", "test", port))
                 .build();
 
             configure_test_datafusion();
@@ -206,33 +206,67 @@ async fn mssql_integration_test() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
             }
 
-            let queries: QueryTests = vec![(
-                "SELECT * FROM test",
-                "select",
-                Some(Box::new(|result_batches| {
-                    for batch in &result_batches {
-                        assert_eq!(batch.num_columns(), 18, "num_cols: {}", batch.num_columns());
-                        assert_eq!(batch.num_rows(), 2, "num_rows: {}", batch.num_rows());
-                    }
+            let queries: QueryTests = vec![
+                (
+                    "SELECT * FROM test",
+                    "select",
+                    Some(Box::new(|result_batches| {
+                        for batch in &result_batches {
+                            assert_eq!(batch.num_columns(), 18, "num_cols: {}", batch.num_columns());
+                            assert_eq!(batch.num_rows(), 2, "num_rows: {}", batch.num_rows());
+                        }
 
-                    // snapshot the values of the results
-                    let results = arrow::util::pretty::pretty_format_batches(&result_batches)
-                        .expect("should pretty print result batch");
-                    insta::with_settings!({
-                        description => format!("MSSQL Integration Test Results"),
-                        omit_expression => true,
-                        snapshot_path => "../snapshots"
-                    }, {
-                        insta::assert_snapshot!(format!("mssql_integration_test_select"), results);
-                    });
-                })),
-            )];
+                        // snapshot the values of the results
+                        let results = arrow::util::pretty::pretty_format_batches(&result_batches)
+                            .expect("should pretty print result batch");
+                        insta::with_settings!({
+                            description => "MSSQL Integration Test Results",
+                            omit_expression => true,
+                            snapshot_path => "../snapshots"
+                        }, {
+                            insta::assert_snapshot!("mssql_integration_test_select", results);
+                        });
+                    })),
+                ),
+                // Sort pushdown (NULLS LAST = native MSSQL behavior for DESC): Exact pushdown, no SortExec
+                (
+                    "SELECT col_long, col_varchar, col_decimal FROM test ORDER BY col_long DESC NULLS LAST LIMIT 2",
+                    "sort_pushdown_nulls_last",
+                    Some(Box::new(|result_batches| {
+                        let results = arrow::util::pretty::pretty_format_batches(&result_batches)
+                            .expect("should pretty print result batch");
+                        insta::with_settings!({
+                            description => "MSSQL Sort Pushdown DESC NULLS LAST Results",
+                            omit_expression => true,
+                            snapshot_path => "../snapshots"
+                        }, {
+                            insta::assert_snapshot!("mssql_integration_test_sort_pushdown_nulls_last_result", results);
+                        });
+                    })),
+                ),
+                // Sort pushdown (NULLS FIRST = non-native for DESC): Inexact pushdown, SortExec stays for NULL ordering
+                (
+                    "SELECT col_long, col_varchar, col_decimal FROM test ORDER BY col_long DESC NULLS FIRST LIMIT 2",
+                    "sort_pushdown_nulls_first",
+                    Some(Box::new(|result_batches| {
+                        let results = arrow::util::pretty::pretty_format_batches(&result_batches)
+                            .expect("should pretty print result batch");
+                        insta::with_settings!({
+                            description => "MSSQL Sort Pushdown DESC NULLS FIRST Results",
+                            omit_expression => true,
+                            snapshot_path => "../snapshots"
+                        }, {
+                            insta::assert_snapshot!("mssql_integration_test_sort_pushdown_nulls_first_result", results);
+                        });
+                    })),
+                ),
+            ];
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(

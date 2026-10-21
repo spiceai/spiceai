@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use bollard::secret::HealthConfig;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use tracing::instrument;
 
-use crate::docker::{ContainerRunnerBuilder, RunningContainer};
+use crate::docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port};
 
 pub fn make_mssql_dataset(path: &str, name: &str, port: u16) -> Dataset {
     let mut dataset = Dataset::new(format!("mssql:{path}"), name.to_string());
@@ -43,34 +43,40 @@ pub fn make_mssql_dataset(path: &str, name: &str, port: u16) -> Dataset {
 }
 
 pub const MSSQL_ROOT_PASSWORD: &str = "S3cret-integration-test-p@ss";
+const MSSQL_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
+const MSSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[instrument]
 pub async fn start_mssql_docker_container(
-    container_name: &'static str,
-    port: u16,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
+    container_name: &str,
+) -> Result<RunningContainer, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(container_name)
         .image("mcr.microsoft.com/mssql/server:2022-latest".to_string())
-        .add_port_binding(1433, port)
+        .publish_port(1433)
         .add_env_var("MSSQL_SA_PASSWORD", MSSQL_ROOT_PASSWORD)
         .add_env_var("ACCEPT_EULA", "Y")
         .healthcheck(HealthConfig {
             test: Some(vec![
                 "CMD-SHELL".to_string(),
                 format!(
-                    "/opt/mssql-tools/bin/sqlcmd -C -U sa -P {MSSQL_ROOT_PASSWORD} -Q \"SELECT 1\""
+                    "/opt/mssql-tools18/bin/sqlcmd -C -U sa -P {MSSQL_ROOT_PASSWORD} -Q \"SELECT 1\""
                 ),
             ]),
-            interval: Some(250_000_000),
-            timeout: Some(100_000_000),
-            retries: Some(5),
-            start_period: Some(500_000_000),
+            interval: Some(1_000_000_000),
+            timeout: Some(5_000_000_000),
+            retries: Some(120),
+            start_period: Some(30_000_000_000),
             start_interval: None,
         })
         .build()?
-        .run(None)
+        .run(Some(MSSQL_CONTAINER_START_TIMEOUT))
         .await?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+    wait_for_tcp_port(
+        "127.0.0.1",
+        running_container.host_port(1433)?,
+        MSSQL_HOST_PORT_READY_TIMEOUT,
+    )
+    .await?;
     Ok(running_container)
 }

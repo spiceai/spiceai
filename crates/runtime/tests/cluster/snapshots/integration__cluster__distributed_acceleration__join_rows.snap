@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/cluster/distributed_acceleration.rs
+expression: rows_fmt
+---
++----+--------------+----------+--------+
+| id | name         | category | rating |
++----+--------------+----------+--------+
+| 1  | John Doe     | A        | 4.5    |
+| 2  | Jane Smith   | B        | 3.2    |
+| 3  | Mike Johnson | A        | 4.8    |
+| 4  | Emily Brown  | C        | 2.1    |
+| 5  | David Lee    | B        | 3.9    |
+| 6  | Sarah Wilson | A        | 4.2    |
+| 7  | Tom Anderson | C        | 1.8    |
+| 8  | Lisa Taylor  | B        | 3.5    |
+| 9  | Chris Martin | A        | 4.6    |
+| 10 | Anna Garcia  | C        | 2.7    |
++----+--------------+----------+--------+

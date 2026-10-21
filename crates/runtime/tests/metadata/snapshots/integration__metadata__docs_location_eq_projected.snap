@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/metadata/mod.rs
+expression: formatted
+---
++-------------+-----------------------+
+| document_id | filename              |
++-------------+-----------------------+
+| doc_3       | empty_placeholder.txt |
++-------------+-----------------------+

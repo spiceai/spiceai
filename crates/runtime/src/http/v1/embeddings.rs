@@ -17,14 +17,15 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::model::EmbeddingModelStore;
-use async_openai::types::CreateEmbeddingRequest;
+use async_openai::types::embeddings::CreateEmbeddingRequest;
 #[cfg(feature = "openapi")]
-use async_openai::types::CreateEmbeddingResponse;
+use async_openai::types::embeddings::CreateEmbeddingResponse;
 use axum::{
     Extension, Json,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use runtime_status::RuntimeStatus;
 use tokio::sync::RwLock;
 
 /// Create Embeddings
@@ -87,18 +88,19 @@ use tokio::sync::RwLock;
 ))]
 pub(crate) async fn post(
     Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
+    Extension(status): Extension<Arc<RuntimeStatus>>,
     Json(req): Json<CreateEmbeddingRequest>,
 ) -> Response {
-    let model_id = req.model.clone().to_string();
-    match embeddings.read().await.get(&model_id) {
-        Some(model) => {
-            let resp: Response = match model.embed_request(req).await {
-                Ok(response) => Json(response).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            };
+    let model_id = req.model.clone();
+    let Some(model) = embeddings.read().await.get(&model_id).cloned() else {
+        let message = status
+            .unavailable_embedding_reason(&model_id)
+            .unwrap_or_else(|| "model not found".to_string());
+        return (StatusCode::NOT_FOUND, message).into_response();
+    };
 
-            resp
-        }
-        None => (StatusCode::NOT_FOUND, "model not found").into_response(),
+    match model.embed_request(req).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

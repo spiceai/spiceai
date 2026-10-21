@@ -1,0 +1,31 @@
+version: v1
+kind: Spicepod
+name: adbc[bigquery]-federated
+datasets:
+  - from: adbc:customer
+    name: customer
+    params: &adbc_bigquery_params
+      adbc_driver: bigquery
+      adbc_driver_options: adbc.bigquery.sql.auth_type=adbc.bigquery.sql.auth_type.json_credential_string;adbc.bigquery.sql.auth_credentials=${secrets:BIGQUERY_SERVICE_ACCOUNT_JSON}
+      adbc_uri: bigquery:///spiceai-testing?DatasetId=tpch_sf1
+  - from: adbc:lineitem
+    name: lineitem
+    params: *adbc_bigquery_params
+  - from: adbc:nation
+    name: nation
+    params: *adbc_bigquery_params
+  - from: adbc:orders
+    name: orders
+    params: *adbc_bigquery_params
+  - from: adbc:part
+    name: part
+    params: *adbc_bigquery_params
+  - from: adbc:partsupp
+    name: partsupp
+    params: *adbc_bigquery_params
+  - from: adbc:region
+    name: region
+    params: *adbc_bigquery_params
+  - from: adbc:supplier
+    name: supplier
+    params: *adbc_bigquery_params

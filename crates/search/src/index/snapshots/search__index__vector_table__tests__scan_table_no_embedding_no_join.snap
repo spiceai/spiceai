@@ -1,0 +1,15 @@
+---
+source: crates/search/src/index/vector_table.rs
+expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
+snapshot_kind: text
+---
++---------------+--------------------------------------------------------------------------+
+| plan_type     | plan                                                                     |
++---------------+--------------------------------------------------------------------------+
+| logical_plan  | Sort: my_vectored_table.pk DESC NULLS FIRST, fetch=5                     |
+|               |   Projection: my_vectored_table.pk, my_vectored_table.a_number           |
+|               |     TableScan: my_vectored_table projection=[a_number, pk]               |
+| physical_plan | SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[false] |
+|               |   BaseTable: projection=["pk", "a_number"] filter=[] limit=None          |
+|               |                                                                          |
++---------------+--------------------------------------------------------------------------+

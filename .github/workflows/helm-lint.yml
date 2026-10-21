@@ -1,0 +1,52 @@
+name: pr - helm-lint
+
+on:
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  workflow_dispatch:
+
+jobs:
+  # merge_group can't path-filter, so gate the lint on a changed-files check
+  # instead of running it for every merge-queue entry.
+  changes:
+    runs-on: ubuntu-latest
+    # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
+    # cold runner having to clone from scratch, not the ~1 min a warm
+    # self-hosted workspace takes.
+    timeout-minutes: 45
+    outputs:
+      relevant: ${{ steps.check.outputs.relevant_changes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: check
+        uses: ./.github/actions/check-code-changes
+        with:
+          filters: |
+            code_changes:
+              - 'deploy/chart/**'
+
+  lint-helm:
+    name: Helm Lint
+    needs: changes
+    # A helm template/lint over one chart.
+    timeout-minutes: 60
+    if: ${{ needs.changes.outputs.relevant == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: spiceai-macos
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+
+      - name: Lint Helm chart
+        run: helm lint deploy/chart/

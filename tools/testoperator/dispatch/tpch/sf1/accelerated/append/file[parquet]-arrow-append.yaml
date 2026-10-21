@@ -1,0 +1,4 @@
+tests:
+  append:
+    spicepod_path: accelerated/append/file[parquet]-arrow-append.yaml
+    query_set: tpch

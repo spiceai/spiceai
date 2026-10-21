@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::Parser;
+mod logs_load;
+
+use clap::{Parser, Subcommand};
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::{
         ExportMetricsServiceRequest, metrics_service_client::MetricsServiceClient,
@@ -35,10 +37,13 @@ use tonic::{
 #[derive(Parser)]
 #[clap(about = "Spice.ai Open Telemetry Publisher Utility")]
 pub struct Args {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     #[arg(
         long,
         value_name = "OTEL_ENDPOINT",
-        default_value = "http://localhost:50052"
+        default_value = "http://localhost:50051"
     )]
     pub otel_endpoint: String,
 
@@ -51,9 +56,19 @@ pub struct Args {
     pub api_key: Option<String>,
 }
 
+#[derive(Subcommand)]
+pub enum Command {
+    /// Send OTLP log exports as fast as they are acknowledged, then report acknowledged
+    /// records per second and the export latency distribution.
+    LogsLoad(logs_load::LogsLoadArgs),
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
+    if let Some(Command::LogsLoad(load)) = args.command {
+        return logs_load::run(load).await;
+    }
 
     // Set up the Otel client
     let mut otel_endpoint = args.otel_endpoint;
@@ -61,8 +76,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tls_root_certificate = std::fs::read(tls_root_certificate_file)?;
         let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
         let client_tls_config = ClientTlsConfig::new().ca_certificate(tls_root_certificate);
-        if otel_endpoint == "http://localhost:50052" {
-            otel_endpoint = "https://localhost:50052".to_string();
+        if otel_endpoint == "http://localhost:50051" {
+            otel_endpoint = "https://localhost:50051".to_string();
         }
         Channel::from_shared(otel_endpoint)?
             .tls_config(client_tls_config)?
@@ -81,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 value: Some(AnyValue {
                     value: Some(Value::StringValue("test".to_string())),
                 }),
+                ..Default::default()
             }],
             ..Default::default()
         }),
@@ -107,11 +123,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut request = request.into_request();
 
     if let Some(api_key) = args.api_key {
-        let metadata_value = match MetadataValue::try_from(api_key) {
+        // The Flight port's authentication reads `authorization: Bearer <key>`.
+        let metadata_value = match MetadataValue::try_from(format!("Bearer {api_key}")) {
             Ok(metadata_value) => metadata_value,
             Err(e) => panic!("Invalid API key: {e}"),
         };
-        request.metadata_mut().insert("x-api-key", metadata_value);
+        request
+            .metadata_mut()
+            .insert("authorization", metadata_value);
     }
 
     client.export(request).await?;

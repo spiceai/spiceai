@@ -1,0 +1,1 @@
+SELECT MAX("L_ORDERKEY") FROM oracle_tpch."TPCH_SF1"."LINEITEM";

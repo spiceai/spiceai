@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,28 +15,34 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
+use runtime_query_engine::query_engine::QueryEngine;
+use runtime_tools::factory::IndividualToolFactory;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{ResultExt, Snafu};
 use spicepod::component::tool::Tool;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{
-    Runtime,
-    tools::{
-        catalog::SpiceToolCatalog, factory::IndividualToolFactory, options::SpiceToolsOptions,
-    },
-};
+use app::App;
+use cache::TabledCacheProvider;
+use cache::result::search::CachedSearchResult;
+use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use runtime_status as status;
+use runtime_tools::catalog::SpiceToolCatalog;
+use runtime_tools::options::SpiceToolsOptions;
+use tokio::sync::RwLock;
 
-use super::{
-    SpiceModelTool,
-    get_readiness::GetReadinessTool,
-    list_datasets::ListDatasetsTool,
-    sample::{SampleTableMethod, tool::SampleDataTool},
-    search::SearchTool,
-    sql::SqlTool,
-    table_schema::TableSchemaTool,
-    web_search::WebSearchTool,
-};
+use runtime_tools::builtin::get_current_datetime::GetCurrentDateTimeTool;
+use runtime_tools::builtin::sample::{SampleTableMethod, tool::SampleDataTool};
+use tools::SpiceModelTool;
+
+use runtime_tools::builtin::list_datasets::ListDatasetsTool;
+use runtime_tools::builtin::search::SearchTool;
+use runtime_tools::builtin::sql::SqlTool;
+use runtime_tools::builtin::table_schema::TableSchemaTool;
+
+use super::get_readiness::GetReadinessTool;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -51,16 +57,56 @@ pub enum Error {
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Clone)]
 pub struct BuiltinToolCatalog {
-    rt: Arc<Runtime>,
+    df: Arc<dyn QueryEngine>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
+    status: Arc<status::RuntimeStatus>,
+    search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
+    /// An optional table allowlist. Overriden by any per-tool `table_allowlist` param.
+    model_table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
+
 impl BuiltinToolCatalog {
-    pub(crate) fn new(rt: Arc<Runtime>) -> Self {
-        Self { rt }
+    pub(crate) fn new(
+        df: Arc<dyn QueryEngine>,
+        app: Arc<RwLock<Option<Arc<App>>>>,
+        status: Arc<status::RuntimeStatus>,
+        search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
+    ) -> Self {
+        Self {
+            df,
+            app,
+            status,
+            search_cache,
+            model_table_allowlist: None,
+        }
+    }
+
+    /// Create a new `BuiltinToolCatalog` with a table allowlist applied to all tools.
+    #[must_use]
+    pub fn with_table_allowlist(mut self, allowlist: ResolvedTableAwareAllowlist) -> Self {
+        self.model_table_allowlist = Some(allowlist);
+        self
     }
 
     pub(crate) fn name() -> &'static str {
         "auto"
+    }
+
+    pub(crate) fn is_builtin_tool(name: &str) -> bool {
+        [
+            "get_readiness",
+            "get_current_datetime",
+            "search",
+            "table_schema",
+            "sql",
+            "sample_distinct_columns",
+            "random_sample",
+            "top_n_sample",
+            "list_datasets",
+        ]
+        .contains(&name)
     }
 
     pub(crate) fn construct_builtin(
@@ -72,73 +118,91 @@ impl BuiltinToolCatalog {
     ) -> Result<Arc<dyn SpiceModelTool>> {
         let name = name.unwrap_or(id);
 
-        // Get default description if none is provided
-        let description = match (id, description) {
-            (_, Some(desc)) => desc, // Use provided description if available
-            ("websearch", None) => "Search the web for information",
-            ("get_readiness", None) => "Get the readiness status of the Spice.ai runtime",
-            ("search", None) => "Search across available, searchable datasets in Spice.ai runtime",
-            ("table_schema", None) => "Get the schema of the Spice.ai dataset",
-            ("sql", None) => "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
-            ("sample_distinct_columns", None) => {
-                "Sample distinct column values from a Spice.ai dataset"
-            }
-            ("random_sample", None) => "Get a random sample of rows from a Spice.ai dataset",
-            ("top_n_sample", None) => {
-                "Get top N samples from a Spice.ai dataset based on a specified ordering"
-            }
-            ("list_datasets", None) => "List available datasets",
-            (_, None) => "",
-        };
+        // Built-in tool defaults live inside each tool's own constructor so the
+        // canonical description has a single source of truth. When the operator
+        // has not supplied a description, pass `None` through and let the tool
+        // pick its default. Otherwise use the operator override verbatim.
+        let description: Option<&str> = description;
+
+        // Use model-level table allowlist if set, otherwise parse from params
+        let table_allowlist: Option<ResolvedTableAwareAllowlist> =
+            if let Some(allowlist) = params.get("table_allowlist") {
+                let tables = allowlist
+                    .expose_secret()
+                    .split(',')
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>();
+                Some(
+                    ResolvedTableAwareAllowlist::with_defaults(
+                        SPICE_DEFAULT_CATALOG,
+                        SPICE_DEFAULT_SCHEMA,
+                    )
+                    .with_table_patterns(tables)
+                    .boxed()
+                    .context(FailedToConstructToolSnafu { id })?,
+                )
+            } else {
+                self.model_table_allowlist.clone()
+            };
 
         match id {
-            "websearch" => Ok(Arc::new(
-                WebSearchTool::try_new(name, Some(description), params)
-                    .context(FailedToConstructToolSnafu { id: id.to_string() })?,
-            )),
             "get_readiness" => Ok(Arc::new(GetReadinessTool::new(
-                Arc::clone(&self.rt),
+                Arc::clone(&self.status),
                 Some(name),
-                Some(description),
+                description,
             ))),
-            "search" => Ok(Arc::new(SearchTool::new(
-                Arc::clone(&self.rt),
+            "get_current_datetime" => Ok(Arc::new(GetCurrentDateTimeTool::new(
                 Some(name),
-                Some(description),
+                description,
             ))),
-            "table_schema" => Ok(Arc::new(TableSchemaTool::new(
-                Arc::clone(&self.rt),
-                Some(name),
-                Some(description),
-            ))),
+            "search" => Ok(Arc::new(
+                SearchTool::new(
+                    Arc::clone(&self.df),
+                    Arc::clone(&self.app),
+                    self.search_cache.clone(),
+                    crate::search::util::RuntimeTableProviderExplorer,
+                    Some(name),
+                    description,
+                )
+                .with_table_allowlist(table_allowlist),
+            )),
+            "table_schema" => Ok(Arc::new(
+                TableSchemaTool::new(
+                    Arc::clone(&self.df),
+                    Arc::clone(&self.app),
+                    Some(name),
+                    description,
+                )
+                .with_table_allowlist(table_allowlist),
+            )),
             "sql" => Ok(Arc::new(SqlTool::new(
-                self.rt.datafusion(),
+                Arc::clone(&self.df),
                 Some(name),
-                Some(description),
+                description,
+                table_allowlist,
             ))),
             "sample_distinct_columns" => Ok(Arc::new(
-                SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::DistinctColumns)
-                    .with_overrides(Some(name), Some(description)),
+                SampleDataTool::new(Arc::clone(&self.df), SampleTableMethod::DistinctColumns)
+                    .with_overrides(Some(name), description)
+                    .with_table_allowlist(table_allowlist),
             )),
             "random_sample" => Ok(Arc::new(
-                SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::RandomSample)
-                    .with_overrides(Some(name), Some(description)),
+                SampleDataTool::new(Arc::clone(&self.df), SampleTableMethod::RandomSample)
+                    .with_overrides(Some(name), description)
+                    .with_table_allowlist(table_allowlist),
             )),
             "top_n_sample" => Ok(Arc::new(
-                SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::TopNSample)
-                    .with_overrides(Some(name), Some(description)),
+                SampleDataTool::new(Arc::clone(&self.df), SampleTableMethod::TopNSample)
+                    .with_overrides(Some(name), description)
+                    .with_table_allowlist(table_allowlist),
             )),
-            "list_datasets" => {
-                let table_allowlist: Option<Vec<&str>> = params
-                    .get("table_allowlist")
-                    .map(|t| t.expose_secret().split(',').map(str::trim).collect());
-                Ok(Arc::new(ListDatasetsTool::new(
-                    Some(name),
-                    Some(description),
-                    table_allowlist,
-                    Arc::clone(&self.rt),
-                )))
-            }
+            "list_datasets" => Ok(Arc::new(ListDatasetsTool::new(
+                Some(name),
+                description,
+                table_allowlist,
+                Arc::clone(&self.df),
+                Arc::clone(&self.app),
+            ))),
             _ => Err(Error::UnknownBuiltinTool { id: id.to_string() }),
         }
     }
@@ -169,7 +233,7 @@ impl IndividualToolFactory for BuiltinToolCatalog {
 impl SpiceToolCatalog for BuiltinToolCatalog {
     async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         let mut tools = vec![];
-        for t in SpiceToolsOptions::Auto.tools_by_name() {
+        for t in SpiceToolsOptions::All.tools_by_name() {
             match self.construct_builtin(t, None, None, &HashMap::new()) {
                 Ok(tool) => tools.push(tool),
                 Err(e) => tracing::warn!("Failed to construct builtin tool: '{}'. Error: {}", t, e),
@@ -183,7 +247,23 @@ impl SpiceToolCatalog for BuiltinToolCatalog {
             .ok()
     }
 
+    fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+        self.construct_builtin(name, None, None, &HashMap::new())
+            .ok()
+    }
+
+    fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+        SpiceToolsOptions::All
+            .tools_by_name()
+            .iter()
+            .filter_map(|t| self.construct_builtin(t, None, None, &HashMap::new()).ok())
+            .collect()
+    }
+
     fn name(&self) -> &str {
         Self::name()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

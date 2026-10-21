@@ -5,3 +5,9 @@ tests:
     query_overrides: postgresql
     runner_type: spiceai-dev-large-runners
     ready_wait: 1800
+    # This arm's acceleration holds only the rows its `refresh_sql` selects, because
+    # a runner cannot hold all of ClickBench, while the `__test_reference.*` clone
+    # drops acceleration and reads every row, so it answers a different question: an
+    # arrow arm holding 100,000 of 1,000,000 rows failed 37 of 43 queries, starting
+    # with `COUNT(*)`.
+    validate_results: false

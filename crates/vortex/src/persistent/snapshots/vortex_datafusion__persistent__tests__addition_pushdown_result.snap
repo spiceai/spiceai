@@ -1,0 +1,10 @@
+---
+source: crates/vortex/src/persistent/mod.rs
+expression: pretty_format_batches(&result)?
+---
++---+------+-----+
+| a | five | six |
++---+------+-----+
+| 3 | 8    | 9   |
+| 4 | 9    | 10  |
++---+------+-----+

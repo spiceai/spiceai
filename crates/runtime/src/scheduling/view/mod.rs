@@ -35,14 +35,19 @@ impl From<Arc<View>> for ViewRefreshTask {
 impl ScheduledTask for ViewRefreshTask {
     async fn execute(&self) -> Result<()> {
         let view = Arc::clone(&self.0);
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "accelerated_refresh", input = %view.name.to_string());
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "acceleration_refresh", input = %view.name.to_string());
         async {
             let runtime = Arc::clone(&view.runtime);
 
             match runtime.datafusion().refresh_table(&view.name, None).await {
-                Ok(notifier) => {
-                    if let Some(notifier) = notifier {
-                        notifier.notified().await;
+                Ok(completion) => {
+                    // Abandoned (removal/shutdown) stays Ok. A terminal
+                    // one-shot failure must fail the scheduled task.
+                    if let Some(completion) = completion {
+                        return super::scheduled_refresh_wait_result(
+                            completion.wait().await,
+                            &view.name,
+                        );
                     }
                     Ok(())
                 }

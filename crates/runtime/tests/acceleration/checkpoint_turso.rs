@@ -86,7 +86,7 @@ async fn test_acceleration_turso_checkpoint() -> Result<(), anyhow::Error> {
                 .collect::<Result<Vec<_>, _>>()?;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -140,7 +140,6 @@ async fn test_acceleration_turso_checkpoint() -> Result<(), anyhow::Error> {
 }
 
 /// Helper function to convert libsql query results to Arrow `RecordBatches`
-#[allow(clippy::too_many_lines)]
 async fn query_to_record_batches(
     conn: &Connection,
     query: &str,
@@ -207,11 +206,11 @@ async fn query_to_record_batches(
 
     let columns = stmt.columns();
 
-    for i in 0..column_count {
+    for (i, value) in all_rows[0].iter().enumerate().take(column_count) {
         let field_name = columns
             .get(i)
             .map_or_else(|| format!("column_{i}"), |col| col.name().to_string());
-        let data_type = match &all_rows[0][i] {
+        let data_type = match value {
             turso::Value::Integer(_) => DataType::Int64,
             turso::Value::Real(_) => DataType::Float64,
             turso::Value::Null | turso::Value::Text(_) => DataType::Utf8,

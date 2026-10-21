@@ -2,10 +2,11 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "llms"
 repository.workspace = true
 rust-version.workspace = true
+autotests = false
 version.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -13,6 +14,10 @@ version.workspace = true
 snafu.workspace = true
 
 async-openai.workspace = true
+chat-api = { path = "../chat-api" }
+embed-api = { path = "../embed-api" }
+rerank-api = { path = "../rerank-api" }
+evaluate-api = { path = "../evaluate-api" }
 async-stream.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
@@ -20,45 +25,45 @@ aws-sdk-bedrockruntime.workspace = true
 aws-smithy-types.workspace = true
 bytes.workspace = true
 cache = { path = "../cache" }
-chunking = {path="../chunking"}
+chunking = { path = "../chunking" }
 futures = { workspace = true }
+google-genai = { path = "../google-genai" }
 governor.workspace = true
 
 hf-hub.workspace = true
-hf_model_downloader = { path = "../hf_model_downloader" }
+http.workspace = true
 insta = { workspace = true, features = ["filters"] }
 itertools.workspace = true
-regex = "1.12.2"
+regex.workspace = true
 reqwest.workspace = true
-reqwest-eventsource = "0.6.0"
+reqwest-eventsource = { git = "https://github.com/spiceai/reqwest-eventsource", rev = "eb11e695128ce264bf05e4220ce2311c25992c73" } # branch: spiceai
 runtime-rate-control = { path = "../runtime-rate-control" }
 schemars.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 spicepod = { path = "../spicepod" }
-tokenizers = "0.21.2"
+tokenizers.workspace = true
 tokio.workspace = true
-tokio-stream = { version = "0.1", features = ["sync"] }
+tower.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", optional = true }
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", package = "mistralrs-core", optional = true }
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "489244bc3c5ec3b8703390e15c1c6ffbb941e45d", optional = true } # branch: lukim/export-chat-template (spiceai/mistral.rs#49 plus the exported chat-template renderer)
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "489244bc3c5ec3b8703390e15c1c6ffbb941e45d", package = "mistralrs-core", optional = true } # branch: lukim/export-chat-template (spiceai/mistral.rs#49 plus the exported chat-template renderer)
 rand.workspace = true
+llama-cpp-2 = { version = "0.1.160", optional = true, default-features = false }
 
-llama-cpp-2 = { version = "0.1", optional = true }
-
-tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "58b44fbbbde55a6ea33c8d0b4b9504942405c481", features = [
+tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", features = [
     "candle",
 ] }
 
-tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "58b44fbbbde55a6ea33c8d0b4b9504942405c481", optional = true }
-tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "58b44fbbbde55a6ea33c8d0b4b9504942405c481", optional = true }
-tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "58b44fbbbde55a6ea33c8d0b4b9504942405c481", optional = true }
+tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", optional = true }
+tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", optional = true }
+tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", optional = true }
 
-cudarc = { version = "0.12.2", optional = true, features = [
+cudarc = { version = "0.19", optional = true, features = [
     "cuda-version-from-build-system",
 ] }
 either = "1.15.0"
@@ -66,28 +71,56 @@ indexmap.workspace = true
 tempfile.workspace = true
 token_provider = { path = "../token_provider" }
 
-model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "dd0beab3810aebacb716d4ab6d38455e74499d13", optional = true }
+model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "55fef28a3556895b20204634b788f7c836b610bc", optional = true } # branch: spiceai
 
 [dev-dependencies]
-anyhow = "1.0.99"
+wiremock = "0.6"
+anyhow.workspace = true
 aws-credential-types.workspace = true
-dotenvy.workspace = true
-insta.workspace = true
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
+dotenv.workspace = true
+insta = {workspace = true, features = ["json"] }
 jsonpath-rust = "0.7.3"
 paste.workspace = true
+rstest = "0.26.1"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 
+# Integration tests are modules of `integration` (`tests/integration.rs`);
+# `model2vec_hf_cache` is compiled only with `local_embed`, which `llms::model2vec`
+# needs.
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
 [features]
 cuda = [
+    "llama-cpp-2?/cuda",
     "tei_backend/cuda",
     "tei_candle/cuda",
     "mistralrs-core/cuda",
-    "mistralrs-core/flash-attn",
     "mistralrs/cuda",
-    "mistralrs/flash-attn",
     "cudarc/cuda-version-from-build-system",
-    "llama-cpp-2?/cuda",
+]
+# Flash-Attention is opt-in (compose with `cuda`). It MUST stay off for
+# MLA-attention models (GLM-4.5/5.x, DeepSeek-V3/R1) whose kernels abort it;
+# enable only for standard-attention models that benefit.
+flash-attn = [
+    "mistralrs-core/flash-attn",
+    "mistralrs/flash-attn",
+]
+# Multi-node distributed (tensor-parallel) inference via mistral.rs's pure-TCP ring
+# all-reduce. No system dependency (unlike `nccl`). Composes with `cuda`. Activated at
+# runtime when a model sets `params.distributed_backend: ring` + a `nodes` list; see
+# `DistributedBackend::Ring` for what the backend guarantees.
+#
+# OFF BY DEFAULT: multi-node distributed inference is a Spice enterprise feature
+# and is intentionally not enabled in standard (OSS) builds. The `distributed`
+# name is backend-agnostic (currently the `ring` backend; `nccl` may follow).
+distributed = [
+    "local_llm",
+    "mistralrs-core/ring",
+    "mistralrs/ring",
 ]
 local_embed = [
     "dep:tei_backend",
@@ -97,13 +130,18 @@ local_embed = [
     "dep:model2vec-rs",
 ]
 local_llm = ["dep:mistralrs", "dep:mistralrs-core"]
-llama_cpp = ["dep:llama-cpp-2"]
+# Serves single-node GGUF models with llama.cpp instead of mistral.rs. Composes with `cuda`
+# or `metal`; ring (`distributed`) models stay on mistral.rs.
+llama_cpp = ["local_llm", "dep:llama-cpp-2"]
 metal = [
+    "llama-cpp-2?/metal",
     "tei_backend/metal",
     "tei_candle/metal",
     "mistralrs-core/metal",
     "mistralrs/metal",
-    "llama-cpp-2?/metal",
 ]
 
 default = ["local_llm", "local_embed"]
+
+[lints]
+workspace = true

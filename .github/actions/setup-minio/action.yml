@@ -5,22 +5,91 @@ inputs:
   minio_endpoint:
     description: 'MinIO endpoint'
     required: true
-    type: string
   minio_access_key:
     description: 'MinIO access key'
     required: true
-    type: string
   minio_secret_key:
     description: 'MinIO secret key'
     required: true
-    type: string
+
 runs:
   using: 'composite'
   steps:
-    - name: Install MinIO
+    - name: Install MinIO on Linux
       shell: bash
+      if: runner.os == 'Linux'
       run: |
-        sudo apt update && sudo apt install wget -y
-        sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
-        sudo chmod +x /usr/local/bin/mc
-        mc alias set spice-minio ${{ inputs.minio_endpoint }} ${{ inputs.minio_access_key }} ${{ inputs.minio_secret_key }}
+        set -euo pipefail
+        if command -v mc >/dev/null 2>&1; then
+          exit 0
+        fi
+
+        # Mirror of mc; dl.min.io currently serves an expired TLS cert.
+        mc_url="https://public-data.spiceai.org/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z"
+        tmp_mc="$(mktemp)"
+        if command -v curl >/dev/null 2>&1; then
+          curl --fail --silent --show-error --location --output "$tmp_mc" "$mc_url"
+        elif command -v wget >/dev/null 2>&1; then
+          wget --quiet --output-document="$tmp_mc" "$mc_url"
+        else
+          echo "curl or wget is required to install the MinIO client" >&2
+          exit 1
+        fi
+        sudo install -m 0755 "$tmp_mc" /usr/local/bin/mc
+
+    - name: Install MinIO on macOS
+      shell: bash
+      if: runner.os == 'macOS'
+      run: |
+        brew update
+        brew install minio/stable/mc
+
+    - name: Install MinIO on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $mcPath = "$env:USERPROFILE\mc"
+        New-Item -ItemType Directory -Force -Path $mcPath | Out-Null
+        Invoke-WebRequest -Uri "https://dl.min.io/client/mc/release/windows-amd64/mc.exe" -OutFile "$mcPath\mc.exe"
+        echo "$mcPath" >> $env:GITHUB_PATH
+
+    # Read through `env` rather than interpolating `${{ }}` into the script, so a
+    # value containing shell metacharacters stays a value. A run that cannot read
+    # the repository's Actions secrets (a Dependabot or fork pull request) passes
+    # all three empty, and mc then fails with only "Incorrect number of
+    # arguments", so name that cause instead.
+    - name: Set MinIO alias (Linux/macOS)
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
+        MINIO_ACCESS_KEY: ${{ inputs.minio_access_key }}
+        MINIO_SECRET_KEY: ${{ inputs.minio_secret_key }}
+      run: |
+        missing=()
+        [[ -n "$MINIO_ENDPOINT" ]] || missing+=(minio_endpoint)
+        [[ -n "$MINIO_ACCESS_KEY" ]] || missing+=(minio_access_key)
+        [[ -n "$MINIO_SECRET_KEY" ]] || missing+=(minio_secret_key)
+        if [[ ${#missing[@]} -gt 0 ]]; then
+          echo "::error::setup-minio received an empty ${missing[*]}. The secrets that feed these inputs are not available to this run (event: ${GITHUB_EVENT_NAME}, actor: ${GITHUB_ACTOR}); Dependabot and fork pull requests cannot read the repository's Actions secrets. Rerun from a branch of this repository, or dispatch the workflow."
+          exit 1
+        fi
+        mc alias set spice-minio "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+
+    - name: Set MinIO alias (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        MINIO_ENDPOINT: ${{ inputs.minio_endpoint }}
+        MINIO_ACCESS_KEY: ${{ inputs.minio_access_key }}
+        MINIO_SECRET_KEY: ${{ inputs.minio_secret_key }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $missing = @('MINIO_ENDPOINT', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY') | Where-Object { -not [Environment]::GetEnvironmentVariable($_) }
+        if ($missing) {
+          Write-Output "::error::setup-minio received an empty $(($missing | ForEach-Object { $_.ToLower() }) -join ' '). The secrets that feed these inputs are not available to this run (event: $env:GITHUB_EVENT_NAME, actor: $env:GITHUB_ACTOR); Dependabot and fork pull requests cannot read the repository's Actions secrets. Rerun from a branch of this repository, or dispatch the workflow."
+          exit 1
+        }
+        $mcExePath = Join-Path $env:USERPROFILE 'mc\mc.exe'
+        & $mcExePath alias set spice-minio $env:MINIO_ENDPOINT $env:MINIO_ACCESS_KEY $env:MINIO_SECRET_KEY

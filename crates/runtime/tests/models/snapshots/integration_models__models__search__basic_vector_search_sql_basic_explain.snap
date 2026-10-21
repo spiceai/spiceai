@@ -6,15 +6,15 @@ snapshot_kind: text
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                      |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: vector_search().id, vector_search().answer, trunc(vector_search().score,Int64(3))                                             |
+| logical_plan  | Projection: vector_search().id, vector_search().answer, trunc(vector_search().score,Int64(2))                                             |
 |               |   Sort: vector_search().score DESC NULLS FIRST, fetch=4                                                                                   |
-|               |     Projection: vector_search().id, vector_search().answer, trunc(vector_search().score, Int64(3)), vector_search().score                 |
+|               |     Projection: vector_search().id, vector_search().answer, trunc(vector_search().score, Int64(2)), vector_search().score                 |
 |               |       BytesProcessedNode                                                                                                                  |
 |               |         TableScan: vector_search() projection=[id, answer, score]                                                                         |
-| physical_plan | ProjectionExec: expr=[id@0 as id, answer@1 as answer, trunc(vector_search().score,Int64(3))@2 as trunc(vector_search().score,Int64(3))]   |
+| physical_plan | ProjectionExec: expr=[id@0 as id, answer@1 as answer, trunc(vector_search().score,Int64(2))@2 as trunc(vector_search().score,Int64(2))]   |
 |               |   SortPreservingMergeExec: [score@3 DESC], fetch=4                                                                                        |
 |               |     SortExec: TopK(fetch=4), expr=[score@3 DESC], preserve_partitioning=[true]                                                            |
-|               |       ProjectionExec: expr=[id@0 as id, answer@1 as answer, trunc(score@2, 3) as trunc(vector_search().score,Int64(3)), score@2 as score] |
+|               |       ProjectionExec: expr=[id@0 as id, answer@1 as answer, trunc(score@2, 3) as trunc(vector_search().score,Int64(2)), score@2 as score] |
 |               |         BytesProcessedExec                                                                                                                |
 |               |           ProjectionExec: expr=[id@0 as id, answer@2 as answer, score@1 as score]                                                         |
 |               |             CoalesceBatchesExec: target_batch_size=8192                                                                                   |
@@ -25,8 +25,8 @@ snapshot_kind: text
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                         |
 |               |                         BytesProcessedExec                                                                                                |
 |               |                           ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]                                      |
-|               |                             RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1                                         |
-|               |                               BytesProcessedExec                                                                                          |
+|               |                             BytesProcessedExec                                                                                            |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1                                       |
 |               |                                 S3VectorsQueryExec: limit=30                                                                              |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                             |
 |               |                     RepartitionExec: partitioning=Hash([id@0], 10), input_partitions=10                                                   |

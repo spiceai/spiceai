@@ -1,0 +1,72 @@
+[package]
+description = "Cluster partition management, executor registry, and write-through for the Spice runtime"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-cluster"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+app = { path = "../app" }
+arc-swap.workspace = true
+arrow = { workspace = true }
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
+arrow-ipc.workspace = true
+arrow-schema = { workspace = true, features = ["serde"] }
+arrow_tools = { path = "../arrow_tools" }
+async-stream.workspace = true
+async-trait.workspace = true
+ballista-core.workspace = true
+ballista-executor.workspace = true
+ballista-scheduler.workspace = true
+bytes.workspace = true
+dashmap = "6.1.0"
+data_components = { path = "../data_components" }
+datafusion.workspace = true
+datafusion-expr = { workspace = true }
+datafusion-proto = { workspace = true }
+datafusion-proto-common = { workspace = true }
+flight_client = { path = "../flight_client" }
+fundu.workspace = true
+futures.workspace = true
+object_store.workspace = true
+object_store_occ = { path = "../object_store_occ" }
+opentelemetry = { workspace = true }
+parking_lot.workspace = true
+prost = { workspace = true }
+serde_json.workspace = true
+runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-metrics = { path = "../runtime-metrics" }
+runtime-proto = { path = "../runtime-proto" }
+runtime-request-context = { path = "../runtime-request-context" }
+runtime-table-partition = { path = "../runtime-table-partition" }
+runtime-tls = { path = "../runtime-tls" }
+rustls.workspace = true
+serde = { workspace = true, features = ["derive"] }
+sha2.workspace = true
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+telemetry = { path = "../telemetry" }
+tokio = { workspace = true, features = ["full"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+util = { path = "../util", default-features = false }
+uuid = { workspace = true, features = ["v4", "serde"] }
+x509-certificate.workspace = true
+
+[dev-dependencies]
+# An SDK meter provider, so the metrics tests can collect what the cluster
+# instruments actually export.
+opentelemetry-prometheus.workspace = true
+opentelemetry_sdk = { workspace = true }
+prometheus.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

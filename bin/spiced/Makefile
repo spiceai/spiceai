@@ -17,11 +17,7 @@ ifdef RUST_PROFILE
     OPT_LEVEL = --profile $(RUST_PROFILE)
 endif
 
-ifdef SPICED_TARGET_DIR
-	TARGET_DIR := $(SPICED_TARGET_DIR)
-else
-	TARGET_DIR := ../../target
-endif
+TARGET_DIR := $(or $(CARGO_TARGET_DIR),../../target)
 
 ifdef SPICED_CUSTOM_FEATURES
 	CUSTOM_FEATURES := --no-default-features --features "$(SPICED_CUSTOM_FEATURES)"
@@ -29,8 +25,10 @@ endif
 
 .PHONY: all
 all:
-# If "metal" is not in SPICED_FEATURES, set MISTRALRS_METAL_PRECOMPILE=0
-ifneq ($(filter metal,$(subst ,, ,$(SPICED_FEATURES))),metal)
-	$(eval export MISTRALRS_METAL_PRECOMPILE=0)
+# When building with metal feature, skip Metal kernel precompilation to avoid requiring
+# Xcode Metal Toolchain. Kernels are compiled at runtime instead.
+# Set MISTRALRS_METAL_PRECOMPILE=1 to precompile (requires: xcodebuild -downloadComponent MetalToolchain)
+ifneq ($(findstring metal,$(SPICED_NON_DEFAULT_FEATURES)$(SPICED_CUSTOM_FEATURES)),)
+	$(eval export MISTRALRS_METAL_PRECOMPILE ?= 0)
 endif
 	cargo build ${OPT_LEVEL} $(SPICED_FEATURES) --target-dir $(TARGET_DIR) $(CUSTOM_FEATURES)

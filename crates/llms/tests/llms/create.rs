@@ -15,9 +15,10 @@ limitations under the License.
 */
 
 use anyhow::Context;
-use async_openai::error::OpenAIError;
-use aws_config::{BehaviorVersion, Region, defaults};
+use async_openai::{config::OpenAIConfig, error::OpenAIError};
+use aws_config::Region;
 use aws_credential_types::Credentials;
+use aws_sdk_credential_bridge::default_aws_config;
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use llms::{
     anthropic::Anthropic,
@@ -25,8 +26,9 @@ use llms::{
     chat::{Chat, Error as ChatError, create_hf_model, create_local_model},
     config::GenericAuthMechanism,
     embeddings::candle::link_files_into_tmp_dir,
-    openai::new_openai_client,
-    perplexity::PerplexitySonar,
+    google::{Google, auth},
+    openai::{Openai, new_openai_client},
+    responses::Responses,
     xai::Xai,
 };
 use secrecy::SecretString;
@@ -38,10 +40,10 @@ use std::{
 };
 
 pub(crate) async fn create_bedrock(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
-    let mut config_builder = defaults(BehaviorVersion::latest());
+    let mut config_builder = default_aws_config();
 
     if let Ok(region) = std::env::var("SPICE_BEDROCK_REGION") {
-        config_builder = config_builder.region(Region::new(region.clone()));
+        config_builder = config_builder.region(Region::new(region));
     }
 
     match (
@@ -70,30 +72,46 @@ pub(crate) async fn create_bedrock(model_id: &str) -> Result<Arc<dyn Chat>, anyh
         }
     }
 
-    let config = config_builder.load().await;
+    let config: aws_config::SdkConfig = config_builder.load().await;
     Ok(Arc::new(BedrockConverse::new(
         Arc::new((&config).into()),
         model_id.to_string(),
     )) as Arc<dyn Chat>)
 }
 
-pub(crate) fn create_xai(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
+fn xai(model_id: &str) -> Result<Xai, anyhow::Error> {
     let Ok(api_key) = std::env::var("SPICE_XAI_API_KEY") else {
         return Err(anyhow::anyhow!("SPICE_XAI_API_KEY not set"));
     };
-    Ok(Arc::new(Xai::new(Some(model_id), api_key.as_str())))
+    Ok(Xai::new(Some(model_id), api_key.as_str()))
 }
 
-pub(crate) fn create_openai(model_id: &str) -> Arc<dyn Chat> {
+pub(crate) fn create_xai(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
+    Ok(Arc::new(xai(model_id)?))
+}
+
+pub(crate) fn create_xai_responses(model_id: &str) -> Result<Arc<dyn Responses>, anyhow::Error> {
+    Ok(Arc::new(xai(model_id)?))
+}
+
+fn openai(model_id: &str) -> Openai<OpenAIConfig> {
     let api_key = std::env::var("SPICE_OPENAI_API_KEY").ok();
-    Arc::new(new_openai_client(
+    new_openai_client(
         model_id.to_string(),
         None,
         api_key.as_deref(),
         None,
         None,
         None,
-    ))
+    )
+}
+
+pub(crate) fn create_openai(model_id: &str) -> Arc<dyn Chat> {
+    Arc::new(openai(model_id))
+}
+
+pub(crate) fn create_openai_responses(model_id: &str) -> Arc<dyn Responses> {
+    Arc::new(openai(model_id))
 }
 
 pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<dyn Chat>, OpenAIError> {
@@ -119,19 +137,35 @@ pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError
             .ok()
             .map(SecretString::from)
             .as_ref(),
+        None,
+        None,
+        llms::chat::ReasoningDefault::default(),
     )
     .await
 }
 
-pub(crate) fn create_perplexity() -> Result<Arc<dyn Chat>, ChatError> {
-    let mut params: HashMap<String, SecretString> = HashMap::new();
-    if let Ok(api_key) = std::env::var("SPICE_PERPLEXITY_AUTH_TOKEN") {
-        params.insert("auth_token".to_string(), SecretString::from(api_key));
-    }
-    let sonar = PerplexitySonar::from_unprefixed_params(None, &params)
-        .map_err(|e| ChatError::FailedToLoadModel { source: e })?;
+pub(crate) async fn create_google(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
+    let project = std::env::var("SPICE_GOOGLE_PROJECT").context("SPICE_GOOGLE_PROJECT not set")?;
+    let location =
+        std::env::var("SPICE_GOOGLE_LOCATION").context("SPICE_GOOGLE_LOCATION not set")?;
 
-    Ok(Arc::new(sonar))
+    // Authenticate the way `from: google` does — as a GCP service account against Vertex AI —
+    // here through Application Default Credentials, so this needs
+    // `GOOGLE_APPLICATION_CREDENTIALS` pointing at a service-account key.
+    let client = auth::build_client(
+        auth::VertexAuthParams {
+            project: Some(&project),
+            location: Some(&location),
+            service_account_path: None,
+            service_account_key: None,
+            application_default_credentials: true,
+        },
+        "model.params",
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to create Google client: {e}"))?;
+
+    Ok(Arc::new(Google::from_client(client, model_id)))
 }
 
 pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
@@ -145,6 +179,7 @@ pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow
         temp_dir.join("tokenizer_config.json").to_str(),
         None,
         None,
+        llms::chat::LocalModelOptions::default(),
     )
     .await
     .map_err(anyhow::Error::from)?;
@@ -152,7 +187,7 @@ pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow
 }
 
 /// For a given `HuggingFace` repo, downloads the specified file and save them into provided folder. Return folder, and which ones are model weights.
-#[allow(clippy::case_sensitive_file_extension_comparisons)]
+#[expect(clippy::case_sensitive_file_extension_comparisons)]
 fn download_hf_model_artifacts(
     model_id: &str,
     revision: Option<&str>,
@@ -169,7 +204,7 @@ fn download_hf_model_artifacts(
     } else {
         Repo::new(model_id.to_string(), RepoType::Model)
     };
-    let api_repo = api.repo(repo.clone());
+    let api_repo = api.repo(repo);
 
     let mut files = HashMap::<String, PathBuf>::new();
     let mut weights = vec![];

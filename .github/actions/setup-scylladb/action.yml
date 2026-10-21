@@ -1,0 +1,62 @@
+name: Setup ScyllaDB
+description: 'Starts a local ScyllaDB container and optionally bootstraps TPC-H SF1 data'
+inputs:
+  keyspace:
+    description: 'Keyspace name to create'
+    default: 'tpch_sf1'
+  load-tpch:
+    description: 'Whether to load TPC-H SF1 data'
+    default: 'true'
+  data-dir:
+    description: 'Directory containing tpch.db (used to export .tbl files)'
+    default: '/opt/spiced/data'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Start ScyllaDB container
+      shell: bash
+      run: |
+        docker run -d --name scylladb \
+          -p 9042:9042 \
+          -e SCYLLA_DEVELOPER_MODE=1 \
+          scylladb/scylla:2026.1.2 --smp 4 # limit shards to speed up provisioning and to avoid starving spiced/testoperator
+
+    - name: Wait for ScyllaDB
+      shell: bash
+      run: |
+        for i in $(seq 1 60); do
+          if docker exec scylladb cqlsh -e 'DESC KEYSPACES' 2>/dev/null; then
+            echo 'ScyllaDB is ready.'
+            exit 0
+          fi
+          echo "Waiting for ScyllaDB... ($i/60)"
+          sleep 5
+        done
+        echo 'ScyllaDB did not become ready in time.'
+        docker logs scylladb
+        exit 1
+
+    - name: Bootstrap TPC-H data
+      if: inputs.load-tpch == 'true'
+      shell: bash
+      run: |
+        python -m pip install 'duckdb==1.4.4'
+        python <<'PY'
+        import duckdb
+        import os
+
+        out_dir = '/tmp/tpch_tbl'
+        os.makedirs(out_dir, exist_ok=True)
+
+        conn = duckdb.connect('${{ inputs.data-dir }}/tpch.db', read_only=True)
+        tables = ['region', 'nation', 'customer', 'supplier', 'part', 'partsupp', 'orders', 'lineitem']
+        for table in tables:
+            path = os.path.join(out_dir, f'{table}.tbl')
+            conn.execute(f"COPY {table} TO '{path}' (DELIMITER '|', HEADER false)")
+            print(f'Exported {table}')
+        conn.close()
+        PY
+
+        SCYLLADB_CONTAINER=scylladb SCYLLADB_KEYSPACE=${{ inputs.keyspace }} \
+          bash test/tpc-bench/scylladb/load_tpch.sh /tmp/tpch_tbl

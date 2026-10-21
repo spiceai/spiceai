@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use app::AppBuilder;
 
@@ -32,6 +32,7 @@ use std::sync::Arc;
 async fn databricks_delta_lake_m2m_integration_test_catalog() -> Result<(), anyhow::Error> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(None);
+    register_test_connectors().await;
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
@@ -55,7 +56,7 @@ async fn databricks_delta_lake_m2m_integration_test_catalog() -> Result<(), anyh
                     .await;
             let cloned_rt = Arc::new(rt.clone());
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     panic!("Timeout waiting for components to load");
                 }
 () = cloned_rt.load_components() => {}
@@ -76,11 +77,11 @@ async fn databricks_delta_lake_m2m_integration_test_catalog() -> Result<(), anyh
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Databricks Catalog (mode: delta_lake) Integration Test Results"),
+                        description => "Databricks Catalog (mode: delta_lake) Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("test_select_tpch"), results);
+                        insta::assert_snapshot!("test_select_tpch", results);
                     });
                 })),
             ),
@@ -97,11 +98,11 @@ async fn databricks_delta_lake_m2m_integration_test_catalog() -> Result<(), anyh
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Databricks Catalog (mode: delta_lake) Integration Test Results"),
+                        description => "Databricks Catalog (mode: delta_lake) Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("test_select_tpcds"), results);
+                        insta::assert_snapshot!("test_select_tpcds", results);
                     });
                 })),
             ),

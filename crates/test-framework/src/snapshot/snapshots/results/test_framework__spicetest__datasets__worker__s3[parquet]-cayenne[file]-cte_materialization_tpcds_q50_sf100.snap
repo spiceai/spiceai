@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q50"
+---
++--------------+--------------+-----------------+------------------+---------------+----------------+-----------------+-------------------+---------+-------+---------+------------+------------+-------------+-----------+
+| s_store_name | s_company_id | s_street_number | s_street_name    | s_street_type | s_suite_number | s_city          | s_county          | s_state | s_zip | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
++--------------+--------------+-----------------+------------------+---------------+----------------+-----------------+-------------------+---------+-------+---------+------------+------------+-------------+-----------+
+| able         | 1            | 128             | 15th             | RD            | Suite T        | Oakland         | Luce County       | MI      | 49843 | 230     | 167        | 165        | 149         | 308       |
+| able         | 1            | 227             | 8th              | Road          | Suite 290      | New Hope        | Luce County       | MI      | 49431 | 201     | 179        | 157        | 167         | 314       |
+| able         | 1            | 228             | Cherry           | Avenue        | Suite G        | Centerville     | Walker County     | AL      | 30059 | 220     | 192        | 174        | 169         | 357       |
+| able         | 1            | 255             | Sycamore         | Dr.           | Suite 410      | Midway          | Ziebach County    | SD      | 51904 | 227     | 165        | 160        | 163         | 338       |
+| able         | 1            | 292             | Walnut North     | Circle        | Suite Q        | Pleasant Valley | Franklin Parish   | LA      | 72477 | 212     | 146        | 163        | 165         | 318       |
+| able         | 1            | 300             | Forest           | Lane          | Suite 230      | Riverside       | Walker County     | AL      | 39231 | 199     | 161        | 173        | 162         | 322       |
+| able         | 1            | 302             | Walnut Madison   | Wy            | Suite T        | Oakland         | Ziebach County    | SD      | 59843 | 224     | 158        | 169        | 149         | 355       |
+| able         | 1            | 441             | 11th             | ST            | Suite H        | Union           | Williamson County | TN      | 38721 | 246     | 154        | 142        | 153         | 312       |
+| able         | 1            | 443             | Hickory Sycamore | Street        | Suite C        | Fairview        | Richland County   | OH      | 45709 | 238     | 165        | 151        | 178         | 299       |
+| able         | 1            | 479             | Park First       | Lane          | Suite 20       | Salem           | Walker County     | AL      | 38048 | 223     | 152        | 142        | 136         | 324       |
++--------------+--------------+-----------------+------------------+---------------+----------------+-----------------+-------------------+---------+-------+---------+------------+------------+-------------+-----------+

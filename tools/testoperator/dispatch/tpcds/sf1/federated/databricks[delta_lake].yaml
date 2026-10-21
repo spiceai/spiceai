@@ -1,8 +1,11 @@
+# Databricks bills per use, so this runs on the weekly schedule instead of daily.
+schedule: weekly
 tests:
   bench:
     spicepod_path: federated/databricks[delta_lake].yaml
     query_set: tpcds
     runner_type: spiceai-dev-runners
+    validate_results: true
   throughput:
     spicepod_path: federated/databricks[delta_lake].yaml
     query_set: tpcds

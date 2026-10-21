@@ -1,14 +1,17 @@
 #!/usr/bin/expect -f
 
-# Runtime response timeout
-set timeout 30:
+source [file join [file dirname [info script]] repl_helpers.exp]
 
-spawn spice chat
+# How long the runtime may go silent before the script calls it stalled. This is
+# not a bound on how long a response may take — see repl_idle_timeout.
+set timeout [repl_idle_timeout]
+
+spawn spice chat {*}[repl_endpoint_args]
 
 proc chat {message}  {
     global timeout
 
-     send "$message\r"
+    repl_send "$message\r"
 
     expect {
         " ERROR " {
@@ -20,23 +23,47 @@ proc chat {message}  {
         "chat> " {
             # end of model response
         }
+        -re {[^\n]*\n} {
+            # Still streaming — restart the wait. Whole lines only, for the
+            # reason given in repl_helpers.exp.
+            exp_continue
+        }
+        eof {
+            repl_died "Waiting for the response to \"$message\""
+        }
         timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
+            repl_stalled "Waiting for the response to \"$message\""
         }
     }
 
     send_user "Model returned expected response\n"
 }
 
-expect "chat>"
+# Wait once for the initial prompt. Each chat call consumes the prompt that
+# terminates its response, so waiting again at the start of the next call would
+# block while the REPL is already ready for input.
+expect {
+    "chat> " {}
+    -re {[^\n]*\n} {
+        # Banner and connection lines the CLI prints on its way to the prompt.
+        exp_continue
+    }
+    eof {
+        repl_died "Waiting for the initial chat prompt"
+    }
+    timeout {
+        repl_stalled "Waiting for the initial chat prompt"
+    }
+}
 
-chat "What datasets you have access to?"
-sleep 1
+chat "Reply in one short sentence: what datasets do you have access to?"
 
-chat "How many issues stored in database?"
+chat "Reply in one short sentence: how many issues are stored in the database?"
+
+# Every verification passed, so the REPL must still be sitting at its prompt.
+repl_assert_running "Checking the chat REPL is still running"
 
 # Signal to exit (Ctrl+C)
-send \x03
+repl_send \x03
 
 exit 0

@@ -1,0 +1,48 @@
+---
+name: Release Script Tests
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+    paths:
+      - '.github/scripts/github_release.py'
+      - '.github/scripts/test_github_release.py'
+      - '.github/workflows/release_script_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/scripts/github_release.py'
+      - '.github/scripts/test_github_release.py'
+      - '.github/workflows/release_script_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-github-release-script:
+    name: Unit tests for github_release.py
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run tests
+        env:
+          GITHUB_TOKEN: test-token
+        run: python .github/scripts/test_github_release.py -v

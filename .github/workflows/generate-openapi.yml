@@ -8,6 +8,12 @@ on:
       - 'crates/**'
   workflow_dispatch:
 
+# A run pushes to the open regeneration PR's branch, so two runs at once would race on
+# that push. GitHub keeps only the newest queued run, which generates from the newest commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -19,39 +25,28 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Check for existing PR
-        id: check_pr
-        run: |
-          existing_pr=$(gh pr list \
-            --base trunk \
-            --json title,headRefName \
-            --jq '.[] | select(.title=="Update openapi.json")')
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
-          if [ ! -z "$existing_pr" ]; then
-            echo "An existing PR for updating openapi.json was found. Skipping updates."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up make
+        if: runner.os != 'macOS'
+        uses: ./.github/actions/setup-make
 
-      - name: Install Rust stable
-        if: steps.check_pr.outputs.skip != 'true'
-        run: rustup toolchain install stable --profile minimal
+      - name: Set up cc
+        if: runner.os != 'macOS'
+        uses: ./.github/actions/setup-cc
 
       - name: Build Cargo project
-        if: steps.check_pr.outputs.skip != 'true'
         run: cargo build --manifest-path tools/spiceschema/Cargo.toml
 
       - name: Run Cargo project to generate OpenAPI
-        if: steps.check_pr.outputs.skip != 'true'
         run: cargo run --manifest-path tools/spiceschema/Cargo.toml -- http --json > .schema/openapi.json
 
       - name: Verify OpenAPI file
-        if: steps.check_pr.outputs.skip != 'true'
         run: |
           if [ -f ".schema/openapi.json" ]; then
             echo ".schema/openapi.json file was successfully created."
@@ -62,31 +57,90 @@ jobs:
           fi
 
       - name: Upload OpenAPI artifact
-        if: steps.check_pr.outputs.skip != 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: openapi.json
           path: .schema/openapi.json
 
-      - name: Create PR if needed
-        if: steps.check_pr.outputs.skip != 'true'
+      # Keeps at most one open PR, carrying the spec that trunk's code generates. A dispatch
+      # on another branch generates that branch's spec, which must not reach trunk's PR.
+      - name: Publish to the regeneration PR
+        if: github.ref == 'refs/heads/trunk'
         run: |
+          set -euo pipefail
+          spec=.schema/openapi.json
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}"
+
+          # `gh pr list` returns 30 PRs by default, and trunk often has more open.
+          prs=$(gh pr list --base trunk --state open --limit 1000 \
+            --json number,title,headRefName,isCrossRepository,createdAt \
+            --jq '.[] | select(.title == "Update openapi.json" and (.headRefName | startswith("openapi/")) and (.isCrossRepository | not))
+              | "\(.number) \(.headRefName) \((now - (.createdAt | fromdateiso8601)) / 3600 | floor)"')
+
+          count=0 numbers='' number='' branch='' age_hours=''
+          while read -r n b a; do
+            [ -n "$n" ] || continue
+            count=$((count + 1)) numbers="$numbers #$n" number=$n branch=$b age_hours=$a
+          done <<< "$prs"
+          if [ "$count" -gt 1 ]; then
+            echo "::error::Found ${count} open 'Update openapi.json' PRs (${numbers# }). Close all but one so this workflow knows which one to update."
+            exit 1
+          fi
+
+          if git diff --quiet -- "$spec"; then
+            if [ -n "$number" ]; then
+              gh pr close "$number" --comment "Trunk already has the OpenAPI spec that its code generates, so this PR has nothing left to publish."
+              echo "Closed #${number}: trunk's ${spec} is already current."
+            else
+              echo "Trunk's ${spec} is already current."
+            fi
+            exit 0
+          fi
+
           git config --global user.name 'Spice Schema Bot'
           git config --global user.email 'schema-bot@spice.ai'
 
-          git checkout -b openapi/${GITHUB_RUN_ID}
-          if git diff --exit-code -- .schema/openapi.json; then
-            echo "No changes detected"
+          if [ -n "$number" ]; then
+            # Commit on top of the open PR's branch so the push fast-forwards it. Resetting
+            # the index to the branch tip keeps the commit to the spec alone.
+            git -c credential.helper='' -c credential.interactive=false \
+              fetch --depth=1 "$remote" "refs/heads/${branch}"
+            git reset --soft FETCH_HEAD
+            git reset --quiet FETCH_HEAD -- .
           else
-            git add .schema/openapi.json
-            git commit -m "Update openapi.json"
-            git push origin openapi/${GITHUB_RUN_ID}
-            gh pr create \
-              --title "Update openapi.json" \
-              --body $'Updated OpenAPI specification\n\n**Remember**\n- [ ] Updated in [spiceai/docs](https://github.com/spiceai/docs).' \
-              --label 'kind/documentation' \
-              --base trunk \
-              --head openapi/${GITHUB_RUN_ID}
+            branch="openapi/${GITHUB_RUN_ID}"
+          fi
+
+          git add "$spec"
+          if git diff --cached --quiet; then
+            echo "::notice::#${number} already has the current ${spec}; it is waiting for review."
+          else
+            git commit --quiet -m "Update openapi.json"
+            # Non-interactive: a credential helper on the runner can otherwise intercept
+            # this push and block on a prompt forever. See
+            # scripts/check_ci_git_push_noninteractive.py.
+            git -c credential.helper='' -c credential.interactive=false \
+              push "$remote" "HEAD:refs/heads/${branch}"
+            if [ -n "$number" ]; then
+              echo "Updated #${number} with the current ${spec}."
+            else
+              gh pr create \
+                --title "Update openapi.json" \
+                --body $'Updated OpenAPI specification\n\n**Remember**\n- [ ] Updated in [spiceai/docs](https://github.com/spiceai/docs).' \
+                --label 'kind/documentation' \
+                --label 'area/config' \
+                --base trunk \
+                --head "$branch"
+            fi
+          fi
+
+          if [ -n "$number" ] && [ "$age_hours" -ge "$STALE_AFTER_HOURS" ]; then
+            echo "::error::#${number} has been open for ${age_hours} hours, and trunk's ${spec} stays out of date until it merges: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/pull/${number}"
+            exit 1
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STALE_AFTER_HOURS: '24'
+          # Never fall back to an interactive prompt; fail fast if auth is rejected.
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: 'never'

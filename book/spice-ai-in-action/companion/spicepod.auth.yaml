@@ -1,0 +1,43 @@
+version: v1
+kind: Spicepod
+name: northstar-auth
+datasets:
+- from: file://data/customers.csv
+  name: customers
+  params:
+    file_format: csv
+    csv_has_header: 'true'
+- from: file://data/orders.csv
+  name: orders
+  params:
+    file_format: csv
+    csv_has_header: 'true'
+- from: file://data/order_items.csv
+  name: order_items
+  params:
+    file_format: csv
+    csv_has_header: 'true'
+- from: file://data/returns.csv
+  name: returns
+  params:
+    file_format: csv
+    csv_has_header: 'true'
+- from: file://data/articles.csv
+  name: articles
+  params:
+    file_format: csv
+    csv_has_header: 'true'
+views:
+- name: paid_orders
+  sql: "SELECT order_id, tenant_id, customer_id,\n       CAST(ordered_at AS TIMESTAMP)\
+    \ AS ordered_at,\n       total_cents\nFROM orders\nWHERE status = 'paid'\n"
+- name: daily_sales
+  sql: "SELECT tenant_id, CAST(ordered_at AS DATE) AS sales_date,\n       COUNT(*)\
+    \ AS order_count, SUM(total_cents) AS gross_cents\nFROM paid_orders\nGROUP BY\
+    \ tenant_id, CAST(ordered_at AS DATE)\n"
+runtime:
+  auth:
+    api_key:
+      enabled: true
+      keys:
+      - ${ env:BOOK_API_KEY }

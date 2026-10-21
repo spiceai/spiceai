@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{sync::LazyLock, time::Duration};
 
-use async_openai::types::{CreateEmbeddingRequest, EncodingFormat};
+use async_openai::types::embeddings::{CreateEmbeddingRequest, EncodingFormat};
 use opentelemetry::{
     Key, KeyValue, Value, global,
     metrics::{Counter, Histogram, Meter},
@@ -59,16 +59,13 @@ pub(crate) fn request_labels(req: &CreateEmbeddingRequest) -> Vec<KeyValue> {
         Some(EncodingFormat::Base64) => "base64",
     };
     let mut labels = vec![
-        KeyValue::new(
-            Key::new("model"),
-            Value::String(req.model.to_string().into()),
-        ),
+        KeyValue::new(Key::new("model"), Value::String(req.model.clone().into())),
         KeyValue::new(Key::new("encoding_format"), Value::String(encoding.into())),
     ];
     if let Some(ref user) = req.user {
         labels.push(KeyValue::new(
             Key::new("user"),
-            Value::String(user.to_string().into()),
+            Value::String(user.clone().into()),
         ));
     }
 
@@ -85,7 +82,7 @@ pub(crate) fn request_labels(req: &CreateEmbeddingRequest) -> Vec<KeyValue> {
 pub(crate) fn handle_metrics(duration: Duration, is_failure: bool, labels: &[KeyValue]) {
     EMBEDDING_REQUESTS.add(1, labels);
 
-    EMBEDDING_INTERNAL_DURATION_MS.record(duration.as_secs_f64(), labels);
+    EMBEDDING_INTERNAL_DURATION_MS.record(duration.as_secs_f64() * 1000.0, labels);
 
     if is_failure {
         FAILURES.add(1, labels);

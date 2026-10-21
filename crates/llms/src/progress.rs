@@ -70,8 +70,8 @@ impl Progress {
     }
 
     #[must_use]
-    pub fn id(mut self, id: String) -> Self {
-        self.id = Some(id);
+    pub fn id(mut self, id: Option<String>) -> Self {
+        self.id = id;
         self
     }
 

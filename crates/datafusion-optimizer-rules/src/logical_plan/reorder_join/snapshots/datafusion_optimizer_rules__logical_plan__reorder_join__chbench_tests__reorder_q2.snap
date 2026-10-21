@@ -1,0 +1,39 @@
+---
+source: crates/datafusion-optimizer-rules/src/logical_plan/reorder_join/chbench_tests.rs
+expression: plan
+---
+Sort: nation.n_name ASC NULLS LAST, supplier.su_name ASC NULLS LAST, item.i_id ASC NULLS LAST
+  Projection: supplier.su_suppkey, supplier.su_name, nation.n_name, item.i_id, item.i_name, supplier.su_address, supplier.su_phone, supplier.su_comment
+    Inner Join: nation.n_regionkey = region.r_regionkey
+      Projection: item.i_id, item.i_name, supplier.su_suppkey, supplier.su_name, supplier.su_address, supplier.su_phone, supplier.su_comment, nation.n_name, nation.n_regionkey
+        Inner Join: supplier.su_nationkey = nation.n_nationkey
+          Projection: item.i_id, item.i_name, supplier.su_suppkey, supplier.su_nationkey, supplier.su_name, supplier.su_address, supplier.su_phone, supplier.su_comment
+            Inner Join: mod(stock.s_w_id * stock.s_i_id, Int64(10000)) = supplier.su_suppkey
+              Projection: item.i_id, item.i_name, stock.s_w_id, stock.s_i_id
+                Inner Join: item.i_id = stock.s_i_id, m.m_s_quantity = stock.s_quantity
+                  Projection: item.i_id, item.i_name, m.m_s_quantity
+                    Inner Join: item.i_id = m.m_i_id
+                      Projection: item.i_id, item.i_name
+                        Filter: item.i_data LIKE Utf8("%b")
+                          TableScan: item projection=[i_id, i_data, i_name]
+                      SubqueryAlias: m
+                        Projection: stock.s_i_id AS m_i_id, min(stock.s_quantity) AS m_s_quantity
+                          Aggregate: groupBy=[[stock.s_i_id]], aggr=[[min(stock.s_quantity)]]
+                            Projection: stock.s_i_id, stock.s_quantity
+                              Inner Join: nation.n_regionkey = region.r_regionkey
+                                Projection: stock.s_i_id, stock.s_quantity, nation.n_regionkey
+                                  Inner Join: supplier.su_nationkey = nation.n_nationkey
+                                    Projection: stock.s_i_id, stock.s_quantity, supplier.su_nationkey
+                                      Inner Join: mod(stock.s_w_id * stock.s_i_id, Int64(10000)) = supplier.su_suppkey
+                                        TableScan: stock projection=[s_w_id, s_i_id, s_quantity]
+                                        TableScan: supplier projection=[su_suppkey, su_nationkey]
+                                    TableScan: nation projection=[n_nationkey, n_regionkey]
+                                Projection: region.r_regionkey
+                                  Filter: region.r_name LIKE Utf8("EUROP%")
+                                    TableScan: region projection=[r_regionkey, r_name]
+                  TableScan: stock projection=[s_w_id, s_i_id, s_quantity]
+              TableScan: supplier projection=[su_suppkey, su_nationkey, su_name, su_address, su_phone, su_comment]
+          TableScan: nation projection=[n_nationkey, n_name, n_regionkey]
+      Projection: region.r_regionkey
+        Filter: region.r_name LIKE Utf8("EUROP%")
+          TableScan: region projection=[r_regionkey, r_name]

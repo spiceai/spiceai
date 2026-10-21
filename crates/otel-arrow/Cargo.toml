@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "otel-arrow"
 repository.workspace = true
 rust-version.workspace = true
@@ -12,8 +12,13 @@ version.workspace = true
 arrow.workspace = true
 arrow-buffer.workspace = true
 async-trait.workspace = true
+blake3.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
+tracing.workspace = true
 
 [features]
 dev = []
+
+[lints]
+workspace = true

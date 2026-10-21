@@ -1,0 +1,38 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q1"
+---
++---------------+----------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                   |
++---------------+----------------------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_orderkey)]]                             |
+|               |   TableScan: lineitem projection=[l_orderkey]                                          |
+| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_orderkey)]                     |
+|               |   CoalescePartitionsExec                                                               |
+|               |     AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_orderkey)]               |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=7            |
+|               |         SchemaCastScanExec                                                             |
+|               |           PartitionedUnionExec                                                         |
+|               |             CooperativeExec                                                            |
+|               |               BytesProcessedExec                                                       |
+|               |                 DuckSqlExec sql= SELECT "l_orderkey" FROM "expression=1992/lineitem"   |
+|               |             CooperativeExec                                                            |
+|               |               BytesProcessedExec                                                       |
+|               |                 DuckSqlExec sql= SELECT "l_orderkey" FROM "expression=1993/lineitem"   |
+|               |             CooperativeExec                                                            |
+|               |               BytesProcessedExec                                                       |
+|               |                 DuckSqlExec sql= SELECT "l_orderkey" FROM "expression=1994/lineitem"   |
+|               |             CooperativeExec                                                            |
+|               |               BytesProcessedExec                                                       |
+|               |                 DuckSqlExec sql= SELECT "l_orderkey" FROM "expression=1995/lineitem"   |
+|               |             CooperativeExec                                                            |
+|               |               BytesProcessedExec                                                       |
+|               |                 DuckSqlExec sql= SELECT "l_orderkey" FROM "expression=1996/lineitem"   |
+|               |             CooperativeExec                                                            |
+|               |               BytesProcessedExec                                                       |
+|               |                 DuckSqlExec sql= SELECT "l_orderkey" FROM "expression=1997/lineitem"   |
+|               |             CooperativeExec                                                            |
+|               |               BytesProcessedExec                                                       |
+|               |                 DuckSqlExec sql= SELECT "l_orderkey" FROM "expression=1998/lineitem"   |
+|               |                                                                                        |
++---------------+----------------------------------------------------------------------------------------+

@@ -80,4 +80,3 @@ embeddings:
     name: openai_embeddings
     params:
       openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
-    metadata: {}

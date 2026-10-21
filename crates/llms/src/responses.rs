@@ -27,7 +27,7 @@ use crate::chat::nsql::SqlGeneration;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("Failed to load the model: {source}"))]
+    #[snafu(display("Failed to load the model. Verify the model configuration: {source}"))]
     FailedToLoadModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -66,7 +66,7 @@ pub trait Responses: Sync + Send {
                 .boxed()
                 .context(FailedToRunModelSnafu)?;
 
-            Ok(resp.output_text)
+            Ok(resp.output_text())
         }
         .instrument(span)
         .await

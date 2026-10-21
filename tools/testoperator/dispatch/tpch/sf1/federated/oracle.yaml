@@ -1,8 +1,9 @@
+# Oracle Cloud bills per use, so this runs on the weekly schedule instead of daily.
+schedule: weekly
 tests:
   bench:
     spicepod_path: federated/oracle.yaml
     query_set: tpch
     query_overrides: oracle
     runner_type: spiceai-dev-runners
-    # https://github.com/spiceai/spiceai/issues/6450
-    validate_results: false
+    validate_results: true

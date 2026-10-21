@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{BooleanArray, RecordBatch, StringArray, TimestampNanosecondArray};
+use arrow::array::{BooleanArray, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::TableReference;
 use futures::{StreamExt, TryStreamExt};
@@ -24,7 +24,7 @@ use spicepod::{
     component::dataset::{Dataset, TimeFormat},
     param::Params,
 };
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use app::AppBuilder;
 
@@ -33,10 +33,9 @@ use runtime::Runtime;
 use crate::{
     configure_test_datafusion, init_tracing,
     postgres::common::{
-        get_pg_params, get_postgres_connection_pool, get_random_port,
-        start_postgres_docker_container,
+        get_pg_params, get_postgres_connection_pool, start_postgres_docker_container,
     },
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 fn make_spiceai_dataset(path: &str, name: &str, engine: &str, retention_sql: &str) -> Dataset {
@@ -49,6 +48,10 @@ fn make_spiceai_dataset(path: &str, name: &str, engine: &str, retention_sql: &st
         retention_check_interval: Some("200ms".to_string()),
         ..Default::default()
     });
+    ds.params = Some(Params::from_string_map(HashMap::from([(
+        "spiceai_region".to_string(),
+        "us-east-1".to_string(),
+    )])));
     ds
 }
 
@@ -86,8 +89,8 @@ fn rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<(String, i64, bool)>
         let updated_at = batch
             .column(1)
             .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .ok_or_else(|| anyhow::anyhow!("Expected TimestampNanosecondArray in column 1"))?;
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or_else(|| anyhow::anyhow!("Expected TimestampMicrosecondArray in column 1"))?;
         let deleted = batch
             .column(2)
             .as_any()
@@ -165,9 +168,44 @@ async fn refresh_table(rt: Arc<Runtime>, table_name: &str) -> Result<(), anyhow:
         .await?;
     notifier
         .ok_or_else(|| anyhow::anyhow!("Failed to refresh table"))?
-        .notified()
+        .wait()
         .await;
     Ok(())
+}
+
+/// Polls `sql` until it returns `expected_rows` (the retention task runs on a
+/// background interval, so the row count may not drop immediately after
+/// `refresh_table` returns). Returns the matching batches once observed, or
+/// errors after `timeout`. The entire poll loop — including any in-flight
+/// query and the inter-attempt sleep — is bounded by `timeout` via
+/// `tokio::time::timeout_at`, so a slow query cannot extend the total runtime
+/// past the deadline.
+async fn wait_for_retention_applied(
+    rt: &Runtime,
+    sql: &str,
+    expected_rows: usize,
+    timeout: std::time::Duration,
+) -> Result<Vec<RecordBatch>, anyhow::Error> {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    let polled = tokio::time::timeout_at(deadline, async {
+        loop {
+            let query = rt.datafusion().query_builder(sql).build().run().await?;
+            let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
+            let count: usize = results.iter().map(RecordBatch::num_rows).sum();
+            if count == expected_rows {
+                return Ok::<_, anyhow::Error>(results);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    polled.unwrap_or_else(|_| {
+        Err(anyhow::anyhow!(
+            "retention did not apply within {timeout:?} for `{sql}` (expected {expected_rows} rows)"
+        ))
+    })
 }
 
 #[tokio::test]
@@ -176,6 +214,7 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(None);
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -204,29 +243,37 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
                 .await;
 
             let cloned_rt = Arc::new(rt.clone());
+            let load_rt = Arc::clone(&cloned_rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     panic!("Timeout waiting for components to load");
                 }
-                () = cloned_rt.load_components() => {}
+                () = load_rt.load_components() => {}
             }
 
             runtime_ready_check(&rt).await;
 
-            tokio::time::sleep(Duration::from_secs(1)).await; // Allow retention to complete
+            refresh_table(Arc::clone(&cloned_rt), "nation").await?;
+            refresh_table(Arc::clone(&cloned_rt), "taxi_trips").await?;
 
-            for (sql, snapshot_name) in [
+            for (sql, snapshot_name, expected_rows) in [
                 (
                     "SELECT n_nationkey, n_name, n_regionkey FROM nation",
                     "retention_sql",
+                    3usize,
                 ),
-                ("SELECT VendorID, Airport_fee, tpep_pickup_datetime, passenger_count, trip_distance FROM taxi_trips", "retention_sql_and_time_column"),
+                ("SELECT VendorID, Airport_fee, tpep_pickup_datetime, passenger_count, trip_distance FROM taxi_trips", "retention_sql_and_time_column", 4usize),
             ] {
-                let query = rt.datafusion().query_builder(sql).build().run().await?;
-
-                let results: Vec<RecordBatch> =
-                    query.data.try_collect::<Vec<RecordBatch>>().await?;
+                // Retention runs on a 200ms interval after refresh completes, so
+                // wait for it to apply before snapshotting.
+                let results = wait_for_retention_applied(
+                    &rt,
+                    sql,
+                    expected_rows,
+                    std::time::Duration::from_secs(10),
+                )
+                .await?;
 
                 let results_str =
                     arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
@@ -238,17 +285,17 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
         .await
 }
 
-#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_duckdb_append_refresh_preserves_timestamptz() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
             let _tz_guard = TimezoneGuard::new("Asia/Tokyo");
 
-            let port = get_random_port()?;
-            let running_container = start_postgres_docker_container(port).await?;
+            let running_container = start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let pool = get_postgres_connection_pool(port, None).await?;
             let db_conn = pool
@@ -305,7 +352,7 @@ SET
             let pg_initial_ts: i64 = db_conn
                 .conn
                 .query_one(
-                    "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000000)::BIGINT FROM widgets WHERE name = 'Sample widget';",
+                    "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT FROM widgets WHERE name = 'Sample widget';",
                     &[],
                 )
                 .await?
@@ -341,7 +388,7 @@ SET
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}
@@ -369,8 +416,8 @@ SET
                 .expect("updated_at column present");
             assert_eq!(
                 updated_field.data_type(),
-                &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                "accelerator should expose updated_at as UTC"
+                &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                "accelerator should expose timestamptz updated_at as microsecond UTC (DuckDB's TIMESTAMPTZ precision, #10627)"
             );
 
             let initial_rows = rows_from_batches(&initial_batches)?;

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::num::TryFromIntError;
+use std::ops::{Add, Rem, Sub};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -30,7 +31,6 @@ use datafusion::logical_expr::{
 };
 use datafusion::scalar::ScalarValue;
 use snafu::{ResultExt, Snafu, ensure};
-use tract_core::num_traits::Num;
 
 // Maximum truncation width or length, chosen to prevent overflow or excessive memory usage.
 const MAX_TRUNCATE_WIDTH: i64 = i64::MAX / 2;
@@ -62,6 +62,8 @@ impl From<TruncateError> for DataFusionError {
         DataFusionError::External(val.to_string().into())
     }
 }
+pub static TRUNCATE_SCALAR_UDF_NAME: &str = "truncate";
+runtime_udfs_api::register_spice_function!(TRUNCATE_SPICE_FUNCTION, TRUNCATE_SCALAR_UDF_NAME);
 
 #[derive(Debug, Hash, Eq, PartialEq)]
 pub struct Truncate {
@@ -109,12 +111,8 @@ impl Truncate {
 }
 
 impl ScalarUDFImpl for Truncate {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
-        "truncate"
+        TRUNCATE_SCALAR_UDF_NAME
     }
 
     fn signature(&self) -> &Signature {
@@ -238,7 +236,11 @@ fn compute_truncate_scalar(
 
 fn truncate_numeric<V, W>(v: V, w: W) -> Result<V, TruncateError>
 where
-    V: Num + Copy + TryFrom<W, Error = TryFromIntError>,
+    V: Rem<Output = V>
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Copy
+        + TryFrom<W, Error = TryFromIntError>,
 {
     let w = V::try_from(w).context(WidthCastingFailedSnafu)?;
     Ok(v - (((v % w) + w) % w))

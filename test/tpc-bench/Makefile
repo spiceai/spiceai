@@ -4,11 +4,24 @@
 
 all: tpch-gen pg-load
 
-tpch-init:
+# Directory the *-load targets read TPC-H .tbl files from. dbgen writes its output
+# next to the binary, so that is the default; tpch-fleet-gen writes to
+# $(TPCH_FLEET_DIR) instead, so a caller using it must pass TPCH_DATA_DIR to match.
+TPCH_DATA_DIR ?= tpch-kit/dbgen
+
+# Directory the *-tpcds-load targets read TPC-DS .dat files from. dsdgen writes to
+# tpcds-kit/tools/tmp/data (see tpcds-gen), so that is the default; tpcds-fleet-gen
+# writes to $(TPCDS_FLEET_DIR) instead, so a caller using it must pass
+# TPCDS_DATA_DIR to match.
+TPCDS_DATA_DIR ?= tpcds-kit/tools/tmp/data
+
+tpch-clone:
 	@if [ ! -d "tpch-kit" ]; then \
 		git clone https://github.com/spiceai/tpch-kit.git; \
 		cd tpch-kit && git checkout 319892381ff1213ca794d449c04c5a31f2252d57; \
 	fi
+
+tpch-init: tpch-clone
 	@OS=`uname`; \
 	if [ -z "$(MACHINE)" ]; then \
 		if [ "$$OS" = "Linux" ]; then \
@@ -24,11 +37,13 @@ tpch-init:
 
 	@echo "Initialized successfully."
 
-tpcds-init:
+tpcds-clone:
 	@if [ ! -d "tpcds-kit" ]; then \
 		git clone https://github.com/spiceai/tpcds-kit.git; \
 		cd tpcds-kit && git checkout dd01f906992e1e39837526bffb3f5b759e83b3a8; \
 	fi
+
+tpcds-init: tpcds-clone
 	@OS=`uname`; \
 	if [ -z "$(OS)" ]; then \
 		if [ "$$OS" = "Linux" ]; then \
@@ -75,6 +90,117 @@ tpch-gen: tpch-init
 
 	@echo "Test data and queries generated successfully."
 
+# tpch-fleet-gen generates the same TPC-H dataset the rest of the benchmark fleet
+# runs on - s3://spiceai-public-datasets/tpch and the hosted MySQL, Iceberg, Glue,
+# Databricks, Snowflake and Spice Cloud copies - which is what
+# crates/test-framework/src/queries/validation/tpch/*.csv holds the expected
+# answers for. That dataset comes from DuckDB's tpch extension, and DuckDB's
+# generator disagrees with tpch-kit's dbgen on the free-text columns (c_address,
+# s_address, and every *_comment): keys, numerics, dates and even the string
+# lengths are identical, but the characters differ. That changes 4 of the 22 TPC-H
+# answers - Q2 and Q20 (s_address), Q10 (c_address), and Q13, whose predicate reads
+# o_comment - so a Postgres database seeded with dbgen data fails result validation
+# on exactly those four queries no matter how correct the engine under test is.
+# dbgen is the officially correct generator (its output matches the TPC-supplied
+# answers in tpch-kit's dbgen/answers/); the fleet's dataset is the one that
+# diverges, tracked separately in #12137. Until that is resolved, seeding from the
+# same generator the answers were produced with is what makes a result mismatch
+# mean a real bug.
+#
+# Data only - qgen/tpch_queries.sql still comes from tpch-gen.
+# Example: DBGEN_SCALE=1 make tpch-fleet-gen
+TPCH_FLEET_DIR ?= ./tmp/fleet
+
+# Pinned so the generated dataset cannot drift with whatever duckdb happens to be
+# on PATH. v1.5.4's output was verified row-for-row identical to the fleet dataset
+# across all 8 tables (0 rows differing in either direction, 6,001,215 lineitem
+# rows). Override DUCKDB to use an already-installed CLI.
+DUCKDB_VERSION ?= v1.5.4
+DUCKDB ?= ./tmp/bin/duckdb
+
+$(DUCKDB):
+	@mkdir -p ./tmp/bin
+	@OS=`uname`; ARCH=`uname -m`; \
+	case "$$OS/$$ARCH" in \
+		Linux/x86_64) ASSET=duckdb_cli-linux-amd64.zip ;; \
+		Linux/aarch64 | Linux/arm64) ASSET=duckdb_cli-linux-arm64.zip ;; \
+		Darwin/*) ASSET=duckdb_cli-osx-universal.zip ;; \
+		*) echo "No DuckDB CLI release asset for $$OS/$$ARCH - install duckdb and re-run with DUCKDB=\`command -v duckdb\`"; exit 1 ;; \
+	esac; \
+	echo "Downloading DuckDB CLI $(DUCKDB_VERSION) ($$ASSET)..."; \
+	curl -fsSL --retry 3 -o ./tmp/bin/duckdb.zip "https://github.com/duckdb/duckdb/releases/download/$(DUCKDB_VERSION)/$$ASSET"
+	@unzip -oq ./tmp/bin/duckdb.zip -d ./tmp/bin
+	@rm -f ./tmp/bin/duckdb.zip
+	@chmod +x "$(DUCKDB)"
+	@"$(DUCKDB)" --version
+
+tpch-fleet-gen: $(DUCKDB)
+	@# Check if DBGEN_SCALE is set, else default to 1
+	$(eval DBGEN_SCALE ?= 1)
+	@mkdir -p "$(TPCH_FLEET_DIR)"
+	@rm -f "$(TPCH_FLEET_DIR)"/*.tbl "$(TPCH_FLEET_DIR)/gen.duckdb" "$(TPCH_FLEET_DIR)/gen.duckdb.wal"
+	@echo "Generating TPC-H scale factor $(DBGEN_SCALE)..."
+	@"$(DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=$(DBGEN_SCALE));" > /dev/null
+	@# QUOTE '' disables CSV quoting so no field is ever wrapped, and the trailing
+	@# empty column reproduces dbgen's trailing '|'; the result is byte-compatible
+	@# with dbgen's .tbl format, so every *-load target reads it unchanged. Tables
+	@# are dropped as they are written to bound peak disk at the larger scales.
+	@for table in region nation customer supplier part partsupp orders lineitem; do \
+		echo "Writing $$table.tbl..."; \
+		"$(DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "\
+			COPY (SELECT *, '' FROM $$table) TO '$(TPCH_FLEET_DIR)/$$table.tbl' (FORMAT CSV, DELIMITER '|', HEADER false, QUOTE ''); \
+			DROP TABLE $$table; \
+			CHECKPOINT;" > /dev/null || exit 1; \
+	done
+	@rm -f "$(TPCH_FLEET_DIR)/gen.duckdb" "$(TPCH_FLEET_DIR)/gen.duckdb.wal"
+	@echo "Test data generated successfully in $(TPCH_FLEET_DIR) - pass TPCH_DATA_DIR=$(TPCH_FLEET_DIR) to the load targets."
+
+# tpcds-fleet-gen is the TPC-DS analog of tpch-fleet-gen above: it generates the
+# same TPC-DS dataset the rest of the benchmark fleet runs on - the s3/file
+# parquet copies and the hosted MySQL and Spice Cloud databases - which is what
+# crates/test-framework/src/queries/validation/tpcds/*.csv holds the expected
+# answers for. That dataset comes from DuckDB's tpcds extension, a
+# reimplementation whose RNG diverges from tpcds-kit's C dsdgen: schemas and row
+# counts are identical, but which customer bought which item on which ticket
+# differs, so cross-fact-table join incidence differs. Queries whose canonical
+# SF1 answers hold only 1-2 rows (q17, q25, q85 - store/catalog/web sales
+# joined to their returns) come back genuinely empty from a tpcds-kit-seeded
+# database no matter how correct the engine under test is, and value-level
+# result snapshots differ broadly. Seeding from the same generator the expected
+# answers were produced with is what makes a result mismatch mean a real bug.
+#
+# Data only - the DDL (tpcds.sql) and foreign keys (tpcds_ri.sql) still come
+# from tpcds-kit, which tpcds-clone fetches without compiling the C tools.
+# Example: DBGEN_SCALE=1 make tpcds-fleet-gen
+TPCDS_FLEET_DIR ?= ./tmp/tpcds-fleet
+
+TPCDS_TABLES = call_center catalog_page catalog_returns catalog_sales customer \
+	customer_address customer_demographics date_dim household_demographics \
+	income_band inventory item promotion reason ship_mode store store_returns \
+	store_sales time_dim warehouse web_page web_returns web_sales web_site
+
+tpcds-fleet-gen: $(DUCKDB)
+	@# Check if DBGEN_SCALE is set, else default to 1
+	$(eval DBGEN_SCALE ?= 1)
+	@mkdir -p "$(TPCDS_FLEET_DIR)"
+	@rm -f "$(TPCDS_FLEET_DIR)"/*.dat "$(TPCDS_FLEET_DIR)/gen.duckdb" "$(TPCDS_FLEET_DIR)/gen.duckdb.wal"
+	@echo "Generating TPC-DS scale factor $(DBGEN_SCALE)..."
+	@"$(DUCKDB)" "$(TPCDS_FLEET_DIR)/gen.duckdb" -c "INSTALL tpcds; LOAD tpcds; CALL dsdgen(sf=$(DBGEN_SCALE));" > /dev/null
+	@# QUOTE '' disables CSV quoting so no field is ever wrapped, and the trailing
+	@# empty column reproduces dsdgen's trailing '|'; NULLs export as empty fields,
+	@# exactly as dsdgen writes them. The result is byte-compatible with dsdgen's
+	@# .dat format, so every *-tpcds-load target reads it unchanged. Tables are
+	@# dropped as they are written to bound peak disk at the larger scales.
+	@for table in $(TPCDS_TABLES); do \
+		echo "Writing $$table.dat..."; \
+		"$(DUCKDB)" "$(TPCDS_FLEET_DIR)/gen.duckdb" -c "\
+			COPY (SELECT *, '' FROM $$table) TO '$(TPCDS_FLEET_DIR)/$$table.dat' (FORMAT CSV, DELIMITER '|', HEADER false, QUOTE ''); \
+			DROP TABLE $$table; \
+			CHECKPOINT;" > /dev/null || exit 1; \
+	done
+	@rm -f "$(TPCDS_FLEET_DIR)/gen.duckdb" "$(TPCDS_FLEET_DIR)/gen.duckdb.wal"
+	@echo "Test data generated successfully in $(TPCDS_FLEET_DIR) - pass TPCDS_DATA_DIR=$(TPCDS_FLEET_DIR) to the load targets."
+
 # Default value for DB_NAME
 DB_NAME ?= tpch
 
@@ -91,20 +217,69 @@ pg-init:
 
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-load
 pg-load:
+	@mkdir -p ./tmp
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' tpch-kit/dbgen/$$table.tbl > ./tmp/$$table.tbl; \
+		sed 's/|$$//' "$(TPCH_DATA_DIR)/$$table.tbl" > ./tmp/$$table.tbl; \
 		psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "\\copy $$table FROM './tmp/$$table.tbl' CSV DELIMITER '|';"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to $(DB_NAME) database"
 
+# tpch-kit's dbgen/dss.ddl (used by pg-init) creates bare tables with no
+# PRIMARY KEY, FOREIGN KEY, or index of any kind - unlike a hand-written TPC-H
+# DDL (e.g. the postgres cookbook's load-tpch.py), which declares real keys.
+# So this target must create the nominal TPC-H primary/unique-key indexes
+# itself, not assume dss.ddl already created them, plus the secondary
+# indexes covering join/filter columns the TPC-H queries in
+# crates/test-framework/src/queries/tpch actually use.
+# idx_lineitem_l_partkey_l_suppkey must be the composite (l_partkey, l_suppkey),
+# not a standalone l_partkey index: Q20's correlated subquery filters lineitem
+# on both columns together, and without the composite it falls back to a full
+# scan per outer row (observed ~1h49m vs ~0.1s with the composite).
+# Missing the supplier(s_suppkey) key index specifically starves Q2's
+# correlated MIN(ps_supplycost) subquery of an index-driven nested loop,
+# forcing Postgres to rebuild a full supplier/nation/region hash join on every
+# one of tens of thousands of correlated invocations instead of a cheap probe.
+# ANALYZE runs after index creation so the planner has fresh statistics on the
+# just-bulk-loaded tables; without it, correlated-subquery queries (Q2, Q20)
+# can get planned as per-row full/seq scans instead of index lookups.
+# statement_timeout is set on the database as a backstop: a cancelled CI run
+# only stops the GitHub runner, not the Postgres backend connection - we've
+# observed cancelled benchmark queries keep running server-side for hours,
+# competing for resources with every subsequent run. 90 minutes gives ample
+# headroom over the slowest known-good query (~52 min at SF100) while
+# bounding how long a leaked connection can hold resources.
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-create-index
 pg-create-index:
-	@echo "Creating indexes in $(DB_NAME) database"
-	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX idx_partsupp_ps_partkey ON partsupp (ps_partkey);";
-	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX idx_part_p_partkey ON part (p_partkey);";
-	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX idx_lineitem_l_partkey ON lineitem (l_partkey);";
+	@echo "Creating primary/unique-key indexes in $(DB_NAME) database"
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "DROP INDEX IF EXISTS idx_part_p_partkey;";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "DROP INDEX IF EXISTS idx_partsupp_ps_partkey;";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_region_pk ON region (r_regionkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_nation_pk ON nation (n_nationkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_part_pk ON part (p_partkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_supplier_pk ON supplier (s_suppkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_pk ON customer (c_custkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_pk ON orders (o_orderkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_partsupp_pk ON partsupp (ps_partkey, ps_suppkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_lineitem_pk ON lineitem (l_orderkey, l_linenumber);";
+	@echo "Creating secondary indexes in $(DB_NAME) database"
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "DROP INDEX IF EXISTS idx_lineitem_l_partkey;";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_lineitem_l_partkey_l_suppkey ON lineitem (l_partkey, l_suppkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_lineitem_l_suppkey ON lineitem (l_suppkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_lineitem_l_shipdate ON lineitem (l_shipdate);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_orders_o_custkey ON orders (o_custkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_orders_o_orderdate ON orders (o_orderdate);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_customer_c_nationkey ON customer (c_nationkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_supplier_s_nationkey ON supplier (s_nationkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_nation_n_regionkey ON nation (n_regionkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_partsupp_ps_suppkey ON partsupp (ps_suppkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_part_p_brand_p_container ON part (p_brand, p_container);";
 	@echo "Indexes have been successfully created to $(DB_NAME) database"
+	@echo "Analyzing $(DB_NAME) database"
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "ANALYZE;";
+	@echo "Statistics have been refreshed for $(DB_NAME) database"
+	@echo "Setting statement_timeout on $(DB_NAME) database"
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "ALTER DATABASE \"$(DB_NAME)\" SET statement_timeout = '5400000';";
 
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make tpch-run-pq
 tpch-run-pq:
@@ -136,13 +311,44 @@ mysql-init:
 
 	@echo "Database '$(DB_NAME)' has been successfully created or updated."
 
+# MySQL's LOAD DATA reads an empty field as the column type's zero value - an empty
+# integer field lands as 0, never NULL - while PostgreSQL's `\copy ... CSV` reads that
+# same empty field as NULL. dsdgen writes a NULL as an empty field (and the DuckDB
+# tpcds/tpch extensions export with QUOTE '', so they write one too), so loading these
+# files into MySQL unchanged replaces every NULL foreign key with 0. The MySQL arms then
+# benchmark different data from every other arm seeded from the same files, and nothing
+# downstream can tell: row counts still match, and only a query keying on NULL-ness
+# disagrees. tpcds_q76, whose three predicates are all `IS NULL`, is that query.
+#
+# The repair is type-directed rather than a rewrite of the data file, because the file
+# cannot distinguish a NULL from an empty string and a blanket rewrite would null the
+# empty strings too - `time_dim.t_meal_time` is 50,400 empty strings and zero NULLs.
+# `mysql-null-spec.awk` turns the table's own column types into a LOAD DATA spec that
+# NULLIFs only the columns where an empty field cannot be anything but NULL, and binds
+# text columns positionally so they keep their empty strings. The tables must already
+# exist, which `mysql-*-init` guarantees.
+#
+# TPC-H contains no NULLs and no empty strings, so `mysql-load` was never wrong; it uses
+# the same spec so the two loaders cannot drift.
+#
+# Each loader refuses an empty spec rather than loading without one. The generator
+# prints nothing for an empty column listing, and awk in a pipeline hides the exit
+# status of the `mysql` feeding it, so a server the recipe cannot reach would
+# otherwise load every table with no spec at all - reinstating the zero-for-NULL
+# corruption above, under a recipe that still reports success.
+MYSQL_NULL_SPEC = awk -f ./mysql-null-spec.awk
+MYSQL_COLUMN_TYPES = SELECT column_name, data_type FROM information_schema.columns WHERE table_schema='$(DB_NAME)' AND table_name=
+
 # Example: DB_HOST=localhost DB_PORT=3306 DB_USER=root DB_PASS=root DB_NAME=tpch make mysql-load
 mysql-load:
 	@mkdir -p ./tmp
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' tpch-kit/dbgen/$$table.tbl > ./tmp/$$table.tbl; \
-		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
+		sed 's/|$$//' "$(TPCH_DATA_DIR)/$$table.tbl" > ./tmp/$$table.tbl; \
+		columns=$$(mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -N -B $(DB_NAME) -e "$(MYSQL_COLUMN_TYPES)'$$table' ORDER BY ordinal_position;") || columns=''; \
+		spec=$$(printf '%s' "$$columns" | $(MYSQL_NULL_SPEC)); \
+		[ -n "$$spec" ] || { echo "Failed to read the column types of table '$$table' from database '$(DB_NAME)'. Loading without a column spec reads every empty field as 0 instead of NULL, so the load is refused. Check DB_HOST/DB_PORT/DB_USER/DB_PASS, and run 'make mysql-init' first so the tables exist." >&2; exit 1; }; \
+		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n' $$spec;" || { echo "Loading table '$$table' failed, so the benchmark dataset is incomplete." >&2; exit 1; }; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
 
@@ -177,8 +383,11 @@ mysql-tpcds-load:
 	@mkdir -p ./tmp
 	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' tpcds-kit/tools/tmp/data/$$table.dat > ./tmp/$$table.dat; \
-		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
+		sed 's/|$$//' "$(TPCDS_DATA_DIR)/$$table.dat" > ./tmp/$$table.dat; \
+		columns=$$(mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) -N -B $(DB_NAME) -e "$(MYSQL_COLUMN_TYPES)'$$table' ORDER BY ordinal_position;") || columns=''; \
+		spec=$$(printf '%s' "$$columns" | $(MYSQL_NULL_SPEC)); \
+		[ -n "$$spec" ] || { echo "Failed to read the column types of table '$$table' from database '$(DB_NAME)'. Loading without a column spec reads every empty field as 0 instead of NULL, so the load is refused. Check DB_HOST/DB_PORT/DB_USER/DB_PASS, and run 'make mysql-tpcds-init' first so the tables exist." >&2; exit 1; }; \
+		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.dat' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n' $$spec;" || { echo "Loading table '$$table' failed, so the benchmark dataset is incomplete." >&2; exit 1; }; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
 
@@ -197,20 +406,29 @@ pg-tpcds-init:
 	@echo "Creating tables from tpcds.sql..."
 	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f ./tpcds-kit/tools/tpcds.sql
 
-	@if [ "$(ADD_INDEXES)" = "true" ] || [ "$(ADD_INDEXES)" = "1" ]; then \
-		echo "Applying indexes from tpcds_index.sql..."; \
-		psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f tpcds_index.sql; \
-		echo "Indexes applied successfully."; \
-	fi
-
 	@echo "Database '$(DB_NAME)' has been successfully created or updated."
 
-# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-tpcds-load
+# Indexes are built after pg-tpcds-load, not as part of pg-tpcds-init: building
+# them against empty tables means every bulk \copy in pg-tpcds-load has to
+# incrementally maintain each index row-by-row, instead of one efficient
+# sort-and-build pass over already-loaded data.
+# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpcds make pg-tpcds-create-index
+pg-tpcds-create-index:
+	@echo "Applying indexes from tpcds_index.sql..."
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f tpcds_index.sql
+	@echo "Indexes applied successfully."
+	@echo "Analyzing $(DB_NAME) database"
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "ANALYZE;";
+	@echo "Statistics have been refreshed for $(DB_NAME) database"
+	@echo "Setting statement_timeout on $(DB_NAME) database"
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "ALTER DATABASE \"$(DB_NAME)\" SET statement_timeout = '5400000';";
+
+# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpcds make pg-tpcds-load
 pg-tpcds-load:
 	@mkdir -p ./tmp
 	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' tpcds-kit/tools/tmp/data/$$table.dat > ./tmp/$$table.dat; \
+		sed 's/|$$//' "$(TPCDS_DATA_DIR)/$$table.dat" > ./tmp/$$table.dat; \
 		psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "\\copy $$table FROM './tmp/$$table.dat' CSV DELIMITER '|';"; \
 	done
 	@echo "Applying foreign keys from tpcds_ri.sql..."
@@ -222,7 +440,7 @@ file-tpch-init:
 	@mkdir -p ./tmp
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Preparing $$table..."; \
-		cp tpch-kit/dbgen/$$table.tbl ./tmp/$$table.csv; \
+		cp "$(TPCH_DATA_DIR)/$$table.tbl" ./tmp/$$table.csv; \
 		python ./tpch_file.py ./tmp/$$table; \
 		rm ./tmp/$$table.csv; \
 	done
@@ -279,7 +497,7 @@ mssql-init:
 
 mssql-load:
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
-		cp tpch-kit/dbgen/$$table.tbl ./mssql-tpch/data/$$table.tbl; \
+		cp "$(TPCH_DATA_DIR)/$$table.tbl" ./mssql-tpch/data/$$table.tbl; \
 	done
 	chmod 755 ./mssql-tpch/data
 	sqlcmd -U $(DB_USER) -P $(DB_PASS) -S $(DB_HOST) -d $(DB_NAME) -i ./mssql-tpch/insert.sql

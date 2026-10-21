@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/dynamodb/streams.rs
+expression: formatted
+---
++------+--------+---------+
+| id   | name   | version |
++------+--------+---------+
+| id-0 | Item 0 | 0       |
+| id-1 | Item 1 | 1       |
+| id-2 | Item 2 | 2       |
+| id-3 | Item 3 | 3       |
+| id-4 | Item 4 | 4       |
++------+--------+---------+

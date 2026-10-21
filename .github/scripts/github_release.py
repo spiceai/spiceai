@@ -11,12 +11,19 @@ if token == None:
 
 authHeader = { "Authorization": f"token {token}"}
 
+# GitHub rejects a release body longer than this with a 422. Release notes are
+# also read from a file rather than taken as an argument: a body this large
+# exceeds MAX_ARG_STRLEN (128 KiB), so the exec fails with E2BIG before Python
+# ever starts.
+MAX_BODY_CHARS = 125000
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--owner')
 parser.add_argument('--repo')
 parser.add_argument('--tag')
 parser.add_argument('--release-name')
 parser.add_argument('--body')
+parser.add_argument('--body-file')
 parser.add_argument('--prerelease')
 parser.add_argument('action')
 parser.add_argument('artifact', nargs='+')
@@ -25,6 +32,18 @@ def getReleaseByTag(owner, repo, tag):
     releaseInfo = requests.get(f"{apiHost}/repos/{owner}/{repo}/releases/tags/{tag}", headers=authHeader)
 
     if releaseInfo.status_code == 404:
+        return None
+
+    if not releaseInfo.ok:
+        # Non-2xx responses (e.g. transient 5xx, 403 rate limit) return an
+        # error payload that lacks the keys callers expect ("id", "assets",
+        # "upload_url"). Treat as missing so callers can retry/skip cleanly
+        # instead of crashing on KeyError downstream.
+        print(f"Failed to fetch release for tag {tag}: HTTP {releaseInfo.status_code}")
+        try:
+            print(releaseInfo.json())
+        except ValueError:
+            print(releaseInfo.text)
         return None
 
     return releaseInfo.json()
@@ -92,21 +111,69 @@ def updateRelease(id, owner, repo, release_name, body, prerelease):
         print(resp.json())
 
 
+def readBody(args):
+    """Resolve the release body, preferring --body-file over --body."""
+    if args.body_file:
+        with open(args.body_file, encoding="utf-8") as f:
+            return f.read()
+
+    return args.body
+
+def truncateBody(body, owner, repo, tag):
+    """Trim an oversized body to fit GitHub's limit, linking to the full notes."""
+    if body is None or len(body) <= MAX_BODY_CHARS:
+        return body
+
+    notice = (
+        "\n\n---\n\n"
+        f"Release notes truncated to fit GitHub's {MAX_BODY_CHARS} character limit. "
+        f"Full notes: https://github.com/{owner}/{repo}/blob/{tag}/docs/release_notes/{tag}.md\n"
+    )
+
+    kept = body[:MAX_BODY_CHARS - len(notice)]
+
+    # Cut on a line boundary so the body never ends mid-sentence or mid-link.
+    # A body with no line break in the retained prefix falls back to a word
+    # break, which still drops a partial URL whole. Dropping the prefix
+    # entirely would discard the whole body to satisfy the boundary.
+    boundary = kept.rfind("\n")
+    if boundary <= 0:
+        boundary = kept.rfind(" ")
+    if boundary > 0:
+        kept = kept[:boundary]
+
+    print(f"Body is {len(body)} characters, over the {MAX_BODY_CHARS} limit; truncating to {len(kept) + len(notice)}")
+
+    return kept + notice
+
+def extract_title_from_body(body, fallback_name):
+    """Extract the first # heading from body as the release title, returning (title, remaining_body)."""
+    if body:
+        lines = body.splitlines()
+        if lines and lines[0].startswith("# "):
+            title = lines[0][2:].strip()
+            remaining = "\n".join(lines[1:]).lstrip("\n")
+            return title, remaining
+    return fallback_name, body
+
 def actionUpload(args):
     # Step 1: Get the release
     releaseInfo = getReleaseByTag(args.owner, args.repo, args.tag)
 
     is_prerelease = args.prerelease == "true"
-    
+
+    body = truncateBody(readBody(args), args.owner, args.repo, args.tag)
+    release_name, body = extract_title_from_body(body, args.release_name)
+
     # Step 2: Create the release if it doesn't exist
     if releaseInfo == None:
         print("Creating release")
-        releaseInfo = createRelease(args.owner, args.repo, args.tag, args.release_name, args.body, is_prerelease)
+        releaseInfo = createRelease(args.owner, args.repo, args.tag, release_name, body, is_prerelease)
         print("Release created!")
     else:
         # Step 2.5: Update the release with the latest info
         print("Updating release")
-        updateRelease(releaseInfo["id"], args.owner, args.repo, args.release_name, args.body, is_prerelease)
+        updateRelease(releaseInfo["id"], args.owner, args.repo, release_name, body, is_prerelease)
         print("Release updated!")
 
     # Step 3: Upload the release asset for each artifact
@@ -133,11 +200,12 @@ def actionDelete(args):
         return
 
     # Step 2: For each artifact, see if it already exists as an asset on the release
+    assets = releaseInfo.get("assets", [])
     for artifact in args.artifact:
         filename = os.path.basename(artifact)
         print(f"Deleting -> {filename}")
 
-        for asset in releaseInfo["assets"]:
+        for asset in assets:
             if asset["name"] == filename:
                 deleteAsset(args.owner, args.repo, asset["id"])
 

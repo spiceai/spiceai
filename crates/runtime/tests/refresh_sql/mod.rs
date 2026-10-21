@@ -15,21 +15,20 @@ limitations under the License.
 */
 
 use arrow::array::RecordBatch;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::TryStreamExt;
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use app::AppBuilder;
 
 use runtime::{
-    Runtime, accelerated_table::refresh::RefreshOverrides,
-    component::dataset::acceleration::RefreshMode,
+    Runtime, accelerated::refresh::RefreshOverrides, component::dataset::acceleration::RefreshMode,
 };
-use spicepod::{acceleration::Acceleration, component::dataset::Dataset};
+use spicepod::{acceleration::Acceleration, component::dataset::Dataset, param::Params};
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context, wait_until_true},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context, wait_until_true},
 };
 
 mod refresh_max_timestamp_df;
@@ -41,6 +40,10 @@ fn make_spiceai_dataset(path: &str, name: &str, refresh_sql: String) -> Dataset 
         refresh_sql: Some(refresh_sql),
         ..Default::default()
     });
+    ds.params = Some(Params::from_string_map(HashMap::from([(
+        "spiceai_region".to_string(),
+        "us-east-1".to_string(),
+    )])));
     ds
 }
 
@@ -50,6 +53,7 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(None);
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -67,7 +71,7 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}

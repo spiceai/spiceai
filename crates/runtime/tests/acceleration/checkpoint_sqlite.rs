@@ -26,6 +26,7 @@ use runtime::{Runtime, component::dataset::builder::DatasetBuilder};
 use spicepod::acceleration::Mode;
 use spicepod::acceleration::{Acceleration, RefreshMode};
 use spicepod::component::dataset::Dataset;
+use spicepod::param::Params;
 use std::sync::Arc;
 
 use crate::acceleration::get_params;
@@ -53,6 +54,9 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
                 refresh_sql: Some("SELECT * FROM decimal".to_string()),
                 ..Acceleration::default()
             });
+            dataset.params = Some(Params::from_string_map(
+                [("file_format".to_string(), "parquet".to_string())].into(),
+            ));
 
             let app = AppBuilder::new("test_acceleration_sqlite_checkpoint")
                 .with_dataset(dataset)
@@ -87,7 +91,7 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
                 .collect::<Result<Vec<_>, _>>()?;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -106,7 +110,7 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
                 datafusion_table_providers::sql::db_connection_pool::Mode::File,
                 JoinPushDown::Disallow,
                 vec![],
-                std::time::Duration::from_millis(5000),
+                std::time::Duration::from_secs(5),
             )
             .await
             .expect("connection pool");

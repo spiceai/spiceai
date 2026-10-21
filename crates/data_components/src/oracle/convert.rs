@@ -83,7 +83,11 @@ pub(crate) fn map_oracle_type_to_arrow_type(
 
             Some(DataType::Decimal128(p, s))
         }
-        "DATE" => Some(DataType::Date32),
+        // Oracle's DATE stores century, year, month, day, hour, minute and second, so it is a
+        // datetime with 1-second resolution rather than a date-only type. Mapping it to Date32
+        // would make the time-of-day unrepresentable and silently truncate every value to
+        // midnight, so it shares the mapping used for TIMESTAMP(0).
+        "DATE" => Some(DataType::Timestamp(TimeUnit::Second, None)),
         "BINARY_FLOAT" => Some(DataType::Float32),
         // A subtype of the NUMBER data type having precision p. A FLOAT value is represented internally as NUMBER.
         // The precision p can range from 1 to 126 binary digits.
@@ -134,8 +138,6 @@ macro_rules! handle_primitive_type {
         }
     };
 }
-
-#[allow(clippy::too_many_lines)]
 pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<RecordBatch> {
     let mut arrow_columns_builders = vec![];
     for field in schema.fields() {
@@ -187,11 +189,9 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         row,
                         idx,
                         |v: String| {
-                            let decimal =
-                                v.parse::<BigDecimal>()
-                                    .context(FailedToParseBigDecimalSnafu {
-                                        value: v.to_string(),
-                                    })?;
+                            let decimal = v
+                                .parse::<BigDecimal>()
+                                .context(FailedToParseBigDecimalSnafu { value: v.clone() })?;
 
                             big_decimal_to_i128(&decimal, *scale).context(
                                 FailedToConvertBigDecimalToI128Snafu {
@@ -327,13 +327,7 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         chrono::DateTime<FixedOffset>,
                         row,
                         idx,
-                        |v: chrono::DateTime<FixedOffset>| {
-                            // Normalize to UTC before converting to nanos timestamp
-                            let utc_value = v.with_timezone(&chrono::Utc);
-                            Ok::<_, super::Error>(
-                                utc_value.timestamp_nanos_opt().unwrap_or_default(),
-                            )
-                        }
+                        fixed_offset_to_nanos
                     );
                 }
                 (DataType::Binary, _) => {
@@ -388,6 +382,19 @@ fn big_decimal_to_i128(decimal: &bigdecimal::BigDecimal, scale: i8) -> Option<i1
         .and_then(|scale| (decimal * scale).to_i128())
 }
 
+/// Convert an Oracle `TIMESTAMP WITH TIME ZONE` value to nanoseconds since epoch (UTC).
+/// Returns an error if the value is outside the i64 nanosecond range (~1677-2262).
+/// Previously used `unwrap_or_default()` which silently converted out-of-range
+/// timestamps to epoch 0 (1970-01-01 UTC), corrupting query results.
+fn fixed_offset_to_nanos(v: chrono::DateTime<FixedOffset>) -> super::Result<i64> {
+    let utc_value = v.with_timezone(&chrono::Utc);
+    utc_value
+        .timestamp_nanos_opt()
+        .context(FailedToConvertNaiveDateTimeToNanosSnafu {
+            v: utc_value.naive_utc(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,7 +410,10 @@ mod tests {
                 ("SALARY", "NUMBER", Some(10), Some(2)),
                 DataType::Decimal128(10, 2),
             ),
-            (("HIRE_DATE", "DATE", None, None), DataType::Date32),
+            (
+                ("HIRE_DATE", "DATE", None, None),
+                DataType::Timestamp(TimeUnit::Second, None),
+            ),
             (
                 ("CREATED_AT", "TIMESTAMP", None, Some(6)),
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -463,6 +473,80 @@ mod tests {
                 Some(expected.clone()),
                 "Failed mapping for column {name}: {oracle_type} -> {expected:?}",
             );
+        }
+    }
+
+    /// Regression test for #12096.
+    ///
+    /// Oracle's `DATE` carries hour, minute and second, so it must not map to a date-only Arrow
+    /// type: `Date32` cannot represent the time-of-day and the `Date32` read path fetches the
+    /// column as `chrono::NaiveDate`, which drops it. A truncated `DATE` silently corrupts query
+    /// results and stalls `refresh_mode: append` (every row of a day collapses onto that day's
+    /// midnight, so `value > max_seen` is never true again for the rest of the day).
+    #[test]
+    fn oracle_date_maps_to_a_type_that_can_hold_the_time_of_day() {
+        let mapped =
+            map_oracle_type_to_arrow_type("DATE", None, None).expect("DATE should be supported");
+
+        assert_eq!(
+            mapped,
+            DataType::Timestamp(TimeUnit::Second, None),
+            "Oracle DATE has 1-second resolution, so it should map to Timestamp(Second, None)"
+        );
+
+        assert!(
+            !matches!(mapped, DataType::Date32 | DataType::Date64),
+            "Oracle DATE must not map to a date-only Arrow type: {mapped} discards the time-of-day"
+        );
+    }
+
+    #[test]
+    fn test_fixed_offset_to_nanos_in_range() {
+        use chrono::TimeZone;
+
+        let offset = FixedOffset::east_opt(3600).expect("valid offset");
+        let v = offset
+            .with_ymd_and_hms(2020, 1, 1, 12, 34, 56)
+            .single()
+            .expect("valid datetime");
+        let nanos = fixed_offset_to_nanos(v).expect("in-range timestamp should convert");
+        assert_eq!(
+            nanos,
+            v.with_timezone(&chrono::Utc)
+                .timestamp_nanos_opt()
+                .expect("chrono nanos")
+        );
+    }
+
+    #[test]
+    fn test_fixed_offset_to_nanos_overflow_errors_not_silent() {
+        use chrono::TimeZone;
+
+        // Year 2300 overflows i64 nanoseconds. Previously `unwrap_or_default()`
+        // silently returned 0 (epoch 1970-01-01), corrupting query results for
+        // Oracle `TIMESTAMP WITH TIME ZONE` values outside ~1677-2262.
+        let offset = FixedOffset::east_opt(3600).expect("valid offset");
+        let v = offset
+            .with_ymd_and_hms(2300, 6, 15, 12, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        let result = fixed_offset_to_nanos(v);
+
+        match result {
+            Err(super::super::Error::FailedToConvertNaiveDateTimeToNanos { v: offending }) => {
+                assert_eq!(
+                    offending.date().format("%Y").to_string(),
+                    "2300",
+                    "error should carry the offending value"
+                );
+            }
+            Err(other) => panic!("expected FailedToConvertNaiveDateTimeToNanos, got {other:?}"),
+            Ok(nanos) => panic!(
+                "expected error for year-2300 TIMESTAMP WITH TIME ZONE, but got \
+                 nanos={nanos} (this indicates the bug has regressed — \
+                 out-of-range timestamps are silently converting to epoch 0)"
+            ),
         }
     }
 }

@@ -1,9 +1,12 @@
 #!/usr/bin/expect -f
 
-# Runtime response timeout
-set timeout 30:
+source [file join [file dirname [info script]] repl_helpers.exp]
 
-spawn spice chat
+# How long the runtime may go silent before the script calls it stalled. This is
+# not a bound on how long a response may take — see repl_idle_timeout.
+set timeout [repl_idle_timeout]
+
+spawn spice chat {*}[repl_endpoint_args]
 
 proc verify_datasets_access {} {
     global timeout
@@ -12,7 +15,7 @@ proc verify_datasets_access {} {
     set gh_issues_available 0
     set catalog_page_available 0
 
-    send "What datasets you have access to\r"
+    repl_send "What datasets you have access to\r"
 
     expect {
         -re "(?i)taxi_trips|taxi trips" {
@@ -36,9 +39,18 @@ proc verify_datasets_access {} {
         "chat> " {
             # end of model response
         }
+        -re {[^\n]*\n} {
+            # Still streaming — restart the wait. Whole lines only, for the
+            # reason given in repl_helpers.exp. The dataset patterns above are
+            # tried first, so a name anywhere in the buffer still wins over
+            # this branch.
+            exp_continue
+        }
+        eof {
+            repl_died "Waiting for the list of datasets"
+        }
         timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
+            repl_stalled "Waiting for the list of datasets"
         }
     }
 
@@ -53,7 +65,7 @@ proc verify_datasets_access {} {
 proc verify_num_issues {} {
     global timeout
 
-    send "How many issues stored in database?\r"
+    repl_send "How many issues stored in database?\r"
 
     expect {
         " ERROR " {
@@ -65,9 +77,15 @@ proc verify_num_issues {} {
         "chat> " {
             # end of model response
         }
+        -re {[^\n]*\n} {
+            # Still streaming — restart the wait. See verify_datasets_access.
+            exp_continue
+        }
+        eof {
+            repl_died "Waiting for the issue count"
+        }
         timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
+            repl_stalled "Waiting for the issue count"
         }
     }
 
@@ -75,9 +93,7 @@ proc verify_num_issues {} {
 }
 
 proc verify_catalog_page {} {
-    global timeout
-
-    send "find top 3 exclusive deals in catalog pages\r"
+    repl_send "find top 3 exclusive deals in catalog pages. Respond with a short bullet list.\r"
 
     expect {
         " ERROR " {
@@ -89,16 +105,36 @@ proc verify_catalog_page {} {
         "chat> " {
             # end of model response
         }
+        -re {[^\n]*\n} {
+            # Still streaming — restart the wait. See verify_datasets_access.
+            exp_continue
+        }
+        eof {
+            repl_died "Waiting for the catalog page deals"
+        }
         timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
+            repl_stalled "Waiting for the catalog page deals"
         }
     }
 
     send_user "Model returned expected response\n"
 }
 
-expect "chat>"
+expect {
+    "chat>" {
+        # runtime is ready for input
+    }
+    -re {[^\n]*\n} {
+        # Banner and connection lines the CLI prints on its way to the prompt.
+        exp_continue
+    }
+    eof {
+        repl_died "Waiting for the initial chat prompt"
+    }
+    timeout {
+        repl_stalled "Waiting for the initial chat prompt"
+    }
+}
 
 verify_datasets_access
 sleep 1
@@ -108,7 +144,10 @@ sleep 1
 
 verify_catalog_page
 
+# Every verification passed, so the REPL must still be sitting at its prompt.
+repl_assert_running "Checking the chat REPL is still running"
+
 # Signal to exit (Ctrl+C)
-send \x03
+repl_send \x03
 
 exit 0

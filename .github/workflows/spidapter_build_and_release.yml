@@ -1,0 +1,115 @@
+name: Build spidapter binary and Docker Image
+
+on:
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'tools/spidapter/**'
+      - 'crates/test-framework/**'
+      - 'Cargo.lock'
+      - '.github/workflows/spidapter_build_and_release.yml'
+      - '.github/actions/build-spidapter/**'
+
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish Docker image to GHCR'
+        required: false
+        type: boolean
+        default: false
+      image_tag:
+        description: 'Docker image tag to apply in addition to the commit SHA (e.g. a branch name). Defaults to latest.'
+        required: false
+        type: string
+        default: latest
+
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build-binary:
+    name: Build spidapter
+    runs-on: spiceai-dev-runners
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spidapter
+        uses: ./.github/actions/build-spidapter
+        with:
+          install_to_system_path: 'false'
+          upload_artifact: 'true'
+          force_rebuild: 'true'
+          download_from_minio: 'true'
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Print version
+        run: ./target/release/spidapter --version
+
+  build-docker:
+    name: Build Docker image
+    needs: build-binary
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: spidapter-linux
+          path: ./build
+
+      - name: List artifacts
+        run: ls -lR ./build
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before building so the base image pull
+        # uses the authenticated rate limits instead of anonymous (per-IP) limits.
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Copy Dockerfile and scenarios to build context
+        run: |
+          cp tools/spidapter/Dockerfile ./build/Dockerfile
+          cp -r tools/spidapter/scenarios ./build/scenarios
+
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./build
+          file: ./build/Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/spidapter:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/spidapter:${{ github.event_name == 'workflow_dispatch' && github.event.inputs.image_tag || 'latest' }}
+          cache-from: type=gha,scope=spidapter
+          cache-to: type=gha,scope=spidapter,mode=max

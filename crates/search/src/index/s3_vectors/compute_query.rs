@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use data_components::s3_vectors::query_provider::ComputeQueryVector;
+use data_components::s3_vectors::compute_query::ComputeQueryVector;
 use llms::embeddings::Embed;
 use snafu::ResultExt;
 use std::sync::Arc;
@@ -29,13 +29,12 @@ impl ComputeQueryVector for EmbedQuery {
         &self,
         query: &str,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(vec) = self
+        let embeddings = self
             .0
             .embed(llms::embeddings::EmbeddingInput::String(query.to_string()))
             .await
-            .boxed()?
-            .pop()
-        else {
+            .boxed()?;
+        let Some(vec) = embeddings.first().cloned() else {
             return Err(Box::from(
                 "no embedding vector created for query".to_string(),
             ));

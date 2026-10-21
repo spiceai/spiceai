@@ -1,0 +1,76 @@
+---
+name: integration tests (management API)
+
+on:
+  # Manual dispatch only: the dev OAuth client behind SPICE_MANAGEMENT_CLIENT_ID_DEV is
+  # inactive, so a scheduled run fails in 'Authenticate with Spice Cloud dev API' before
+  # the suite runs (https://github.com/spiceai/spiceai/issues/12376). Restore the schedule
+  # once a manual dispatch is green; the `event_name == 'schedule'` branches below are
+  # kept so that is a one-line change:
+  #   schedule:
+  #     - cron: '0 2 * * *' # Daily at 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      update_snapshots:
+        description: 'Update the snapshots?'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'always'
+          - 'no'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+
+jobs:
+  test-management-api:
+    name: Test Management API Integration
+    runs-on: 'spiceai-macos'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Authenticate with Spice Cloud dev API
+        uses: ./.github/actions/management-login
+        with:
+          # The dev credentials that pair with SPICE_CLOUD_API_URL below.
+          # testoperator_run_cluster_bench.yml uses the _PROD pair the same way.
+          token-url: https://dev.spice.ai/api/oauth/token
+          client-id: ${{ secrets.SPICE_MANAGEMENT_CLIENT_ID_DEV }}
+          client-secret: ${{ secrets.SPICE_MANAGEMENT_CLIENT_SECRET_DEV }}
+          env-name: SPICE_SPICEAI_TOKEN
+
+      - name: Run management API integration tests
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          SPICE_CLOUD_API_URL: "https://dev-api.spice.ai"
+        run: |
+          if [ -z "$SPICE_SPICEAI_TOKEN" ] ; then
+            echo "Error: SPICE_SPICEAI_TOKEN is not set. Management login may have failed."
+            exit 1
+          fi
+          cargo test -p spice --test cloud_integration -- --test-threads=1
+
+      - name: Push snapshots to branch
+        if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
+        timeout-minutes: 10
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          title: 'fix: Update Management API integration test snapshots'

@@ -11,42 +11,69 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use async_openai::types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
-use async_stream::stream;
-use async_trait::async_trait;
-use futures::Stream;
-use nsql::SqlGeneration;
-use secrecy::SecretString;
-use serde::{Deserialize, Serialize};
-use snafu::{ResultExt, Snafu};
-use spicepod::component::model::ModelSource;
-use std::path::PathBuf;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::{path::Path, pin::Pin};
-use tracing_futures::Instrument;
 
-use async_openai::{
-    error::{ApiError, OpenAIError},
-    types::{
-        ChatChoice, ChatCompletionRequestAssistantMessage,
-        ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestDeveloperMessage,
-        ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestFunctionMessage,
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
-        ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
-        ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage,
-        ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
-        Role,
-    },
+// The contract lives in `chat-api`, below every provider; re-exported so existing
+// `llms::chat::…` paths resolve, including SNAFU's generated context selectors.
+pub use chat_api::*;
+#[cfg(feature = "local_llm")]
+use secrecy::SecretString;
+#[cfg(feature = "local_llm")]
+use snafu::ResultExt;
+use std::path::Path;
+#[cfg(any(feature = "local_llm", test))]
+use std::path::PathBuf;
+#[cfg(feature = "local_llm")]
+use std::str::FromStr;
+#[cfg(feature = "local_llm")]
+use std::sync::Arc;
+
+// Only `message_to_mistral` below still names these, and it is `local_llm`-gated: every
+// other user moved to `chat-api` with the `Chat` trait.
+#[cfg(feature = "local_llm")]
+use async_openai::types::chat::{
+    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
+    ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
+    ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestFunctionMessage,
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
+    ChatCompletionRequestUserMessageContent, ReasoningEffort,
 };
 
 #[cfg(feature = "llama_cpp")]
 pub mod llama_cpp;
+#[cfg(feature = "local_llm")]
 pub mod mistral;
 pub mod nsql;
-use crate::streaming_utils::generate_stream_id;
+#[cfg(feature = "local_llm")]
+use crate::chat::distributed::configure_ring_distributed;
+#[cfg(feature = "local_llm")]
+pub use crate::chat::distributed::{DistributedBackend, DistributedConfig};
+#[cfg(feature = "local_llm")]
 use indexmap::IndexMap;
+#[cfg(feature = "local_llm")]
 use mistralrs::MessageContent;
+
+// Distributed inference only matters for local mistral.rs models, so the module
+// (and its `configure_ring_distributed` helper) is gated on `local_llm` to avoid
+// dead-code in `--no-default-features` / feature-matrix builds.
+#[cfg(feature = "local_llm")]
+pub mod distributed;
+
+// The attention-implementation knob is plain config with no engine dependency, so it
+// stays ungated: the model parameter spec compiles unconditionally and shares its
+// accepted values.
+mod paged_attention;
+pub use crate::chat::paged_attention::PagedAttentionMode;
+
+// Whether pickle-format weights are trusted is plain config with no engine
+// dependency, so it stays ungated alongside `paged_attention` above.
+mod pickle_trust;
+pub use crate::chat::pickle_trust::PickleTrust;
+
+// The `distributed_backend` setting itself is plain config; kept ungated and
+// separate from the `local_llm`-gated `distributed` module above.
+mod distributed_backend_setting;
+pub use crate::chat::distributed_backend_setting::DistributedBackendSetting;
 
 static WEIGHTS_EXTENSIONS: [&str; 7] = [
     ".safetensors",
@@ -57,123 +84,6 @@ static WEIGHTS_EXTENSIONS: [&str; 7] = [
     ".gguf",
     ".ggml",
 ];
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum LlmRuntime {
-    Candle,
-    Mistral,
-    Openai,
-}
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display(
-        "Failed to check the status of the model. An error occurred: {source} Verify the model configuration."
-    ))]
-    HealthCheckError {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Failed to run the model. An error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
-    FailedToRunModel {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Failed to find the Local model at '{expected_path}'. Verify the model exists, and try again."
-    ))]
-    LocalModelNotFound { expected_path: String },
-
-    #[snafu(display(
-        "Failed to find the Local model config at '{expected_path}'. Verify the model config exists, and try again."
-    ))]
-    LocalModelConfigNotFound { expected_path: String },
-
-    #[snafu(display(
-        "Failed to find the Local tokenizer at '{expected_path}'. Verify the tokenizer exists, and try again."
-    ))]
-    LocalTokenizerNotFound { expected_path: String },
-
-    #[snafu(display(
-        "Failed to load the model. An error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
-    FailedToLoadModel {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Unsupported value for `model_type` parameter. {source}  Verify the `model_type` parameter, and try again"
-    ))]
-    UnsupportedModelType {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "The specified model identifier '{model}' is not valid for the source '{model_source}'. Verify the model exists, and try again."
-    ))]
-    ModelNotFound { model: String, model_source: String },
-
-    #[snafu(display(
-        "A model identifier must be provided for source '{model_source}' via `from: {model_source}:<model_id>`"
-    ))]
-    ModelNotProvided { model_source: String },
-
-    #[snafu(display(
-        "Failed to load model tokenizer. An error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
-    FailedToLoadTokenizer {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "An unsupported model source was specified in the 'from' parameter: '{from}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models"
-    ))]
-    UnknownModelSource { from: String },
-
-    #[snafu(display(
-        "The specified model, '{from}', does not support executing the task '{task}'. Select a different model or task, and try again."
-    ))]
-    UnsupportedTaskForModel { from: String, task: String },
-
-    #[snafu(display("Invalid value for parameter {param}. {message}"))]
-    InvalidParamValueError { param: String, message: String },
-
-    #[snafu(display("Expected `param.{param_key}`, but it was not provided"))]
-    MissingParamError { param_key: &'static str },
-
-    #[snafu(display(
-        "Failed to find weights for the model. Expected tensors with a file extension of: {extensions}. Verify the model is correctly configured, and try again."
-    ))]
-    ModelMissingWeights { extensions: String },
-
-    #[snafu(display(
-        "Failed to load a file specified for the model. Could not find the file: {file_url}. Verify the `files` parameters for the model, and try again."
-    ))]
-    ModelFileMissing { file_url: String },
-
-    #[snafu(display(
-        "Invalid parameters for model '{model}': {source} Verify the model parameters, and try again."
-    ))]
-    ModelParameterFailed {
-        model: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Model '{from}' does not support the OpenAI Responses API. Change the model provider to 'openai' to use the Responses API or use the Chat Completions API."
-    ))]
-    ResponsesNotSupported { from: ModelSource },
-
-    #[snafu(display(
-        "The tool '{tool}' was not found. Verify the Spicepod configuration, and view the tools documentation at https://spiceai.org/docs/components/tools"
-    ))]
-    ToolNotFound { tool: String },
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Attempts to string match a model error to a known error type.
 /// Returns None if no match is found.
@@ -219,113 +129,15 @@ pub fn try_map_boxed_error_to_box(
     try_map_boxed_error(&*e).map_or_else(|| e, std::convert::Into::into)
 }
 
-/// Convert a structured [`ChatCompletionRequestMessage`] to a basic string. Useful for basic
-/// [`Chat::run`] but reduces optional configuration provided by callers.
-#[must_use]
-pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
-    match message {
-        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-            content, ..
-        }) => match content {
-            ChatCompletionRequestUserMessageContent::Text(text) => text.clone(),
-            ChatCompletionRequestUserMessageContent::Array(array) => {
-                let x: Vec<_> = array
-                    .iter()
-                    .map(|p| match p {
-                        async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => {
-                            t.text.clone()
-                        }
-                        async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(
-                            i,
-                        ) => i.image_url.url.clone(),
-                        async_openai::types::ChatCompletionRequestUserMessageContentPart::InputAudio(
-                            a
-                        ) => a.input_audio.data.clone(),
-                    })
-                    .collect();
-                x.join("\n")
-            }
-        },
-        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content,
-            ..
-        }) => match content {
-            async_openai::types::ChatCompletionRequestSystemMessageContent::Text(t) => t.clone(),
-            async_openai::types::ChatCompletionRequestSystemMessageContent::Array(parts) => {
-                let x: Vec<_> = parts
-                    .iter()
-                    .map(|p| match p {
-                        async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
-                            t.text.clone()
-                        }
-                    })
-                    .collect();
-                x.join("\n")
-            }
-        },
-        ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
-            content, ..
-        }) => match content {
-            async_openai::types::ChatCompletionRequestToolMessageContent::Text(t) => t.clone(),
-            async_openai::types::ChatCompletionRequestToolMessageContent::Array(parts) => {
-                let x: Vec<_> = parts
-                    .iter()
-                    .map(|p| match p {
-                        async_openai::types::ChatCompletionRequestToolMessageContentPart::Text(
-                            t,
-                        ) => t.text.clone(),
-                    })
-                    .collect();
-                x.join("\n")
-            }
-        }
-        .clone(),
-        ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-            content,
-            ..
-        }) => match content {
-            Some(ChatCompletionRequestAssistantMessageContent::Text(s)) => s.clone(),
-            Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => {
-                let x: Vec<_> = parts
-                        .iter()
-                        .map(|p| match p {
-                            async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
-                                t.text.clone()
-                            }
-                            async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
-                                i.refusal.clone()
-                            }
-                        })
-                        .collect();
-                x.join("\n")
-            }
-            None => todo!(),
-        },
-        ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
-            content,
-            ..
-        }) => content.clone().unwrap_or_default(),
-        ChatCompletionRequestMessage::Developer(ChatCompletionRequestDeveloperMessage {
-            content,
-            ..
-        }) => match content {
-            ChatCompletionRequestDeveloperMessageContent::Text(t) => t.clone(),
-            ChatCompletionRequestDeveloperMessageContent::Array(parts) => {
-                let x: Vec<_> = parts.iter().map(|p| p.text.clone()).collect();
-                x.join("\n")
-            }
-        },
-    }
-}
-
 /// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequestMessage`] type.
+#[cfg(feature = "local_llm")]
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn message_to_mistral(
     message: &ChatCompletionRequestMessage,
 ) -> IndexMap<String, MessageContent> {
-    use async_openai::types::{
-        ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageContent,
+    use async_openai::types::chat::{
+        ChatCompletionMessageToolCalls, ChatCompletionRequestSystemMessageContent,
+        ChatCompletionRequestToolMessageContent,
     };
     use either::Either;
     use serde_json::{Value, json};
@@ -339,21 +151,23 @@ pub fn message_to_mistral(
                     either::Either::Left(text.clone())
                 }
                 ChatCompletionRequestUserMessageContent::Array(array) => {
-                    let v = array.iter().map(|p| {
+                    let index_map = array.iter().map(|p| {
                         match p {
-                            async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::Text(t) => {
                                 ("content".to_string(), Value::String(t.text.clone()))
                             }
-                            async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
                                 ("image_url".to_string(), Value::String(i.image_url.url.clone()))
                             }
-                            async_openai::types::ChatCompletionRequestUserMessageContentPart::InputAudio(a) => {
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::InputAudio(a) => {
                                 ("input_audio".to_string(), Value::String(a.input_audio.data.clone()))
+                            }
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::File(f) => {
+                                ("file".to_string(), serde_json::to_value(&f.file).unwrap_or_default())
                             }
                         }
 
-                    }).collect::<Vec<_>>();
-                    let index_map: IndexMap<String, Value> = v.into_iter().collect();
+                    }).collect();
                     either::Either::Right(vec![index_map])
                 }
             };
@@ -377,7 +191,13 @@ pub fn message_to_mistral(
             ..
         }) => {
             // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-            let content_json = parts.iter().map(|p| p.text.clone()).collect::<Vec<_>>();
+            let content_json = parts
+                .iter()
+                .map(|p| {
+                    let ChatCompletionRequestDeveloperMessageContentPart::Text(t) = p;
+                    t.text.clone()
+                })
+                .collect::<Vec<_>>();
             IndexMap::from([
                 (
                     String::from("role"),
@@ -404,7 +224,7 @@ pub fn message_to_mistral(
             let content_json = parts
                 .iter()
                 .map(|p| match p {
-                    async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
+                    async_openai::types::chat::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
                         ("text".to_string(), t.text.clone())
                     }
                 })
@@ -436,7 +256,7 @@ pub fn message_to_mistral(
             let content_json = parts
                 .iter()
                 .map(|p| match p {
-                    async_openai::types::ChatCompletionRequestToolMessageContentPart::Text(t) => {
+                    async_openai::types::chat::ChatCompletionRequestToolMessageContentPart::Text(t) => {
                         ("text".to_string(), t.text.clone())
                     }
                 })
@@ -471,10 +291,10 @@ pub fn message_to_mistral(
                 Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => {
                     // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
                     let content_json= parts.iter().map(|p| match p {
-                        async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
+                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
                             ("text".to_string(), t.text.clone())
                         }
-                        async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
+                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
                             ("refusal".to_string(), i.refusal.clone())
                         }
                     }).collect::<Vec<_>>();
@@ -495,13 +315,16 @@ pub fn message_to_mistral(
                 let tool_call_results: Vec<IndexMap<String, Value>> = tool_calls
                     .iter()
                     .filter_map(|t| {
-                        let Ok(function) = serde_json::to_value(&t.function) else {
-                            tracing::warn!("Invalid function call: {:#?}", t.function);
+                        let ChatCompletionMessageToolCalls::Function(func_call) = t else {
+                            return None;
+                        };
+                        let Ok(function) = serde_json::to_value(&func_call.function) else {
+                            tracing::warn!("Invalid function call: {:#?}", func_call.function);
                             return None;
                         };
 
                         let mut map = IndexMap::new();
-                        map.insert("id".to_string(), Value::String(t.id.to_string()));
+                        map.insert("id".to_string(), Value::String(func_call.id.clone()));
                         map.insert("function".to_string(), function);
                         map.insert("type".to_string(), Value::String("function".to_string()));
 
@@ -520,163 +343,10 @@ pub fn message_to_mistral(
             (String::from("role"), Either::Left(String::from("function"))),
             (
                 "content".to_string(),
-                Either::Left(content.clone().unwrap_or_default().clone()),
+                Either::Left(content.clone().unwrap_or_default()),
             ),
             ("name".to_string(), Either::Left(name.clone())),
         ]),
-    }
-}
-
-#[async_trait]
-pub trait Chat: Sync + Send {
-    fn as_sql(&self) -> Option<&dyn SqlGeneration>;
-    async fn run(&self, prompt: String) -> Result<Option<String>> {
-        // BUG FIX: Remove double .instrument(Span::current()) calls that break span propagation
-        // The outer .instrument is redundant and interferes with parent span context
-        self.chat_request(
-            CreateChatCompletionRequestArgs::default()
-                .messages(vec![
-                    ChatCompletionRequestUserMessageArgs::default()
-                        .content(prompt)
-                        .build()
-                        .map_err(|e| Error::FailedToRunModel {
-                            source: Box::new(e),
-                        })?
-                        .into(),
-                ])
-                .build()
-                .map_err(|e| Error::FailedToRunModel {
-                    source: Box::new(e),
-                })?,
-        )
-        .await
-        .map_err(|e| Error::FailedToRunModel {
-            source: Box::new(e),
-        })
-        .map(|resp| {
-            resp.choices
-                .into_iter()
-                .next()
-                .and_then(|c| c.message.content)
-        })
-    }
-
-    /// A basic health check to ensure the model can process future [`Self::run`]
-    /// requests. Default implementation is a basic call to [`Self::run`].
-    async fn health(&self) -> Result<()> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
-
-        if let Err(e) = self
-            .chat_request(CreateChatCompletionRequest {
-                // Cannot be set too low. Some providers will error if it cannot complete in < `max_completion_tokens`.
-                max_completion_tokens: Some(100),
-                messages: vec![ChatCompletionRequestMessage::User(
-                    ChatCompletionRequestUserMessage {
-                        name: None,
-                        content: ChatCompletionRequestUserMessageContent::Text("ping.".to_string()),
-                    },
-                )],
-                ..Default::default()
-            })
-            .instrument(span.clone())
-            .await
-        {
-            tracing::error!(target: "task_history", parent: &span, "{e}");
-            return Err(Error::HealthCheckError {
-                source: Box::new(e),
-            });
-        }
-        Ok(())
-    }
-
-    async fn stream<'a>(
-        &self,
-        prompt: String,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
-        let resp = self.run(prompt).await;
-        Ok(Box::pin(stream! { yield resp }))
-    }
-
-    #[allow(deprecated)]
-    async fn chat_stream(
-        &self,
-        req: CreateChatCompletionRequest,
-    ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let model_id = req.model.clone();
-        let prompt = req
-            .messages
-            .iter()
-            .map(message_to_content)
-            .collect::<Vec<String>>()
-            .join("\n");
-
-        // BUG FIX: The stream() call should inherit the current span context automatically
-        // No need to explicitly instrument here as it interferes with parent span propagation
-        let stream = self.stream(prompt).await.map_err(|e| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })?;
-
-        Ok(crate::streaming_utils::string_stream_to_chat_stream(
-            model_id, stream,
-        ))
-    }
-
-    /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
-    /// implementation will be constructed based on the trait's [`run`] method.
-    #[allow(deprecated)]
-    async fn chat_request(
-        &self,
-        req: CreateChatCompletionRequest,
-    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let model_id = req.model.clone();
-        let prompt = req
-            .messages
-            .iter()
-            .map(message_to_content)
-            .collect::<Vec<String>>()
-            .join("\n");
-
-        // BUG FIX: The run() call should inherit the current span context automatically
-        // No need to explicitly instrument here as it interferes with parent span propagation
-        let choices: Vec<ChatChoice> = match self.run(prompt).await.map_err(|e| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })? {
-            Some(resp) => vec![ChatChoice {
-                message: ChatCompletionResponseMessage {
-                    content: Some(resp),
-                    tool_calls: None,
-                    role: Role::System,
-                    audio: None,
-                    function_call: None,
-                    refusal: None,
-                },
-                index: 0,
-                finish_reason: None,
-                logprobs: None,
-            }],
-            None => vec![],
-        };
-
-        Ok(CreateChatCompletionResponse {
-            id: generate_stream_id(&model_id),
-            choices,
-            model: model_id,
-            created: 0,
-            system_fingerprint: None,
-            object: "list".to_string(),
-            usage: None,
-            service_tier: None,
-        })
     }
 }
 
@@ -687,26 +357,111 @@ pub trait Chat: Sync + Send {
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
 /// `from_gguf` is a path to a GGUF file within the huggingface model repo. If provided, the model will be loaded from this GGUF. This is useful for loading quantized models.
 /// `hf_token_literal` is a literal string of the Huggingface API token. If not provided, the token will be read from the HF token cache (i.e. `~/.cache/huggingface/token` or set via `HF_TOKEN_PATH`).
+/// `distributed` optionally runs the model tensor-parallel across multiple nodes.
+/// `reasoning` names the model and its `reasoning_effort` default for the load-time check.
+#[cfg(feature = "local_llm")]
 pub async fn create_hf_model(
     model_id: &str,
     model_type: Option<&str>,
     from_gguf: Option<PathBuf>,
     hf_token_literal: Option<&SecretString>,
+    chat_template_literal: Option<&str>,
+    distributed: Option<DistributedConfig>,
+    reasoning: ReasoningDefault<'_>,
 ) -> Result<Arc<dyn Chat>> {
-    mistral::MistralLlama::from_hf(model_id, model_type, hf_token_literal, from_gguf)
-        .await
-        .map(|x| Arc::new(x) as Arc<dyn Chat>)
+    // Configure multi-node distributed (ring) inference before loading: the
+    // loader reads `RING_CONFIG` from the environment while building the
+    // pipeline. The returned guard keeps the temp file alive for the model.
+    let ring_config = if let Some(cfg) = distributed {
+        Some(configure_ring_distributed(&cfg)?)
+    } else {
+        // Defensive: clear any `RING_CONFIG` left set by a prior distributed
+        // load in this process, so this single-node load can't accidentally
+        // run distributed.
+        // SAFETY: touched only during model init, before mistral.rs reads it.
+        unsafe { std::env::remove_var("RING_CONFIG") };
+        None
+    };
+    mistral::MistralLlama::from_hf(
+        model_id,
+        model_type,
+        hf_token_literal,
+        from_gguf,
+        chat_template_literal,
+        ring_config,
+        reasoning,
+    )
+    .await
+    .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }
 
-#[allow(unused_variables)]
+/// Knobs pushed into the loader for a locally served model. Grouped so that adding one is
+/// a field rather than another positional argument on two signatures and every call site —
+/// and so a caller cannot transpose two of the several optional arguments and still
+/// type-check. Multi-node topology is deliberately not here: it is a side effect applied
+/// before the loader runs, not something the loader reads.
+#[cfg(feature = "local_llm")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LocalModelOptions<'a> {
+    /// Overrides the chat template; ignored for GGUF when the file carries its own.
+    pub chat_template_literal: Option<&'a str>,
+    /// Sequence-length budget for layer placement and KV-cache sizing.
+    pub context_length: Option<usize>,
+    /// Attention implementation to request from the engine.
+    pub paged_attention: PagedAttentionMode,
+    /// The model's name and `reasoning_effort` default, checked against its chat template.
+    pub reasoning: ReasoningDefault<'a>,
+}
+
+/// A local model's Spicepod name and its `reasoning_effort` default. The loader checks the
+/// default against the model's chat template, so a default the template can't honor fails
+/// the load instead of every request. The name is what the refusal names.
+#[cfg(feature = "local_llm")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReasoningDefault<'a> {
+    pub model_name: &'a str,
+    pub effort: Option<&'a ReasoningEffort>,
+}
+
+#[cfg(feature = "local_llm")]
 pub async fn create_local_model(
     model_weights: &[String],
     config: Option<&str>,
     tokenizer: Option<&str>,
     tokenizer_config: Option<&str>,
     generation_config: Option<&str>,
-    chat_template_literal: Option<&str>,
+    distributed: Option<DistributedConfig>,
+    options: LocalModelOptions<'_>,
 ) -> Result<Arc<dyn Chat>> {
+    // A single-node GGUF model is served by llama.cpp when it is linked in; a ring model
+    // stays on mistral.rs, whose tensor-parallel backend llama.cpp has no counterpart for.
+    #[cfg(feature = "llama_cpp")]
+    if distributed.is_none()
+        && !model_weights.is_empty()
+        && model_weights.iter().all(|w| {
+            Path::new(w)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        })
+    {
+        let weights = model_weights.iter().map(PathBuf::from).collect::<Vec<_>>();
+        return llama_cpp::LlamaCpp::from(&weights, options)
+            .await
+            .map(|x| Arc::new(x) as Arc<dyn Chat>);
+    }
+    // Configure multi-node distributed (ring) inference before loading: the
+    // loader reads `RING_CONFIG` from the environment while building the
+    // pipeline. The returned guard keeps the temp file alive for the model.
+    let ring_config = if let Some(cfg) = distributed {
+        Some(configure_ring_distributed(&cfg)?)
+    } else {
+        // Defensive: clear any `RING_CONFIG` left set by a prior distributed
+        // load in this process, so this single-node load can't accidentally
+        // run distributed.
+        // SAFETY: touched only during model init, before mistral.rs reads it.
+        unsafe { std::env::remove_var("RING_CONFIG") };
+        None
+    };
     mistral::MistralLlama::from(
         model_weights
             .iter()
@@ -719,37 +474,97 @@ pub async fn create_local_model(
         tokenizer.map(Path::new),
         tokenizer_config.map(Path::new),
         generation_config.map(Path::new),
-        chat_template_literal,
+        options,
+        ring_config,
     )
     .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }
 
-/// Create a llama.cpp model from `HuggingFace`
-/// This requires the `llama_cpp` feature to be enabled.
-#[cfg(feature = "llama_cpp")]
-pub async fn create_hf_model_llama_cpp(
-    model_id: &str,
-    from_gguf: Option<PathBuf>,
-    hf_token_literal: Option<&SecretString>,
-) -> Result<Arc<dyn Chat>> {
-    llama_cpp::LlamaCpp::from_hf(model_id, hf_token_literal, from_gguf)
-        .await
-        .map(|x| Arc::new(x) as Arc<dyn Chat>)
+/// File extensions that are conventionally Python pickle by `PyTorch`'s
+/// ecosystem and that are unsafe to load from any source the operator
+/// does not fully trust. Pickle deserialization is RCE by design.
+const PICKLE_WEIGHT_EXTENSIONS: &[&str] = &["bin", "pt", "pth", "ckpt"];
+
+/// Reject any weight path whose extension lands in [`PICKLE_WEIGHT_EXTENSIONS`]
+/// unless the caller has explicitly opted in via `trust_pickle = true`.
+///
+/// `weights` is expected to be the same slice of paths that will be handed
+/// to the model loader. Returns [`Error::UnsafePickleWeight`] on the first
+/// match, so the message identifies the offending file.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsafePickleWeight`] when `trust_pickle` is `false`
+/// and any path has a pickle-class extension.
+pub fn reject_unsafe_weight_formats<P: AsRef<Path>>(
+    weights: &[P],
+    trust_pickle: bool,
+) -> Result<()> {
+    if trust_pickle {
+        return Ok(());
+    }
+    for w in weights {
+        let path = w.as_ref();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let ext = ext.to_ascii_lowercase();
+            if PICKLE_WEIGHT_EXTENSIONS.contains(&ext.as_str()) {
+                return Err(Error::UnsafePickleWeight {
+                    path: path.to_string_lossy().into_owned(),
+                    extension: ext,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
-/// Create a llama.cpp model from local files
-/// This requires the `llama_cpp` feature to be enabled.
-#[cfg(feature = "llama_cpp")]
-pub async fn create_local_model_llama_cpp(model_weights: &[String]) -> Result<Arc<dyn Chat>> {
-    let paths: Vec<PathBuf> = model_weights
-        .iter()
-        .map(|p| PathBuf::from_str(p))
-        .collect::<Result<Vec<_>, _>>()
-        .boxed()
-        .map_err(|e| Error::FailedToLoadModel { source: e })?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    llama_cpp::LlamaCpp::from(&paths)
-        .await
-        .map(|x| Arc::new(x) as Arc<dyn Chat>)
+    #[test]
+    fn rejects_pickle_extensions_by_default() {
+        for ext in PICKLE_WEIGHT_EXTENSIONS {
+            let path = PathBuf::from(format!("/models/pytorch_model.{ext}"));
+            let err = reject_unsafe_weight_formats(&[path], false)
+                .expect_err(&format!("expected rejection for .{ext}"));
+            assert!(matches!(err, Error::UnsafePickleWeight { .. }));
+        }
+    }
+
+    #[test]
+    fn allows_safe_extensions() {
+        for ext in ["safetensors", "gguf", "ggml", "onnx"] {
+            let path = PathBuf::from(format!("/models/weights.{ext}"));
+            reject_unsafe_weight_formats(&[path], false)
+                .unwrap_or_else(|e| panic!("expected ok for .{ext}, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn opt_in_allows_pickle_extensions() {
+        let paths = [
+            PathBuf::from("/m/a.pt"),
+            PathBuf::from("/m/pytorch_model.bin"),
+        ];
+        reject_unsafe_weight_formats(&paths, true).expect("opt-in should allow pickle");
+    }
+
+    #[test]
+    fn extension_check_is_case_insensitive() {
+        let path = PathBuf::from("/m/Pytorch_Model.PT");
+        let err = reject_unsafe_weight_formats(&[path], false)
+            .expect_err("case-insensitive .PT must be rejected");
+        match err {
+            Error::UnsafePickleWeight { extension, .. } => assert_eq!(extension, "pt"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extensionless_path_is_ignored() {
+        let path = PathBuf::from("/m/no_extension_here");
+        reject_unsafe_weight_formats(&[path], false).expect("no extension → no rejection");
+    }
 }

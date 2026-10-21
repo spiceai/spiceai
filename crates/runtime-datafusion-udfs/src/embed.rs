@@ -20,7 +20,7 @@ use arrow::array::Array;
 use arrow::array::{ListBuilder, PrimitiveBuilder};
 use arrow::datatypes::Float32Type;
 use arrow_schema::{DataType, Field};
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::cast::{as_large_string_array, as_list_array, as_string_array};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{DocSection, Documentation, ScalarFunctionArgs};
@@ -29,12 +29,12 @@ use datafusion::{
     common::{Result as DataFusionResult, exec_err},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility},
 };
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
 
-pub static EMBED_UDF_NAME: &str = "embed";
+pub use crate::EMBED_UDF_NAME;
+runtime_udfs_api::register_spice_function!(EMBED_SPICE_FUNCTION, EMBED_UDF_NAME);
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
     doc_section: DocSection::default(),
     description: "Generates embeddings for text using a specified embedding model".to_string(),
@@ -118,17 +118,22 @@ impl Embed {
         let embedding = model
             .embed_sync(EmbeddingInput::String(sentence.to_owned()))
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let vector_size = match embedding.first() {
-            Some(embedding) => embedding.len(),
-            _ => unreachable!("Should have at least one embedding"),
-        };
+
+        let first_embedding = embedding.first().ok_or_else(|| {
+            DataFusionError::Execution(
+                "Embedding model returned empty result for input text (contract violation)"
+                    .to_string(),
+            )
+        })?;
+
+        let vector_size = first_embedding.len();
 
         let mut builder = ListBuilder::with_capacity(
             PrimitiveBuilder::<Float32Type>::with_capacity(vector_size),
             1,
         );
 
-        builder.values().append_slice(&embedding[0]);
+        builder.values().append_slice(first_embedding);
         builder.append(true);
 
         Ok(ColumnarValue::Array(Arc::new(builder.finish())))
@@ -138,19 +143,56 @@ impl Embed {
         model: &dyn llms::embeddings::Embed,
         sentences: impl Iterator<Item = Option<&'a str>>,
     ) -> DataFusionResult<ColumnarValue> {
-        let mut builder =
-            ListBuilder::new(ListBuilder::new(PrimitiveBuilder::<Float32Type>::new()));
+        let (lower, _) = sentences.size_hint();
+        let mut is_valid = Vec::with_capacity(lower);
+        let mut texts = Vec::with_capacity(lower);
 
         for maybe_string in sentences {
-            let embedded = match maybe_string {
-                Some(s) => model
-                    .embed_sync(EmbeddingInput::String(s.to_string()))
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
-                None => vec![vec![]],
-            };
+            match maybe_string {
+                Some(s) => {
+                    is_valid.push(true);
+                    texts.push(s.to_owned());
+                }
+                None => is_valid.push(false),
+            }
+        }
 
-            builder.values().values().append_slice(&embedded[0]);
-            builder.values().append(!embedded[0].is_empty());
+        // `embed_sync` yields the cache's shared handle; the empty case matches
+        // that shape rather than forcing the result back into an owned `Vec`.
+        let embeddings: Arc<Vec<Vec<f32>>> = if texts.is_empty() {
+            Arc::new(Vec::new())
+        } else {
+            model
+                .embed_sync(EmbeddingInput::StringArray(texts))
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        };
+
+        let non_null_count = is_valid.iter().filter(|&&v| v).count();
+        if embeddings.len() != non_null_count {
+            return Err(DataFusionError::Execution(format!(
+                "Embedding model returned {} vectors for {non_null_count} non-null inputs (contract violation)",
+                embeddings.len(),
+            )));
+        }
+
+        let vector_size = embeddings.first().map_or(0, Vec::len);
+        let mut builder = ListBuilder::with_capacity(
+            ListBuilder::with_capacity(
+                PrimitiveBuilder::<Float32Type>::with_capacity(vector_size * non_null_count),
+                is_valid.len(),
+            ),
+            1,
+        );
+
+        let mut emb_idx = 0;
+        for valid in is_valid {
+            if valid {
+                builder.values().values().append_slice(&embeddings[emb_idx]);
+                builder.values().append(true);
+                emb_idx += 1;
+            } else {
+                builder.values().append(false);
+            }
         }
 
         builder.append(true);
@@ -160,10 +202,6 @@ impl Embed {
 }
 
 impl ScalarUDFImpl for Embed {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         EMBED_UDF_NAME
     }
@@ -218,11 +256,16 @@ impl ScalarUDFImpl for Embed {
                 let ColumnarValue::Array(embeddings) =
                     Self::embed_multiple(&**model, string_array_iter!(arr))?
                 else {
-                    unreachable!("Should retrieve embedding list")
+                    unreachable!(
+                        "{EMBED_UDF_NAME}: embed_multiple must return ColumnarValue::Array by contract"
+                    );
                 };
 
                 // Unpack the inner list (i.e. as used for single row, multiple input below)
                 let list_array = as_list_array(&*embeddings)?;
+                if list_array.is_empty() {
+                    return exec_err!("{EMBED_UDF_NAME}: embedding result array is empty");
+                }
                 Ok(ColumnarValue::Array(Arc::new(list_array.value(0))))
             }
             // A single text value
@@ -231,14 +274,23 @@ impl ScalarUDFImpl for Embed {
             ) => Self::embed_single(&**model, text),
             // Various combinations of single row/multiple input
             ColumnarValue::Scalar(ScalarValue::LargeList(arr)) => {
+                if arr.is_empty() {
+                    return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
+                }
                 let inner_array = arr.value(0);
                 Self::embed_multiple(&**model, string_array_iter!(&inner_array))
             }
             ColumnarValue::Scalar(ScalarValue::List(arr)) => {
+                if arr.is_empty() {
+                    return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
+                }
                 let inner_array = arr.value(0);
                 Self::embed_multiple(&**model, string_array_iter!(&inner_array))
             }
             ColumnarValue::Scalar(ScalarValue::FixedSizeList(arr)) => {
+                if arr.is_empty() {
+                    return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
+                }
                 let inner_array = arr.value(0);
                 Self::embed_multiple(&**model, string_array_iter!(&inner_array))
             }

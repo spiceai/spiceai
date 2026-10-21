@@ -1,729 +1,297 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
+
      https://www.apache.org/licenses/LICENSE-2.0
+
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-#![allow(clippy::missing_errors_doc)]
 
-use super::{Chat, Error as ChatError, Result, nsql::SqlGeneration};
+//! Serves a single-node GGUF model with llama.cpp.
+//!
+//! The prompt is the one the mistral.rs engine would send: the same messages
+//! ([`message_to_mistral`]) rendered by the same chat-template code
+//! ([`apply_chat_template_to`]), with `reasoning_effort` checked by the same
+//! [`ReasoningSupport`]. llama.cpp only runs the forward passes and samples.
+//!
+//! One thread owns the backend, the model and its context. Requests wait on a channel and
+//! run one at a time from an empty KV cache, and their tokens stream back over a Tokio
+//! channel, so a forward pass never blocks an async worker.
+
+use std::{
+    num::NonZeroU32,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+        mpsc as std_mpsc,
+    },
+    thread,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
-        ChatChoice, ChatCompletionResponseMessage, ChatCompletionResponseStream, CompletionUsage,
-        CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, Role,
+    types::chat::{
+        ChatChoice, ChatChoiceStream, ChatCompletionRequestMessage, ChatCompletionResponseMessage,
+        ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, CompletionUsage,
+        CreateChatCompletionRequest, CreateChatCompletionResponse,
+        CreateChatCompletionStreamResponse, FinishReason, Role, StopConfiguration,
     },
 };
 use async_trait::async_trait;
+use either::Either;
 use futures::Stream;
+use indexmap::IndexMap;
 use llama_cpp_2::{
-    LogOptions,
-    context::params::LlamaContextParams,
+    context::{
+        LlamaContext,
+        params::{LlamaContextParams, LlamaContextType},
+    },
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::params::LlamaModelParams,
-    model::{AddBos, LlamaModel, Special},
+    model::{LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
-    send_logs_to_tracing,
+    speculative::{MtpSpeculative, MtpSpeculativeParams},
+    token::LlamaToken,
 };
-use secrecy::SecretString;
-use std::{
-    fmt::Write,
-    path::{Path, PathBuf},
-    pin::Pin,
-    sync::{Arc, OnceLock},
-    time::SystemTime,
+use mistralrs_core::{
+    ChatTemplateValue, MessageContent, ReasoningEffort as TemplateReasoningEffort,
+    apply_chat_template_to,
 };
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::{mpsc, oneshot};
 
+use super::mistral::{ReasoningControls, ReasoningSupport, opens_reasoning, reasoning_controls};
+use super::{Chat, Error as ChatError, LocalModelOptions, Result, message_to_mistral, nsql::SqlGeneration};
 use crate::streaming_utils::generate_stream_id;
 
-/// Type alias for streaming result
-type StreamResult = Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>;
+/// Tokens decoded per forward pass while reading the prompt.
+const PROMPT_BATCH: usize = 512;
 
-/// Initialize llama.cpp logging once globally.
-///
-/// By default, llama.cpp/ggml logs are filtered out (via `OFF_FILTERS` in bin/spiced/src/tracing.rs).
-/// To enable llama.cpp logs, set the `SPICED_LOG` or `RUST_LOG` environment variable to include
-/// `llama_cpp_2`, `llama.cpp`, or `ggml`. For example:
-/// - `SPICED_LOG=llama_cpp_2=debug` - Enable debug logs from llama-cpp-2 bindings
-/// - `SPICED_LOG=llama.cpp=info` - Enable info logs from llama.cpp library
-/// - `SPICED_LOG=ggml=trace` - Enable trace logs from ggml library
-fn init_llama_logging() {
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        // Check if verbose logging is enabled via SPICED_LOG or RUST_LOG
-        let verbose = std::env::var("SPICED_LOG")
-            .or_else(|_| std::env::var("RUST_LOG"))
-            .map(|log_config| {
-                // Enable llama.cpp logs if llama_cpp_2 is explicitly enabled in the log config
-                log_config.contains("llama_cpp_2")
-                    || log_config.contains("llama.cpp")
-                    || log_config.contains("ggml")
-            })
-            .unwrap_or(false);
+/// The context size when the model sets no `context_length`.
+const DEFAULT_CONTEXT: u32 = 8192;
 
-        // Send logs to tracing, but they'll be filtered by OFF_FILTERS unless explicitly enabled
-        send_logs_to_tracing(LogOptions::default().with_logs_enabled(verbose));
-    });
-}
+/// Draft tokens an MTP head proposes per step. Two measured fastest for Qwen3.8-Flash-Next
+/// on a DGX Spark (53.7 tok/s against 47.5 without a draft, and 42.4 with three).
+const MTP_DRAFT: i32 = 2;
 
-/// Sampling parameters for llama.cpp inference
-#[derive(Debug, Clone)]
-struct SamplingParams {
-    temperature: f32,
-    top_p: f32,
-    top_k: i32,
-    max_tokens: usize,
-    frequency_penalty: f32,
-    presence_penalty: f32,
-    repeat_penalty: f32,
-    n_ctx: u32,
-    stop_sequences: Vec<String>,
-}
+/// How many streamed tokens may wait for a slow client before decoding pauses.
+const STREAM_BUFFER: usize = 64;
 
-impl Default for SamplingParams {
-    fn default() -> Self {
-        Self {
-            temperature: 0.8,
-            top_p: 0.95,
-            top_k: 40,
-            max_tokens: 512,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
-            repeat_penalty: 1.1,
-            // Default context size for llama.cpp models.
-            // 2048 is a common default for many LLMs, balancing memory usage and context length.
-            // This value is currently not user-configurable; making it user-settable is a planned future enhancement.
-            n_ctx: 2048,
-            stop_sequences: Vec::new(),
-        }
-    }
-}
+/// The opening and closing tags of a reasoning block.
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
 
-impl SamplingParams {
-    /// Create sampling parameters from an `OpenAI` chat completion request
-    fn from_request(req: &CreateChatCompletionRequest) -> Self {
-        let mut params = Self::default();
+/// llama.cpp's backend is process-wide and can be initialized once.
+static BACKEND: OnceLock<std::result::Result<LlamaBackend, String>> = OnceLock::new();
 
-        if let Some(temp) = req.temperature {
-            params.temperature = temp;
-        }
-
-        if let Some(top_p) = req.top_p {
-            params.top_p = top_p;
-        }
-
-        // Prefer max_completion_tokens (new field) over max_tokens (deprecated)
-        if let Some(max_completion_tokens) = req.max_completion_tokens {
-            params.max_tokens = max_completion_tokens as usize;
-        } else {
-            #[allow(deprecated)]
-            if let Some(max_tokens) = req.max_tokens {
-                params.max_tokens = max_tokens as usize;
-            }
-        }
-
-        if let Some(freq_penalty) = req.frequency_penalty {
-            params.frequency_penalty = freq_penalty;
-        }
-
-        if let Some(pres_penalty) = req.presence_penalty {
-            params.presence_penalty = pres_penalty;
-        }
-
-        // Extract stop sequences from the request
-        if let Some(stop) = &req.stop {
-            params.stop_sequences = match stop {
-                async_openai::types::Stop::String(s) => vec![s.clone()],
-                async_openai::types::Stop::StringArray(arr) => arr.clone(),
-            };
-        }
-
-        params
-    }
-
-    /// Check if the output contains any stop sequence
-    /// Returns `Some(position)` if a stop sequence is found, `None` otherwise
-    fn find_stop_sequence(&self, text: &str) -> Option<usize> {
-        for stop_seq in &self.stop_sequences {
-            if let Some(pos) = text.find(stop_seq) {
-                return Some(pos);
-            }
-        }
-        None
-    }
-
-    /// Create a sampler chain from these parameters
-    fn create_sampler(&self) -> LlamaSampler {
-        const EPSILON: f32 = 1e-6;
-        let mut samplers = Vec::new();
-
-        // Add penalties if configured
-        if (self.repeat_penalty - 1.0).abs() > EPSILON
-            || self.frequency_penalty.abs() > EPSILON
-            || self.presence_penalty.abs() > EPSILON
-        {
-            // penalty_last_n: number of tokens to consider for repetition penalty (64 is reasonable)
-            // penalty_repeat: base repetition penalty
-            // penalty_freq: frequency penalty (maps to OpenAI frequency_penalty)
-            // penalty_present: presence penalty (maps to OpenAI presence_penalty)
-            samplers.push(LlamaSampler::penalties(
-                64,
-                self.repeat_penalty,
-                self.frequency_penalty,
-                self.presence_penalty,
-            ));
-        }
-
-        // Add top-k sampling if enabled
-        if self.top_k > 0 {
-            samplers.push(LlamaSampler::top_k(self.top_k));
-        }
-
-        // Add top-p (nucleus) sampling
-        if self.top_p < 1.0 {
-            samplers.push(LlamaSampler::top_p(self.top_p, 1));
-        }
-
-        // Add temperature sampling
-        if self.temperature > 0.0 {
-            samplers.push(LlamaSampler::temp(self.temperature));
-        }
-
-        // Always end with a token selection sampler
-        // Note: greedy() is the final sampler that actually selects a token from the distribution
-        samplers.push(LlamaSampler::greedy());
-
-        // Chain samplers together
-        if samplers.len() == 1 {
-            // We've verified samplers.len() == 1, so pop() is guaranteed to return Some
-            match samplers.pop() {
-                Some(sampler) => sampler,
-                None => unreachable!("samplers.len() == 1 guarantees pop() returns Some"),
-            }
-        } else {
-            LlamaSampler::chain_simple(samplers)
-        }
-    }
+fn backend() -> std::result::Result<&'static LlamaBackend, String> {
+    BACKEND
+        .get_or_init(|| {
+            llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default());
+            LlamaBackend::init().map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 pub struct LlamaCpp {
-    model: Arc<LlamaModel>,
-    backend: Arc<LlamaBackend>,
+    jobs: std_mpsc::Sender<Job>,
     model_name: String,
+    template: String,
+    special: SpecialTokens,
+    reasoning_support: ReasoningSupport,
+    counter: AtomicUsize,
+}
+
+/// The token strings a chat template may refer to.
+#[derive(Debug, Clone, Default)]
+struct SpecialTokens {
+    bos: Option<String>,
+    eos: Option<String>,
+}
+
+/// What the decode thread reports once the model is loaded.
+struct Loaded {
+    template: Option<String>,
+    special: SpecialTokens,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Sampling {
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: u32,
+}
+
+struct Job {
+    prompt: String,
+    limit: Option<usize>,
+    sampling: Sampling,
+    stop: Vec<String>,
+    events: mpsc::Sender<Event>,
+}
+
+enum Event {
+    /// The text one generated token added; empty while a multi-byte character or a
+    /// possible stop sequence is still incomplete.
+    Token(String),
+    Done(Outcome),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Outcome {
+    finish: FinishReason,
+    prompt_tokens: u32,
+    completion_tokens: u32,
 }
 
 impl LlamaCpp {
-    /// Create a new `LlamaCpp` instance from a model file path
-    pub async fn from_file(model_path: &Path) -> Result<Self> {
-        // Initialize logging configuration once
-        init_llama_logging();
-
-        if !model_path.exists() {
-            return Err(ChatError::LocalModelNotFound {
-                expected_path: model_path.to_string_lossy().to_string(),
-            });
-        }
-
-        // Load model on blocking thread pool since it's CPU-intensive
-        let model_path_owned = model_path.to_path_buf();
-        let backend = Arc::new(
-            LlamaBackend::init().map_err(|e| ChatError::FailedToLoadModel {
-                source: format!("Failed to initialize llama backend: {e}").into(),
-            })?,
-        );
-
-        let backend_clone = Arc::clone(&backend);
-        let model = tokio::task::spawn_blocking(move || {
-            let params = LlamaModelParams::default();
-            LlamaModel::load_from_file(backend_clone.as_ref(), &model_path_owned, &params).map_err(
-                |e| ChatError::FailedToLoadModel {
-                    source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                },
-            )
-        })
-        .await
-        .map_err(|e| ChatError::FailedToLoadModel {
-            source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-        })??;
-
-        Ok(Self {
-            model: Arc::new(model),
-            backend,
-            // Extract model name from file path for display/logging purposes.
-            // Falls back to "unknown" if the path has no filename or contains invalid UTF-8.
-            model_name: model_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map_or_else(|| "unknown".to_string(), ToString::to_string),
-        })
-    }
-
-    /// Create from `HuggingFace` model ID
-    ///
-    /// This method supports three modes:
-    /// 1. If `gguf_filename` is a local file path, it will be loaded directly
-    /// 2. If `gguf_filename` is just a filename, it will be downloaded from `HuggingFace`
-    /// 3. If `gguf_filename` is `None`, the best GGUF file will be automatically discovered and downloaded
-    ///
-    /// # Arguments
-    /// * `model_id` - `HuggingFace` model ID (e.g., "TheBloke/Llama-2-7B-GGUF")
-    /// * `hf_token_literal` - Optional `HuggingFace` API token for private models
-    /// * `gguf_filename` - Optional GGUF file path or filename. If omitted, auto-discovers the best GGUF file
-    pub async fn from_hf(
-        model_id: &str,
-        hf_token_literal: Option<&SecretString>,
-        gguf_filename: Option<PathBuf>,
-    ) -> Result<Self> {
-        let model_path = match gguf_filename {
-            // Case 1: Local file path provided
-            Some(ref gguf_path) if gguf_path.exists() => {
-                tracing::debug!("Using local GGUF file: {}", gguf_path.display());
-                gguf_path.clone()
-            }
-            // Case 2: Filename provided (download specific file)
-            Some(ref gguf_path) if gguf_path.components().count() == 1 => {
-                let filename = gguf_path
-                    .to_str()
-                    .ok_or_else(|| ChatError::FailedToLoadModel {
-                        source: "Invalid GGUF filename".into(),
-                    })?;
-
-                tracing::info!(
-                    "Downloading GGUF file '{}' from HuggingFace repository '{}'",
-                    filename,
-                    model_id
-                );
-
-                let mut config = hf_model_downloader::DownloadConfig::new(model_id);
-                if let Some(token) = hf_token_literal {
-                    config = config.with_token(token.clone());
-                }
-
-                let downloader = hf_model_downloader::HfDownloader::new(config).map_err(|e| {
-                    ChatError::FailedToLoadModel {
-                        source: format!("Failed to create HuggingFace downloader: {e}").into(),
-                    }
-                })?;
-
-                downloader.download_file(filename).await.map_err(|e| {
-                    ChatError::FailedToLoadModel {
-                        source: format!("Failed to download GGUF file from HuggingFace: {e}")
-                            .into(),
-                    }
-                })?
-            }
-            // Case 3: No filename provided - auto-discover and download best GGUF
-            None => {
-                tracing::info!(
-                    "Auto-discovering GGUF files in HuggingFace repository '{}'",
-                    model_id
-                );
-
-                let mut config = hf_model_downloader::DownloadConfig::new(model_id);
-                if let Some(token) = hf_token_literal {
-                    config = config.with_token(token.clone());
-                }
-
-                let downloader = hf_model_downloader::HfDownloader::new(config).map_err(|e| {
-                    ChatError::FailedToLoadModel {
-                        source: format!("Failed to create HuggingFace downloader: {e}").into(),
-                    }
-                })?;
-
-                downloader
-                    .download_best_gguf()
-                    .await
-                    .map_err(|e| ChatError::FailedToLoadModel {
-                        source: format!(
-                            "Failed to auto-discover and download GGUF file from HuggingFace: {e}"
-                        )
-                        .into(),
-                    })?
-            }
-            // Case 4: Path doesn't exist and has multiple components
-            Some(ref gguf_path) => {
-                return Err(ChatError::FailedToLoadModel {
-                    source: format!(
-                        "GGUF file not found: {}. Either provide a valid local path, \
-                        just a filename to download from HuggingFace, or omit the filename \
-                        to auto-discover the best GGUF file.",
-                        gguf_path.display()
-                    )
-                    .into(),
+    /// Loads a GGUF model. For a sharded GGUF, `weights` lists every shard and llama.cpp
+    /// opens the rest from the first.
+    pub async fn from(weights: &[PathBuf], options: LocalModelOptions<'_>) -> Result<Self> {
+        for weight in weights {
+            if !weight.exists() {
+                return Err(ChatError::LocalModelNotFound {
+                    expected_path: weight.to_string_lossy().to_string(),
                 });
             }
+        }
+        // An MTP head ships as its own GGUF (`mtp-*.gguf`); it drafts for the model, so it is
+        // loaded beside it rather than as one of its shards.
+        let (drafts, trunk): (Vec<_>, Vec<_>) = weights.iter().cloned().partition(|w| is_mtp_head(w));
+        let first = first_shard(&trunk).ok_or_else(|| ChatError::LocalModelNotFound {
+            expected_path: String::new(),
+        })?;
+        let draft = drafts.into_iter().next();
+        let n_ctx = options
+            .context_length
+            .and_then(|length| u32::try_from(length).ok())
+            .and_then(NonZeroU32::new)
+            .or(NonZeroU32::new(DEFAULT_CONTEXT));
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (jobs_tx, jobs_rx) = std_mpsc::channel();
+        thread::Builder::new()
+            .name("llama-cpp".to_string())
+            .spawn(move || serve(&first, draft.as_deref(), n_ctx, ready_tx, &jobs_rx))
+            .map_err(|e| ChatError::FailedToLoadModel { source: Box::new(e) })?;
+        let loaded = ready_rx
+            .await
+            .map_err(|e| ChatError::FailedToLoadModel { source: Box::new(e) })?
+            .map_err(|message| ChatError::FailedToLoadModel {
+                source: message.into(),
+            })?;
+
+        // As on the mistral.rs path, a GGUF's own template wins over `chat_template`.
+        let template = loaded
+            .template
+            .or_else(|| options.chat_template_literal.map(ToString::to_string))
+            .ok_or_else(|| ChatError::FailedToLoadModel {
+                source: "the GGUF file carries no chat template, and the model sets no `chat_template`".into(),
+            })?;
+
+        let model_name = options.reasoning.model_name.to_string();
+        let reasoning_support = {
+            let template = template.clone();
+            let special = loaded.special.clone();
+            tokio::task::spawn_blocking(move || {
+                ReasoningSupport::from_renders(|enable_thinking, effort| {
+                    let message = IndexMap::from([
+                        ("role".to_string(), Either::Left("user".to_string())),
+                        ("content".to_string(), Either::Left("Hi".to_string())),
+                    ]);
+                    render(&template, &special, vec![message], enable_thinking, effort).ok()
+                })
+            })
+            .await
+            .unwrap_or_default()
         };
-
-        Self::from_file(&model_path).await
-    }
-
-    /// Create from local file paths
-    pub async fn from(model_weights: &[PathBuf]) -> Result<Self> {
-        if model_weights.is_empty() {
-            return Err(ChatError::FailedToLoadModel {
-                source: "No model weights provided".into(),
-            });
+        if let Some(effort) = options.reasoning.effort {
+            reasoning_controls(Some(effort), &reasoning_support, &model_name).map_err(
+                |message| ChatError::InvalidParamValueError {
+                    param: "reasoning_effort".to_string(),
+                    message,
+                },
+            )?;
         }
 
-        // Use first weight file (GGUF format)
-        Self::from_file(&model_weights[0]).await
-    }
-
-    /// Convert `OpenAI` chat request messages to a prompt string
-    fn messages_to_prompt(req: &CreateChatCompletionRequest) -> String {
-        let mut prompt = String::new();
-
-        for message in &req.messages {
-            match message {
-                async_openai::types::ChatCompletionRequestMessage::System(msg) => {
-                    let content_str = match &msg.content {
-                        async_openai::types::ChatCompletionRequestSystemMessageContent::Text(
-                            text,
-                        ) => text.clone(),
-                        async_openai::types::ChatCompletionRequestSystemMessageContent::Array(
-                            parts,
-                        ) => {
-                            let mut text = String::new();
-                            for part in parts {
-                                let async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(t) = part;
-                                text.push_str(&t.text);
-                            }
-                            text
-                        }
-                    };
-                    let _ = write!(prompt, "System: {content_str}\n\n");
-                }
-                async_openai::types::ChatCompletionRequestMessage::User(msg) => {
-                    let content = match &msg.content {
-                        async_openai::types::ChatCompletionRequestUserMessageContent::Text(
-                            text,
-                        ) => text.clone(),
-                        async_openai::types::ChatCompletionRequestUserMessageContent::Array(
-                            parts,
-                        ) => {
-                            let mut text = String::new();
-                            for part in parts {
-                                if let async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) = part {
-                                    text.push_str(&t.text);
-                                }
-                            }
-                            text
-                        }
-                    };
-                    let _ = write!(prompt, "User: {content}\n\n");
-                }
-                async_openai::types::ChatCompletionRequestMessage::Assistant(msg) => {
-                    if let Some(content) = &msg.content {
-                        let content_str = match content {
-                            async_openai::types::ChatCompletionRequestAssistantMessageContent::Text(text) => text.clone(),
-                            async_openai::types::ChatCompletionRequestAssistantMessageContent::Array(parts) => {
-                                let mut text = String::new();
-                                for part in parts {
-                                    if let async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Text(t) = part {
-                                        text.push_str(&t.text);
-                                    }
-                                }
-                                text
-                            }
-                        };
-                        let _ = write!(prompt, "Assistant: {content_str}\n\n");
-                    }
-                }
-                _ => {} // Ignore other message types for now
-            }
-        }
-
-        prompt.push_str("Assistant:");
-        prompt
-    }
-
-    /// Internal method for running inference with configurable sampling parameters
-    async fn run_with_params(
-        &self,
-        prompt: String,
-        params: &SamplingParams,
-    ) -> Result<Option<String>> {
-        let model = Arc::clone(&self.model);
-        let backend = Arc::clone(&self.backend);
-        let params_clone = params.clone();
-
-        tokio::task::spawn_blocking(move || {
-            // Create context for inference with configured context size
-            let ctx_params = LlamaContextParams::default()
-                .with_n_ctx(std::num::NonZeroU32::new(params_clone.n_ctx))
-                .with_n_batch(512);
-
-            let mut ctx = model.new_context(&backend, ctx_params).map_err(|e| {
-                ChatError::FailedToRunModel {
-                    source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                }
-            })?;
-
-            // Tokenize the prompt
-            let tokens = model.str_to_token(&prompt, AddBos::Always).map_err(|e| {
-                ChatError::FailedToRunModel {
-                    source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                }
-            })?;
-
-            if tokens.is_empty() {
-                return Ok(Some(String::new()));
-            }
-
-            // Create batch for the prompt
-            // We only request logits for the last token to save computation
-            let mut batch = LlamaBatch::new(512, 1);
-            let n_prompt_tokens = tokens.len();
-
-            for (i, &token) in tokens.iter().enumerate() {
-                let is_last = i == n_prompt_tokens - 1;
-                let i_i32 = i32::try_from(i).map_err(|e| ChatError::FailedToRunModel {
-                    source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                })?;
-                batch.add(token, i_i32, &[0], is_last).map_err(|e| {
-                    ChatError::FailedToRunModel {
-                        source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                    }
-                })?;
-            }
-
-            // Decode the prompt
-            ctx.decode(&mut batch)
-                .map_err(|e| ChatError::FailedToRunModel {
-                    source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                })?;
-
-            // Create sampler from parameters
-            let mut sampler = params_clone.create_sampler();
-
-            let mut output = String::new();
-            let mut n_generated = 0;
-            let mut n_cur =
-                i32::try_from(n_prompt_tokens).map_err(|e| ChatError::FailedToRunModel {
-                    source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                })?;
-
-            // Generate tokens
-            while n_generated < params_clone.max_tokens {
-                // Sample the next token from the last position
-                let new_token = sampler.sample(&ctx, -1);
-
-                // Check for end of generation
-                if model.is_eog_token(new_token) {
-                    break;
-                }
-
-                // Convert token to string and check for stop sequences BEFORE accepting/decoding
-                let token_str = match model.token_to_str(new_token, Special::Tokenize) {
-                    Ok(s) => s,
-                    Err(_) => continue, // Skip tokens that can't be converted
-                };
-
-                // Tentatively add to output to check for stop sequences
-                let output_with_new_token = format!("{output}{token_str}");
-
-                // Check if this new token would trigger a stop sequence
-                if let Some(stop_pos) = params_clone.find_stop_sequence(&output_with_new_token) {
-                    // Only add the part before the stop sequence
-                    if stop_pos > output.len() {
-                        output.push_str(&token_str[..(stop_pos - output.len())]);
-                    }
-                    break; // Don't accept or decode this token
-                }
-
-                // No stop sequence found, accept the token
-                output.push_str(&token_str);
-                sampler.accept(new_token);
-
-                // Prepare next batch with the new token at the next position
-                batch.clear();
-                batch.add(new_token, n_cur, &[0], true).map_err(|e| {
-                    ChatError::FailedToRunModel {
-                        source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                    }
-                })?;
-
-                // Decode the new token
-                ctx.decode(&mut batch)
-                    .map_err(|e| ChatError::FailedToRunModel {
-                        source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                    })?;
-
-                n_cur += 1;
-                n_generated += 1;
-            }
-
-            Ok(Some(output))
+        Ok(Self {
+            jobs: jobs_tx,
+            model_name,
+            template,
+            special: loaded.special,
+            reasoning_support,
+            counter: AtomicUsize::new(0),
         })
-        .await
-        .map_err(|e| ChatError::FailedToRunModel {
-            source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-        })?
     }
 
-    /// Internal method for streaming inference with configurable sampling parameters
-    #[allow(clippy::too_many_lines)]
-    fn stream_with_params(&self, prompt: String, params: &SamplingParams) -> StreamResult {
-        let model = Arc::clone(&self.model);
-        let backend = Arc::clone(&self.backend);
-        let params_clone = params.clone();
+    fn prompt(
+        &self,
+        messages: &[ChatCompletionRequestMessage],
+        reasoning: ReasoningControls,
+    ) -> std::result::Result<String, OpenAIError> {
+        render(
+            &self.template,
+            &self.special,
+            messages.iter().map(message_to_mistral).collect(),
+            reasoning.enable_thinking,
+            reasoning.reasoning_effort,
+        )
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to render the chat template: {e}")))
+    }
 
-        // Create a channel to send tokens from the blocking thread
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Option<String>>>(100);
+    /// Validates `req`, renders its prompt and queues it on the decode thread.
+    fn submit(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> std::result::Result<(mpsc::Receiver<Event>, bool), OpenAIError> {
+        if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+            return Err(OpenAIError::InvalidArgument(format!(
+                "Model '{}' is served by llama.cpp, which does not take `tools` yet.",
+                self.model_name
+            )));
+        }
+        let reasoning = reasoning_controls(
+            req.reasoning_effort.as_ref(),
+            &self.reasoning_support,
+            &self.model_name,
+        )
+        .map_err(OpenAIError::InvalidArgument)?;
+        let prompt = self.prompt(&req.messages, reasoning)?;
+        let reasons = opens_reasoning(&prompt);
+        let (events, rx) = mpsc::channel(STREAM_BUFFER);
+        let job = Job {
+            prompt,
+            limit: completion_limit(req),
+            sampling: Sampling {
+                temperature: req.temperature,
+                top_p: req.top_p,
+                seed: rand::random(),
+            },
+            stop: match &req.stop {
+                Some(StopConfiguration::String(s)) => vec![s.clone()],
+                Some(StopConfiguration::StringArray(s)) => s.clone(),
+                None => Vec::new(),
+            },
+            events,
+        };
+        self.jobs.send(job).map_err(|_| api_error("the llama.cpp decode thread has stopped"))?;
+        Ok((rx, reasons))
+    }
 
-        tokio::task::spawn_blocking(move || {
-            // Create context for inference with configured context size
-            let ctx_params = LlamaContextParams::default()
-                .with_n_ctx(std::num::NonZeroU32::new(params_clone.n_ctx))
-                .with_n_batch(512);
-
-            let mut ctx = match model.new_context(&backend, ctx_params) {
-                Ok(ctx) => ctx,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(ChatError::FailedToRunModel {
-                        source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                    }));
-                    return;
-                }
-            };
-
-            // Tokenize the prompt
-            let tokens = match model.str_to_token(&prompt, AddBos::Always) {
-                Ok(tokens) => tokens,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(ChatError::FailedToRunModel {
-                        source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                    }));
-                    return;
-                }
-            };
-
-            if tokens.is_empty() {
-                return;
-            }
-
-            // Create batch for the prompt
-            // We only request logits for the last token to save computation
-            let mut batch = LlamaBatch::new(512, 1);
-            let n_prompt_tokens = tokens.len();
-
-            for (i, &token) in tokens.iter().enumerate() {
-                let is_last = i == n_prompt_tokens - 1;
-                let i_i32 = match i32::try_from(i) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(ChatError::FailedToRunModel {
-                            source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                        }));
-                        return;
-                    }
-                };
-                if let Err(e) = batch.add(token, i_i32, &[0], is_last) {
-                    let _ = tx.blocking_send(Err(ChatError::FailedToRunModel {
-                        source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                    }));
-                    return;
-                }
-            }
-
-            // Decode the prompt
-            if let Err(e) = ctx.decode(&mut batch) {
-                let _ = tx.blocking_send(Err(ChatError::FailedToRunModel {
-                    source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                }));
-                return;
-            }
-
-            // Create sampler from parameters
-            let mut sampler = params_clone.create_sampler();
-
-            let mut accumulated_output = String::new(); // Track output for stop sequence detection
-            let mut n_generated = 0;
-            let mut n_cur = match i32::try_from(n_prompt_tokens) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(ChatError::FailedToRunModel {
-                        source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                    }));
-                    return;
-                }
-            };
-
-            // Generate and stream tokens
-            while n_generated < params_clone.max_tokens {
-                // Sample the next token from the last position
-                let new_token = sampler.sample(&ctx, -1);
-
-                // Check for end of generation
-                if model.is_eog_token(new_token) {
-                    break;
-                }
-
-                // Convert token to string BEFORE accepting/decoding
-                let token_str = match model.token_to_str(new_token, Special::Tokenize) {
-                    Ok(s) => s,
-                    Err(_) => continue, // Skip tokens that can't be converted
-                };
-
-                // Tentatively add to accumulated output to check for stop sequences
-                let output_with_new_token = format!("{accumulated_output}{token_str}");
-
-                // Check if this new token would trigger a stop sequence
-                if let Some(stop_pos) = params_clone.find_stop_sequence(&output_with_new_token) {
-                    // Send only the partial token text that comes before the stop sequence
-                    let current_len = accumulated_output.len();
-                    if stop_pos > current_len {
-                        let partial_token = &token_str[..(stop_pos - current_len)];
-                        if !partial_token.is_empty() {
-                            let _ = tx.blocking_send(Ok(Some(partial_token.to_string())));
-                        }
-                    }
-                    break; // Don't accept or decode this token
-                }
-
-                // No stop sequence found, send the token and accept it
-                if tx.blocking_send(Ok(Some(token_str.clone()))).is_err() {
-                    // Receiver dropped, stop generation
-                    break;
-                }
-
-                accumulated_output.push_str(&token_str);
-                sampler.accept(new_token);
-
-                // Prepare next batch with the new token at the next position
-                batch.clear();
-                if let Err(e) = batch.add(new_token, n_cur, &[0], true) {
-                    let _ = tx.blocking_send(Err(ChatError::FailedToRunModel {
-                        source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                    }));
-                    break;
-                }
-
-                // Decode the new token
-                if let Err(e) = ctx.decode(&mut batch) {
-                    let _ = tx.blocking_send(Err(ChatError::FailedToRunModel {
-                        source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                    }));
-                    break;
-                }
-
-                n_cur += 1;
-                n_generated += 1;
-            }
-        });
-
-        // Create stream from receiver using ReceiverStream (avoids async_stream::stream! macro)
-        let stream = ReceiverStream::new(rx);
-
-        Box::pin(stream)
+    fn id(&self) -> String {
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        format!("{}-{n}", generate_stream_id(&self.model_name))
     }
 }
 
@@ -734,182 +302,759 @@ impl Chat for LlamaCpp {
     }
 
     async fn health(&self) -> Result<()> {
-        // Health check: Try to run a simple inference
-        tracing::debug!(
-            "Running health check for llama.cpp model '{}'",
-            self.model_name
-        );
-
-        match self.run("ping".to_string()).await {
-            Ok(_) => {
-                tracing::info!(
-                    "Health check passed for llama.cpp model '{}'",
-                    self.model_name
-                );
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Health check failed for llama.cpp model '{}': {}",
-                    self.model_name,
-                    e
-                );
-                Err(e)
-            }
-        }
-    }
-
-    async fn stream<'a>(
-        &self,
-        _prompt: String,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
-        // Use default sampling parameters for trait method
-        let params = SamplingParams::default();
-        Ok(self.stream_with_params(_prompt, &params))
-    }
-
-    async fn run(&self, _prompt: String) -> Result<Option<String>> {
-        // Use default sampling parameters for trait method
-        let params = SamplingParams::default();
-        self.run_with_params(_prompt, &params).await
+        // A model that loaded is healthy; the decode thread lives as long as `self`.
+        Ok(())
     }
 
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
-    ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let prompt = Self::messages_to_prompt(&req);
-        tracing::debug!("Generated prompt for llama.cpp streaming: {}", prompt);
-
-        let model_id = req.model.clone();
-
-        // Extract sampling parameters from request
-        let params = SamplingParams::from_request(&req);
-
-        // Use the stream() method with parameters
-        let stream = self.stream_with_params(prompt, &params);
-
-        Ok(crate::streaming_utils::string_stream_to_chat_stream(
-            model_id, stream,
-        ))
+    ) -> std::result::Result<ChatCompletionResponseStream, OpenAIError> {
+        let (rx, reasons) = self.submit(&req)?;
+        let id = self.id();
+        let model = req.model;
+        let created = now();
+        let state = StreamState {
+            rx,
+            split: ThinkSplit::new(reasons),
+            first: true,
+            done: false,
+        };
+        let stream = futures::stream::unfold(state, move |mut state| {
+            let id = id.clone();
+            let model = model.clone();
+            async move {
+                if state.done {
+                    return None;
+                }
+                let event = state.rx.recv().await;
+                let first = std::mem::replace(&mut state.first, false);
+                let item = match event {
+                    Some(Event::Token(piece)) => {
+                        let (_, content) = state.split.push(&piece);
+                        Ok(chunk(&id, &model, created, first, non_empty(content), None, None))
+                    }
+                    Some(Event::Done(outcome)) => {
+                        state.done = true;
+                        let (_, content) = state.split.finish();
+                        Ok(chunk(
+                            &id,
+                            &model,
+                            created,
+                            first,
+                            non_empty(content),
+                            Some(outcome.finish),
+                            Some(usage(outcome)),
+                        ))
+                    }
+                    Some(Event::Failed(message)) => {
+                        state.done = true;
+                        Err(api_error(&message))
+                    }
+                    None => {
+                        state.done = true;
+                        Err(api_error("the llama.cpp decode thread stopped mid-response"))
+                    }
+                };
+                Some((item, state))
+            }
+        });
+        Ok(Box::pin(stream) as Pin<Box<dyn Stream<Item = _> + Send>>)
     }
 
+    #[expect(deprecated, reason = "`function_call` and `system_fingerprint` are deprecated fields of the response")]
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
-    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let prompt = Self::messages_to_prompt(&req);
-        tracing::debug!("Generated prompt for llama.cpp: {}", prompt);
-
-        // Extract sampling parameters from request
-        let params = SamplingParams::from_request(&req);
-
-        // Count prompt tokens
-        let prompt_tokens = {
-            let model = Arc::clone(&self.model);
-            let prompt_clone = prompt.clone();
-            match tokio::task::spawn_blocking(move || {
-                model
-                    .str_to_token(&prompt_clone, AddBos::Always)
-                    .map(|tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX))
-            })
-            .await
-            {
-                Ok(Ok(count)) => count,
-                Ok(Err(e)) => {
-                    tracing::warn!("Failed to tokenize prompt for token counting: {}", e);
-                    0
+    ) -> std::result::Result<CreateChatCompletionResponse, OpenAIError> {
+        let (mut rx, reasons) = self.submit(&req)?;
+        let mut split = ThinkSplit::new(reasons);
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        let outcome = loop {
+            match rx.recv().await {
+                Some(Event::Token(piece)) => {
+                    let (r, c) = split.push(&piece);
+                    reasoning.push_str(&r);
+                    content.push_str(&c);
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to spawn blocking task for prompt tokenization: {}",
-                        e
-                    );
-                    0
+                Some(Event::Done(outcome)) => {
+                    let (r, c) = split.finish();
+                    reasoning.push_str(&r);
+                    content.push_str(&c);
+                    break outcome;
                 }
+                Some(Event::Failed(message)) => return Err(api_error(&message)),
+                None => return Err(api_error("the llama.cpp decode thread stopped mid-response")),
             }
         };
-
-        // Use the run() method with parameters to get the completion
-        let response_text = self.run_with_params(prompt, &params).await.map_err(|e| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })?;
-
-        // response_text is Option<String> from run_with_params.
-        // None indicates empty generation (e.g., immediate EOS token).
-        let content = response_text.unwrap_or_default();
-
-        // Count completion tokens
-        let completion_tokens = {
-            let model = Arc::clone(&self.model);
-            let content_clone = content.clone();
-            match tokio::task::spawn_blocking(move || {
-                model
-                    .str_to_token(&content_clone, AddBos::Never)
-                    .map(|tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX))
-            })
-            .await
-            {
-                Ok(Ok(count)) => count,
-                Ok(Err(e)) => {
-                    tracing::warn!("Failed to tokenize completion for token counting: {}", e);
-                    0
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to spawn blocking task for completion tokenization: {}",
-                        e
-                    );
-                    0
-                }
-            }
+        let message = ChatCompletionResponseMessage {
+            content: Some(content),
+            reasoning_content: non_empty(reasoning),
+            refusal: None,
+            tool_calls: None,
+            annotations: None,
+            role: Role::Assistant,
+            function_call: None,
+            audio: None,
         };
-
-        let created = u32::try_from(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
-                .as_secs(),
-        )
-        .unwrap_or(0);
-
-        let stream_id = generate_stream_id(&self.model_name);
-
-        let response = CreateChatCompletionResponse {
-            id: stream_id,
+        Ok(CreateChatCompletionResponse {
+            id: self.id(),
             object: "chat.completion".to_string(),
-            created,
-            model: self.model_name.clone(),
+            created: now(),
+            model: req.model,
             choices: vec![ChatChoice {
                 index: 0,
-                message: ChatCompletionResponseMessage {
-                    content: Some(content),
-                    role: Role::Assistant,
-                    #[allow(deprecated)]
-                    function_call: None,
-                    tool_calls: None,
-                    refusal: None,
-                    audio: None,
-                },
-                finish_reason: Some(FinishReason::Stop),
+                message,
+                finish_reason: Some(outcome.finish),
                 logprobs: None,
             }],
-            usage: Some(CompletionUsage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
-                completion_tokens_details: None,
-                prompt_tokens_details: None,
-            }),
-            system_fingerprint: None,
+            usage: Some(usage(outcome)),
             service_tier: None,
-        };
+            system_fingerprint: None,
+        })
+    }
+}
 
-        Ok(response)
+struct StreamState {
+    rx: mpsc::Receiver<Event>,
+    split: ThinkSplit,
+    first: bool,
+    done: bool,
+}
+
+/// Renders a conversation the way the mistral.rs engine does.
+fn render(
+    template: &str,
+    special: &SpecialTokens,
+    messages: Vec<IndexMap<String, MessageContent>>,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<TemplateReasoningEffort>,
+) -> std::result::Result<String, String> {
+    apply_chat_template_to(
+        messages,
+        true,
+        enable_thinking,
+        reasoning_effort,
+        &ChatTemplateValue(Either::Left(template.to_string())),
+        special.bos.clone(),
+        special.eos.clone(),
+        None,
+        Vec::new(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// The decode thread: loads the model, reports readiness, then runs jobs in order.
+fn serve(
+    path: &Path,
+    draft: Option<&Path>,
+    n_ctx: Option<NonZeroU32>,
+    ready: oneshot::Sender<std::result::Result<Loaded, String>>,
+    jobs: &std_mpsc::Receiver<Job>,
+) {
+    let backend = match backend() {
+        Ok(backend) => backend,
+        Err(message) => {
+            let _ = ready.send(Err(message));
+            return;
+        }
+    };
+    let params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX);
+    let model = match LlamaModel::load_from_file(backend, path, &params) {
+        Ok(model) => model,
+        Err(e) => {
+            let _ = ready.send(Err(format!(
+                "llama.cpp could not load '{}': {e}",
+                path.display()
+            )));
+            return;
+        }
+    };
+    let draft_model = match draft.map(|d| {
+        LlamaModel::load_from_file(backend, d, &params.clone().with_load_mtp(true))
+            .map_err(|e| format!("llama.cpp could not load the MTP head '{}': {e}", d.display()))
+    }) {
+        Some(Err(message)) => {
+            let _ = ready.send(Err(message));
+            return;
+        }
+        Some(Ok(model)) => Some(model),
+        None => None,
+    };
+    // The contexts borrow the models, so all of them live in this frame for the thread's
+    // lifetime.
+    let context_params = LlamaContextParams::default()
+        .with_n_ctx(n_ctx)
+        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX));
+    let context = match model.new_context(backend, context_params) {
+        Ok(context) => context,
+        Err(e) => {
+            let _ = ready.send(Err(format!("llama.cpp could not create a context: {e}")));
+            return;
+        }
+    };
+    let mut decoder = match &draft_model {
+        None => Decoder::Plain(context),
+        Some(draft_model) => match mtp(backend, draft_model, context) {
+            Ok(spec) => Decoder::Mtp(Box::new(spec)),
+            Err(message) => {
+                let _ = ready.send(Err(message));
+                return;
+            }
+        },
+    };
+    let vocab = model.vocab();
+    let special = SpecialTokens {
+        bos: piece(&model, vocab.bos()),
+        eos: piece(&model, vocab.eos()),
+    };
+    let template = model
+        .chat_template(None)
+        .ok()
+        .and_then(|t| t.to_string().ok());
+    if ready.send(Ok(Loaded { template, special })).is_err() {
+        return;
+    }
+    while let Ok(job) = jobs.recv() {
+        let events = job.events.clone();
+        let result = match &mut decoder {
+            Decoder::Plain(context) => generate(&model, context, job),
+            Decoder::Mtp(spec) => generate_mtp(&model, spec, job),
+        };
+        let event = match result {
+            Ok(outcome) => Event::Done(outcome),
+            Err(message) => Event::Failed(message),
+        };
+        let _ = events.blocking_send(event);
+    }
+}
+
+/// The decode thread's engine: plain decoding, or decoding with an MTP draft head.
+enum Decoder<'m> {
+    Plain(LlamaContext<'m>),
+    Mtp(Box<MtpSpeculative<'m>>),
+}
+
+/// Creates an MTP draft context linked to `context`, as llama.cpp's own server does: an
+/// MTP-type context of the same size, reading the target's hidden states.
+fn mtp<'m>(
+    backend: &LlamaBackend,
+    draft_model: &'m LlamaModel,
+    context: LlamaContext<'m>,
+) -> std::result::Result<MtpSpeculative<'m>, String> {
+    let params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(context.n_ctx()))
+        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
+        .with_context_type(LlamaContextType::Mtp)
+        .with_n_rs_seq(0);
+    let draft = draft_model
+        .new_context_with_ctx_other(backend, params, &context)
+        .map_err(|e| format!("llama.cpp could not create the MTP draft context: {e}"))?;
+    MtpSpeculative::new(
+        context,
+        draft,
+        MtpSpeculativeParams {
+            n_max: MTP_DRAFT,
+            n_min: 0,
+            p_min: 0.0,
+        },
+    )
+    .map_err(|e| format!("llama.cpp could not start MTP drafting: {e}"))
+}
+
+/// What prompt reading needs from either engine.
+trait Target<'m> {
+    fn context(&self) -> &LlamaContext<'m>;
+    fn context_mut(&mut self) -> &mut LlamaContext<'m>;
+    /// Called after every target decode; the MTP head reads the batch's hidden states.
+    fn decoded(&mut self, batch: &LlamaBatch<'_>) -> std::result::Result<(), String>;
+}
+
+impl<'m> Target<'m> for LlamaContext<'m> {
+    fn context(&self) -> &LlamaContext<'m> {
+        self
+    }
+    fn context_mut(&mut self) -> &mut LlamaContext<'m> {
+        self
+    }
+    fn decoded(&mut self, _: &LlamaBatch<'_>) -> std::result::Result<(), String> {
+        Ok(())
+    }
+}
+
+impl<'m> Target<'m> for MtpSpeculative<'m> {
+    fn context(&self) -> &LlamaContext<'m> {
+        self.target_context()
+    }
+    fn context_mut(&mut self) -> &mut LlamaContext<'m> {
+        self.target_context_mut()
+    }
+    fn decoded(&mut self, batch: &LlamaBatch<'_>) -> std::result::Result<(), String> {
+        self.process(batch).map_err(|e| e.to_string())
+    }
+}
+
+/// Tokenizes the prompt and decodes it from an empty KV cache, returning the tokens and the
+/// batch whose last logits predict the first generated token.
+fn read_prompt<'m>(
+    model: &LlamaModel,
+    target: &mut impl Target<'m>,
+    prompt: &str,
+) -> std::result::Result<(Vec<LlamaToken>, LlamaBatch<'static>), String> {
+    target.context_mut().clear_kv_cache();
+    let tokens = model.vocab().tokenize(prompt.as_bytes(), false, true);
+    let n_ctx = usize::try_from(target.context().n_ctx()).unwrap_or(usize::MAX);
+    if tokens.is_empty() {
+        return Err("the rendered prompt is empty".to_string());
+    }
+    if tokens.len() >= n_ctx {
+        return Err(format!(
+            "the prompt is {} tokens, and the model's context holds {n_ctx}. Shorten the conversation, or raise `context_length`.",
+            tokens.len()
+        ));
+    }
+    let mut batch = LlamaBatch::new(PROMPT_BATCH, 1);
+    let mut pos: i32 = 0;
+    let chunks = tokens.chunks(PROMPT_BATCH).count();
+    for (i, chunk) in tokens.chunks(PROMPT_BATCH).enumerate() {
+        batch.clear();
+        for (j, &token) in chunk.iter().enumerate() {
+            let last = i + 1 == chunks && j + 1 == chunk.len();
+            batch.add(token, pos, &[0], last).map_err(|e| e.to_string())?;
+            pos += 1;
+        }
+        target.context_mut().decode(&mut batch).map_err(|e| e.to_string())?;
+        target.decoded(&batch)?;
+    }
+    Ok((tokens, batch))
+}
+
+/// Sends generated tokens to the client, ending at an end-of-generation token, a stop
+/// sequence or the token budget.
+struct Output {
+    events: mpsc::Sender<Event>,
+    limit: Option<usize>,
+    stops: StopMatcher,
+    pending: Vec<u8>,
+    produced: u32,
+}
+
+impl Output {
+    fn new(job: Job) -> (String, Sampling, Self) {
+        let output = Self {
+            events: job.events,
+            limit: job.limit,
+            stops: StopMatcher::new(job.stop),
+            pending: Vec::new(),
+            produced: 0,
+        };
+        (job.prompt, job.sampling, output)
+    }
+
+    /// Sends one sampled token, or returns why generation ends.
+    fn token(&mut self, model: &LlamaModel, token: LlamaToken) -> Option<FinishReason> {
+        let vocab = model.vocab();
+        if vocab.is_eog(token) {
+            return Some(FinishReason::Stop);
+        }
+        self.produced += 1;
+        self.pending.extend(vocab.token_to_piece(token, true, None));
+        let text = take_utf8(&mut self.pending);
+        let (emit, stopped) = self.stops.push(&text);
+        if self.events.blocking_send(Event::Token(emit)).is_err() || stopped {
+            return Some(FinishReason::Stop);
+        }
+        self.limit
+            .is_some_and(|limit| self.produced as usize >= limit)
+            .then_some(FinishReason::Length)
+    }
+
+    /// Tokens the budget still allows.
+    fn remaining(&self) -> usize {
+        self.limit
+            .map_or(usize::MAX, |limit| limit.saturating_sub(self.produced as usize))
+    }
+
+    fn finish(mut self, finish: FinishReason, prompt_tokens: usize) -> Outcome {
+        let tail = self.stops.finish();
+        if !tail.is_empty() {
+            let _ = self.events.blocking_send(Event::Token(tail));
+        }
+        Outcome {
+            finish,
+            prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
+            completion_tokens: self.produced,
+        }
+    }
+}
+
+/// Runs one request, one token per forward pass.
+fn generate(
+    model: &LlamaModel,
+    context: &mut LlamaContext<'_>,
+    job: Job,
+) -> std::result::Result<Outcome, String> {
+    let (prompt, sampling, mut out) = Output::new(job);
+    let (tokens, mut batch) = read_prompt(model, context, &prompt)?;
+    let n_ctx = usize::try_from(context.n_ctx()).unwrap_or(usize::MAX);
+    let mut pos = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
+    let mut sampler = sampler(sampling);
+    let finish = loop {
+        let token = sampler.sample(context, batch.n_tokens() - 1);
+        if let Some(finish) = out.token(model, token) {
+            break finish;
+        }
+        if usize::try_from(pos).unwrap_or(usize::MAX) + 1 >= n_ctx {
+            break FinishReason::Length;
+        }
+        batch.clear();
+        batch.add(token, pos, &[0], true).map_err(|e| e.to_string())?;
+        pos += 1;
+        context.decode(&mut batch).map_err(|e| e.to_string())?;
+    };
+    Ok(out.finish(finish, tokens.len()))
+}
+
+/// Runs one request with MTP drafting: each forward pass verifies the last token plus up
+/// to [`MTP_DRAFT`] drafted ones, and keeps the drafts the target would have sampled.
+fn generate_mtp(
+    model: &LlamaModel,
+    spec: &mut MtpSpeculative<'_>,
+    job: Job,
+) -> std::result::Result<Outcome, String> {
+    let (prompt, sampling, mut out) = Output::new(job);
+    spec.draft_context_mut().clear_kv_cache();
+    let prompt_tokens = model.vocab().tokenize(prompt.as_bytes(), false, true);
+    spec.begin(&prompt_tokens).map_err(|e| e.to_string())?;
+    let (tokens, mut batch) = read_prompt(model, spec, &prompt)?;
+    let n_ctx = usize::try_from(spec.target_context().n_ctx()).unwrap_or(usize::MAX);
+    let mut history = tokens.clone();
+    let mut n_past = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
+    let mut sampler = sampler(sampling);
+    let mut id = sampler.sample(spec.target_context(), batch.n_tokens() - 1);
+    let finish = 'generate: loop {
+        if let Some(finish) = out.token(model, id) {
+            break finish;
+        }
+        let past = usize::try_from(n_past).unwrap_or(usize::MAX);
+        if past + 1 >= n_ctx {
+            break FinishReason::Length;
+        }
+        let mut draft = spec.draft(n_past, id, &history).map_err(|e| e.to_string())?;
+        draft.truncate(out.remaining().min(n_ctx - past - 1));
+
+        batch.clear();
+        batch.add(id, n_past, &[0], true).map_err(|e| e.to_string())?;
+        for (i, &token) in draft.iter().enumerate() {
+            let at = n_past + 1 + i32::try_from(i).map_err(|e| e.to_string())?;
+            batch.add(token, at, &[0], true).map_err(|e| e.to_string())?;
+        }
+        spec.target_context_mut().decode(&mut batch).map_err(|e| e.to_string())?;
+        spec.process(&batch).map_err(|e| e.to_string())?;
+        history.push(id);
+
+        let mut accepted = 0;
+        let next = loop {
+            let index = i32::try_from(accepted).map_err(|e| e.to_string())?;
+            let token = sampler.sample(spec.target_context(), index);
+            if accepted < draft.len() && token == draft[accepted] {
+                accepted += 1;
+                if let Some(finish) = out.token(model, token) {
+                    break 'generate finish;
+                }
+                history.push(token);
+            } else {
+                break token;
+            }
+        };
+        n_past += 1 + i32::try_from(accepted).map_err(|e| e.to_string())?;
+        // Drop the rejected drafts' cache entries, then let the head roll back its own.
+        spec.target_context_mut()
+            .clear_kv_cache_seq(Some(0), u32::try_from(n_past).ok(), None)
+            .map_err(|e| e.to_string())?;
+        spec.accept(u16::try_from(accepted).unwrap_or(u16::MAX))
+            .map_err(|e| e.to_string())?;
+        id = next;
+    };
+    Ok(out.finish(finish, tokens.len()))
+}
+
+/// Greedy at temperature 0 or unset, as the mistral.rs engine's deterministic default;
+/// otherwise top-p then temperature, then a seeded draw.
+fn sampler(sampling: Sampling) -> LlamaSampler {
+    match sampling.temperature {
+        Some(t) if t > 0.0 => LlamaSampler::chain_simple([
+            LlamaSampler::top_p(sampling.top_p.unwrap_or(1.0), 1),
+            LlamaSampler::temp(t),
+            LlamaSampler::dist(sampling.seed),
+        ]),
+        _ => LlamaSampler::greedy(),
+    }
+}
+
+/// Whether a file is an MTP draft head, by the `mtp-` name the GGUF publishers give them.
+fn is_mtp_head(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("mtp-"))
+}
+
+/// The GGUF a sharded model is opened from: the `-00001-of-` file, or the only file.
+fn first_shard(weights: &[PathBuf]) -> Option<PathBuf> {
+    weights
+        .iter()
+        .find(|w| w.to_string_lossy().contains("-00001-of-"))
+        .or_else(|| weights.first())
+        .cloned()
+}
+
+fn piece(model: &LlamaModel, token: LlamaToken) -> Option<String> {
+    if token.0 < 0 {
+        return None;
+    }
+    String::from_utf8(model.vocab().token_to_piece(token, true, None))
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Removes and returns the longest valid UTF-8 prefix of `bytes`, keeping an incomplete
+/// trailing character for the next token. Bytes that can never become valid are replaced.
+fn take_utf8(bytes: &mut Vec<u8>) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => {
+            let text = text.to_string();
+            bytes.clear();
+            text
+        }
+        Err(e) if e.error_len().is_none() => {
+            let valid = e.valid_up_to();
+            let rest = bytes.split_off(valid);
+            let text = String::from_utf8_lossy(bytes).into_owned();
+            *bytes = rest;
+            text
+        }
+        Err(_) => {
+            let text = String::from_utf8_lossy(bytes).into_owned();
+            bytes.clear();
+            text
+        }
+    }
+}
+
+/// Holds back text that could still become a stop sequence, and ends generation at the
+/// first one.
+struct StopMatcher {
+    stops: Vec<String>,
+    held: String,
+}
+
+impl StopMatcher {
+    fn new(stops: Vec<String>) -> Self {
+        Self {
+            stops: stops.into_iter().filter(|s| !s.is_empty()).collect(),
+            held: String::new(),
+        }
+    }
+
+    /// The text that can be released, and whether a stop sequence was reached.
+    fn push(&mut self, text: &str) -> (String, bool) {
+        if self.stops.is_empty() {
+            return (text.to_string(), false);
+        }
+        self.held.push_str(text);
+        if let Some(at) = self.stops.iter().filter_map(|s| self.held.find(s.as_str())).min() {
+            let emit = self.held[..at].to_string();
+            self.held.clear();
+            return (emit, true);
+        }
+        let keep = self
+            .stops
+            .iter()
+            .map(|s| longest_suffix_prefix(&self.held, s))
+            .max()
+            .unwrap_or(0);
+        let cut = self.held.len() - keep;
+        let emit = self.held[..cut].to_string();
+        self.held.drain(..cut);
+        (emit, false)
+    }
+
+    fn finish(&mut self) -> String {
+        std::mem::take(&mut self.held)
+    }
+}
+
+/// The length of the longest suffix of `text` that is a proper prefix of `pattern`, on a
+/// character boundary.
+fn longest_suffix_prefix(text: &str, pattern: &str) -> usize {
+    (1..pattern.len().min(text.len() + 1))
+        .rev()
+        .find(|&n| {
+            text.is_char_boundary(text.len() - n)
+                && pattern.is_char_boundary(n)
+                && text.ends_with(&pattern[..n])
+        })
+        .unwrap_or(0)
+}
+
+/// Splits generated text into reasoning and content at `<think>` and `</think>`.
+struct ThinkSplit {
+    in_think: bool,
+    held: String,
+}
+
+impl ThinkSplit {
+    fn new(in_think: bool) -> Self {
+        Self {
+            in_think,
+            held: String::new(),
+        }
+    }
+
+    /// The reasoning and content `text` adds, holding back a possible partial tag.
+    fn push(&mut self, text: &str) -> (String, String) {
+        self.held.push_str(text);
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        loop {
+            let tag = if self.in_think { THINK_CLOSE } else { THINK_OPEN };
+            if let Some(at) = self.held.find(tag) {
+                let before: String = self.held.drain(..at).collect();
+                self.held.drain(..tag.len());
+                if self.in_think {
+                    reasoning.push_str(&before);
+                } else {
+                    content.push_str(&before);
+                }
+                self.in_think = !self.in_think;
+                continue;
+            }
+            let keep = longest_suffix_prefix(&self.held, tag);
+            let cut = self.held.len() - keep;
+            let ready: String = self.held.drain(..cut).collect();
+            if self.in_think {
+                reasoning.push_str(&ready);
+            } else {
+                content.push_str(&ready);
+            }
+            return (reasoning, content);
+        }
+    }
+
+    fn finish(&mut self) -> (String, String) {
+        let rest = std::mem::take(&mut self.held);
+        if self.in_think {
+            (rest, String::new())
+        } else {
+            (String::new(), rest)
+        }
+    }
+}
+
+#[expect(deprecated)]
+fn completion_limit(req: &CreateChatCompletionRequest) -> Option<usize> {
+    req.max_completion_tokens
+        .or(req.max_tokens)
+        .and_then(|limit| usize::try_from(limit).ok())
+}
+
+#[expect(deprecated, reason = "`function_call` and `system_fingerprint` are deprecated fields of a chunk")]
+fn chunk(
+    id: &str,
+    model: &str,
+    created: u32,
+    first: bool,
+    content: Option<String>,
+    finish_reason: Option<FinishReason>,
+    usage: Option<CompletionUsage>,
+) -> CreateChatCompletionStreamResponse {
+    let delta = ChatCompletionStreamResponseDelta {
+        content,
+        function_call: None,
+        tool_calls: None,
+        role: first.then_some(Role::Assistant),
+        refusal: None,
+    };
+    CreateChatCompletionStreamResponse {
+        id: id.to_string(),
+        choices: vec![ChatChoiceStream {
+            index: 0,
+            delta,
+            finish_reason,
+            logprobs: None,
+        }],
+        created,
+        model: model.to_string(),
+        service_tier: None,
+        system_fingerprint: None,
+        object: "chat.completion.chunk".to_string(),
+        usage,
+    }
+}
+
+fn usage(outcome: Outcome) -> CompletionUsage {
+    CompletionUsage {
+        prompt_tokens: outcome.prompt_tokens,
+        completion_tokens: outcome.completion_tokens,
+        total_tokens: outcome.prompt_tokens + outcome.completion_tokens,
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
+    }
+}
+
+fn non_empty(text: String) -> Option<String> {
+    (!text.is_empty()).then_some(text)
+}
+
+fn now() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u32::try_from(d.as_secs()).ok())
+        .unwrap_or_default()
+}
+
+fn api_error(message: &str) -> OpenAIError {
+    OpenAIError::ApiError(ApiError {
+        message: message.to_string(),
+        r#type: None,
+        param: None,
+        code: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_split_tag_is_held_until_it_completes() {
+        let mut split = ThinkSplit::new(true);
+        assert_eq!(split.push("plan</th"), ("plan".to_string(), String::new()));
+        assert_eq!(split.push("ink>\n\nanswer"), (String::new(), "\n\nanswer".to_string()));
+        assert_eq!(split.finish(), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn a_reply_that_opens_its_own_block_is_split_too() {
+        let mut split = ThinkSplit::new(false);
+        assert_eq!(
+            split.push("<think>why</think>42"),
+            ("why".to_string(), "42".to_string())
+        );
+    }
+
+    #[test]
+    fn a_stop_sequence_ends_the_text_before_it() {
+        let mut stops = StopMatcher::new(vec!["\n\nUser:".to_string()]);
+        assert_eq!(stops.push("1, 2, 3\n"), ("1, 2, 3".to_string(), false));
+        assert_eq!(stops.push("\nUser: hi"), (String::new(), true));
+    }
+
+    #[test]
+    fn an_incomplete_character_waits_for_the_next_token() {
+        let mut bytes = "é".as_bytes()[..1].to_vec();
+        assert_eq!(take_utf8(&mut bytes), "");
+        bytes.extend(&"é".as_bytes()[1..]);
+        assert_eq!(take_utf8(&mut bytes), "é");
     }
 }

@@ -14,6 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(dead_code, clippy::allow_attributes)]
+
+// Accelerator engines are their own crates and self-register through a linkme slice. A
+// dev-dependency alone does not put an entry in a test binary — the linker drops the
+// unreferenced static — and every integration binary links separately, so each one that
+// exercises an engine needs its own reference. `integration.rs`'s
+// `accelerator_crates_register_their_engines` guards the mechanism; this is where the
+// binaries that share these helpers get it.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
+#[cfg(feature = "duckdb")]
+use accelerator_duckdb as _;
+#[cfg(feature = "postgres-accel")]
+use accelerator_postgres as _;
+#[cfg(feature = "sqlite")]
+use accelerator_sqlite as _;
+#[cfg(feature = "turso")]
+use accelerator_turso as _;
+
 use std::{
     fmt::Display,
     future::Future,
@@ -21,10 +40,17 @@ use std::{
     time::Duration,
 };
 
-use opentelemetry::InstrumentationScope;
-use opentelemetry_sdk::{runtime::TokioCurrentThread, trace::TracerProvider};
+use opentelemetry::{InstrumentationScope, global, trace::TracerProvider as _};
+use opentelemetry_sdk::{
+    Resource,
+    metrics::SdkMeterProvider,
+    runtime::TokioCurrentThread,
+    trace::{SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor},
+};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use runtime::{Runtime, task_history::otel_exporter::TaskHistoryExporter};
-use spicepod::component::runtime::TaskHistoryCapturedOutput;
+use serde::Deserialize;
+use spicepod::component::runtime::{TaskHistoryCapturedContext, TaskHistoryCapturedOutput};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::{EnvFilter, Layer, filter, fmt, layer::SubscriberExt};
 
@@ -32,6 +58,95 @@ use arrow::array::RecordBatch;
 use chrono::Timelike;
 use futures::StreamExt;
 use runtime_request_context::{Protocol, RequestContext, UserAgent};
+
+/// The one `MeterProvider` for the test process, installed before any instrument
+/// exists: instruments bind to the provider installed when they are first used, so
+/// force this before building a runtime whose metrics a test reads.
+pub(crate) static PROMETHEUS: LazyLock<prometheus::Registry> =
+    LazyLock::new(install_prometheus_meter_provider);
+
+/// Installs a `MeterProvider` backed by a scrapable Prometheus registry, as
+/// `spiced` does for the `--metrics` endpoint.
+fn install_prometheus_meter_provider() -> prometheus::Registry {
+    let registry = prometheus::Registry::new();
+
+    let exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .without_scope_info()
+        .without_units()
+        .without_counter_suffixes()
+        .without_target_info()
+        .build()
+        .expect("to build the prometheus exporter");
+
+    let provider = SdkMeterProvider::builder()
+        .with_resource(Resource::builder().build())
+        .with_reader(exporter)
+        .build();
+    global::set_meter_provider(provider);
+
+    registry
+}
+
+/// The summed value of counter `name` over the series whose `label` is `value`; `0`
+/// before any is recorded.
+pub(crate) fn counter_with_label(
+    registry: &prometheus::Registry,
+    name: &str,
+    label: &str,
+    value: &str,
+) -> f64 {
+    metric_value(registry, name, &[(label, value)])
+}
+
+/// The sum of `name` over the series that carry every label in `labels`; a histogram
+/// counts its samples. `0` before any is recorded.
+pub(crate) fn metric_value(
+    registry: &prometheus::Registry,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> f64 {
+    metric_series(registry, name, labels)
+        .iter()
+        .map(|(_, value)| value)
+        .sum()
+}
+
+/// The series of `name` that carry every label in `labels`, as `(labels, value)`; a
+/// histogram's value is its sample count.
+pub(crate) fn metric_series(
+    registry: &prometheus::Registry,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Vec<(Vec<(String, String)>, f64)> {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == name)
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .map(|metric| {
+            let metric_labels: Vec<(String, String)> = metric
+                .get_label()
+                .iter()
+                .map(|pair| (pair.name().to_string(), pair.value().to_string()))
+                .collect();
+            let value = match metric.get_histogram().as_ref() {
+                // Exact: a sample count is a small integer.
+                #[expect(clippy::cast_precision_loss)]
+                Some(histogram) => histogram.get_sample_count() as f64,
+                None => metric.get_counter().value(),
+            };
+            (metric_labels, value)
+        })
+        .filter(|(metric_labels, _)| {
+            labels.iter().all(|(name, value)| {
+                metric_labels
+                    .iter()
+                    .any(|(metric_name, metric_value)| metric_name == name && metric_value == value)
+            })
+        })
+        .collect()
+}
 
 pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock::new(|| {
     Arc::new(
@@ -45,14 +160,39 @@ pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock
 });
 
 pub(crate) async fn runtime_ready_check(rt: &Runtime) {
-    runtime_ready_check_with_timeout(rt, Duration::from_secs(120)).await;
+    runtime_ready_check_with_timeout(rt, Duration::from_mins(2)).await;
 }
 
 pub(crate) async fn runtime_ready_check_with_timeout(rt: &Runtime, duration: Duration) {
-    assert!(wait_until_true(duration, || async { rt.status().is_ready() }).await);
+    assert!(
+        wait_until_true(duration, || async { rt.status().is_ready() }).await,
+        "the runtime did not become ready within {duration:?} — {}",
+        describe_component_statuses(rt)
+    );
 }
 
-#[allow(dead_code)]
+/// Name every registered component and the state it is in.
+///
+/// The readiness wait elapses identically whether a component failed to load, is
+/// still initializing, or was never registered at all, so on its own it says only
+/// that the runtime is not ready. `ComponentStatus::Error` carries the message that
+/// put the component in that state, so naming the states turns the timeout into the
+/// reason for it.
+fn describe_component_statuses(rt: &Runtime) -> String {
+    let statuses = rt.status().get_all_statuses();
+    if statuses.is_empty() {
+        return "no components were registered".to_string();
+    }
+
+    let mut described: Vec<String> = statuses
+        .iter()
+        .map(|(component, status)| format!("{component}: {status:?}"))
+        .collect();
+    // `get_all_statuses` returns a `HashMap`, so sort for a stable message.
+    described.sort();
+    described.join(", ")
+}
+
 pub(crate) async fn runtime_ready_check_with_timeout_err(
     rt: &Runtime,
     duration: Duration,
@@ -82,28 +222,96 @@ where
     false
 }
 
-/// Returns the duration until the next occurrence of the nearest second.
-/// Optionally, add an overhead to apply to wait for a bit longer after the nearest second is reached.
-#[allow(dead_code)]
+/// Returns how long to sleep to land `wait` seconds after the next wall-clock second that
+/// is a multiple of `nearest_second`.
+///
+/// Most callers change something a cron-scheduled refresh should pick up, sleep here, then
+/// assert the refresh happened. That only holds when the boundary this targets is one whose
+/// tick has not fired yet, so the boundary is always strictly in the future. A reading that
+/// already sits on a boundary second therefore counts as a whole period away: that second's
+/// tick fired before the caller's change existed, so only the following tick can pick it up
+/// (#13759).
+///
+/// The reading is truncated to whole seconds, so the sleep can end up to a second past
+/// the boundary rather than before it. That direction spends none of the caller's grace.
 pub(crate) fn time_till_second(nearest_second: u32, wait: Option<u32>) -> Duration {
-    assert!(
-        nearest_second < 60,
-        "nearest_second must be between 0 and 59"
-    );
-    let now_second = chrono::Utc::now().second();
-    let modulus = now_second % nearest_second;
-    let time_until_nearest = if modulus == 0 {
-        0
-    } else {
-        nearest_second - modulus
-    };
-
-    Duration::from_secs(u64::from(time_until_nearest + wait.unwrap_or(0)))
+    time_till_second_at(chrono::Utc::now().second(), nearest_second, wait)
 }
 
-#[allow(dead_code)]
+/// [`time_till_second`] against a supplied clock reading, so the boundary arithmetic can
+/// be checked without waiting for a boundary to come round.
+fn time_till_second_at(now_second: u32, nearest_second: u32, wait: Option<u32>) -> Duration {
+    // Cron restarts its `*/n` count every minute, so a period that does not divide 60 has
+    // a short final gap this arithmetic does not model: `*/7` runs at :56 and then :00,
+    // which it would place at :63. Every caller uses 10, 15 or 30; refuse the rest here
+    // rather than let a future one sleep through the tick it is waiting for.
+    assert!(
+        nearest_second > 0 && nearest_second < 60 && 60 % nearest_second == 0,
+        "nearest_second must divide 60"
+    );
+
+    // In `1..=nearest_second`.
+    let till_boundary = nearest_second - now_second % nearest_second;
+
+    Duration::from_secs(u64::from(till_boundary) + u64::from(wait.unwrap_or(0)))
+}
+
+#[cfg(test)]
+mod time_till_second_tests {
+    use super::{Duration, time_till_second_at};
+
+    #[test]
+    fn a_reading_between_boundaries_waits_out_the_remainder() {
+        assert_eq!(time_till_second_at(7, 15, None), Duration::from_secs(8));
+        assert_eq!(
+            time_till_second_at(7, 15, Some(5)),
+            Duration::from_secs(13),
+            "the grace is added to the wait for the boundary, not to the boundary"
+        );
+    }
+
+    #[test]
+    fn a_reading_inside_a_boundary_second_waits_for_the_next_boundary() {
+        // The tick at :15 has already run, so a sleep of only the grace ends before the
+        // tick that can see the caller's change (#13759, as seen by
+        // `acceleration::cron::test_append_cron_schedule`).
+        assert_eq!(
+            time_till_second_at(15, 15, Some(5)),
+            Duration::from_secs(20),
+            "a boundary second is behind us, not ahead"
+        );
+        assert_eq!(time_till_second_at(0, 30, None), Duration::from_secs(30));
+        assert_eq!(
+            time_till_second_at(30, 30, Some(20)),
+            Duration::from_secs(50)
+        );
+    }
+
+    #[test]
+    fn no_reading_waits_longer_than_one_period() {
+        // One period is the ceiling the callers' nextest slow-timeout is sized for. 60 is
+        // the second chrono reports during a leap second; every accepted period divides
+        // it, so it needs no case of its own.
+        for nearest in [10_u32, 15, 30] {
+            for second in 0..=60 {
+                let waited = time_till_second_at(second, nearest, None);
+                assert!(
+                    waited > Duration::ZERO && waited <= Duration::from_secs(u64::from(nearest)),
+                    "second {second} with period {nearest} waited {waited:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "nearest_second must divide 60")]
+    fn a_period_that_does_not_divide_60_is_refused() {
+        let _ = time_till_second_at(59, 7, None);
+    }
+}
+
 pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), String> {
-    let mut secrets = runtime::secrets::Secrets::new();
+    let mut secrets = runtime_secrets::Secrets::new();
     // Will automatically load `env` as the default
     secrets
         .load_from(&[])
@@ -123,7 +331,6 @@ pub(crate) fn test_request_context() -> Arc<RequestContext> {
     Arc::clone(&TEST_REQUEST_CONTEXT)
 }
 
-#[allow(dead_code)]
 pub(crate) async fn run_query(
     rt: &Arc<Runtime>,
     query: &str,
@@ -138,7 +345,27 @@ pub(crate) async fn run_query(
     Ok(results)
 }
 
-#[allow(dead_code)]
+/// The SQL each federated scan in an `EXPLAIN` sends to the remote engine, one
+/// per line, and empty when nothing federated.
+///
+/// `base_sql=` is the only part of a plan that says what the remote engine is
+/// asked to evaluate -- the logical plan above it names the `DataFusion`
+/// function whether or not it was pushed down -- so a test claiming a call did
+/// or did not reach the source reads this rather than the whole plan.
+///
+/// Returns an error rather than an empty string when the plan will not format:
+/// "nothing federated" and "the assertion could not be made" must not look the
+/// same to a caller asserting emptiness.
+pub(crate) fn pushed_down_sql(plan: &[RecordBatch]) -> Result<String, anyhow::Error> {
+    let rendered = to_pretty_display(plan)?.to_string();
+    Ok(rendered
+        .split("base_sql=")
+        .skip(1)
+        .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display, anyhow::Error> {
     let pretty = arrow::util::pretty::pretty_format_batches(batches)
         .map_err(|e| anyhow::Error::msg(e.to_string()))?;
@@ -146,11 +373,43 @@ pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display,
     Ok(pretty)
 }
 
-#[allow(dead_code)]
 pub(crate) fn init_tracing_with_task_history(
     default_level: Option<&str>,
     rt: &Runtime,
-) -> (DefaultGuard, TracerProvider) {
+) -> (DefaultGuard, SdkTracerProvider) {
+    init_tracing_with_task_history_captured_context(
+        default_level,
+        rt,
+        TaskHistoryCapturedContext::Truncated,
+    )
+}
+
+pub(crate) fn init_tracing_with_task_history_captured_context(
+    default_level: Option<&str>,
+    rt: &Runtime,
+    captured_context: TaskHistoryCapturedContext,
+) -> (DefaultGuard, SdkTracerProvider) {
+    init_tracing_with_task_history_plan_capture(
+        default_level,
+        rt,
+        captured_context,
+        spicepod::component::runtime::TaskHistoryCapturedPlan::None,
+        None,
+        None,
+    )
+}
+
+/// Like [`init_tracing_with_task_history_captured_context`], but also configures
+/// plan capture mode/thresholds on both the exporter and `DataFusion` (for the
+/// execution-time `ExplainAnalyze` path).
+pub(crate) fn init_tracing_with_task_history_plan_capture(
+    default_level: Option<&str>,
+    rt: &Runtime,
+    captured_context: TaskHistoryCapturedContext,
+    captured_plan: spicepod::component::runtime::TaskHistoryCapturedPlan,
+    min_plan_duration_ms: Option<f64>,
+    min_sql_duration_ms: Option<f64>,
+) -> (DefaultGuard, SdkTracerProvider) {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
@@ -159,23 +418,41 @@ pub(crate) fn init_tracing_with_task_history(
 
     let fmt_layer = fmt::layer().with_ansi(true).with_filter(filter);
 
-    let task_history_exporter = TaskHistoryExporter::new(
-        rt.datafusion(),
-        TaskHistoryCapturedOutput::Truncated,
-        None, // min_sql_duration_ms
-        spicepod::component::runtime::TaskHistoryCapturedPlan::None,
-        None, // min_plan_duration_ms
+    rt.datafusion().set_plan_capture_config(
+        runtime::datafusion::query::plan_capture::PlanCaptureConfig {
+            captured_plan: captured_plan.clone(),
+            min_plan_duration_ms,
+            min_sql_duration_ms,
+        },
     );
 
+    let (ballista_transform, ballista_retention) =
+        runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
+    let query_engine: std::sync::Arc<dyn runtime_query_engine::query_engine::QueryEngine> =
+        rt.datafusion();
+    let task_history_exporter = TaskHistoryExporter::new(
+        query_engine,
+        TaskHistoryCapturedOutput::Truncated,
+        captured_context,
+        min_sql_duration_ms,
+        captured_plan,
+        min_plan_duration_ms,
+        None, // scheduler_id - not in cluster mode for tests
+    )
+    .with_transform(ballista_transform)
+    .with_retention(ballista_retention);
+
     // Tests hang if we don't use TokioCurrentThread here (similar to https://github.com/open-telemetry/opentelemetry-rust/issues/868)
-    let provider = TracerProvider::builder()
-        .with_batch_exporter(task_history_exporter, TokioCurrentThread)
+    let processor = BatchSpanProcessor::builder(task_history_exporter, TokioCurrentThread).build();
+
+    let provider = SdkTracerProvider::builder()
+        .with_span_processor(processor)
         .build();
 
     let scope = InstrumentationScope::builder("task_history")
         .with_version(env!("CARGO_PKG_VERSION"))
         .build();
-    let tracer = opentelemetry::trace::TracerProvider::tracer_with_scope(&provider, scope);
+    let tracer = provider.tracer_with_scope(scope);
 
     let task_history_layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
@@ -190,4 +467,483 @@ pub(crate) fn init_tracing_with_task_history(
     let guard = tracing::subscriber::set_default(subscriber);
 
     (guard, provider)
+}
+
+/// Response structure for xAI models list API
+#[derive(Debug, Deserialize)]
+struct XaiModelsResponse {
+    data: Vec<XaiModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XaiModel {
+    id: String,
+}
+
+/// Response structure for xAI API errors
+#[derive(Debug, Deserialize)]
+struct XaiErrorResponse {
+    error: Option<XaiError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XaiError {
+    message: String,
+    code: Option<String>,
+}
+
+/// Verify that a specific model is available from xAI.
+/// This calls the xAI models API directly to check if the model exists.
+/// Returns Ok(()) if the model is available, Err with a descriptive message otherwise.
+pub(crate) async fn verify_xai_model_available(model_id: &str) -> Result<(), String> {
+    let api_key = std::env::var("SPICE_XAI_API_KEY")
+        .map_err(|_| "SPICE_XAI_API_KEY environment variable not set".to_string())?;
+
+    let client = reqwest::Client::new();
+    let url = format!("https://api.x.ai/v1/models/{model_id}");
+
+    let response = client
+        .get(&url)
+        .header(AUTHORIZATION, format!("Bearer {api_key}"))
+        .header(CONTENT_TYPE, "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to xAI API: {e}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read xAI API response: {e}"))?;
+
+    if status.is_success() {
+        Ok(())
+    } else {
+        // Try to parse error response for better error message
+        if let Ok(error_resp) = serde_json::from_str::<XaiErrorResponse>(&body)
+            && let Some(error) = error_resp.error
+        {
+            return Err(format!(
+                "xAI model '{model_id}' not available: {} (code: {})",
+                error.message,
+                error.code.unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        Err(format!(
+            "xAI model '{model_id}' not available (HTTP {status}): {body}"
+        ))
+    }
+}
+
+/// List all available xAI models
+pub(crate) async fn list_xai_models() -> Result<Vec<String>, String> {
+    let api_key = std::env::var("SPICE_XAI_API_KEY")
+        .map_err(|_| "SPICE_XAI_API_KEY environment variable not set".to_string())?;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get("https://api.x.ai/v1/models")
+        .header(AUTHORIZATION, format!("Bearer {api_key}"))
+        .header(CONTENT_TYPE, "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to xAI API: {e}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read xAI API response: {e}"))?;
+
+    if status.is_success() {
+        let models: XaiModelsResponse = serde_json::from_str(&body)
+            .map_err(|e| format!("Failed to parse xAI models response: {e}. Body: {body}"))?;
+        Ok(models.data.into_iter().map(|m| m.id).collect())
+    } else {
+        if let Ok(error_resp) = serde_json::from_str::<XaiErrorResponse>(&body)
+            && let Some(error) = error_resp.error
+        {
+            return Err(format!(
+                "Failed to list xAI models: {} (code: {})",
+                error.message,
+                error.code.unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        Err(format!("Failed to list xAI models (HTTP {status}): {body}"))
+    }
+}
+
+/// Verify that a specific model is available from `OpenAI`.
+pub(crate) async fn verify_openai_model_available(model_id: &str) -> Result<(), String> {
+    let api_key = std::env::var("SPICE_OPENAI_API_KEY")
+        .map_err(|_| "SPICE_OPENAI_API_KEY environment variable not set".to_string())?;
+
+    let client = reqwest::Client::new();
+    let url = format!("https://api.openai.com/v1/models/{model_id}");
+
+    let response = client
+        .get(&url)
+        .header(AUTHORIZATION, format!("Bearer {api_key}"))
+        .header(CONTENT_TYPE, "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to OpenAI API: {e}"))?;
+
+    let status = response.status();
+
+    if status.is_success() {
+        Ok(())
+    } else {
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read OpenAI API response: {e}"))?;
+        Err(format!(
+            "OpenAI model '{model_id}' not available (HTTP {status}): {body}"
+        ))
+    }
+}
+
+/// Anthropic doesn't have a models list API, so we validate using a minimal messages request.
+/// This sends a minimal request to check if the model is accessible.
+pub(crate) async fn verify_anthropic_model_available(model_id: &str) -> Result<(), String> {
+    let api_key = std::env::var("SPICE_ANTHROPIC_API_KEY")
+        .map_err(|_| "SPICE_ANTHROPIC_API_KEY environment variable not set".to_string())?;
+
+    let client = reqwest::Client::new();
+
+    // Send a minimal request to check model availability
+    let body = serde_json::json!({
+        "model": model_id,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    let response = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to Anthropic API: {e}"))?;
+
+    let status = response.status();
+
+    if status.is_success() {
+        Ok(())
+    } else {
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read Anthropic API response: {e}"))?;
+
+        // Check for specific error types
+        if status.as_u16() == 404 {
+            return Err(format!(
+                "Anthropic model '{model_id}' not found. Verify the model identifier is correct."
+            ));
+        }
+
+        Err(format!(
+            "Anthropic model '{model_id}' not available (HTTP {status}): {body}"
+        ))
+    }
+}
+
+/// Verify that a Bedrock model is accessible.
+/// Since Bedrock uses AWS SDK authentication, we verify by checking if the model ID
+/// matches known Bedrock model patterns.
+/// For runtime verification, the actual health check happens when the model is loaded.
+pub(crate) fn verify_bedrock_model_available(model_id: &str) -> Result<(), String> {
+    // Bedrock model IDs follow specific patterns
+    // Examples: amazon.titan-embed-text-v1, anthropic.claude-3-sonnet-20240229-v1:0
+    let valid_prefixes = [
+        "amazon.",
+        "anthropic.",
+        "cohere.",
+        "meta.",
+        "mistral.",
+        "ai21.",
+        "stability.",
+    ];
+
+    // Check if model ID matches any known provider prefix
+    if valid_prefixes
+        .iter()
+        .any(|prefix| model_id.starts_with(prefix))
+    {
+        // For Bedrock, we rely on AWS SDK authentication at runtime
+        // Here we just validate the format is correct
+        Ok(())
+    } else {
+        Err(format!(
+            "Bedrock model '{model_id}' does not match known model ID patterns. \
+             Expected format: <provider>.<model-name>[-version] \
+             (e.g., amazon.titan-embed-text-v1, anthropic.claude-3-sonnet-20240229-v1:0)"
+        ))
+    }
+}
+
+/// Verify models from multiple providers in parallel, failing fast if any model is unavailable.
+/// Returns Ok(()) if all models are available, or an error listing all unavailable models.
+pub(crate) async fn verify_models_available(
+    models: &[(&str, &str)], // Vec of (provider, model_id) tuples
+) -> Result<(), String> {
+    use futures::future::join_all;
+
+    let futures: Vec<_> = models
+        .iter()
+        .map(|(provider, model_id)| async move {
+            let result = match *provider {
+                "openai" => verify_openai_model_available(model_id).await,
+                "anthropic" => verify_anthropic_model_available(model_id).await,
+                "xai" => verify_xai_model_available(model_id).await,
+                "bedrock" => verify_bedrock_model_available(model_id),
+                _ => Err(format!("Unknown provider: {provider}")),
+            };
+            (format!("{provider}:{model_id}"), result)
+        })
+        .collect();
+
+    let results = join_all(futures).await;
+    let errors: Vec<String> = results
+        .into_iter()
+        .filter_map(|(model, result)| result.err().map(|e| format!("{model}: {e}")))
+        .collect();
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "The following models are not available:\n{}",
+            errors.join("\n")
+        ))
+    }
+}
+
+/// Helper struct for building model verification lists
+pub struct ModelVerificationBuilder {
+    models: Vec<(String, String)>,
+}
+
+impl ModelVerificationBuilder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { models: Vec::new() }
+    }
+
+    #[must_use]
+    pub fn openai(mut self, model_id: &str) -> Self {
+        self.models
+            .push(("openai".to_string(), model_id.to_string()));
+        self
+    }
+
+    #[must_use]
+    pub fn anthropic(mut self, model_id: &str) -> Self {
+        self.models
+            .push(("anthropic".to_string(), model_id.to_string()));
+        self
+    }
+
+    #[must_use]
+    pub fn xai(mut self, model_id: &str) -> Self {
+        self.models.push(("xai".to_string(), model_id.to_string()));
+        self
+    }
+
+    #[must_use]
+    pub fn bedrock(mut self, model_id: &str) -> Self {
+        self.models
+            .push(("bedrock".to_string(), model_id.to_string()));
+        self
+    }
+
+    /// Verify all added models are available
+    pub async fn verify(self) -> Result<(), String> {
+        let model_refs: Vec<(&str, &str)> = self
+            .models
+            .iter()
+            .map(|(p, m)| (p.as_str(), m.as_str()))
+            .collect();
+        verify_models_available(&model_refs).await
+    }
+}
+
+impl Default for ModelVerificationBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Registers all external data connectors for integration tests.
+///
+/// This function must be called before creating a runtime in tests that use
+/// connectors from the extracted crates (e.g., duckdb, postgres, mysql, etc.).
+/// Without this, the runtime won't be able to find connectors like "duckdb".
+///
+/// This function is idempotent - calling it multiple times is safe and efficient
+/// as the registration only happens once.
+///
+/// # Example
+///
+/// ```ignore
+/// #[tokio::test]
+/// async fn test_duckdb_connector() {
+///     register_test_connectors().await;
+///     let rt = Runtime::builder().build().await;
+///     // Now duckdb connector is available
+/// }
+/// ```
+pub(crate) async fn register_test_connectors() {
+    // Simply register all connectors. This is idempotent since the registry
+    // is a HashMap and duplicate inserts just overwrite with the same value.
+    // We avoid using OnceCell to prevent any potential async synchronization issues.
+    do_register_test_connectors().await;
+}
+
+async fn do_register_test_connectors() {
+    use runtime::dataconnector::register_connector_factory;
+
+    tracing::debug!("Starting connector registration for tests");
+
+    // Register all connectors - dev-dependencies are always compiled regardless of features
+    register_connector_factory(
+        connector_clickhouse::CONNECTOR_NAME,
+        connector_clickhouse::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_dynamodb::CONNECTOR_NAME,
+        connector_dynamodb::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_databricks::CONNECTOR_NAME,
+        connector_databricks::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_delta_lake::CONNECTOR_NAME,
+        connector_delta_lake::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_dremio::CONNECTOR_NAME,
+        connector_dremio::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_duckdb::CONNECTOR_NAME,
+        connector_duckdb::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_flightsql::CONNECTOR_NAME,
+        connector_flightsql::factory(),
+    )
+    .await;
+    register_connector_factory(connector_ftp::CONNECTOR_NAME, connector_ftp::factory()).await;
+    register_connector_factory(
+        connector_graphql::CONNECTOR_NAME,
+        connector_graphql::factory(),
+    )
+    .await;
+    register_connector_factory(connector_imap::CONNECTOR_NAME, connector_imap::factory()).await;
+    register_connector_factory(
+        connector_mongodb::CONNECTOR_NAME,
+        connector_mongodb::factory(),
+    )
+    .await;
+    register_connector_factory(connector_mssql::CONNECTOR_NAME, connector_mssql::factory()).await;
+    register_connector_factory(connector_mysql::CONNECTOR_NAME, connector_mysql::factory()).await;
+    // Note: connector-odbc is not registered here because it requires the unixODBC system library
+    // ODBC tests should use feature gates and run in environments with ODBC installed
+    register_connector_factory(
+        connector_oracle::CONNECTOR_NAME,
+        connector_oracle::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_postgres::CONNECTOR_NAME,
+        connector_postgres::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_scylladb::CONNECTOR_NAME,
+        connector_scylladb::factory(),
+    )
+    .await;
+    register_connector_factory(connector_sftp::CONNECTOR_NAME, connector_sftp::factory()).await;
+    register_connector_factory(
+        connector_sharepoint::CONNECTOR_NAME,
+        connector_sharepoint::factory(),
+    )
+    .await;
+    register_connector_factory(connector_smb::CONNECTOR_NAME, connector_smb::factory()).await;
+    register_connector_factory(
+        connector_snowflake::CONNECTOR_NAME,
+        connector_snowflake::factory(),
+    )
+    .await;
+    register_connector_factory(connector_spark::CONNECTOR_NAME, connector_spark::factory()).await;
+
+    // Connectors extracted into dedicated crates (registered the same way as in `bin/spiced`).
+    register_connector_factory(connector_abfs::CONNECTOR_NAME, connector_abfs::factory()).await;
+    // Also register the "abfss" prefix (secure variant uses the same factory)
+    register_connector_factory("abfss", connector_abfs::factory()).await;
+    register_connector_factory(connector_adbc::CONNECTOR_NAME, connector_adbc::factory()).await;
+    register_connector_factory(
+        connector_cosmosdb::CONNECTOR_NAME,
+        connector_cosmosdb::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_ducklake::CONNECTOR_NAME,
+        connector_ducklake::factory(),
+    )
+    .await;
+    register_connector_factory(connector_gcs::CONNECTOR_NAME, connector_gcs::factory()).await;
+    // Also register the "gs" prefix alias for GCS
+    register_connector_factory("gs", connector_gcs::factory()).await;
+    register_connector_factory(connector_git::CONNECTOR_NAME, connector_git::factory()).await;
+    register_connector_factory(
+        connector_github::CONNECTOR_NAME,
+        connector_github::factory(),
+    )
+    .await;
+    register_connector_factory(connector_glue::CONNECTOR_NAME, connector_glue::factory()).await;
+    register_connector_factory(connector_kafka::CONNECTOR_NAME, connector_kafka::factory()).await;
+    register_connector_factory(
+        connector_spiceai::CONNECTOR_NAME,
+        connector_spiceai::factory(),
+    )
+    .await;
+    // Also register the legacy "spiceai" prefix
+    register_connector_factory(
+        connector_spiceai::LEGACY_CONNECTOR_NAME,
+        connector_spiceai::legacy_factory(),
+    )
+    .await;
+
+    tracing::debug!("Completed connector registration for tests");
+}
+
+/// Fails the calling test unless it runs in a process of its own.
+///
+/// nextest runs every test in its own process; plain `cargo test` runs a
+/// binary's tests on threads of one process. A test that changes process-global
+/// state calls this before changing it, so under `cargo test` it fails with
+/// instructions instead of changing the state every neighbouring test runs under.
+/// `why` names that state.
+pub fn require_process_per_test(why: &str) {
+    assert!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test"),
+        "{why}, so it must run in a process of its own. Run it with \
+         `cargo nextest run -p runtime --test integration <test name>`: plain \
+         `cargo test` runs every test in the binary on threads of one process"
+    );
 }

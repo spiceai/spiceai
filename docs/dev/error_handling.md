@@ -140,8 +140,6 @@ Related reading:
         Is your `file_format` parameter correct? Spice found the following file extensions: '.parquet'.
     ```
 
-    ```
-
 6. **Do not use internal concepts in error messages**
 
     Users generally do not care about the fact that the logical plan builder failed to construct - they care about the fact that their query failed.

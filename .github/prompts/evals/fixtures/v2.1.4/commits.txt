@@ -1,0 +1,18 @@
+# Frozen output of: git log v2.1.3..HEAD --oneline --no-merges
+# Captured for the writeReleaseNotes eval. Do not regenerate against live history.
+a1b2c3d feat(snowflake): add on_conflict write-back behaviour (#12010)
+b2c3d4e feat(cayenne): add cayenne_scan_concurrency setting (#12014)
+c3d4e5f fix(postgres): retry replication slot creation on SQLSTATE 55006 (#12019)
+d4e5f6a fix(cayenne): correct row counts after deletion-vector compaction (#12021)
+e5f6a7b feat(runtime)!: rename runtime.cpu.cores to runtime.cpu.limit (#12025)
+f6a7b8c chore(deps): bump duckdb from 1.5.3 to 1.6.0 (#12027)
+a7b8c9d chore(deps): bump serde from 1.0.219 to 1.0.221 (#12028)
+b8c9d0e fix(tests): update snapshots for DataFusion 54 (#12002)
+c9d0e1f chore(ci): rewrite the benchmark dispatch workflow (#12005)
+d0e1f2a fix(flight): return 503 instead of 500 when the memory pool refuses a query (#12031)
+e1f2a3b docs: fix typo in acceleration README (#12033)
+f2a3b4c chore: Clean up Cargo.lock (#12035)
+a3b4c5d feat(search): add recency_decay parameter to rrf() (#12038)
+b4c5d6e revert: "feat(cayenne): experimental spill-to-disk" (#12040)
+c5d6e7f fix(duckdb): honor memory_limit for file-mode accelerations (#12042)
+d6e7f8a chore(benchmarks): disable flaky tpcds q78 in CI (#12044)

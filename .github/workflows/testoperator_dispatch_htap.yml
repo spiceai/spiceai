@@ -1,0 +1,137 @@
+name: testoperator dispatch htap
+
+on:
+  schedule:
+    # htap-sf1000-adaptive, every 8 hours (0000, 0800, 1600) — the high-value SF1000 adaptive
+    # configs (mysql + postgres, which also run the Cayenne datalake tier) for frequent adaptive
+    # trend data (spiceai-dev-xlarge-runners). With the daily batch below that is 8 runs/day on
+    # the serialized SF1000 xlarge queue at a 30-minute HTAP window, leaving slack for slow arms.
+    - cron: '0 */8 * * *'
+    # htap-sf1000 (the turso-metastore adaptive configs), once daily (0400) on the xlarge pool.
+    # 0400 sits after the 0000 adaptive batch so it usually starts on an idle slot rather than
+    # queueing immediately.
+    - cron: '0 4 * * *'
+    # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners).
+    # SF1 uses a different runner pool and a unique concurrency group, so it does not serialize
+    # with the SF1000 xlarge queue.
+    - cron: '0 6,18 * * *'
+    # htap-sf1-source-versions, weekly (Sunday 0200) — the SF1 PostgreSQL and MySQL Cayenne
+    # configs on every source release line in test/source_versions.json (7 runs), on the
+    # same large runners as htap-sf1, which start the source in Docker at a chosen version.
+    - cron: '0 2 * * 0'
+    # htap-sf1-layouts, weekly (Sunday 0300) — the SF1 configs under acceleration layouts
+    # (dispatch/chbench/sf1-layouts, 10 runs), on the same large runners as htap-sf1.
+    - cron: '0 3 * * 0'
+
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'An optional commit hash to use for spiced'
+        required: false
+        type: string
+      scale_factor:
+        description: 'Scale factor to run'
+        required: true
+        type: choice
+        options:
+          - 'sf1'
+          - 'sf10'
+          - 'sf100'
+          - 'sf1000'
+          - 'sf1000-adaptive'
+          - 'sf1-source-versions'
+          - 'sf1-layouts'
+
+jobs:
+  dispatch-htap:
+    name: Dispatch HTAP - ${{ github.event.inputs.scale_factor || github.event.schedule }}
+    runs-on: spiceai-dev-runners
+    # The dispatcher only fires the workflow_dispatch events (spaced ~80s apart) and exits; the runs
+    # themselves serialize via the htap workflow's queue: max concurrency group, not here. So this
+    # only needs to cover the build + dispatch loop (≤~10 min for the largest batch), not the sum of
+    # run durations.
+    timeout-minutes: 120
+    # Per-cron group on schedule (so the SF1/SF100/SF1000 dispatchers don't block each other),
+    # per-ref on manual dispatch.
+    concurrency:
+      group: testoperator-dispatch-htap-${{ github.event.schedule || github.event.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        id: setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
+          # github.event.ref is empty on schedule (cron only runs on the default branch).
+          ref: ${{ github.event.ref || 'refs/heads/trunk' }}
+
+      - name: Display spiced commit
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicepod validator
+        id: build-spicepod-validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Set spicepod validator path
+        run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV
+
+      - name: Validate spicepods - CH-BenCHmark
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/chbench/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      # On manual dispatch the scale factor comes from the input. On schedule, derive it from the
+      # cron that fired. Both manual and scheduled dispatch are fire-and-forget: the runs serialize
+      # via the htap workflow's queue: max concurrency group (FIFO), so the dispatcher no longer
+      # feeds them one at a time with --max-concurrent.
+      - name: Resolve scale factor
+        id: resolve
+        run: |
+          SF="${{ github.event.inputs.scale_factor }}"
+          if [ -z "$SF" ]; then
+            case "${{ github.event.schedule }}" in
+              '0 */8 * * *')                  SF=sf1000-adaptive ;;
+              '0 4 * * *')                    SF=sf1000 ;;
+              '0 6,18 * * *')                 SF=sf1 ;;
+              '0 2 * * 0')                    SF=sf1-source-versions ;;
+              '0 3 * * 0')                    SF=sf1-layouts ;;
+              *)                              SF= ;;   # unrecognized cron — dispatch nothing
+            esac
+          fi
+          echo "Resolved scale factor: '$SF'"
+          echo "scale_factor=$SF" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch Testoperator - HTAP - CH-BenCHmark - ${{ steps.resolve.outputs.scale_factor }}
+        if: ${{ steps.resolve.outputs.scale_factor != '' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/${{ steps.resolve.outputs.scale_factor }} \
+            --workflow htap
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref || 'trunk' }}

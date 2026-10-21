@@ -9,25 +9,39 @@ updates:
     directory: '/' # Location of package manifests
     schedule:
       interval: 'weekly'
+    # enforce-pull-with-spice requires both a kind/ and an area/ label, and it is
+    # a required check — without area/ these bumps cannot enter the merge queue
+    # however green their Attestation is.
     labels:
       - 'rust'
       - 'kind/dependencies'
-
-  - package-ecosystem: 'gomod' # See documentation for possible values
-    directory: '/' # Location of package manifests
-    schedule:
-      interval: 'weekly'
-    labels:
-      - 'go'
-      - 'kind/dependencies'
+      - 'area/build'
+    groups:
+      aws-sdk:
+        patterns:
+          - 'aws-*'
+      rust-dependencies:
+        patterns:
+          - '*'
 
   - package-ecosystem: 'github-actions' # See documentation for possible values
-    directory: '/' # Location of package manifests
+    # Note: directory: '/' covers .github/workflows/ (and root action.yml per docs), but composite
+    # actions in .github/actions/*/action.yml are not auto-scanned; use explicit directories (or
+    # globs like '/.github/actions/*' if supported by the Dependabot version) to cover them.
+    # See https://github.com/dependabot/dependabot-core/issues/6704
+    directories:
+      - '/'
+      - '/.github/actions/*'
     schedule:
       interval: 'weekly'
     labels:
       - 'github_actions'
       - 'kind/dependencies'
+      - 'area/ci'
+    groups:
+      github-actions-dependencies:
+        patterns:
+          - '*'
 
   - package-ecosystem: 'docker' # See documentation for possible values
     directory: '/' # Location of package manifests
@@ -36,3 +50,8 @@ updates:
     labels:
       - 'docker'
       - 'kind/dependencies'
+      - 'area/build'
+    groups:
+      docker-dependencies:
+        patterns:
+          - '*'

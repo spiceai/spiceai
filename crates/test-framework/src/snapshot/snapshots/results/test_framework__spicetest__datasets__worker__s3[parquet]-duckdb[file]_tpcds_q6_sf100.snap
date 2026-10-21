@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q6"
+---
++-------+------+
+| state | cnt  |
++-------+------+
+| DC    | 85   |
+| DE    | 228  |
+| HI    | 314  |
+| RI    | 354  |
+| CT    | 697  |
+| NH    | 812  |
+| MA    | 1053 |
+| VT    | 1121 |
+| AZ    | 1227 |
+| ME    | 1372 |
++-------+------+

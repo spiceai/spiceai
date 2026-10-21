@@ -18,114 +18,103 @@ limitations under the License.
 #![allow(clippy::missing_panics_doc)]
 
 //! Adds telemetry to leaf nodes (i.e. `TableScans`) to track the number of bytes scanned during query execution.
+use crate::extension::request_context::resolve_request_context;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use async_trait::async_trait;
-use datafusion::common::{Statistics, internal_err};
+use datafusion::common::Statistics;
+use datafusion::common::tree_node::TransformedResult;
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
-use datafusion::execution::SessionState;
-use datafusion::logical_expr::UserDefinedLogicalNode;
 use datafusion::physical_expr::OrderingRequirements;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::SortOrderPushdownResult;
 use datafusion::physical_plan::execution_plan::{
     CardinalityEffect, InvariantLevel, check_default_invariants,
 };
+use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
 };
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::{Distribution, PhysicalExpr, PlanProperties};
-use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
+use datafusion::physical_plan::{
+    ChildStats, Distribution, InputDistributionRequirements, PhysicalExpr, PlanProperties,
+    ReplaceChildrenOptions, StatisticsArgs, StatisticsContext,
+};
 use datafusion::{
-    common::{
-        DFSchemaRef,
-        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
-    },
+    common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     error::Result,
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNodeCore},
-    optimizer::{OptimizerConfig, OptimizerRule},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, stream::RecordBatchStreamAdapter,
     },
-    prelude::Expr,
 };
-use datafusion_federation::FederatedPlanNode;
 use futures::{Stream, StreamExt};
 use opentelemetry::KeyValue;
-use runtime_request_context::{Protocol, RequestContext, RequestContextBuilder};
+use runtime_request_context::RequestContext;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::{
-    any::Any,
-    collections::HashSet,
-    fmt::{self, Debug},
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+use std::{any::Any, sync::Arc};
 
 /// A function that receives the number of bytes processed with [`KeyValue`] dimensions from the thread's [`RequestContext`].
 pub type BytesEmittedCallback = Box<dyn Fn(u64, &[KeyValue]) + Send + Sync + 'static>;
 
-pub struct BytesProcessedExtensionPlanner {
+pub struct BytesProcessedPhysicalOptimizer {
     emit_bytes_callback: Arc<BytesEmittedCallback>,
-    fallback_to_new_context: bool,
 }
 
-impl Default for BytesProcessedExtensionPlanner {
-    fn default() -> Self {
-        BytesProcessedExtensionPlanner {
-            emit_bytes_callback: Arc::new(Box::new(|_, _| {})),
-            fallback_to_new_context: false,
-        }
-    }
-}
-
-impl BytesProcessedExtensionPlanner {
+impl BytesProcessedPhysicalOptimizer {
     #[must_use]
-    pub fn new(emit_bytes_callback: BytesEmittedCallback, fallback_to_new_context: bool) -> Self {
-        BytesProcessedExtensionPlanner {
-            emit_bytes_callback: Arc::new(emit_bytes_callback),
-            fallback_to_new_context,
+    pub fn new(emit_bytes_callback: Arc<BytesEmittedCallback>) -> Self {
+        Self {
+            emit_bytes_callback,
         }
     }
 }
 
-#[async_trait]
-impl ExtensionPlanner for BytesProcessedExtensionPlanner {
-    async fn plan_extension(
-        &self,
-        _planner: &dyn PhysicalPlanner,
-        node: &dyn UserDefinedLogicalNode,
-        logical_inputs: &[&LogicalPlan],
-        physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
-    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        // bytes_processed Extension
-        let bytes_processed_node = node.as_any().downcast_ref::<BytesProcessedNode>();
-        if bytes_processed_node.is_some() {
-            assert_eq!(logical_inputs.len(), 1, "should have 1 input");
-            assert_eq!(physical_inputs.len(), 1, "should have 1 input");
-            let physical_input = &physical_inputs[0];
+impl std::fmt::Debug for BytesProcessedPhysicalOptimizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BytesProcessedPhysicalOptimizer").finish()
+    }
+}
 
-            let mut exec_plan = BytesProcessedExec::new(
-                Arc::clone(physical_input),
-                Arc::clone(&self.emit_bytes_callback),
-            );
-            if self.fallback_to_new_context {
-                exec_plan = exec_plan.fallback_to_new_context();
+impl PhysicalOptimizerRule for BytesProcessedPhysicalOptimizer {
+    fn name(&self) -> &'static str {
+        "BytesProcessedPhysicalOptimizer"
+    }
+
+    fn schema_check(&self) -> bool {
+        false
+    }
+
+    fn optimize(
+        &self,
+        plan: std::sync::Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        plan.transform_down(|plan| {
+            if plan.is::<BytesProcessedExec>() {
+                return Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump));
             }
 
-            return Ok(Some(Arc::new(exec_plan)));
-        }
+            if !plan.children().is_empty() {
+                return Ok(Transformed::new(plan, false, TreeNodeRecursion::Continue));
+            }
 
-        Ok(None)
+            let mut exec_plan =
+                BytesProcessedExec::new(plan, Arc::clone(&self.emit_bytes_callback));
+
+            exec_plan = exec_plan.fallback_to_new_context();
+
+            Ok(Transformed::new(
+                Arc::new(exec_plan),
+                true,
+                TreeNodeRecursion::Jump,
+            ))
+        })
+        .data()
     }
 }
-
-#[derive(Debug, Default)]
-pub struct BytesProcessedOptimizerRule {}
 
 struct BytesProcessedStream {
     inner: SendableRecordBatchStream,
@@ -160,7 +149,8 @@ impl Stream for BytesProcessedStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                self.bytes_processed += batch.get_array_memory_size() as u64;
+                let array_size: usize = batch.get_array_memory_size();
+                self.bytes_processed += array_size as u64;
                 Poll::Ready(Some(Ok(batch)))
             }
             Poll::Ready(None) => {
@@ -171,170 +161,6 @@ impl Stream for BytesProcessedStream {
         }
     }
 }
-
-/// Walk over the plan and insert a `BytesProcessedNode` as the parent of any `TableScans` and `FederationNodes`.
-///
-/// This should be added as an optimizer rule to run after the `PushDownLimit` rule, since it doesn't support pushing
-/// down limits for extension nodes.
-impl OptimizerRule for BytesProcessedOptimizerRule {
-    /// Walk over the plan and insert a `BytesProcessedNode` as the parent of any `TableScans` and `FederationNodes`.
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Transformed<LogicalPlan>> {
-        plan.transform_down(|plan| match plan {
-            LogicalPlan::Extension(extension) => {
-                // If the extension is already a BytesProcessedNode, don't add another one.
-                if extension
-                    .node
-                    .as_any()
-                    .downcast_ref::<BytesProcessedNode>()
-                    .is_some()
-                {
-                    return Ok(Transformed::new(
-                        LogicalPlan::Extension(extension),
-                        false,
-                        TreeNodeRecursion::Jump, // Don't process any further children of this sub-tree.
-                    ));
-                }
-
-                let plan_node = extension.node.as_any().downcast_ref::<FederatedPlanNode>();
-
-                if plan_node.is_some() {
-                    let bytes_processed =
-                        BytesProcessedNode::new(LogicalPlan::Extension(extension.clone()));
-                    let ext_node = Extension {
-                        node: Arc::new(bytes_processed),
-                    };
-                    Ok(Transformed::new(
-                        LogicalPlan::Extension(ext_node),
-                        true,
-                        TreeNodeRecursion::Jump,
-                    ))
-                } else {
-                    Ok(Transformed::no(LogicalPlan::Extension(extension)))
-                }
-            }
-            LogicalPlan::TableScan(table_scan) => {
-                let bytes_processed = BytesProcessedNode::new(LogicalPlan::TableScan(table_scan));
-                let ext_node = Extension {
-                    node: Arc::new(bytes_processed),
-                };
-                Ok(Transformed::new(
-                    LogicalPlan::Extension(ext_node),
-                    true,
-                    TreeNodeRecursion::Jump,
-                ))
-            }
-            _ => Ok(Transformed::no(plan)),
-        })
-    }
-
-    /// A human readable name for this optimizer rule
-    fn name(&self) -> &'static str {
-        "bytes_processed_optimizer_rule"
-    }
-}
-
-impl BytesProcessedOptimizerRule {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-#[derive(PartialOrd)]
-pub struct BytesProcessedNode {
-    pub(super) input: LogicalPlan,
-}
-
-impl BytesProcessedNode {
-    #[must_use]
-    pub fn new(input: LogicalPlan) -> Self {
-        assert!(input.inputs().is_empty(), "should have no inputs");
-        Self { input }
-    }
-}
-
-impl Debug for BytesProcessedNode {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        UserDefinedLogicalNodeCore::fmt_for_explain(self, f)
-    }
-}
-
-impl UserDefinedLogicalNodeCore for BytesProcessedNode {
-    fn name(&self) -> &'static str {
-        "BytesProcessedNode"
-    }
-
-    fn inputs(&self) -> Vec<&LogicalPlan> {
-        vec![&self.input]
-    }
-
-    fn schema(&self) -> &DFSchemaRef {
-        self.input.schema()
-    }
-
-    fn expressions(&self) -> Vec<Expr> {
-        Vec::new()
-    }
-
-    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "BytesProcessedNode")
-    }
-
-    /// Returns the necessary input columns for this node required to compute
-    /// the columns in the output schema
-    ///
-    /// This is used for projection push-down when `DataFusion` has determined that
-    /// only a subset of the output columns of this node are needed by its parents.
-    /// This API is used to tell `DataFusion` which, if any, of the input columns are no longer
-    /// needed.
-    ///
-    /// Return `None`, the default, if this information can not be determined.
-    /// Returns `Some(_)` with the column indices for each child of this node that are
-    /// needed to compute `output_columns`
-    fn necessary_children_exprs(&self, output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
-        // Since the input & output schema is the same, output columns require their corresponding index in the input columns.
-        Some(vec![output_columns.to_vec()])
-    }
-
-    /// A list of output columns (e.g. the names of columns in
-    /// `self.schema()`) for which predicates can not be pushed below
-    /// this node without changing the output.
-    ///
-    /// By default, this returns all columns and thus prevents any
-    /// predicates from being pushed below this node.
-    fn prevent_predicate_push_down_columns(&self) -> HashSet<String> {
-        // Allow filters for all columns to be pushed down
-        HashSet::new()
-    }
-
-    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
-        assert_eq!(inputs.len(), 1, "should have one input");
-        assert_eq!(exprs.len(), 0, "should have no expressions");
-        let Some(input) = inputs.into_iter().next() else {
-            panic!("should have one input");
-        };
-        Ok(Self { input })
-    }
-}
-
-impl PartialEq<BytesProcessedNode> for BytesProcessedNode {
-    fn eq(&self, other: &BytesProcessedNode) -> bool {
-        self.input == other.input
-    }
-}
-
-impl Eq for BytesProcessedNode {}
-
-impl Hash for BytesProcessedNode {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.input.hash(state);
-    }
-}
-
 pub struct BytesProcessedExec {
     input_exec: Arc<dyn ExecutionPlan>,
     emit_bytes_callback: Arc<BytesEmittedCallback>,
@@ -353,7 +179,8 @@ impl BytesProcessedExec {
         }
     }
 
-    pub(crate) fn fallback_to_new_context(mut self) -> Self {
+    #[must_use]
+    pub fn fallback_to_new_context(mut self) -> Self {
         self.fallback_to_new_context = true;
         self
     }
@@ -382,6 +209,14 @@ impl DisplayAs for BytesProcessedExec {
 // for example, the recently added `gather_filters_for_pushdown` defaults to `all_unsupported` but we likely want `from_children`
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for BytesProcessedExec {
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
+
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "BytesProcessedExec"
     }
@@ -393,15 +228,11 @@ impl ExecutionPlan for BytesProcessedExec {
         "BytesProcessedExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(self.properties().eq_properties.schema())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input_exec.properties()
     }
 
@@ -413,6 +244,18 @@ impl ExecutionPlan for BytesProcessedExec {
         vec![Distribution::UnspecifiedDistribution; self.children().len()]
     }
 
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![
+            Distribution::UnspecifiedDistribution;
+            self.children().len()
+        ])
+    }
+
+    /// Byte counting owns no dynamic filters.
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         vec![None; self.children().len()]
     }
@@ -421,34 +264,54 @@ impl ExecutionPlan for BytesProcessedExec {
         vec![true; self.children().len()]
     }
 
-    /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.
-    /// This guarantees that the input is processed as a single stream, preserving the order of the data.
+    /// Only allow optimizer-introduced repartitioning when the child has no
+    /// output ordering. This keeps order-sensitive plans stable by avoiding
+    /// repartition on already ordered inputs.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
+        vec![self.input_exec.properties().output_ordering().is_none()]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input_exec]
     }
 
+    /// `properties()` is read from the input, so there is nothing to keep or recompute.
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.with_input(children)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        assert_eq!(children.len(), 1, "should have one input");
-        let Some(input) = children.into_iter().next() else {
-            panic!("should have one input");
-        };
-        Ok(Arc::new(Self {
-            input_exec: input,
-            emit_bytes_callback: Arc::clone(&self.emit_bytes_callback),
-            fallback_to_new_context: self.fallback_to_new_context,
-        }))
+        self.with_input(children)
+    }
+
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.with_input(children)
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.with_input(children)
     }
 
     fn repartitioned(
@@ -467,13 +330,8 @@ impl ExecutionPlan for BytesProcessedExec {
         let stream = self.input_exec.execute(partition, Arc::clone(&context))?;
         let schema = stream.schema();
 
-        let request_context = if let Some(request_context) =
-            context.session_config().get_extension::<RequestContext>()
-        {
-            request_context
-        } else if self.fallback_to_new_context {
-            Arc::new(RequestContextBuilder::new(Protocol::Internal).build())
-        } else {
+        let Some(request_context) = resolve_request_context(&context, self.fallback_to_new_context)
+        else {
             // This should never happen if all queries are run through the query builder, so if it does its a bug we need to catch in development.
             panic!(
                 "The request context was not provided to BytesProcessedExec, report a bug at https://github.com/spiceai/spiceai/issues"
@@ -492,39 +350,49 @@ impl ExecutionPlan for BytesProcessedExec {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        None
+        self.input_exec.metrics()
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema()))
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        StatisticsContext::new().compute(
+            self.input_exec.as_ref(),
+            &StatisticsArgs::new().with_partition(partition),
+        )
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        if let Some(idx) = partition {
-            // Validate partition index
-            let partition_count = self.properties().partitioning.partition_count();
-            if idx >= partition_count {
-                return internal_err!(
-                    "Invalid partition index: {}, the partition count is {}",
-                    idx,
-                    partition_count
-                );
-            }
-        }
-        Ok(Statistics::new_unknown(&self.schema()))
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    /// Counting bytes neither adds nor removes rows, so the input's statistics hold unchanged.
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        input_stats.first().map(Arc::clone).ok_or_else(|| {
+            DataFusionError::External(
+                crate::Error::InvalidChildrenCount {
+                    children_count: input_stats.len(),
+                }
+                .into(),
+            )
+        })
     }
 
     // Allow optimizer to push limits through to inputs
     fn supports_limit_pushdown(&self) -> bool {
-        true
+        self.input_exec.supports_limit_pushdown()
     }
 
-    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        None
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        self.input_exec
+            .with_fetch(limit)
+            .map(|plan| self.wrap_input_exec(plan))
     }
 
     fn fetch(&self) -> Option<usize> {
-        None
+        self.input_exec.fetch()
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -559,6 +427,55 @@ impl ExecutionPlan for BytesProcessedExec {
     fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
+
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        let result = self.input_exec.try_pushdown_sort(order)?;
+        Ok(result.map(|plan| self.wrap_input_exec(plan)))
+    }
+
+    /// Not serializable. Forwarding to the input would ship a plan without the
+    /// byte accounting, so a remote executor's bytes would go uncounted.
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>> {
+        Ok(None)
+    }
+}
+
+impl BytesProcessedExec {
+    fn with_input(
+        &self,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let [input]: [Arc<dyn ExecutionPlan>; 1] =
+            children
+                .try_into()
+                .map_err(|children: Vec<Arc<dyn ExecutionPlan>>| {
+                    DataFusionError::External(
+                        crate::Error::InvalidChildrenCount {
+                            children_count: children.len(),
+                        }
+                        .into(),
+                    )
+                })?;
+        Ok(Arc::new(Self {
+            input_exec: input,
+            emit_bytes_callback: Arc::clone(&self.emit_bytes_callback),
+            fallback_to_new_context: self.fallback_to_new_context,
+        }))
+    }
+
+    fn wrap_input_exec(&self, input_exec: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let mut exec = BytesProcessedExec::new(input_exec, Arc::clone(&self.emit_bytes_callback));
+        if self.fallback_to_new_context {
+            exec = exec.fallback_to_new_context();
+        }
+        Arc::new(exec) as Arc<dyn ExecutionPlan>
+    }
 }
 
 #[cfg(test)]
@@ -572,12 +489,16 @@ mod tests {
     use datafusion::physical_expr::expressions::col as physical_col;
     use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+    use datafusion::physical_plan::collect;
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::{ExecutionPlan, displayable};
-    use datafusion::prelude::SessionContext;
-    use std::sync::Arc;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use std::sync::{Arc, Mutex};
 
-    use crate::extension::bytes_processed::BytesProcessedExec;
+    use crate::config::request_context_config::SpiceRequestContextConfig;
+    use crate::extension::bytes_processed::{BytesEmittedCallback, BytesProcessedExec};
+    use opentelemetry::trace::{SpanId, TraceFlags, TraceId};
+    use runtime_request_context::{Protocol, RequestContextBuilder, TraceParent};
 
     fn make_test_table() -> Result<Arc<dyn TableProvider>> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -589,10 +510,14 @@ mod tests {
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 
-    #[allow(clippy::similar_names)]
+    fn make_test_context() -> SessionContext {
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2))
+    }
+
+    #[expect(clippy::similar_names)]
     #[tokio::test]
     async fn test_preserve_order_pushdown() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = make_test_context();
         let test_table = make_test_table()?;
 
         let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
@@ -648,6 +573,181 @@ mod tests {
             displayable(final_plan.as_ref()).tree_render().to_string(),
             displayable(optimized.as_ref()).tree_render().to_string()
         );
+
+        Ok(())
+    }
+
+    #[expect(clippy::similar_names)]
+    #[tokio::test]
+    async fn test_allow_repartition_for_unordered_input() -> Result<()> {
+        let ctx = make_test_context();
+        let test_table = make_test_table()?;
+
+        let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
+
+        let final_plan: Arc<dyn ExecutionPlan> = Arc::new(BytesProcessedExec::new(
+            data_source_exec,
+            Arc::new(Box::new(|_, _| {})),
+        ));
+
+        let optimizer = PhysicalOptimizer::new();
+        let config = Arc::clone(ctx.state().config_options());
+
+        let optimized = optimizer
+            .rules
+            .iter()
+            .fold(Arc::clone(&final_plan), |plan, rule| {
+                rule.optimize(plan, &config).expect("Must optimize plan")
+            });
+
+        let optimized_plan = displayable(optimized.as_ref()).tree_render().to_string();
+        assert!(
+            optimized_plan.contains("RepartitionExec"),
+            "Expected RepartitionExec for unordered input, got: {optimized_plan}"
+        );
+
+        Ok(())
+    }
+
+    #[expect(clippy::similar_names)]
+    #[tokio::test]
+    async fn test_bytes_processed_total_preserved_with_repartition() -> Result<()> {
+        let ctx = make_test_context();
+        let test_table = make_test_table()?;
+
+        let build_test_plan = |callback: Arc<BytesEmittedCallback>| async {
+            let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
+            let bytes_processed_exec =
+                BytesProcessedExec::new(data_source_exec, callback).fallback_to_new_context();
+            Result::<Arc<dyn ExecutionPlan>>::Ok(Arc::new(bytes_processed_exec))
+        };
+
+        let before_values = Arc::new(Mutex::new(Vec::new()));
+        let before_values_ref = Arc::clone(&before_values);
+        let before_callback: Arc<BytesEmittedCallback> = Arc::new(Box::new(move |bytes, _| {
+            before_values_ref
+                .lock()
+                .expect("before callback mutex should not be poisoned")
+                .push(bytes);
+        }));
+
+        let before_plan = build_test_plan(before_callback).await?;
+        let before_batches = collect(before_plan, ctx.task_ctx()).await?;
+        let before_rows: usize = before_batches.iter().map(RecordBatch::num_rows).sum();
+        let before_total: u64 = before_values
+            .lock()
+            .expect("before mutex should not be poisoned")
+            .iter()
+            .sum();
+
+        let after_values = Arc::new(Mutex::new(Vec::new()));
+        let after_values_ref = Arc::clone(&after_values);
+        let after_callback: Arc<BytesEmittedCallback> = Arc::new(Box::new(move |bytes, _| {
+            after_values_ref
+                .lock()
+                .expect("after callback mutex should not be poisoned")
+                .push(bytes);
+        }));
+
+        let final_plan = build_test_plan(after_callback).await?;
+
+        let optimizer = PhysicalOptimizer::new();
+        let config = Arc::clone(ctx.state().config_options());
+
+        let optimized = optimizer.rules.iter().fold(final_plan, |plan, rule| {
+            rule.optimize(plan, &config).expect("Must optimize plan")
+        });
+
+        let optimized_plan = displayable(optimized.as_ref()).tree_render().to_string();
+        assert!(
+            optimized_plan.contains("RepartitionExec"),
+            "Expected RepartitionExec for unordered input, got: {optimized_plan}"
+        );
+
+        let after_batches = collect(optimized, ctx.task_ctx()).await?;
+        let after_rows: usize = after_batches.iter().map(RecordBatch::num_rows).sum();
+        let after_total: u64 = after_values
+            .lock()
+            .expect("after mutex should not be poisoned")
+            .iter()
+            .sum();
+
+        assert_eq!(before_rows, after_rows);
+        assert_eq!(before_rows, 10_000);
+        // Byte totals may differ slightly because RepartitionExec creates new
+        // RecordBatches with different buffer allocations than the original.
+        // The key invariant is that BytesProcessedExec still tracks bytes when
+        // RepartitionExec is placed below it.
+        assert!(
+            before_total > 0,
+            "Expected non-zero bytes tracked before optimization"
+        );
+        assert!(
+            after_total > 0,
+            "Expected non-zero bytes tracked after repartitioning"
+        );
+
+        Ok(())
+    }
+
+    /// Verifies the executor-side propagation path that this issue
+    /// enables: when no typed `Arc<RequestContext>` is present on the
+    /// session config (the case after Ballista round-trips the config to
+    /// an executor), `BytesProcessedExec` reconstructs the request
+    /// context from the `SpiceRequestContextConfig` option extension and
+    /// emits metric dimensions tagged with the originating protocol.
+    #[tokio::test]
+    async fn test_uses_config_extension_when_typed_request_context_missing() -> Result<()> {
+        let trace_id = TraceId::from_hex("0123456789abcdef0123456789abcdef").expect("trace id");
+        let span_id = SpanId::from_hex("0123456789abcdef").expect("span id");
+
+        let cfg_ext = SpiceRequestContextConfig::from_request_context(&Arc::new(
+            RequestContextBuilder::new(Protocol::FlightSQL)
+                .with_trace_parent(Some(TraceParent {
+                    trace_id,
+                    span_id,
+                    trace_flags: TraceFlags::SAMPLED,
+                }))
+                .build(),
+        ));
+
+        let session_config = SessionConfig::new()
+            .with_target_partitions(1)
+            .with_option_extension(cfg_ext);
+        let ctx = SessionContext::new_with_config(session_config);
+        let test_table = make_test_table()?;
+
+        let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
+
+        // `fallback_to_new_context` is intentionally left off here: the
+        // exec must resolve via the config extension, not the fallback.
+        let exec = Arc::new(BytesProcessedExec::new(
+            data_source_exec,
+            Arc::new(Box::new(|_, _| {})),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let observed_protocol = Arc::new(Mutex::new(None::<String>));
+        let observed_clone = Arc::clone(&observed_protocol);
+        let capture_protocol: Arc<BytesEmittedCallback> = Arc::new(Box::new(move |_, dims| {
+            let protocol = dims
+                .iter()
+                .find(|kv| kv.key.as_str() == "protocol")
+                .map(|kv| kv.value.as_str().to_string());
+            *observed_clone
+                .lock()
+                .expect("observed protocol mutex should not be poisoned") = protocol;
+        }));
+
+        let capturing_exec = Arc::new(BytesProcessedExec::new(exec, Arc::clone(&capture_protocol)))
+            as Arc<dyn ExecutionPlan>;
+
+        let _ = collect(capturing_exec, ctx.task_ctx()).await?;
+
+        let observed = observed_protocol
+            .lock()
+            .expect("observed protocol mutex should not be poisoned")
+            .clone();
+        assert_eq!(observed.as_deref(), Some("flightsql"));
 
         Ok(())
     }

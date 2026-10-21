@@ -1,0 +1,1013 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! The System One evaluation contract.
+//!
+//! An evaluation model takes unstructured `state` plus a map of typed
+//! `questions` and returns structured `answers` (noul / choice / score) with
+//! probabilities. Implemented by provider crates and by `evaluate-chat`, which
+//! answers through any chat model; called by the runtime's `POST /v1/decisions` and SQL decision functions
+//! endpoint — which never names a provider. [`check_answers`] holds every
+//! implementation's answers to the same invariants.
+//!
+//! Deliberately separate from chat completions: System One models such as
+//! `TypeSafe` Jev do not generate strings and must not be faked as `OpenAI` chat.
+
+use std::collections::BTreeMap;
+use std::fmt::Debug;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use snafu::Snafu;
+
+mod check;
+pub mod openai;
+
+pub use check::{check_answers, is_probability, probability_sum_tolerance};
+
+/// Name → evaluation model map. Holds System One providers (e.g. `TypeSafe` Jev).
+pub type EvaluateModelStore = std::collections::HashMap<String, Arc<dyn Evaluate>>;
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum Error {
+    #[snafu(display("Evaluation model '{model}' failed: {source}"))]
+    ModelCallFailed {
+        model: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Evaluation model '{model}' returned an unparseable response: {response}"))]
+    UnparseableResponse { model: String, response: String },
+
+    #[snafu(display(
+        "Failed to build HTTP client for evaluation model '{model}' — standard timeout/TLS defaults are unavailable."
+    ))]
+    HttpClientCreationFailed { model: String },
+
+    #[snafu(display("Evaluation health check failed: {source}"))]
+    HealthCheckFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Invalid evaluation request for model '{model}': {message}"))]
+    InvalidRequest { model: String, message: String },
+
+    #[snafu(display("Authentication failed for evaluation model '{model}': {message}"))]
+    AuthenticationFailed { model: String, message: String },
+
+    #[snafu(display("Permission denied for evaluation model '{model}': {message}"))]
+    PermissionDenied { model: String, message: String },
+
+    #[snafu(display("Rate limited by evaluation provider for model '{model}': {message}"))]
+    RateLimited { model: String, message: String },
+
+    #[snafu(display("Evaluation provider is unavailable for model '{model}': {message}"))]
+    ServiceUnavailable { model: String, message: String },
+
+    #[snafu(display("Evaluation model '{model}' was not found upstream: {message}"))]
+    ModelNotFound { model: String, message: String },
+
+    #[snafu(display(
+        "Failed to acquire rate-limit permit for evaluation model '{model}': {source}"
+    ))]
+    RatePermitFailed {
+        model: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Stable failure text for `runtime.task_history`.
+    ///
+    /// Omits upstream response bodies and other provider-supplied text so a
+    /// redacted capture cannot still persist them via `error_message`.
+    #[must_use]
+    pub fn telemetry_message(&self) -> String {
+        match self {
+            Self::HealthCheckFailed { .. } => "Evaluation health check failed".to_string(),
+            Self::ModelCallFailed { model, .. } => {
+                format!("Evaluation of model '{model}' failed: provider call failed")
+            }
+            Self::UnparseableResponse { model, .. } => {
+                format!("Evaluation of model '{model}' failed: unparseable response")
+            }
+            Self::HttpClientCreationFailed { model } => {
+                format!("Evaluation of model '{model}' failed: could not build HTTP client")
+            }
+            Self::InvalidRequest { model, .. } => {
+                format!("Evaluation of model '{model}' failed: invalid request")
+            }
+            Self::AuthenticationFailed { model, .. } => {
+                format!("Evaluation of model '{model}' failed: authentication failed")
+            }
+            Self::PermissionDenied { model, .. } => {
+                format!("Evaluation of model '{model}' failed: permission denied")
+            }
+            Self::RateLimited { model, .. } => {
+                format!("Evaluation of model '{model}' failed: rate limited")
+            }
+            Self::ServiceUnavailable { model, .. } => {
+                format!("Evaluation of model '{model}' failed: provider unavailable")
+            }
+            Self::ModelNotFound { model, .. } => {
+                format!("Evaluation of model '{model}' failed: model not found")
+            }
+            Self::RatePermitFailed { model, .. } => {
+                format!("Evaluation of model '{model}' failed: rate-limit permit failed")
+            }
+        }
+    }
+}
+
+/// `TypeSafe` `EntryType`: string, object, array, or null.
+///
+/// Used for `instructions` and structured criteria descriptions.
+/// See <https://docs.typesafe.ai/primitives/advanced>.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum EntryType {
+    String(String),
+    Array(Vec<Value>),
+    Object(Map<String, Value>),
+    Null,
+}
+
+impl From<&str> for EntryType {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
+}
+
+impl From<String> for EntryType {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+/// Non-null `EntryType` values: string, object, or array (not JSON null).
+///
+/// Used for score rubric levels so the `OpenAPI` contract matches `TypeSafe`'s
+/// non-empty `list[str | object | array]` criteria shape.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum NonNullEntry {
+    String(String),
+    Array(Vec<Value>),
+    Object(Map<String, Value>),
+}
+
+/// Written by hand so a level of the wrong kind is refused by saying which kinds a level
+/// may be, rather than that no variant of an untagged enum matched.
+impl<'de> Deserialize<'de> for NonNullEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let kind = match Value::deserialize(deserializer)? {
+            Value::String(text) => return Ok(Self::String(text)),
+            Value::Array(items) => return Ok(Self::Array(items)),
+            Value::Object(fields) => return Ok(Self::Object(fields)),
+            Value::Null => "null",
+            Value::Bool(_) => "a boolean",
+            Value::Number(_) => "a number",
+        };
+        Err(serde::de::Error::custom(format!(
+            "a score level must be a string, an object, or an array, not {kind}"
+        )))
+    }
+}
+
+impl From<&str> for NonNullEntry {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
+}
+
+impl From<String> for NonNullEntry {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<&NonNullEntry> for EntryType {
+    fn from(value: &NonNullEntry) -> Self {
+        match value {
+            NonNullEntry::String(text) => Self::String(text.clone()),
+            NonNullEntry::Array(items) => Self::Array(items.clone()),
+            NonNullEntry::Object(fields) => Self::Object(fields.clone()),
+        }
+    }
+}
+
+/// Distinguishes an omitted field from an explicit JSON `null` and a present value.
+///
+/// Serde's `Option<T>` collapses JSON `null` to `None`, which would drop nested
+/// null criteria when forwarding to `TypeSafe`. This wrapper preserves that null.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum NullableEntry {
+    /// Field was omitted from the JSON object.
+    #[default]
+    Absent,
+    /// Field was present as JSON `null`.
+    Null,
+    /// Field was present with a concrete `EntryType` value (including nested null
+    /// via [`EntryType::Null`] is not used here — top-level null is [`Self::Null`]).
+    Value(EntryType),
+}
+
+impl Serialize for NullableEntry {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Absent | Self::Null => serializer.serialize_none(),
+            Self::Value(v) => v.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NullableEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Option::<EntryType>::deserialize(deserializer)? {
+            None => Ok(Self::Null),
+            Some(v) => Ok(Self::Value(v)),
+        }
+    }
+}
+
+impl JsonSchema for NullableEntry {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("NullableEntry")
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // Documented as EntryType | null (same wire shape as before).
+        <EntryType as JsonSchema>::json_schema(generator)
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for NullableEntry {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        <EntryType as utoipa::PartialSchema>::schema()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for NullableEntry {}
+
+impl<T: Into<EntryType>> From<T> for NullableEntry {
+    fn from(value: T) -> Self {
+        NullableEntry::Value(value.into())
+    }
+}
+
+fn nullable_entry_is_absent(value: &NullableEntry) -> bool {
+    matches!(value, NullableEntry::Absent)
+}
+
+/// A typed question sent to a System One evaluation model.
+///
+/// `instructions` uses [`NullableEntry`] so an explicit JSON `null` survives the round
+/// trip to `TypeSafe` instead of collapsing into an omitted field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Question {
+    /// Yes/no probability question. Answer is `noul` in \[0, 1\] (P(yes)).
+    Noul {
+        #[serde(default, skip_serializing_if = "nullable_entry_is_absent")]
+        instructions: NullableEntry,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        criteria: Option<NoulCriteria>,
+    },
+    /// Closed-set selection. Answer is the highest-probability option plus the full distribution.
+    Choice {
+        #[serde(default, skip_serializing_if = "nullable_entry_is_absent")]
+        instructions: NullableEntry,
+        /// Option id → description (`EntryType`, or JSON null). An option listed twice
+        /// is refused rather than merged.
+        #[serde(deserialize_with = "deserialize_choice_criteria")]
+        criteria: BTreeMap<String, EntryType>,
+    },
+    /// Ordered rubric score. Answer is a probability-weighted value across levels.
+    Score {
+        #[serde(default, skip_serializing_if = "nullable_entry_is_absent")]
+        instructions: NullableEntry,
+        /// Two to ten non-null rubric levels: `TypeSafe` documents score criteria as
+        /// "at least two levels and takes up to 10"
+        /// (<https://docs.typesafe.ai/primitives/score>).
+        #[serde(deserialize_with = "deserialize_score_criteria")]
+        #[schemars(length(min = 2, max = 10))]
+        #[cfg_attr(feature = "openapi", schema(min_items = 2, max_items = 10))]
+        criteria: Vec<NonNullEntry>,
+    },
+}
+
+impl Question {
+    /// The answer to a question that needs no model: a choice with a single option,
+    /// which is that option with all the probability. Every model answers it this way
+    /// rather than asking. `None` for any other question.
+    #[must_use]
+    pub fn foregone_answer(&self) -> Option<Answer> {
+        let Self::Choice { criteria, .. } = self else {
+            return None;
+        };
+        if criteria.len() != 1 {
+            return None;
+        }
+        let option = criteria.keys().next()?;
+        Some(Answer::Choice {
+            choice: option.clone(),
+            probabilities: BTreeMap::from([(option.clone(), 1.0)]),
+            confidence: 1.0,
+        })
+    }
+}
+
+/// Optional yes/no rubric for a noul question.
+///
+/// `true` / `false` use [`NullableEntry`] so explicit JSON `null` is preserved when
+/// forwarding to `TypeSafe` (unlike `Option<EntryType>`, which drops nulls).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct NoulCriteria {
+    #[serde(
+        default,
+        skip_serializing_if = "nullable_entry_is_absent",
+        rename = "true"
+    )]
+    pub true_meaning: NullableEntry,
+    #[serde(
+        default,
+        skip_serializing_if = "nullable_entry_is_absent",
+        rename = "false"
+    )]
+    pub false_meaning: NullableEntry,
+}
+
+/// A JSON object as a map, refusing a repeated key: `serde` keeps only the last value
+/// of a repeated key, which would let one entry silently replace another.
+fn deserialize_unique_map<'de, D, V>(
+    deserializer: D,
+    entry: &'static str,
+) -> std::result::Result<BTreeMap<String, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    struct UniqueKeys<V> {
+        entry: &'static str,
+        value: std::marker::PhantomData<V>,
+    }
+
+    impl<'de, V: Deserialize<'de>> serde::de::Visitor<'de> for UniqueKeys<V> {
+        type Value = BTreeMap<String, V>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut entries: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut map = BTreeMap::new();
+            while let Some((key, value)) = entries.next_entry::<String, V>()? {
+                if map.contains_key(&key) {
+                    return Err(serde::de::Error::custom(format!(
+                        "{} '{key}' is listed more than once",
+                        self.entry
+                    )));
+                }
+                map.insert(key, value);
+            }
+            Ok(map)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueKeys {
+        entry,
+        value: std::marker::PhantomData,
+    })
+}
+
+fn deserialize_choice_criteria<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, EntryType>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_unique_map(deserializer, "choice option")
+}
+
+fn deserialize_probabilities<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_unique_map(deserializer, "probability for option")
+}
+
+fn deserialize_legend<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, EntryType>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_unique_map(deserializer, "legend level")
+}
+
+fn deserialize_score_criteria<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<NonNullEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let criteria = Vec::<NonNullEntry>::deserialize(deserializer)?;
+    if !(2..=10).contains(&criteria.len()) {
+        return Err(serde::de::Error::custom(
+            "score criteria must contain between two and ten non-null levels",
+        ));
+    }
+    Ok(criteria)
+}
+
+/// A successful evaluation answers something; an empty `answers` map, or one that
+/// answers a question twice, is a malformed provider response, not a 200.
+fn deserialize_nonempty_answers<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, Answer>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let answers = deserialize_unique_map::<_, Answer>(deserializer, "answer")?;
+    if answers.is_empty() {
+        return Err(serde::de::Error::custom(
+            "answers must contain at least one answer",
+        ));
+    }
+    Ok(answers)
+}
+
+/// Evaluation `state`: string, object, or array (not bool/number/null).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum EvaluateState {
+    String(String),
+    Array(Vec<Value>),
+    Object(Map<String, Value>),
+}
+
+impl From<&str> for EvaluateState {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
+}
+
+impl From<String> for EvaluateState {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+/// `minProperties` has no utoipa attribute, but `ObjectBuilder` supports it, so these
+/// describe the two maps that must carry at least one entry.
+#[cfg(feature = "openapi")]
+fn nonempty_map_of(component: &str) -> utoipa::openapi::schema::Object {
+    utoipa::openapi::ObjectBuilder::new()
+        .schema_type(utoipa::openapi::schema::SchemaType::new(
+            utoipa::openapi::schema::Type::Object,
+        ))
+        .additional_properties(Some(utoipa::openapi::Ref::from_schema_name(component)))
+        .min_properties(Some(1))
+        .build()
+}
+
+#[cfg(feature = "openapi")]
+fn nonempty_question_map() -> utoipa::openapi::schema::Object {
+    nonempty_map_of("Question")
+}
+
+#[cfg(feature = "openapi")]
+fn nonempty_answer_map() -> utoipa::openapi::schema::Object {
+    nonempty_map_of("Answer")
+}
+
+/// How much a chat model reasons before it answers.
+/// Wire values match `reasoning_effort`. `max` is not a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+/// A System One evaluation request, as providers receive it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct EvaluateRequest {
+    /// Spicepod model name (runtime) or provider model id (provider forward).
+    pub model: String,
+    /// State for the model to evaluate: string, object, or array.
+    pub state: EvaluateState,
+    /// Questions keyed by caller-selected identifiers. At least one is required.
+    #[schemars(extend("minProperties" = 1))]
+    #[cfg_attr(feature = "openapi", schema(schema_with = nonempty_question_map))]
+    pub questions: BTreeMap<String, Question>,
+    /// Opaque end-user identifier from an `OpenAI`-shaped request, forwarded only to
+    /// `OpenAI` decision models. It is never serialized, so other providers never see it.
+    #[serde(skip)]
+    pub safety_identifier: Option<String>,
+    /// Effort for a chat evaluator. Skipped in serde so a provider never receives it.
+    /// The `OpenAI` Decisions API has no effort field.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// How an `OpenAI`-shaped caller typed each choice question with a boolean option, by
+    /// question id. Only `OpenAI` decision models read it: their choice values are typed,
+    /// so `true` and `"true"` are different values. A choice without a boolean option
+    /// needs none, because its keys are its values. Skipped in serde so a provider never
+    /// receives it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub typed_choices: BTreeMap<String, openai::ChoiceTypes>,
+}
+
+/// Token usage reported by the provider.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct Usage {
+    /// Defaulted: the provider may report one count without the other, and a partial
+    /// `usage` block must not fail an otherwise successful evaluation.
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Input tokens served from the provider's prompt cache, when it reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
+    /// Input tokens written to the provider's prompt cache, when it reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    /// Output tokens spent on reasoning, when the provider reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    /// The provider's own total, when it reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+}
+
+/// A typed answer returned for one question.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Answer {
+    Noul {
+        noul: f64,
+    },
+    Choice {
+        choice: String,
+        #[serde(deserialize_with = "deserialize_probabilities")]
+        probabilities: BTreeMap<String, f64>,
+        confidence: f64,
+    },
+    Score {
+        score: f64,
+        #[serde(deserialize_with = "deserialize_legend")]
+        legend: BTreeMap<String, EntryType>,
+        #[serde(deserialize_with = "deserialize_probabilities")]
+        probabilities: BTreeMap<String, f64>,
+        confidence: f64,
+    },
+    /// The model declined to answer this question. Only a model that can refuse
+    /// reports it (an `OpenAI` decision model); the other answers in the response stand.
+    Refusal {},
+}
+
+/// Response body for evaluation: typed answers plus provider metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct EvaluateResponse {
+    /// The Spicepod model name the request named, as `/v1/chat/completions` reports it.
+    pub model: String,
+    #[serde(deserialize_with = "deserialize_nonempty_answers")]
+    #[schemars(extend("minProperties" = 1))]
+    #[cfg_attr(feature = "openapi", schema(schema_with = nonempty_answer_map))]
+    pub answers: BTreeMap<String, Answer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+/// A System One evaluation model: state + typed questions → structured answers.
+#[async_trait]
+pub trait Evaluate: Send + Sync + Debug {
+    /// Run an evaluation against `state` and `questions`.
+    ///
+    /// The runtime sets `request.model` to the Spicepod model *name*; providers
+    /// should substitute their upstream model id before calling the remote API, and
+    /// report the Spicepod name back in [`EvaluateResponse::model`].
+    async fn evaluate(&self, request: EvaluateRequest) -> Result<EvaluateResponse>;
+
+    /// Checks the model can answer, e.g. by listing the provider's models.
+    ///
+    /// No default: a wrapper that inherited one would silently skip the check of the
+    /// model it wraps, so every implementation says what its health is.
+    async fn health(&self) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `Display` embeds the upstream body; task history must not.
+    #[test]
+    fn telemetry_message_omits_upstream_body() {
+        let secret = "sk-upstream-secret-body";
+        let err = Error::AuthenticationFailed {
+            model: "jev".into(),
+            message: secret.into(),
+        };
+        let logged = err.telemetry_message();
+        assert!(
+            !logged.contains(secret),
+            "telemetry must not carry the provider body: {logged}"
+        );
+        assert!(
+            logged.contains("'jev'"),
+            "telemetry must name the model: {logged}"
+        );
+        assert!(
+            logged.contains("authentication failed"),
+            "telemetry must name the failure class: {logged}"
+        );
+        assert!(
+            err.to_string().contains(secret),
+            "Display still has the body"
+        );
+    }
+
+    #[test]
+    fn a_response_with_a_repeated_key_is_refused() {
+        for (body, error) in [
+            (
+                r#"{"model":"m","answers":{"q":{"type":"noul","noul":0.1},"q":{"type":"noul","noul":0.9}}}"#,
+                "answer 'q' is listed more than once",
+            ),
+            (
+                r#"{"model":"m","answers":{"q":{"type":"choice","choice":"a","probabilities":{"a":0.6,"a":0.4},"confidence":1.0}}}"#,
+                "probability for option 'a' is listed more than once",
+            ),
+        ] {
+            let err = serde_json::from_str::<EvaluateResponse>(body).expect_err(body);
+            assert!(err.to_string().contains(error), "{err}");
+        }
+    }
+
+    #[test]
+    fn telemetry_message_omits_unparseable_response_body() {
+        let body = "internal stack: token=abc";
+        let err = Error::UnparseableResponse {
+            model: "jev-latest".into(),
+            response: body.into(),
+        };
+        let logged = err.telemetry_message();
+        assert!(!logged.contains(body), "{logged}");
+        assert!(logged.contains("'jev-latest'"), "{logged}");
+        assert!(logged.contains("unparseable response"), "{logged}");
+    }
+
+    #[test]
+    fn instructions_accept_string_object_and_array() {
+        let as_string: Question = serde_json::from_value(json!({
+            "type": "noul",
+            "instructions": "Is this urgent?"
+        }))
+        .expect("string");
+        assert!(matches!(
+            as_string,
+            Question::Noul {
+                instructions: NullableEntry::Value(EntryType::String(_)),
+                ..
+            }
+        ));
+
+        let as_object: Question = serde_json::from_value(json!({
+            "type": "noul",
+            "instructions": { "question": "Is this urgent?", "focus": "timing" }
+        }))
+        .expect("object");
+        assert!(matches!(
+            as_object,
+            Question::Noul {
+                instructions: NullableEntry::Value(EntryType::Object(_)),
+                ..
+            }
+        ));
+
+        let as_array: Question = serde_json::from_value(json!({
+            "type": "choice",
+            "instructions": ["Pick a team", "Prefer technical when ambiguous"],
+            "criteria": { "technical": "Bugs", "billing": null }
+        }))
+        .expect("array");
+        assert!(matches!(
+            as_array,
+            Question::Choice {
+                instructions: NullableEntry::Value(EntryType::Array(_)),
+                ..
+            }
+        ));
+        if let Question::Choice { criteria, .. } = as_array {
+            assert!(matches!(criteria.get("billing"), Some(EntryType::Null)));
+        }
+    }
+
+    #[test]
+    fn instructions_optional_and_null() {
+        let omitted: Question = serde_json::from_value(json!({ "type": "noul" })).expect("omit");
+        assert!(matches!(
+            omitted,
+            Question::Noul {
+                instructions: NullableEntry::Absent,
+                ..
+            }
+        ));
+
+        // An explicit null is kept distinct from omission, so it can be forwarded as
+        // sent; see `instructions_preserve_explicit_null_when_forwarded`.
+        let null_instr: Question = serde_json::from_value(json!({
+            "type": "noul",
+            "instructions": null
+        }))
+        .expect("null");
+        assert!(matches!(
+            null_instr,
+            Question::Noul {
+                instructions: NullableEntry::Null,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn evaluate_state_rejects_bool_number_null() {
+        for bad in [json!(true), json!(1), json!(null)] {
+            let err = serde_json::from_value::<EvaluateRequest>(json!({
+                "model": "m",
+                "state": bad,
+                "questions": {"q": {"type": "noul"}}
+            }));
+            assert!(err.is_err(), "expected reject for {bad}");
+        }
+
+        let ok: EvaluateRequest = serde_json::from_value(json!({
+            "model": "m",
+            "state": "hello",
+            "questions": {"q": {"type": "noul"}}
+        }))
+        .expect("string state");
+        assert!(matches!(ok.state, EvaluateState::String(_)));
+    }
+
+    #[test]
+    fn score_legend_accepts_entry_types() {
+        let answer: Answer = serde_json::from_value(json!({
+            "type": "score",
+            "score": 1.5,
+            "legend": {
+                "0": "low",
+                "1": { "label": "mid" },
+                "2": ["high", "detail"]
+            },
+            "probabilities": { "0": 0.1, "1": 0.2, "2": 0.7 },
+            "confidence": 0.9
+        }))
+        .expect("legend");
+        if let Answer::Score { legend, .. } = answer {
+            assert!(matches!(legend.get("0"), Some(EntryType::String(_))));
+            assert!(matches!(legend.get("1"), Some(EntryType::Object(_))));
+            assert!(matches!(legend.get("2"), Some(EntryType::Array(_))));
+        } else {
+            panic!("expected Score");
+        }
+    }
+
+    #[test]
+    fn score_levels_must_be_strings_objects_or_arrays() {
+        for (level, kind) in [(json!(null), "null"), (json!(3), "a number")] {
+            let error = serde_json::from_value::<Question>(json!({
+                "type": "score",
+                "criteria": ["low", level]
+            }))
+            .expect_err("a level that is not a string, object, or array must fail");
+            assert_eq!(
+                error.to_string(),
+                format!("a score level must be a string, an object, or an array, not {kind}")
+            );
+        }
+
+        let ok: Question = serde_json::from_value(json!({
+            "type": "score",
+            "criteria": ["low", {"label": "mid"}, ["high"]]
+        }))
+        .expect("string, object, and array levels");
+        let Question::Score { criteria, .. } = ok else {
+            panic!("expected a score question, got {ok:?}");
+        };
+        assert_eq!(
+            criteria,
+            vec![
+                NonNullEntry::String("low".to_string()),
+                NonNullEntry::Object(Map::from_iter([("label".to_string(), json!("mid"))])),
+                NonNullEntry::Array(vec![json!("high")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn score_criteria_rejects_empty_and_null() {
+        let empty = serde_json::from_value::<Question>(json!({
+            "type": "score",
+            "criteria": []
+        }));
+        assert!(empty.is_err(), "empty score criteria must fail");
+
+        let with_null = serde_json::from_value::<Question>(json!({
+            "type": "score",
+            "criteria": [null]
+        }));
+        assert!(with_null.is_err(), "null score criteria items must fail");
+
+        let ok: Question = serde_json::from_value(json!({
+            "type": "score",
+            "criteria": ["low", {"label": "mid"}]
+        }))
+        .expect("non-empty non-null");
+        assert!(matches!(ok, Question::Score { criteria, .. } if criteria.len() == 2));
+    }
+
+    #[test]
+    fn choice_criteria_refuse_an_option_listed_twice() {
+        // Raw text: a `json!` object would already have merged the repeat.
+        let err = serde_json::from_str::<Question>(
+            r#"{"type": "choice", "criteria": {"billing": null, "billing": "Payments"}}"#,
+        )
+        .expect_err("a repeated option must fail");
+        assert_eq!(
+            err.to_string(),
+            "choice option 'billing' is listed more than once"
+        );
+
+        let ok: Question = serde_json::from_str(
+            r#"{"type": "choice", "criteria": {"billing": null, "technical": "Bugs"}}"#,
+        )
+        .expect("distinct options");
+        assert!(matches!(ok, Question::Choice { criteria, .. } if criteria.len() == 2));
+    }
+
+    #[test]
+    fn noul_criteria_preserves_explicit_null() {
+        let q: Question = serde_json::from_value(json!({
+            "type": "noul",
+            "criteria": { "true": null, "false": "not urgent" }
+        }))
+        .expect("noul");
+        let Question::Noul {
+            criteria: Some(c), ..
+        } = q
+        else {
+            panic!("expected noul with criteria");
+        };
+        assert!(matches!(c.true_meaning, NullableEntry::Null));
+        assert!(matches!(
+            c.false_meaning,
+            NullableEntry::Value(EntryType::String(_))
+        ));
+
+        let forwarded = serde_json::to_value(&c).expect("serialize");
+        assert_eq!(forwarded.get("true"), Some(&json!(null)));
+        assert_eq!(forwarded.get("false"), Some(&json!("not urgent")));
+
+        let omitted: NoulCriteria = serde_json::from_value(json!({})).expect("omit");
+        assert!(matches!(omitted.true_meaning, NullableEntry::Absent));
+        let omitted_json = serde_json::to_value(&omitted);
+        assert!(omitted_json.is_ok(), "serialize omitted criteria");
+        match omitted_json.ok().and_then(|v| v.as_object().cloned()) {
+            Some(obj) => assert!(obj.is_empty()),
+            None => panic!("expected empty JSON object"),
+        }
+    }
+    /// Regression: `Option<EntryType>` collapsed an explicit `null` to `None`, and
+    /// `skip_serializing_if` then dropped the key, so `TypeSafe` could not tell an
+    /// explicit null from an omitted field.
+    #[test]
+    fn instructions_preserve_explicit_null_when_forwarded() {
+        let explicit: Question =
+            serde_json::from_value(json!({"type": "noul", "instructions": null}))
+                .expect("explicit null instructions");
+        let Question::Noul { instructions, .. } = &explicit else {
+            panic!("expected noul, got {explicit:?}");
+        };
+        assert!(matches!(instructions, NullableEntry::Null));
+        assert_eq!(
+            serde_json::to_value(&explicit).expect("ser"),
+            json!({"type": "noul", "instructions": null}),
+            "an explicit null must survive the round trip"
+        );
+
+        let omitted: Question =
+            serde_json::from_value(json!({"type": "noul"})).expect("omitted instructions");
+        let Question::Noul { instructions, .. } = &omitted else {
+            panic!("expected noul, got {omitted:?}");
+        };
+        assert!(matches!(instructions, NullableEntry::Absent));
+        assert_eq!(
+            serde_json::to_value(&omitted).expect("ser"),
+            json!({"type": "noul"}),
+            "an omitted field must stay omitted"
+        );
+    }
+
+    /// `TypeSafe` documents score criteria as two to ten levels.
+    #[test]
+    fn score_criteria_requires_two_levels() {
+        const LEVELS_ERROR: &str =
+            "score criteria must contain between two and ten non-null levels";
+
+        let one = serde_json::from_value::<Question>(
+            json!({"type": "score", "instructions": "how bad?", "criteria": ["only"]}),
+        )
+        .expect_err("one level must be rejected");
+        assert_eq!(one.to_string(), LEVELS_ERROR);
+
+        serde_json::from_value::<Question>(
+            json!({"type": "score", "instructions": "how bad?", "criteria": ["calm", "angry"]}),
+        )
+        .expect("two levels are valid");
+
+        let ten: Vec<String> = (0..10).map(|i| format!("level {i}")).collect();
+        serde_json::from_value::<Question>(
+            json!({"type": "score", "instructions": "how bad?", "criteria": ten}),
+        )
+        .expect("ten levels are valid");
+
+        let eleven: Vec<String> = (0..11).map(|i| format!("level {i}")).collect();
+        let over = serde_json::from_value::<Question>(
+            json!({"type": "score", "instructions": "how bad?", "criteria": eleven}),
+        )
+        .expect_err("eleven levels must be rejected");
+        assert_eq!(over.to_string(), LEVELS_ERROR);
+    }
+
+    /// A provider reply with no answers is malformed, not a successful evaluation.
+    #[test]
+    fn response_requires_at_least_one_answer() {
+        let empty = serde_json::from_value::<EvaluateResponse>(
+            json!({"model": "jev-latest", "answers": {}}),
+        )
+        .expect_err("empty answers must be rejected");
+        assert_eq!(
+            empty.to_string(),
+            "answers must contain at least one answer"
+        );
+    }
+
+    /// A partial `usage` block must not turn a successful evaluation into an error.
+    #[test]
+    fn partial_usage_defaults_rather_than_failing() {
+        let resp: EvaluateResponse = serde_json::from_value(json!({
+            "model": "jev-latest",
+            "answers": {"q": {"type": "noul", "noul": 0.5}},
+            "usage": {"input_tokens": 7}
+        }))
+        .expect("a partial usage block is still a successful response");
+        let usage = resp.usage.expect("usage present");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 0);
+    }
+}

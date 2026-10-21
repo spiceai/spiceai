@@ -32,7 +32,7 @@ use std::sync::Arc;
 use crate::{
     acceleration::get_params,
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 fn get_dataset() -> Dataset {
@@ -42,6 +42,7 @@ fn get_dataset() -> Dataset {
 #[tokio::test]
 async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -89,7 +90,7 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
                 .collect::<Result<Vec<_>, _>>()?;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}

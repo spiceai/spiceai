@@ -7,6 +7,17 @@ on:
       - 'crates/spicepod/**'
 
   workflow_dispatch:
+    inputs:
+      run_build:
+        description: 'Run build and generation'
+        required: false
+        type: boolean
+        default: true
+      create_pr:
+        description: 'Create PR'
+        required: false
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,23 +27,37 @@ env:
 jobs:
   generate_schema:
     runs-on: self-hosted
+    # Bound the blast radius: without this, a hung step runs until GitHub's
+    # default 6h job timeout. The Create PR step previously hung for ~5.5h on an
+    # interactive git credential prompt before being auto-cancelled.
+    timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - run: rustup toolchain install stable --profile minimal
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       - name: Set up make
-        if: runner.os != 'macOS'
+        if: runner.os != 'macOS' && (github.event_name != 'workflow_dispatch' || inputs.run_build)
         uses: ./.github/actions/setup-make
 
+      - name: Set up cc
+        if: runner.os != 'macOS' && (github.event_name != 'workflow_dispatch' || inputs.run_build)
+        uses: ./.github/actions/setup-cc
+
       - name: Build Cargo project
+        if: github.event_name != 'workflow_dispatch' || inputs.run_build
         run: cargo build --manifest-path tools/spicepodschema/Cargo.toml
 
       - name: Run Cargo project
+        if: github.event_name != 'workflow_dispatch' || inputs.run_build
         run: cargo run --manifest-path tools/spicepodschema/Cargo.toml -- .schema/spicepod.schema.json
 
       - name: Verify JSON schema file
+        if: github.event_name != 'workflow_dispatch' || inputs.run_build
         run: |
           if [ -f ".schema/spicepod.schema.json" ]; then
             echo ".schema/spicepod.schema.json file was successfully created."
@@ -43,13 +68,14 @@ jobs:
           fi
 
       - name: Upload JSON schema artifact
-        uses: actions/upload-artifact@v5
+        if: github.event_name != 'workflow_dispatch' || inputs.run_build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spicepod.schema
           path: .schema/spicepod.schema.json
 
       - name: Create PR
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.create_pr && inputs.run_build
         run: |
           git config --global user.name 'Spice Schema Bot'
           git config --global user.email 'schema-bot@spice.ai'
@@ -58,10 +84,57 @@ jobs:
           if [[ $(git diff --exit-code .schema/spicepod.schema.json) ]]; then
             git add .schema/spicepod.schema.json
             git commit -m "Update spicepod.schema.json"
-            git push origin schema/${GITHUB_RUN_ID}
+            # Disable any credential helper configured on the (self-hosted) runner
+            # so git authenticates with the URL-embedded token only. Otherwise a
+            # helper (osxkeychain / git-credential-manager) can intercept the push
+            # and block on an interactive credential prompt, hanging the job.
+            git -c credential.helper='' -c credential.interactive=false \
+              push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:schema/${GITHUB_RUN_ID}
             gh pr create --title "Update spicepod.schema.json" --body "Updated Spicepod Schema" --base trunk --head schema/${GITHUB_RUN_ID}
           else
             echo "No changes detected"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Never fall back to an interactive prompt; fail fast if auth is rejected.
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: 'never'
+
+      - name: Validate schema against test files
+        continue-on-error: true
+        run: |
+          set +e
+          python3 -m venv .venv
+          .venv/bin/python -m pip install check-jsonschema
+
+          echo "## Schema Validation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          VALIDATION_FAILED=0
+          for file in tools/spicepodschema/tests/*.yaml; do
+            filename=$(basename "$file")
+            if .venv/bin/check-jsonschema --schemafile .schema/spicepod.schema.json "$file" 2>&1; then
+              echo "✅ \`$filename\` - Valid" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ \`$filename\` - Invalid" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "<details><summary>Validation errors</summary>" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              { .venv/bin/check-jsonschema --schemafile .schema/spicepod.schema.json "$file" --verbose 2>&1 || true; } >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "</details>" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              VALIDATION_FAILED=1
+            fi
+          done
+
+          if [ $VALIDATION_FAILED -eq 1 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **Some test files failed validation. Please fix the errors above.**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **All test files passed validation.**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          exit 0

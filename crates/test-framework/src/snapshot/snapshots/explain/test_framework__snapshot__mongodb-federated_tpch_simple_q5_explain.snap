@@ -27,14 +27,14 @@ description: "Query: tpch_simple_q5"
 |               |                 HashJoinExec: mode=Partitioned, join_type=Inner, on=[(o_orderkey@0, l_orderkey@1)], projection=[o_totalprice@1, l_linestatus@2] |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |                     RepartitionExec: partitioning=Hash([o_orderkey@0], 32), input_partitions=32                                                 |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                     |
-|               |                         BytesProcessedExec                                                                                                      |
+|               |                       BytesProcessedExec                                                                                                        |
+|               |                         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                   |
 |               |                           CooperativeExec                                                                                                       |
 |               |                             MongoDBExec projection=[o_orderkey, o_totalprice] filters=[{}]                                                      |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |                     RepartitionExec: partitioning=Hash([l_orderkey@1], 32), input_partitions=32                                                 |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                     |
-|               |                         BytesProcessedExec                                                                                                      |
+|               |                       BytesProcessedExec                                                                                                        |
+|               |                         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                   |
 |               |                           CooperativeExec                                                                                                       |
 |               |                             MongoDBExec projection=[l_linestatus, l_orderkey] filters=[{}]                                                      |
 |               |                                                                                                                                                 |

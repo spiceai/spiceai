@@ -1,3 +1,7 @@
+# Validates query results over data loaded from Databricks into DuckDB, a load
+# no other automated test makes. Weekly and bench only, as Databricks bills per
+# use: the DuckDB accelerator itself is benchmarked from file[parquet].
+schedule: weekly
 tests:
   bench:
     spicepod_path: accelerated/databricks[delta_lake]-duckdb[file].yaml
@@ -5,13 +9,3 @@ tests:
     runner_type: spiceai-dev-runners
     ready_wait: 600
     validate_results: true
-  throughput:
-    spicepod_path: accelerated/databricks[delta_lake]-duckdb[file].yaml
-    query_set: tpch
-    runner_type: spiceai-dev-runners
-  load:
-    spicepod_path: accelerated/databricks[delta_lake]-duckdb[file].yaml
-    query_set: tpch
-    runner_type: spiceai-dev-runners
-    duration: 28800
-    ready_wait: 600

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use bytes::Bytes;
 use cache::result::CacheStatus;
 use tonic::{
     Response,
@@ -22,7 +23,26 @@ use tonic::{
 
 use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 
-pub fn attach_cache_metadata<T>(response: &mut Response<T>, results_cache_status: CacheStatus) {
+use crate::datafusion::request_context_extension::DataFusionContextExtension;
+
+/// The trace id as a `FlightInfo.app_metadata` payload:
+/// `{"trace_id":"<32 hex characters>"}`.
+///
+/// `app_metadata` is the one place a Flight SQL JDBC caller can read it — the
+/// driver surfaces it as
+/// `ArrowFlightJdbcFlightStreamResultSet.getAppMetadata()`, and surfaces
+/// neither response metadata nor per-message `app_metadata`. JSON so a second
+/// field can be added without breaking a client that already parses this one.
+#[must_use]
+pub(crate) fn trace_id_app_metadata(trace_id: &str) -> Bytes {
+    Bytes::from(serde_json::json!({ "trace_id": trace_id }).to_string())
+}
+
+pub fn attach_cache_metadata<T>(
+    response: &mut Response<T>,
+    results_cache_status: CacheStatus,
+    context: &RequestContext,
+) {
     if let Some(val) = status_to_x_cache_value(results_cache_status) {
         response.metadata_mut().insert("x-cache", val);
     }
@@ -30,12 +50,48 @@ pub fn attach_cache_metadata<T>(response: &mut Response<T>, results_cache_status
     if let Some(val) = status_to_results_cache_value(results_cache_status) {
         response.metadata_mut().insert("results-cache-status", val);
     }
+
+    // Add Cache-Control response metadata with stale-while-revalidate if configured
+    // Access the DataFusion instance to get the pre-parsed cache configuration
+    if let Some(df_ext) = context.extension::<DataFusionContextExtension>() {
+        let df = df_ext.datafusion();
+        if let Some(cache_provider) = df.results_cache_provider()
+            && let Some(stale_duration) = cache_provider.stale_while_revalidate_ttl()
+        {
+            // When serving stale content, set max-age=0 to indicate the response is not fresh
+            // The results-cache-status metadata will indicate STALE
+            let max_age = if results_cache_status == CacheStatus::CacheStaleWhileRevalidate {
+                0
+            } else {
+                cache_provider.ttl().as_secs()
+            };
+
+            let cache_control_value = format!(
+                "max-age={}, stale-while-revalidate={}",
+                max_age,
+                stale_duration.as_secs()
+            );
+
+            if let Ok(metadata_value) = cache_control_value.parse() {
+                response
+                    .metadata_mut()
+                    .insert("cache-control", metadata_value);
+            } else {
+                tracing::warn!(
+                    "Failed to parse cache-control metadata value: {}",
+                    cache_control_value
+                );
+            }
+        }
+    }
 }
 
 /// This is the legacy cache header, preserved for backwards compatibility.
 fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<MetadataValue<Ascii>> {
     match results_cache_status {
-        CacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
+        CacheStatus::CacheHit | CacheStatus::CacheStaleWhileRevalidate => {
+            "Hit from spiceai".parse().ok()
+        }
         CacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
         CacheStatus::CacheDisabled | CacheStatus::CacheBypass => None,
     }
@@ -48,6 +104,7 @@ fn status_to_results_cache_value(
         CacheStatus::CacheHit => "HIT".parse().ok(),
         CacheStatus::CacheMiss => "MISS".parse().ok(),
         CacheStatus::CacheBypass => "BYPASS".parse().ok(),
+        CacheStatus::CacheStaleWhileRevalidate => "STALE".parse().ok(),
         CacheStatus::CacheDisabled => None,
     }
 }
@@ -55,4 +112,25 @@ fn status_to_results_cache_value(
 pub(crate) async fn set_flightsql_protocol() {
     let request_context = RequestContext::current(AsyncMarker::new().await);
     request_context.update_protocol(Protocol::FlightSQL);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A query the results cache refuses (e.g. one calling `random()` or
+    /// `now()`) reports `CacheDisabled`, which must emit no cache metadata
+    /// rather than a misleading HIT/MISS.
+    #[test]
+    fn disabled_results_cache_emits_no_metadata() {
+        assert!(status_to_results_cache_value(CacheStatus::CacheDisabled).is_none());
+        assert!(status_to_x_cache_value(CacheStatus::CacheDisabled).is_none());
+        assert_eq!(
+            status_to_results_cache_value(CacheStatus::CacheHit)
+                .expect("HIT")
+                .to_str()
+                .expect("ascii"),
+            "HIT"
+        );
+    }
 }

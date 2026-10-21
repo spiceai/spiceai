@@ -1,0 +1,27 @@
+---
+source: crates/runtime/tests/models/hf.rs
+assertion_line: 546
+expression: "normalize_chat_completion_response(response, true)"
+---
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "content_val",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": "created_val",
+  "id": "id_val",
+  "model": "gemma_model",
+  "object": "chat.completion",
+  "system_fingerprint": "system_fingerprint_val",
+  "usage": {
+    "completion_tokens": "completion_tokens_val",
+    "prompt_tokens": "prompt_tokens_val",
+    "total_tokens": "total_tokens_val"
+  }
+}

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use arrow_schema::DataType;
 use datafusion::{
@@ -23,23 +24,27 @@ use datafusion::{
         tree_node::{TreeNode, TreeNodeRecursion},
     },
     error::DataFusionError,
-    logical_expr::ExprSchemable,
+    logical_expr::{ExprSchemable, simplify::SimplifyContext},
+    optimizer::simplify_expressions::ExprSimplifier,
     prelude::{Expr, SessionContext},
     scalar::ScalarValue,
 };
 use snafu::prelude::*;
+use util::format_datafusion_error;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("Failed to determine data type: {source}"))]
+    #[snafu(display("Failed to determine data type: {}", format_datafusion_error(source)))]
     DataTypeError { source: DataFusionError },
     #[snafu(display("Expression {expr} does not meet the criteria: {criterion} Expression Criteria: {}", PartitionCriteria.doc()))]
     CriterionFailed { expr: String, criterion: String },
     #[snafu(display("Invalid expression: {message}"))]
     InvalidExpression { message: String },
-    #[snafu(display("Parsing SQL expression failed: {source}"))]
+    #[snafu(display("Parsing SQL expression failed: {}", format_datafusion_error(source)))]
     ParsingExpression { source: DataFusionError },
+    #[snafu(display("Simplifying expression failed: {}", format_datafusion_error(source)))]
+    SimplifyingExpression { source: DataFusionError },
     #[snafu(display(
         "Scalar value type {scalar_type} is incompatible with expression type {expr_type}"
     ))]
@@ -68,13 +73,39 @@ pub fn partition_by_expressions(
     ctx: &SessionContext,
     df_schema: &DFSchema,
 ) -> Result<Vec<PartitionedBy>, Error> {
+    // DataFusion registers Spark-compatible scalar functions (e.g. `date_part`)
+    // as stubs that must be rewritten to their standard DataFusion equivalents by
+    // the `SimplifyExpressions` optimizer pass. The partition path builds a physical
+    // expression directly from this parsed expression and never runs that pass, so
+    // simplify here is reuiqred.
+    let simplifier = ExprSimplifier::new(
+        SimplifyContext::builder()
+            .with_schema(Arc::new(df_schema.clone()))
+            .build(),
+    );
+
     let partitioned_by = partitioned_by
         .iter()
         .map(|p| {
             let expression = ctx
                 .parse_sql_expr(&p.expression, df_schema)
                 .context(ParsingExpressionSnafu)?;
+            let expression = simplifier
+                .simplify(expression)
+                .context(SimplifyingExpressionSnafu)?;
             PartitionCriteria.validate(&expression, df_schema)?;
+            ensure!(
+                !p.name.is_empty()
+                    && p.name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+                InvalidExpressionSnafu {
+                    message: format!(
+                        "partition name '{}' must contain only ASCII letters, digits, and underscores",
+                        p.name
+                    )
+                }
+            );
             Ok(PartitionedBy {
                 name: p.name.clone(),
                 expression,
@@ -83,6 +114,17 @@ pub fn partition_by_expressions(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(partitioned_by)
+}
+
+/// Validates that a single [`Expr`] meets the partition expression criteria.
+///
+/// This is useful for DDL paths where the expression is already parsed as a
+/// `DataFusion` `Expr` (e.g. from a `PARTITION BY` clause).
+///
+/// # Errors
+/// Returns an error if the expression does not meet the partition criteria.
+pub fn validate_partition_expression(expr: &Expr, schema: &DFSchema) -> ValidationResult {
+    PartitionCriteria.validate(expr, schema)
 }
 
 /// Validates whether a [`ScalarValue`] can be produced by the given [`Expr`].
@@ -94,7 +136,8 @@ pub fn validate_scalar_compatibility(
     scalar: &ScalarValue,
     schema: &DFSchema,
 ) -> ValidationResult {
-    let (expr_type, _nullable) = expr.data_type_and_nullable(schema).context(DataTypeSnafu)?;
+    let (_, expr_field) = expr.to_field(schema).context(DataTypeSnafu)?;
+    let expr_type = expr_field.data_type().clone();
     let scalar_type = scalar.data_type();
 
     ensure!(
@@ -157,12 +200,15 @@ impl Criterion for DataTypeCriterion {
     }
 
     fn validate(&self, expr: &Expr, schema: &DFSchema) -> ValidationResult {
-        let (data_type, _nullable) = expr.data_type_and_nullable(schema).context(DataTypeSnafu)?;
+        let (_, field) = expr.to_field(schema).context(DataTypeSnafu)?;
+        let data_type = field.data_type().clone();
 
         ensure!(
             matches!(
                 data_type,
                 DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View
                     | DataType::Int8
                     | DataType::Int16
                     | DataType::Int32
@@ -271,6 +317,51 @@ mod tests {
         DFSchema::try_from(schema).expect("schema created")
     }
 
+    /// Regression: `partition_by_expressions` must reject partition *names* that
+    /// are not `[A-Za-z0-9_]` (they become path components / identifiers, so an
+    /// unsafe name like `../escape` is a path-traversal risk), and must reject
+    /// empty names, while accepting safe names.
+    #[tokio::test]
+    async fn test_partition_by_expressions_rejects_unsafe_name() -> Result<(), Error> {
+        let schema = create_test_schema();
+        let ctx = datafusion::prelude::SessionContext::new();
+
+        // Valid expression, but a path-unsafe partition name.
+        let unsafe_name = vec![spicepod::partitioning::PartitionedBy {
+            name: "../escape".to_string(),
+            expression: "region".to_string(),
+        }];
+        assert!(
+            matches!(
+                partition_by_expressions(&unsafe_name, &ctx, &schema),
+                Err(Error::InvalidExpression { .. })
+            ),
+            "path-unsafe partition name must be rejected"
+        );
+
+        // An empty name is also rejected.
+        let empty_name = vec![spicepod::partitioning::PartitionedBy {
+            name: String::new(),
+            expression: "region".to_string(),
+        }];
+        assert!(
+            matches!(
+                partition_by_expressions(&empty_name, &ctx, &schema),
+                Err(Error::InvalidExpression { .. })
+            ),
+            "empty partition name must be rejected"
+        );
+
+        // A safe alphanumeric/underscore name is accepted.
+        let safe_name = vec![spicepod::partitioning::PartitionedBy {
+            name: "region_bucket".to_string(),
+            expression: "region".to_string(),
+        }];
+        partition_by_expressions(&safe_name, &ctx, &schema)
+            .expect("safe partition name must be accepted");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_partition_expression_criterion() -> Result<(), Error> {
         let schema = create_test_schema();
@@ -297,23 +388,30 @@ mod tests {
             )
             .otherwise(lit("other"))
             .expect("expression created");
-        assert!(criterion.validate(&expr, &schema).is_ok());
+        criterion
+            .validate(&expr, &schema)
+            .expect("should create expression");
 
         // Valid: date_trunc('month', date)
         let expr = Expr::ScalarFunction(ScalarFunction {
             func: date_trunc(),
             args: vec![lit("month"), col("date")],
         });
-        assert!(criterion.validate(&expr, &schema).is_ok());
+        criterion
+            .validate(&expr, &schema)
+            .expect("should create expression");
 
         // Invalid: Two columns (a + region)
         let expr = col("a") + col("region");
-        assert!(criterion.validate(&expr, &schema).is_err());
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
 
         // Invalid: Literal (no column)
         let expr = lit(42);
-        assert!(criterion.validate(&expr, &schema).is_err());
-
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
         // Invalid: Alias
         let expr = Expr::Alias(Alias {
             expr: Box::new(col("region")),
@@ -321,15 +419,15 @@ mod tests {
             relation: None,
             metadata: None,
         });
-        assert!(
-            criterion.validate(&expr, &schema).is_err(),
-            "forbidden expression"
-        );
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
 
         // Invalid: Non-existent column
         let expr = col("missing");
-        assert!(criterion.validate(&expr, &schema).is_err());
-
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
         Ok(())
     }
 }

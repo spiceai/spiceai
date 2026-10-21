@@ -23,7 +23,7 @@ use spicepod::{component::dataset::Dataset, param::Params};
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::test_request_context,
+    utils::{register_test_connectors, test_request_context},
 };
 
 fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
@@ -38,6 +38,7 @@ fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
                 "spiceai_endpoint".to_string(),
                 "https://flight.spiceai.io".to_string(),
             ),
+            ("spiceai_region".to_string(), "us-east-1".to_string()),
         ]
         .into_iter()
         .collect(),
@@ -63,6 +64,7 @@ async fn spiceai_federation() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let mut rt =
                 Runtime::builder()
                     .with_app(app)
@@ -72,7 +74,7 @@ async fn spiceai_federation() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     panic!("Timeout waiting for components to load");
                 }
 () = cloned_rt.load_components() => {}
@@ -88,11 +90,11 @@ async fn spiceai_federation() -> Result<(), anyhow::Error> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Spice.ai Test Results"),
+                        description => "Spice.ai Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("select"), results);
+                        insta::assert_snapshot!("select", results);
                     });
                 })),
             )];

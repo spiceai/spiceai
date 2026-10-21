@@ -36,3 +36,11 @@ impl Display for Error {
         }
     }
 }
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Other(err) => Some(err.as_ref()),
+        }
+    }
+}

@@ -14,17 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+#![recursion_limit = "256"]
 
 use ::tools::SpiceModelTool;
+use ::tools::naming::{decode_tool_name, encode_tool_name};
 use ::tools::rename::with_name;
 use async_stream::stream;
+use datafusion_expr::Expr;
+use datafusion_proto::bytes::Serializeable;
 use init::scheduler::ScheduleRegistry;
+use spicepod::component::runtime::TelemetryConfig;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Weak;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
@@ -35,54 +41,57 @@ use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+use crate::datafusion::DataFusion;
+use crate::datafusion::DeferredRefreshOutcome;
+use crate::datafusion::error::format_datafusion_error;
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::model::LLMResponsesModelStore;
-use crate::{
-    auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
-    internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
-};
+use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
 use ::datafusion::error::DataFusionError;
-use ::datafusion::sql::{TableReference, sqlparser};
+use ::datafusion::{
+    common::{ResolvedTableReference, TableReference},
+    sql::sqlparser,
+};
 use app::App;
 
-#[cfg(feature = "cluster")]
-use {
-    crate::Error::FailedToStartClusterExecutor, crate::config::ClusterMode,
-    crate::datafusion::cluster,
-};
+use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
 
 use builder::RuntimeBuilder;
-use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 use config::Config;
 use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
-use futures::Stream;
-use futures::future::{join_all, try_join_all};
+use futures::{
+    Stream, TryFutureExt,
+    future::{join_all, try_join_all},
+};
+use governor::RateLimiter;
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
-use model::{EmbeddingModelStore, EvalScorerRegistry, LLMChatCompletionsModelStore};
+use llms::rerank::RerankerModelStore;
+use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
-use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
-use model_components::model::Model;
+use crate::tools::{Tooling, factory::default_available_catalogs};
 pub use notify::Error as NotifyError;
+use runtime_status::ComponentStatus;
+use runtime_tls::TlsConfig;
 use snafu::prelude::*;
-use spicepod::component::eval::Eval;
-use status::ComponentStatus;
-use tls::TlsConfig;
 
 use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
+use crate::cluster::{
+    ClusterStateStore, DistributedNode, PartitionStore, SchedulerHeartbeatStore, SchedulerPeers,
+};
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
-
-pub mod accelerated_table;
+use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
+pub use runtime_table::accelerated;
 pub mod auth;
-mod builder;
-mod cancellable_task;
+pub mod builder;
 pub mod catalogconnector;
 mod changes;
 pub mod component;
@@ -91,42 +100,74 @@ pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
 pub mod datasets_health_monitor;
-pub mod dataupdate;
+pub(crate) mod drasi;
+pub use runtime_acceleration::dataupdate;
+pub(crate) mod egress;
 pub mod embeddings;
+pub mod executor_table;
 pub mod extension;
-pub mod federated_table;
+pub use runtime_table::federated;
 pub mod flight;
 mod http;
+pub use http::v1::datasets::dataset_infos_with_status;
+
+pub mod http_types {
+    pub use crate::http::v1::queries::SubmitQueryRequest;
+}
+
 mod init;
+#[doc(hidden)]
+pub use init::snapshot_source::SnapshotRestoreHold;
 pub mod internal_table;
+pub mod jobs;
 mod management;
-mod metrics;
 mod metrics_server;
 pub mod model;
-mod opentelemetry;
+pub mod opentelemetry;
+pub mod opentelemetry_logs;
+pub mod opentelemetry_store;
+// Moved to `runtime-otel-push`; re-exported so `runtime::otel_push_exporter` still resolves.
+pub use runtime_otel_push as otel_push_exporter;
+// Host/container resource introspection lives in `runtime-resources`; it names
+// nothing from the runtime. Re-exported so `crate::resource_monitor::…` resolves.
+pub mod resource_monitor {
+    pub use runtime_resources::*;
+}
 
-pub use runtime_parameters as parameters;
+// Connector parameters live in `runtime-parameters`; the runtime names them
+// through this alias. Crate-visible so that a crate outside the runtime has to
+// depend on `runtime-parameters` directly rather than route through here — the
+// layering guard cannot see a path that hides inside a legal crate-level edge.
+pub(crate) use runtime_parameters as parameters;
 
-pub mod podswatcher;
+pub use metrics_server::prometheus_reader;
 pub mod request;
 mod scheduling;
+pub(crate) use runtime_component::schema_evolution;
 pub mod search;
-pub mod secrets {
+// Secrets live in `runtime-secrets`. Crate-visible for the same reason as
+// `parameters` above: reach for `runtime-secrets` instead.
+pub(crate) mod secrets {
     pub use runtime_secrets::*;
 }
+pub mod cluster;
+mod server_timing;
 pub mod spice_metrics;
-pub mod status;
+// The status tracker lives in `runtime-status`. Aliased so `runtime::status::…`
+// (used by tests, `spiced` and grouped `crate::{status, …}` imports) still resolves.
+pub use runtime_status as status;
+mod state_location;
 pub mod task_history;
-pub mod timing;
-pub mod tls;
-mod token_providers;
+pub mod token_providers;
 pub mod tools;
-pub mod topological_ordering;
-pub(crate) mod tracers;
 mod tracing_util;
 mod udtfs;
 mod view;
 mod worker;
+
+pub type PartitionAssignments =
+    HashMap<ResolvedTableReference, Vec<::datafusion::logical_expr::Expr>>;
+pub type SharedPartitionAssignments = Arc<RwLock<PartitionAssignments>>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -144,66 +185,111 @@ pub enum Error {
     #[snafu(display("Unable to start Flight server: {source}"))]
     UnableToStartFlightServer { source: flight::Error },
 
-    #[snafu(display("Unable to start OpenTelemetry server: {source}"))]
-    UnableToStartOpenTelemetryServer { source: opentelemetry::Error },
+    #[snafu(display("Unable to start internal cluster server: {source}"))]
+    UnableToStartClusterServer { source: flight::Error },
+
+    #[snafu(display("Failed to start cluster scheduler: executor registry missing"))]
+    MissingSchedulerExecutorRegistry,
 
     #[snafu(display("Unknown data source: {data_source}"))]
     UnknownDataSource { data_source: String },
 
-    #[snafu(display("Unable to create data backend: {source}"))]
-    UnableToCreateBackend { source: datafusion::Error },
+    #[snafu(display("Failed to initialize the query engine: {source}"))]
+    UnableToCreateBackend {
+        // `datafusion::Error` alone is over clippy's `result_large_err` limit.
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
+    },
 
-    #[snafu(display("Unable to attach view: {source}"))]
-    UnableToAttachView { source: datafusion::Error },
+    #[snafu(display("Failed to attach view: {source}"))]
+    UnableToAttachView {
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
+    },
 
-    #[snafu(display("Unable to attach dataset index: {source}"))]
-    UnableToAttachIndex { source: datafusion::Error },
+    #[snafu(display("Failed to attach dataset index: {source}"))]
+    UnableToAttachIndex {
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
+    },
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: NotifyError },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize data connector: {source}"))]
     UnableToInitializeDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize catalog connector: {source}"))]
     UnableToInitializeCatalogConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize LLM model: {source}"))]
     UnableToInitializeLlm {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize embedding model: {source}"))]
     UnableToInitializeEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize LLM tool: {source}"))]
     UnableToInitializeLlmTool {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Unknown data connector: {data_connector}. Specify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"
+        "Unknown data connector '{data_connector}'.{}{} For details, visit: https://spiceai.org/docs/components/data-connectors",
+        suggestion.as_ref().map(|s| format!(" Did you mean '{s}'?")).unwrap_or_default(),
+        if available.is_empty() { String::new() } else { format!(" Available: {}.", available.join(", ")) },
     ))]
-    UnknownDataConnector { data_connector: String },
+    UnknownDataConnector {
+        data_connector: String,
+        suggestion: Option<String>,
+        available: Vec<String>,
+    },
 
     #[snafu(display(
-        "Unknown catalog connector: {catalog_connector}. Specify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"
+        "Unknown catalog connector '{catalog_connector}'.{}{} For details, visit: https://spiceai.org/docs/components/catalogs",
+        suggestion.as_ref().map(|s| format!(" Did you mean '{s}'?")).unwrap_or_default(),
+        if available.is_empty() { String::new() } else { format!(" Available: {}.", available.join(", ")) },
     ))]
-    UnknownCatalogConnector { catalog_connector: String },
+    UnknownCatalogConnector {
+        catalog_connector: String,
+        suggestion: Option<String>,
+        available: Vec<String>,
+    },
 
     #[snafu(display(
         "The runtime is built without ODBC support. Build Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
     ))]
     OdbcNotInstalled,
 
+    #[snafu(display(
+        "This build of Spice.ai does not include the {data_connector} data connector. Build Spice.ai OSS with the `{feature}` feature enabled, or use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise"
+    ))]
+    DataConnectorNotInBuild {
+        data_connector: String,
+        feature: String,
+    },
+
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
     UnableToLoadDataConnectorSecrets { data_connector: String },
+
+    #[snafu(display("Unable to update cluster partition filters for table {table}: {source}"))]
+    UnableToUpdateClusterPartitionFilters {
+        table: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to deserialize partition expression for table {table}: {source}"))]
+    UnableToDeserializeClusterPartitionExpression {
+        table: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Unable to get secret for data connector {data_connector}: {source}"))]
     UnableToGetSecretForDataConnector {
@@ -218,7 +304,8 @@ pub enum Error {
 
     #[snafu(display("Failed to setup the {connector_component} ({data_connector}). {source}"))]
     UnableToAttachDataConnector {
-        source: datafusion::Error,
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
         connector_component: ConnectorComponent,
         data_connector: String,
     },
@@ -243,14 +330,91 @@ pub enum Error {
     NeedToSpecifySQLView { name: String },
 
     #[snafu(display(
-        "An accelerated table was configured as read_write without setting replication.enabled = true"
+        "An accelerated table for {dataset_name} was configured with 'acceleration.write_mode: write_back' but 'replication.enabled' is not set. Write-back commits to the local accelerator and a delivery worker carries the write to the federated source afterwards, so the source lags the accelerator, and the source's own changes come back over the change stream. Set 'replication.enabled: true' to opt in, or use a different write_mode."
     ))]
-    AcceleratedReadWriteTableWithoutReplication,
+    AcceleratedWriteBackWithoutReplication { dataset_name: String },
+
+    #[snafu(display(
+        "Dataset '{dataset_name}' sets `acceleration.write_mode: acceleration` and refreshes by `changes` (set by `refresh_mode` or by its connector's default), but the source's changes would overwrite writes kept only in the acceleration, so the dataset cannot load. Use `write_mode: write_through` or `write_back` with a change stream, or another `refresh_mode`. See: https://spiceai.org/docs/reference/spicepod/datasets#accelerationwrite_mode"
+    ))]
+    AccelerationWriteModeWithChanges { dataset_name: String },
 
     #[snafu(display(
         "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."
     ))]
     AcceleratedTableInvalidChanges { dataset_name: String },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} (drasi): Drasi forwarding publishes the dataset's change stream, but this dataset has no change stream to publish — it is {reason}. Set 'acceleration.refresh_mode: changes' on a source that supports change data capture, or remove the 'drasi' block. See: https://spiceai.org/docs/reference/spicepod/datasets#drasi"
+    ))]
+    DrasiWithoutChangeStream {
+        dataset_name: String,
+        reason: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Set 'acceleration.write_mode: write_through' to send writes to the source directly instead, and also set 'access: read' if the source does not accept writes. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackUnsupportedBySource {
+        dataset_name: String,
+        connector: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers every committed row from the accelerator, so the accelerator has to keep each row until it reaches the source, but this dataset also sets '{retention_setting}' to prune rows from the accelerator. A prune can remove a row that has been acknowledged to the writer and not yet delivered, and nothing else holds that value, so the write would be lost. Remove the retention settings from this dataset, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackWithRetention {
+        dataset_name: String,
+        connector: String,
+        retention_setting: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): '{param}: none' turns off the primary-key check Cayenne uses to replace a stored row, but {consequence}. {advice} See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    PkConflictDetectionDisabled {
+        dataset_name: String,
+        connector: String,
+        param: String,
+        consequence: String,
+        advice: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers every committed row from the accelerator, so the accelerator has to keep each row until it reaches the source, but 'acceleration.mode: {mode}' does not keep the accelerator across a restart or a recreate. Recreating it discards both the rows that have not been delivered and the record of what still owes delivery, and nothing else holds those values, so an acknowledged write would be lost. Set 'acceleration.mode: file', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackRecreatingMode {
+        dataset_name: String,
+        connector: String,
+        mode: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): 'acceleration.write_mode: write_back' delivers each committed write to the source from the markers its transactional commit records, which requires {missing}. Without that nothing records a write for delivery, so this dataset would load and then refuse every write it is given. Add the missing setting(s), or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackPrerequisitesUnmet {
+        dataset_name: String,
+        connector: String,
+        missing: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers each committed row to the source keyed on the primary key, but this dataset declares no 'acceleration.primary_key'. Without one the delivery worker has nothing to key a delivery on, so this dataset would accept writes, record them, and never deliver any of them. Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackUndeclaredPrimaryKey {
+        dataset_name: String,
+        connector: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers each committed row to the source keyed on the primary key, and only a single-column primary key is supported today, but this dataset declares a {pk_columns}-column key ({primary_key}). Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackCompositePrimaryKey {
+        dataset_name: String,
+        connector: String,
+        primary_key: String,
+        pk_columns: usize,
+    },
 
     #[snafu(display(
         "An accelerated table has invalid configuration: {source}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
@@ -262,8 +426,14 @@ pub enum Error {
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
+    // The list comes from the accelerator registration slice, so it names the engines
+    // this build actually linked. A hand-written list is wrong for every build that
+    // omits an engine, which is every build that omits an engine crate.
     #[snafu(display(
-        "The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."
+        "The accelerator engine '{name}' is not available in this build. Valid engines are {available}. \
+        Set `acceleration.engine` to one of those, or install a build that includes '{name}'. \
+        For details, visit: https://spiceai.org/docs/components/data-accelerators",
+        available = data_accelerator_api::registered_engine_list()
     ))]
     AcceleratorEngineNotAvailable { name: String },
 
@@ -284,7 +454,15 @@ pub enum Error {
     #[snafu(display("Unable to load dataset connector: {dataset}"))]
     UnableToLoadDatasetConnector { dataset: TableReference },
 
-    #[snafu(display("Unable to load data connector for catalog {catalog}: {source}"))]
+    #[snafu(display("Unable to load dataset connector: {dataset}. {reason}"))]
+    PermanentDatasetFailure {
+        dataset: TableReference,
+        reason: String,
+    },
+
+    #[snafu(display(
+        "Failed to load catalog '{catalog}': {source}. It is retried automatically; if it persists, report this bug: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToLoadCatalogConnector {
         catalog: String,
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -301,11 +479,31 @@ pub enum Error {
     #[snafu(display("Unable to create accelerated table: {dataset}, {source}"))]
     UnableToCreateAcceleratedTable {
         dataset: TableReference,
-        source: datafusion::Error,
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
     },
 
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
     UnableToReceiveAcceleratedTableStatus { source: RecvError },
+
+    #[snafu(display(
+        "Failed to reload dataset {dataset}: its acceleration did not complete a refresh within {timeout_secs}s of being recreated. \
+        Reloading the dataset from scratch instead. \
+        Check that the dataset's source is reachable, and for 'refresh_mode: changes' that its change stream is producing data. \
+        See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    HotReloadRefreshTimedOut {
+        dataset: TableReference,
+        timeout_secs: u64,
+    },
+
+    #[snafu(display(
+        "Failed to reload dataset {dataset}: its acceleration's first refresh failed and will not be retried. \
+        Reloading the dataset from scratch instead. \
+        Check that the dataset's source is reachable and that the refresh configuration is valid. \
+        See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    HotReloadRefreshFailed { dataset: TableReference },
 
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
@@ -313,14 +511,14 @@ pub enum Error {
     #[snafu(display("Unable to track task history: {source}"))]
     UnableToTrackTaskHistory { source: task_history::Error },
 
-    #[snafu(display("Unable to create metrics table: {source}"))]
+    #[snafu(display("Unable to create metrics table: {}", format_datafusion_error(source)))]
     UnableToCreateMetricsTable { source: DataFusionError },
 
-    #[snafu(display("Unable to create eval runs table: {source}"))]
-    UnableToCreateEvalRunsTable { source: InternalTableError },
-
     #[snafu(display("Unable to register metrics table: {source}"))]
-    UnableToRegisterMetricsTable { source: datafusion::Error },
+    UnableToRegisterMetricsTable {
+        #[snafu(source(from(datafusion::Error, Box::new)))]
+        source: Box<datafusion::Error>,
+    },
 
     #[snafu(display("Invalid dataset defined in Spicepod: {source}"))]
     InvalidSpicepodDataset {
@@ -414,62 +612,121 @@ pub enum Error {
     ))]
     FullTextSearchRequiresAcceleration { dataset_name: String },
 
-    #[cfg(feature = "cluster")]
+    #[snafu(display("{reason}"))]
+    StateLocationRefused { reason: String },
+
     #[snafu(display("Failed to start Ballista scheduler: {source}"))]
     FailedToStartClusterScheduler {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("Failed to start or register Ballista executor: {source}"))]
     FailedToStartClusterExecutor {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Failed to register scheduler: {source}"))]
+    FailedToRegisterScheduler {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Failed to convert partition expression to SQL: {}",
+        format_datafusion_error(source)
+    ))]
+    UnableToConvertPartitionExpr { source: DataFusionError },
 }
 
-#[cfg(feature = "cluster")]
 const CLUSTER_EXECUTOR: &str = "cluster_executor";
+const CLUSTER_INTERNAL_SERVER: &str = "cluster_internal_server";
+const CLUSTER_SCHEDULER_REGISTRY: &str = "cluster_scheduler_registry";
+const CLUSTER_PARTITION_ASSIGNMENT_TASK: &str = "cluster_partition_assignment_task";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
-const OPENTELEMETRY_SERVER: &str = "opentelemetry_server";
 const PODS_WATCHER: &str = "pods_watcher";
 const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
+const CACHE_MAINTENANCE: &str = "cache_maintenance";
+
+/// How often [`Runtime::run_cache_maintenance`] drives moka housekeeping.
+const CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);
 
 // Allow 30 seconds for tasks for graceful shutdown
 const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const CAYENNE_COMPACTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_mins(2);
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Copy)]
 pub struct LogErrors(pub bool);
 
+/// State of the initial [`Runtime::load_components`] pass.
+///
+/// `in_flight` starts `true` — a load is pending from the moment the runtime
+/// exists — and turns `false` once the load is over, however it ends. See
+/// [`Runtime::initial_load_in_flight`].
+struct InitialLoad {
+    in_flight: AtomicBool,
+}
+
+impl Default for InitialLoad {
+    fn default() -> Self {
+        Self {
+            in_flight: AtomicBool::new(true),
+        }
+    }
+}
+
 #[derive(Clone)]
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
+    /// Serializes [`Runtime::apply_app`] so that concurrent callers cannot
+    /// interleave their diff-and-swap. `apply_app` computes diffs under a read
+    /// lock and only takes the app write lock for the final swap; that is sound
+    /// when applies are serialized, but `apply_app` now has two independent
+    /// callers — the on-disk pods watcher and Spice Cloud Connect's
+    /// `apply_spicepod` — which can fire concurrently. Without this mutex two
+    /// applies could diff against the same old app, interleave their
+    /// catalog/dataset/view mutations, and last-writer-wins the swap. Holding
+    /// this mutex (not the app write lock) for the whole apply avoids that while
+    /// keeping the read-lock-for-diff / write-lock-for-swap discipline, so the
+    /// diff phase can still read the app `RwLock` without deadlocking.
+    apply_app_lock: Arc<tokio::sync::Mutex<()>>,
+    /// State of the process's one-time initial component load. See
+    /// [`Runtime::initial_load_in_flight`]. Shared, not copied, so every clone of
+    /// the runtime reports the same load.
+    initial_load: Arc<InitialLoad>,
     df: Arc<DataFusion>,
-    models: Arc<RwLock<HashMap<String, Model>>>,
-    completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
-    // LLMs that support the OpenAI Responses API
-    responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
+    llm_runtime_stores: Arc<model::LlmRuntimeStores>,
+    http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
+    /// Registered reranker models (native cross-encoders, reranker-API
+    /// providers). Consumed by the `rerank()` UDTF; may be empty when only
+    /// LLM-as-reranker usage is needed — chat models are resolved from
+    /// `completion_llms`, then evaluation models from `evaluate_models`, as fallbacks.
+    rerankers: Arc<RwLock<RerankerModelStore>>,
     workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
+    /// Sync MCP schemas + epoch. Streamable HTTP rebuilds when this bumps
+    /// so rmcp cannot keep a cached `get_tool == None` after a tool appears.
+    #[cfg(feature = "mcp")]
+    mcp_schemas: Arc<runtime_tools::mcp::server::McpSchemaSnapshot>,
     tool_factories: Arc<Mutex<HashMap<String, ToolFactory>>>,
-    evals: Arc<RwLock<Vec<Eval>>>,
-    eval_scorers: EvalScorerRegistry,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
+    /// On-demand metrics reader for cluster observability.
+    /// Used by `GetMetrics` RPC and executor control stream to collect local OTLP metrics.
+    metrics_reader: Option<telemetry::metrics_reader::MetricsReader>,
     rate_limits: Arc<RateLimits>,
     io_runtime: Handle,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
-    spaced_tracer: Arc<tracers::SpacedTracer>,
+    spaced_tracer: Arc<util::tracers::SpacedTracer>,
 
     status: Arc<status::RuntimeStatus>,
     tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
@@ -478,8 +735,38 @@ pub struct Runtime {
 
     schedulers: Arc<ScheduleRegistry>,
 
-    #[allow(dead_code)] // used in "cluster" feature
+    /// When the runtime is part of a distributed cluster, this holds the node-specific information. It is `None` for stand-alone runtimes.
+    distributed: Option<DistributedNode>,
+    resource_monitor: resource_monitor::ResourceMonitor,
+
     config: Arc<Config>,
+
+    /// Shared semaphore that bounds concurrent dataset schema inference
+    /// (`read_provider`) calls so that startup loads and on-demand loads both
+    /// honor `runtime.dataset_load_parallelism`.
+    dataset_load_semaphore: Arc<tokio::sync::Semaphore>,
+
+    /// The dataset loads still retrying, so a Spicepod change can stop the load
+    /// of a configuration it replaces or removes.
+    dataset_loads: Arc<init::dataset_loads::DatasetLoads>,
+    /// The model loads in progress, so a Spicepod change can stop the load of a
+    /// configuration it replaces or removes.
+    model_loads: Arc<init::model::ModelLoads>,
+    /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
+    view_loads: Arc<init::view_loads::ViewLoads>,
+
+    /// Handle for resolving the spicepod `TelemetryConfig` for anonymous
+    /// telemetry. For executors this is set after the app definition is
+    /// fetched from the scheduler; for all other modes it is set before
+    /// the runtime starts.
+    telemetry_config: Option<Arc<tokio::sync::SetOnce<TelemetryConfig>>>,
+
+    /// The engines found to have created the snapshots of datasets that read snapshots
+    /// (`file_format: snapshot`), which building those datasets needs.
+    snapshot_sources: Arc<component::dataset::snapshot_source::SnapshotSourceRegistry>,
+
+    /// The startup check of `runtime.state.location`, when it is set.
+    state_location_check: Option<Arc<runtime_state_location::StateLocationCheck>>,
 }
 
 impl Debug for Runtime {
@@ -506,8 +793,23 @@ impl Runtime {
     }
 
     #[must_use]
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.config)
+    }
+
+    #[must_use]
+    pub fn flight_write_rate_limit_enabled(&self) -> bool {
+        self.rate_limits.flight_write_enabled()
+    }
+
+    #[must_use]
     pub fn secrets(&self) -> Arc<RwLock<secrets::Secrets>> {
         Arc::clone(&self.secrets)
+    }
+
+    #[cfg(feature = "mcp")]
+    pub(crate) fn refresh_mcp_tool_schemas(&self, tools: &HashMap<String, Tooling>) {
+        self.mcp_schemas.replace_from_map(tools);
     }
 
     #[must_use]
@@ -527,12 +829,72 @@ impl Runtime {
 
     #[must_use]
     pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
-        Arc::clone(&self.completion_llms)
+        self.llm_runtime_stores.completion_llms()
+    }
+
+    #[must_use]
+    pub fn evaluate_models(&self) -> Arc<RwLock<crate::model::EvaluateModelStore>> {
+        self.llm_runtime_stores.evaluate_models()
+    }
+
+    #[must_use]
+    pub fn rerankers(&self) -> Arc<RwLock<RerankerModelStore>> {
+        Arc::clone(&self.rerankers)
+    }
+
+    /// What each loaded model can serve, by model name.
+    #[must_use]
+    pub fn model_capabilities(&self) -> Arc<RwLock<model_capabilities::CapabilityStore>> {
+        self.llm_runtime_stores.capabilities()
+    }
+
+    pub async fn responses_supported_model_names(&self) -> HashSet<String> {
+        let capabilities = self.llm_runtime_stores.capabilities();
+        let capabilities = capabilities.read().await;
+        let responses = self.llm_runtime_stores.responses_llms();
+        let responses = responses.read().await;
+        capabilities
+            .keys()
+            .filter(|name| {
+                model_capabilities::require(
+                    &capabilities,
+                    &responses,
+                    name,
+                    model_capabilities::Capability::Responses,
+                )
+                .is_ok()
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn model_rate_controllers(
+        &self,
+    ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
+        self.llm_runtime_stores.rate_controllers()
+    }
+
+    #[must_use]
+    pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
+        self.llm_runtime_stores.responses_llms()
+    }
+
+    #[must_use]
+    pub fn http_rate_control_registry(
+        &self,
+    ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
+        Arc::clone(&self.http_rate_control_registry)
     }
 
     #[must_use]
     pub fn app(&self) -> Arc<RwLock<Option<Arc<App>>>> {
         Arc::clone(&self.app)
+    }
+
+    pub async fn read_app(&self) -> Option<Arc<App>> {
+        let guard = self.app.read().await;
+        guard.clone()
     }
 
     #[must_use]
@@ -543,6 +905,25 @@ impl Runtime {
     #[must_use]
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    /// The startup check of `runtime.state.location`, when it is set.
+    pub(crate) fn state_location_check(
+        &self,
+    ) -> Option<&Arc<runtime_state_location::StateLocationCheck>> {
+        self.state_location_check.as_ref()
+    }
+
+    /// The engines of the snapshot sources this runtime has resolved.
+    pub(crate) fn snapshot_sources(
+        &self,
+    ) -> &Arc<component::dataset::snapshot_source::SnapshotSourceRegistry> {
+        &self.snapshot_sources
+    }
+
+    #[must_use]
+    pub fn resource_monitor(&self) -> resource_monitor::ResourceMonitor {
+        self.resource_monitor.clone()
     }
 
     #[must_use]
@@ -556,8 +937,659 @@ impl Runtime {
     }
 
     #[must_use]
+    pub fn scheduler_peers(&self) -> Option<Arc<RwLock<SchedulerPeers>>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { peers, .. }) => Some(Arc::clone(peers)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn partition_assignments(&self) -> Option<Arc<RwLock<PartitionAssignments>>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Executor {
+                partition_assignments,
+                ..
+            }) => Some(Arc::clone(partition_assignments)),
+            _ => None,
+        }
+    }
+
+    /// Returns the executor outbound broadcaster used to send
+    /// `PartitionsLoaded` and other unsolicited messages back to schedulers.
+    /// Only available when this runtime is running as a cluster executor.
+    #[must_use]
+    pub fn executor_outbound_broadcaster(
+        &self,
+    ) -> Option<crate::cluster::ExecutorOutboundBroadcaster> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Executor {
+                outbound_broadcaster,
+                ..
+            }) => Some(outbound_broadcaster.clone()),
+            _ => None,
+        }
+    }
+
+    /// Adds `assignments` to the partitions this executor holds and loads the
+    /// tables whose partitions change. Partitions the scheduler pushed earlier
+    /// are kept: the scheduler removes a partition by an explicit update.
+    pub async fn set_partition_assignments(&self, assignments: PartitionAssignments) {
+        if let Some(DistributedNode::Executor {
+            partition_assignments,
+            assignment_updates,
+            ..
+        }) = self.distributed.as_ref()
+        {
+            let _applying = assignment_updates.lock().await;
+            let mut guard = partition_assignments.write().await;
+            let mut changed = Vec::new();
+            for (table, partitions) in assignments {
+                let held = guard.entry(table.clone()).or_default();
+                let before = held.len();
+                for partition in partitions {
+                    if !held.contains(&partition) {
+                        held.push(partition);
+                    }
+                }
+                if held.len() != before {
+                    changed.push(table);
+                }
+            }
+            let merged = guard.clone();
+            drop(guard); // drop lock before updating tables
+
+            self.record_executor_assigned_partitions(&merged);
+
+            for table in changed {
+                if let Err(e) = self
+                    .update_partition_refresh_sql(table.clone(), &merged)
+                    .await
+                {
+                    tracing::warn!("Failed to update partition refresh SQL for {table}: {e}");
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Attempted to set partition assignments on a non-executor node. Ignoring."
+            );
+        }
+    }
+
+    /// Emit `executor_assigned_partitions_count` for each assigned table.
+    ///
+    /// Uses `schema.table` for the `dataset` label so executor-side series
+    /// line up with the scheduler-side partition metrics, which build their
+    /// label from the user-declared dataset name (typically 2-part). The
+    /// `node_id` label uses `metrics_node_id()` (host + bind port, scheme
+    /// stripped) to match the executor identity registered with the scheduler.
+    fn record_executor_assigned_partitions(&self, assignments: &PartitionAssignments) {
+        let node_id = self.df.cluster_config.metrics_node_id();
+        for (table, partitions) in assignments {
+            let dataset = format!("{}.{}", table.schema, table.table);
+            runtime_cluster::metrics::set_executor_assigned_partitions_count(
+                &node_id,
+                &dataset,
+                partitions.len() as u64,
+            );
+        }
+    }
+
+    pub async fn update_partition_assignments(
+        &self,
+        new_partitions: HashMap<String, Vec<Vec<u8>>>,
+        removed_partitions: HashMap<String, Vec<Vec<u8>>>,
+    ) -> Result<()> {
+        let Some(DistributedNode::Executor {
+            partition_assignments,
+            assignment_updates,
+            ..
+        }) = self.distributed.as_ref()
+        else {
+            tracing::warn!(
+                "Attempted to update partition assignments on a non-executor node. Ignoring."
+            );
+            // Not an executor — there's nothing for us to apply. Report success
+            // so the scheduler doesn't retry; the routing layer is what'd be
+            // misconfigured here.
+            return Ok(());
+        };
+        let _applying = assignment_updates.lock().await;
+
+        // Compute the prospective post-update state from a snapshot of the
+        // current map. We apply the DataFusion filter updates against this
+        // *before* committing to shared state, so a per-table failure leaves
+        // the routing map unchanged and the scheduler's retry sees a
+        // consistent starting point on the next attempt.
+        let mut prospective: PartitionAssignments = partition_assignments.read().await.clone();
+
+        for (table_name, partitions) in &removed_partitions {
+            let table_ref = TableReference::parse_str(table_name)
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+            if let Some(current_partitions) = prospective.get_mut(&table_ref) {
+                for partition_bytes in partitions {
+                    let partition_expr =
+                        Expr::from_bytes_with_ctx(partition_bytes, &self.df.ctx.task_ctx())
+                            .map_err(|source| {
+                                Error::UnableToDeserializeClusterPartitionExpression {
+                                    table: table_name.clone(),
+                                    source: Box::new(source),
+                                }
+                            })?;
+                    current_partitions.retain(|p| p != &partition_expr);
+                }
+            }
+        }
+
+        for (table_name, partitions) in &new_partitions {
+            let table_ref = TableReference::parse_str(table_name)
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+            let current_partitions = prospective.entry(table_ref.clone()).or_default();
+            for partition_bytes in partitions {
+                let partition_expr = ::datafusion_expr::Expr::from_bytes_with_ctx(
+                    partition_bytes,
+                    &self.df.ctx.task_ctx(),
+                )
+                .map_err(|source| {
+                    Error::UnableToDeserializeClusterPartitionExpression {
+                        table: table_name.clone(),
+                        source: Box::new(source),
+                    }
+                })?;
+                if !current_partitions.contains(&partition_expr) {
+                    current_partitions.push(partition_expr);
+                }
+            }
+        }
+
+        // Tables whose partitions this update changes load them. An update
+        // that repeats what the executor already holds (the scheduler re-sends
+        // partitions it has no load report for) repairs that report instead.
+        let (affected_tables, repeated_tables): (
+            HashSet<ResolvedTableReference>,
+            HashSet<ResolvedTableReference>,
+        ) = {
+            let current = partition_assignments.read().await;
+            new_partitions
+                .keys()
+                .chain(removed_partitions.keys())
+                .map(|table_name| {
+                    TableReference::parse_str(table_name)
+                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                })
+                .partition(|table| current.get(table) != prospective.get(table))
+        };
+
+        // Apply DataFusion filter updates against the prospective state. If any
+        // fails, the shared partition_assignments map is not modified — the
+        // scheduler retries the update and we'll re-attempt all tables.
+        for resolved in affected_tables {
+            self.update_partition_refresh_sql(resolved, &prospective)
+                .await?;
+        }
+
+        self.record_executor_assigned_partitions(&prospective);
+
+        // All filter updates succeeded — commit the new routing state. Last
+        // step so the planner's view of executor partitions never gets ahead
+        // of what the AcceleratedTables actually know about.
+        *partition_assignments.write().await = prospective.clone();
+
+        for resolved in repeated_tables {
+            self.repair_partition_load(resolved, &prospective).await?;
+        }
+        Ok(())
+    }
+
+    /// Answers a scheduler that re-sent partitions of `table` this executor
+    /// already holds because it has no report of them loaded: replays the
+    /// report of the load of the current partitions, or loads them again when
+    /// no load of them finished (it failed) and none is running. Does nothing
+    /// before the table's initial load reports, which reports on its own.
+    async fn repair_partition_load(
+        &self,
+        table: ResolvedTableReference,
+        assignments: &PartitionAssignments,
+    ) -> Result<()> {
+        let Some(broadcaster) = self.executor_outbound_broadcaster() else {
+            return Ok(());
+        };
+        let table_name = table.to_string();
+        if broadcaster.is_loading(&table_name) {
+            return Ok(());
+        }
+        let Some(loaded) = broadcaster.loaded_partitions(&table_name).await else {
+            return Ok(());
+        };
+        let assigned: HashSet<Vec<u8>> = assignments
+            .get(&table)
+            .map(|exprs| runtime_cluster::encode_partition_exprs(exprs, &table_name))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if loaded.into_iter().collect::<HashSet<_>>() == assigned {
+            let sent = broadcaster.rebroadcast_partitions_loaded(&table_name).await;
+            tracing::debug!("Re-sent PartitionsLoaded for {table_name} to {sent} scheduler(s)");
+            return Ok(());
+        }
+        tracing::info!("Loading the assigned partitions of {table_name} again");
+        self.update_partition_refresh_sql(table, assignments).await
+    }
+
+    /// Loads the partitions of `table` assigned while its initial load read
+    /// `loaded`, the partitions that load filtered to.
+    pub(crate) async fn load_partitions_assigned_during_initial_load(
+        &self,
+        table: ResolvedTableReference,
+        loaded: &[Expr],
+    ) -> Result<()> {
+        let Some(DistributedNode::Executor {
+            partition_assignments,
+            assignment_updates,
+            ..
+        }) = self.distributed.as_ref()
+        else {
+            return Ok(());
+        };
+        let _applying = assignment_updates.lock().await;
+        let current = partition_assignments.read().await.clone();
+        let loaded: HashSet<&Expr> = loaded.iter().collect();
+        let assigned: HashSet<&Expr> = current
+            .get(&table)
+            .map(|exprs| exprs.iter().collect())
+            .unwrap_or_default();
+        if loaded == assigned {
+            return Ok(());
+        }
+        self.update_partition_refresh_sql(table, &current).await
+    }
+
+    pub(crate) async fn update_partition_refresh_sql(
+        &self,
+        table: ResolvedTableReference,
+        assignments: &PartitionAssignments,
+    ) -> Result<()> {
+        let table_ref = TableReference::full(
+            Arc::<str>::clone(&table.catalog),
+            Arc::<str>::clone(&table.schema),
+            Arc::<str>::clone(&table.table),
+        );
+
+        // During startup the scheduler can push an assignment before this
+        // executor has registered the table — it's still blocked in
+        // `allocate_initial_partitions` ahead of `executor_bind_app`/dataset
+        // load. Skip cleanly rather than erroring (which NACKs the scheduler and
+        // triggers retries): the table's initial snapshot reads its filters from
+        // the assignments map (see `init::dataset`) once it loads, so the
+        // partitions are applied without this path.
+        if !self.datafusion().table_exists(&table_ref) {
+            tracing::debug!(
+                "Deferring partition filter update for {table}: table not yet registered"
+            );
+            return Ok(());
+        }
+
+        // This path runs only in executor partitioned mode, so the table is
+        // always partition-scoped: wrap in `Some`. An empty result here means no
+        // partition is assigned to this executor, which resolves to a `false`
+        // predicate (load no rows) rather than an unfiltered full-table load.
+        let partition_filters = Some(crate::cluster::partition::get_partition_filter_exprs(
+            &table,
+            assignments,
+        ));
+
+        // The ack below reports that *this* table instance loaded these
+        // partitions, so the identity has to be the one the assignments are
+        // about — captured ahead of the update that installs them, not after.
+        // Capturing later would tie the ack to whatever the name resolves to by
+        // then, which is a different table if a rebuild has landed in between.
+        let instance = self.datafusion().capture_table_instance(&table_ref).await;
+        let table_name = table.to_string();
+        let broadcaster = self.executor_outbound_broadcaster();
+        // Dropping the guard ends the load, including when this future is
+        // cancelled before the completion task below takes it over.
+        let load = broadcaster
+            .as_ref()
+            .map(|broadcaster| broadcaster.start_load(&table_name));
+
+        // Propagate the filter-update error so the caller (and the executor's
+        // ack to the scheduler) sees the failure rather than just logging it.
+        // Trigger a refresh to load the data for the new partitions, capturing
+        // the completion notifier so we can ack the scheduler with a
+        // `PartitionsLoaded` once the accelerated table has actually finished
+        // loading. A refresh that cannot start fails the update, so the
+        // scheduler sends it again rather than count it delivered.
+        let started = async {
+            self.datafusion()
+                .update_partition_filters(table_ref.clone(), partition_filters)
+                .await
+                .map_err(|source| Error::UnableToUpdateClusterPartitionFilters {
+                    table: table_name.clone(),
+                    source: Box::new(source),
+                })?;
+            tracing::info!("Updated partition assignments for {table}");
+            self.datafusion()
+                .refresh_table(&table_ref, None)
+                .await
+                .map_err(|source| Error::UnableToUpdateClusterPartitionFilters {
+                    table: table_name.clone(),
+                    source: Box::new(source),
+                })
+        }
+        .await;
+        let notifier = started?;
+
+        // Snapshot the partition exprs assigned to us for this table, encoded
+        // the same way the scheduler encodes them when sending UpdatePartitions
+        // (`Expr::to_bytes()`). `partition_value_to_bytes` sorts entries by
+        // key so the encoding is deterministic across re-serialization.
+        let partition_expr_bytes: Vec<Vec<u8>> = assignments
+            .get(&table)
+            .map(|exprs| runtime_cluster::encode_partition_exprs(exprs, &table_name))
+            .unwrap_or_default();
+
+        if let (Some(broadcaster), Some(load)) = (broadcaster, load) {
+            // Send the ack even when `partition_expr_bytes` is empty — a
+            // legitimately empty assignment (e.g. zero-partition source, or
+            // partitions that all failed to serialize) still needs to flip
+            // the scheduler-side readiness gate via the
+            // `is_table_loaded`/`updated_at` shortcut. Suppressing the empty
+            // case here would leave the dataset stuck in `Refreshing`.
+            let df = self.datafusion();
+            tokio::spawn(async move {
+                // Acking readiness for a table that did not load this partition
+                // set tells the scheduler a lie it then caches, so wait for the
+                // refresh *and* re-resolve the table before broadcasting.
+                let loaded = match df.await_refresh_completion(instance, notifier).await {
+                    DeferredRefreshOutcome::Apply => true,
+                    DeferredRefreshOutcome::Abandoned => {
+                        // The table was removed before the refresh we triggered
+                        // landed, so the partition set was never loaded.
+                        tracing::debug!(
+                            "{table_name} was removed before its partition refresh completed; not broadcasting PartitionsLoaded."
+                        );
+                        false
+                    }
+                    DeferredRefreshOutcome::Failed => {
+                        // A one-shot refresh failed. Advertising those
+                        // partitions as queryable would tell the scheduler a
+                        // lie it then caches.
+                        tracing::warn!(
+                            "{table_name} partition refresh failed terminally; not broadcasting PartitionsLoaded."
+                        );
+                        false
+                    }
+                    DeferredRefreshOutcome::TableChanged => {
+                        // A refresh did land, but not on the table this ack is
+                        // about — the name has since been removed or rebuilt,
+                        // and a rebuild carries its own partition set.
+                        tracing::debug!(
+                            "{table_name} was removed or rebuilt after its partition refresh completed; not broadcasting PartitionsLoaded."
+                        );
+                        false
+                    }
+                };
+                if loaded {
+                    // Statistics flow via the periodic ExecutorStatistics
+                    // reporter, not this readiness ack.
+                    let sent = broadcaster
+                        .broadcast_partitions_loaded(
+                            table_name.clone(),
+                            partition_expr_bytes,
+                            load.load_sequence(),
+                        )
+                        .await;
+                    tracing::debug!(
+                        "Broadcast PartitionsLoaded for {table_name} to {sent} scheduler(s)"
+                    );
+                }
+                drop(load);
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Periodically drives moka housekeeping so invalidation predicates and
+    /// expired entries are reclaimed even on caches with no `get`/`insert`
+    /// traffic. Returns immediately when no cache is configured; otherwise loops
+    /// until the task is cancelled at shutdown.
+    pub(crate) async fn run_cache_maintenance(self: Arc<Self>) -> Result<()> {
+        let caching = self.datafusion().caching();
+        if caching.results.is_none()
+            && caching.plans.is_none()
+            && caching.search.is_none()
+            && caching.embeddings.is_none()
+        {
+            return Ok(());
+        }
+
+        let mut interval = tokio::time::interval(CACHE_MAINTENANCE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+
+            caching.run_pending_maintenance().await;
+        }
+    }
+
+    /// Periodically recompute and rebroadcast this executor's per-table row-count
+    /// statistics to all schedulers. `PartitionsLoaded` is otherwise only sent on
+    /// initial load / assignment change, so during streaming ETL the coordinator's
+    /// in-memory stats would reflect only the first snapshot (or nothing if the
+    /// table had no data at initial-load time). A periodic rebroadcast keeps the
+    /// coordinator's join-sizing statistics fresh as the executor's local data grows.
+    pub(crate) async fn run_executor_statistics_reporter(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The statistics source (`local_executor_table_statistics`) reads the
+        // Cayenne metastore aggregate, which is maintained incrementally on the
+        // write path: always-fresh, O(1), and never degrades to a row-count-only
+        // result mid-ingest. So there is no non-degrading cache here — each tick
+        // simply broadcasts the current aggregate.
+        loop {
+            // Rebroadcast on write completion (debounced so a burst of segment
+            // publishes coalesces into one pass) with the interval tick as the
+            // idle heartbeat.
+            let df_for_notify = self.datafusion();
+            tokio::select! {
+                _ = interval.tick() => {}
+                () = df_for_notify.write_completed_notified() => {
+                    // Debounce, then drain the (at most one) permit stored by
+                    // writes that completed during the sleep so a burst yields
+                    // a single rebroadcast; writes after this point store a
+                    // fresh permit and trigger the next pass.
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::ZERO,
+                        df_for_notify.write_completed_notified(),
+                    )
+                    .await;
+                    interval.reset();
+                }
+            }
+            let Some(broadcaster) = self.executor_outbound_broadcaster() else {
+                continue;
+            };
+            let df = self.datafusion();
+
+            // Enumerate the tables this executor serves locally. The q18 tables
+            // are cayenne *catalog* tables (not spice.public datasets), so the
+            // dataset partition-assignment map doesn't cover them; enumerate the
+            // cayenne catalog directly. Also include any dataset assignments.
+            let mut tables: Vec<TableReference> = Vec::new();
+            #[cfg(not(windows))]
+            {
+                tables.extend(crate::cluster::discover_cayenne_tables(&df).await);
+            }
+            if let Some(assignments_lock) = self.partition_assignments() {
+                for resolved in assignments_lock.read().await.keys() {
+                    tables.push(TableReference::full(
+                        Arc::<str>::clone(&resolved.catalog),
+                        Arc::<str>::clone(&resolved.schema),
+                        Arc::<str>::clone(&resolved.table),
+                    ));
+                }
+            }
+            tables.sort_by_key(ToString::to_string);
+            tables.dedup_by_key(|t| t.to_string());
+            if tables.is_empty() {
+                continue;
+            }
+            tracing::debug!(
+                count = tables.len(),
+                "Reporting per-executor table statistics to schedulers"
+            );
+            for table in tables {
+                let table_key = table.to_string();
+                if let Some((stats, column_names)) =
+                    crate::cluster::partition::local_executor_table_statistics(&df, &table).await
+                {
+                    let encoded = runtime_cluster::encode_statistics(&stats);
+                    broadcaster
+                        .broadcast_executor_statistics(table_key, encoded, column_names)
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Returns the partition store for accelerated table partition metadata (scheduler only).
+    #[must_use]
+    pub fn partition_store(&self) -> Option<Arc<PartitionStore>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                accelerations_partitions_store,
+                ..
+            }) => Some(Arc::clone(accelerations_partitions_store)),
+            _ => None,
+        }
+    }
+
+    /// Returns the partition load tracker used to aggregate executor
+    /// `PartitionsLoaded` acks (scheduler only).
+    #[must_use]
+    pub fn partition_load_tracker(&self) -> Option<Arc<runtime_cluster::PartitionLoadTracker>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                partition_load_tracker,
+                ..
+            }) => Some(Arc::clone(partition_load_tracker)),
+            _ => None,
+        }
+    }
+
+    /// Returns the cluster state store (scheduler only).
+    #[must_use]
+    pub fn cluster_state(&self) -> Option<Arc<ClusterStateStore>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { cluster_state, .. }) => {
+                Some(Arc::clone(cluster_state))
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the scheduler heartbeat store (scheduler only).
+    #[must_use]
+    pub fn scheduler_heartbeats(&self) -> Option<Arc<SchedulerHeartbeatStore>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { heartbeats, .. }) => Some(Arc::clone(heartbeats)),
+            _ => None,
+        }
+    }
+
+    /// Returns the metrics reader for on-demand OTLP metrics collection.
+    ///
+    /// This is used in cluster mode by:
+    /// - `GetMetrics` RPC to return local metrics to peer schedulers
+    /// - Executors responding to metrics requests from schedulers via control stream
+    #[must_use]
+    pub fn metrics_reader(&self) -> Option<&telemetry::metrics_reader::MetricsReader> {
+        self.metrics_reader.as_ref()
+    }
+
+    /// Returns the job executor for async SQL queries if available (cluster mode only).
+    ///
+    /// This uses `try_read()` to avoid blocking the caller. If another thread holds
+    /// a write lock (e.g., during initialization), this returns `None`. The caller
+    /// should be aware that a `None` result could mean either:
+    /// 1. Async jobs are not enabled (not in cluster mode), or
+    /// 2. The executor is being initialized (rare, transient condition)
+    #[must_use]
+    pub fn job_executor(&self) -> Option<Arc<jobs::JobExecutor>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { job_executor, .. }) => {
+                if let Ok(guard) = job_executor.try_read() {
+                    guard.clone()
+                } else {
+                    tracing::debug!(
+                        "Job executor is currently being initialized. Returning None. This is a transient condition during startup."
+                    );
+                    None
+                }
+            }
+            None | Some(DistributedNode::Executor { .. }) => None,
+        }
+    }
+
+    /// Sets the job executor for async SQL queries.
+    pub async fn set_job_executor(&self, executor: Arc<jobs::JobExecutor>) {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { job_executor, .. }) => {
+                let mut guard = job_executor.write().await;
+                *guard = Some(executor);
+            }
+            Some(DistributedNode::Executor { .. }) => {
+                tracing::warn!(
+                    "Attempted to set job executor on an executor node. This should only be set on the scheduler. Ignoring."
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "Attempted to set job executor on a non-cluster runtime. This should only be set in cluster mode on the scheduler node. Ignoring."
+                );
+            }
+        }
+    }
+
+    #[must_use]
     pub fn datasets_health_monitor(&self) -> Option<Arc<DatasetsHealthMonitor>> {
         self.datasets_health_monitor.clone()
+    }
+
+    /// Initialize cache metrics after OpenTelemetry meter provider is set up.
+    /// Must be called after `init_metrics` in spiced to ensure metrics are registered.
+    pub fn init_cache_metrics(&self) {
+        use cache::metrics::CacheMetrics;
+        use cache::result::{
+            embeddings::CachedEmbeddingResult, query::CachedQueryResult, search::CachedSearchResult,
+        };
+
+        let caching = self.datafusion().caching();
+        if caching.results.is_some() {
+            CachedQueryResult::init();
+        }
+        if caching.search.is_some() {
+            CachedSearchResult::init();
+        }
+        if caching.embeddings.is_some() {
+            CachedEmbeddingResult::init();
+        }
+
+        // Every value these pools share is held by a cache entry, so a runtime
+        // with no cache configured has nothing to report.
+        if caching.results.is_some() || caching.search.is_some() {
+            cache::metrics::init_interner_metrics();
+        }
+    }
+
+    /// Publishes the component counters at zero. Must be called after
+    /// `init_metrics` in spiced, for the same reason as
+    /// [`Runtime::init_cache_metrics`].
+    pub fn init_component_metrics(&self) {
+        runtime_metrics::publish_component_counters_at_zero();
+        runtime_state_location::metrics::init();
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -595,13 +1627,20 @@ impl Runtime {
     /// The future returned by this function drives the individual server futures and will only return once the servers are shutdown.
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
-    #[allow(clippy::too_many_lines)]
     pub async fn start_servers(
         self: Arc<Self>,
         config: Config,
         tls_config: Option<Arc<TlsConfig>>,
         endpoint_auth: EndpointAuth,
     ) -> Result<()> {
+        // Executors: mark cluster status Initializing before any await so a
+        // concurrent `load_components` cannot report ready from dataset-only
+        // status while task slots are still closed (Fix B for #11758).
+        if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
+            self.status
+                .update_cluster("executor", status::ComponentStatus::Initializing);
+        }
+
         Arc::clone(&self)
             .register_metrics_table(self.prometheus_registry.is_some())
             .await?;
@@ -624,51 +1663,145 @@ impl Runtime {
             }
         };
 
-        // - Scheduler: does some init, but all requests handled by Flight RPC stack
+        // - Scheduler: does some init, starts internal cluster gRPC server on separate port
         // - Executor: does some init, but has a polling loop to fetch work from scheduler
-        #[cfg(feature = "cluster")]
-        let maybe_cluster_future = match self.config.cluster.mode {
-            Some(ClusterMode::Scheduler) => {
-                cluster::initialize_cluster_scheduler(&self).await?;
-                None
-            }
-            Some(ClusterMode::Executor) => Some(
-                self.start_runtime_task(
-                    CLUSTER_EXECUTOR,
-                    None,
-                    cluster::initialize_cluster_executor(Arc::clone(&self)).await?,
+        #[expect(
+            clippy::items_after_statements,
+            reason = "type alias scoped to cluster setup"
+        )]
+        type BoxedClusterFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
+
+        // For distributed cluster mode, start the appropriate additional cluster components.
+        // For scheduler, this includes cluster-wide metrics collection.
+        let (maybe_cluster_future, cluster_collector): (
+            Option<BoxedClusterFuture>,
+            Option<Arc<metrics_server::cluster::ClusterMetricsCollector>>,
+        ) = match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                executor_registry,
+                peers,
+                ..
+            }) => {
+                let fut = cluster::initialize_cluster_scheduler_future(
+                    &self,
+                    Arc::clone(executor_registry),
+                    Arc::clone(peers),
                 )
-                .await,
-            ),
-            _ => None,
+                .await?;
+
+                // Create local metrics collector closure that uses MetricsReader
+                let metrics_reader_for_collector = self.metrics_reader.clone();
+                let local_metrics_collector: Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
+                    Arc::new(move || {
+                        metrics_reader_for_collector
+                            .as_ref()
+                            .map(telemetry::metrics_reader::MetricsReader::collect_otlp)
+                            .unwrap_or_default()
+                    });
+                (
+                    fut,
+                    Some(Arc::new(
+                        metrics_server::cluster::ClusterMetricsCollector::new(
+                            Arc::clone(peers),
+                            Arc::clone(executor_registry),
+                            self.df.cluster_config.client_tls_config(),
+                            self.df.cluster_config.node_id(),
+                            local_metrics_collector,
+                        ),
+                    )),
+                )
+            }
+            Some(DistributedNode::Executor { .. }) => {
+                let executor_shutdown = CancellationToken::new();
+                let executor_fut = cluster::initialize_cluster_executor(
+                    Arc::clone(&self),
+                    executor_shutdown.clone(),
+                )
+                .await?;
+                let self_ref = Arc::clone(&self);
+                (
+                    Some(Box::pin(
+                        self_ref
+                            .start_runtime_task(
+                                CLUSTER_EXECUTOR,
+                                Some(executor_shutdown),
+                                executor_fut,
+                            )
+                            .await,
+                    )),
+                    None,
+                )
+            }
+            None => (None, None),
         };
 
         // Start Flight server
+        // On executors, periodically rebroadcast per-table row-count statistics so
+        // the coordinator's join-sizing stats stay fresh as streaming ETL grows
+        // local data (PartitionsLoaded is otherwise sent only on initial load /
+        // assignment change).
+        if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
+            let reporter_self = Arc::clone(&self);
+            tokio::spawn(async move {
+                reporter_self.run_executor_statistics_reporter().await;
+            });
+        }
+
         let flight_shutdown = CancellationToken::new();
         let self_ref = Arc::clone(&self);
         let cloned_tls_config = tls_config.clone();
-        let cloned_endpoint_auth = endpoint_auth.clone();
-        let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
-
-        let flight_future = self
-            .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
-                flight::start(
-                    config.flight_bind_address,
-                    cloned_app_ref,
-                    Arc::clone(&self_ref),
-                    cloned_tls_config,
-                    cloned_endpoint_auth,
-                    Arc::clone(&self_ref.rate_limits),
-                    Some(flight_shutdown),
+        let executor_endpoint_auth = endpoint_auth.clone();
+        let flight_future: std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> =
+            if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
+                Box::pin(
+                    self.start_runtime_task(
+                        FLIGHT_SERVER,
+                        Some(flight_shutdown.clone()),
+                        async move {
+                            cluster::start_executor_flight_server(
+                                config.flight_bind_address,
+                                Arc::clone(&self_ref),
+                                executor_endpoint_auth,
+                                Some(flight_shutdown),
+                            )
+                            .await
+                            .context(UnableToStartFlightServerSnafu)
+                        },
+                    )
+                    .await,
                 )
-                .await
-                .context(UnableToStartFlightServerSnafu)
-            })
-            .await;
+            } else {
+                let cloned_endpoint_auth = endpoint_auth.clone();
+                let cloned_app_ref = self.read_app().await;
 
-        #[cfg(feature = "cluster")]
-        // If this is an executor, we only need the shutdown signal and flight server
-        if matches!(self.config.cluster.mode, Some(ClusterMode::Executor)) {
+                Box::pin(
+                    self.start_runtime_task(
+                        FLIGHT_SERVER,
+                        Some(flight_shutdown.clone()),
+                        async move {
+                            flight::start(
+                                config.flight_bind_address,
+                                cloned_app_ref,
+                                Arc::clone(&self_ref),
+                                cloned_tls_config,
+                                cloned_endpoint_auth,
+                                Arc::clone(&self_ref.rate_limits),
+                                Some(flight_shutdown),
+                            )
+                            .await
+                            .context(UnableToStartFlightServerSnafu)
+                        },
+                    )
+                    .await,
+                )
+            };
+
+        // If this is an executor, we only need the shutdown signal, flight server, and health endpoint.
+        // Early exit to avoid starting unneeded servers: http server, metrics server, pods watcher, etc.
+        if matches!(
+            self.df.cluster_config.effective_role(),
+            Some(ClusterRole::Executor)
+        ) {
             let Some(executor_future) = maybe_cluster_future else {
                 return Err(FailedToStartClusterExecutor {
                     source: "Executor work loop not bound. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues"
@@ -677,67 +1810,71 @@ impl Runtime {
                 });
             };
 
-            return tokio::try_join!(shutdown_signal_future, executor_future, flight_future,)
-                .map(|_| ());
+            // Start health-only HTTP server for executor
+            let http_shutdown = CancellationToken::new();
+            let health_http_future = self
+                .start_runtime_task(
+                    HTTP_SERVER,
+                    Some(http_shutdown.clone()),
+                    http::start_health_only(config.http_bind_address, Some(http_shutdown))
+                        .map_err(Error::from),
+                )
+                .await;
+
+            return tokio::try_join!(
+                shutdown_signal_future,
+                executor_future,
+                flight_future,
+                health_http_future,
+                self.state_location_refusal(),
+            )
+            .map(|_| ());
         }
 
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
-        let http_auth = endpoint_auth.http_auth.clone();
+        let auth = endpoint_auth.http_auth.clone();
+        let identity_source = endpoint_auth.identity_source;
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
         let http_future = self
-            .start_runtime_task(HTTP_SERVER, Some(http_shutdown.clone()), async move {
+            .start_runtime_task(
+                HTTP_SERVER,
+                Some(http_shutdown.clone()),
                 http::start(
                     cloned_config.http_bind_address,
                     self_ref,
                     cloned_config.into(),
                     cloned_tls_config,
-                    http_auth,
+                    auth,
+                    identity_source,
                     Some(http_shutdown),
                 )
-                .await
-                .context(UnableToStartHttpServerSnafu)
-            })
+                .map_err(Error::from),
+            )
             .await;
 
         // Start Metrics server
         let metrics_endpoint = self.metrics_endpoint;
         let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
+        let metrics_rate_limiter =
+            Arc::new(RateLimiter::direct(self.rate_limits.metrics_endpoint_limit));
 
         let metrics_future = self
             .start_runtime_task(METRICS_SERVER, None, async move {
-                metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
-                    .await
-                    .context(UnableToStartMetricsServerSnafu)
+                metrics_server::start(
+                    metrics_endpoint,
+                    prometheus_registry,
+                    cloned_tls_config,
+                    cluster_collector,
+                    Some(metrics_rate_limiter),
+                )
+                .await
+                .context(UnableToStartMetricsServerSnafu)
             })
-            .await;
-
-        // Start OpenTelemetry server
-        let opentelemetry_graceful_shutdown = CancellationToken::new();
-        let df_ref = Arc::clone(&self.df);
-        let cloned_tls_config = tls_config.clone();
-        let grpc_auth = endpoint_auth.grpc_auth.clone();
-
-        let opentelemetry_future = self
-            .start_runtime_task(
-                OPENTELEMETRY_SERVER,
-                Some(opentelemetry_graceful_shutdown.clone()),
-                async move {
-                    opentelemetry::start(
-                        config.open_telemetry_bind_address,
-                        df_ref,
-                        cloned_tls_config,
-                        grpc_auth,
-                        Some(opentelemetry_graceful_shutdown),
-                    )
-                    .await
-                    .context(UnableToStartOpenTelemetryServerSnafu)
-                },
-            )
             .await;
 
         if let Some(tls_config) = tls_config {
@@ -762,28 +1899,70 @@ impl Runtime {
             })
             .await;
 
+        // `None` cancellation token: the loop is aborted at shutdown.
+        let maintenance_self = Arc::clone(&self);
+        let cache_maintenance_future = self
+            .start_runtime_task(
+                CACHE_MAINTENANCE,
+                None,
+                maintenance_self.run_cache_maintenance(),
+            )
+            .await;
+
         // wait for all servers to shut down or if any of the servers fail to start
+        if let Some(cluster_future) = maybe_cluster_future {
+            return match tokio::try_join!(
+                http_future,
+                flight_future,
+                metrics_future,
+                pods_watcher_future,
+                cache_maintenance_future,
+                cluster_future,
+                shutdown_signal_future,
+                self.state_location_refusal()
+            ) {
+                Err(err) => Err(err),
+                _ => Ok(()),
+            };
+        }
+
         match tokio::try_join!(
             http_future,
             flight_future,
             metrics_future,
-            opentelemetry_future,
             pods_watcher_future,
-            shutdown_signal_future
+            cache_maintenance_future,
+            shutdown_signal_future,
+            self.state_location_refusal()
         ) {
             Err(err) => Err(err),
             _ => Ok(()),
         }
     }
 
+    /// Fails when the startup check refuses `runtime.state.location`, which
+    /// stops startup. Otherwise resolves once the check passes, or at shutdown.
+    async fn state_location_refusal(&self) -> Result<()> {
+        let Some(check) = &self.state_location_check else {
+            return Ok(());
+        };
+        let shutdown = self.status.shutdown_token();
+        tokio::select! {
+            refused = check.finished() => match refused {
+                Some(reason) => StateLocationRefusedSnafu { reason: reason.to_string() }.fail(),
+                None => Ok(()),
+            },
+            () = shutdown.cancelled() => Ok(()),
+        }
+    }
+
     /// Updates all of the component statuses to `Initializing`.
     pub async fn set_components_initializing(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-        let Some(app) = app_lock.as_ref() else {
+        let Some(app) = self.read_app().await else {
             return;
         };
 
-        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(false));
         for ds in &valid_datasets {
             self.status
                 .update_dataset(&ds.name, ComponentStatus::Initializing);
@@ -793,6 +1972,11 @@ impl Runtime {
             for embedding in &app.embeddings {
                 self.status
                     .update_embedding(&embedding.name, ComponentStatus::Initializing);
+            }
+
+            for reranker in &app.rerankers {
+                self.status
+                    .update_reranker(&reranker.name, ComponentStatus::Initializing);
             }
 
             for model in &app.models {
@@ -816,33 +2000,135 @@ impl Runtime {
             }
         }
 
-        let valid_catalogs = Arc::clone(&self).get_valid_catalogs(app, LogErrors(false));
+        let valid_catalogs = Arc::clone(&self).get_valid_catalogs(&app, LogErrors(false));
         for catalog in valid_catalogs {
             self.status
                 .update_catalog(&catalog.name, ComponentStatus::Initializing);
         }
 
-        let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
-        for view in valid_views {
+        let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(false));
+        for validated_view in valid_views {
             self.status
-                .update_view(&view.name, ComponentStatus::Initializing);
+                .update_view(&validated_view.view.name, ComponentStatus::Initializing);
         }
+    }
+
+    /// Installs the `runtime.drasi` forwarders for the runtime's own tables.
+    ///
+    /// A misconfiguration disables forwarding with a loud warning rather than
+    /// failing startup. These tables carry telemetry, and refusing to start the
+    /// runtime because a downstream reaction engine was misconfigured trades a
+    /// much larger outage for a smaller one.
+    async fn init_drasi_forwarders(self: &Arc<Self>) {
+        let Some(app) = self.read_app().await else {
+            return;
+        };
+        let Some(spec) = app.runtime.drasi.as_ref() else {
+            return;
+        };
+
+        if spec.forwarding == spicepod::drasi::DrasiForwarding::Disabled {
+            tracing::debug!("'runtime.drasi' is present but disabled; not forwarding.");
+            return;
+        }
+
+        if spec.tables.is_empty() {
+            tracing::warn!(
+                "'runtime.drasi' is configured but names no tables, so nothing is forwarded to Drasi. Add entries under 'runtime.drasi.tables'."
+            );
+            return;
+        }
+
+        match crate::drasi::internal::InternalForwarders::try_new(spec).await {
+            Ok(forwarders) => {
+                tracing::warn!(
+                    "Drasi change forwarding (Alpha) is in preview and should not be used in production."
+                );
+                tracing::info!(
+                    "Forwarding {} runtime table(s) to the Drasi source {}",
+                    spec.tables.len(),
+                    spec.source_id
+                );
+                self.df.set_drasi_forwarders(Arc::new(forwarders));
+            }
+            Err(e) => {
+                tracing::warn!("Not forwarding runtime tables to Drasi: {e}");
+            }
+        }
+    }
+
+    /// Whether the initial component load is still running.
+    ///
+    /// While it is, what is registered is not yet what the loaded app describes,
+    /// so a caller that reconciles a new app against the loaded one — the diff
+    /// [`Runtime::apply_app`] performs — would treat components the load has not
+    /// reached yet as already registered.
+    #[must_use]
+    pub fn initial_load_in_flight(&self) -> bool {
+        self.initial_load.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Reports every `${ store:key }` reference the app cannot resolve, as one
+    /// consolidated block, before any component is loaded.
+    ///
+    /// Runs at the start of the load rather than when the runtime is built,
+    /// because the two are not the same moment for the stores the runtime owns
+    /// rather than the spicepod: Cloud Connect registers its delivered-secrets
+    /// store on the built runtime and fills it from the local cache, and a
+    /// preflight that ran before that reported every delivered secret as
+    /// missing while the components that referenced them went on to load
+    /// perfectly well.
+    ///
+    /// Diagnostics only: it never changes whether or how components load, and
+    /// it never logs secret values.
+    async fn secrets_preflight(&self) {
+        // A cluster executor resolves every reference over the scheduler RPC
+        // store, one round trip each, and the scheduler has already checked
+        // them — so checking here re-reports the scheduler's own findings at
+        // the cost of a round trip per reference.
+        if matches!(self.distributed, Some(DistributedNode::Executor { .. })) {
+            return;
+        }
+
+        let Some(app) = self.app.read().await.clone() else {
+            return;
+        };
+        // A snapshot rather than the read guard: a lookup can be a network
+        // round trip, and holding the guard across it stalls a writer (and
+        // risks the write-preferring deadlock `Secrets::snapshot` documents).
+        let secrets = secrets::Secrets::snapshot(&self.secrets).await;
+        runtime_secrets::preflight::run(&app, &secrets).await;
     }
 
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    #[allow(clippy::too_many_lines)]
     pub async fn load_components(self: Arc<Self>) {
+        self.secrets_preflight().await;
+
+        let hold_ready_for_warmup = self.df.results_cache_warmup_holds_ready();
+        if hold_ready_for_warmup {
+            tracing::info!(
+                "SQL results cache warmup will run after the first full or append refresh, so datasets stay not ready until warmup completes"
+            );
+            self.status.hold_dataset_ready();
+        }
+
         Arc::clone(&self).set_components_initializing().await;
 
         Arc::clone(&self).start_extensions().await;
 
-        // Must be loaded before datasets
-        self.load_embeddings().await;
+        // Installed before anything can write: the forwarders resolve a table's
+        // key lazily from the constraints handed to them at write time, so they
+        // do not need the runtime tables to exist yet — and installing them here
+        // rather than alongside `task_history` keeps `runtime.drasi` working
+        // when task history itself is disabled.
+        self.init_drasi_forwarders().await;
 
-        // Spawn each component load in its own task to run in parallel
+        // Spawned before `load_embeddings`/`load_rerankers` so the table is registered as early as
+        // possible: it depends only on the app config, not on embeddings/rerankers being loaded, and
+        // other startup paths (tracing, `datasets_health_monitor`) start querying it immediately.
         let task_history = tokio::spawn({
             let self_clone = Arc::clone(&self);
             async move {
@@ -852,6 +2138,11 @@ impl Runtime {
             }
         });
 
+        // Must be loaded before datasets
+        self.load_embeddings().await;
+        self.load_rerankers().await;
+
+        // Spawn each remaining component load in its own task to run in parallel
         let datasets = tokio::spawn({
             let self_clone = Arc::clone(&self);
             async move {
@@ -866,7 +2157,7 @@ impl Runtime {
             }
         });
 
-        let models_and_evals = tokio::spawn({
+        let models = tokio::spawn({
             let self_clone = Arc::clone(&self);
 
             // This cannot be done earlier since we must have a `Arc<Runtime>` to provide to factories.
@@ -874,33 +2165,10 @@ impl Runtime {
 
             async move {
                 Arc::clone(&self_clone).load_models().await;
-                let app_ref = Arc::clone(&self_clone).app();
-                let app_lock = app_ref.read().await;
-
-                if !cfg!(feature = "models")
-                    && app_lock.as_ref().is_some_and(|s| !s.evals.is_empty())
-                {
-                    tracing::error!(
-                        "Cannot load evals without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}"
-                    );
-                }
 
                 #[cfg(feature = "models")]
                 {
                     Arc::clone(&self_clone).load_workers().await;
-                    let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());
-                    if an_eval_exists {
-                        let () = self_clone.verify_evals().await;
-                        drop(app_lock);
-                        self_clone.load_eval_scorer().await;
-                        if let Err(err) = self_clone.load_eval_tables().await {
-                            tracing::warn!("Failed to create internal eval tables: {err}");
-                        }
-                    } else {
-                        tracing::trace!(
-                            "No eval spice components defined. Therefore not loading eval tables into database."
-                        );
-                    }
                 }
             }
         });
@@ -918,13 +2186,13 @@ impl Runtime {
 
         let ctx = &self.datafusion().ctx;
         ctx.register_udtf(
-            "list_udfs",
+            udtfs::LIST_UDFS_UDTF_NAME,
             Arc::new(ListUDFTableFunc::new(Arc::clone(ctx))),
         );
 
-        let components = vec![task_history, datasets, catalogs, models_and_evals];
+        let components = vec![task_history, datasets, catalogs, models];
 
-        // Signal that the load must be canceled if the runtime is shut down before the components are loaded
+        // Signal that the load must be canceled if the runtime is shut down before the components are loaded.
         let cancel_loading = CancellationToken::new();
 
         // Wait for all components to load returning the first error
@@ -954,13 +2222,24 @@ impl Runtime {
             )
             .await;
 
-        if let Err(err) = load_result.await {
+        let load_outcome = load_result.await;
+
+        // The initial load is over — completed, failed, or cancelled.
+        self.initial_load.in_flight.store(false, Ordering::SeqCst);
+
+        if let Err(err) = load_outcome {
             if !matches!(err, Error::ComponentsInitializationCancelled) {
                 tracing::error!("Could not start the Spice runtime: {err}");
             }
+            self.status.release_dataset_ready();
         } else {
-            // Create a background task to report once all components are marked as `Ready`
             let status = self.status();
+            if hold_ready_for_warmup {
+                let app = self.read_app().await;
+                self.df.spawn_results_cache_warmup(Arc::clone(&status), app);
+            }
+
+            // Create a background task to report once all components are marked as `Ready`
             tokio::spawn({
                 async move {
                     loop {
@@ -970,11 +2249,11 @@ impl Runtime {
                             break;
                         }
                         if status.is_ready() {
-                            if let Some(app) = self.app.read().await.as_ref() {
+                            if let Some(app) = self.read_app().await {
                                 let valid_datasets =
-                                    Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
+                                    Arc::clone(&self).get_valid_datasets(&app, LogErrors(false));
                                 let valid_catalogs =
-                                    Arc::clone(&self).get_valid_catalogs(app, LogErrors(false));
+                                    Arc::clone(&self).get_valid_catalogs(&app, LogErrors(false));
                                 if valid_datasets.is_empty() && valid_catalogs.is_empty() {
                                     tracing::info!(
                                         "No datasets or catalogs were configured. If this is unexpected, check the Spicepod configuration."
@@ -990,7 +2269,7 @@ impl Runtime {
         }
     }
 
-    // Closes and deallocates all resources (including the static registries)
+    // Closes and deallocates all resources, including this runtime's accelerator engines.
     pub async fn shutdown(&self) {
         if self.status.is_shutdown() {
             return;
@@ -998,7 +2277,15 @@ impl Runtime {
 
         self.status.mark_shutdown();
 
-        let shutdown_timeout: Duration = self.app.read().await.as_ref().and_then(|app| {
+        // Tell CDC sources to release their upstream resources NOW, before
+        // the connection-drain phase below: a Postgres replication connection
+        // holds a single-consumer slot, and releasing it at shutdown start
+        // (instead of at process exit) lets a replacement instance attach
+        // during a rolling deploy instead of retrying against "slot is
+        // active".
+        data_components::cdc::begin_shutdown();
+
+        let shutdown_timeout: Duration = self.read_app().await.and_then(|app| {
             app.runtime.shutdown_timeout().unwrap_or_else(|err| {
                 tracing::warn!("Invalid shutdown timeout: {err}. Using default: {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
                 Some(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT)
@@ -1008,18 +2295,27 @@ impl Runtime {
             "Shutdown initiated; waiting up to {shutdown_timeout:?} for connections to drain"
         );
 
+        // Stop new Cayenne compaction-runtime passes as soon as shutdown begins.
+        // In-flight passes remain counted and are drained below before the
+        // dedicated compaction runtime itself can be dropped.
+        cayenne::begin_compaction_shutdown();
+
         let start_time = Instant::now();
 
-        // shutdown all running components except the HTTP and Metrics servers
+        // Shutdown running components in phases so request-serving tasks drain
+        // before query execution resources are cleaned up.
         let mut runtime_tasks = self.tasks.write().await;
 
-        // HTTP and METRICS servers must be shutdown last
+        // Query-serving tasks, including HTTP and Flight, must drain before
+        // DataFusion cleanup so in-flight queries still have access to their
+        // execution resources during graceful shutdown. Metrics can stay up
+        // until the end for health and observability during shutdown.
         let mut first_shutdown_group = Vec::new();
         let mut last_shutdown_group = Vec::new();
 
         for (name, handle) in runtime_tasks.drain() {
             match name.as_str() {
-                HTTP_SERVER | METRICS_SERVER => last_shutdown_group.push((name, handle)),
+                METRICS_SERVER => last_shutdown_group.push((name, handle)),
                 _ => first_shutdown_group.push((name, handle)),
             }
         }
@@ -1036,23 +2332,67 @@ impl Runtime {
             })
             .collect();
 
-        join_all(shutdown_futures).await;
+        // A change-data-capture source records how far its accelerations were
+        // advanced on its way out (`data_components::cdc::ShutdownDrainGuard`),
+        // and those writes go into the accelerations DataFusion cleanup closes
+        // below — so they have to land first, and they need the process to still
+        // be here, which signalling alone does not guarantee: a source notices the
+        // signal on its next poll, and this function otherwise finishes in
+        // milliseconds. Waited on alongside the connection drain, under the same
+        // timeout: a source that cannot finish in it costs a rebuild on the next
+        // start, never a hung shutdown.
+        //
+        // Snapshot writer leases are resigned alongside, so a replacement instance
+        // need not wait for them to lapse.
+        let (unfinished_sources, _, leases_released) = tokio::join!(
+            data_components::cdc::drain_shutdown(shutdown_timeout),
+            join_all(shutdown_futures),
+            tokio::time::timeout(shutdown_timeout, self.df.resign_snapshot_writer_leases()),
+        );
+        if leases_released.is_err() {
+            tracing::warn!(
+                "Shutdown waited {shutdown_timeout:?} to release snapshot writer leases and gave up; another instance takes over those datasets' snapshots only after the leases lapse"
+            );
+        }
+        if unfinished_sources > 0 {
+            tracing::warn!(
+                "Shutdown waited {shutdown_timeout:?} for {unfinished_sources} change-data-capture source(s) to record how far their accelerations were advanced, and gave up; each dataset on those sources will be rebuilt from its source on the next start rather than resumed"
+            );
+        }
 
         // Clean up DataFusion first as there could be datasets loading and accessing registries below.
         self.df.shutdown().await;
-        dataconnector::unregister_all().await;
-        catalogconnector::unregister_all().await;
+
+        let in_flight = cayenne::in_flight_compaction_tasks();
+        if in_flight > 0 {
+            let compaction_timeout = CAYENNE_COMPACTION_SHUTDOWN_TIMEOUT;
+            tracing::debug!(
+                in_flight,
+                ?compaction_timeout,
+                "Waiting for in-flight Cayenne compaction passes before dropping compaction runtime"
+            );
+            if !cayenne::drain_compaction_tasks(compaction_timeout).await {
+                tracing::warn!(
+                    remaining = cayenne::in_flight_compaction_tasks(),
+                    ?compaction_timeout,
+                    "Timed out waiting for Cayenne compaction passes during shutdown"
+                );
+            }
+        }
+
+        // `dataconnector`, `catalogconnector`, and `document_parse` hold only
+        // stateless factories (see the comments atop their `register_all()`)
+        // — clearing them here would strip connectors/parsers out from
+        // under every other `Runtime` in this process, so shutdown skips them.
         self.accelerator_engine_registry.unregister_all().await;
         tools::factory::unregister_all_factories(self).await;
 
-        document_parse::unregister_all().await;
-
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
-        // group includes only Metrics and HTTP Healthcheck endpoints; general HTTP API endpoints have already stopped accepting requests.
+        // group includes only Metrics endpoints.
         let elapsed = start_time.elapsed();
         let remaining_timeout = shutdown_timeout.saturating_sub(elapsed);
 
-        // Shutdown HTTP & Metrics servers last
+        // Shutdown Metrics server last
         let shutdown_futures: Vec<_> = last_shutdown_group
             .into_iter()
             .map(|(name, handle)| {
@@ -1067,16 +2407,18 @@ impl Runtime {
     }
 
     /// Spawns and registers a runtime task with optional cancellation support.
-    async fn start_runtime_task<F>(
+    pub(crate) async fn start_runtime_task<F>(
         self: &Arc<Self>,
         component_name: &str,
         cancellation_token: Option<CancellationToken>,
         task_fn: F,
-    ) -> impl Future<Output = Result<(), Error>>
+    ) -> impl Future<Output = Result<(), Error>> + use<F>
     where
         F: Future<Output = Result<(), Error>> + Send + 'static,
     {
-        let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn);
+        let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn, |err| {
+            Error::FailedToExecuteTask { source: err }
+        });
 
         self.tasks
             .write()
@@ -1092,7 +2434,7 @@ impl Runtime {
     ///
     /// For tools from catalog, the name is prefixed with the catalog name. e.g. `catalog_name/tool_name`.
     fn list_all_tools(self: &Arc<Self>) -> impl Stream<Item = Arc<dyn SpiceModelTool>> {
-        let default_catalogs = default_available_catalogs(Arc::clone(self));
+        let default_catalogs = default_available_catalogs(self);
         let stream_self = Arc::clone(self);
         stream! {
             let tool_lock = stream_self.tools.read().await;
@@ -1102,17 +2444,17 @@ impl Runtime {
                 .collect::<HashSet<_>>();
             for (name, tooling) in tool_lock.iter() {
                 match tooling {
-                    Tooling::Tool(tool) => {
+                    Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
                         yield Arc::clone(tool);
                     }
-                    Tooling::Catalog(catalog) => {
+                    Tooling::Catalog { tools: catalog, .. } => {
                         // Do not list tools from default catalogs. They are already listed individually as tools.
                         if default_catalog_names.contains(&name.as_str()) {
                             continue;
                         }
                         let all = catalog.all().await;
                         for tool in all {
-                            yield with_name(&tool, format!("{}/{}", catalog.name(), tool.name()).as_str());
+                            yield with_name(&tool, encode_tool_name(catalog.name(), &tool.name()).as_str());
                         }
                     }
                 }
@@ -1122,42 +2464,42 @@ impl Runtime {
 
     pub async fn get_tool(self: &Arc<Self>, tool_name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         let tools = self.tools.read().await;
-        let tool: Arc<dyn SpiceModelTool> =
-            if let Some((catalog_name, name)) = tool_name.split_once('/') {
-                let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
-                    return None;
-                };
-                return catalog.get(name).await;
-            } else {
-                let Some(Tooling::Tool(tool)) = tools.get(tool_name) else {
-                    return None;
-                };
-                Arc::clone(tool)
-            };
-        Some(tool)
+        if let Some((catalog_name, name)) = decode_tool_name(tool_name)
+            && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
+            && let Some(tool) = catalog.get(&name).await
+        {
+            return Some(tool);
+        }
+        // Fall back to a direct (non-catalog) lookup — covers top-level tools
+        // whose names legitimately contain the `__` catalog separator.
+        let Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) = tools.get(tool_name) else {
+            return None;
+        };
+        Some(Arc::clone(tool))
     }
 }
 
-#[must_use]
-pub fn spice_data_base_path() -> String {
-    let Ok(working_dir) = std::env::current_dir() else {
-        return ".".to_string();
-    };
+// The accelerator data directory is named by `data-accelerator-api`, so an engine
+// below `runtime` can resolve it; re-exported here for path compatibility.
+pub use data_accelerator_api::spice_data_base_path;
 
-    let base_folder = working_dir.join(".spice/data");
-    base_folder.to_str().unwrap_or(".").to_string()
-}
-
-#[allow(clippy::result_large_err)]
-pub(crate) fn make_spice_data_directory() -> Result<()> {
-    make_spice_data_sub_directory(&[])?;
-    Ok(())
-}
-
-#[allow(clippy::result_large_err)]
 pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<PathBuf> {
     let mut base_folder = PathBuf::from(spice_data_base_path());
     base_folder.extend(directory);
     std::fs::create_dir_all(base_folder.clone()).context(UnableToCreateDirectorySnafu)?;
     Ok(base_folder)
+}
+
+impl From<http::Error> for Error {
+    fn from(err: http::Error) -> Self {
+        Error::UnableToStartHttpServer { source: err }
+    }
+}
+
+impl From<runtime_acceleration::AccelerationParseError> for Error {
+    fn from(err: runtime_acceleration::AccelerationParseError) -> Self {
+        Error::InvalidAccelerationConfiguration {
+            source: Box::new(err),
+        }
+    }
 }

@@ -24,10 +24,10 @@ use datafusion::prelude::SessionContext;
 use datafusion_expr::CreateExternalTable;
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
 use runtime::Runtime;
-use runtime::accelerated_table::refresh_task::{accelerator_table_provider, max_timestamp_df};
+use runtime::accelerated::refresh_task::{accelerator_table_provider, max_timestamp_df};
 use runtime::component::dataset::acceleration::Engine;
 use runtime::datafusion::builder::AnalyzerRulesBuilder;
-use runtime_datafusion::extension::bytes_processed::BytesProcessedExtensionPlanner;
+use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimizer;
 use runtime_datafusion::{
     execution_plan::schema_cast::EnsureSchema, extension::ExtensionPlanQueryPlanner,
 };
@@ -57,7 +57,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -80,10 +80,11 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
             let cmd = CreateExternalTable {
                 schema: ToDFSchema::to_dfschema_ref(Arc::clone(&schema))?,
                 name: TableReference::bare("test_table"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -93,14 +94,15 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 temporary: false,
             };
             let accelerated_table = engine
-                .create_external_table(cmd, None, vec![])
+                .create_external_table(cmd, None, vec![], None)
                 .await
                 .expect("Failed to create external table");
 
-            accelerated_table
-                .as_any()
-                .downcast_ref::<PolyTableProvider>()
-                .expect("Expected PolyTableProvider");
+            spice_table::find_layer::<PolyTableProvider>(
+                accelerated_table.as_ref(),
+                spice_table::LayerWalk::Write,
+            )
+            .expect("Expected PolyTableProvider");
 
             let mut state = SessionStateBuilder::new()
                 .with_runtime_env(default_runtime_env(Handle::current()))
@@ -108,15 +110,14 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 .with_query_planner(Arc::new(
                     ExtensionPlanQueryPlanner::from_extension_planners(vec![
                         Arc::new(FederatedPlanner::new()),
-                        Arc::new(BytesProcessedExtensionPlanner::new(
-                            Box::new(track_bytes_processed),
-                            cfg!(feature = "cluster"),
-                        )),
                         Arc::new(IndexTableScanExtensionPlanner::new()),
                     ]),
                 ))
                 .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
                 .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
+                .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
+                    Arc::new(Box::new(track_bytes_processed)),
+                )))
                 .build();
 
             if let Err(e) = datafusion_functions_json::register_all(&mut state) {
@@ -131,10 +132,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 &df.clone().explain(false, false)?.collect().await?,
             )?;
 
-            insta::assert_snapshot!(
-                format!("refresh_max_timestamp_df_explain_plan"),
-                explain_plan
-            );
+            insta::assert_snapshot!("refresh_max_timestamp_df_explain_plan", explain_plan);
 
             Ok(())
         })
@@ -155,7 +153,7 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -178,10 +176,11 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
             let cmd = CreateExternalTable {
                 schema: ToDFSchema::to_dfschema_ref(Arc::clone(&schema))?,
                 name: TableReference::bare("test_table"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -191,19 +190,19 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
                 temporary: false,
             };
             let accelerated_table = engine
-                .create_external_table(cmd, None, vec![])
+                .create_external_table(cmd, None, vec![], None)
                 .await
                 .expect("Failed to create external table");
 
-            accelerated_table
-                .as_any()
-                .downcast_ref::<PolyTableProvider>()
-                .expect("Expected PolyTableProvider");
+            spice_table::find_layer::<PolyTableProvider>(
+                accelerated_table.as_ref(),
+                spice_table::LayerWalk::Write,
+            )
+            .expect("Expected PolyTableProvider");
 
             let table_provider = accelerator_table_provider(&accelerated_table);
 
             let federated_table_adaptor = table_provider
-                .as_any()
                 .downcast_ref::<FederatedTableProviderAdaptor>()
                 .expect("Expected FederatedTableProviderAdaptor");
 
@@ -211,7 +210,6 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
                 .table_provider
                 .as_ref()
                 .expect("Expected table provider")
-                .as_any()
                 .downcast_ref::<EnsureSchema>()
                 .expect("Expected EnsureSchema");
 

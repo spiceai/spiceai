@@ -17,6 +17,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM catalog_sales LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/catalog_returns.parquet
     name: catalog_returns
     params: *s3_params
@@ -26,6 +28,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM catalog_returns LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/inventory.parquet
     name: inventory
     params: *s3_params
@@ -35,6 +39,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM inventory LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/store_sales.parquet
     name: store_sales
     params: *s3_params
@@ -44,6 +50,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM store_sales LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/store_returns.parquet
     name: store_returns
     params: *s3_params
@@ -53,6 +61,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM store_returns LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/web_sales.parquet
     name: web_sales
     params: *s3_params
@@ -62,6 +72,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM web_sales LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/web_returns.parquet
     name: web_returns
     params: *s3_params
@@ -71,6 +83,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM web_returns LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/customer.parquet
     name: customer
     params: *s3_params
@@ -80,6 +94,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM customer LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/customer_address.parquet
     name: customer_address
     params: *s3_params
@@ -89,6 +105,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM customer_address LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/customer_demographics.parquet
     name: customer_demographics
     params: *s3_params
@@ -98,6 +116,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM customer_demographics LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/date_dim.parquet
     name: date_dim
     params: *s3_params
@@ -107,6 +127,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM date_dim LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/household_demographics.parquet
     name: household_demographics
     params: *s3_params
@@ -116,6 +138,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM household_demographics LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/item.parquet
     name: item
     params: *s3_params
@@ -125,6 +149,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM item LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/promotion.parquet
     name: promotion
     params: *s3_params
@@ -134,6 +160,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM promotion LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/ship_mode.parquet
     name: ship_mode
     params: *s3_params
@@ -143,6 +171,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM ship_mode LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/store.parquet
     name: store
     params: *s3_params
@@ -152,6 +182,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM store LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/time_dim.parquet
     name: time_dim
     params: *s3_params
@@ -161,6 +193,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM time_dim LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/warehouse.parquet
     name: warehouse
     params: *s3_params
@@ -170,6 +204,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM warehouse LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/web_page.parquet
     name: web_page
     params: *s3_params
@@ -179,6 +215,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM web_page LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/web_site.parquet
     name: web_site
     params: *s3_params
@@ -188,6 +226,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM web_site LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/reason.parquet
     name: reason
     params: *s3_params
@@ -197,6 +237,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM reason LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/call_center.parquet
     name: call_center
     params: *s3_params
@@ -206,6 +248,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM call_center LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/income_band.parquet
     name: income_band
     params: *s3_params
@@ -215,6 +259,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM income_band LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/catalog_page.parquet
     name: catalog_page
     params: *s3_params
@@ -224,3 +270,5 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM catalog_page LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25

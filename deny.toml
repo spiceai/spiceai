@@ -3,9 +3,45 @@
 all-features = true
 
 [advisories]
-ignore = [
-]
+# cargo-deny v2 schema: vulnerability, unmaintained, unsound, and notice
+# advisories all fail the check by default. Yanked crates also fail.
+# To bypass a specific advisory, add its RUSTSEC ID to `ignore` with a
+# comment explaining why and an owner.
+version = 2
 yanked = "deny"
+ignore = [
+  # Runtime-object-store pulls `async-std` through `suppaftp`; no safe upgrade is available yet. Owner: runtime-object-store.
+  "RUSTSEC-2025-0052",
+  # Runtime serialization pulls `atomic-polyfill` through `postcard`/`heapless`; no safe upgrade is available yet. Owner: runtime.
+  "RUSTSEC-2023-0089",
+  # A transitive local-model dependency still pulls `dotenv`; no safe upgrade is available yet. Owner: llms.
+  "RUSTSEC-2021-0141",
+  # Local model search dependencies pull `fxhash`; no safe upgrade is available yet. Owner: llms.
+  "RUSTSEC-2025-0057",
+  # Progress-display dependencies pull `number_prefix`; no safe upgrade is available yet. Owner: llms.
+  "RUSTSEC-2025-0119",
+  # `paste` is widely used by proc-macro/data connector dependencies; no safe upgrade is available yet. Owner: runtime/data connectors.
+  "RUSTSEC-2024-0436",
+  # Object store signing dependencies pull `rsa`; no safe upgrade is available yet. Owner: data components/runtime.
+  "RUSTSEC-2023-0071",
+  # `rustls-pemfile` is unmaintained. Runtime no longer depends on it directly
+  # (uses `rustls::pki_types::pem` instead), but the spice-rs SDK (`spiceai`
+  # crate) still pulls v1.x transitively. Owner: spice-rs / runtime.
+  "RUSTSEC-2025-0134",
+  # Azure storage dependencies pull `http-types` through `azure_core` 0.21; no safe upgrade is available yet. Owner: data connectors/runtime.
+  "RUSTSEC-2026-0174",
+  # `document_parse` pulls `ttf-parser` through `pdf-extract`/`lopdf`; the author
+  # marked it unmaintained and there is no safe upgrade (the suggested `skrifa`
+  # alternative is not wired through `lopdf`/`pdf-extract`). Owner: document_parse.
+  # `quick-xml` quadratic duplicate-attribute check on start tags (DoS). Pulled
+  # transitively in several versions (via vortex, AWS-XML, and serialization
+  # dependencies); no single safe upgrade across all pins yet. Owner: data components/runtime.
+  "RUSTSEC-2026-0194",
+  # `quick-xml` unbounded namespace-declaration allocation in `NsReader`
+  # (memory-exhaustion DoS), same transitive chain as RUSTSEC-2026-0194; no safe
+  # upgrade yet. Owner: data components/runtime.
+  "RUSTSEC-2026-0195",
+]
 
 [bans]
 allow-wildcard-paths = false
@@ -19,7 +55,6 @@ allow = [
   "BSD-2-Clause",
   "BSD-3-Clause",
   "BSL-1.0",
-  "BlueOak-1.0.0",
   "CC0-1.0",
   "ISC",
   "MIT",
@@ -27,9 +62,9 @@ allow = [
   "Unicode-3.0",
   "CDLA-Permissive-2.0",
   "Zlib",
-  "OpenSSL",
   "0BSD",
-  "bzip2-1.0.6" # https://spdx.org/licenses/bzip2-1.0.6.html
+  "bzip2-1.0.6", # https://spdx.org/licenses/bzip2-1.0.6.html
+  "NCSA" # University of Illinois/NCSA Open Source License (OSI-approved, FSF Free/Libre)
 ]
 private = { ignore = false }
 unused-allowed-license = "deny"
@@ -82,4 +117,3 @@ name = "cfg_block"
 version = "0.1.1"
 expression = "Apache-2.0"
 license-files = []
-

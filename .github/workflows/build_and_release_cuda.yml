@@ -1,12 +1,13 @@
 name: build_and_release_cuda
 
+# CUDA is not part of pull-request CI: a single compute-cap 90 compile takes
+# hours on the large runners, and the workflow is not a required check. Trunk
+# pushes, tagged releases, and manual dispatches still build every compute
+# capability.
 on:
-  pull_request:
+  push:
     branches:
       - trunk
-    paths:
-      - 'crates/llms/Cargo.toml'
-  push:
     tags:
       - v*
     paths-ignore:
@@ -59,47 +60,57 @@ on:
           - 'release-lto'
         default: 'release'
 
+# A trunk push cancels the CUDA build of any older trunk push, queued or
+# running. Tag and manual runs each get a group of their own, so they never
+# cancel or wait on another run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/trunk' && 'trunk' || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   setup-matrix:
     name: Setup CUDA matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         id: setup-matrix
         with:
           script: |
+            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
+            const runner = isTaggedRelease ? "ubuntu-24.04-16core" : "spiceai-dev-large-runners";
+
             const matrix = [
               {
                 compute_cap: "80",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "86",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "87",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "89",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "90",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               }
@@ -124,11 +135,6 @@ jobs:
               return filtered;
             }
 
-            // For `on.pull_request`, only build 90 compute capability on Linux.
-            if (context.eventName === 'pull_request') {
-              return matrix.filter(m => m.compute_cap === "90" && m.target_os === "linux");
-            }
-
             return matrix;
 
   build:
@@ -146,15 +152,13 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: ${{ matrix.target.target_os }}
 
       - name: Set up wget
         if: matrix.target.target_os == 'linux'
@@ -163,17 +167,18 @@ jobs:
       - name: Set up make
         if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-make
-        with:
-          os: ${{ matrix.target.target_os }}
 
       - name: Set up cc
         if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-cc
 
+      - name: Install protoc
+        uses: ./.github/actions/install-protoc
+
       - name: Run Spiced CUDA Build
         uses: ./.github/actions/spiced-cuda-build
         with:
-          cuda-version: '12.4.1'
+          cuda-version: '12.6.0'
           cuda-compute-capability: ${{ matrix.target.compute_cap }}
           artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           target_os: ${{ matrix.target.target_os }}
@@ -192,17 +197,17 @@ jobs:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
 
       # Download all Linux CUDA artifacts
       - name: Download Linux CUDA artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         continue-on-error: true
         with:
-          pattern: spiced_models_cuda_*_linux_x86_64
+          pattern: spiced_cuda_*_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
           merge-multiple: true
 
@@ -210,12 +215,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install wget -y
-          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo wget https://public-data.spiceai.org/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
           mc alias set spice-minio ${{ env.MINIO_ENDPOINT }} ${{ env.MINIO_ACCESS_KEY }} ${{ env.MINIO_SECRET_KEY }}
 
           # Upload any CUDA artifacts that were successfully built
-          for file in ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_*_linux_x86_64.tar.gz; do
+          for file in ${{ env.ARTIFACT_DIR }}/spiced_cuda_*_linux_x86_64.tar.gz; do
             if [ -f "$file" ]; then
               echo "Uploading $file to Minio..."
               mc cp "$file" spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
@@ -230,9 +235,9 @@ jobs:
       ARTIFACT_DIR: ./release
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
@@ -242,7 +247,7 @@ jobs:
 
       # Download all CUDA artifacts for this platform
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         continue-on-error: true
         with:
           path: ${{ env.ARTIFACT_DIR }}
@@ -278,10 +283,13 @@ jobs:
             --tag "v${{ env.REL_VERSION }}" \
             "${RELEASE_ARTIFACTS[@]}"
 
-          if [ "$LATEST_RELEASE" = "true" ]; then
-            export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
+          # Pass the notes by path, not by value: a release body over 128 KiB
+          # exceeds MAX_ARG_STRLEN and the exec fails with E2BIG (exit 126)
+          # after every build has already succeeded.
+          if [ "$HAS_RELEASE_NOTES" = "true" ]; then
+            BODY_ARGS=(--body-file "./docs/release_notes/v${{ env.REL_VERSION }}.md")
           else
-            export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
+            BODY_ARGS=(--body "This is the release candidate ${{ env.REL_VERSION }}")
           fi
 
           echo "Uploading Spice.ai CUDA Binaries to GitHub Release"
@@ -289,6 +297,6 @@ jobs:
             --owner $OWNER_NAME --repo $REPO_NAME \
             --tag "v${{ env.REL_VERSION }}" \
             --release-name "v${{ env.REL_VERSION }}" \
-            --body "${RELEASE_BODY}" \
+            "${BODY_ARGS[@]}" \
             --prerelease "$PRE_RELEASE" \
             "${RELEASE_ARTIFACTS[@]}"

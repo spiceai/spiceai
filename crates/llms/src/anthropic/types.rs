@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::{error::OpenAIError, types::ChatCompletionTool};
+use async_openai::{
+    error::OpenAIError,
+    types::chat::{ChatCompletionTool, ChatCompletionTools, CompletionUsage, PromptTokensDetails},
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -33,6 +36,8 @@ pub struct MessageCreateParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoiceParam>,
@@ -42,6 +47,188 @@ pub struct MessageCreateParams {
     pub top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<RequestServiceTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<ContextManagementConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Vec<McpServerDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormat>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ThinkingConfig {
+    #[serde(rename = "enabled")]
+    Enabled { budget_tokens: u32 },
+    #[serde(rename = "disabled")]
+    Disabled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestServiceTier {
+    Auto,
+    StandardOnly,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContainerParam {
+    Id(String),
+    Config(ContainerConfig),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContainerConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<SkillParams>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SkillParams {
+    pub skill_id: String,
+    #[serde(rename = "type")]
+    pub skill_type: SkillType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillType {
+    Anthropic,
+    Custom,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContextManagementConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edits: Option<Vec<ContextManagementEdit>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContextManagementEdit {
+    #[serde(rename = "clear_tool_uses_20250919")]
+    ClearToolUses {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trigger: Option<ContextTrigger>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        keep: Option<ToolUsesKeep>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        clear_at_least: Option<InputTokensClearAtLeast>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        clear_tool_inputs: Option<ClearToolInputs>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exclude_tools: Option<Vec<String>>,
+    },
+    #[serde(rename = "clear_thinking_20251015")]
+    ClearThinking {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        keep: Option<ThinkingKeep>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContextTrigger {
+    #[serde(rename = "input_tokens")]
+    InputTokens { value: u32 },
+    #[serde(rename = "tool_uses")]
+    ToolUses { value: u32 },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolUsesKeep {
+    #[serde(rename = "type")]
+    pub keep_type: String, // Always "tool_uses"
+    pub value: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InputTokensClearAtLeast {
+    #[serde(rename = "type")]
+    pub clear_type: String, // Always "input_tokens"
+    pub value: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ClearToolInputs {
+    All(bool),
+    Specific(Vec<String>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ThinkingKeep {
+    All(ThinkingKeepAll),
+    Turns(ThinkingTurns),
+    Literal(String), // "all"
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThinkingKeepAll {
+    #[serde(rename = "type")]
+    pub keep_type: String, // Always "all"
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThinkingTurns {
+    #[serde(rename = "type")]
+    pub keep_type: String, // Always "thinking_turns"
+    pub value: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpServerDefinition {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub server_type: String, // Always "url"
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_configuration: Option<McpToolConfiguration>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpToolConfiguration {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OutputConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<EffortLevel>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EffortLevel {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OutputFormat {
+    #[serde(rename = "type")]
+    pub format_type: String, // Always "json_schema"
+    pub schema: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,17 +279,98 @@ impl MessageRole {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
+    #[serde(rename = "text")]
     Text(TextBlockParam),
+    #[serde(rename = "image")]
     Image(ImageBlockParam),
+    #[serde(rename = "tool_use")]
     ToolUse(ToolUseBlockParam),
+    #[serde(rename = "tool_result")]
     ToolResult(ToolResultBlockParam),
+    #[serde(rename = "thinking")]
+    Thinking(ThinkingBlockParam),
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking(RedactedThinkingBlockParam),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ThinkingBlockParam {
+    pub thinking: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RedactedThinkingBlockParam {
+    pub data: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "type")]
 pub enum ResponseContentBlock {
-    Text(TextBlockParam),
-    ToolUse(ToolUseBlockParam),
+    #[serde(rename = "text")]
+    Text(ResponseTextBlock),
+    #[serde(rename = "tool_use")]
+    ToolUse(ResponseToolUseBlock),
+    #[serde(rename = "thinking")]
+    Thinking(ThinkingBlock),
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking(RedactedThinkingBlock),
+    #[serde(rename = "server_tool_use")]
+    ServerToolUse(ServerToolUseBlock),
+}
+
+/// Text block for responses - unlike `TextBlockParam`, this doesn't include the `type` field
+/// since it's consumed by the `#[serde(tag = "type")]` attribute on `ResponseContentBlock`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ResponseTextBlock {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
+}
+
+/// Tool use block for responses - unlike `ToolUseBlockParam`, this doesn't include the `type` field
+/// since it's consumed by the `#[serde(tag = "type")]` attribute on `ResponseContentBlock`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ResponseToolUseBlock {
+    pub id: String,
+    pub input: serde_json::Value,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<ToolCaller>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ThinkingBlock {
+    pub thinking: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RedactedThinkingBlock {
+    pub data: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ServerToolUseBlock {
+    pub id: String,
+    pub name: ServerToolName,
+    pub input: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<ToolCaller>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerToolName {
+    WebSearch,
+    WebFetch,
+    CodeExecution,
+    BashCodeExecution,
+    TextEditorCodeExecution,
+    ToolSearchToolRegex,
+    ToolSearchToolBm25,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -110,51 +378,78 @@ pub struct TextBlockParam {
     pub text: String,
     #[serde(rename = "type")]
     pub block_type: String, // Always "text"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
 }
+
 impl TextBlockParam {
     pub fn new(text: String) -> Self {
         Self {
             text,
             block_type: "text".to_string(),
+            cache_control: None,
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Source {
-    pub data: String, // Base64 encoded string
-    pub media_type: MediaType,
+pub struct CacheControlEphemeral {
     #[serde(rename = "type")]
-    pub r#type: SourceType,
+    pub control_type: String, // Always "ephemeral"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<CacheTtl>,
+}
+
+impl CacheControlEphemeral {
+    pub fn ephemeral() -> Self {
+        Self {
+            control_type: "ephemeral".to_string(),
+            ttl: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
+pub enum CacheTtl {
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum MediaType {
-    #[serde(rename = "image_jpeg")]
+    #[serde(rename = "image/jpeg")]
     Jpeg,
 
-    #[serde(rename = "image_png")]
+    #[serde(rename = "image/png")]
     Png,
 
-    #[serde(rename = "image_gif")]
+    #[serde(rename = "image/gif")]
     Gif,
 
-    #[serde(rename = "image_webp")]
+    #[serde(rename = "image/webp")]
     Webp,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum SourceType {
-    Base64,
+pub struct ImageBlockParam {
+    pub source: ImageSource,
+    #[serde(rename = "type")]
+    pub block_type: String, // Always "image"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ImageBlockParam {
-    pub source: Source,
-    #[serde(rename = "type")]
-    pub block_type: String, // Always "image"
+#[serde(tag = "type")]
+pub enum ImageSource {
+    #[serde(rename = "base64")]
+    Base64 { data: String, media_type: MediaType },
+    #[serde(rename = "url")]
+    Url { url: String },
+    #[serde(rename = "file")]
+    File { file_id: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -164,6 +459,10 @@ pub struct ToolUseBlockParam {
     pub name: String,
     #[serde(rename = "type")]
     pub block_type: String, // Always "tool_use"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<ToolCaller>,
 }
 
 impl ToolUseBlockParam {
@@ -173,8 +472,19 @@ impl ToolUseBlockParam {
             input,
             name,
             block_type: "tool_use".to_string(),
+            cache_control: None,
+            caller: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum ToolCaller {
+    #[serde(rename = "direct")]
+    Direct,
+    #[serde(rename = "code_execution_20250825")]
+    ServerToolCaller { tool_id: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -268,6 +578,14 @@ impl From<&ChatCompletionTool> for ToolParam {
     }
 }
 
+/// Converts a `ChatCompletionTools` enum to a `ToolParam`, returning `None` for custom tools.
+pub fn tool_from_completion_tools(val: &ChatCompletionTools) -> Option<ToolParam> {
+    match val {
+        ChatCompletionTools::Function(tool) => Some(ToolParam::from(tool)),
+        ChatCompletionTools::Custom(_) => None,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MetadataParam {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -307,13 +625,48 @@ pub(crate) fn validate_model_variant(model: &str) -> Result<AnthropicModelVarian
     Ok(model.to_string())
 }
 
-/// Max tokens, limited by the model variant
+/// Output-token ceiling of Claude 3 and the Claude 1/2/instant generations before it.
+const LEGACY_MAX_TOKENS: u32 = 4096;
+
+/// Output tokens every model from Claude 3.5 onward accepts. Deliberately a floor rather than each
+/// model's own maximum, which is far higher and differs per model: Anthropic requires a request
+/// above roughly 21000 output tokens to stream, so a per-model maximum here would make every
+/// non-streaming request fail. Tracking those maxima would also put this constant back in the
+/// business of going stale, which is the defect that brought us here.
+const MODERN_MAX_TOKENS: u32 = 8192;
+
+/// Model families capped at [`LEGACY_MAX_TOKENS`], as the fragment of the model id that identifies
+/// each. Every id Anthropic has published for these carries one of these fragments in all three
+/// formats `ANTHROPIC_REGEX` accepts — the AWS and GCP forms only add a prefix or a suffix
+/// (`anthropic.claude-3-haiku-20240307-v1:0`, `claude-3-haiku@20240307`).
+///
+/// `claude-3-5-*` and `claude-3-7-*` are absent by construction, and none of these fragments is a
+/// substring of a later id: `claude-3-haiku` does not occur in `claude-3-5-haiku`.
+const LEGACY_MODEL_FRAGMENTS: &[&str] = &[
+    "claude-instant",
+    "claude-1",
+    "claude-v1",
+    "claude-2",
+    "claude-v2",
+    "claude-3-opus",
+    "claude-3-sonnet",
+    "claude-3-haiku",
+];
+
+/// Max tokens to request when the caller sets no limit of its own, limited by the model variant.
 /// Based on: `<https://docs.anthropic.com/en/docs/about-claude/models#model-comparison-table>`
+///
+/// Keyed on the legacy families rather than on an allowlist of current ones so that a model
+/// Anthropic releases after this code was written gets the higher budget. An allowlist silently
+/// truncates every response from a new model at [`LEGACY_MAX_TOKENS`] instead.
 pub fn default_max_tokens(model: &AnthropicModelVariant) -> u32 {
-    if model.as_str().contains("claude-3-5-sonnet") {
-        8192
+    if LEGACY_MODEL_FRAGMENTS
+        .iter()
+        .any(|fragment| model.as_str().contains(fragment))
+    {
+        LEGACY_MAX_TOKENS
     } else {
-        4096
+        MODERN_MAX_TOKENS
     }
 }
 
@@ -339,6 +692,9 @@ pub enum StopReason {
     MaxTokens,
     StopSequence,
     ToolUse,
+    PauseTurn,
+    Refusal,
+    ModelContextWindowExceeded,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -353,11 +709,94 @@ pub struct Usage {
     pub input_tokens: u32,
     #[serde(default)]
     pub output_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tool_use: Option<ServerToolUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTier>,
+}
+
+impl From<Usage> for CompletionUsage {
+    fn from(usage: Usage) -> Self {
+        let cache_creation_input_tokens = usage.cache_creation_input_tokens.unwrap_or_default();
+        let cache_read_input_tokens = usage.cache_read_input_tokens.unwrap_or_default();
+        let prompt_tokens = usage
+            .input_tokens
+            .saturating_add(cache_creation_input_tokens)
+            .saturating_add(cache_read_input_tokens);
+        let prompt_tokens_details = (cache_read_input_tokens > 0).then_some(PromptTokensDetails {
+            cached_tokens: Some(cache_read_input_tokens),
+            audio_tokens: None,
+        });
+
+        CompletionUsage {
+            prompt_tokens,
+            completion_tokens: usage.output_tokens,
+            total_tokens: prompt_tokens.saturating_add(usage.output_tokens),
+            prompt_tokens_details,
+            completion_tokens_details: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CacheCreation {
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: u32,
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ServerToolUsage {
+    #[serde(default)]
+    pub web_search_requests: u32,
+    #[serde(default)]
+    pub web_fetch_requests: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceTier {
+    Standard,
+    Priority,
+    Batch,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_model_variant;
+    use super::{
+        LEGACY_MAX_TOKENS, MODERN_MAX_TOKENS, Usage, default_max_tokens, validate_model_variant,
+    };
+    use crate::anthropic::DEFAULT_ANTHROPIC_MODEL;
+    use async_openai::types::chat::CompletionUsage;
+
+    #[test]
+    fn usage_conversion_saturates_token_totals() {
+        let usage = CompletionUsage::from(Usage {
+            input_tokens: u32::MAX,
+            output_tokens: 1,
+            cache_creation_input_tokens: Some(1),
+            cache_read_input_tokens: Some(2),
+            ..Usage::default()
+        });
+
+        assert_eq!(usage.prompt_tokens, u32::MAX);
+        assert_eq!(usage.completion_tokens, 1);
+        assert_eq!(usage.total_tokens, u32::MAX);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens),
+            Some(2)
+        );
+    }
 
     // Current Anthropic model names to validate.
     // Based on the models list from https://docs.claude.com/en/docs/about-claude/models/overview, as of 2025-09-28.
@@ -369,7 +808,7 @@ mod tests {
         "claude-opus-4-0",
         "claude-sonnet-4-0",
         "claude-3-7-sonnet-latest",
-        "claude-3-5-haiku-latest",
+        "claude-haiku-4-5",
         "claude-sonnet-4-20250514",
         "claude-3-7-sonnet-20250219",
         "claude-3-5-haiku-20241022",
@@ -403,5 +842,76 @@ mod tests {
             let res = validate_model_variant(m);
             assert!(res.is_err(), "model {m} should be invalid");
         }
+    }
+
+    /// Every id Anthropic has published for a family that caps generation at
+    /// [`LEGACY_MAX_TOKENS`], across the three formats `ANTHROPIC_REGEX` accepts. Requesting more
+    /// output tokens than the model allows is rejected outright, so this direction must not
+    /// regress.
+    const LEGACY_MODELS: &[&str] = &[
+        "claude-instant-1.2",
+        "claude-2.0",
+        "claude-2.1",
+        "claude-3-opus-latest",
+        "claude-3-opus-20240229",
+        "claude-3-sonnet-20240229",
+        "claude-3-haiku-20240307",
+        "anthropic.claude-instant-v1",
+        "anthropic.claude-v2",
+        "anthropic.claude-v2:1",
+        "anthropic.claude-3-opus-20240229-v1:0",
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        "anthropic.claude-3-haiku-20240307-v1:0",
+        "claude-3-opus@20240229",
+        "claude-3-haiku@20240307",
+    ];
+
+    #[test]
+    fn legacy_models_keep_their_lower_ceiling() {
+        for model in LEGACY_MODELS {
+            assert_eq!(
+                default_max_tokens(&(*model).to_string()),
+                LEGACY_MAX_TOKENS,
+                "{model} caps generation at {LEGACY_MAX_TOKENS} output tokens, so asking for more \
+                 would be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn models_from_claude_35_onward_get_the_larger_budget() {
+        // `VALID_MODELS` is the list this file already keeps of ids the runtime accepts; the
+        // Claude 3 entries in it are the only ones that belong to a legacy family.
+        let modern = VALID_MODELS
+            .iter()
+            .filter(|model| !LEGACY_MODELS.contains(model))
+            .chain(
+                [
+                    "claude-3-5-sonnet-latest",
+                    "claude-sonnet-5",
+                    "claude-opus-5",
+                ]
+                .iter(),
+            );
+
+        for model in modern {
+            assert_eq!(
+                default_max_tokens(&(*model).to_string()),
+                MODERN_MAX_TOKENS,
+                "{model} accepts at least {MODERN_MAX_TOKENS} output tokens, so a response must \
+                 not be truncated below that"
+            );
+        }
+    }
+
+    /// Regression test for #13557. The ceiling used to be keyed on the single id
+    /// `claude-3-5-sonnet`, which was also the default model — so moving the default off a retired
+    /// id silently halved the output budget of every request that names no model.
+    #[test]
+    fn the_default_model_is_not_truncated_at_the_legacy_ceiling() {
+        assert_eq!(
+            default_max_tokens(&DEFAULT_ANTHROPIC_MODEL.to_string()),
+            MODERN_MAX_TOKENS
+        );
     }
 }

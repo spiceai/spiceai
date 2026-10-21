@@ -1,2 +1,19 @@
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# x86_64 optimization with AVX2, FMA, BMI, etc. Portable across all AWS x86_64 C6/C7/C8 instances.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+avx2,+fma,+bmi1,+bmi2,+lzcnt,+popcnt"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
+
+# arm64/aarch64 optimization. Requires NEON + FP16 (FEAT_FP16 / FEAT_FHM).
+# FP16 is needed for gemm-f16 compilation (https://github.com/sarah-quinones/gemm/issues/31).
+# lld is needed to avoid R_AARCH64_CALL26 relocation overflow on large debug binaries.
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "target-feature=+neon,+fp16,+fhm", "-Clink-arg=-fuse-ld=lld"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]

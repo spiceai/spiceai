@@ -8,8 +8,19 @@ on:
       - release-*
       - release/*
     paths:
+      # The model contracts these tests exercise are no longer all under
+      # `crates/llms/` — a change to a trait in one of the API crates reaches
+      # every provider implementing it.
       - 'crates/llms/**'
-
+      - 'crates/chat-api/**'
+      - 'crates/embed-api/**'
+      - 'crates/rerank-api/**'
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
   workflow_dispatch:
     inputs:
       run:
@@ -30,32 +41,44 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
 
 jobs:
   setup-matrix:
     name: Setup strategy matrix
     runs-on: spiceai-dev-runners
+    # Evaluates one inline script.
+    timeout-minutes: 15
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         id: setup-matrix
         with:
           script: |
+            // `spiceai-macos-large` in the merge queue, like `build`: on the
+            // `spiceai-macos` minis these legs queued 52.5 min at p90 for a
+            // runner and then ran for about a minute (merge_group,
+            // 2026-09-29..10-13). The standard pool on every other event.
+            const runner = context.eventName === 'merge_group' ? 'spiceai-macos-large' : 'spiceai-macos';
             const matrix = [
               {
                 name: 'self-hosted',
                 needs_env: false,
-                runner: 'spiceai-macos',
+                runner,
                 model_allowlist: 'local_phi3,hf_phi3'
               },
               {
                 name: 'hosted',
                 needs_env: true,
-                runner: 'spiceai-macos',
-                model_allowlist: 'anthropic,bedrock,openai,xai,perplexity'
+                runner,
+                // Bedrock is left out until CI has credentials that can invoke it (#13558).
+                model_allowlist: 'anthropic,openai,xai'
               }
             ];
 
@@ -68,32 +91,37 @@ jobs:
 
               return matrix.filter(m => m.name === name);
             }
+
+            // On pull_request, only run tests that don't require secrets
+            if (context.eventName === 'pull_request') {
+              return matrix.filter(m => !m.needs_env);
+            }
+
             return matrix;
 
   build:
     name: Build Test Binary
-    runs-on: [self-hosted, spiceai-macos]
+    # `spiceai-macos-large` in the merge queue: on the `spiceai-macos` minis
+    # this build queued 68 min at p90 for a runner (merge_group,
+    # 2026-09-29..10-13). The `test` legs follow it there through
+    # `setup-matrix`. The standard pool on every other event.
+    runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
+    # Slowest observed success in the 2026-07-25..08-08 window: 17 min, but
+    # every sample had a warm sccache. Sized against the other macOS workspace
+    # builds (pr.yml peaks at 117 min) so a cold cache cannot turn a passing
+    # build into a red one.
+    timeout-minutes: 300
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 1 # Shallow clone for faster checkout
-
-      # Cache Cargo dependencies
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: darwin
 
       - name: Build LLMs integration test binary
         env:
@@ -104,25 +132,97 @@ jobs:
           TEST_BINARY_PATH=$(cargo test -p llms --test integration --features metal --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
           cp $TEST_BINARY_PATH ./llms_integration_test
 
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
+
+      - name: Upload test binary to spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to upload the LLM integration test binary}"
+          test_binary_url="${SPICEIO_ENDPOINT%/}/build/${TEST_BINARY_OBJECT_KEY}"
+          curl --fail --silent --show-error --upload-file ./llms_integration_test "$test_binary_url"
+
       - name: Upload test binary
-        uses: actions/upload-artifact@v5
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: llms-integration-test-binary
           path: ./llms_integration_test
-          retention-days: 1
+          retention-days: 3
+          compression-level: 1
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
   test:
-    runs-on: [self-hosted, spiceai-macos]
+    runs-on: ${{ matrix.target.runner }}
     needs: [build, setup-matrix]
+    # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
+    timeout-minutes: 90
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
     strategy:
+      # The two arms cover disjoint model sets — self-hosted local models and the hosted
+      # providers — so one arm's result says nothing about the other's, and cancelling the
+      # sibling on the first failure throws away half the signal this suite exists to give.
+      fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     permissions: read-all
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}-${{ strategy.job-index }}
+          machine: ${{ runner.name }}
+
+      - name: Download test binary from spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the LLM integration test binary}"
+          mkdir -p ./integration_test
+          test_binary_url="${SPICEIO_ENDPOINT%/}/build/${TEST_BINARY_OBJECT_KEY}"
+          curl --fail --silent --show-error --output ./integration_test/llms_integration_test "$test_binary_url"
+
       - name: Download test binary
-        uses: actions/download-artifact@v6
+        if: env.HAS_SPICEIO_SECRET != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: llms-integration-test-binary
           path: ./integration_test
@@ -136,10 +236,11 @@ jobs:
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
-          SPICE_PERPLEXITY_AUTH_TOKEN: ${{ secrets.SPICE_SECRET_PERPLEXITY_AUTH_TOKEN }}
-          SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
-          SPICE_BEDROCK_SECRET_KEY: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
+          # The spiceio setup action exports AWS_ENDPOINT_URL for sccache; the AWS SDK
+          # honours it for every service, so leaving it set sends this suite's Bedrock
+          # calls to the local build cache instead of AWS.
+          unset AWS_ENDPOINT_URL
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
             if [ -z "$SPICE_OPENAI_API_KEY" ]; then
               echo "Error: 'SPICE_OPENAI_API_KEY' is not defined."
@@ -153,19 +254,40 @@ jobs:
               echo "Error: 'SPICE_XAI_API_KEY' is not defined."
               exit 1
             fi
-            if [ -z "$SPICE_PERPLEXITY_AUTH_TOKEN" ]; then
-              echo "Error: 'SPICE_PERPLEXITY_AUTH_TOKEN' is not defined."
-              exit 1
-            fi
-            export SPICE_BEDROCK_REGION="us-east-1"
-            if [ -z "$SPICE_BEDROCK_ACCESS_KEY" ]; then
-              echo "Error: 'SPICE_BEDROCK_ACCESS_KEY' is not defined."
-              exit 1
-            fi
-            if [ -z "$SPICE_BEDROCK_SECRET_KEY" ]; then
-              echo "Error: 'SPICE_BEDROCK_SECRET_KEY' is not defined."
-              exit 1
-            fi
           fi
-          # `--test-threads` to reduce possible rate limiting/ connection issues for hosted models.
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/llms_integration_test --nocapture -- llms::tests --test-threads=2
+          test_binary=./integration_test/llms_integration_test
+          # The live-provider tests live under `integration.rs`'s `llms` module; the
+          # binary's other modules are credential-free and run in `make nextest`.
+          filter='llms::'
+
+          # A filter that matches nothing makes libtest print `ok. 0 passed` and exit 0, so the
+          # suite reports success having tested nothing. The filter names test-code structure,
+          # which a refactor is free to move, so count the selection and refuse an empty one
+          # rather than trusting a green result. `--list` only enumerates — it runs no test body,
+          # so it costs no model call and needs none of the snapshot environment below. Its exit
+          # status is checked separately from the count, because a harness that cannot run also
+          # produces no output, and reporting that as a stale filter sends the reader to the
+          # wrong file.
+          if ! listed=$("$test_binary" --list "$filter"); then
+            echo "::error::The LLM integration test binary failed to list its tests, so the suite could not run. Check the build and download steps above."
+            exit 1
+          fi
+          # `grep -c` exits 1 on no match, which `-e` would otherwise turn into an abort before
+          # the branch below can report the real problem.
+          selected=$(printf '%s\n' "$listed" | grep -c ': test$' || true)
+          echo "Filter '$filter' selects ${selected} test(s)."
+          if [ "$selected" -eq 0 ]; then
+            echo "::error::The LLM integration filter '$filter' selected no tests, so this suite would report success without exercising any model. Point it at the current test module path under crates/llms/tests/."
+            exit 1
+          fi
+
+          # The binary is itself the libtest harness, so its options are passed directly. A `--`
+          # here would end option parsing, and libtest would read `--test-threads=2` as a second
+          # filter and silently keep its default thread count. `--test-threads` holds concurrent
+          # requests low enough to stay under the hosted providers' rate limits.
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" \
+            "$test_binary" --nocapture --test-threads=2 "$filter"
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true

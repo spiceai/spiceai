@@ -1,0 +1,14 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q1"
+---
++---------------+-------------------------------------------------------------+
+| plan_type     | plan                                                        |
++---------------+-------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_orderkey)]]  |
+|               |   TableScan: lineitem projection=[l_orderkey]               |
+| physical_plan | ProjectionExec: expr=[60000000 as max(lineitem.l_orderkey)] |
+|               |   BytesProcessedExec                                        |
+|               |     PlaceholderRowExec                                      |
+|               |                                                             |
++---------------+-------------------------------------------------------------+

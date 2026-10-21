@@ -1,0 +1,7 @@
+---
+source: crates/data_components/src/arrow/indexed.rs
+expression: indexed_plan
+---
+FilterExec: id@0 = 1
+  CooperativeExec
+    IndexedLookupExec: indexed_scan on [id]

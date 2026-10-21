@@ -1,0 +1,152 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use data_connector_api::ConnectorContext;
+use data_connector_api::listing::{self, LISTING_TABLE_PARAMETERS, ListingTableConnector};
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
+    NewDataConnectorResult,
+};
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ParameterSpec, Parameters};
+use snafu::prelude::*;
+use std::any::Any;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, LazyLock};
+use url::Url;
+
+#[derive(Debug)]
+pub struct SFTP {
+    params: Parameters,
+}
+
+impl std::fmt::Display for SFTP {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sftp")
+    }
+}
+
+#[derive(Default, Debug, Copy, Clone)]
+pub struct SFTPFactory {}
+
+impl SFTPFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    let mut all_parameters = Vec::new();
+    all_parameters.extend_from_slice(&[
+        ParameterSpec::component("user").secret(),
+        ParameterSpec::component("pass").secret(),
+        ParameterSpec::component("port").description("The port to connect to."),
+        ParameterSpec::runtime("client_timeout")
+            .description("The timeout setting for SFTP client."),
+    ]);
+    all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
+    all_parameters
+});
+
+impl DataConnectorFactory for SFTPFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn create<'a>(
+        &'a self,
+        params: ConnectorParams,
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
+        Box::pin(async move {
+            let sftp = SFTP {
+                params: params.parameters,
+            };
+            Ok(Arc::new(sftp) as Arc<dyn DataConnector>)
+        })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "sftp"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        &PARAMETERS
+    }
+}
+
+impl ListingTableConnector for SFTP {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn get_params(&self) -> &Parameters {
+        &self.params
+    }
+
+    fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle {
+        tokio::runtime::Handle::current()
+    }
+
+    fn get_object_store_url(
+        &self,
+        dataset: &DatasetSpec,
+        url: Option<&str>,
+    ) -> DataConnectorResult<Url> {
+        let url = url.unwrap_or(dataset.from.as_str());
+        let mut sftp_url = Url::parse(url).boxed().map_err(|source| {
+            data_connector_api::DataConnectorError::InvalidConfiguration {
+                dataconnector: format!("{self}"),
+                message: format!("{url} is not a valid URL. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/sftp"),
+                connector_component: ConnectorComponent::from(dataset),
+                source,
+            }
+        })?;
+
+        sftp_url.set_fragment(Some(&listing::build_fragments(
+            &self.params,
+            vec!["port", "user", "pass", "client_timeout"],
+        )));
+
+        Ok(sftp_url)
+    }
+}
+
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "sftp";
+
+/// Returns a new instance of the `SFTP` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    SFTPFactory::new_arc()
+}
+
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_sftp as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+data_connector_api::register_data_connector!(
+    register_sftp_connector,
+    SFTP_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    SFTPFactory
+);

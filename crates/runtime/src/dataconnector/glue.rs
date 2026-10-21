@@ -14,28 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::ConnectorContext;
+use app::App;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::error::CredentialsError;
-use aws_sdk_glue::{Client, types::Table};
-use aws_sdk_sts::config::ProvideCredentials;
+use aws_sdk_glue::{Client, error::DisplayErrorContext, types::Table};
+use aws_sdk_s3::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
 use iceberg::{
     CatalogBuilder, NamespaceIdent, TableIdent,
-    io::{S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN},
+    io::{
+        S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
+        S3_SESSION_TOKEN,
+    },
 };
 use iceberg_catalog_glue::{
     AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
     GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
 };
 use iceberg_datafusion::IcebergTableProvider;
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::sync::LazyLock;
 use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
+use url::Url;
 
 use crate::{
-    component::dataset::Dataset,
+    component::dataset::DatasetSpec,
     parameters::{ParameterSpec, Parameters},
 };
 
@@ -53,9 +60,13 @@ static PREFIX: &str = "glue";
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Cannot retrieve table '{table}' from Glue database '{database}'. Verify that the database and table exist and are accessible. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "Cannot retrieve table '{table}' from Glue database '{database}': {message}. Verify that the database and table exist and are accessible. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
-    GetTable { database: String, table: String },
+    GetTable {
+        database: String,
+        table: String,
+        message: String,
+    },
     #[snafu(display(
         "Cannot load AWS configuration for Glue data connector. Verify your AWS credentials and region settings. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue {source}"
     ))]
@@ -88,6 +99,8 @@ pub enum Error {
         "The input format {input_format} for table '{table}' is not supported. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     InvalidInputFormat { input_format: String, table: String },
+    #[snafu(display("{}", unsupported_transactional_orc_message(table)))]
+    UnsupportedTransactionalOrc { table: String },
     #[snafu(display(
         "No storage descriptor found for table '{table}'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
@@ -101,21 +114,30 @@ pub enum Error {
 #[derive(Clone, Debug)]
 pub struct GlueDataConnector {
     params: Parameters,
+    /// The loaded app, which the S3 sub-provider needs and a dataset's configuration spec
+    /// does not carry. Held strongly: the app is configuration and references no runtime.
+    app: Option<Arc<App>>,
     tokio_io_runtime: tokio::runtime::Handle,
 }
 
 impl GlueDataConnector {
     #[must_use]
-    pub fn new(params: Parameters, tokio_io_runtime: tokio::runtime::Handle) -> Self {
+    pub fn new(
+        params: Parameters,
+        app: Option<Arc<App>>,
+        tokio_io_runtime: tokio::runtime::Handle,
+    ) -> Self {
         Self {
             params,
+            app,
             tokio_io_runtime,
         }
     }
 
     async fn create_table_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.parse_path(false, None).map_err(|e| {
             super::DataConnectorError::InvalidConfiguration {
@@ -156,10 +178,13 @@ impl GlueDataConnector {
             glue_table_builder = glue_table_builder.catalog_id(catalog_id.expose_secret());
         }
 
-        let get_table_output = glue_table_builder.send().await.map_err(|_| {
+        let get_table_output = glue_table_builder.send().await.map_err(|e| {
             let e = Error::GetTable {
                 database: database.to_string(),
                 table: table.to_string(),
+                message: e
+                    .as_service_error()
+                    .map_or_else(|| DisplayErrorContext(&e).to_string(), ToString::to_string),
             };
             super::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
@@ -173,6 +198,7 @@ impl GlueDataConnector {
             let e = Error::GetTable {
                 database: database.to_string(),
                 table: table.to_string(),
+                message: "Glue returned no table definition".to_string(),
             };
             super::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
@@ -190,18 +216,27 @@ impl GlueDataConnector {
                 source: Box::new(e),
             }
         })? {
-            input_format @ (InputFormat::Parquet | InputFormat::Csv) => {
+            input_format @ (InputFormat::Parquet | InputFormat::Csv | InputFormat::Orc) => {
                 create_s3_provider(
+                    context,
                     input_format,
                     dataset.clone(),
                     self.params.clone(),
+                    self.app.clone(),
                     &table,
                     self.tokio_io_runtime.clone(),
                 )
                 .await
             }
             InputFormat::Iceberg => {
-                create_iceberg_provider(dataset, &config, database.to_string(), &table).await
+                create_iceberg_provider(
+                    dataset,
+                    &config,
+                    &self.params,
+                    database.to_string(),
+                    &table,
+                )
+                .await
             }
         }
     }
@@ -209,6 +244,7 @@ impl GlueDataConnector {
 
 impl GlueDataConnector {
     async fn config(&self) -> Result<SdkConfig, aws::Error> {
+        let iam_role_source = self.params.get("iam_role_source").expose().ok();
         let config = initiate_config_with_credentials(
             "GlueCatalogConnector",
             "region",
@@ -216,7 +252,9 @@ impl GlueDataConnector {
             "secret",
             "session_token",
             &self.params,
-        )?
+            iam_role_source,
+        )
+        .await?
         .load()
         .await;
 
@@ -246,12 +284,14 @@ impl DataConnectorFactory for GlueDataConnectorFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let glue = GlueDataConnector::new(params.parameters, params.io_runtime);
+            let app = Some(context.app());
+            let glue = GlueDataConnector::new(params.parameters, app, params.io_runtime);
             Ok(Arc::new(glue) as Arc<dyn DataConnector>)
         })
     }
@@ -273,18 +313,20 @@ impl DataConnector for GlueDataConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        self.create_table_provider(dataset).await
+        self.create_table_provider(context, dataset).await
     }
 
     #[cfg(feature = "iceberg-write")]
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         // Iceberg supports read and write operations through the same TableProvider interface.
-        Some(self.create_table_provider(dataset).await)
+        Some(self.create_table_provider(context, dataset).await)
     }
 }
 
@@ -295,8 +337,22 @@ pub enum InputFormat {
     // Json,
     // Xml,
     Parquet,
-    // Orc,
+    Orc,
     Iceberg,
+}
+
+/// The formats above, for the user-facing message naming what Spice can read.
+/// It lives beside the variants so enabling one of the commented-out formats
+/// does not leave a diagnostic claiming Spice cannot read it.
+pub(crate) const SUPPORTED_INPUT_FORMATS: &str = "parquet, csv, orc, iceberg";
+
+/// Listing `file_extension` Glue sets when `InputFormat` already selected
+/// Parquet or ORC. Shared listing then accepts extensionless Hive objects.
+const GLUE_FORMAT_SELECTED_FILE_EXTENSION: &str = "*";
+
+fn glue_format_selected_file_extension(input_format: InputFormat) -> Option<&'static str> {
+    matches!(input_format, InputFormat::Parquet | InputFormat::Orc)
+        .then_some(GLUE_FORMAT_SELECTED_FILE_EXTENSION)
 }
 
 impl InputFormat {
@@ -307,9 +363,35 @@ impl InputFormat {
         match self {
             InputFormat::Csv => "csv",
             InputFormat::Parquet => "parquet",
+            InputFormat::Orc => "orc",
             InputFormat::Iceberg => "iceberg",
         }
     }
+}
+
+/// Hive and Glue store boolean table properties as strings. These are the
+/// values writers emit for a true property (`transactional=true`).
+fn hive_table_parameter_is_true(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "1"
+    )
+}
+
+fn is_hive_transactional(table: &Table) -> bool {
+    table
+        .parameters
+        .as_ref()
+        .and_then(|params| params.get("transactional"))
+        .is_some_and(|value| hive_table_parameter_is_true(value))
+}
+
+/// User-facing refusal for Hive ACID ORC. Catalog listing records the table
+/// as unreadable through the same [`InputFormat::try_from`] error.
+fn unsupported_transactional_orc_message(table: &str) -> String {
+    format!(
+        "Cannot read Hive ACID/transactional ORC table '{table}', so queries against it will not resolve. Spice does not support Hive ACID snapshot semantics (`base_*`, `delta_*`, `delete_delta_*`). Export or materialize the current snapshot into a genuinely non-transactional ORC location and register that table instead. See: https://docs.spiceai.org/components/data-connectors/glue"
+    )
 }
 
 impl TryFrom<&Table> for InputFormat {
@@ -336,22 +418,30 @@ impl TryFrom<&Table> for InputFormat {
             });
         };
 
-        Ok(match input_format {
-            "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat" => Self::Parquet,
-            "org.apache.hadoop.mapred.TextInputFormat" => Self::Csv,
-            input_format => {
-                return Err(Error::InvalidInputFormat {
-                    input_format: input_format.to_string(),
-                    table: table.name().to_string(),
-                });
+        match input_format {
+            "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat" => Ok(Self::Parquet),
+            "org.apache.hadoop.mapred.TextInputFormat" => Ok(Self::Csv),
+            "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat" => {
+                ensure!(
+                    !is_hive_transactional(table),
+                    UnsupportedTransactionalOrcSnafu {
+                        table: table.name().to_string(),
+                    }
+                );
+                Ok(Self::Orc)
             }
-        })
+            input_format => Err(Error::InvalidInputFormat {
+                input_format: input_format.to_string(),
+                table: table.name().to_string(),
+            }),
+        }
     }
 }
 
 async fn create_iceberg_provider(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     config: &SdkConfig,
+    params: &Parameters,
     database: String,
     table: &Table,
 ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
@@ -423,45 +513,88 @@ async fn create_iceberg_provider(
         props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
     }
 
+    // Disable OpenDAL's automatic credential loading from environment variables and config files.
+    // As we provide explicit credentials, we don't want OpenDAL to pick up AWS_SESSION_TOKEN
+    // or other credentials from the environment that may not be valid for this specific connection.
+    props.insert("s3.disable-config-load".to_string(), "true".to_string());
+
+    props.extend(s3_addressing_props(params, &metadata_location));
+
     props.insert(
         GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
-        metadata_location.to_string(),
+        metadata_location.clone(),
     );
 
     if let Some(catalog_id) = table.catalog_id.clone() {
         props.insert(GLUE_CATALOG_PROP_CATALOG_ID.to_string(), catalog_id);
     }
 
-    let catalog = GlueCatalogBuilder::default()
-        .load("glue", props)
-        .await
-        .map_err(|e| {
-            super::DataConnectorError::InvalidConfiguration {
+    let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
+        Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: None,
+        });
+
+    let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+        GlueCatalogBuilder::default()
+            .with_storage_factory(storage_factory)
+            .load("glue", props)
+            .await
+            .map_err(|e| super::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
-                message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'. Verify your AWS Glue configuration and credentials. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
+                message: format!("Cannot initialize Glue catalog for dataset '{} (glue)': {e}. Verify your AWS Glue configuration and credentials. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
                 source: e.into(),
-            }
-    })?;
+            })?,
+    );
 
     let identifier = TableIdent::new(NamespaceIdent::new(database), table.name().to_string());
 
-    let table_provider = IcebergTableProvider::try_new(Arc::new(catalog), identifier)
-        .await
-        .map_err(|e| super::DataConnectorError::InvalidConfiguration {
-            dataconnector: PREFIX.to_string(),
-            connector_component: dataset.into(),
-            message: format!("Cannot load Iceberg table '{}' for dataset '{} (glue)'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
-            source: e.into(),
-        })?;
+    let table_provider = IcebergTableProvider::try_new(
+        Arc::clone(&catalog),
+        identifier.namespace().clone(),
+        identifier.name().to_string(),
+    )
+    .await
+    .map_err(|e| super::DataConnectorError::InvalidConfiguration {
+        dataconnector: PREFIX.to_string(),
+        connector_component: dataset.into(),
+        message: format!("Cannot create table provider for Iceberg table '{}' for dataset '{} (glue)': {e}. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
+        source: e.into(),
+    })?;
 
     Ok(Arc::new(table_provider))
 }
 
+/// Iceberg `FileIO` properties that address the table's S3 bucket the way the S3
+/// connector does. An explicit `url_style` wins. Otherwise a bucket name with dots
+/// uses path style: the virtual-hosted host (`my.dotted.bucket.s3.<region>.amazonaws.com`)
+/// fails TLS validation against the single-label wildcard certificate.
+fn s3_addressing_props(params: &Parameters, metadata_location: &str) -> Vec<(String, String)> {
+    let mut props = Vec::new();
+
+    if let Some(endpoint) = params.get("endpoint").expose().ok() {
+        props.push((S3_ENDPOINT.to_string(), endpoint.to_string()));
+    }
+
+    let path_style = match params.get("url_style").expose().ok() {
+        Some(url_style) => Some(url_style == "path"),
+        None => Url::parse(metadata_location)
+            .is_ok_and(|url| url.host_str().is_some_and(|bucket| bucket.contains('.')))
+            .then_some(true),
+    };
+    if let Some(path_style) = path_style {
+        props.push((S3_PATH_STYLE_ACCESS.to_string(), path_style.to_string()));
+    }
+
+    props
+}
+
 async fn create_s3_provider(
+    context: &dyn ConnectorContext,
     input_format: InputFormat,
-    mut dataset: Dataset,
+    mut dataset: DatasetSpec,
     mut params: Parameters,
+    app: Option<Arc<App>>,
     table: &Table,
     tokio_io_runtime: tokio::runtime::Handle,
 ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
@@ -502,10 +635,16 @@ async fn create_s3_provider(
                 params.insert("csv_delimiter".to_string(), delimiter.as_str().into());
             }
         }
-        InputFormat::Parquet => {
+        InputFormat::Parquet | InputFormat::Orc => {
             dataset
                 .params
                 .insert("hive_partitioning_enabled".to_string(), "true".to_string());
+            // Glue's InputFormat is authoritative. Hive often writes
+            // extensionless objects (`000000_0`); `*` tells listing to accept
+            // those plus the format suffix and to skip job-marker files.
+            if let Some(file_extension) = glue_format_selected_file_extension(input_format) {
+                params.insert("file_extension".into(), file_extension.into());
+            }
         }
         InputFormat::Iceberg => {}
     }
@@ -514,13 +653,13 @@ async fn create_s3_provider(
     params.insert("file_format".into(), input_format.file_format().into());
     let s3 = S3 {
         params,
-        runtime: Some(Arc::unwrap_or_clone(dataset.runtime())),
+        app,
         tokio_io_runtime,
     };
 
     dataset.from = from;
 
-    s3.read_provider(&dataset).await
+    s3.read_provider(context, &dataset).await
 }
 
 fn ensure_s3_trailing_slash(s3_location: &str) -> String {
@@ -548,7 +687,7 @@ fn get_metadata_location(table: &Table) -> Result<String, Error> {
     const METADATA_LOCATION: &str = "metadata_location";
     match &table.parameters {
         Some(properties) => match properties.get(METADATA_LOCATION) {
-            Some(location) => Ok(location.to_string()),
+            Some(location) => Ok(location.clone()),
             None => Err(Error::MissingMetadataLocation {
                 table: table.name().to_string(),
                 message: format!("No property '{METADATA_LOCATION}' found"),
@@ -581,5 +720,173 @@ mod tests {
         );
         assert_eq!(ensure_s3_trailing_slash(""), "");
         assert_eq!(ensure_s3_trailing_slash("/local/path"), "/local/path");
+    }
+
+    fn orc_glue_table(name: &str, transactional: Option<&str>) -> Table {
+        let descriptor = aws_sdk_glue::types::StorageDescriptor::builder()
+            .input_format("org.apache.hadoop.hive.ql.io.orc.OrcInputFormat")
+            .build();
+        let mut builder = Table::builder().name(name).storage_descriptor(descriptor);
+        if let Some(value) = transactional {
+            builder = builder.parameters("transactional", value);
+        }
+        builder.build().expect("a Glue ORC table with a name")
+    }
+
+    #[test]
+    fn orc_glue_tables_use_the_listing_orc_format() {
+        assert_eq!(InputFormat::Orc.file_format(), "orc");
+    }
+
+    #[test]
+    fn hive_table_parameter_is_true_accepts_hive_truthy_values() {
+        for value in ["true", "TRUE", " True ", "yes", "YES", "1"] {
+            assert!(
+                hive_table_parameter_is_true(value),
+                "{value} is a Hive true table property"
+            );
+        }
+        for value in ["false", "FALSE", "no", "0", "", "maybe"] {
+            assert!(
+                !hive_table_parameter_is_true(value),
+                "{value} is not a Hive true table property"
+            );
+        }
+    }
+
+    #[test]
+    fn transactional_orc_glue_tables_are_refused() {
+        for value in ["true", "TRUE", "yes", "1"] {
+            let table = orc_glue_table("acid_orders", Some(value));
+            let err = InputFormat::try_from(&table)
+                .expect_err("a transactional ORC Glue table must be refused");
+            assert!(
+                matches!(err, Error::UnsupportedTransactionalOrc { ref table } if table == "acid_orders"),
+                "transactional={value} must be UnsupportedTransactionalOrc, got {err:?}"
+            );
+            let message = err.to_string();
+            assert_eq!(
+                message,
+                unsupported_transactional_orc_message("acid_orders")
+            );
+            assert!(
+                message.contains("Export or materialize")
+                    && message.contains("genuinely non-transactional ORC location"),
+                "directs the user to a rewritten snapshot, not a property flip: {message}"
+            );
+            assert!(
+                !message.contains("`transactional` to `false`")
+                    && !message.contains("transactional=false"),
+                "must not suggest flipping Glue `transactional`: {message}"
+            );
+            assert!(
+                !message.contains('\n'),
+                "the refusal must stay on one line: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_transactional_orc_glue_tables_map_to_orc() {
+        for table in [
+            orc_glue_table("orders", None),
+            orc_glue_table("orders", Some("false")),
+            orc_glue_table("orders", Some("0")),
+            orc_glue_table("orders", Some("no")),
+        ] {
+            assert_eq!(
+                InputFormat::try_from(&table).expect("ordinary ORC must map"),
+                InputFormat::Orc
+            );
+        }
+    }
+
+    async fn glue_params(params: &[(&str, &str)]) -> Parameters {
+        Parameters::try_new(
+            "glue_test",
+            params
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string().into()))
+                .collect(),
+            PREFIX,
+            Arc::new(tokio::sync::RwLock::new(runtime_secrets::Secrets::new())),
+            PARAMETERS.as_ref(),
+        )
+        .await
+        .expect("valid Glue test parameters")
+    }
+
+    async fn iceberg_s3_addressing(
+        params: &[(&str, &str)],
+        metadata_location: &str,
+    ) -> HashMap<String, String> {
+        s3_addressing_props(&glue_params(params).await, metadata_location)
+            .into_iter()
+            .collect()
+    }
+
+    const DOTTED_METADATA: &str =
+        "s3://my.dotted.bucket/warehouse/orders/metadata/00001-abc.metadata.json";
+    const PLAIN_METADATA: &str =
+        "s3://plain-bucket/warehouse/orders/metadata/00001-abc.metadata.json";
+
+    #[tokio::test]
+    async fn iceberg_tables_in_dotted_buckets_use_path_style() {
+        let props = iceberg_s3_addressing(&[], DOTTED_METADATA).await;
+        assert_eq!(
+            props.get(S3_PATH_STYLE_ACCESS).map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn iceberg_tables_in_plain_buckets_keep_the_iceberg_default() {
+        let props = iceberg_s3_addressing(&[], PLAIN_METADATA).await;
+        assert!(props.is_empty(), "unexpected props: {props:?}");
+    }
+
+    #[tokio::test]
+    async fn glue_url_style_overrides_iceberg_addressing() {
+        let props = iceberg_s3_addressing(&[("glue_url_style", "vhost")], DOTTED_METADATA).await;
+        assert_eq!(
+            props.get(S3_PATH_STYLE_ACCESS).map(String::as_str),
+            Some("false")
+        );
+
+        let props = iceberg_s3_addressing(&[("glue_url_style", "path")], PLAIN_METADATA).await;
+        assert_eq!(
+            props.get(S3_PATH_STYLE_ACCESS).map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn glue_endpoint_reaches_iceberg_file_io() {
+        let props = iceberg_s3_addressing(
+            &[("glue_endpoint", "https://s3.us-west-2.amazonaws.com")],
+            PLAIN_METADATA,
+        )
+        .await;
+        assert_eq!(
+            props.get(S3_ENDPOINT).map(String::as_str),
+            Some("https://s3.us-west-2.amazonaws.com")
+        );
+    }
+
+    #[test]
+    fn glue_parquet_and_orc_enable_extensionless_hive_listing() {
+        assert_eq!(
+            glue_format_selected_file_extension(InputFormat::Orc),
+            Some("*")
+        );
+        assert_eq!(
+            glue_format_selected_file_extension(InputFormat::Parquet),
+            Some("*")
+        );
+        assert_eq!(glue_format_selected_file_extension(InputFormat::Csv), None);
+        assert_eq!(
+            glue_format_selected_file_extension(InputFormat::Iceberg),
+            None
+        );
     }
 }

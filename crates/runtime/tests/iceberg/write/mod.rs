@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use anyhow::Context;
 use app::AppBuilder;
@@ -48,7 +48,7 @@ async fn iceberg_insert_into_existing_table() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}
@@ -106,11 +106,15 @@ async fn glue_insert_into_existing_table() -> Result<(), anyhow::Error> {
 
             configure_test_datafusion();
 
+            // The `glue` connector is registered explicitly (its `linkme` auto-registration
+            // moved to the extracted `connector-glue` crate), so register it before building.
+            register_test_connectors().await;
+
             let rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}

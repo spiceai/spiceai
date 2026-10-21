@@ -26,9 +26,9 @@ pub mod metadata;
 pub mod pipeline;
 pub mod provider;
 
-pub static SEARCH_SCORE_COLUMN_NAME: &str = "score";
-pub static SEARCH_VALUE_COLUMN_NAME: &str = "value";
-pub static SEARCH_MATCH_COLUMN_NAME: &str = "match";
+pub static SEARCH_SCORE_COLUMN_NAME: &str = "_score";
+pub static SEARCH_VALUE_COLUMN_NAME: &str = "_value";
+pub static SEARCH_MATCH_COLUMN_NAME: &str = "_match";
 
 pub async fn collect_batches(
     mut stream: SendableRecordBatchStream,

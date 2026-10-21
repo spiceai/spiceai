@@ -28,9 +28,9 @@ use crate::{
         Service, metrics, record_batches_to_flight_stream, to_tonic_err,
         util::set_flightsql_protocol,
     },
-    timing::TimedStream,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
+use telemetry::timing::TimedStream;
 
 /// Get a `FlightInfo` for listing schemas.
 pub(crate) async fn get_flight_info(
@@ -66,7 +66,7 @@ pub(crate) async fn do_get(
     let catalog = &query.catalog;
     tracing::trace!("do_get: {query:?}");
     let filtered_catalogs = match catalog {
-        Some(catalog) => vec![catalog.to_string()],
+        Some(catalog) => vec![catalog.clone()],
         None => datafusion.ctx.catalog_names(),
     };
     let mut builder = query.into_builder();

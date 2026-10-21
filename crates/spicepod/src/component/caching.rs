@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{default_true, is_default_or_none};
+use std::fmt::Display;
+
+use super::{default_true, is_default, is_default_or_none};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -32,10 +34,12 @@ pub enum CacheKeyType {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum HashingAlgorithm {
-    #[default]
+    #[serde(rename = "siphash")]
     Siphash,
+    #[serde(rename = "ahash")]
     Ahash,
     #[serde(rename = "xxh3")]
+    #[default]
     XXH3,
     #[serde(rename = "xxh32")]
     XXH32,
@@ -43,6 +47,121 @@ pub enum HashingAlgorithm {
     XXH64,
     #[serde(rename = "xxh128")]
     XXH128,
+    #[serde(rename = "blake3")]
+    Blake3,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CacheEngine {
+    /// Historical default (`moka`). Accepted for spicepod configuration
+    /// compatibility and ignored at runtime: SQL, search, and embeddings
+    /// `LruCache` paths always use the Spice sharded-cache backend. Leaving
+    /// `engine: moka` does not preserve Moka eviction or timing behavior.
+    ///
+    /// Migration: leave `engine: moka` in place for deserialize compatibility,
+    /// or remove the field; neither value selects a backend.
+    #[default]
+    Moka,
+    /// Historical Pingora-LRU option (`pingora`). Accepted for spicepod
+    /// compatibility and ignored at runtime; a one-time warning is logged.
+    /// SQL, search, and embeddings caches always use the Spice sharded-cache
+    /// backend — `engine: pingora` no longer selects Pingora.
+    ///
+    /// Migration: remove `engine: pingora` from the spicepod, or leave it (it is
+    /// ignored). Use `caching_policy` to choose eviction behavior.
+    Pingora,
+}
+
+impl Display for CacheEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheEngine::Moka => write!(f, "Moka"),
+            CacheEngine::Pingora => write!(f, "Pingora-LRU"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Encoding {
+    #[default]
+    None,
+    Zstd,
+}
+
+/// Whether the SQL results cache records query plans and replays them after
+/// the first full/append refresh.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ResultsCacheWarmup {
+    /// Do not record query plans or replay them after a refresh.
+    #[default]
+    Disabled,
+    /// After the first full/append refresh, replay the first 10 distinct query
+    /// plans (equality-filter values taken from distinct keys in the dataset)
+    /// until the cache is full. Datasets stay not ready until that warmup
+    /// completes. Later refreshes do not re-warm.
+    OnFirstRefresh,
+}
+
+impl ResultsCacheWarmup {
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::OnFirstRefresh)
+    }
+}
+
+/// Reject `warmup: on_first_refresh` together with `cache_key_type: sql`.
+///
+/// Warmup replays plan-shaped templates (SQL + bound params). Under
+/// `cache_key_type: sql` a live literal query hashes raw SQL without
+/// parameters, so a warmed entry can never be hit.
+///
+/// # Errors
+///
+/// Returns a user-facing message describing the invalid combination and the
+/// corrective action.
+pub fn validate_sql_results_warmup_config(
+    sql_results: &SQLResultsCacheConfig,
+) -> Result<(), String> {
+    if sql_results.enabled
+        && sql_results.warmup.is_enabled()
+        && matches!(sql_results.cache_key_type, CacheKeyType::Sql)
+    {
+        return Err(
+            "invalid spicepod: `runtime.caching.sql_results.warmup: on_first_refresh` requires `cache_key_type: plan` (or the default). `cache_key_type: sql` hashes raw SQL without parameters, so warmed entries cannot be hit. Disable warmup or set `cache_key_type: plan`."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CachingPolicy {
+    /// Least Recently Used caching policy.
+    /// Suitable for workloads with strong recency bias, such as streaming data processing.
+    #[default]
+    Lru,
+    /// Least Frequently Used caching policy.
+    ///
+    /// Evicts the lowest hit-count resident, chosen by a full walk of each
+    /// shard rather than a sampled tail. Choose it when a stable set of keys is
+    /// read far more often than the rest and you want that set to survive a
+    /// burst of one-off queries. Prefer `lru` when traffic is recency-biased,
+    /// such as streaming or time-windowed reads, and `tiny_lfu` as the
+    /// general-purpose choice for mixed database, search and analytics
+    /// workloads. The default remains `lru`.
+    Lfu,
+    /// W-`TinyLFU` caching policy.
+    /// Admission window + SLRU main (probation/protected) with Count-Min Sketch.
+    /// Suitable for most workloads including database, search, and analytics.
+    TinyLfu,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -75,9 +194,20 @@ pub struct CacheConfig {
     pub enabled: bool,
     pub max_size: Option<String>,
     pub item_ttl: Option<String>,
-    pub eviction_policy: Option<String>,
+    #[serde(default, alias = "eviction_policy")]
+    pub caching_policy: CachingPolicy,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
+    /// Cache backend selector retained for spicepod compatibility and ignored
+    /// at runtime. Values `moka` and `pingora` still deserialize; the runtime
+    /// always uses the Spice sharded-cache backend for SQL, search, and
+    /// embeddings `LruCache` paths. `engine: pingora` no longer selects
+    /// Pingora (a one-time warning is logged).
+    ///
+    /// Migration: remove `engine` from the spicepod, or leave it unchanged for
+    /// compatibility. See <https://spiceai.org/docs/features/caching>.
+    #[serde(default)]
+    pub engine: CacheEngine,
 }
 
 impl Default for CacheConfig {
@@ -86,8 +216,9 @@ impl Default for CacheConfig {
             enabled: true,
             max_size: None,
             item_ttl: None,
-            eviction_policy: None,
+            caching_policy: CachingPolicy::default(),
             hashing_algorithm: HashingAlgorithm::default(),
+            engine: CacheEngine::default(),
         }
     }
 }
@@ -103,11 +234,39 @@ pub struct SQLResultsCacheConfig {
     pub enabled: bool,
     pub max_size: Option<String>,
     pub item_ttl: Option<String>,
-    pub eviction_policy: Option<String>,
+    #[serde(default, alias = "eviction_policy")]
+    pub caching_policy: CachingPolicy,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
     #[serde(default)]
     pub cache_key_type: CacheKeyType,
+    /// Cache backend selector retained for spicepod compatibility and ignored
+    /// at runtime. Values `moka` and `pingora` still deserialize; the runtime
+    /// always uses the Spice sharded-cache backend for SQL, search, and
+    /// embeddings `LruCache` paths. `engine: pingora` no longer selects
+    /// Pingora (a one-time warning is logged).
+    ///
+    /// Migration: remove `engine` from the spicepod, or leave it unchanged for
+    /// compatibility. See <https://spiceai.org/docs/features/caching>.
+    #[serde(default)]
+    pub engine: CacheEngine,
+    /// Entries past `item_ttl` and within this extra window are served stale
+    /// while one background revalidation replaces them. Age counts from when
+    /// the query that produced the entry started. Accelerated refreshes do not
+    /// invalidate cached results; results reflect a refresh once they age past
+    /// `item_ttl` and revalidation completes.
+    ///
+    /// Format: duration string (e.g., "30s", "5m"). This is a response directive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_while_revalidate_ttl: Option<String>,
+    /// Encoding algorithm for compressing cached results.
+    #[serde(default)]
+    pub encoding: Encoding,
+    /// Replay recorded query plans into the results cache after the first
+    /// full/append refresh. Datasets stay not ready until warmup completes.
+    /// Has no effect unless [`Self::enabled`] is `true`. Default: `disabled`.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub warmup: ResultsCacheWarmup,
 }
 
 // serde(default) only applies when deserializing, so to return enabled: true from ::default() calls
@@ -118,9 +277,13 @@ impl Default for SQLResultsCacheConfig {
             enabled: true,
             max_size: None,
             item_ttl: None,
-            eviction_policy: None,
+            caching_policy: CachingPolicy::default(),
             hashing_algorithm: HashingAlgorithm::default(),
             cache_key_type: CacheKeyType::default(),
+            engine: CacheEngine::default(),
+            stale_while_revalidate_ttl: None,
+            encoding: Encoding::default(),
+            warmup: ResultsCacheWarmup::default(),
         }
     }
 }
@@ -133,11 +296,24 @@ pub struct ResultsCache {
     pub enabled: bool,
     pub cache_max_size: Option<String>,
     pub item_ttl: Option<String>,
-    pub eviction_policy: Option<String>,
+    #[serde(default, alias = "eviction_policy")]
+    pub caching_policy: CachingPolicy,
     #[serde(default)]
     pub cache_key_type: CacheKeyType,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
+    /// Cache backend selector retained for spicepod compatibility and ignored
+    /// at runtime. Values `moka` and `pingora` still deserialize; the runtime
+    /// always uses the Spice sharded-cache backend for SQL, search, and
+    /// embeddings `LruCache` paths. `engine: pingora` no longer selects
+    /// Pingora (a one-time warning is logged).
+    ///
+    /// Migration: remove `engine` from the spicepod, or leave it unchanged for
+    /// compatibility. See <https://spiceai.org/docs/features/caching>.
+    #[serde(default)]
+    pub engine: CacheEngine,
+    /// Maximum stale-while-revalidate duration to add to the cache TTL.
+    pub max_stale_while_revalidate: Option<String>,
 }
 
 impl Default for ResultsCache {
@@ -146,9 +322,11 @@ impl Default for ResultsCache {
             enabled: true,
             cache_max_size: None,
             item_ttl: None,
-            eviction_policy: None,
+            caching_policy: CachingPolicy::default(),
             cache_key_type: CacheKeyType::default(),
             hashing_algorithm: HashingAlgorithm::default(),
+            engine: CacheEngine::default(),
+            max_stale_while_revalidate: None,
         }
     }
 }
@@ -159,9 +337,13 @@ impl From<ResultsCache> for SQLResultsCacheConfig {
             enabled: val.enabled,
             max_size: val.cache_max_size,
             item_ttl: val.item_ttl,
-            eviction_policy: val.eviction_policy,
+            caching_policy: val.caching_policy,
             hashing_algorithm: val.hashing_algorithm,
             cache_key_type: val.cache_key_type,
+            engine: val.engine,
+            stale_while_revalidate_ttl: None,
+            encoding: Encoding::default(),
+            warmup: ResultsCacheWarmup::default(),
         }
     }
 }
@@ -183,7 +365,8 @@ mod tests {
         assert_eq!(sql_results.cache_key_type, CacheKeyType::default());
         assert!(sql_results.max_size.is_none());
         assert!(sql_results.item_ttl.is_none());
-        assert!(sql_results.eviction_policy.is_none());
+        assert_eq!(sql_results.caching_policy, CachingPolicy::Lru);
+        assert_eq!(sql_results.warmup, ResultsCacheWarmup::Disabled);
         assert_eq!(sql_results, SQLResultsCacheConfig::default());
 
         let search_results = caching.search_results.expect("Should have cache config");
@@ -194,7 +377,7 @@ mod tests {
         );
         assert!(search_results.max_size.is_none());
         assert!(search_results.item_ttl.is_none());
-        assert!(search_results.eviction_policy.is_none());
+        assert_eq!(search_results.caching_policy, CachingPolicy::Lru);
         assert_eq!(search_results, CacheConfig::default());
 
         let embeddings = caching.embeddings.expect("Should have cache config");
@@ -202,7 +385,77 @@ mod tests {
         assert_eq!(embeddings.hashing_algorithm, HashingAlgorithm::default());
         assert!(embeddings.max_size.is_none());
         assert!(embeddings.item_ttl.is_none());
-        assert!(embeddings.eviction_policy.is_none());
+        assert_eq!(embeddings.caching_policy, CachingPolicy::Lru);
         assert_eq!(embeddings, CacheConfig::default());
+    }
+
+    #[test]
+    fn test_sql_results_warmup_default_is_disabled() {
+        assert_eq!(
+            SQLResultsCacheConfig::default().warmup,
+            ResultsCacheWarmup::Disabled
+        );
+        let parsed: SQLResultsCacheConfig = yaml::from_str("enabled: true").expect("parse");
+        assert_eq!(parsed.warmup, ResultsCacheWarmup::Disabled);
+    }
+
+    #[test]
+    fn test_sql_results_warmup_on_first_refresh() {
+        let parsed: SQLResultsCacheConfig = yaml::from_str(
+            "
+            enabled: true
+            warmup: on_first_refresh
+            ",
+        )
+        .expect("parse");
+        assert!(parsed.warmup.is_enabled());
+        assert_eq!(parsed.warmup, ResultsCacheWarmup::OnFirstRefresh);
+    }
+
+    #[test]
+    fn test_sql_results_warmup_rejects_a_boolean() {
+        let err = yaml::from_str::<SQLResultsCacheConfig>(
+            "
+            enabled: true
+            warmup: true
+            ",
+        )
+        .expect_err("boolean warmup values are not accepted");
+        let message = err.to_string();
+        assert!(
+            message.contains("enum") || message.contains("Bool"),
+            "boolean warmup values must be rejected, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sql_results_warmup_parses_when_cache_is_disabled() {
+        let parsed: SQLResultsCacheConfig = yaml::from_str(
+            "
+            enabled: false
+            warmup: on_first_refresh
+            ",
+        )
+        .expect("parse");
+        assert!(!parsed.enabled);
+        assert!(parsed.warmup.is_enabled());
+    }
+
+    #[test]
+    fn test_sql_results_warmup_rejects_sql_cache_key_type() {
+        let parsed: SQLResultsCacheConfig = yaml::from_str(
+            "
+            enabled: true
+            cache_key_type: sql
+            warmup: on_first_refresh
+            ",
+        )
+        .expect("fields themselves are valid");
+        let err = validate_sql_results_warmup_config(&parsed)
+            .expect_err("warmup + cache_key_type: sql must be rejected");
+        assert!(
+            err.contains("cache_key_type: plan"),
+            "error must name the corrective action, got: {err}"
+        );
     }
 }

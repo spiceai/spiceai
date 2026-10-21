@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/metadata/mod.rs
+expression: formatted
+---
++-------------+-----------------------+
+| document_id | filename              |
++-------------+-----------------------+
+| doc_1       | requirements.pdf      |
+| doc_10      | postmortem_feb.md     |
+| doc_2       | arch_review.md        |
+| doc_3       | empty_placeholder.txt |
+| doc_4       | q1_finance.xlsx       |
++-------------+-----------------------+

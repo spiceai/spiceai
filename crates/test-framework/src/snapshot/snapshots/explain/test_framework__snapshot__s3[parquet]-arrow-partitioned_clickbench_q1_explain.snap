@@ -1,0 +1,15 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q1"
+---
++---------------+-----------------------------------------------------+
+| plan_type     | plan                                                |
++---------------+-----------------------------------------------------+
+| logical_plan  | Projection: count(Int64(1)) AS count(*)             |
+|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]] |
+|               |     TableScan: hits projection=[]                   |
+| physical_plan | ProjectionExec: expr=[50000000 as count(*)]         |
+|               |   BytesProcessedExec                                |
+|               |     PlaceholderRowExec                              |
+|               |                                                     |
++---------------+-----------------------------------------------------+

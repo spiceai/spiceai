@@ -1,0 +1,48 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-turso[file]
+datasets:
+  - from: s3://benchmarks/clickbench/hits.parquet
+    name: hits
+    params:
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      # dev-runners do not have enough memory for full clickbench.
+      # Limit data but ensure certain questions have sufficient data
+      refresh_sql: |
+        SELECT *
+        FROM hits
+        WHERE  "UserID" = 435090932899640449 -- q20
+        -- q41
+        OR (
+          "CounterID" = 62 AND date_trunc('day', from_unixtime("EventTime")) >= '2013-07-01' AND date_trunc('day', from_unixtime("EventTime")) <= '2013-07-31' AND "IsRefresh" = 0 AND "TraficSourceID" IN (-1, 6) AND "RefererHash" = 3594120000172545465
+        )
+        -- q42
+        OR (
+          "CounterID" = 62 AND date_trunc('day', from_unixtime("EventTime")) >= '2013-07-01' AND date_trunc('day', from_unixtime("EventTime")) <= '2013-07-31' AND "IsRefresh" = 0 AND "DontCountHits" = 0 AND "URLHash" = 2868770270353813622
+        )
+        -- q22
+        OR (
+          "URL" LIKE '%google%' AND "SearchPhrase" <> ''
+        )
+        -- q23
+        OR (
+          "Title" LIKE '%Google%' AND "URL" NOT LIKE '%.google.%' AND "SearchPhrase" <> ''
+        )
+        -- q39
+        OR (
+          "CounterID" = 62 AND date_trunc('day', from_unixtime("EventTime")) >= '2013-07-01' AND date_trunc('day', from_unixtime("EventTime")) <= '2013-07-31' AND "IsRefresh" = 0 AND "IsLink" <> 0 AND "IsDownload" = 0
+        )
+        -- q43
+        OR (
+          "CounterID" = 62 AND to_timestamp("EventDate" * 86400) >= '2013-07-14' AND to_timestamp("EventDate" * 86400) <= '2013-07-15' AND "IsRefresh" = 0 AND "DontCountHits" = 0
+        )
+        LIMIT 10000000

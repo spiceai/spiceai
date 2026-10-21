@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/http/json_nested_fields.rs
+expression: pretty
+---
++---------+---------------+----------+-----------+----------------+
+| id      | action        | severity | automated | retention_days |
++---------+---------------+----------+-----------+----------------+
+| evt-001 | user.login    | info     | false     | 30             |
+| evt-002 | config.update | warning  | true      | 7              |
+| evt-003 | data.export   | info     | false     | 90             |
++---------+---------------+----------+-----------+----------------+

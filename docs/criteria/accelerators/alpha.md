@@ -6,12 +6,15 @@ All criteria must be met for the Accelerator to be considered Alpha. As Alpha si
 
 ## Alpha Quality Accelerators
 
-| Accelerator | Alpha Quality | DRI Sign-off |
-| ----------- | ------------- | ------------ |
-| Arrow       | ✅            | @Sevenannn   |
-| DuckDB      | ✅            | @peasee      |
-| SQLite      | ✅            | @sgrebnov    |
-| PostgreSQL  | ✅            | @sgrebnov    |
+| Accelerator             | Alpha Quality | DRI Sign-off |
+| ----------------------- | ------------- | ------------ |
+| Arrow                   | ✅             | @Sevenannn   |
+| Cayenne                 | ✅             | @lukekim     |
+| DuckDB                  | ✅             | @peasee      |
+| SQLite                  | ✅             | @sgrebnov    |
+| PostgreSQL<sup>\*</sup> | ✅             | @sgrebnov    |
+
+<sup>\*</sup> PostgreSQL is a [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise)-only accelerator.
 
 ## Alpha Release Criteria
 

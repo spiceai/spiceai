@@ -1,0 +1,65 @@
+version: v1
+kind: Spicepod
+name: model2vec[potion-multilingual-128M]-cayenne[file]
+
+# FinanceBench PDF search benchmark (vector variant). The corpus is one PDF per filing page,
+# staged to S3 by scripts/financebench_stage.py. See README.md for the one-time staging procedure
+# and how to run this spicepod as a custom search test.
+
+datasets:
+  # Per-page filing PDFs. `file_format: pdf` routes each *.pdf to the text table (schema:
+  # location, content), one row per page-PDF; it is required because the directory `from:` carries
+  # no extension for the listing connector to infer. `location` is the full in-bucket key, e.g.
+  # financebench/corpus_pages/<doc>/pNNNN.pdf.
+  - from: s3://benchmarks/financebench/corpus_pages/
+    name: corpus_pdfs
+    params:
+      file_format: pdf
+      <<: &s3_params
+        allow_http: true
+        s3_auth: key
+        s3_endpoint: ${secrets:S3_ENDPOINT}
+        s3_key: ${secrets:S3_KEY}
+        s3_secret: ${secrets:S3_SECRET}
+
+  - from: s3://benchmarks/financebench/queries.parquet
+    name: test_queries
+    params:
+      file_format: parquet
+      <<: *s3_params
+    acceleration:
+      enabled: true
+
+  - from: s3://benchmarks/financebench/relevance_data.parquet
+    name: relevance_data
+    params:
+      file_format: parquet
+      <<: *s3_params
+    acceleration:
+      enabled: true
+
+views:
+  # The searchable corpus. Stripping everything up to and including `corpus_pages/` turns the raw
+  # `location` into the portable `<doc>/pNNNN.pdf` key, so the search primary key equals the
+  # `corpus-id` that relevance_data carries — independent of the bucket or prefix the PDFs live
+  # under. Each page embeds to one vector — model2vec is a static, context-free model, so a whole
+  # page never truncates, and one vector per page maps directly onto the page-level qrels.
+  # Acceleration lives here, not on corpus_pdfs: the embeddings are a column of this view, so only
+  # a refresh against the view itself scans through them and materializes the vectors before
+  # readiness.
+  - name: corpus
+    sql: SELECT regexp_replace(location, '^.*corpus_pages/', '') AS _id, content AS text FROM corpus_pdfs
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+    columns:
+      - name: text
+        embeddings:
+          - from: potion
+            row_id:
+              - _id
+
+embeddings:
+  - from: model2vec:minishlab/potion-multilingual-128M
+    name: potion

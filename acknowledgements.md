@@ -4,42 +4,28 @@ Spice.ai acknowledges the following open source projects for making this project
 
 
 
-## Go Modules
-
-github.com/AzureAD/microsoft-authentication-library-for-go/apps, https://github.com/AzureAD/microsoft-authentication-library-for-go/blob/v1.5.0/LICENSE, MIT
-github.com/chzyer/readline, https://github.com/chzyer/readline/blob/2972be24d48e/LICENSE, MIT
-github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/v1.9.0/LICENSE, BSD-3-Clause
-github.com/go-viper/mapstructure/v2, https://github.com/go-viper/mapstructure/blob/v2.4.0/LICENSE, MIT
-github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/b87c2d0e983a/LICENSE, MIT
-github.com/golang-jwt/jwt/v5, https://github.com/golang-jwt/jwt/blob/v5.2.2/LICENSE, MIT
-github.com/google/uuid, https://github.com/google/uuid/blob/v1.6.0/LICENSE, BSD-3-Clause
-github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/v0.5.2/LICENSE, MPL-2.0
-github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/v0.7.8/LICENSE, MPL-2.0
-github.com/joho/godotenv, https://github.com/joho/godotenv/blob/v1.5.1/LICENCE, MIT
-github.com/kylelemons/godebug, https://github.com/kylelemons/godebug/blob/v1.1.0/LICENSE, Apache-2.0
-github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/v2.0.3/LICENSE, Unlicense
-github.com/manifoldco/promptui, https://github.com/manifoldco/promptui/blob/v0.9.0/LICENSE.md, BSD-3-Clause
-github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/v0.0.15/LICENSE, MIT
-github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/v0.0.5/LICENSE.md, MIT
-github.com/pelletier/go-toml/v2, https://github.com/pelletier/go-toml/blob/v2.2.4/LICENSE, MIT
-github.com/peterh/liner, https://github.com/peterh/liner/blob/v1.2.2/COPYING, MIT
-github.com/pkg/browser, https://github.com/pkg/browser/blob/5ac0b6a4141c/LICENSE, BSD-2-Clause
-github.com/rivo/uniseg, https://github.com/rivo/uniseg/blob/v0.4.6/LICENSE.txt, MIT
-github.com/sagikazarmark/locafero, https://github.com/sagikazarmark/locafero/blob/v0.11.0/LICENSE, MIT
-github.com/sourcegraph/conc, https://github.com/sourcegraph/conc/blob/5f936abd7ae8/LICENSE, MIT
-github.com/spf13/afero, https://github.com/spf13/afero/blob/v1.15.0/LICENSE.txt, Apache-2.0
-github.com/spf13/cast, https://github.com/spf13/cast/blob/v1.10.0/LICENSE, MIT
-github.com/spf13/cobra, https://github.com/spf13/cobra/blob/v1.10.1/LICENSE.txt, Apache-2.0
-github.com/spf13/pflag, https://github.com/spf13/pflag/blob/v1.0.10/LICENSE, BSD-3-Clause
-github.com/spf13/viper, https://github.com/spf13/viper/blob/v1.21.0/LICENSE, MIT
-github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/v1.6.0/LICENSE, MIT
-go.yaml.in/yaml/v3, https://github.com/yaml/go-yaml/blob/v3.0.4/LICENSE, MIT
-golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.28.0:LICENSE, BSD-3-Clause
-golang.org/x/sys/unix, https://cs.opensource.google/go/x/sys/+/v0.36.0:LICENSE, BSD-3-Clause
-golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.28.0:LICENSE, BSD-3-Clause
-gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
-
 ## Rust Crates
+
+- adbc_core 0.24.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-adbc
+
+- adbc_driver_manager 0.24.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-adbc
+
+- adbc_ffi 0.24.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-adbc
+
+- adobe-cmap-parser 0.4.1, MIT 
+  <br/>https://github.com/jrmuizel/adobe-cmap-parser
+
+- aegis 0.9.12, MIT 
+  <br/>https://github.com/jedisct1/rust-aegis
+
+- aes 0.8.4, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/block-ciphers
+
+- aes 0.9.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/block-ciphers
 
 - ahash 0.7.8, Apache-2.0 OR MIT 
   <br/>https://github.com/tkaitchuck/ahash
@@ -47,49 +33,67 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - ahash 0.8.12, Apache-2.0 OR MIT 
   <br/>https://github.com/tkaitchuck/ahash
 
-- ansi_term 0.12.1, MIT 
-  <br/>https://github.com/ogham/rust-ansi-term
-
-- anyhow 1.0.99, Apache-2.0 OR MIT 
+- anyhow 1.0.103, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/anyhow
 
-- arrow 55.2.0, Apache-2.0 
+- apache-avro 0.21.0, Apache-2.0 
+  <br/>https://github.com/apache/avro-rs
+
+- arc-swap 1.9.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/vorner/arc-swap
+
+- arrow 59.3.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-array 55.2.0, Apache-2.0 
+- arrow-array 59.3.0, Apache-2.0 AND MIT 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-buffer 55.2.0, Apache-2.0 
+- arrow-buffer 59.3.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-cast 55.2.0, Apache-2.0 
+- arrow-cast 59.3.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-csv 55.2.0, Apache-2.0 
+- arrow-csv 59.3.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-flight 55.2.0, Apache-2.0 
+- arrow-flight 59.3.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-ipc 55.2.0, Apache-2.0 
+- arrow-ipc 59.3.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-json 55.2.0, Apache-2.0 
+- arrow-json 59.3.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-odbc 16.0.2, MIT 
+- arrow-odbc 25.3.0, MIT 
   <br/>https://github.com/pacman82/arrow-odbc
 
-- arrow-schema 55.2.0, Apache-2.0 
+- arrow-row 59.3.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- async-graphql 7.0.17, Apache-2.0 OR MIT 
+- arrow-schema 59.3.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-rs
+
+- assert_cmd 2.2.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/assert-rs/assert_cmd.git
+
+- async-channel 1.9.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/smol-rs/async-channel
+
+- async-channel 2.5.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/smol-rs/async-channel
+
+- async-compression 0.4.42, Apache-2.0 OR MIT 
+  <br/>https://github.com/Nullus157/async-compression
+
+- async-graphql 7.2.1, Apache-2.0 OR MIT 
   <br/>https://github.com/async-graphql/async-graphql
 
-- async-graphql-axum 7.0.17, Apache-2.0 OR MIT 
+- async-graphql-axum 7.2.1, Apache-2.0 OR MIT 
   <br/>https://github.com/async-graphql/async-graphql
 
-- async-openai 0.29.1, MIT 
+- async-openai 0.32.0, MIT 
   <br/>https://github.com/64bit/async-openai
 
 - async-stream 0.3.6, MIT 
@@ -98,74 +102,92 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - async-trait 0.1.89, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/async-trait
 
-- aws-config 1.8.5, Apache-2.0 
+- aws-config 1.8.18, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-credential-types 1.2.5, Apache-2.0 
+- aws-credential-types 1.3.0, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-runtime 1.5.10, Apache-2.0 
+- aws-lc-rs 1.18.1, (Apache-2.0 OR ISC) AND ISC 
+  <br/>https://github.com/aws/aws-lc-rs
+
+- aws-runtime 1.7.5, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-sdk-bedrockruntime 1.101.0, Apache-2.0 
+- aws-sdk-bedrockruntime 1.135.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-cognitoidentity 1.81.0, Apache-2.0 
+- aws-sdk-cognitoidentity 1.104.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-cognitoidentityprovider 1.94.0, Apache-2.0 
+- aws-sdk-cognitoidentityprovider 1.123.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-dynamodb 1.88.0, Apache-2.0 
+- aws-sdk-dynamodb 1.116.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-glue 1.114.0, Apache-2.0 
+- aws-sdk-dynamodbstreams 1.104.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-s3 1.102.0, Apache-2.0 
+- aws-sdk-ec2 1.237.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-s3vectors 1.6.0, Apache-2.0 
+- aws-sdk-glue 1.153.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-secretsmanager 1.84.0, Apache-2.0 
+- aws-sdk-s3 1.137.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-sts 1.82.0, Apache-2.0 
+- aws-sdk-s3vectors 1.29.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-smithy-runtime 1.8.6, Apache-2.0 
+- aws-sdk-secretsmanager 1.108.0, Apache-2.0 
+  <br/>https://github.com/awslabs/aws-sdk-rust
+
+- aws-sdk-sqs 1.102.0, Apache-2.0 
+  <br/>https://github.com/awslabs/aws-sdk-rust
+
+- aws-sdk-sts 1.107.0, Apache-2.0 
+  <br/>https://github.com/awslabs/aws-sdk-rust
+
+- aws-smithy-async 1.3.0, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-smithy-runtime-api 1.8.7, Apache-2.0 
+- aws-smithy-runtime 1.16.0, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-smithy-types 1.3.2, Apache-2.0 
+- aws-smithy-runtime-api 1.19.0, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- axum 0.7.9, MIT 
+- aws-smithy-types 1.8.1, Apache-2.0 
+  <br/>https://github.com/smithy-lang/smithy-rs
+
+- axum 0.8.9, MIT 
   <br/>https://github.com/tokio-rs/axum
 
-- axum 0.8.4, MIT 
+- axum-extra 0.12.6, MIT 
   <br/>https://github.com/tokio-rs/axum
 
-- axum-extra 0.10.1, MIT 
-  <br/>https://github.com/tokio-rs/axum
-
-- azure_core 0.21.0, MIT 
+- azure_core 0.31.0, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
-- azure_core 0.27.0, MIT 
+- azure_data_cosmos 0.30.0, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
-- azure_storage 0.21.0, MIT 
+- azure_identity 0.31.0, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
-- azure_storage_blobs 0.21.0, MIT 
+- azure_security_keyvault_secrets 0.10.0, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
-- backoff 0.4.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/ihrwein/backoff
+- ballista-core 55.0.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion-ballista
+
+- ballista-executor 55.0.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion-ballista
+
+- ballista-scheduler 55.0.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion-ballista
 
 - base64 0.13.1, Apache-2.0 OR MIT 
   <br/>https://github.com/marshallpierce/rust-base64
@@ -176,31 +198,79 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - base64 0.22.1, Apache-2.0 OR MIT 
   <br/>https://github.com/marshallpierce/rust-base64
 
-- bb8 0.8.6, MIT 
-  <br/>https://github.com/djc/bb8
+- base64 0.23.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/marshallpierce/rust-base64
 
-- bb8 0.9.0, MIT 
+- bb8 0.9.1, MIT 
   <br/>https://github.com/djc/bb8
 
 - bb8-oracle 0.3.0, Apache-2.0 OR MIT 
   <br/>https://github.com/RavuAlHemio/bb8-oracle
 
-- bigdecimal 0.4.8, Apache-2.0 OR MIT 
+- bcder 0.7.6, BSD-3-Clause 
+  <br/>https://github.com/nlnetlabs/bcder
+
+- bigdecimal 0.4.10, Apache-2.0 OR MIT 
   <br/>https://github.com/akubera/bigdecimal-rs
+
+- bindgen 0.69.5, BSD-3-Clause 
+  <br/>https://github.com/rust-lang/rust-bindgen
+
+- bindgen 0.70.1, BSD-3-Clause 
+  <br/>https://github.com/rust-lang/rust-bindgen
+
+- bindgen 0.71.1, BSD-3-Clause 
+  <br/>https://github.com/rust-lang/rust-bindgen
+
+- bindgen 0.72.1, BSD-3-Clause 
+  <br/>https://github.com/rust-lang/rust-bindgen
+
+- bitflags 1.3.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/bitflags/bitflags
+
+- bitflags 2.13.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/bitflags/bitflags
+
+- bitvec 1.0.1, MIT 
+  <br/>https://github.com/bitvecto-rs/bitvec
+
+- blake3 1.8.5, Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR CC0-1.0 
+  <br/>https://github.com/BLAKE3-team/BLAKE3
 
 - bollard 0.18.1, Apache-2.0 
   <br/>https://github.com/fussybeaver/bollard
 
-- byte-unit 5.1.6, MIT 
+- brotli 8.0.3, BSD-3-Clause AND MIT 
+  <br/>https://github.com/dropbox/rust-brotli
+
+- byte-unit 5.2.0, MIT 
   <br/>https://github.com/magiclen/byte-unit
 
-- bytes 1.10.1, MIT 
+- bytes 1.11.1, MIT 
   <br/>https://github.com/tokio-rs/bytes
+
+- calamine 0.28.0, MIT 
+  <br/>https://github.com/tafia/calamine
+
+- cbc 0.1.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/block-modes
+
+- cbc 0.2.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/block-modes
+
+- cff-parser 0.2.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/jrmuizel/cff-parser
+
+- chacha20poly1305 0.11.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/AEADs
 
 - charset 0.1.5, Apache-2.0 OR MIT 
   <br/>https://github.com/hsivonen/charset
 
-- chrono 0.4.42, Apache-2.0 OR MIT 
+- chdb-rust 1.3.1, Apache-2.0 
+  <br/>https://github.com/chdb-io/chdb-rust
+
+- chrono 0.4.45, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono
 
 - chrono-tz 0.8.6, Apache-2.0 OR MIT 
@@ -209,59 +279,143 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - chrono-tz 0.9.0, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono-tz
 
-- chrono-tz 0.10.3, Apache-2.0 OR MIT 
+- chrono-tz 0.10.4, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono-tz
 
-- clap 4.5.47, Apache-2.0 OR MIT 
+- clap 4.6.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/clap-rs/clap
+
+- clap_complete 4.6.5, Apache-2.0 OR MIT 
   <br/>https://github.com/clap-rs/clap
 
 - clickhouse-rs 1.1.0-alpha.1, MIT 
   <br/>https://github.com/suharev7/clickhouse-rs
 
-- croner 3.0.0, MIT 
+- cmac 0.7.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/MACs
+
+- comfy-table 7.1.4, MIT 
+  <br/>https://github.com/nukesor/comfy-table
+
+- connector-nfs 1.11.0-unstable, Apache-2.0 
+  <br/>
+
+- core_maths 0.1.1, MIT 
+  <br/>https://github.com/robertbastian/core_maths
+
+- crash-handler 0.8.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/EmbarkStudios/crash-handling
+
+- criterion 0.5.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/bheisler/criterion.rs
+
+- criterion 0.6.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/bheisler/criterion.rs
+
+- criterion 0.7.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/bheisler/criterion.rs
+
+- criterion 0.8.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/criterion-rs/criterion.rs
+
+- croner 3.0.1, MIT 
   <br/>https://github.com/hexagon/croner-rust
 
-- csv 1.3.1, MIT OR Unlicense 
+- csv 1.4.0, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/rust-csv
 
-- ctor 0.5.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/mmastrac/rust-ctor
+- ctor 1.0.13, Apache-2.0 OR MIT 
+  <br/>https://github.com/mmastrac/linktime
 
-- ctrlc 3.5.0, Apache-2.0 OR MIT 
+- ctrlc 3.5.2, Apache-2.0 OR MIT 
   <br/>https://github.com/Detegr/rust-ctrlc.git
 
-- cudarc 0.12.2, Apache-2.0 OR MIT 
+- cudarc 0.17.8, Apache-2.0 OR MIT 
   <br/>https://github.com/coreylowman/cudarc
 
-- cudarc 0.13.9, Apache-2.0 OR MIT 
-  <br/>https://github.com/coreylowman/cudarc
+- cudarc 0.19.8, Apache-2.0 OR MIT 
+  <br/>https://github.com/chelsea0x3b/cudarc
 
-- dashmap 6.1.0, MIT 
+- dashmap 6.2.1, MIT 
   <br/>https://github.com/xacrimon/dashmap
 
-- datafusion 49.0.2, Apache-2.0 
+- datafusion 55.2.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-datasource 49.0.2, Apache-2.0 
+- datafusion-catalog 55.2.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-expr 49.0.2, Apache-2.0 
+- datafusion-common 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-common-runtime 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-datasource 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-execution 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-expr 55.2.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
 - datafusion-federation 0.4.2, Apache-2.0 
   <br/>https://github.com/datafusion-contrib/datafusion-federation
 
-- datafusion-functions-json 0.49.0, Apache-2.0 
+- datafusion-functions 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-functions-aggregate 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-functions-aggregate-common 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-functions-json 0.55.6, Apache-2.0 
   <br/>https://github.com/datafusion-contrib/datafusion-functions-json/
 
-- datafusion-table-providers 0.1.0,  
+- datafusion-functions-nested 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-physical-expr 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-physical-expr-adapter 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-physical-expr-common 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-physical-plan 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-proto 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-proto-common 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-pruning 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-spark 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-substrait 55.2.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
+- datafusion-table-providers 0.1.0, Apache-2.0 
   <br/>https://github.com/datafusion-contrib/datafusion-table-providers
 
-- delta_kernel 0.14.0, Apache-2.0 
+- delta_kernel 0.27.1, Apache-2.0 
   <br/>https://github.com/delta-io/delta-kernel-rs
 
-- dirs 5.0.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/soc/dirs-rs
+- delta_kernel_default_engine 0.27.1, Apache-2.0 
+  <br/>https://github.com/delta-io/delta-kernel-rs
+
+- dialoguer 0.12.0, MIT 
+  <br/>https://github.com/console-rs/dialoguer
 
 - dirs 6.0.0, Apache-2.0 OR MIT 
   <br/>https://github.com/soc/dirs-rs
@@ -269,37 +423,70 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - docx-rs 0.4.17, MIT 
   <br/>https://github.com/bokuweb/docx-rs
 
-- dotenvy 0.15.7, MIT 
-  <br/>https://github.com/allan2/dotenvy
+- dotenv 0.15.0, MIT 
+  <br/>https://github.com/dotenv-rs/dotenv
 
-- duckdb 1.3.2, MIT 
+- duckdb 1.4.4, MIT 
   <br/>https://github.com/duckdb/duckdb-rs
 
-- dyn-clone 1.0.19, Apache-2.0 OR MIT 
+- dyn-clone 1.0.20, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/dyn-clone
 
-- either 1.15.0, Apache-2.0 OR MIT 
+- ecb 0.1.2, MIT 
+  <br/>https://github.com/magic-akari/ecb
+
+- ecb 0.2.0, MIT 
+  <br/>https://github.com/magic-akari/ecb
+
+- either 1.16.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rayon-rs/either
 
-- env_logger 0.11.8, Apache-2.0 OR MIT 
+- encoding_rs 0.8.35, (Apache-2.0 OR MIT) AND BSD-3-Clause 
+  <br/>https://github.com/hsivonen/encoding_rs
+
+- env_logger 0.11.10, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-cli/env_logger
 
-- evalconverter 0.1.0, Apache-2.0 
-  <br/>
+- euclid 0.20.14, Apache-2.0 OR MIT 
+  <br/>https://github.com/servo/euclid
+
+- flatbuffers 25.12.19, Apache-2.0 
+  <br/>https://github.com/google/flatbuffers
+
+- flate2 1.1.9, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/flate2-rs
+
+- fs4 0.13.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/al8n/fs4-rs
 
 - fundu 2.0.1, MIT 
   <br/>https://github.com/fundu-rs/fundu
 
-- futures 0.3.31, Apache-2.0 OR MIT 
+- futures 0.3.32, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/futures-rs
 
-- futures-util 0.3.31, Apache-2.0 OR MIT 
-  <br/>https://github.com/rust-lang/futures-rs
+- gethostname 1.1.0, Apache-2.0 
+  <br/>https://codeberg.org/swsnr/gethostname.rs.git
 
-- globset 0.4.16, MIT OR Unlicense 
+- getrandom 0.2.17, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-random/getrandom
+
+- getrandom 0.3.4, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-random/getrandom
+
+- getrandom 0.4.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-random/getrandom
+
+- git2 0.21.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/git2-rs
+
+- glob 0.3.3, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/glob
+
+- globset 0.4.18, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/ripgrep/tree/master/crates/globset
 
-- governor 0.10.1, MIT 
+- governor 0.10.4, MIT 
   <br/>https://github.com/boinkor-net/governor.git
 
 - graph-rs-sdk 2.0.1, MIT 
@@ -308,53 +495,113 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - graphql-parser 0.4.1, Apache-2.0 OR MIT 
   <br/>
 
-- headers-accept 0.1.4, MIT 
+- half 2.7.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/VoidStarKat/half-rs
+
+- hashbrown 0.5.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/hashbrown
+
+- hashbrown 0.12.3, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/hashbrown
+
+- hashbrown 0.14.5, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/hashbrown
+
+- hashbrown 0.15.5, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/hashbrown
+
+- hashbrown 0.16.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/hashbrown
+
+- hashbrown 0.17.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/hashbrown
+
+- headers 0.4.1, MIT 
+  <br/>https://github.com/hyperium/headers
+
+- headers-accept 0.3.0, MIT 
   <br/>https://github.com/maxcountryman/headers-accept
+
+- hex 0.4.3, Apache-2.0 OR MIT 
+  <br/>https://github.com/KokaKiwi/rust-hex
 
 - hf-hub 0.4.3, Apache-2.0 
   <br/>https://github.com/huggingface/hf-hub
 
+- hickory-resolver 0.26.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/hickory-dns/hickory-dns
+
+- hmac 0.12.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/MACs
+
+- hmac 0.13.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/MACs
+
 - hostname 0.3.1, MIT 
   <br/>https://github.com/svartalf/hostname
 
-- hostname 0.4.1, MIT 
-  <br/>https://github.com/svartalf/hostname
+- hostname 0.4.2, MIT 
+  <br/>https://github.com/djc/hostname
+
+- hpke 0.14.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/rozbb/rust-hpke
 
 - http 0.2.12, Apache-2.0 OR MIT 
   <br/>https://github.com/hyperium/http
 
-- http 1.3.1, Apache-2.0 OR MIT 
+- http 1.4.1, Apache-2.0 OR MIT 
   <br/>https://github.com/hyperium/http
+
+- http-body 0.4.6, MIT 
+  <br/>https://github.com/hyperium/http-body
+
+- http-body 1.0.1, MIT 
+  <br/>https://github.com/hyperium/http-body
 
 - http-body-util 0.1.3, MIT 
   <br/>https://github.com/hyperium/http-body
 
-- humantime 2.2.0, Apache-2.0 OR MIT 
+- httpdate 1.0.3, Apache-2.0 OR MIT 
+  <br/>https://github.com/pyfisch/httpdate
+
+- humantime 2.3.0, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/humantime
 
 - hyper 0.14.32, MIT 
   <br/>https://github.com/hyperium/hyper
 
-- hyper 1.7.0, MIT 
+- hyper 1.10.1, MIT 
   <br/>https://github.com/hyperium/hyper
 
-- hyper-util 0.1.16, MIT 
+- hyper-util 0.1.20, MIT 
   <br/>https://github.com/hyperium/hyper-util
 
-- iceberg 0.5.2, Apache-2.0 
+- iceberg 0.11.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
-- iceberg-catalog-glue 0.5.2, Apache-2.0 
+- iceberg-catalog-glue 0.11.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
-- iceberg-catalog-rest 0.5.2, Apache-2.0 
+- iceberg-catalog-rest 0.11.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
-- iceberg-datafusion 0.5.2, Apache-2.0 
+- iceberg-datafusion 0.11.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
-- iceberg_test_utils 0.5.2, Apache-2.0 
+- iceberg-storage-opendal 0.11.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
+
+- iceberg_test_utils 0.11.0, Apache-2.0 
+  <br/>https://github.com/apache/iceberg-rust
+
+- im 15.1.0, MPL-2.0+ 
+  <br/>https://github.com/bodil/im-rs
+
+- image 0.24.9, Apache-2.0 OR MIT 
+  <br/>https://github.com/image-rs/image
+
+- image 0.25.10, Apache-2.0 OR MIT 
+  <br/>https://github.com/image-rs/image
 
 - imap 3.0.0-alpha.14, Apache-2.0 OR MIT 
   <br/>https://github.com/jonhoo/rust-imap
@@ -362,22 +609,19 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - indexmap 1.9.3, Apache-2.0 OR MIT 
   <br/>https://github.com/bluss/indexmap
 
-- indexmap 2.11.0, Apache-2.0 OR MIT 
+- indexmap 2.14.0, Apache-2.0 OR MIT 
   <br/>https://github.com/indexmap-rs/indexmap
 
 - indicatif 0.17.11, MIT 
   <br/>https://github.com/console-rs/indicatif
 
-- indicatif 0.18.0, MIT 
+- indicatif 0.18.4, MIT 
   <br/>https://github.com/console-rs/indicatif
 
-- insta 1.43.1, Apache-2.0 
+- insta 1.47.2, Apache-2.0 
   <br/>https://github.com/mitsuhiko/insta
 
 - itertools 0.10.5, Apache-2.0 OR MIT 
-  <br/>https://github.com/rust-itertools/itertools
-
-- itertools 0.12.1, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-itertools/itertools
 
 - itertools 0.13.0, Apache-2.0 OR MIT 
@@ -386,128 +630,194 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - itertools 0.14.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-itertools/itertools
 
+- itertools 0.15.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-itertools/itertools
+
+- itoa 1.0.18, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/itoa
+
+- jiff 0.2.28, MIT OR Unlicense 
+  <br/>https://github.com/BurntSushi/jiff
+
 - jsonpath-rust 0.7.5, MIT 
   <br/>https://github.com/besok/jsonpath-rust
 
-- jsonwebtoken 9.3.1, MIT 
+- jsonwebtoken 10.4.0, MIT 
   <br/>https://github.com/Keats/jsonwebtoken
 
 - keyring 3.6.3, Apache-2.0 OR MIT 
   <br/>https://github.com/hwchen/keyring-rs.git
 
-- log 0.4.27, Apache-2.0 OR MIT 
+- libc 0.2.186, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/libc
+
+- linkme 0.3.36, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/linkme
+
+- liteparse 2.5.1, Apache-2.0 
+  <br/>https://github.com/run-llama/liteparse
+
+- liteparse-pdfium-sys 1.3.0, Apache-2.0 
+  <br/>https://github.com/run-llama/liteparse
+
+- log 0.4.34, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/log
 
-- logos 0.15.1, Apache-2.0 OR MIT 
+- logos 0.16.1, Apache-2.0 OR MIT 
   <br/>https://github.com/maciejhirsz/logos
 
-- mailparse 0.15.0, 0BSD 
+- loom 0.7.2, MIT 
+  <br/>https://github.com/tokio-rs/loom
+
+- lopdf 0.42.0, MIT 
+  <br/>https://github.com/J-F-Liu/lopdf.git
+
+- lopdf 0.43.0, MIT 
+  <br/>https://github.com/J-F-Liu/lopdf.git
+
+- mach2 0.6.0, Apache-2.0 OR BSD-2-Clause OR MIT 
+  <br/>https://github.com/JohnTitor/mach2
+
+- mailparse 0.16.1, 0BSD 
   <br/>https://github.com/staktrace/mailparse
 
-- mediatype 0.19.20, MIT 
+- md-5 0.10.6, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/hashes
+
+- md-5 0.11.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/hashes
+
+- md4 0.10.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/hashes
+
+- md5 0.7.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/stainless-steel/md5
+
+- mediatype 0.21.0, MIT 
   <br/>https://github.com/picoHz/mediatype
 
-- mimalloc 0.1.47, MIT 
+- mimalloc 0.1.52, MIT 
   <br/>https://github.com/purpleprotocol/mimalloc_rust
 
-- mistralrs 0.6.0, MIT 
+- mistralrs 0.9.0, MIT 
   <br/>https://github.com/EricLBuehler/mistral.rs
 
-- mistralrs-core 0.6.0, MIT 
+- mistralrs-core 0.9.0, MIT 
   <br/>https://github.com/EricLBuehler/mistral.rs
 
 - model2vec-rs 0.1.3,  LICENSE
   <br/>https://github.com/MinishLab/model2vec-rs
 
-- moka 0.12.10, Apache-2.0 OR MIT 
+- moka 0.12.15, (Apache-2.0 OR MIT) AND Apache-2.0 
   <br/>https://github.com/moka-rs/moka
 
-- mongodb 3.3.0, Apache-2.0 
+- mongodb 3.7.0, Apache-2.0 
   <br/>https://github.com/mongodb/mongo-rust-driver
 
-- mysql_async 0.35.1, Apache-2.0 OR MIT 
+- mysql_async 0.36.2, Apache-2.0 OR MIT 
   <br/>https://github.com/blackbeam/mysql_async
 
-- ndarray 0.15.6, Apache-2.0 OR MIT 
-  <br/>https://github.com/rust-ndarray/ndarray
+- mysql_common 0.35.5, Apache-2.0 OR MIT 
+  <br/>https://github.com/blackbeam/rust_mysql_common
 
-- ndarray 0.16.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/rust-ndarray/ndarray
+- native-tls 0.2.18, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-native-tls/rust-native-tls
+
+- nix 0.29.0, MIT 
+  <br/>https://github.com/nix-rust/nix
 
 - nix 0.30.1, MIT 
   <br/>https://github.com/nix-rust/nix
 
+- nix 0.31.3, MIT 
+  <br/>https://github.com/nix-rust/nix
+
+- nom 7.1.3, MIT 
+  <br/>https://github.com/Geal/nom
+
+- nom 8.0.0, MIT 
+  <br/>https://github.com/rust-bakery/nom
+
 - notify 8.2.0, CC0-1.0 
   <br/>https://github.com/notify-rs/notify.git
 
-- object_store 0.12.3, Apache-2.0 OR MIT 
+- num_cpus 1.17.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/seanmonstar/num_cpus
+
+- object_store 0.13.2, Apache-2.0 OR MIT 
   <br/>https://github.com/apache/arrow-rs-object-store
 
-- octocrab 0.45.0, Apache-2.0 OR MIT 
+- object_store 0.14.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/apache/arrow-rs-object-store
+
+- octocrab 0.49.9, Apache-2.0 OR MIT 
   <br/>https://github.com/XAMPPRocky/octocrab.git
 
-- odbc-api 13.1.0, MIT 
+- odbc-api 29.1.1, MIT 
   <br/>https://github.com/pacman82/odbc-api
 
-- once_cell 1.21.3, Apache-2.0 OR MIT 
-  <br/>https://github.com/matklad/once_cell
-
-- opendal 0.53.3, Apache-2.0 
+- opendal 0.58.2, Apache-2.0 
   <br/>https://github.com/apache/opendal
 
-- opentelemetry 0.27.1, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust
-
-- opentelemetry 0.29.1, Apache-2.0 
+- opentelemetry 0.32.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry
 
-- opentelemetry-http 0.27.0, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust
+- opentelemetry-http 0.32.0, Apache-2.0 
+  <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-http
 
-- opentelemetry-prometheus 0.27.0, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust
+- opentelemetry-otlp 0.32.0, Apache-2.0 
+  <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp
 
-- opentelemetry-proto 0.29.0, Apache-2.0 
+- opentelemetry-prometheus 0.32.0, Apache-2.0 
+  <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-prometheus
+
+- opentelemetry-proto 0.32.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto
 
-- opentelemetry-zipkin 0.27.0, Apache-2.0 
+- opentelemetry-zipkin 0.32.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-zipkin
 
-- opentelemetry_sdk 0.27.1, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust
-
-- opentelemetry_sdk 0.29.0, Apache-2.0 
+- opentelemetry_sdk 0.32.1, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-sdk
 
 - oracle 0.6.3, Apache-2.0 OR UPL-1.0 
   <br/>https://github.com/kubo/rust-oracle
 
-- parking_lot 0.11.2, Apache-2.0 OR MIT 
+- orc-rust 0.9.0, Apache-2.0 
+  <br/>https://github.com/datafusion-contrib/orc-rust
+
+- parking_lot 0.12.5, Apache-2.0 OR MIT 
   <br/>https://github.com/Amanieu/parking_lot
 
-- parking_lot 0.12.4, Apache-2.0 OR MIT 
-  <br/>https://github.com/Amanieu/parking_lot
-
-- parquet 55.2.0, Apache-2.0 
+- parquet 59.3.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
 - paste 1.0.15, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/paste
 
-- path-clean 1.0.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/danreeves/path-clean
-
-- pdf-extract 0.8.0, MIT 
+- pdf-extract 0.12.0, MIT 
   <br/>https://github.com/jrmuizel/pdf-extract
 
-- percent-encoding 2.3.1, Apache-2.0 OR MIT 
+- pdf-inspector 0.1.8, MIT 
+  <br/>https://github.com/firecrawl/pdf-inspector
+
+- pem 3.0.6, MIT 
+  <br/>https://github.com/jcreekmore/pem-rs.git
+
+- percent-encoding 2.3.2, Apache-2.0 OR MIT 
   <br/>https://github.com/servo/rust-url/
 
-- pin-project 1.1.10, Apache-2.0 OR MIT 
+- pgwire-replication 0.3.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/vnvo/pgwire-replication
+
+- pico-args 0.5.0, MIT 
+  <br/>https://github.com/RazrFalcon/pico-args
+
+- pin-project 1.1.13, Apache-2.0 OR MIT 
   <br/>https://github.com/taiki-e/pin-project
 
-- pkcs8 0.9.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/RustCrypto/formats/tree/master/pkcs8
+- pingora-lru 0.8.1, Apache-2.0 
+  <br/>https://github.com/cloudflare/pingora
 
 - pkcs8 0.10.2, Apache-2.0 OR MIT 
   <br/>https://github.com/RustCrypto/formats/tree/master/pkcs8
@@ -515,53 +825,107 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - postcard 1.1.3, Apache-2.0 OR MIT 
   <br/>https://github.com/jamesmunns/postcard
 
-- prometheus 0.13.4, Apache-2.0 
+- postgres-native-tls 0.5.3, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-postgres/rust-postgres
+
+- postgres-protocol 0.6.12, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-postgres/rust-postgres
+
+- postscript 0.19.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/bodoni/postscript
+
+- predicates 3.1.4, Apache-2.0 OR MIT 
+  <br/>https://github.com/assert-rs/predicates-rs
+
+- proc-macro2 1.0.106, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/proc-macro2
+
+- prometheus 0.14.0, Apache-2.0 
   <br/>https://github.com/tikv/rust-prometheus
-
-- prometheus-parse 0.2.5, Apache-2.0 
-  <br/>https://github.com/ccakes/prometheus-parse-rs
-
-- prost 0.11.9, Apache-2.0 
-  <br/>https://github.com/tokio-rs/prost
-
-- prost 0.12.6, Apache-2.0 
-  <br/>https://github.com/tokio-rs/prost
 
 - prost 0.13.5, Apache-2.0 
   <br/>https://github.com/tokio-rs/prost
 
-- pulldown-cmark 0.12.2, MIT 
-  <br/>https://github.com/raphlinus/pulldown-cmark
+- prost 0.14.3, Apache-2.0 
+  <br/>https://github.com/tokio-rs/prost
 
-- pulldown-cmark 0.13.0, MIT 
-  <br/>https://github.com/raphlinus/pulldown-cmark
+- prost-types 0.14.3, Apache-2.0 
+  <br/>https://github.com/tokio-rs/prost
 
-- rand 0.7.3, Apache-2.0 OR MIT 
+- quick-xml 0.37.5, MIT 
+  <br/>https://github.com/tafia/quick-xml
+
+- quick-xml 0.38.4, MIT 
+  <br/>https://github.com/tafia/quick-xml
+
+- quick-xml 0.39.4, MIT 
+  <br/>https://github.com/tafia/quick-xml
+
+- quick-xml 0.40.1, MIT 
+  <br/>https://github.com/tafia/quick-xml
+
+- quick-xml 0.41.0, MIT 
+  <br/>https://github.com/tafia/quick-xml
+
+- quick-xml 0.42.0, MIT 
+  <br/>https://github.com/tafia/quick-xml
+
+- quote 1.0.45, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/quote
+
+- r2d2 0.8.10, Apache-2.0 OR MIT 
+  <br/>https://github.com/sfackler/r2d2
+
+- rand 0.8.6, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-random/rand
 
-- rand 0.8.5, Apache-2.0 OR MIT 
+- rand 0.9.4, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-random/rand
 
-- rand 0.9.2, Apache-2.0 OR MIT 
+- rand 0.10.1, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-random/rand
 
-- rayon 1.11.0, Apache-2.0 OR MIT 
+- rangemap 1.7.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/jeffparsons/rangemap
+
+- rayon 1.12.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rayon-rs/rayon
 
-- rdkafka 0.38.0, MIT 
+- rcgen 0.14.8, Apache-2.0 OR MIT 
+  <br/>https://github.com/rustls/rcgen
+
+- rdkafka 0.39.0, MIT 
   <br/>https://github.com/fede1024/rust-rdkafka
 
-- regex 1.11.2, Apache-2.0 OR MIT 
+- redis 1.5.0, BSD-3-Clause 
+  <br/>https://github.com/redis-rs/redis-rs
+
+- regex 1.12.3, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/regex
 
-- reqwest 0.12.23, Apache-2.0 OR MIT 
+- regex-syntax 0.8.10, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/regex
+
+- reqsign-core 3.3.2, Apache-2.0 
+  <br/>https://github.com/apache/opendal-reqsign
+
+- reqwest 0.11.27, Apache-2.0 OR MIT 
+  <br/>https://github.com/seanmonstar/reqwest
+
+- reqwest 0.12.24, Apache-2.0 OR MIT 
+  <br/>https://github.com/seanmonstar/reqwest
+
+- reqwest 0.13.4, Apache-2.0 OR MIT 
   <br/>https://github.com/seanmonstar/reqwest
 
 - reqwest-eventsource 0.6.0, Apache-2.0 OR MIT 
   <br/>https://github.com/jpopesculian/reqwest-eventsource
 
-- rmcp 0.1.5, Apache-2.0 OR MIT 
+- rmcp 3.3.0, Apache-2.0 
   <br/>https://github.com/modelcontextprotocol/rust-sdk/
+
+- roaring 0.11.4, Apache-2.0 OR MIT 
+  <br/>https://github.com/RoaringBitmap/roaring-rs
 
 - rstest 0.25.0, Apache-2.0 OR MIT 
   <br/>https://github.com/la10736/rstest
@@ -569,28 +933,25 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rstest 0.26.1, Apache-2.0 OR MIT 
   <br/>https://github.com/la10736/rstest
 
-- rusqlite 0.31.0, MIT 
+- rusqlite 0.40.1, MIT 
   <br/>https://github.com/rusqlite/rusqlite
 
-- rustls 0.21.12, Apache-2.0 OR ISC OR MIT 
+- rust_decimal 1.42.0, MIT 
+  <br/>https://github.com/paupino/rust-decimal
+
+- rustc-hash 1.1.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang-nursery/rustc-hash
+
+- rustc-hash 2.1.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/rustc-hash
+
+- rustls 0.23.45, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/rustls/rustls
 
-- rustls 0.23.31, Apache-2.0 OR ISC OR MIT 
-  <br/>https://github.com/rustls/rustls
-
-- rustls-native-certs 0.6.3, Apache-2.0 OR ISC OR MIT 
-  <br/>https://github.com/ctz/rustls-native-certs
-
-- rustls-native-certs 0.8.1, Apache-2.0 OR ISC OR MIT 
+- rustls-native-certs 0.8.4, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/rustls/rustls-native-certs
 
-- rustls-pemfile 1.0.4, Apache-2.0 OR ISC OR MIT 
-  <br/>https://github.com/rustls/pemfile
-
-- rustls-pemfile 2.2.0, Apache-2.0 OR ISC OR MIT 
-  <br/>https://github.com/rustls/pemfile
-
-- rustyline 17.0.1, MIT 
+- rustyline 17.0.2, MIT 
   <br/>https://github.com/kkawakam/rustyline
 
 - schemars 0.8.22, MIT 
@@ -599,95 +960,128 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - schemars 0.9.0, MIT 
   <br/>https://github.com/GREsau/schemars
 
+- schemars 1.2.1, MIT 
+  <br/>https://github.com/GREsau/schemars
+
 - scopeguard 1.2.0, Apache-2.0 OR MIT 
   <br/>https://github.com/bluss/scopeguard
+
+- scylla 1.6.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/scylladb/scylla-rust-driver
 
 - secrecy 0.10.3, Apache-2.0 OR MIT 
   <br/>https://github.com/iqlusioninc/crates/tree/main/secrecy
 
-- serde 1.0.219, Apache-2.0 OR MIT 
+- semver 1.0.28, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/semver
+
+- serde 1.0.228, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/serde
 
 - serde-value 0.7.0, MIT 
   <br/>https://github.com/arcnmx/serde-value
 
-- serde_json 1.0.143, Apache-2.0 OR MIT 
+- serde_json 1.0.150, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/json
 
-- serde_qs 0.8.5, Apache-2.0 OR MIT 
-  <br/>https://github.com/samscott89/serde_qs
-
-- serde_qs 1.0.0-rc.3, Apache-2.0 OR MIT 
-  <br/>https://github.com/samscott89/serde_qs
-
-- serde_yaml 0.9.34+deprecated, Apache-2.0 OR MIT 
-  <br/>https://github.com/dtolnay/serde-yaml
+- serde_path_to_error 0.1.20, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/path-to-error
 
 - sha2 0.10.9, Apache-2.0 OR MIT 
   <br/>https://github.com/RustCrypto/hashes
 
-- snafu 0.8.6, Apache-2.0 OR MIT 
+- sha2 0.11.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/hashes
+
+- shell-words 1.1.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/tmiasko/shell-words
+
+- shellexpand 3.1.2, Apache-2.0 OR MIT 
+  <br/>https://gitlab.com/ijackson/rust-shellexpand
+
+- simple_logger 5.2.0, MIT 
+  <br/>https://github.com/borntyping/rust-simple_logger
+
+- simsimd 6.5.16, Apache-2.0 
+  <br/>https://github.com/ashvardanian/SimSIMD
+
+- snafu 0.8.9, Apache-2.0 OR MIT 
   <br/>https://github.com/shepmaster/snafu
 
 - snmalloc-rs 0.3.8, MIT 
   <br/>https://github.com/SchrodingerZhu/snmalloc-rs
 
-- snowflake-api 0.9.0, Apache-2.0 
+- snowflake-api 0.14.0, Apache-2.0 
   <br/>https://github.com/mycelial/snowflake-rs
 
 - spark-connect-rs 0.0.1-beta.4, Apache-2.0 
   <br/>https://github.com/sjrusso8/spark-connect-rs
 
-- spiceai 2.0.0, Apache-2.0 
-  <br/>
-
-- sqlparser 0.55.0, Apache-2.0 
-  <br/>https://github.com/apache/datafusion-sqlparser-rs
-
-- sqlparser 0.58.0, Apache-2.0 
-  <br/>https://github.com/apache/datafusion-sqlparser-rs
-
 - ssh2 0.9.5, Apache-2.0 OR MIT 
   <br/>https://github.com/alexcrichton/ssh2-rs
 
-- strsim 0.10.0, MIT 
-  <br/>https://github.com/dguo/strsim-rs
+- static_assertions 1.1.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/nvzqz/static-assertions-rs
 
-- strsim 0.11.1, MIT 
-  <br/>https://github.com/rapidfuzz/strsim-rs
+- stringprep 0.1.5, Apache-2.0 OR MIT 
+  <br/>https://github.com/sfackler/rust-stringprep
 
-- suppaftp 5.4.0, Apache-2.0 
+- subtle 2.6.1, BSD-3-Clause 
+  <br/>https://github.com/dalek-cryptography/subtle
+
+- suppaftp 6.3.0, Apache-2.0 OR MIT 
   <br/>https://github.com/veeso/suppaftp
 
-- sysinfo 0.30.13, MIT 
+- syn 1.0.109, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/syn
+
+- syn 2.0.117, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/syn
+
+- syn 3.0.6, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/syn
+
+- sysinfo 0.36.1, MIT 
   <br/>https://github.com/GuillaumeGomez/sysinfo
 
-- sysinfo 0.35.2, MIT 
+- sysinfo 0.38.4, MIT 
   <br/>https://github.com/GuillaumeGomez/sysinfo
 
-- tantivy 0.24.2, MIT 
+- tantivy 0.26.1, MIT 
   <br/>https://github.com/quickwit-oss/tantivy
 
-- tempfile 3.21.0, Apache-2.0 OR MIT 
+- tar 0.4.46, Apache-2.0 OR MIT 
+  <br/>https://github.com/composefs/tar-rs
+
+- tempfile 3.27.0, Apache-2.0 OR MIT 
   <br/>https://github.com/Stebalien/tempfile
 
-- tera 1.20.0, MIT 
+- tera 1.20.1, MIT 
   <br/>https://github.com/Keats/tera
 
-- text-embeddings-backend 1.8.2,  
+- test-log 0.2.21, Apache-2.0 OR MIT 
+  <br/>https://github.com/d-e-s-o/test-log.git
+
+- text-embeddings-backend 1.9.3,  
   <br/>
 
-- text-embeddings-backend-candle 1.8.2,  
+- text-embeddings-backend-candle 1.9.3,  
   <br/>
 
-- text-embeddings-backend-core 1.8.2,  
+- text-embeddings-backend-core 1.9.3,  
   <br/>
 
-- text-embeddings-core 1.8.2,  
+- text-embeddings-core 1.9.3,  
   <br/>
 
 - text-splitter 0.18.1, MIT 
   <br/>https://github.com/benbrandt/text-splitter
+
+- thiserror 1.0.69, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/thiserror
+
+- thiserror 2.0.18, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/thiserror
 
 - tiberius 0.12.3, Apache-2.0 OR MIT 
   <br/>https://github.com/prisma/tiberius
@@ -695,79 +1089,124 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tiktoken-rs 0.6.0, MIT 
   <br/>https://github.com/zurawiki/tiktoken-rs
 
-- tikv-jemallocator 0.6.0, Apache-2.0 OR MIT 
+- tiktoken-rs 0.9.1, MIT 
+  <br/>https://github.com/zurawiki/tiktoken-rs
+
+- tikv-jemallocator 0.7.0, Apache-2.0 OR MIT 
   <br/>https://github.com/tikv/jemallocator
 
-- tokenizers 0.21.2, Apache-2.0 
+- time 0.3.47, Apache-2.0 OR MIT 
+  <br/>https://github.com/time-rs/time
+
+- tiny-skia-path 0.12.0, BSD-3-Clause 
+  <br/>https://github.com/linebender/tiny-skia/tree/master/path
+
+- tokenizers 0.21.4, Apache-2.0 
   <br/>https://github.com/huggingface/tokenizers
 
-- tokio 1.47.1, MIT 
+- tokenizers 0.22.2, Apache-2.0 
+  <br/>https://github.com/huggingface/tokenizers
+
+- tokio 1.52.3, MIT 
   <br/>https://github.com/tokio-rs/tokio
 
-- tokio-postgres 0.7.13, Apache-2.0 OR MIT 
-  <br/>https://github.com/sfackler/rust-postgres
+- tokio-postgres 0.7.18, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-postgres/rust-postgres
 
-- tokio-rusqlite 0.5.1, MIT 
+- tokio-rusqlite 0.7.0, MIT 
   <br/>https://github.com/programatik29/tokio-rusqlite
 
-- tokio-rustls 0.24.1, Apache-2.0 OR MIT 
+- tokio-rustls 0.26.4, Apache-2.0 OR MIT 
   <br/>https://github.com/rustls/tokio-rustls
 
-- tokio-rustls 0.26.2, Apache-2.0 OR MIT 
-  <br/>https://github.com/rustls/tokio-rustls
-
-- tokio-stream 0.1.17, MIT 
+- tokio-stream 0.1.18, MIT 
   <br/>https://github.com/tokio-rs/tokio
 
-- tokio-util 0.7.16, MIT 
+- tokio-util 0.7.18, MIT 
   <br/>https://github.com/tokio-rs/tokio
 
-- tonic 0.12.3, MIT 
+- tonic 0.14.6, MIT 
   <br/>https://github.com/hyperium/tonic
 
-- tonic-health 0.12.3, MIT 
+- tonic-health 0.14.6, MIT 
+  <br/>https://github.com/hyperium/tonic
+
+- tonic-prost 0.14.6, MIT 
+  <br/>https://github.com/hyperium/tonic
+
+- tonic-prost-build 0.14.6, MIT 
   <br/>https://github.com/hyperium/tonic
 
 - tower 0.4.13, MIT 
   <br/>https://github.com/tower-rs/tower
 
-- tower 0.5.2, MIT 
+- tower 0.5.3, MIT 
   <br/>https://github.com/tower-rs/tower
 
-- tower-http 0.6.6, MIT 
+- tower-http 0.6.11, MIT 
   <br/>https://github.com/tower-rs/tower-http
 
-- tracing 0.1.41, MIT 
+- tower-http 0.7.0, MIT 
+  <br/>https://github.com/tower-rs/tower-http
+
+- tpcdsgen 0.1.0-alpha.1, Apache-2.0 
+  <br/>https://github.com/clflushopt/tpchgen-rs
+
+- tpchgen 3.0.0, Apache-2.0 
+  <br/>https://github.com/clflushopt/tpchgen-rs
+
+- tracing 0.1.44, MIT 
   <br/>https://github.com/tokio-rs/tracing
 
 - tracing-futures 0.2.5, MIT 
   <br/>https://github.com/tokio-rs/tracing
 
-- tracing-opentelemetry 0.28.0, MIT 
-  <br/>https://github.com/tokio-rs/tracing-opentelemetry
-
-- tracing-subscriber 0.3.20, MIT 
+- tracing-log 0.2.0, MIT 
   <br/>https://github.com/tokio-rs/tracing
 
-- tract-core 0.22.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/snipsco/tract
+- tracing-opentelemetry 0.33.0, MIT 
+  <br/>https://github.com/tokio-rs/tracing-opentelemetry
 
-- tract-onnx 0.22.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/snipsco/tract
+- tracing-subscriber 0.3.23, MIT 
+  <br/>https://github.com/tokio-rs/tracing
 
-- trust-dns-resolver 0.23.2, Apache-2.0 OR MIT 
-  <br/>https://github.com/bluejekyll/trust-dns
+- tracing-test 0.2.6, MIT 
+  <br/>https://github.com/dbrgn/tracing-test
 
-- twox-hash 1.6.3, MIT 
-  <br/>https://github.com/shepmaster/twox-hash
+- ttf-parser 0.25.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/harfbuzz/ttf-parser
+
+- ttf-parser 0.25.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/harfbuzz/ttf-parser
+
+- turso 0.8.2, MIT 
+  <br/>https://github.com/tursodatabase/turso
 
 - twox-hash 2.1.2, MIT 
   <br/>https://github.com/shepmaster/twox-hash
 
-- url 2.5.4, Apache-2.0 OR MIT 
+- type1-encoding-parser 0.1.1, MIT 
+  <br/>https://github.com/jrmuizel/type1-encoding-parser
+
+- unicode-normalization 0.1.25, Apache-2.0 OR MIT 
+  <br/>https://github.com/unicode-rs/unicode-normalization
+
+- ureq 2.12.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/algesten/ureq
+
+- ureq 3.3.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/algesten/ureq
+
+- url 2.5.8, Apache-2.0 OR MIT 
   <br/>https://github.com/servo/rust-url
 
-- utoipa 5.4.0, Apache-2.0 OR MIT 
+- urlencoding 2.1.3, MIT 
+  <br/>https://github.com/kornelski/rust_urlencoding
+
+- utoipa 5.5.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/juhaku/utoipa
+
+- utoipa 6.0.0, Apache-2.0 OR MIT 
   <br/>https://github.com/juhaku/utoipa
 
 - utoipa-swagger-ui 9.0.2, Apache-2.0 OR MIT 
@@ -776,21 +1215,93 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - uuid 0.8.2, Apache-2.0 OR MIT 
   <br/>https://github.com/uuid-rs/uuid
 
-- uuid 1.18.0, Apache-2.0 OR MIT 
+- uuid 1.23.2, Apache-2.0 OR MIT 
   <br/>https://github.com/uuid-rs/uuid
+
+- vortex 0.1.0, Apache-2.0 
+  <br/>https://github.com/spiraldb/vortex
+
+- vortex-btrblocks 0.1.0, Apache-2.0 
+  <br/>https://github.com/spiraldb/vortex
+
+- vortex-io 0.1.0, Apache-2.0 
+  <br/>https://github.com/spiraldb/vortex
+
+- vortex-scan 0.1.0, Apache-2.0 
+  <br/>https://github.com/spiraldb/vortex
+
+- vortex-session 0.1.0, Apache-2.0 
+  <br/>https://github.com/spiraldb/vortex
+
+- vortex-utils 0.1.0, Apache-2.0 
+  <br/>https://github.com/spiraldb/vortex
+
+- vstd 0.0.0-2026-09-20-0158, MIT 
+  <br/>https://github.com/verus-lang/verus
+
+- walkdir 2.5.0, MIT OR Unlicense 
+  <br/>https://github.com/BurntSushi/walkdir
+
+- wasm-bindgen-test 0.3.72, Apache-2.0 OR MIT 
+  <br/>https://github.com/wasm-bindgen/wasm-bindgen
+
+- wasmtime 47.0.3, Apache-2.0 WITH LLVM-exception 
+  <br/>https://github.com/bytecodealliance/wasmtime
+
+- wat 1.251.0, Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT 
+  <br/>https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wat
+
+- webpki-roots 0.26.11, CDLA-Permissive-2.0 
+  <br/>https://github.com/rustls/webpki-roots
+
+- webpki-roots 1.0.7, CDLA-Permissive-2.0 
+  <br/>https://github.com/rustls/webpki-roots
+
+- weezl 0.1.12, Apache-2.0 OR MIT 
+  <br/>https://github.com/image-rs/weezl
+
+- weezl 0.2.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/image-rs/weezl
 
 - winver 1.0.0, MIT 
   <br/>https://github.com/rhysd/winver
 
-- x509-certificate 0.23.1, MPL-2.0 
+- wiremock 0.6.5, Apache-2.0 OR MIT 
+  <br/>https://github.com/LukeMathWalker/wiremock-rs
+
+- x509-certificate 0.25.0, MPL-2.0 
   <br/>https://github.com/indygreg/cryptography-rs.git
 
-- zip 0.6.6, MIT 
-  <br/>https://github.com/zip-rs/zip.git
+- x509-parser 0.15.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/rusticata/x509-parser.git
 
-- zip 1.1.4, MIT 
-  <br/>https://github.com/zip-rs/zip2.git
+- x509-parser 0.18.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/rusticata/x509-parser.git
+
+- xmlwriter 0.1.0, MIT 
+  <br/>https://github.com/RazrFalcon/xmlwriter
+
+- yaml-rust2 0.11.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/Ethiraric/yaml-rust2
+
+- zeroize 1.8.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/utils
 
 - zip 3.0.0, MIT 
   <br/>https://github.com/zip-rs/zip2.git
+
+- zip 4.6.1, MIT 
+  <br/>https://github.com/zip-rs/zip2.git
+
+- zip 6.0.0, MIT 
+  <br/>https://github.com/zip-rs/zip2.git
+
+- zip 7.2.0, MIT 
+  <br/>https://github.com/zip-rs/zip2.git
+
+- zip 8.6.0, MIT 
+  <br/>https://github.com/zip-rs/zip2
+
+- zstd 0.13.3, MIT 
+  <br/>https://github.com/gyscos/zstd-rs
 

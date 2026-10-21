@@ -106,6 +106,12 @@ impl Params {
     }
 }
 
+pub fn merge_params(target: &mut Params, source: Option<&Params>) {
+    if let Some(source) = source {
+        target.data.extend(source.data.clone());
+    }
+}
+
 impl Serialize for Params {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

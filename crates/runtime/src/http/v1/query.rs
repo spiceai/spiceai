@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use axum::{
     body::Bytes,
     http::StatusCode,
@@ -25,9 +27,10 @@ use http::header::CONTENT_TYPE;
 use serde::Deserialize;
 
 use crate::datafusion::{param_utils, request_context_extension::get_current_datafusion};
+use crate::http::server_timing::ServerTiming;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-use super::{ResponseMimeType, sql_to_http_response};
+use super::{ResponseMimeType, current_principal_requires_read_only, sql_to_http_response};
 
 /// SQL Query
 ///
@@ -64,7 +67,9 @@ use super::{ResponseMimeType, sql_to_http_response};
         )
     ),
     responses(
-        (status = 200, description = "SQL query executed successfully", content((
+        (status = 200, description = "SQL query executed successfully", headers(
+            ("Server-Timing" = String, description = "The time the server spent on the query, in milliseconds: `total;dur=<ms>` (W3C Server-Timing). Sent on every response whose body is complete before its head is sent — every format except the default streamed `application/json`, and every error. A streamed `application/json` body is not complete until it ends, so it sends the field as a trailer instead (declared by `Trailer: Server-Timing`) when the request allows trailers: HTTP/2, or `TE: trailers` on HTTP/1.1.")
+        ), content((
             Vec<serde_json::Value> = "application/json",
             example = json!([
                 {
@@ -180,6 +185,21 @@ pub(crate) async fn post(
     accept: Option<TypedHeader<Accept>>,
     body: Bytes,
 ) -> Response {
+    let mut response = respond(&headers, accept.as_ref(), &body).await;
+    // Every response this handler builds is complete before its head is sent —
+    // a query error, a rejected body, a buffered format — except the streamed
+    // JSON body, which marked itself for a trailer.
+    if response.extensions().get::<ServerTiming>().is_none() {
+        response.extensions_mut().insert(ServerTiming::Header);
+    }
+    response
+}
+
+async fn respond(
+    headers: &axum::http::HeaderMap,
+    accept: Option<&TypedHeader<Accept>>,
+    body: &Bytes,
+) -> Response {
     #[derive(Deserialize)]
     struct ParameterizedQuery {
         sql: String,
@@ -193,8 +213,8 @@ pub(crate) async fn post(
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
 
-    let (sql, parameters) = if let Some("application/json") = content_type {
-        match serde_json::from_slice::<ParameterizedQuery>(&body) {
+    let (sql, parameters) = if content_type == Some("application/json") {
+        match serde_json::from_slice::<ParameterizedQuery>(body) {
             Ok(ParameterizedQuery { sql, parameters }) => {
                 let parameters = match param_utils::convert_json_to_param_values(parameters) {
                     Ok(p) => p,
@@ -205,7 +225,8 @@ pub(crate) async fn post(
                     }
                 };
 
-                (sql, Some(parameters))
+                // Move the deserialized String into Arc<str> without a second copy.
+                (Arc::<str>::from(sql), Some(parameters))
             }
             Err(e) => {
                 tracing::debug!("Error parsing JSON: {e}");
@@ -213,8 +234,9 @@ pub(crate) async fn post(
             }
         }
     } else {
-        let sql = match String::from_utf8(body.to_vec()) {
-            Ok(query) => query,
+        // Decode once into Arc<str> so QueryBuilder does not re-copy the SQL body.
+        let sql = match std::str::from_utf8(body) {
+            Ok(query) => Arc::<str>::from(query),
             Err(e) => {
                 tracing::debug!("Error reading query: {e}");
                 return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
@@ -225,9 +247,10 @@ pub(crate) async fn post(
 
     sql_to_http_response(
         df,
-        &sql,
+        sql,
         parameters,
-        ResponseMimeType::from_accept_header(accept.as_ref()),
+        ResponseMimeType::from_accept_header(accept),
+        current_principal_requires_read_only().await,
     )
     .await
 }

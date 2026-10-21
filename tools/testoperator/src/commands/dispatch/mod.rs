@@ -14,28 +14,40 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::time::Duration;
+
 use test_framework::{
     TestType,
     anyhow::{self, Result},
     gh_utils::{GitHubWorkflow, map_numbers_to_strings},
-    octocrab,
+    octocrab::{self, Octocrab},
     utils::scan_directory_for_yamls,
 };
 
-use crate::args::dispatch::{DispatchArgs, DispatchTestFile, DispatchTests, WorkflowArgs};
+use crate::args::dispatch::{DispatchArgs, DispatchTestFile, WorkflowArgs};
 
-#[allow(clippy::too_many_lines)]
 pub async fn dispatch(args: DispatchArgs) -> Result<()> {
-    if !args.path.is_dir() && !args.path.is_file() {
+    let DispatchArgs {
+        path,
+        workflow,
+        workflow_commit,
+        github_token,
+        spiced_commit,
+        update_snapshots,
+        max_concurrent,
+        max_concurrent_wait_timeout_mins,
+        schedule,
+        ..
+    } = args;
+    if !path.is_dir() && !path.is_file() {
         return Err(anyhow::anyhow!("Path must be a directory or a file"));
     }
 
-    let octo_client = octocrab::instance().user_access_token(args.github_token)?;
-    let test_type: TestType = args.workflow.into();
-    let yaml_files = if args.path.is_dir() {
-        scan_directory_for_yamls(&args.path)?
+    let test_type: TestType = workflow.into();
+    let yaml_files = if path.is_dir() {
+        scan_directory_for_yamls(&path)?
     } else {
-        vec![args.path]
+        vec![path]
     };
 
     println!("Found {} YAML files to load", yaml_files.len());
@@ -44,135 +56,302 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         .iter()
         .map(|path| {
             let file = std::fs::File::open(path)?;
-            let tests: DispatchTestFile = serde_yaml::from_reader(file)?;
+            let tests: DispatchTestFile = yaml::from_reader(file)
+                .map_err(|e| anyhow::anyhow!("Failed to parse {}: {e}", path.display()))?;
 
             Ok::<_, anyhow::Error>((path, tests))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let total_tests = tests.len();
-    for (index, (path, test)) in tests.into_iter().enumerate() {
-        let mut payload = match (test_type, &test.tests) {
-            (
-                TestType::Benchmark,
-                DispatchTests {
-                    bench: Some(bench), ..
-                },
-            ) => {
-                serde_json::json!(WorkflowArgs {
-                    specific_args: bench
-                        .clone()
-                        .with_update_snapshots(args.update_snapshots.into())
-                        .with_validate(args.validate),
-                    spiced_commit: args.spiced_commit.clone(),
-                })
-            }
-            (
-                TestType::Throughput,
-                DispatchTests {
-                    throughput: Some(throughput),
-                    ..
-                },
-            ) => {
-                serde_json::json!(WorkflowArgs {
-                    specific_args: throughput.clone(),
-                    spiced_commit: args.spiced_commit.clone(),
-                })
-            }
-            (
-                TestType::Load,
-                DispatchTests {
-                    load: Some(load), ..
-                },
-            ) => {
-                serde_json::json!(WorkflowArgs {
-                    specific_args: load.clone(),
-                    spiced_commit: args.spiced_commit.clone(),
-                })
-            }
-            (
-                TestType::HttpConsistency,
-                DispatchTests {
-                    http_consistency: Some(consistency),
-                    ..
-                },
-            ) => {
-                serde_json::json!(WorkflowArgs {
-                    specific_args: consistency,
-                    spiced_commit: args.spiced_commit.clone(),
-                })
-            }
-            (
-                TestType::HttpOverhead,
-                DispatchTests {
-                    http_overhead: Some(overhead),
-                    ..
-                },
-            ) => {
-                serde_json::json!(WorkflowArgs {
-                    specific_args: overhead,
-                    spiced_commit: args.spiced_commit.clone(),
-                })
-            }
-            (TestType::Benchmark, _) => {
-                println!(
-                    "Test file {} does not contain a benchmark test",
-                    path.display()
-                );
-                continue;
-            }
-            (TestType::Throughput, _) => {
-                println!(
-                    "Test file {} does not contain a throughput test",
-                    path.display()
-                );
-                continue;
-            }
-            (TestType::Load, _) => {
-                println!("Test file {} does not contain a load test", path.display());
-                continue;
-            }
-            (TestType::HttpConsistency, _) => {
-                println!(
-                    "Test file {} does not contain an HTTP consistency test",
-                    path.display()
-                );
-                continue;
-            }
-            (TestType::HttpOverhead, _) => {
-                println!(
-                    "Test file {} does not contain an HTTP overhead test",
-                    path.display()
-                );
-                continue;
-            }
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "Test type {test_type} not supported for dispatching"
-                ));
-            }
-        };
+    // Collect all test instances for the selected test type
+    let mut tests_to_dispatch = Vec::new();
 
+    for (path, test_file) in tests {
+        if !test_file.is_on_schedule(schedule) {
+            println!(
+                "Skipping {}: it runs on the {} schedule",
+                path.display(),
+                test_file.schedule
+            );
+            continue;
+        }
+        match test_type {
+            TestType::Benchmark => {
+                for bench in &test_file.tests.bench {
+                    let runs = bench
+                        .expand_runs()
+                        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
+                    for run in runs {
+                        tests_to_dispatch.push((
+                            path,
+                            serde_json::json!(WorkflowArgs {
+                                specific_args: run.with_update_snapshots(update_snapshots.into()),
+                                spiced_commit: spiced_commit.clone(),
+                            }),
+                        ));
+                    }
+                }
+            }
+            TestType::Load => {
+                for load in &test_file.tests.load {
+                    load.bench_args
+                        .ensure_only_bench_settings_unset("load")
+                        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: load.clone(),
+                            spiced_commit: spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
+            TestType::Throughput => {
+                for throughput in &test_file.tests.throughput {
+                    throughput
+                        .ensure_only_bench_settings_unset("throughput")
+                        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: throughput.clone(),
+                            spiced_commit: spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
+            TestType::Append => {
+                for append in &test_file.tests.append {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: append.clone(),
+                            spiced_commit: spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
+            TestType::TextToSql => {
+                for text_to_sql in &test_file.tests.text_to_sql {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: text_to_sql.clone(),
+                            spiced_commit: spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
+            TestType::Streaming => {
+                for streaming in &test_file.tests.streaming_bench {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: streaming.clone(),
+                            spiced_commit: spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
+            TestType::StreamingCorrectness => {
+                for correctness in &test_file.tests.streaming_correctness {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: correctness.clone(),
+                            spiced_commit: spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
+            TestType::Schema => {
+                for schema in &test_file.tests.schema {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: schema.clone(),
+                            spiced_commit: spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
+            TestType::Htap => {
+                for htap in &test_file.tests.htap {
+                    let runs = htap
+                        .expand_runs()
+                        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
+                    for run in runs {
+                        tests_to_dispatch.push((
+                            path,
+                            serde_json::json!(WorkflowArgs {
+                                specific_args: run,
+                                spiced_commit: spiced_commit.clone(),
+                            }),
+                        ));
+                    }
+                }
+            }
+            TestType::Search => {
+                for search in &test_file.tests.search {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: search.clone(),
+                            spiced_commit: spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
+            TestType::DataConsistency => {
+                println!("Test type {test_type} not supported for dispatching");
+            }
+        }
+    }
+
+    if tests_to_dispatch.is_empty() {
+        println!("No tests found for test type {test_type}");
+        return Ok(());
+    }
+
+    let mut failed_dispatches = Vec::new();
+    let total_tests = tests_to_dispatch.len();
+    for (index, (path, mut payload)) in tests_to_dispatch.into_iter().enumerate() {
         payload = map_numbers_to_strings(payload);
 
         println!(
-            "{index}/{total_tests} - Dispatching {test_type} test from {}",
+            "{}/{total_tests} - Dispatching {test_type} test from {}",
+            index + 1,
             path.display(),
-            index = index + 1,
         );
-        GitHubWorkflow::new(
-            "spiceai",
-            "spiceai",
-            test_type.workflow(),
-            &args.workflow_commit,
-        )
-        .send(octo_client.actions(), Some(payload))
-        .await?;
 
-        // sleep to space out runs
-        println!("Waiting for next run...");
-        tokio::time::sleep(std::time::Duration::from_secs(80)).await;
+        // If github token is none, `--dry-run true` is forced by `clap`'s `required_if_eq` constraint.
+        let Some(gh_token) = github_token.as_deref() else {
+            let url = format!(
+                "https://api.github.com/repos/spiceai/spiceai/actions/workflows/{}/dispatches",
+                test_type.workflow()
+            );
+
+            let body = serde_json::json!({
+                "ref": &workflow_commit,
+                "inputs": payload
+            });
+
+            println!(
+                "curl -L \\
+  -X POST \\
+  -H \"Accept: application/vnd.github+json\" \\
+  -H \"Authorization: Bearer $GH_TOKEN\" \\
+  -H \"X-GitHub-Api-Version: 2022-11-28\" \\
+  {url} \\
+  -d '{body}'"
+            );
+            continue;
+        };
+
+        let octo_client = octocrab::instance().user_access_token(gh_token)?;
+        let workflow =
+            GitHubWorkflow::new("spiceai", "spiceai", test_type.workflow(), &workflow_commit);
+
+        let result = match max_concurrent {
+            Some(max_concurrent) => {
+                // Dispatch workflow while waiting for an available slot, limiting to max_concurrent parallel runs
+                dispatch_workflow_with_concurrency(
+                    workflow,
+                    &octo_client,
+                    Some(payload),
+                    max_concurrent,
+                    Duration::from_mins(max_concurrent_wait_timeout_mins),
+                )
+                .await
+            }
+            None => {
+                // Dispatch workflow without concurrency limit
+                workflow.run_workflow(&octo_client, Some(payload)).await
+            }
+        };
+        match result {
+            Err(e) => {
+                eprintln!("❌ Failed to dispatch {}. Error: {e:?}", path.display());
+                failed_dispatches.push((path.display().to_string(), e));
+            }
+            Ok(run_url) => {
+                // sleep to space out runs
+                println!("✅ {run_url} is running");
+                tokio::time::sleep(std::time::Duration::from_secs(80)).await;
+            }
+        }
     }
 
+    if !failed_dispatches.is_empty() {
+        eprintln!("\nFailed to dispatch {} tests:", failed_dispatches.len());
+        for (path, error) in &failed_dispatches {
+            eprintln!("  - {path}: {error}");
+        }
+        return Err(anyhow::anyhow!("Some workflow requests failed"));
+    }
+
+    Ok(())
+}
+
+/// Dispatches the workflow, waiting until the number of active runs is below the limit
+/// or until the 30 minutes max wait time expires.
+///
+/// - `max_concurrent`: maximum number of active runs allowed
+///
+/// Returns a URL to the Github workflow run.
+async fn dispatch_workflow_with_concurrency(
+    workflow: GitHubWorkflow,
+    octo: &Octocrab,
+    input: Option<serde_json::Value>,
+    max_concurrent: usize,
+    slot_wait_timeout: Duration,
+) -> Result<String> {
+    println!(
+        "Checking for available slot to run workflow (limit: {max_concurrent} concurrent runs, waiting up to {} min)...",
+        slot_wait_timeout.as_secs() / 60
+    );
+    if let Err(err) = wait_for_slot(&workflow, octo, max_concurrent, slot_wait_timeout).await {
+        eprintln!("Error waiting for slot: {err}");
+    }
+
+    workflow.run_workflow(octo, input).await
+}
+
+/// Waits until the number of already queued runs is below the given limit,
+/// or until the timeout expires.
+///
+/// This is used to limit the number of concurrent workflow runs on GitHub Actions.
+/// - `max_concurrent`: maximum number of active runs allowed
+async fn wait_for_slot(
+    workflow: &GitHubWorkflow,
+    octo: &Octocrab,
+    max_concurrent: usize,
+    timeout: Duration,
+) -> Result<()> {
+    let start_time = std::time::Instant::now();
+
+    loop {
+        let num_active = workflow.active_runs_count(octo).await?;
+        if num_active < max_concurrent {
+            println!("✅ Dispatch slot available! Currently {num_active} active runs.");
+            break;
+        }
+
+        // Check if we've exceeded the maximum wait time
+        if start_time.elapsed() >= timeout {
+            return Err(anyhow::anyhow!(
+                "Timeout: waited {} seconds for available slot but {num_active} runs still active",
+                timeout.as_secs()
+            ));
+        }
+
+        let remaining_time = timeout.saturating_sub(start_time.elapsed());
+        println!(
+            "🕒 {num_active} run(s) already active — waiting for slot... ({} seconds remaining)",
+            remaining_time.as_secs()
+        );
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
     Ok(())
 }

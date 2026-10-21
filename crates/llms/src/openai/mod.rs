@@ -25,8 +25,13 @@ use governor::Quota;
 use runtime_rate_control::{JitterConfig, RateController};
 
 pub mod chat;
+pub mod decisions;
 pub mod embed;
+pub mod list_models;
 pub mod responses;
+mod responses_adapter;
+
+pub use list_models::OpenAiModelLister;
 
 pub const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
 
@@ -35,6 +40,34 @@ pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 
 pub const DEFAULT_LLM_MODEL: &str = GPT_4O_MINI;
 pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatBackend {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
+impl ChatBackend {
+    /// The values accepted in a Spicepod. The parameter spec validates against this same
+    /// slice, so the documented vocabulary and the parsed one cannot drift.
+    pub const VALUES: &'static [&'static str] = &["enabled", "disabled"];
+}
+
+impl FromStr for ChatBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "disabled" => Ok(Self::ChatCompletions),
+            "enabled" => Ok(Self::Responses),
+            other => Err(format!(
+                "must be one of: {}. Found {other}",
+                Self::VALUES.join(", ")
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UsageTier {
@@ -98,6 +131,7 @@ pub struct Openai<C: Config + Clone> {
     model: String,
 
     rate_controller: Arc<RateController>,
+    chat_backend: ChatBackend,
 }
 
 pub(crate) fn default_rate_controller() -> Arc<RateController> {
@@ -121,6 +155,27 @@ pub fn new_azure_client(
     entra_token: Option<&str>,
     api_key: Option<&str>,
 ) -> Openai<AzureConfig> {
+    new_azure_client_with_chat_backend(
+        model,
+        api_base,
+        api_version,
+        deployment_name,
+        entra_token,
+        api_key,
+        ChatBackend::ChatCompletions,
+    )
+}
+
+#[must_use]
+pub fn new_azure_client_with_chat_backend(
+    model: String,
+    api_base: Option<&str>,
+    api_version: Option<&str>,
+    deployment_name: Option<&str>,
+    entra_token: Option<&str>,
+    api_key: Option<&str>,
+    chat_backend: ChatBackend,
+) -> Openai<AzureConfig> {
     let mut cfg = AzureConfig::new().with_deployment_id(deployment_name.unwrap_or(model.as_str()));
 
     if let Some(api_base) = api_base {
@@ -140,9 +195,10 @@ pub fn new_azure_client(
     }
 
     Openai {
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: default_rate_controller(),
+        chat_backend,
     }
 }
 
@@ -154,6 +210,27 @@ pub fn new_openai_client(
     org_id: Option<&str>,
     project_id: Option<&str>,
     usage_tier: Option<UsageTier>,
+) -> Openai<OpenAIConfig> {
+    new_openai_client_with_chat_backend(
+        model,
+        api_base,
+        api_key,
+        org_id,
+        project_id,
+        usage_tier,
+        ChatBackend::ChatCompletions,
+    )
+}
+
+#[must_use]
+pub fn new_openai_client_with_chat_backend(
+    model: String,
+    api_base: Option<&str>,
+    api_key: Option<&str>,
+    org_id: Option<&str>,
+    project_id: Option<&str>,
+    usage_tier: Option<UsageTier>,
+    chat_backend: ChatBackend,
 ) -> Openai<OpenAIConfig> {
     // Default to empty API key to avoid picking up ENV variable in downstream library.
     let mut cfg = OpenAIConfig::new().with_api_key("");
@@ -174,9 +251,10 @@ pub fn new_openai_client(
     }
 
     Openai {
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: usage_tier.map_or_else(default_rate_controller, Into::into),
+        chat_backend,
     }
 }
 
@@ -186,9 +264,10 @@ pub fn new_openai_client_with_config<C: async_openai::config::Config + Clone>(
     cfg: C,
 ) -> Openai<C> {
     Openai {
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: default_rate_controller(),
+        chat_backend: ChatBackend::ChatCompletions,
     }
 }
 
@@ -214,5 +293,281 @@ impl<C: Config + Clone> Openai<C> {
             && (self.model.starts_with("gpt-5")
                 || self.model.starts_with("o3")
                 || self.model.starts_with("o4"))
+    }
+}
+
+#[cfg(test)]
+mod chat_backend_tests {
+    use super::ChatBackend;
+
+    #[test]
+    fn parses_the_documented_values_case_insensitively() {
+        for (raw, expected) in [
+            ("disabled", ChatBackend::ChatCompletions),
+            ("Disabled", ChatBackend::ChatCompletions),
+            ("  disabled ", ChatBackend::ChatCompletions),
+            ("enabled", ChatBackend::Responses),
+            ("ENABLED", ChatBackend::Responses),
+        ] {
+            assert_eq!(
+                raw.parse::<ChatBackend>()
+                    .unwrap_or_else(|e| panic!("{raw:?} should parse: {e}")),
+                expected,
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_values_outside_the_spec() {
+        for (raw, expected) in [
+            // Unlike the other model params, a blank value is not read as unset.
+            ("", "must be one of: enabled, disabled. Found "),
+            ("legacy", "must be one of: enabled, disabled. Found legacy"),
+            ("true", "must be one of: enabled, disabled. Found true"),
+            ("false", "must be one of: enabled, disabled. Found false"),
+        ] {
+            assert_eq!(
+                raw.parse::<ChatBackend>(),
+                Err(expected.to_string()),
+                "{raw:?} should be rejected"
+            );
+        }
+    }
+
+    /// The parameter spec advertises `VALUES`, so every entry has to parse — otherwise
+    /// config validation accepts a value the parser then rejects.
+    #[test]
+    fn every_advertised_value_parses() {
+        for value in ChatBackend::VALUES {
+            value
+                .parse::<ChatBackend>()
+                .unwrap_or_else(|e| panic!("{value:?} is advertised but does not parse: {e}"));
+        }
+    }
+}
+
+/// Guards the `async-openai` fork patch that only sends `Authorization` when there
+/// is a key to send.
+///
+/// Upstream inserts the header unconditionally. Spice builds every `OpenAI` client
+/// through [`new_openai_client_with_chat_backend`], which starts from
+/// `with_api_key("")` on purpose — so the downstream library cannot pick a key up
+/// from the environment — and overrides it only when a key was configured. Without
+/// the patch, a dataset or model with no `api_key` therefore sends
+/// `Authorization: Bearer ` with an empty value to every request, and an
+/// OpenAI-compatible endpoint that needs no key rejects the malformed credential
+/// instead of serving the request.
+///
+/// Both halves are asserted, because the first alone would pass on a client that
+/// had stopped sending the header at all: with no key there must be no
+/// `Authorization` header, and with a key it must carry it as a bearer token.
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "a failed set-up in a test should name itself and stop"
+)]
+pub(crate) mod authorization_header_tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::{ChatBackend, new_openai_client_with_chat_backend};
+    use crate::chat::Chat as _;
+
+    /// Stand a one-shot HTTP server up and hand back its base URL together with a
+    /// channel carrying the request headers it receives.
+    pub(crate) fn capture_one_request() -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let port = listener
+            .local_addr()
+            .expect("read the bound address")
+            .port();
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // Read to the end of the headers, which is all that is under assertion.
+            let mut seen = Vec::new();
+            let mut byte = [0_u8; 1];
+            while stream.read(&mut byte).unwrap_or(0) == 1 {
+                seen.push(byte[0]);
+                if seen.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&seen).into_owned());
+
+            // Any answer will do: the request that arrived is the observation, not
+            // what the client makes of the reply.
+            let body = "{}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        (format!("http://127.0.0.1:{port}/v1"), rx)
+    }
+
+    /// Drive a health check through a client built the way the runtime builds one,
+    /// and return the request headers the endpoint saw.
+    async fn request_headers_for(api_key: Option<&str>) -> String {
+        let (api_base, rx) = capture_one_request();
+        let client = new_openai_client_with_chat_backend(
+            "gpt-4o-mini".to_string(),
+            Some(&api_base),
+            api_key,
+            None,
+            None,
+            None,
+            ChatBackend::ChatCompletions,
+        );
+        // The reply is not a chat completion, so this fails; the request it sent
+        // first is what the assertions read.
+        let _ = tokio::time::timeout(Duration::from_secs(20), client.health()).await;
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("the endpoint received a request")
+    }
+
+    #[tokio::test]
+    async fn a_client_with_no_api_key_sends_no_authorization_header() {
+        let headers = request_headers_for(None).await;
+        assert!(
+            !headers.to_ascii_lowercase().contains("authorization:"),
+            "a model configured with no api_key sent an Authorization header, which carries an \
+             empty bearer token and is refused by an endpoint that needs no key:\n{headers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_with_an_api_key_sends_it_as_a_bearer_token() {
+        let headers = request_headers_for(Some("sk-guard-token")).await;
+        assert!(
+            headers.contains("Bearer sk-guard-token"),
+            "the control: a configured api_key has to reach the endpoint as a bearer token, \
+             otherwise the assertion above passes on a client that sends no credential at \
+             all:\n{headers}"
+        );
+    }
+}
+
+/// Guards the `async-openai` fork patch that models `tool_choice` `allowed_tools` as
+/// the single `{mode, tools}` object the Chat Completions API defines.
+///
+/// Upstream models it as a list. A request in `OpenAI`'s shape then fails to
+/// deserialize, so `/v1/chat/completions` refuses it with a 422, and the list shape it
+/// does accept reaches `OpenAI` as a list, which `OpenAI` refuses with a 400. The
+/// request is read in `OpenAI`'s shape and sent through a client built the way the
+/// runtime builds one, and the body the endpoint receives must carry the same object.
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "a failed set-up in a test should name itself and stop"
+)]
+mod allowed_tools_wire_tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use async_openai::types::chat::CreateChatCompletionRequest;
+
+    use super::{ChatBackend, new_openai_client_with_chat_backend};
+    use crate::chat::Chat as _;
+
+    /// Stand a one-shot HTTP server up and hand back its base URL together with a
+    /// channel carrying the body of the request it receives.
+    fn capture_one_request_body() -> (String, mpsc::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let port = listener
+            .local_addr()
+            .expect("read the bound address")
+            .port();
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let content_length = String::from_utf8_lossy(&head)
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            let mut body = vec![0_u8; content_length];
+            let _ = stream.read_exact(&mut body);
+            let _ = tx.send(body);
+
+            // Any answer will do: the request that arrived is the observation.
+            let reply = "{}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        (format!("http://127.0.0.1:{port}/v1"), rx)
+    }
+
+    #[tokio::test]
+    async fn an_allowed_tools_choice_reaches_the_provider_as_one_object() {
+        let tool_choice = serde_json::json!({
+            "type": "allowed_tools",
+            "allowed_tools": {
+                "mode": "required",
+                "tools": [{ "type": "function", "function": { "name": "get_weather" } }]
+            }
+        });
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "What is the weather in Paris?" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "get_weather", "parameters": { "type": "object" } }
+            }],
+            "tool_choice": tool_choice
+        }))
+        .expect("a request in OpenAI's allowed_tools shape deserializes");
+
+        let (api_base, rx) = capture_one_request_body();
+        let client = new_openai_client_with_chat_backend(
+            "gpt-4o-mini".to_string(),
+            Some(&api_base),
+            Some("sk-test"),
+            None,
+            None,
+            None,
+            ChatBackend::ChatCompletions,
+        );
+        // The reply is not a chat completion, so this fails; the request it sent
+        // first is what the assertion reads.
+        let _ = tokio::time::timeout(Duration::from_secs(20), client.chat_request(request)).await;
+        let body = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the endpoint received a request");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&body).expect("the request body is JSON");
+
+        assert_eq!(sent["tool_choice"], tool_choice, "{sent}");
     }
 }

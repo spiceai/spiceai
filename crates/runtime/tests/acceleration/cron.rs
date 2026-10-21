@@ -19,8 +19,9 @@ use app::AppBuilder;
 
 use arrow::array::RecordBatch;
 use futures::TryStreamExt;
+use podswatcher::PodsWatcher;
 use runtime::Runtime;
-use runtime::{auth::EndpointAuth, config::Config, podswatcher::PodsWatcher};
+use runtime::{auth::EndpointAuth, config::Config};
 use spicepod::acceleration::Acceleration;
 use spicepod::component::dataset::Dataset;
 use std::io::Write;
@@ -44,7 +45,7 @@ fn get_dataset(from: &str, name: &str, cron: &str) -> Dataset {
 
 const NAMES_CSV: &str = include_str!("data/names.csv");
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn snapshot_names_from_runtime(name: &str, rt: &Arc<Runtime>, dataset_name: Option<&str>) {
     let result: Vec<RecordBatch> = rt
         .datafusion()
@@ -71,7 +72,6 @@ async fn snapshot_names_from_runtime(name: &str, rt: &Arc<Runtime>, dataset_name
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -91,7 +91,7 @@ async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -123,7 +123,7 @@ async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
                 .expect("Expected a schedule to be present");
             assert_eq!(
                 schedule.name(),
-                "names".into(),
+                Arc::<str>::from("names"),
                 "Expected schedule name to match dataset name"
             );
 
@@ -154,7 +154,6 @@ async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -184,7 +183,7 @@ async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
             tokio::time::sleep(time_till_second(10, Some(2))).await;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -301,7 +300,6 @@ datasets:
       refresh_cron: \"* * * * * *\" # every minute
 ";
 
-#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cron_reload() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
@@ -339,7 +337,7 @@ async fn test_cron_reload() -> Result<(), anyhow::Error> {
             // Set a timeout for the test
             let cloned_rt = Arc::clone(&rt);
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -383,7 +381,7 @@ async fn test_cron_reload() -> Result<(), anyhow::Error> {
                 .expect("Expected a schedule to be present");
             assert_eq!(
                 schedule.name(),
-                "decimal".into(),
+                Arc::<str>::from("decimal"),
                 "Expected schedule name to match dataset name"
             );
 
@@ -417,7 +415,7 @@ async fn test_cron_reload() -> Result<(), anyhow::Error> {
                 .expect("Expected a schedule to be present");
             assert_eq!(
                 schedule.name(),
-                "decimal".into(),
+                Arc::<str>::from("decimal"),
                 "Expected schedule name to match dataset name"
             );
 
@@ -436,7 +434,6 @@ async fn test_cron_reload() -> Result<(), anyhow::Error> {
 const NAMES_TIMESTAMPED_CSV: &str = include_str!("data/names_timestamped.csv");
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -455,7 +452,7 @@ async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -487,7 +484,7 @@ async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
                 .expect("Expected a schedule to be present");
             assert_eq!(
                 schedule.name(),
-                "names".into(),
+                Arc::<str>::from("names"),
                 "Expected schedule name to match dataset name"
             );
 
@@ -536,7 +533,6 @@ async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_cron_view() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -554,7 +550,7 @@ async fn test_cron_view() -> Result<(), anyhow::Error> {
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -586,7 +582,7 @@ async fn test_cron_view() -> Result<(), anyhow::Error> {
                 .expect("Expected a schedule to be present");
             assert_eq!(
                 schedule.name(),
-                "names_view".into(),
+                Arc::<str>::from("names_view"),
                 "Expected schedule name to match dataset name"
             );
 

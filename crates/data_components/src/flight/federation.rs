@@ -1,3 +1,4 @@
+use crate::function_support::contains_unsupported_functions;
 use async_trait::async_trait;
 use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
@@ -5,9 +6,11 @@ use std::sync::Arc;
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
+    common::TableReference,
     error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::LogicalPlan,
     physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter},
-    sql::{TableReference, unparser::dialect::Dialect},
+    sql::unparser::dialect::Dialect,
 };
 
 use super::{FlightTable, query_to_stream};
@@ -16,7 +19,7 @@ impl FlightTable {
     fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
         let table_name = self.table_reference.clone();
         tracing::trace!(
-            %self.table_reference,
+            ?self.table_reference,
             "create_federated_table_source"
         );
         let schema = Arc::clone(&self.schema);
@@ -48,14 +51,28 @@ impl SQLExecutor for FlightTable {
         Arc::clone(&self.dialect)
     }
 
+    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+        // Don't federate plans referencing a deny-listed Spice-only function
+        // (e.g. json_get_str); the Flight server has no such function, so
+        // evaluate those locally instead. See issue #10703.
+        self.function_support.as_ref().is_none_or(|func_supp| {
+            !contains_unsupported_functions(plan, func_supp).unwrap_or(false)
+        })
+    }
+
     fn execute(
         &self,
         query: &str,
         schema: SchemaRef,
+        _filters: &[Arc<dyn datafusion::physical_plan::PhysicalExpr>],
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            query_to_stream(self.client.clone(), query.to_string()),
+            query_to_stream(
+                self.client.clone(),
+                query.to_string(),
+                self.table_reference.to_quoted_string(),
+            ),
         )))
     }
 

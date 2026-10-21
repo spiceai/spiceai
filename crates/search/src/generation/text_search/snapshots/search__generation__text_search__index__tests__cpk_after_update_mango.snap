@@ -1,0 +1,9 @@
+---
+source: crates/search/src/generation/text_search/index.rs
+expression: "search_and_format(&search_index, \"mango\").await"
+---
++--------------------+------------------------+------------------------+-----+-----+
+| _score             | _value                 | content                | id1 | id2 |
++--------------------+------------------------+------------------------+-----+-----+
+| 0.9808291792869568 | mango nectarine orange | mango nectarine orange | a   | 1   |
++--------------------+------------------------+------------------------+-----+-----+

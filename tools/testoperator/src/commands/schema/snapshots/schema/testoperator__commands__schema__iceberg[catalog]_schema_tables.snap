@@ -1,0 +1,31 @@
+---
+source: tools/testoperator/src/commands/schema/mod.rs
+description: "Schema tables for iceberg[catalog]"
+---
++---------------+--------------------+--------------+------------+
+| table_catalog | table_schema       | table_name   | table_type |
++---------------+--------------------+--------------+------------+
+| ice           | information_schema | columns      | VIEW       |
+| ice           | information_schema | df_settings  | VIEW       |
+| ice           | information_schema | parameters   | VIEW       |
+| ice           | information_schema | routines     | VIEW       |
+| ice           | information_schema | schemata     | VIEW       |
+| ice           | information_schema | tables       | VIEW       |
+| ice           | information_schema | views        | VIEW       |
+| ice           | tpch_sf1           | customer     | BASE TABLE |
+| ice           | tpch_sf1           | lineitem     | BASE TABLE |
+| ice           | tpch_sf1           | nation       | BASE TABLE |
+| ice           | tpch_sf1           | orders       | BASE TABLE |
+| ice           | tpch_sf1           | part         | BASE TABLE |
+| ice           | tpch_sf1           | partsupp     | BASE TABLE |
+| ice           | tpch_sf1           | region       | BASE TABLE |
+| ice           | tpch_sf1           | supplier     | BASE TABLE |
+| spice         | information_schema | columns      | VIEW       |
+| spice         | information_schema | df_settings  | VIEW       |
+| spice         | information_schema | parameters   | VIEW       |
+| spice         | information_schema | routines     | VIEW       |
+| spice         | information_schema | schemata     | VIEW       |
+| spice         | information_schema | tables       | VIEW       |
+| spice         | information_schema | views        | VIEW       |
+| spice         | runtime            | task_history | BASE TABLE |
++---------------+--------------------+--------------+------------+

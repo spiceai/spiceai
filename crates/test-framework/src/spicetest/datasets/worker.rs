@@ -15,42 +15,124 @@ limitations under the License.
 */
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     panic,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Result;
+use arrow::array::RecordBatch;
 use dashmap::DashMap;
-use futures::TryStreamExt;
 use indicatif::ProgressBar;
-use spiceai::{Client as SpiceClient, SpiceClientError};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::execution::QueryExecutor;
+use crate::spicetest::pacer::QueryPacer;
+use crate::telemetry::streaming::QueryMetricEvent;
 
 use crate::{
     metrics::QueryStatus,
-    queries::{
-        Query,
-        validation::{self, QueryValidationResult},
-    },
-    snapshot::record_explain_plan,
+    queries::{Query, validation, validation::QueryValidationResult},
+    snapshot::{ResultsSnapshotPredicate, SnapshotMode, record_explain_plan, round_float_columns},
 };
 
 use super::EndCondition;
+
+/// Hard cap on keyed-reference rows fetched from the top of the result
+/// (`OFFSET` plus the window past it) when an `ORDER BY … LIMIT` answer differs
+/// from the reference's. The matcher indexes from the top, so skipped `OFFSET`
+/// rows count; this is not a bound on rows past the `OFFSET` alone.
+const MAX_KEYED_REFERENCE_ROWS: usize = 1 << 20;
+
+/// First keyed-reference fetch past the `OFFSET` for a `LIMIT` of `limit`. Twice
+/// the limit is enough when the cutoff group is no larger than the result itself;
+/// the cap still bounds a custom query whose `LIMIT` is already past that.
+/// `LIMIT 0` keeps no rows, so the window is 0: a floor of 1 would still request
+/// a row, and `OFFSET` plus that window would request the skipped rows too.
+fn keyed_reference_fetch_rows(limit: usize) -> usize {
+    limit.saturating_mul(2).min(MAX_KEYED_REFERENCE_ROWS)
+}
+
+/// Next fetch after `current` did not cover the tie group at the `LIMIT`.
+/// `None` once the cap has already been requested.
+fn next_keyed_reference_fetch_rows(current: usize) -> Option<usize> {
+    if current >= MAX_KEYED_REFERENCE_ROWS {
+        None
+    } else {
+        Some(current.saturating_mul(2).min(MAX_KEYED_REFERENCE_ROWS))
+    }
+}
+
+/// Whether the keyed-reference loop should issue a larger window. False once
+/// the cutoff group is closed (further batches would only add rows the matcher
+/// does not read), or once this window already asked for the cap.
+fn keyed_reference_should_request_another_window(
+    cutoff_closed: bool,
+    requested_rows: usize,
+    current_window: usize,
+) -> bool {
+    !cutoff_closed
+        && requested_rows < MAX_KEYED_REFERENCE_ROWS
+        && next_keyed_reference_fetch_rows(current_window).is_some()
+}
+
+/// Rows the keyed query asks for: `offset` plus the window past it, never more
+/// than [`MAX_KEYED_REFERENCE_ROWS`]. The matcher indexes from the top of the
+/// result, so the rows an `OFFSET` skips have to be in the stream; a query that
+/// kept its `OFFSET` would hide the tie group that cutoff cuts through. Adding
+/// the offset after clamping the window would still request `OFFSET + N` and
+/// defeat the cap (`OFFSET 2_000_000` plus a 20-row window is `2_000_020`).
+fn keyed_reference_requested_rows(offset: usize, fetch_past_offset: usize) -> usize {
+    offset
+        .saturating_add(fetch_past_offset)
+        .min(MAX_KEYED_REFERENCE_ROWS)
+}
+
+/// Rows to tell [`validation::decide_from_keyed_reference_batches`] the keyed
+/// query asked for. Uses [`keyed_reference_requested_rows`], then at least
+/// `fetched_rows` so a collected stream that already ended is treated as ended,
+/// but never above [`MAX_KEYED_REFERENCE_ROWS`].
+#[cfg(test)]
+fn keyed_reference_compare_requested_rows(
+    offset: usize,
+    fetch_past_offset: usize,
+    fetched_rows: usize,
+) -> usize {
+    keyed_reference_requested_rows(offset, fetch_past_offset)
+        .max(fetched_rows)
+        .min(MAX_KEYED_REFERENCE_ROWS)
+}
 
 pub(crate) struct SpiceTestQueryWorker {
     id: usize,
     query_set: Vec<Query>,
     end_condition: EndCondition,
     explain_plan_snapshot: bool,
-    results_snapshot_predicate: Option<fn(&str) -> bool>,
+    results_snapshot_predicate: Option<ResultsSnapshotPredicate>,
     name: String,
     pub progress_bar: Option<ProgressBar>,
     validate: bool,
     scale_factor: f64,
-    spice_client: Arc<SpiceClient>,
-    http_client: Option<reqwest::Client>,
+    executor: Box<dyn QueryExecutor>,
+    /// Optional custom validation data for scenario queries
+    validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
+    /// Optional reference schema for validating against known good tables
+    reference_schema: Option<String>,
+    /// Queries to skip row count validation for (e.g., queries that legitimately return 0 rows)
+    skip_row_count_validation: HashSet<String>,
+    /// Whether to validate that queries return at least one row (default: true)
+    validate_row_count: bool,
+    shutdown_token: CancellationToken,
+    /// Optional sender for streaming query metrics to OTLP
+    streaming_metrics_sender: Option<mpsc::Sender<QueryMetricEvent>>,
+    /// Duration threshold - queries exceeding this are marked as failed in streaming metrics
+    query_duration_threshold: Option<Duration>,
+    /// Fleet-wide issue-rate limiter. `None` runs closed-loop, where the offered
+    /// rate is whatever the server's latency allows.
+    pacer: Option<Arc<QueryPacer>>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -94,27 +176,29 @@ impl SpiceTestQueryWorker {
         id: usize,
         query_set: Vec<Query>,
         end_condition: EndCondition,
-        spice_client: SpiceClient,
         name: String,
+        executor: Box<dyn QueryExecutor>,
     ) -> Self {
         Self {
             id,
             query_set,
             end_condition,
-            spice_client: Arc::new(spice_client),
+            executor,
             explain_plan_snapshot: false,
             results_snapshot_predicate: None,
             name,
             progress_bar: None,
             validate: false,
             scale_factor: 1.0,
-            http_client: None,
+            validation_data: None,
+            reference_schema: None,
+            skip_row_count_validation: default_row_count_validation_skip_queries(),
+            validate_row_count: true,
+            shutdown_token: CancellationToken::new(),
+            streaming_metrics_sender: None,
+            query_duration_threshold: None,
+            pacer: None,
         }
-    }
-
-    pub fn with_http_client(mut self, http_client: reqwest::Client) -> Self {
-        self.http_client = Some(http_client);
-        self
     }
 
     pub fn with_scale_factor(mut self, scale_factor: f64) -> Self {
@@ -122,8 +206,29 @@ impl SpiceTestQueryWorker {
         self
     }
 
+    pub fn with_shutdown_token(mut self, shutdown_token: CancellationToken) -> Self {
+        self.shutdown_token = shutdown_token;
+        self
+    }
+
     pub fn with_validate(mut self, validate: bool) -> Self {
         self.validate = validate;
+        self
+    }
+
+    pub fn with_streaming_metrics(mut self, sender: mpsc::Sender<QueryMetricEvent>) -> Self {
+        self.streaming_metrics_sender = Some(sender);
+        self
+    }
+
+    pub fn with_query_duration_threshold(mut self, threshold: Duration) -> Self {
+        self.query_duration_threshold = Some(threshold);
+        self
+    }
+
+    #[must_use]
+    pub fn with_pacer(mut self, pacer: Option<Arc<QueryPacer>>) -> Self {
+        self.pacer = pacer;
         self
     }
 
@@ -134,7 +239,7 @@ impl SpiceTestQueryWorker {
 
     pub fn with_results_snapshot(
         mut self,
-        results_snapshot_predicate: Option<fn(&str) -> bool>,
+        results_snapshot_predicate: Option<ResultsSnapshotPredicate>,
     ) -> Self {
         self.results_snapshot_predicate = results_snapshot_predicate;
         self
@@ -145,9 +250,85 @@ impl SpiceTestQueryWorker {
         self
     }
 
-    #[allow(clippy::too_many_lines)]
+    pub fn with_validation_data(
+        mut self,
+        validation_data: HashMap<Arc<str>, Vec<RecordBatch>>,
+    ) -> Self {
+        self.validation_data = Some(validation_data);
+        self
+    }
+
+    pub fn with_reference_schema(mut self, reference_schema: Option<String>) -> Self {
+        self.reference_schema = reference_schema;
+        self
+    }
+
+    pub fn with_skip_row_count_validation(
+        mut self,
+        queries: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.skip_row_count_validation = queries.into_iter().collect();
+        self
+    }
+
+    pub fn with_validate_row_count(mut self, enabled: bool) -> Self {
+        self.validate_row_count = enabled;
+        self
+    }
+
+    /// Send a query metric event to the streaming exporter if configured.
+    /// If a duration threshold is set and the query exceeds it, it will be marked as a timeout failure.
+    fn send_streaming_metric(&self, query_name: &str, duration: Duration, success: bool) {
+        let Some(sender) = &self.streaming_metrics_sender else {
+            return;
+        };
+
+        // Check if duration exceeds threshold - if so, mark as timeout failure
+        let exceeded_threshold =
+            success && self.query_duration_threshold.is_some_and(|t| duration > t);
+
+        let event = if exceeded_threshold {
+            QueryMetricEvent::with_failure(query_name.to_string(), duration, self.id, "timeout")
+        } else if success {
+            QueryMetricEvent::new(query_name.to_string(), duration, true, self.id)
+        } else {
+            QueryMetricEvent::with_failure(query_name.to_string(), duration, self.id, "error")
+        };
+
+        // Non-blocking send - if channel is full, we drop the metric
+        let _ = sender.try_send(event);
+    }
+
+    /// Validate query results against expected data
+    /// Uses TPCH validation for TPCH queries, custom validation data for scenario queries
+    fn validate_query_results(
+        &self,
+        query: &Query,
+        actual_batches: &[RecordBatch],
+    ) -> Result<QueryValidationResult> {
+        // Check if we have custom validation data for this query
+        if let Some(validation_data) = &self.validation_data
+            && let Some(expected_batches) = validation_data.get(&query.name)
+        {
+            return validation::validate_with_expected_batches(
+                &query.name,
+                actual_batches,
+                expected_batches,
+            );
+        }
+
+        // Fall back to TPCH validation (which handles TPCH, parameterized TPCH, etc.)
+        validation::validate_tpch_query_at_scale(query, actual_batches, self.scale_factor)
+    }
+
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
+            // Load test queries may be generated with multiple parameter sets, resulting in a large
+            // set of queries. To respect duration limits, we group queries by name and run one
+            // group at a time, cycling through each group's parameter variations.
+            // If queries are unique, it will result in a single query set and will be the same as usual
+            let query_sets = build_unique_query_sets(&self.query_set)?;
+
             let query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>> = Arc::new(DashMap::new());
 
             // Keeps track of the start and end time of each query iteration
@@ -160,9 +341,11 @@ impl SpiceTestQueryWorker {
             let start = Instant::now();
 
             match self.end_condition {
-                EndCondition::Duration(_) => {
-                    // For Duration-based end condition, keep running queries in sequence
-                    while !self.end_condition.is_met(&start, query_set_count) {
+                EndCondition::Duration(_) | EndCondition::Unlimited => {
+                    // For Duration-based or Unlimited end condition, keep running queries in sequence
+                    while !self.shutdown_token.is_cancelled()
+                        && !self.end_condition.is_met(&start, query_set_count)
+                    {
                         if self.progress_bar.is_none() && self.id == 0 {
                             println!(
                                 "Worker {} - Query set count: {} - Elapsed time: {:?}",
@@ -172,11 +355,19 @@ impl SpiceTestQueryWorker {
                             );
                         }
 
+                        // Select the query set to use for this iteration
+                        let queries_to_run = {
+                            let set_index = query_set_count % query_sets.len();
+                            &query_sets[set_index]
+                        };
+
                         if !self
                             .run_query_set(
                                 Arc::clone(&query_durations),
                                 &mut query_statuses,
                                 &mut row_counts,
+                                queries_to_run,
+                                &start,
                             )
                             .await?
                         {
@@ -195,6 +386,9 @@ impl SpiceTestQueryWorker {
                     // For QuerySetCompleted, run each query target_count times before moving to next
                     let start = SystemTime::now();
                     for query in &self.query_set {
+                        if self.shutdown_token.is_cancelled() {
+                            break;
+                        }
                         if self.validate && query.name.contains("simple") {
                             continue; // skip validation for simple TPCH queries, because they are not part of the spec
                         }
@@ -203,39 +397,25 @@ impl SpiceTestQueryWorker {
                         let query_start = SystemTime::now();
                         let mut query_status = QueryStatus::Passed;
 
-                        let snapshot_results = self
-                            .results_snapshot_predicate
-                            .is_some_and(|predicate| predicate(&query.name))
-                            && self.id == 0; // only one worker should snapshot results
+                        // Only one worker should snapshot results.
+                        let snapshot_mode = if self.id == 0 {
+                            self.results_snapshot_predicate
+                                .map_or(SnapshotMode::Skip, |predicate| {
+                                    predicate(&self.name, &query.name)
+                                })
+                        } else {
+                            SnapshotMode::Skip
+                        };
 
-                        // Additional round of query run before recording results.
-                        // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
-
-                        let QueryRunResult {
-                            connection_failed, ..
-                        } = self
-                            .run_single_query(
-                                query,
-                                Arc::new(DashMap::new()),
-                                &mut BTreeMap::new(),
-                                snapshot_results,
-                                false,
-                            )
-                            .await?;
-                        if connection_failed {
-                            return Ok(SpiceTestQueryWorkerResult::new(
-                                &query_durations,
-                                query_iteration_durations,
-                                query_statuses,
-                                true,
-                                row_counts,
-                            ));
-                        }
-
-                        if self.explain_plan_snapshot && self.id == 0 {
+                        // Record the explain plan before the warmup run so the plan is visible
+                        // in logs even if the warmup query itself hangs.
+                        if self.explain_plan_snapshot
+                            && self.id == 0
+                            && let Some(client) = self.executor.as_spice_client()
+                        {
                             println!("Worker {} - Query '{}' - Explain plan", self.id, query.name);
                             if let Err(e) = record_explain_plan(
-                                Arc::clone(&self.spice_client),
+                                client,
                                 self.name.as_str(),
                                 query,
                                 self.scale_factor,
@@ -251,6 +431,53 @@ impl SpiceTestQueryWorker {
                                     "Explain plan snapshot assertion failed".into(),
                                 ));
                             }
+                        }
+
+                        // Additional round of query run before recording results.
+                        // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
+                        println!(
+                            "Worker {} - Query '{}' - Running warmup query",
+                            self.id, query.name
+                        );
+                        let warmup_start = std::time::Instant::now();
+
+                        let QueryRunResult {
+                            connection_failed,
+                            query_failure,
+                        } = self
+                            .run_single_query(
+                                query,
+                                Arc::new(DashMap::new()),
+                                &mut BTreeMap::new(),
+                                snapshot_mode,
+                                self.validate_on_run(true),
+                            )
+                            .await?;
+
+                        // The warmup's timing is thrown away; its verdict is not. This is the
+                        // only run of the query that compares results against their snapshot —
+                        // the timed iterations below pass `Skip` for `snapshot_mode` so they
+                        // do not re-assert it — and the only run that issues a live reference
+                        // query when `--validate` uses a reference schema. Dropping this
+                        // failure is what would let a wrong answer, or a missing baseline,
+                        // finish the benchmark green.
+                        query_status = status_after_run(query_status, query_failure);
+
+                        println!(
+                            "Worker {} - Query '{}' - Warmup query completed in {:?}",
+                            self.id,
+                            query.name,
+                            warmup_start.elapsed()
+                        );
+
+                        if connection_failed {
+                            return Ok(SpiceTestQueryWorkerResult::new(
+                                &query_durations,
+                                query_iteration_durations,
+                                query_statuses,
+                                true,
+                                row_counts,
+                            ));
                         }
 
                         while current_query_count < target_count {
@@ -276,8 +503,8 @@ impl SpiceTestQueryWorker {
                                     query,
                                     Arc::clone(&query_durations),
                                     &mut row_counts,
-                                    false, // don't attempt to snapshot results more than once
-                                    self.validate,
+                                    SnapshotMode::Skip, // don't attempt to snapshot results more than once
+                                    self.validate_on_run(false),
                                 )
                                 .await?;
 
@@ -291,9 +518,7 @@ impl SpiceTestQueryWorker {
                                 ));
                             }
 
-                            if let Some(query_failure) = query_failure {
-                                query_status = QueryStatus::Failed(Some(query_failure.into()));
-                            }
+                            query_status = status_after_run(query_status, query_failure);
 
                             current_query_count += 1;
                         }
@@ -315,14 +540,75 @@ impl SpiceTestQueryWorker {
         })
     }
 
+    /// Whether this run of the query should compare results.
+    fn validate_on_run(&self, is_warmup: bool) -> bool {
+        should_validate_on_run(self.validate, is_warmup, self.reference_schema.is_some())
+    }
+
+    /// Whether this worker should stop issuing queries: shutdown was requested,
+    /// or a duration-based run has reached its scheduled end.
+    fn should_stop(&self, start: &Instant) -> bool {
+        self.shutdown_token.is_cancelled()
+            || matches!(self.end_condition, EndCondition::Duration(d) if start.elapsed() >= d)
+    }
+
+    /// Wait for this worker's turn in the fleet's issue schedule, giving up if
+    /// the run ends first.
+    ///
+    /// At low target rates a slot can be many seconds out. Sleeping through one
+    /// that will never be used would drag a duration-based run past its
+    /// scheduled end and leave a cancelled run lingering, so the wait races the
+    /// run's own end. Abandoning a reserved slot on the way out costs nothing:
+    /// no further queries are issued either way.
+    async fn await_issue_slot(&self, pacer: &QueryPacer, start: &Instant) {
+        tokio::select! {
+            () = pacer.acquire() => {}
+            () = self.shutdown_token.cancelled() => {}
+            () = Self::sleep_until_scheduled_end(self.end_condition, start) => {}
+        }
+    }
+
+    /// Completes when a duration-based run reaches its scheduled end, and never
+    /// for a run with no deadline to reach.
+    async fn sleep_until_scheduled_end(end_condition: EndCondition, start: &Instant) {
+        match end_condition {
+            EndCondition::Duration(duration) => {
+                tokio::time::sleep(duration.saturating_sub(start.elapsed())).await;
+            }
+            EndCondition::QuerySetCompleted(_) | EndCondition::Unlimited => {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
     // run queries as a duration-based test
     async fn run_query_set(
         &self,
         query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
         query_statuses: &mut BTreeMap<Arc<str>, QueryStatus>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
+        queries: &[Query],
+        start: &Instant,
     ) -> Result<bool> {
-        for query in &self.query_set {
+        for query in queries {
+            // Stop submitting new queries once the duration has elapsed or shutdown
+            // was requested, so the test finishes close to the scheduled duration.
+            if self.should_stop(start) {
+                break;
+            }
+
+            // Hold this worker at the fleet's scheduled issue rate before doing
+            // anything else, so the wait is not counted in the query's own
+            // duration below.
+            if let Some(pacer) = &self.pacer {
+                self.await_issue_slot(pacer, start).await;
+                // The wait can end because the run did rather than because the
+                // slot came up.
+                if self.should_stop(start) {
+                    break;
+                }
+            }
+
             let QueryRunResult {
                 connection_failed,
                 query_failure,
@@ -331,7 +617,7 @@ impl SpiceTestQueryWorker {
                     query,
                     Arc::clone(&query_durations),
                     row_counts,
-                    false,
+                    SnapshotMode::Skip,
                     false,
                 )
                 .await?;
@@ -364,15 +650,16 @@ impl SpiceTestQueryWorker {
         query: &Query,
         query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
-        results_snapshot: bool,
+        snapshot_mode: SnapshotMode,
         validate: bool,
     ) -> Result<QueryRunResult> {
+        let query_start = std::time::Instant::now();
         match self
             .execute_query(
                 query,
                 Arc::clone(&query_durations),
                 row_counts,
-                results_snapshot,
+                snapshot_mode,
                 validate,
             )
             .await
@@ -382,12 +669,21 @@ impl SpiceTestQueryWorker {
                 query_failure: None,
             }),
             Err(e) => {
-                let flight_error = e.downcast_ref::<flight_client::Error>();
-                if let Some(
-                    flight_client::Error::UnableToConnectToServer { .. }
-                    | flight_client::Error::UnableToPerformHandshake { .. },
-                ) = flight_error
-                {
+                let failed_duration = query_start.elapsed();
+
+                // Check if this is a connection error using typed error checking
+                // This is more reliable than string matching
+                let is_connection_error =
+                    e.downcast_ref::<flight_client::Error>()
+                        .is_some_and(|flight_err| {
+                            matches!(
+                                flight_err,
+                                flight_client::Error::UnableToConnectToServer { .. }
+                                    | flight_client::Error::UnableToPerformHandshake { .. }
+                            )
+                        });
+
+                if is_connection_error {
                     eprintln!(
                         "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
                         self.id, query.name, e
@@ -398,10 +694,11 @@ impl SpiceTestQueryWorker {
                     })
                 } else {
                     eprintln!(
-                        "{} FAIL - Worker {} - Query '{}' failed: {}",
+                        "{} FAIL - Worker {} - Query '{}' failed (duration: {:.3}s): {}",
                         chrono::Utc::now(),
                         self.id,
                         query.name,
+                        failed_duration.as_secs_f64(),
                         e
                     );
 
@@ -415,91 +712,274 @@ impl SpiceTestQueryWorker {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
-    async fn execute_flight(
+    async fn execute_query(
         &self,
         query: &Query,
         query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
-        results_snapshot: bool,
+        snapshot_mode: SnapshotMode,
         validate: bool,
     ) -> Result<()> {
-        let query_start = Instant::now();
+        // Only retain result batches when something actually consumes them:
+        // validation (executor must support it) or a results snapshot. The
+        // throughput path needs neither, so the executor streams-and-discards
+        // instead of materializing the full result set in memory.
+        let collect_batches = snapshot_mode != SnapshotMode::Skip
+            || (validate && self.executor.supports_validation());
 
-        let mut result_stream = self
-            .spice_client
-            .query_with_params(&query.sql, query.get_parameters_batch().transpose()?)
-            .await?;
+        // Execute query using the configured executor
+        let result = self.executor.execute(query, collect_batches).await?;
 
-        let mut row_count: usize = 0;
-        let mut limited_records = vec![];
-        let mut validation_records = vec![];
+        let mut reference_validation_passed = false;
 
-        loop {
-            let batch = result_stream.try_next().await;
-            match batch {
-                Ok(None) => break,
-                Err(e) => {
-                    if let SpiceClientError::ConnectionReset { .. } = e {
-                        row_count = 0;
-                        limited_records.clear();
-                        validation_records.clear();
-                    } else {
-                        eprintln!(
-                            "{} FAIL - Worker {} - Query '{}' failed: {}",
-                            chrono::Utc::now(),
-                            self.id,
-                            query.name,
-                            e
-                        );
+        // Handle validation if supported and requested
+        if validate
+            && self.executor.supports_validation()
+            && let Some(batches) = &result.batches
+        {
+            // Execute reference query if reference_schema is provided
+            if let Some(ref_schema) = &self.reference_schema
+                && let Some(spice_client) = self.executor.as_spice_client()
+            {
+                let reference_query = query.rewrite_with_reference_schema(ref_schema)?;
+                println!(
+                    "Worker {} - Query '{}' - Executing reference query against {}.* tables",
+                    self.id, query.name, ref_schema
+                );
 
-                        query_durations.entry(Arc::clone(&query.name)).or_default();
-                        return Err(e.into());
+                let ref_batches = {
+                    let mut stream = spice_client
+                        .sql_with_params(
+                            &reference_query.sql,
+                            reference_query.get_parameters_batch().transpose()?,
+                        )
+                        .await?;
+                    let mut batches = Vec::new();
+                    while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                        batches.push(batch?);
                     }
+                    batches
+                };
+
+                // Validate against reference query results. Engine-vs-engine
+                // (not static TPCH CSV): scan order is not part of the answer
+                // unless the row set itself depends on ORDER BY + LIMIT.
+                let mut validation_result =
+                    validation::validate_against_reference_batches(query, batches, &ref_batches)?;
+
+                // A top-level LIMIT without ORDER BY may keep any rows, so rows that
+                // differ from the reference's fail only if one of them is not in the
+                // full result the LIMIT was taken from. An arity `SchemaMismatch`
+                // stays: a cell-wise retry cannot fix a width mismatch.
+                if let Some(unordered_limit) = live_oracle_unordered_limit_fallback_applies(
+                    &validation_result,
+                    &reference_query.sql,
+                    batches.iter().map(RecordBatch::num_rows).sum(),
+                    ref_batches.iter().map(RecordBatch::num_rows).sum(),
+                ) {
+                    println!(
+                        "Worker {} - Query '{}' - LIMIT without ORDER BY kept different rows than the reference query; checking each returned row against the reference query's full result",
+                        self.id, query.name
+                    );
+                    let mut subset_check =
+                        validation::UnorderedLimitSubsetCheck::new(&unordered_limit, batches)?;
+                    if !subset_check.observation_complete() {
+                        let mut stream = spice_client
+                            .sql_with_params(
+                                &unordered_limit.unlimited_sql,
+                                reference_query.get_parameters_batch().transpose()?,
+                            )
+                            .await?;
+                        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                            subset_check.observe(&batch?)?;
+                            if subset_check.observation_complete() {
+                                break;
+                            }
+                        }
+                    }
+                    validation_result = subset_check.finish();
                 }
-                Ok(Some(batch)) => {
-                    if validate {
-                        validation_records.push(batch.clone());
-                    }
-                    if batch.num_rows() == 0 {
-                        println!(
-                            "Worker {} - Query '{}' returned 0 rows",
+
+                // An ORDER BY … LIMIT answer that differs from the reference's can still
+                // be right: SQL lets each engine choose among the rows tied at the LIMIT
+                // or OFFSET cutoff, and an ORDER BY on something the result does not
+                // include hides where tie groups begin and end. Such a mismatch is
+                // judged against the reference query's leading rows read back with
+                // their sort keys. An arity `SchemaMismatch` stays, same as the
+                // unordered-LIMIT fallback.
+                if let Some(schema) = batches.first().map(RecordBatch::schema)
+                    && let Some(sort_limit) = live_oracle_keyed_sort_fallback_applies(
+                        &validation_result,
+                        &reference_query.sql,
+                        &schema,
+                    )
+                {
+                    match sort_limit.key {
+                        validation::SortKeyCells::Appended(_) => println!(
+                            "Worker {} - Query '{}' - ORDER BY sorts on columns the result does not include; checking the result against the reference query's rows with their sort keys",
                             self.id, query.name
-                        );
+                        ),
+                        validation::SortKeyCells::Returned(_) => println!(
+                            "Worker {} - Query '{}' - ORDER BY with LIMIT returned rows that differ from the reference query's; checking the result against the tie groups of the reference query's rows around the LIMIT and OFFSET",
+                            self.id, query.name
+                        ),
                     }
-                    row_count += batch.num_rows();
-                    if limited_records.len() < 10 {
-                        let required_rows = 10 - limited_records.len();
-                        let end = if batch.num_rows() > required_rows {
-                            required_rows
+                    // LIMIT 0 keeps no rows. The keyed matcher would pass an empty
+                    // answer even when a raised-LIMIT reference has rows, and a 0
+                    // window would still request OFFSET rows; the row-by-row result
+                    // already names the count.
+                    let mut fetch_rows = keyed_reference_fetch_rows(sort_limit.limit);
+                    while fetch_rows > 0 {
+                        if sort_limit.offset >= MAX_KEYED_REFERENCE_ROWS {
+                            println!(
+                                "Worker {} - Query '{}' - OFFSET {} starts past {MAX_KEYED_REFERENCE_ROWS} reference rows; keeping the row-by-row comparison's result",
+                                self.id, query.name, sort_limit.offset
+                            );
+                            break;
+                        }
+                        let requested_rows =
+                            keyed_reference_requested_rows(sort_limit.offset, fetch_rows);
+                        let mut stream = spice_client
+                            .sql_with_params(
+                                &sort_limit.keyed_sql(requested_rows),
+                                reference_query.get_parameters_batch().transpose()?,
+                            )
+                            .await?;
+                        // Held only until the cutoff group closes (or the cap).
+                        let mut keyed_reference = Vec::new();
+                        let mut fetched_rows: usize = 0;
+                        let mut cutoff_closed = false;
+                        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                            let batch = batch?;
+                            fetched_rows = fetched_rows.saturating_add(batch.num_rows());
+                            keyed_reference.push(batch);
+                            if validation::keyed_reference_cutoff_closed(
+                                &keyed_reference,
+                                sort_limit.limit,
+                                sort_limit.offset,
+                                &sort_limit.key,
+                            )? {
+                                cutoff_closed = true;
+                                break;
+                            }
+                        }
+                        if let Some(result) = validation::validate_against_keyed_reference(
+                            batches,
+                            &keyed_reference,
+                            sort_limit.limit,
+                            sort_limit.offset,
+                            &sort_limit.key,
+                            !cutoff_closed && fetched_rows < requested_rows,
+                        )? {
+                            validation_result = result;
+                            break;
+                        }
+                        if keyed_reference_should_request_another_window(
+                            cutoff_closed,
+                            requested_rows,
+                            fetch_rows,
+                        ) && let Some(next) = next_keyed_reference_fetch_rows(fetch_rows)
+                        {
+                            fetch_rows = next;
                         } else {
-                            batch.num_rows()
-                        };
-                        for i in 0..end {
-                            limited_records.push(batch.slice(i, 1));
+                            if !cutoff_closed {
+                                println!(
+                                    "Worker {} - Query '{}' - more than {MAX_KEYED_REFERENCE_ROWS} reference rows tie at the LIMIT; keeping the row-by-row comparison's result",
+                                    self.id, query.name
+                                );
+                            }
+                            break;
                         }
                     }
                 }
-            }
-        }
 
-        if validate {
-            // Validate the query results
-            let validation_result = validation::validate_tpch_query(query, &validation_records)?;
+                if let QueryValidationResult::Fail(validation_reason) = validation_result {
+                    eprintln!(
+                        "\n{} FAIL - Worker {} - Query '{}' reference validation failed",
+                        chrono::Utc::now(),
+                        self.id,
+                        query.name
+                    );
+                    eprintln!("Query SQL: {}", query.sql);
+                    eprintln!("Validation failure reason: {validation_reason:?}");
+                    eprintln!("\nExpected results (from reference schema):");
+                    match arrow::util::pretty::pretty_format_batches(&ref_batches) {
+                        Ok(pretty) => eprintln!("{pretty}"),
+                        Err(e) => eprintln!("Failed to format expected batches: {e}"),
+                    }
+                    eprintln!("\nActual results:");
+                    match arrow::util::pretty::pretty_format_batches(batches) {
+                        Ok(pretty) => eprintln!("{pretty}"),
+                        Err(e) => eprintln!("Failed to format actual batches: {e}"),
+                    }
+                    eprintln!();
+                    return Err(anyhow::anyhow!(
+                        "Query reference validation failed: {validation_reason:?}"
+                    ));
+                }
+
+                reference_validation_passed = true;
+            }
+
+            // Also validate using existing validation logic (TPCH or custom validation data)
+            let validation_result = validation_result_after_reference_validation(
+                self.validate_query_results(query, batches)?,
+                reference_validation_passed,
+            );
+
             if let QueryValidationResult::Fail(validation_reason) = validation_result {
                 eprintln!(
-                    "{} FAIL - Worker {} - Query '{}' validation failed: {validation_reason:?}",
+                    "\n{} FAIL - Worker {} - Query '{}' validation failed",
                     chrono::Utc::now(),
                     self.id,
                     query.name
                 );
+                eprintln!("Query SQL: {}", query.sql);
+                eprintln!("Validation failure reason: {validation_reason:?}");
+
+                // Print expected results based on validation source
+                if let Some(validation_data) = &self.validation_data
+                    && let Some(expected_batches) = validation_data.get(&query.name)
+                {
+                    eprintln!("\nExpected results (from custom validation data):");
+                    match arrow::util::pretty::pretty_format_batches(expected_batches) {
+                        Ok(pretty) => eprintln!("{pretty}"),
+                        Err(e) => eprintln!("Failed to format expected batches: {e}"),
+                    }
+                } else if matches!(
+                    &validation_reason,
+                    validation::QueryValidationFailReason::NoExpectedAnswerAtScaleFactor
+                ) {
+                    eprintln!(
+                        "\nNo static expected answer exists for query '{}' at scale factor {}. \
+                         Static TPCH answers are only available at scale factor 1.0; validating at \
+                         other scale factors requires a configured reference schema.",
+                        query.name, self.scale_factor
+                    );
+                } else {
+                    eprintln!(
+                        "\nExpected results: See TPCH specification for query {}",
+                        query.name
+                    );
+                }
+
+                eprintln!("\nActual results:");
+                match arrow::util::pretty::pretty_format_batches(batches) {
+                    Ok(pretty) => eprintln!("{pretty}"),
+                    Err(e) => eprintln!("Failed to format actual batches: {e}"),
+                }
+                eprintln!();
+
                 return Err(anyhow::anyhow!(
                     "Query validation failed: {validation_reason:?}"
                 ));
             }
         }
 
-        if results_snapshot {
+        // Handle result snapshots if requested
+        if snapshot_mode != SnapshotMode::Skip
+            && let Some(batches) = &result.batches
+        {
             let query_name = Arc::clone(&query.name);
             let name = self.name.clone();
             let snapshot_name = if (self.scale_factor - 1.0).abs() < f64::EPSILON {
@@ -508,6 +988,33 @@ impl SpiceTestQueryWorker {
                 format!("{name}_{query_name}_sf{}", self.scale_factor)
             };
 
+            // Limit to first 10 rows for snapshot
+            let mut limited_records = vec![];
+            for batch in batches {
+                if limited_records.len() >= 10 {
+                    break;
+                }
+                let required_rows = 10 - limited_records.len();
+                let end = if batch.num_rows() > required_rows {
+                    required_rows
+                } else {
+                    batch.num_rows()
+                };
+                for i in 0..end {
+                    limited_records.push(batch.slice(i, 1));
+                }
+            }
+
+            // In `RoundedFloats` mode, round float columns to a fixed precision
+            // before formatting: these scenarios' sources surface numbers as
+            // Float64, so their aggregates carry machine-dependent low bits
+            // (partial sums combine in partition order and float addition is not
+            // associative) and would re-record on every machine change.
+            let limited_records = if snapshot_mode == SnapshotMode::RoundedFloats {
+                round_float_columns(&limited_records)?
+            } else {
+                limited_records
+            };
             let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)?;
             let result = panic::catch_unwind(|| {
                 insta::with_settings!({
@@ -519,88 +1026,1008 @@ impl SpiceTestQueryWorker {
                 });
             });
             if result.is_err() {
-                let error_str = format!("Query `{name}` `{query_name}` snapshot assertion failed",);
+                let error_str = format!("Query `{name}` `{query_name}` snapshot assertion failed");
                 eprintln!("{error_str}");
                 return Err(anyhow::anyhow!(error_str));
             }
         }
 
-        let duration = query_start.elapsed();
+        // Check for zero row count if not in skip list. A live reference
+        // comparison that already passed (including both sides empty) is the
+        // oracle: TPC-DS Q25 is empty at some scale factors and must not fail
+        // `--validate` when the file scan is empty too.
+        //
+        // Only on runs that compare results (`validate`). Timed iterations
+        // under `--validate` + `--reference-schema` set `validate=false` so
+        // they do not re-issue the oracle; they still return 0 rows for Q25.
+        if validate
+            && zero_row_count_is_failure(
+                self.validate_row_count,
+                self.skip_row_count_validation
+                    .contains(&query.name.to_string()),
+                result.row_count,
+                reference_validation_passed,
+            )
+        {
+            eprintln!(
+                "{} FAIL - Worker {} - Query '{}' returned 0 rows",
+                chrono::Utc::now(),
+                self.id,
+                query.name
+            );
+            return Err(anyhow::anyhow!(
+                "Worker {} - Query '{}' returned 0 rows",
+                self.id,
+                query.name
+            ));
+        }
 
+        // Send streaming metric
+        self.send_streaming_metric(&query.name, result.duration, true);
+
+        // Record metrics
         query_durations
             .entry(Arc::clone(&query.name))
             .or_default()
-            .push(duration);
+            .push(result.duration);
 
         row_counts
             .entry(Arc::clone(&query.name))
             .or_default()
-            .push(row_count);
+            .push(result.row_count);
 
         if let Some(pb) = self.progress_bar.as_ref() {
             pb.inc(1);
         }
+
         Ok(())
     }
+}
 
-    async fn execute_http(
-        &self,
-        query: &Query,
-        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
-    ) -> Result<()> {
-        if let Some(http_client) = self.http_client.as_ref() {
-            let query_start = Instant::now();
-            let http_response = http_client
-                .post("http://localhost:8090/v1/sql")
-                .body(query.sql.to_string())
-                .send()
-                .await?;
+/// Fold one run of a query into the status the benchmark reports for it.
+///
+/// Every run funnels through here — the warmup and each timed iteration alike — so
+/// the two cannot drift about what a failure is worth. A failure is sticky: once a
+/// run has failed, a later one that succeeds does not clear it.
+///
+/// The warmup is the reason this is a named function rather than an `if` at each
+/// site. Its *timing* is discarded by design, which makes it tempting to discard
+/// its verdict too, but it is the only run that asserts the result snapshot — the
+/// timed iterations pass `Skip` for `snapshot_mode` so they never re-assert it.
+/// A status that skipped the warmup would let a wrong answer, or a missing
+/// baseline, finish the benchmark green.
+fn status_after_run(current: QueryStatus, query_failure: Option<String>) -> QueryStatus {
+    match query_failure {
+        Some(failure) => QueryStatus::Failed(Some(failure.into())),
+        None => current,
+    }
+}
 
-            if !http_response.status().is_success() {
-                eprintln!(
-                    "{} FAIL - Worker {} - Query '{}' HTTP request failed: {}",
-                    chrono::Utc::now(),
-                    self.id,
-                    query.name,
-                    http_response.status()
-                );
+/// Warmup always validates when `--validate` is set: it is already materializing
+/// batches for the result snapshot, and a live reference query (TPC-DS, or TPC-H
+/// at scale factors other than 1) belongs off the timed path so the recorded
+/// durations still measure the accelerator. Timed iterations keep static-answer
+/// validation (TPC-H SF-1, scenario gold) because that is a local compare with
+/// no extra query.
+fn zero_row_count_is_failure(
+    validate_row_count: bool,
+    skipped: bool,
+    row_count: usize,
+    reference_validation_passed: bool,
+) -> bool {
+    validate_row_count && !skipped && row_count == 0 && !reference_validation_passed
+}
+
+/// LIMIT fallbacks match rows by their rendered cells. They must not replace an
+/// arity [`validation::QueryValidationFailReason::SchemaMismatch`], and they must
+/// not replace a [`validation::QueryValidationFailReason::SortOrderViolation`]:
+/// those rows already show that the engine broke its own `ORDER BY`.
+///
+/// A [`validation::QueryValidationFailReason::RowCountMismatch`] against the
+/// limited oracle still enters the keyed path: that matcher re-derives the page
+/// length from the raised-`LIMIT` stream (`actual_rows == expected_rows`), so an
+/// extra row stays a Fail, and a correct `LIMIT` page is not stuck on a limited
+/// oracle that returned a different count. The unordered-`LIMIT` path already
+/// requires the two limited answers to have the same count
+/// ([`validation::UnorderedLimit::may_keep_different_rows`]).
+fn live_oracle_row_fallback_applies(result: &QueryValidationResult) -> bool {
+    matches!(
+        result,
+        QueryValidationResult::Fail(reason)
+            if !matches!(
+                reason,
+                validation::QueryValidationFailReason::SchemaMismatch
+                    | validation::QueryValidationFailReason::SortOrderViolation { .. }
+            )
+    )
+}
+
+fn live_oracle_unordered_limit_fallback_applies(
+    result: &QueryValidationResult,
+    sql: &str,
+    actual_rows: usize,
+    limited_reference_rows: usize,
+) -> Option<validation::UnorderedLimit> {
+    if !live_oracle_row_fallback_applies(result) {
+        return None;
+    }
+    let unordered_limit = validation::unordered_limit(sql)?;
+    unordered_limit
+        .may_keep_different_rows(actual_rows, limited_reference_rows)
+        .then_some(unordered_limit)
+}
+
+fn live_oracle_keyed_sort_fallback_applies(
+    result: &QueryValidationResult,
+    sql: &str,
+    schema: &arrow::datatypes::SchemaRef,
+) -> Option<validation::KeyedSortLimit> {
+    if !live_oracle_row_fallback_applies(result) {
+        return None;
+    }
+    validation::unprojected_sort_limit(sql, schema)
+        .or_else(|| validation::projected_sort_limit(sql, schema))
+}
+
+/// The same fallbacks [`SpiceTestQueryWorker::execute_query`] applies after the
+/// live oracle's limited answer fails the row-by-row compare. `unlimited_reference`
+/// is the un-`LIMIT`ed stream of an unordered `LIMIT`; `keyed_reference` is the
+/// raised-`LIMIT` stream of an `ORDER BY … LIMIT`. A missing stream leaves that
+/// fallback's verdict unchanged.
+#[cfg(test)]
+fn apply_live_oracle_row_fallbacks(
+    query: &Query,
+    actual: &[RecordBatch],
+    limited_reference: &[RecordBatch],
+    unlimited_reference: Option<&[RecordBatch]>,
+    keyed_reference: Option<&[RecordBatch]>,
+) -> Result<QueryValidationResult> {
+    let mut validation_result =
+        validation::validate_against_reference_batches(query, actual, limited_reference)?;
+
+    if let Some(unordered_limit) = live_oracle_unordered_limit_fallback_applies(
+        &validation_result,
+        &query.sql,
+        actual.iter().map(RecordBatch::num_rows).sum(),
+        limited_reference.iter().map(RecordBatch::num_rows).sum(),
+    ) && let Some(unlimited_reference) = unlimited_reference
+    {
+        let mut subset_check =
+            validation::UnorderedLimitSubsetCheck::new(&unordered_limit, actual)?;
+        if !subset_check.observation_complete() {
+            for batch in unlimited_reference {
+                subset_check.observe(batch)?;
+                if subset_check.observation_complete() {
+                    break;
+                }
+            }
+        }
+        validation_result = subset_check.finish();
+    }
+
+    if let Some(schema) = actual.first().map(RecordBatch::schema)
+        && let Some(sort_limit) =
+            live_oracle_keyed_sort_fallback_applies(&validation_result, &query.sql, &schema)
+        && keyed_reference_fetch_rows(sort_limit.limit) > 0
+        && let Some(keyed_reference) = keyed_reference
+    {
+        let fetched_rows: usize = keyed_reference.iter().map(RecordBatch::num_rows).sum();
+        let requested_rows = keyed_reference_compare_requested_rows(
+            sort_limit.offset,
+            keyed_reference_fetch_rows(sort_limit.limit),
+            fetched_rows,
+        );
+        if let Some(result) = validation::decide_from_keyed_reference_batches(
+            actual,
+            keyed_reference.iter().cloned(),
+            sort_limit.limit,
+            sort_limit.offset,
+            &sort_limit.key,
+            requested_rows,
+        )?
+        .0
+        {
+            validation_result = result;
+        }
+    }
+
+    Ok(validation_result)
+}
+
+fn should_validate_on_run(validate: bool, is_warmup: bool, has_reference_schema: bool) -> bool {
+    if !validate {
+        return false;
+    }
+    if is_warmup {
+        return true;
+    }
+    !has_reference_schema
+}
+
+fn validation_result_after_reference_validation(
+    validation_result: QueryValidationResult,
+    reference_validation_passed: bool,
+) -> QueryValidationResult {
+    match validation_result {
+        QueryValidationResult::Fail(
+            validation::QueryValidationFailReason::NoExpectedAnswer
+            | validation::QueryValidationFailReason::NoExpectedAnswerAtScaleFactor,
+        ) if reference_validation_passed => QueryValidationResult::Pass,
+        validation_result => validation_result,
+    }
+}
+
+fn default_row_count_validation_skip_queries() -> HashSet<String> {
+    [
+        "tpcds_q8",
+        "tpcds_q29",
+        "tpcds_q37",
+        "tpcds_q41",
+        "tpcds_q44",
+        "tpcds_q54",
+        "tpcds_q58",
+    ]
+    .iter()
+    .map(std::string::ToString::to_string)
+    .collect()
+}
+
+/// Build unique query sets by grouping queries by parameter index.
+/// Creates one query set per parameter variation, where each set contains
+/// one query of each type with the same parameter index.
+fn build_unique_query_sets(queries: &[Query]) -> Result<Vec<Vec<Query>>> {
+    use std::collections::HashMap;
+
+    // Group queries by name first
+    let mut groups: HashMap<Arc<str>, Vec<&Query>> = HashMap::new();
+    for query in queries {
+        groups
+            .entry(Arc::clone(&query.name))
+            .or_default()
+            .push(query);
+    }
+
+    // Validate that all groups have the same size
+    let mut expected_size = None;
+    for (name, query_group) in &groups {
+        let group_size = query_group.len();
+        match expected_size {
+            None => expected_size = Some(group_size),
+            Some(expected) if expected != group_size => {
                 return Err(anyhow::anyhow!(
-                    "Query HTTP request failed: {}",
-                    http_response.status()
+                    "Uneven parameter groups detected: query '{name}' has {group_size} parameters, expected {expected}"
                 ));
             }
-
-            let duration = query_start.elapsed();
-
-            query_durations
-                .entry(Arc::clone(&query.name))
-                .or_default()
-                .push(duration);
+            _ => {}
         }
-
-        Ok(())
     }
 
-    async fn execute_query(
-        &self,
-        query: &Query,
-        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
-        row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
-        results_snapshot: bool,
-        validate: bool,
-    ) -> Result<()> {
-        futures::future::try_join(
-            self.execute_flight(
-                query,
-                Arc::clone(&query_durations),
-                row_counts,
-                results_snapshot,
-                validate,
-            ),
-            self.execute_http(query, Arc::clone(&query_durations)),
-        )
-        .await?;
+    let num_variations = expected_size.unwrap_or(0);
 
-        Ok(())
+    // Create query sets by parameter index
+    let mut result = Vec::with_capacity(num_variations);
+
+    for param_index in 0..num_variations {
+        let mut query_set = Vec::with_capacity(groups.len());
+
+        for query_group in groups.values() {
+            if let Some(query) = query_group.get(param_index) {
+                query_set.push((*query).clone());
+            }
+        }
+
+        result.push(query_set);
+    }
+
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::queries::parameterized::ParameterValue;
+
+    use super::*;
+    use std::sync::Arc;
+
+    /// `LIMIT 600000` would request `2 * 600000` keyed rows; the first fetch
+    /// must stay at or below [`MAX_KEYED_REFERENCE_ROWS`].
+    #[test]
+    fn keyed_reference_first_request_is_clamped_to_the_cap() {
+        let unclamped = 600_000usize.saturating_mul(2);
+        assert_eq!(
+            unclamped, 1_200_000,
+            "the unclamped first request is 2 * LIMIT"
+        );
+        assert!(
+            unclamped > MAX_KEYED_REFERENCE_ROWS,
+            "unclamped {unclamped} must exceed cap {MAX_KEYED_REFERENCE_ROWS}"
+        );
+        assert_eq!(
+            keyed_reference_fetch_rows(600_000),
+            MAX_KEYED_REFERENCE_ROWS
+        );
+        assert_eq!(keyed_reference_fetch_rows(1), 2);
+        assert_eq!(
+            keyed_reference_fetch_rows(MAX_KEYED_REFERENCE_ROWS),
+            MAX_KEYED_REFERENCE_ROWS
+        );
+    }
+
+    /// `LIMIT 0` keeps no rows. A floor of 1 on the window would still request a
+    /// row, so the worker skips the keyed path when this is 0.
+    #[test]
+    fn keyed_reference_limit_zero_window_is_zero() {
+        assert_eq!(keyed_reference_fetch_rows(0), 0);
+        assert_eq!(
+            keyed_reference_requested_rows(0, keyed_reference_fetch_rows(0)),
+            0
+        );
+    }
+
+    /// `OFFSET` plus a 0 window is still the `OFFSET` rows. The worker must not
+    /// call [`keyed_reference_requested_rows`] for `LIMIT 0`, because that would
+    /// fetch the skipped rows even though the window is empty.
+    #[test]
+    fn keyed_reference_offset_plus_zero_window_still_counts_the_offset() {
+        assert_eq!(
+            keyed_reference_requested_rows(2_000_000, 0),
+            MAX_KEYED_REFERENCE_ROWS,
+            "OFFSET plus a 0 window is still OFFSET rows; the worker must not fetch them"
+        );
+    }
+
+    #[test]
+    fn keyed_reference_grow_does_not_exceed_the_cap() {
+        assert_eq!(
+            next_keyed_reference_fetch_rows(MAX_KEYED_REFERENCE_ROWS),
+            None
+        );
+        assert_eq!(
+            next_keyed_reference_fetch_rows(800_000),
+            Some(MAX_KEYED_REFERENCE_ROWS)
+        );
+        assert_eq!(next_keyed_reference_fetch_rows(2), Some(4));
+        let first = keyed_reference_fetch_rows(400_000);
+        assert_eq!(first, 800_000);
+        assert_eq!(
+            next_keyed_reference_fetch_rows(first),
+            Some(MAX_KEYED_REFERENCE_ROWS)
+        );
+        assert!(
+            !keyed_reference_should_request_another_window(true, 4, 2),
+            "a closed cutoff must not grow the window"
+        );
+        assert!(
+            !keyed_reference_should_request_another_window(
+                false,
+                MAX_KEYED_REFERENCE_ROWS,
+                800_000
+            ),
+            "a window that already asked for the cap must not grow"
+        );
+        assert!(
+            !keyed_reference_should_request_another_window(false, 4, MAX_KEYED_REFERENCE_ROWS),
+            "a current window at the cap has no next size"
+        );
+        assert!(
+            keyed_reference_should_request_another_window(false, 4, 2),
+            "an open cutoff under the cap may double"
+        );
+    }
+
+    /// `OFFSET + 2 * LIMIT` is the first keyed request. That sum is not itself
+    /// clamped by [`keyed_reference_fetch_rows`], so a large `OFFSET` would
+    /// request more than [`MAX_KEYED_REFERENCE_ROWS`] unless the add is clamped.
+    #[test]
+    fn keyed_reference_request_clamps_offset_plus_window_to_the_cap() {
+        let fetch = keyed_reference_fetch_rows(10);
+        assert_eq!(fetch, 20, "first window past OFFSET is 2 * LIMIT");
+        assert_eq!(keyed_reference_requested_rows(100, fetch), 120);
+        let offset = 2_000_000usize;
+        let unclamped = offset.saturating_add(fetch);
+        assert_eq!(
+            unclamped, 2_000_020,
+            "the unclamped request is OFFSET + 2 * LIMIT"
+        );
+        assert!(
+            unclamped > MAX_KEYED_REFERENCE_ROWS,
+            "unclamped {unclamped} must exceed cap {MAX_KEYED_REFERENCE_ROWS}"
+        );
+        assert_eq!(
+            keyed_reference_requested_rows(offset, fetch),
+            MAX_KEYED_REFERENCE_ROWS
+        );
+        assert_eq!(
+            keyed_reference_requested_rows(0, MAX_KEYED_REFERENCE_ROWS),
+            MAX_KEYED_REFERENCE_ROWS
+        );
+        assert_eq!(
+            keyed_reference_requested_rows(MAX_KEYED_REFERENCE_ROWS, fetch),
+            MAX_KEYED_REFERENCE_ROWS
+        );
+        // Capping only the window (rows past OFFSET) and then adding OFFSET
+        // would still request OFFSET + window and defeat the total-row cap.
+        let if_cap_were_rows_past_offset =
+            fetch.min(MAX_KEYED_REFERENCE_ROWS).saturating_add(offset);
+        assert!(
+            if_cap_were_rows_past_offset > MAX_KEYED_REFERENCE_ROWS,
+            "capping only rows past OFFSET then adding OFFSET ({if_cap_were_rows_past_offset}) exceeds the total cap"
+        );
+        assert_eq!(
+            keyed_reference_requested_rows(offset, fetch),
+            MAX_KEYED_REFERENCE_ROWS,
+            "the cap is total keyed-reference rows (OFFSET + window), not rows past OFFSET"
+        );
+    }
+
+    /// A collected keyed stream can be larger than the first window. Taking
+    /// `requested.max(fetched)` without clamping again would raise the count
+    /// past [`MAX_KEYED_REFERENCE_ROWS`].
+    #[test]
+    fn keyed_reference_compare_requested_rows_never_exceeds_the_cap() {
+        let fetch = keyed_reference_fetch_rows(10);
+        let requested = keyed_reference_requested_rows(0, fetch);
+        assert_eq!(requested, 20);
+        let fetched_past_cap = MAX_KEYED_REFERENCE_ROWS.saturating_add(100);
+        let unclamped = requested.max(fetched_past_cap);
+        assert!(
+            unclamped > MAX_KEYED_REFERENCE_ROWS,
+            "unclamped max(requested, fetched) {unclamped} must exceed the cap"
+        );
+        assert_eq!(
+            keyed_reference_compare_requested_rows(0, fetch, fetched_past_cap),
+            MAX_KEYED_REFERENCE_ROWS
+        );
+        assert_eq!(
+            keyed_reference_compare_requested_rows(100, fetch, 50),
+            120,
+            "when fetched is under the window, the request is the window"
+        );
+        assert_eq!(
+            keyed_reference_compare_requested_rows(0, fetch, 40),
+            40,
+            "when fetched is above the window but under the cap, the request is fetched"
+        );
+    }
+
+    #[test]
+    fn schema_mismatch_and_sort_violation_do_not_take_a_row_fallback() {
+        assert!(!live_oracle_row_fallback_applies(
+            &QueryValidationResult::Fail(validation::QueryValidationFailReason::SchemaMismatch)
+        ));
+        assert!(!live_oracle_row_fallback_applies(
+            &QueryValidationResult::Fail(
+                validation::QueryValidationFailReason::SortOrderViolation {
+                    side: "left".into(),
+                    violation: validation::SortOrderViolation {
+                        column: "id".into(),
+                        row_number: 2,
+                        previous: "2".into(),
+                        current: "1".into(),
+                    },
+                }
+            )
+        ));
+        assert!(live_oracle_row_fallback_applies(
+            &QueryValidationResult::Fail(validation::QueryValidationFailReason::DataMismatch {
+                column: "value".into(),
+                row_number: 1,
+                expected: "true".into(),
+                actual: "false".into(),
+            })
+        ));
+        assert!(
+            live_oracle_row_fallback_applies(&QueryValidationResult::Fail(
+                validation::QueryValidationFailReason::RowCountMismatch {
+                    expected: 1,
+                    actual: 2,
+                }
+            )),
+            "a limited-oracle count mismatch still enters the keyed path, which re-checks the page length"
+        );
+        assert!(!live_oracle_row_fallback_applies(
+            &QueryValidationResult::Pass
+        ));
+    }
+
+    const UNORDERED_GROUP_LIMIT: &str = r#"SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY "UserID", "SearchPhrase" LIMIT 2"#;
+    const PROJECTED_SORT_LIMIT: &str = "SELECT k, v FROM t ORDER BY k DESC LIMIT 1";
+    const VISIBLE_PREFIX_ORDER: &str = "SELECT k, v FROM t ORDER BY k LIMIT 2";
+
+    fn user_phrase_counts(rows: &[(i64, Option<&str>, i64)]) -> RecordBatch {
+        use arrow::{
+            array::{Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("UserID", DataType::Int64, false),
+                Field::new("SearchPhrase", DataType::Utf8, true),
+                Field::new("count(*)", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.2))),
+            ],
+        )
+        .expect("user phrase count batch")
+    }
+
+    fn keyed_page(rows: &[(i64, &str)]) -> RecordBatch {
+        use arrow::{
+            array::{Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("keyed page")
+    }
+
+    /// Direct mismatch of two correct Q18 groups becomes a Pass after the
+    /// unordered-LIMIT fallback; a row the full result does not have stays Fail.
+    #[test]
+    fn live_oracle_unordered_limit_fallback_turns_a_group_mismatch_into_a_pass() {
+        let full_result = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5), (3, Some("c"), 7)]);
+        let returned = user_phrase_counts(&[(3, Some("c"), 7), (2, None, 5)]);
+        let limited_reference = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5)]);
+        let query = Query::new("clickbench_q18".into(), UNORDERED_GROUP_LIMIT.into(), false);
+        let direct = validation::validate_against_reference_batches(
+            &query,
+            std::slice::from_ref(&returned),
+            std::slice::from_ref(&limited_reference),
+        )
+        .expect("direct compare");
+        assert!(
+            matches!(direct, QueryValidationResult::Fail(_)),
+            "two correct answers that kept different groups do not compare equal directly: {direct:?}"
+        );
+        assert_eq!(
+            apply_live_oracle_row_fallbacks(
+                &query,
+                std::slice::from_ref(&returned),
+                std::slice::from_ref(&limited_reference),
+                Some(std::slice::from_ref(&full_result)),
+                None,
+            )
+            .expect("unordered fallback"),
+            QueryValidationResult::Pass
+        );
+
+        let not_in_full = user_phrase_counts(&[(3, Some("c"), 6), (2, None, 5)]);
+        assert!(
+            matches!(
+                apply_live_oracle_row_fallbacks(
+                    &query,
+                    std::slice::from_ref(&not_in_full),
+                    std::slice::from_ref(&limited_reference),
+                    Some(std::slice::from_ref(&full_result)),
+                    None,
+                )
+                .expect("unordered fallback of a foreign row"),
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::RowNotAllowedByLimit { .. }
+                )
+            ),
+            "a row the full result does not have must stay a Fail"
+        );
+    }
+
+    /// A lone cutoff row that differs from the limited reference but belongs to
+    /// the tied group becomes a Pass after the keyed fallback.
+    #[test]
+    fn live_oracle_keyed_sort_fallback_turns_a_tied_cutoff_mismatch_into_a_pass() {
+        let limited_reference = keyed_page(&[(10, "a")]);
+        let actual = keyed_page(&[(10, "b")]);
+        let keyed_reference = keyed_page(&[(10, "a"), (10, "b"), (9, "c")]);
+        let query = Query::new("tied_cutoff".into(), PROJECTED_SORT_LIMIT.into(), false);
+        let direct = validation::validate_against_reference_batches(
+            &query,
+            std::slice::from_ref(&actual),
+            std::slice::from_ref(&limited_reference),
+        )
+        .expect("direct compare");
+        assert!(
+            matches!(direct, QueryValidationResult::Fail(_)),
+            "the two tied cutoff rows do not compare equal directly: {direct:?}"
+        );
+        assert_eq!(
+            apply_live_oracle_row_fallbacks(
+                &query,
+                std::slice::from_ref(&actual),
+                std::slice::from_ref(&limited_reference),
+                None,
+                Some(std::slice::from_ref(&keyed_reference)),
+            )
+            .expect("keyed fallback"),
+            QueryValidationResult::Pass
+        );
+
+        let foreign = keyed_page(&[(8, "z")]);
+        assert!(
+            matches!(
+                apply_live_oracle_row_fallbacks(
+                    &query,
+                    std::slice::from_ref(&foreign),
+                    std::slice::from_ref(&limited_reference),
+                    None,
+                    Some(std::slice::from_ref(&keyed_reference)),
+                )
+                .expect("keyed fallback of a foreign row"),
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::RowNotAllowedByLimit { .. }
+                )
+            ),
+            "a row the page cannot hold must stay a Fail"
+        );
+    }
+
+    /// An extra row past the `LIMIT` is a `RowCountMismatch` against the limited
+    /// oracle. The keyed matcher must keep that Fail: it re-checks
+    /// `actual_rows == expected_rows` against the raised-`LIMIT` stream, so
+    /// membership of the extra row in the cutoff group is not enough to Pass.
+    #[test]
+    fn live_oracle_keyed_fallback_keeps_an_extra_row_as_a_count_mismatch() {
+        let limited_reference = keyed_page(&[(10, "a")]);
+        let actual = keyed_page(&[(10, "a"), (10, "b")]);
+        let keyed_reference = keyed_page(&[(10, "a"), (10, "b"), (9, "c")]);
+        let query = Query::new("tied_cutoff".into(), PROJECTED_SORT_LIMIT.into(), false);
+        let direct = validation::validate_against_reference_batches(
+            &query,
+            std::slice::from_ref(&actual),
+            std::slice::from_ref(&limited_reference),
+        )
+        .expect("direct compare");
+        assert!(
+            matches!(
+                direct,
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::RowCountMismatch { .. }
+                )
+            ),
+            "two rows against a one-row limited oracle is a RowCountMismatch: {direct:?}"
+        );
+        assert_eq!(
+            apply_live_oracle_row_fallbacks(
+                &query,
+                std::slice::from_ref(&actual),
+                std::slice::from_ref(&limited_reference),
+                None,
+                Some(std::slice::from_ref(&keyed_reference)),
+            )
+            .expect("keyed fallback of an extra row"),
+            QueryValidationResult::Fail(validation::QueryValidationFailReason::RowCountMismatch {
+                expected: 1,
+                actual: 2,
+            })
+        );
+    }
+
+    /// The limited oracle can return a different count than a correct `LIMIT`
+    /// page (for example it ignored the `LIMIT`). The keyed path must still
+    /// Pass a single valid cutoff row, which excluding `RowCountMismatch` from
+    /// the fallback guard would leave as a Fail.
+    #[test]
+    fn live_oracle_keyed_fallback_accepts_a_correct_page_after_a_limited_count_mismatch() {
+        let limited_reference = keyed_page(&[(10, "a"), (10, "b")]);
+        let actual = keyed_page(&[(10, "b")]);
+        let keyed_reference = keyed_page(&[(10, "a"), (10, "b"), (9, "c")]);
+        let query = Query::new("tied_cutoff".into(), PROJECTED_SORT_LIMIT.into(), false);
+        let direct = validation::validate_against_reference_batches(
+            &query,
+            std::slice::from_ref(&actual),
+            std::slice::from_ref(&limited_reference),
+        )
+        .expect("direct compare");
+        assert!(
+            matches!(
+                direct,
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::RowCountMismatch { .. }
+                )
+            ),
+            "a one-row page against a two-row limited oracle is a RowCountMismatch: {direct:?}"
+        );
+        assert_eq!(
+            apply_live_oracle_row_fallbacks(
+                &query,
+                std::slice::from_ref(&actual),
+                std::slice::from_ref(&limited_reference),
+                None,
+                Some(std::slice::from_ref(&keyed_reference)),
+            )
+            .expect("keyed fallback after limited count mismatch"),
+            QueryValidationResult::Pass
+        );
+    }
+
+    /// Schema and sort-order failures must not enter either fallback, even when
+    /// in-memory streams that would otherwise Pass are supplied.
+    #[test]
+    fn live_oracle_fallbacks_do_not_replace_schema_or_sort_failures() {
+        let returned = user_phrase_counts(&[(3, Some("c"), 7), (2, None, 5)]);
+        let full_result = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5), (3, Some("c"), 7)]);
+        let other_schema = keyed_page(&[(1, "a"), (2, "b")]);
+        let unordered_query =
+            Query::new("clickbench_q18".into(), UNORDERED_GROUP_LIMIT.into(), false);
+        assert_eq!(
+            apply_live_oracle_row_fallbacks(
+                &unordered_query,
+                std::slice::from_ref(&returned),
+                std::slice::from_ref(&other_schema),
+                Some(std::slice::from_ref(&full_result)),
+                None,
+            )
+            .expect("schema mismatch"),
+            QueryValidationResult::Fail(validation::QueryValidationFailReason::SchemaMismatch)
+        );
+
+        let reference = keyed_page(&[(1, "a"), (2, "b")]);
+        let inverted = keyed_page(&[(2, "b"), (1, "a")]);
+        let keyed_reference = keyed_page(&[(1, "a"), (2, "b"), (3, "c")]);
+        let sort_query = Query::new("prefix_order".into(), VISIBLE_PREFIX_ORDER.into(), false);
+        let result = apply_live_oracle_row_fallbacks(
+            &sort_query,
+            std::slice::from_ref(&inverted),
+            std::slice::from_ref(&reference),
+            None,
+            Some(std::slice::from_ref(&keyed_reference)),
+        )
+        .expect("sort violation");
+        assert!(
+            matches!(
+                result,
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::SortOrderViolation { .. }
+                )
+            ),
+            "an inverted visible ORDER BY must stay a SortOrderViolation: {result:?}"
+        );
+    }
+
+    /// The warmup is the only run that asserts a result snapshot, so its failure has
+    /// to reach the reported status. Regression test for a benchmark that logged
+    /// `FAIL` for a mismatched or missing snapshot and still finished green.
+    #[test]
+    fn a_failed_run_fails_the_query() {
+        let status = status_after_run(
+            QueryStatus::Passed,
+            Some(
+                "Query `s3[parquet]-cayenne[file]` `clickbench_q1` snapshot assertion failed"
+                    .to_string(),
+            ),
+        );
+
+        assert!(matches!(status, QueryStatus::Failed(Some(_))));
+    }
+
+    #[test]
+    fn a_successful_run_leaves_the_status_alone() {
+        assert!(status_after_run(QueryStatus::Passed, None) == QueryStatus::Passed);
+    }
+
+    /// A failure is sticky: the timed iterations run after the warmup, and a passing
+    /// one must not clear a warmup that already failed its snapshot.
+    #[test]
+    fn a_successful_run_does_not_clear_an_earlier_failure() {
+        let failed = QueryStatus::Failed(Some("snapshot assertion failed".into()));
+
+        assert!(status_after_run(failed.clone(), None) == failed);
+    }
+
+    #[test]
+    fn empty_result_is_ok_when_the_live_oracle_also_returned_empty() {
+        assert!(
+            !zero_row_count_is_failure(true, false, 0, true),
+            "TPC-DS Q25 at SF-10 is empty on the file oracle; --validate must not fail that"
+        );
+        assert!(
+            zero_row_count_is_failure(true, false, 0, false),
+            "zero rows without a passing live oracle remain a failure"
+        );
+        assert!(
+            !zero_row_count_is_failure(true, true, 0, false),
+            "skip-list queries must not fail on zero rows"
+        );
+        assert!(!zero_row_count_is_failure(true, false, 1, false));
+        // execute_query only applies this check when `validate` is true.
+        // Timed iterations under --validate + --reference-schema set
+        // validate=false; they still return 0 rows and must not fail Q25.
+        let this_run_validates = false;
+        assert!(
+            !(this_run_validates && zero_row_count_is_failure(true, false, 0, false)),
+            "timed iterations do not re-issue the oracle and must not fail Q25 for 0 rows after warmup passed"
+        );
+    }
+
+    #[test]
+    fn test_reference_validation_runs_on_warmup_not_timed_iterations() {
+        assert!(
+            should_validate_on_run(true, true, true),
+            "warmup with a reference schema must compare results"
+        );
+        assert!(
+            !should_validate_on_run(true, false, true),
+            "timed iterations must not issue a second live reference query"
+        );
+        assert!(
+            should_validate_on_run(true, false, false),
+            "timed iterations keep cheap static-answer validation"
+        );
+        assert!(
+            !should_validate_on_run(false, true, true),
+            "nothing validates when --validate is off"
+        );
+    }
+
+    #[test]
+    fn test_reference_validation_does_not_skip_static_validation_failures() {
+        let validation_result = validation_result_after_reference_validation(
+            QueryValidationResult::Fail(validation::QueryValidationFailReason::DataMismatch {
+                column: "order_count".to_string(),
+                row_number: 1,
+                expected: "42".to_string(),
+                actual: "41".to_string(),
+            }),
+            true,
+        );
+
+        assert!(matches!(
+            validation_result,
+            QueryValidationResult::Fail(validation::QueryValidationFailReason::DataMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_reference_validation_covers_missing_static_answer() {
+        assert_eq!(
+            validation_result_after_reference_validation(
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::NoExpectedAnswer
+                ),
+                true,
+            ),
+            QueryValidationResult::Pass
+        );
+        assert_eq!(
+            validation_result_after_reference_validation(
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::NoExpectedAnswerAtScaleFactor,
+                ),
+                true,
+            ),
+            QueryValidationResult::Pass
+        );
+    }
+
+    #[test]
+    fn test_missing_static_answer_fails_without_reference_validation() {
+        assert_eq!(
+            validation_result_after_reference_validation(
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::NoExpectedAnswer
+                ),
+                false,
+            ),
+            QueryValidationResult::Fail(validation::QueryValidationFailReason::NoExpectedAnswer)
+        );
+    }
+
+    #[test]
+    fn test_build_unique_query_sets_single_group() {
+        let queries = vec![
+            Query {
+                name: Arc::from("query1"),
+                sql: Arc::from("SELECT * FROM table WHERE id = ?"),
+                overridden: false,
+                parameters: Some(vec![ParameterValue::String("1".into())]),
+            },
+            Query {
+                name: Arc::from("query1"),
+                sql: Arc::from("SELECT * FROM table WHERE id = ?"),
+                overridden: false,
+                parameters: Some(vec![ParameterValue::String("2".into())]),
+            },
+        ];
+
+        let result = build_unique_query_sets(&queries).expect("Should succeed");
+
+        assert_eq!(
+            result.len(),
+            2,
+            "Should have two query sets (one per parameter)"
+        );
+        assert_eq!(result[0].len(), 1, "Each set should have one query");
+        assert_eq!(result[1].len(), 1, "Each set should have one query");
+    }
+
+    #[test]
+    fn test_build_unique_query_sets_multiple_groups() {
+        let queries = vec![
+            Query {
+                name: Arc::from("query1"),
+                sql: Arc::from("SELECT * FROM table1"),
+                overridden: false,
+                parameters: None,
+            },
+            Query {
+                name: Arc::from("query2"),
+                sql: Arc::from("SELECT * FROM table2"),
+                overridden: false,
+                parameters: None,
+            },
+            Query {
+                name: Arc::from("query1"),
+                sql: Arc::from("SELECT * FROM table1 WHERE id = ?"),
+                overridden: false,
+                parameters: Some(vec![ParameterValue::String("1".into())]),
+            },
+            Query {
+                name: Arc::from("query2"),
+                sql: Arc::from("SELECT * FROM table2 WHERE id = ?"),
+                overridden: false,
+                parameters: Some(vec![ParameterValue::String("2".into())]),
+            },
+        ];
+
+        let result = build_unique_query_sets(&queries).expect("Should succeed");
+
+        assert_eq!(
+            result.len(),
+            2,
+            "Should have two query sets (one per parameter)"
+        );
+        for group in &result {
+            assert_eq!(
+                group.len(),
+                2,
+                "Each set should have two queries (one per query type)"
+            );
+        }
+
+        // Verify each set contains one query of each type
+        let set1_names: Vec<&str> = result[0].iter().map(|q| q.name.as_ref()).collect();
+        let set2_names: Vec<&str> = result[1].iter().map(|q| q.name.as_ref()).collect();
+        assert!(set1_names.contains(&"query1") && set1_names.contains(&"query2"));
+        assert!(set2_names.contains(&"query1") && set2_names.contains(&"query2"));
+    }
+
+    #[test]
+    fn test_build_unique_query_sets_unique_names() {
+        let queries = vec![
+            Query {
+                name: Arc::from("query1"),
+                sql: Arc::from("SELECT * FROM table1"),
+                overridden: false,
+                parameters: None,
+            },
+            Query {
+                name: Arc::from("query2"),
+                sql: Arc::from("SELECT * FROM table2"),
+                overridden: false,
+                parameters: None,
+            },
+        ];
+
+        let result = build_unique_query_sets(&queries).expect("Should succeed");
+
+        assert_eq!(result.len(), 1, "Should have one query set");
+        assert_eq!(result[0].len(), 2, "Set should have both queries");
+
+        // Verify we have both query names in the single set
+        let names: Vec<&str> = result[0].iter().map(|q| q.name.as_ref()).collect();
+        assert!(names.contains(&"query1") && names.contains(&"query2"));
     }
 }

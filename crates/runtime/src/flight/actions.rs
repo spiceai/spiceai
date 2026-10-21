@@ -13,38 +13,57 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-use std::fmt::{self, Display, Formatter};
-
 use prost::Message;
+use std::fmt::{self, Display, Formatter};
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{Service, flightsql::prepared_statement_query, metrics, to_tonic_err},
-    timing::TimedStream,
+    datafusion::request_context_extension::get_current_datafusion,
+    flight::{Service, async_actions, flightsql::prepared_statement_query, metrics, to_tonic_err},
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
+use telemetry::timing::TimedStream;
 
-use crate::datafusion::app_context_extension::AppContextExtension;
 use arrow_flight::{
     Action, ActionType as FlightActionType,
     flight_service_server::FlightService,
     sql::{self, Any, ProstMessageExt},
 };
-use runtime_request_context::{AsyncMarker, RequestContext};
 
 enum ActionType {
     CreatePreparedStatement,
     ClosePreparedStatement,
-    GetAppDefinition,
+    // Async query actions
+    SubmitAsyncQuery,
+    GetAsyncQueryStatus,
+    GetAsyncQueryResult,
+    CancelAsyncQuery,
+    /// Cancels a synchronous query running via `FlightSQL` or HTTP `/v1/sql`.
+    /// Body: JSON `{"query_id": "<uuid>"}`.
+    /// Response: JSON `{"query_id": "...", "cancelled": bool}`.
+    CancelQuery,
     Unknown,
 }
 
 impl ActionType {
     fn from_str(s: &str) -> Self {
+        if let Some(async_action) = async_actions::AsyncActionType::from_str(s) {
+            return match async_action {
+                async_actions::AsyncActionType::SubmitAsyncQuery => ActionType::SubmitAsyncQuery,
+                async_actions::AsyncActionType::GetAsyncQueryStatus => {
+                    ActionType::GetAsyncQueryStatus
+                }
+                async_actions::AsyncActionType::GetAsyncQueryResult => {
+                    ActionType::GetAsyncQueryResult
+                }
+                async_actions::AsyncActionType::CancelAsyncQuery => ActionType::CancelAsyncQuery,
+            };
+        }
+
         match s {
             "CreatePreparedStatement" => ActionType::CreatePreparedStatement,
             "ClosePreparedStatement" => ActionType::ClosePreparedStatement,
-            "GetAppDefinition" => ActionType::GetAppDefinition,
+            "CancelQuery" => ActionType::CancelQuery,
             _ => ActionType::Unknown,
         }
     }
@@ -53,7 +72,11 @@ impl ActionType {
         match self {
             ActionType::CreatePreparedStatement => "CreatePreparedStatement",
             ActionType::ClosePreparedStatement => "ClosePreparedStatement",
-            ActionType::GetAppDefinition => "GetAppDefinition",
+            ActionType::SubmitAsyncQuery => async_actions::action_types::SUBMIT_ASYNC_QUERY,
+            ActionType::GetAsyncQueryStatus => async_actions::action_types::GET_ASYNC_QUERY_STATUS,
+            ActionType::GetAsyncQueryResult => async_actions::action_types::GET_ASYNC_QUERY_RESULT,
+            ActionType::CancelAsyncQuery => async_actions::action_types::CANCEL_ASYNC_QUERY,
+            ActionType::CancelQuery => "CancelQuery",
             ActionType::Unknown => "Unknown",
         }
     }
@@ -82,18 +105,52 @@ pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsSt
             Response Message: N/A"
             .into(),
     };
-    let get_app_definition_action_type = FlightActionType {
-        r#type: ActionType::GetAppDefinition.to_string(),
-        description:
-            "Used in cluster mode to ask Spice for its App declaration for runtime dependencies.\n
-            Request Message: N/A
-            Response Message: app::App serialized as JSON bytes"
-                .into(),
+
+    // Async query actions
+    let submit_async_query_action_type = FlightActionType {
+        r#type: async_actions::action_types::SUBMIT_ASYNC_QUERY.to_string(),
+        description: "Submits a SQL query for async execution.\n
+            Request Message: JSON {sql: string, parameters?: object}\n
+            Response Message: JSON {query_id: string, status: string}"
+            .into(),
     };
+    let get_async_query_status_action_type = FlightActionType {
+        r#type: async_actions::action_types::GET_ASYNC_QUERY_STATUS.to_string(),
+        description: "Gets the status of an async query.\n
+            Request Message: JSON {query_id: string}\n
+            Response Message: JSON {query_id: string, status: string, error?: object, result?: object}"
+            .into(),
+    };
+    let get_async_query_result_action_type = FlightActionType {
+        r#type: async_actions::action_types::GET_ASYNC_QUERY_RESULT.to_string(),
+        description: "Gets the result of a completed async query as Arrow IPC.\n
+            Request Message: JSON {query_id: string, chunk_index?: number}\n
+            Response Message: Arrow IPC stream"
+            .into(),
+    };
+    let cancel_async_query_action_type = FlightActionType {
+        r#type: async_actions::action_types::CANCEL_ASYNC_QUERY.to_string(),
+        description: "Cancels a running async query.\n
+            Request Message: JSON {query_id: string}\n
+            Response Message: JSON {query_id: string, cancelled: boolean, status: string}"
+            .into(),
+    };
+    let cancel_query_action_type = FlightActionType {
+        r#type: ActionType::CancelQuery.to_string(),
+        description: "Cancels a running synchronous query (FlightSQL or HTTP /v1/sql).\n
+            Request Message: JSON {query_id: string}\n
+            Response Message: JSON {query_id: string, cancelled: boolean}"
+            .into(),
+    };
+
     let actions: Vec<Result<FlightActionType, Status>> = vec![
         Ok(create_prepared_statement_action_type),
         Ok(close_prepared_statement_action_type),
-        Ok(get_app_definition_action_type),
+        Ok(submit_async_query_action_type),
+        Ok(get_async_query_status_action_type),
+        Ok(get_async_query_result_action_type),
+        Ok(cancel_async_query_action_type),
+        Ok(cancel_query_action_type),
     ];
 
     let output = TimedStream::new(futures::stream::iter(actions), || start);
@@ -106,8 +163,7 @@ pub(crate) async fn do_action(
 ) -> Result<Response<<Service as FlightService>::DoActionStream>, Status> {
     let action_type = ActionType::from_str(request.get_ref().r#type.as_str());
 
-    let action_type_str = action_type.as_str().to_string();
-    let start = metrics::track_flight_request("do_action", Some(&action_type_str)).await;
+    let start = metrics::track_flight_request("do_action", Some(action_type.as_str())).await;
 
     let stream = match action_type {
         ActionType::CreatePreparedStatement => {
@@ -129,19 +185,32 @@ pub(crate) async fn do_action(
             tracing::trace!("do_action: ClosePreparedStatement");
             futures::stream::iter(vec![Ok(arrow_flight::Result::default())])
         }
-        ActionType::GetAppDefinition => {
-            tracing::trace!("do_action: GetAppDefinition");
-            let context = RequestContext::current(AsyncMarker::new().await);
-            let Some(app) = context
-                .extension::<AppContextExtension>()
-                .and_then(|a| a.app())
-            else {
-                return Err(Status::internal("App context not available"));
-            };
-
-            let bs = serde_json::to_vec(&app).map_err(to_tonic_err)?;
-            let result = arrow_flight::Result::new(bs);
-            futures::stream::iter(vec![Ok(result)])
+        ActionType::SubmitAsyncQuery => {
+            tracing::trace!("do_action: SubmitAsyncQuery");
+            let body = async_actions::handle_submit_async_query(&request.get_ref().body).await?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
+        }
+        ActionType::GetAsyncQueryStatus => {
+            tracing::trace!("do_action: GetAsyncQueryStatus");
+            let body =
+                async_actions::handle_get_async_query_status(&request.get_ref().body).await?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
+        }
+        ActionType::GetAsyncQueryResult => {
+            tracing::trace!("do_action: GetAsyncQueryResult");
+            let body =
+                async_actions::handle_get_async_query_result(&request.get_ref().body).await?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
+        }
+        ActionType::CancelAsyncQuery => {
+            tracing::trace!("do_action: CancelAsyncQuery");
+            let body = async_actions::handle_cancel_async_query(&request.get_ref().body).await?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
+        }
+        ActionType::CancelQuery => {
+            tracing::trace!("do_action: CancelQuery");
+            let body = handle_cancel_query(&request.get_ref().body).await?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
         }
         ActionType::Unknown => return Err(Status::invalid_argument("Unknown action type")),
     };
@@ -150,4 +219,45 @@ pub(crate) async fn do_action(
         stream,
         move || start,
     ))))
+}
+
+#[derive(serde::Deserialize)]
+struct CancelQueryRequest {
+    query_id: String,
+}
+
+#[derive(serde::Serialize)]
+struct CancelQueryResponse {
+    query_id: String,
+    cancelled: bool,
+}
+
+/// Handles the custom `CancelQuery` Flight action by looking up the supplied
+/// query id in the runtime's sync query registry and signalling its
+/// cancellation token.
+async fn handle_cancel_query(body: &[u8]) -> Result<Vec<u8>, Status> {
+    let req: CancelQueryRequest = serde_json::from_slice(body)
+        .map_err(|e| Status::invalid_argument(format!("Invalid CancelQuery request body: {e}")))?;
+
+    let parsed = uuid::Uuid::parse_str(&req.query_id)
+        .map_err(|e| Status::invalid_argument(format!("Invalid query_id (expected UUID): {e}")))?;
+
+    let context = RequestContext::current(AsyncMarker::new().await);
+    if crate::flight::is_auth_read_only(context.as_ref()) {
+        return Err(Status::permission_denied(
+            "API key does not allow write access",
+        ));
+    }
+
+    let df = get_current_datafusion(&context);
+    let cancelled = df
+        .query_cancel_registry()
+        .cancel_owned(parsed, &crate::jobs::current_job_owner().await);
+
+    let resp = CancelQueryResponse {
+        query_id: req.query_id,
+        cancelled,
+    };
+    serde_json::to_vec(&resp)
+        .map_err(|e| Status::internal(format!("Failed to encode CancelQuery response: {e}")))
 }

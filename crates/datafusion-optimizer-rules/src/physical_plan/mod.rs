@@ -15,6 +15,19 @@ limitations under the License.
 */
 
 //! General [`datafusion::physical_optimizer::PhysicalOptimizerRule`] not in [`datafusion`] by default.
+//! These optimizations should be unrelated to the `runtime` or `spiced`. Ideally they could be contributed
+//! upstream to `datafusion` directly.
 
+#[cfg(feature = "duckdb")]
+pub mod duckdb;
+pub mod first_record_probe;
+pub mod flightsql;
 pub mod hash_join_optimization;
+pub mod http_subquery_pushdown;
+pub mod partition_only_scan;
+
+pub mod cluster;
+
 pub use hash_join_optimization::EmptyHashJoinExecPhysicalOptimization;
+pub use http_subquery_pushdown::HttpParamsPushdown;
+pub use partition_only_scan::PartitionOnlyScanRewrite;

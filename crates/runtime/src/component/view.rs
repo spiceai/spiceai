@@ -15,46 +15,66 @@ limitations under the License.
 */
 
 use app::App;
-use datafusion::sql::TableReference;
-use serde_json::Value;
-use snafu::prelude::*;
-use spicepod::{component::view as spicepod_view, vector::VectorStore};
-use std::{collections::HashMap, fs, sync::Arc, time::Duration};
+use datafusion::common::TableReference;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 use crate::{Runtime, dataaccelerator::AccelerationSource};
 
-use super::{
-    dataset::{
-        Dataset, ReadyState,
-        acceleration::{self, Acceleration},
-    },
-    validate_identifier,
-};
-use spicepod::semantic::Column;
+use super::dataset::acceleration::{self, Acceleration};
 
-/// [`View`] is the internal representation of the [`spicepod_view::View`] spicepod component.
+// Config-only spec and its builder live in `runtime-component`; re-export for
+// path compatibility (`crate::component::view::{ViewBuilder, ViewSpec}`).
+pub use runtime_component::view::{Error, ViewBuilder, ViewSpec};
+
+impl From<Error> for crate::Error {
+    /// Maps each view parse error to the runtime error that reported it before the
+    /// builder moved, so the user-facing messages do not change.
+    fn from(err: Error) -> Self {
+        match err {
+            Error::InvalidViewName { source } => crate::Error::ComponentError { source },
+            Error::ViewNameIncludesCatalog { catalog, name } => {
+                crate::Error::DatasetNameIncludesCatalog { catalog, name }
+            }
+            Error::UnableToLoadSqlFile { file, source } => {
+                crate::Error::UnableToLoadSqlFile { file, source }
+            }
+            Error::NeedToSpecifySQLView { name } => crate::Error::NeedToSpecifySQLView { name },
+            Error::InvalidAccelerationConfiguration { source } => source.into(),
+            Error::AcceleratedViewInvalidConfiguration { view_name, reason } => {
+                crate::Error::AcceleratedViewInvalidConfiguration { view_name, reason }
+            }
+        }
+    }
+}
+
+/// `Arc<Runtime>`-bound wrapper over a [`ViewSpec`]. Derefs to the spec so
+/// `view.acceleration`, `view.columns`, `view.is_accelerated()`, etc. keep
+/// working unchanged.
 #[derive(Clone)]
 pub struct View {
-    pub name: TableReference,
-    pub sql: Arc<str>,
-    pub metadata: HashMap<String, Value>,
-    pub columns: Vec<Column>,
-    pub acceleration: Option<acceleration::Acceleration>,
-    pub ready_state: ReadyState,
+    pub spec: ViewSpec,
     pub runtime: Arc<Runtime>,
-    pub vectors: Option<VectorStore>,
     pub app: Arc<App>,
+}
+
+impl Deref for View {
+    type Target = ViewSpec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.spec
+    }
+}
+
+impl DerefMut for View {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.spec
+    }
 }
 
 impl PartialEq for View {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.sql == other.sql
-            && self.metadata == other.metadata
-            && self.columns == other.columns
-            && self.acceleration == other.acceleration
-            && self.vectors == other.vectors
-            && self.ready_state == other.ready_state
+        self.spec == other.spec
     }
 }
 
@@ -68,70 +88,23 @@ impl std::fmt::Debug for View {
             .field("acceleration", &self.acceleration)
             .field("ready_state", &self.ready_state)
             .field("vectors", &self.vectors)
+            .field("params", &self.params)
             .finish_non_exhaustive()
     }
 }
 
 impl View {
-    #[allow(clippy::result_large_err)]
-    fn load_sql_ref(sql_ref: &str) -> crate::Result<String> {
-        let sql = fs::read_to_string(sql_ref)
-            .context(crate::UnableToLoadSqlFileSnafu { file: sql_ref })?;
-        Ok(sql)
-    }
-
+    /// Attaches the runtime handles to a parsed [`ViewSpec`].
     #[must_use]
-    pub fn is_accelerated(&self) -> bool {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.enabled;
-        }
-
-        false
-    }
-
-    #[must_use]
-    pub fn refresh_check_interval(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_check_interval;
-        }
-        None
-    }
-
-    #[must_use]
-    pub fn refresh_max_jitter(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration
-            && acceleration.refresh_jitter_enabled
-        {
-            // If `refresh_jitter_max` is not set, use 10% of `refresh_check_interval`.
-            return match acceleration.refresh_jitter_max {
-                Some(jitter) => Some(jitter),
-                None => self.refresh_check_interval().map(|i| i.mul_f64(0.1)),
-            };
-        }
-        None
-    }
-
-    #[must_use]
-    pub fn refresh_retry_enabled(&self) -> bool {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_retry_enabled;
-        }
-        false
-    }
-
-    #[must_use]
-    pub fn refresh_retry_max_attempts(&self) -> Option<usize> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_retry_max_attempts;
-        }
-        None
+    pub fn new(spec: ViewSpec, runtime: Arc<Runtime>, app: Arc<App>) -> Self {
+        Self { spec, runtime, app }
     }
 
     #[must_use]
     pub async fn is_accelerator_initialized(&self) -> bool {
         if let Some(acceleration_settings) = &self.acceleration {
             let Some(accelerator) = self
-                .runtime()
+                .runtime
                 .accelerator_engine_registry()
                 .get_accelerator_engine(acceleration_settings.engine)
                 .await
@@ -143,89 +116,6 @@ impl View {
         }
 
         false
-    }
-
-    #[must_use]
-    pub fn has_embeddings(&self) -> bool {
-        self.columns.iter().any(|c| !c.embeddings.is_empty())
-    }
-
-    #[must_use]
-    pub fn has_full_text_column(&self) -> bool {
-        self.columns
-            .iter()
-            .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
-    }
-}
-
-pub struct ViewBuilder {
-    pub name: TableReference,
-    pub sql: String,
-    pub metadata: HashMap<String, Value>,
-    pub columns: Vec<Column>,
-    pub acceleration: Option<acceleration::Acceleration>,
-    pub ready_state: ReadyState,
-    pub vectors: Option<VectorStore>,
-}
-
-impl TryFrom<spicepod_view::View> for ViewBuilder {
-    type Error = crate::Error;
-
-    fn try_from(view: spicepod_view::View) -> Result<Self, Self::Error> {
-        validate_identifier(&view.name).context(crate::ComponentSnafu)?;
-
-        let table_reference = Dataset::parse_table_reference(&view.name)?;
-
-        let sql = if let Some(view_sql) = &view.sql {
-            view_sql.to_string()
-        } else if let Some(sql_ref) = &view.sql_ref {
-            View::load_sql_ref(sql_ref)?
-        } else {
-            return Err(crate::Error::NeedToSpecifySQLView {
-                name: table_reference.to_string(),
-            });
-        };
-
-        let acceleration = view
-            .acceleration
-            .map(acceleration::Acceleration::try_from)
-            .transpose()?;
-
-        // verify that the acceleration configuration is fully supported
-        if let Some(acc) = &acceleration {
-            if acc.refresh_mode.is_some()
-                && acc.refresh_mode != Some(acceleration::RefreshMode::Full)
-            {
-                return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name.to_string(),
-                    reason: "Only 'refresh_mode: full' is supported".to_string(),
-                });
-            }
-
-            if acc.refresh_sql.is_some() {
-                return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name.to_string(),
-                    reason: "'refresh_sql' is not supported".to_string(),
-                });
-            }
-
-            if acc.on_zero_results == acceleration::ZeroResultsAction::UseSource {
-                return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name.to_string(),
-                    reason: "Only 'on_zero_results: return_empty' is supported".to_string(),
-                });
-            }
-        }
-
-        Ok(ViewBuilder {
-            name: table_reference,
-            sql,
-            metadata: view.metadata,
-            columns: view.columns,
-            acceleration,
-            ready_state: ReadyState::from(view.ready_state),
-            vectors: view.vectors,
-        })
     }
 }
 
@@ -239,7 +129,11 @@ impl AccelerationSource for View {
             if acceleration.engine == acceleration::Engine::PostgreSQL {
                 return false;
             }
-            return acceleration.enabled && acceleration.mode == acceleration::Mode::File;
+            return acceleration.enabled
+                && matches!(
+                    acceleration.mode,
+                    acceleration::Mode::File | acceleration::Mode::FileCreate
+                );
         }
         false
     }
@@ -248,8 +142,14 @@ impl AccelerationSource for View {
         Arc::clone(&self.app)
     }
 
-    fn runtime(&self) -> Arc<Runtime> {
-        Arc::clone(&self.runtime)
+    fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
+        self.runtime.secrets()
+    }
+
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<runtime_acceleration::snapshot::notifications::SnapshotNotifications>> {
+        self.runtime.datafusion().snapshot_notifications()
     }
 
     fn acceleration(&self) -> Option<&Acceleration> {
@@ -260,6 +160,27 @@ impl AccelerationSource for View {
         &self.name
     }
 
+    fn connector_name(&self) -> Option<&str> {
+        // A view has no `from:` — its rows come from its SQL, not a connector — so
+        // there is no connector default to apply. `ViewBuilder::try_from` also
+        // rejects every refresh mode except `full`, which is the fallback a `None`
+        // resolves to.
+        None
+    }
+
+    fn on_schema_change(&self) -> Option<runtime_acceleration::OnSchemaChange> {
+        // A view declares no `on_schema_change`: its columns follow its SQL, so there is
+        // no source schema for an accelerator to reconcile against.
+        None
+    }
+
+    fn allows_write(&self) -> bool {
+        // A view is not writable, and `ViewBuilder::try_from` rejects every refresh mode
+        // except `full`, so a view is never the read-only CDC replica the scan-freshness
+        // decision is about.
+        false
+    }
+
     fn time_column(&self) -> Option<&str> {
         None
     }
@@ -267,34 +188,88 @@ impl AccelerationSource for View {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-}
 
-impl ViewBuilder {
-    #[must_use]
-    pub fn new(name: TableReference, sql: String) -> Self {
-        Self {
-            name,
-            sql,
-            metadata: HashMap::default(),
-            columns: vec![],
-            acceleration: None,
-            ready_state: ReadyState::default(),
-            vectors: None,
-        }
+    fn initialized_sources<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Vec<Arc<dyn runtime_acceleration::AccelerationSource>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let app = self.app();
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            let datasets: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
+                Arc::clone(&runtime)
+                    .get_initialized_datasets(&app, crate::LogErrors(false))
+                    .await
+                    .into_iter()
+                    .map(|ds| ds as Arc<dyn runtime_acceleration::AccelerationSource>)
+                    .collect();
+            #[cfg(feature = "duckdb")]
+            {
+                let views: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
+                    Arc::clone(&runtime)
+                        .get_initialized_views(&app, crate::LogErrors(false))
+                        .await
+                        .into_iter()
+                        .map(|v| v as Arc<dyn runtime_acceleration::AccelerationSource>)
+                        .collect();
+                datasets.into_iter().chain(views).collect()
+            }
+            #[cfg(not(feature = "duckdb"))]
+            datasets
+        })
     }
 
-    #[must_use]
-    pub fn build_with(self, runtime: Arc<Runtime>, app: Arc<App>) -> View {
-        View {
-            name: self.name,
-            sql: Arc::from(self.sql),
-            metadata: self.metadata,
-            columns: self.columns,
-            acceleration: self.acceleration,
-            ready_state: self.ready_state,
-            vectors: self.vectors,
-            runtime,
-            app,
-        }
+    fn checkpointer_factory(
+        &self,
+        snapshot_behavior: runtime_acceleration::snapshot::SnapshotBehavior,
+    ) -> runtime_acceleration::dataset_checkpoint::DatasetCheckpointerFactory {
+        crate::dataaccelerator::spice_sys::checkpointer_factory(
+            self,
+            self.runtime.accelerator_engine_registry(),
+            snapshot_behavior,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ViewBuilder;
+    use crate::component::{AcceleratedComponent, deprecated_ready_state_warning};
+    use spicepod::component::view as spicepod_view;
+
+    /// The wording itself is asserted beside the shared builder in `component::tests`. What is
+    /// specific to the view — and what makes that escaping load-bearing rather than decorative — is
+    /// that a name carrying a newline gets through `ViewBuilder::try_from` at all: a *quoted*
+    /// identifier may legally contain a newline, and `validate_identifier` accepts one, so a name
+    /// that passes validation could otherwise break the line in two and forge a second record.
+    /// `disabled_acceleration_warning` escapes for exactly this reason.
+    #[test]
+    fn a_view_name_carrying_a_newline_cannot_forge_a_second_log_line() {
+        let hostile = "\"api\nWARN forged\"";
+
+        // The escaping only matters if such a name reaches the warning at all, so assert that
+        // the builder accepts it rather than assuming it does.
+        let view: spicepod_view::View =
+            yaml::from_str(&format!("name: {hostile:?}\nsql: SELECT 1\n")).expect("yaml parses");
+        assert!(
+            ViewBuilder::try_from(view).is_ok(),
+            "a quoted identifier containing a newline is accepted by the builder, which is what \
+             makes escaping load-bearing rather than decorative"
+        );
+
+        let message = deprecated_ready_state_warning(AcceleratedComponent::View, hostile);
+        assert!(
+            !message.contains('\n'),
+            "an embedded newline must not survive into the log line: {message:?}"
+        );
+        assert!(
+            message.contains("WARN forged"),
+            "the name is still reported in full, only escaped: {message:?}"
+        );
     }
 }

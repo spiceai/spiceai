@@ -13,24 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use serde_json::{Map, Value};
 use snafu::ResultExt;
 use std::sync::Arc;
 
 use arrow::{
-    array::{
-        Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Float16Array,
-        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-        LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
-        UInt32Array, UInt64Array,
-    },
+    array::{ArrayRef, RecordBatch, StringArray},
     datatypes::DataType,
     error::ArrowError,
 };
 use arrow_schema::{Field as ArrowField, Schema, SchemaRef};
-use tantivy::{Term, schema::Field};
-
-use serde_json::to_string;
 
 /// Adds an additional [`StringArray`] column to a [`RecordBatch`] as a JSON-string representation
 /// from a subset of the columns present.
@@ -50,20 +41,18 @@ pub fn with_json_subset_column(
     let subset_schema: SchemaRef = Arc::new(Schema::new(subset_fields));
     let subset_batch = RecordBatch::try_new(Arc::clone(&subset_schema), subset_arrays).boxed()?;
 
+    // Line-delimited writer emits one JSON object per row (NDJSON). Use the raw line
+    // bytes as Utf8 values directly — no serde Map parse/re-serialize round-trip.
     let buf = Vec::new();
-    let mut writer = arrow_json::ArrayWriter::new(buf);
+    let mut writer = arrow_json::LineDelimitedWriter::new(buf);
     writer.write_batches(&[&subset_batch]).boxed()?;
     writer.finish().boxed()?;
     let json_data = writer.into_inner();
 
-    let json_strings: Vec<String> =
-        serde_json::from_reader::<_, Vec<Map<String, Value>>>(json_data.as_slice())
-            .boxed()?
-            .into_iter()
-            .map(|v| to_string(&v).boxed())
-            .collect::<Result<Vec<String>, _>>()?;
-
-    let json_array: ArrayRef = Arc::new(StringArray::from(json_strings));
+    let json_str = std::str::from_utf8(&json_data).boxed()?;
+    // `lines().filter(...)` is not ExactSizeIterator; `from_iter_values` requires sized.
+    let lines: Vec<&str> = json_str.lines().filter(|line| !line.is_empty()).collect();
+    let json_array: ArrayRef = Arc::new(StringArray::from(lines));
 
     let mut new_fields: Vec<_> = batch.schema().fields().iter().cloned().collect();
     new_fields.push(Arc::new(ArrowField::new(
@@ -79,195 +68,64 @@ pub fn with_json_subset_column(
     RecordBatch::try_new(new_schema, new_columns).boxed()
 }
 
-/// Macro to downcast an `ArrayRef` to concrete Arrow array type or return Err.
-///
-/// Users should check type-compatibility beforehand using [`ArrayRef::data_type`].
-macro_rules! downcast_array {
-    ($ARRAY:expr, $TY:ty) => {
-        $ARRAY.as_any().downcast_ref::<$TY>().ok_or_else(|| {
-            ArrowError::CastError(format!("Expected arrow array of type {}", stringify!($TY)))
-        })?
-    };
+/// Returns `batch` with every column named in `exclude` removed. Column order is otherwise
+/// preserved.
+pub fn without_columns(batch: &RecordBatch, exclude: &[String]) -> Result<RecordBatch, ArrowError> {
+    let keep: Vec<usize> = (0..batch.num_columns())
+        .filter(|&i| !exclude.iter().any(|e| e == batch.schema().field(i).name()))
+        .collect();
+    batch.project(&keep)
 }
 
-#[allow(clippy::too_many_lines)]
-pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowError> {
-    let mut terms = Vec::with_capacity(arr.len());
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-    match arr.data_type() {
-        // --- Floats → f64
-        DataType::Float16 => {
-            let a = downcast_array!(arr, Float16Array);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    let v = f64::from(a.value(i).to_f32());
-                    terms.push(Term::from_field_f64(field, v));
-                }
-            }
-        }
-        DataType::Float32 => {
-            let a = downcast_array!(arr, Float32Array);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    let v = f64::from(a.value(i));
-                    terms.push(Term::from_field_f64(field, v));
-                }
-            }
-        }
-        DataType::Float64 => {
-            let a = downcast_array!(arr, Float64Array);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_f64(field, a.value(i)));
-                }
-            }
-        }
+    use arrow::{
+        array::{Array, Int32Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
 
-        // --- Unsigned ints → u64
-        DataType::UInt8 => {
-            let a = downcast_array!(arr, UInt8Array);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_u64(field, u64::from(a.value(i))));
-                }
-            }
-        }
-        DataType::UInt16 => {
-            let a = downcast_array!(arr, UInt16Array);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_u64(field, u64::from(a.value(i))));
-                }
-            }
-        }
-        DataType::UInt32 => {
-            let a = downcast_array!(arr, UInt32Array);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_u64(field, u64::from(a.value(i))));
-                }
-            }
-        }
-        DataType::UInt64 => {
-            let a = downcast_array!(arr, UInt64Array);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_u64(field, a.value(i)));
-                }
-            }
-        }
+    use super::with_json_subset_column;
 
-        // --- Signed ints → i64
-        DataType::Int8 => {
-            let a = downcast_array!(arr, Int8Array);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_i64(field, i64::from(a.value(i))));
-                }
-            }
-        }
-        DataType::Int16 => {
-            let a = downcast_array!(arr, Int16Array);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_i64(field, i64::from(a.value(i))));
-                }
-            }
-        }
-        DataType::Int32 => {
-            let a = downcast_array!(arr, Int32Array);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_i64(field, i64::from(a.value(i))));
-                }
-            }
-        }
-        DataType::Int64 => {
-            let a = downcast_array!(arr, Int64Array);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_i64(field, a.value(i)));
-                }
-            }
-        }
+    /// Locks the exact NDJSON string format written into tantivy as the composite
+    /// primary-key unique field. Format drift breaks update/delete term matching
+    /// against existing on-disk indexes.
+    #[test]
+    fn json_subset_column_utf8_int32_golden_format() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("seq", DataType::Int32, false),
+            Field::new("content", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["apple", "banana"])),
+            ],
+        )
+        .expect("test batch");
 
-        // --- Boolean
-        DataType::Boolean => {
-            let a = downcast_array!(arr, BooleanArray);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_bool(field, a.value(i)));
-                }
-            }
-        }
+        let with_pk = with_json_subset_column(
+            &batch,
+            &["id".to_string(), "seq".to_string()],
+            "__spice.unique_field",
+        )
+        .expect("json subset column");
 
-        // --- Dates
-        DataType::Date32 => {
-            let a = downcast_array!(arr, Date32Array);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_date(
-                        field,
-                        tantivy::DateTime::from_timestamp_secs(i64::from(a.value(i)) * 86_400),
-                    ));
-                }
-            }
-        }
-        DataType::Date64 => {
-            let a = downcast_array!(arr, Date64Array);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_date(
-                        field,
-                        tantivy::DateTime::from_timestamp_millis(a.value(i)),
-                    ));
-                }
-            }
-        }
+        let col_idx = with_pk
+            .schema()
+            .index_of("__spice.unique_field")
+            .expect("unique field present");
+        let json_col = with_pk
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 unique field");
 
-        // --- UTF8 text
-        DataType::Utf8 => {
-            let a = downcast_array!(arr, StringArray);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_text(field, a.value(i)));
-                }
-            }
-        }
-        DataType::LargeUtf8 => {
-            let a = downcast_array!(arr, LargeStringArray);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_text(field, a.value(i)));
-                }
-            }
-        }
-
-        // --- Binary blobs
-        DataType::Binary => {
-            let a = downcast_array!(arr, BinaryArray);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_bytes(field, a.value(i)));
-                }
-            }
-        }
-        DataType::LargeBinary => {
-            let a = downcast_array!(arr, LargeBinaryArray);
-            for i in 0..a.len() {
-                if a.is_valid(i) {
-                    terms.push(Term::from_field_bytes(field, a.value(i)));
-                }
-            }
-        }
-
-        // --- Everything else is unsupported
-        other => {
-            return Err(ArrowError::NotYetImplemented(format!(
-                "Cannot use primary key of arrow type {other:?} for full-text search"
-            )));
-        }
+        let lines: Vec<&str> = (0..json_col.len()).map(|i| json_col.value(i)).collect();
+        insta::assert_snapshot!("json_subset_column_utf8_int32", lines.join("\n"));
     }
-
-    Ok(terms)
 }

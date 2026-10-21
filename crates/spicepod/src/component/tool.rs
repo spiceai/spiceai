@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 
+use crate::component::function::Signature;
 use crate::metric::Metrics;
 
 use super::{Nameable, WithDependsOn};
@@ -44,6 +45,22 @@ pub struct Tool {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+
+    /// Whether this tool is also callable as a SQL UDF. Defaults to
+    /// `false`; set to `true` to also register a `DataFusion` `ScalarUDF`
+    /// that invokes this tool per-row.
+    ///
+    /// Requires [`Self::signature`] to be set with typed Arrow arg /
+    /// return types — a tool's free-form JSON Schema does not uniquely
+    /// map to a SQL signature, so the author must pin types explicitly.
+    /// Also requires `runtime.functions.enabled: true`.
+    #[serde(default)]
+    pub as_sql: bool,
+
+    /// Typed signature for SQL invocation when [`Self::as_sql`] is true.
+    /// Ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
 }
 
 impl Nameable for Tool {
@@ -62,6 +79,8 @@ impl WithDependsOn<Tool> for Tool {
             env: self.env.clone(),
             depends_on: depends_on.to_vec(),
             metrics: self.metrics.clone(),
+            as_sql: self.as_sql,
+            signature: self.signature.clone(),
         }
     }
 }

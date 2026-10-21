@@ -6,13 +6,31 @@
 
 While a test is executing, `testoperator` continuously probes the `/health` and `/v1/ready` endpoints on the running `spiced` instance. Responses that fail or take longer than 5 ms are recorded and surfaced after the test run; any such issues will cause the test to fail with a summary that includes the number of failures and the worst latency observed.
 
+## Liveness endpoints (`testoperator run htap`)
+
+An HTAP run seeds the source, waits for `spiced`, drives load for hours, then runs its gates — and from outside the process every one of those phases looks like the same quiet `testoperator`. So the run serves, about itself, the two endpoints it probes on `spiced`. They bind `127.0.0.1:8099` by default (`--health-listen <ADDR>`, `TESTOPERATOR_HEALTH_LISTEN`; `off` disables them):
+
+- `GET /health` — liveness: `200 ok` while the process is up. Answered on the same Tokio runtime that drives the workload, so its *latency* also says whether that runtime is still scheduling promptly.
+- `GET /v1/ready` — readiness, meaning **the measured workload is running**: `200` only while load is being applied, `503` naming the current phase otherwise.
+
+Both bodies are one line of `key=value` tokens, so a shell probe can read them without a JSON parser:
+
+```shell
+$ curl -s localhost:8099/v1/ready
+not_ready phase=preparing_source phase_s=412
+```
+
+Phases are `starting`, `preparing_source`, `waiting_for_spiced`, `running` (the only ready one), `finalizing` and `finished`. Failing to bind is a warning, never a failed run.
+
 ## Common Options
 
 - `-p, --spicepod-path <SPICEPOD_PATH>`: Path to the `spicepod.yaml` file.
-- `-s, --spiced-path <SPICED_PATH>`: Path to the `spiced` binary.
+- `-s, --spiced-path <SPICED_PATH>`: Path to the `spiced` binary, or URL to an already-running spiced instance's Flight endpoint (e.g., `http://localhost:50051` to connect to an external instance).
 - `-d, --data-dir <DATA_DIR>`: An optional data directory to symlink into the `spiced` instance.
 - `--ready-wait <WAIT TIME>`: How long to wait before spiced is ready.
 - `--disable-progress-bars`: Disable progress bars during the test.
+- `--health-listen <ADDR>`: Where testoperator serves its own `/health` and `/v1/ready` (default `127.0.0.1:8099`, `off` to disable). See [Liveness endpoints](#liveness-endpoints-testoperator-run-htap).
+- `--otlp-endpoint <URL>` / `--otlp-header KEY=VALUE`: Export metrics to an OTLP collector over the standard OTLP protocol instead of the default Arrow exporter. Repeat `--otlp-header` to add multiple headers (e.g., auth tokens).
 
 ## Use cases
 
@@ -20,14 +38,17 @@ While a test is executing, `testoperator` continuously probes the `/health` and 
 
 Run standard benchmarks using the `testoperator run bench [OPTIONS]` command. In addition to the common options, this command supports the following options:
 
-- `--query-set <QUERY_SET>`: The query set to use for the test. Possible values: `tpch`, `tpcds`, `clickbench`, `tpch[parameterized]`.
+- `--query-set <QUERY_SET>`: The query set to use for the test. Possible values: `tpch`, `tpcds`, `clickbench`, `tpch[parameterized]`, `integration[http]`, `scenario`.
+- `--scenario-query-file <FILE_PATH>`: Path to a YAML file containing custom scenario queries. Required when `--query-set scenario` is specified.
 - `--query-overrides <QUERY_OVERRIDES>`: Optional query overrides. Possible values: `sqlite`, `postgresql`, `mysql`, `dremio`, `spark`, `odbcathena`, `duckdb`.
 - `--scale-factor <SCALE_FACTOR>`: The expected scale factor for the test, used in metrics calculation.
-- `--validate`: A boolean flag to specify whether results should be validated against their expected results. Only supported for `tpch` or `tpch[parameterized]` query sets, and only supported for scale factor 1.
+- `--validate`: Compare query results against an oracle. TPC-H / `tpch[parameterized]` at scale factor 1 use the spec answer files. TPC-DS (any scale) and TPC-H at other scale factors compare each query to the same SQL run against unaccelerated clones under a reference schema: when testoperator starts `spiced`, it injects `__test_reference.*` datasets automatically; against an already-running instance, add those clones to the spicepod (`scripts/add_test_reference_datasets.py`) and pass `--reference-schema __test_reference`. ClickBench validates the same way. Scenario query sets validate when expected results are defined in the scenario file. Numeric cells, and numeric `ORDER BY` keys, compare equal when they differ by at most 0.1%, or, when both are written to the same four or more decimal places, by one unit in the last of them and within 1% — where an engine that rounds a decimal result and one that truncates it part ways. Infinities and NaN match only themselves. The scale factor 1 TPC-H, TPC-DS and ClickBench benchmarks in `dispatch/` set `validate_results: true`, except ten that keep `validate_results: false`. On `tpch/sf1/federated/glue[csv].yaml` and `tpch/sf1/federated/iceberg[hadoop].yaml`, TPC-H Q6 returns a wrong answer: both sources type `l_discount` as a double, and Spice types the literal `0.06 + 0.01` as a `Float64` just below 0.07, so Q6's `BETWEEN` drops the rows at 0.07. The TPC-H tables behind `tpch/sf1/federated/mssql.yaml`, `mssql[catalog].yaml` and `odbc[athena].yaml` hold different text columns than the parquet the answer files were computed from, so no answer file is their oracle. The five `ClickBench` arms whose acceleration holds only part of the source — `s3[parquet]-arrow`, `s3[parquet]-arrow-partitioned`, `s3[parquet]-sqlite[memory]`, `s3[parquet]-turso[file]` and `s3[parquet]-postgres` — have no oracle either: their `refresh_sql` keeps the rows a runner can hold, while the `__test_reference.*` clone drops acceleration and reads every row. Benchmarks at larger scale factors measure performance and leave `validate_results` unset.
 - `--metrics`: Whether to upload metrics to the Spice OSS benchmarks dashboards. By default, submits to the Production metrics endpoint using the API key specified in the `SPICEAI_BENCHMARK_METRICS_KEY` environment variable. If specified, the metrics delivery endpoint can be overridden with the `SPICEAI_TELEMETRY_ENDPOINT` environment variable.
-- `--disable-caching`: Whether to disable results cache by supplying a `Cache-Control: no-cache` header over the Flight request. Allows disabling results cache separately from spicepod configuration.
+- `--disable-caching`: Whether to disable results cache by supplying a `Cache-Control: no-cache` header over the Flight request. Allows disabling results cache separately from spicepod configuration. A benchmark should almost always pass this: `runtime.caching.sql_results` is on by default with a one-second `item_ttl`, and a benchmark runs one warmup query followed by its timed iterations of the same SQL back-to-back, so without it the timed iterations read the cache the warmup filled. The `bench` workflow passes it by default; turn it off only for a spicepod that is benchmarking the cache itself, such as those under `test/spicepods/tpch/sf5/cache`.
 
-Running a benchmark test will always generate snapshots for the query explain plan and results for `tpch` and `tpcds` queries. Only explain plans will be generated for `clickbench` queries.
+Running a benchmark test will always generate snapshots for the query explain plan, and result snapshots for the `tpch` and `tpcds` queries. `clickbench` records result snapshots for the subset of its queries whose rows do not depend on how the engine breaks ties — see `SNAPSHOTTED_CLICKBENCH_QUERIES` in `src/commands/bench/mod.rs` — and explain plans for all of them.
+
+A snapshot that does not match, or that does not exist yet, fails the benchmark. Result snapshots are asserted on the warmup run — the only run that takes them — so that verdict comes from the warmup rather than from a timed iteration.
 
 Snapshots can be automatically re-generated using the [`INSTA_UPDATE`](https://docs.rs/insta/latest/insta/#updating-snapshots) environment variable.
 
@@ -63,6 +84,60 @@ or:
 cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced --query-set tpch --query-overrides postgresql --validate
 ```
 
+##### Run TPC-DS with result validation
+
+TPC-DS and ClickBench have no static answer files. `--validate` clones each unqualified dataset as an unaccelerated `__test_reference.*` table and compares every query's rows to that federated scan (multiset unless the row set depends on `ORDER BY` + `LIMIT`). A `GROUP BY` query with a top-level `LIMIT` and no `ORDER BY` that returns its group keys, such as ClickBench Q18, may return any of its groups, so when its rows differ from the reference's, each returned row is instead checked against the reference query's full, un-`LIMIT`ed result. Any other query with a top-level `LIMIT` and no `ORDER BY` keeps the direct comparison, because a row it returns can match the full result while being computed wrongly. A query whose `ORDER BY … LIMIT` sorts on something it does not return, such as ClickBench Q25, must match the reference row by row; when it does not, it is checked against the reference rows read back with their sort keys: rows tied on every sort key may come back in any order, rows the sort keys separate must keep their order, and the `LIMIT` may keep any of the rows tied at its cutoff. A query whose `ORDER BY … LIMIT` sorts only on columns it returns is compared one tie group at a time. A group of several rows that the `LIMIT` or `OFFSET` cuts must match on its sort key alone. A single row at either cutoff must match in full, and when it does not, it is checked the same way against the reference query's rows read past the `LIMIT` and before the `OFFSET`, because rows there may tie with it: two of ClickBench Q31's groups share the tenth count, 1058, so either one is a correct tenth row.
+
+```sh
+testoperator run bench -p ./test/spicepods/tpcds/sf1/accelerated/file\[parquet\]-cayenne\[file\].yaml -s spiced -d ./.data --query-set tpcds --validate
+```
+
+##### Run a custom scenario query set with validation
+
+Scenario query sets allow you to define custom queries in a YAML file. This is useful for ad-hoc testing or when you need custom validation that doesn't fit the standard integration test pattern.
+
+```sh
+testoperator run bench \
+  -p test/spicepods/http/post_requests.yaml \
+  -s spiced \
+  --query-set scenario \
+  --scenario-query-file test/scenario/http/post_requests.yaml \
+  --validate
+```
+
+The scenario query file format:
+
+```yaml
+name: my_custom_queries # Optional name for the query set
+
+queries:
+  # Query without validation
+  - name: basic_select
+    sql: SELECT * FROM my_table
+
+  # Query with row count validation
+  - name: count_check
+    sql: SELECT COUNT(*) FROM my_table
+    expected_results:
+      row_count: 100
+
+  # Query with inline expected results
+  - name: specific_values
+    sql: SELECT id, name FROM users ORDER BY id LIMIT 2
+    expected_results:
+      columns: 'id, name'
+      rows:
+        - '1, Alice'
+        - '2, Bob'
+
+  # Query with external CSV file validation
+  # - name: full_dataset
+  #   sql: SELECT * FROM my_table ORDER BY id
+  #   expected_results: ./expected/full_dataset.csv
+```
+
+For more examples, see `test/spicepods/http/queries.yaml`.
+
 ### Running Throughput Tests
 
 A throughput test replicates a benchmark test, but runs with multiple concurrent query executors. A throughput test uses the same command options as a benchmark test, with the additional options:
@@ -94,6 +169,8 @@ testoperator run throughput -p ./benchmarks/file_tpch.yaml -s spiced -d ./.data 
 A load test replicates a throughput test, but instead of running for a set number of query executions (2 by default for throughput tests) load tests run for a specified duration. A load test uses the same command options as a throughput test, with the additional options:
 
 - `--duration <SECONDS>`: The duration of the load test to run in seconds.
+- `--run-until-stopped`: Continue the load phase until manually interrupted (Ctrl+C). Warm-up and baseline still use `--duration` to size their runs.
+- `--mark-query-failed-if-exceeds <DURATION>`: Mark queries as failed if they exceed this duration threshold (e.g., "500ms", "2s"). Useful for identifying slow queries that should be treated as failures in metrics.
 
 A load test will match the specified duration as a best-effort. A load test will never be shorter than the specified duration, but can be longer than the specified duration if there are running queries when the end duration is passed. For example, a `--duration 10` is specified but a query that takes 60 seconds runs. The load test will end after the query finishes, taking 60 seconds instead of 10.
 
@@ -113,7 +190,7 @@ testoperator run load -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spic
 
 ### Running Data Consistency tests
 
-Data consistency tests support specifying two spicepods, and validating that the outputs of queries between the two match. This has been partially superseded by the functionality of `--validate`, but is still useful for testing between query sets that do not yet support the `--validate` option (like `tpcds` and `clickbench`).
+Data consistency tests support specifying two spicepods, and validating that the outputs of queries between the two match. This has been partially superseded by `--validate` (TPC-H gold files, TPC-DS / ClickBench / non-SF-1 TPC-H via a reference schema). It remains useful for comparing two spicepods rather than an accelerator against its unaccelerated source.
 
 A data consistency test supports the same options as a benchmark test, with the additional options:
 
@@ -232,20 +309,66 @@ Where `bodies.jsonl` might look like
 {"model": "claude-3-5-sonnet-20241022","max_tokens": 512,"messages": [{"role": "system", "content": "You are god"}, {"role": "user", "content": "Is god real?"}]}
 ```
 
-### Running Evaluation tests
+### Running Search Tests
 
-Run model evaluations (evals) test. In addition to the common options, supports specifying:
+Search tests send each query in the `test_queries` table to the runtime, then calculate NDCG, recall, MRR, and precision at each rank cutoff `k` against the `relevance_data` table. Search tests support the common options.
 
-- `--model <MODEL NAME>`: The language model (as named in Spicepod) to test against. If not specified, the first model from the Spicepod definition will be used.
-- `--eval <EVAL NAME>`: The eval name (as named in Spicepod) to test against. If not specified, the first eval from the Spicepod definition will be used.
+`testoperator run search [OPTIONS] -p <SPICEPOD>`
 
-`testoperator run evals [OPTIONS]`
+The spicepod loads its own data (for example, parquet files on Hugging Face) and must define the `corpus`, `test_queries`, and `relevance_data` tables. The `benchmark_dataset` metric attribute comes from the spicepod's top-level `metadata.benchmark_dataset` value, or is `custom` when the spicepod does not set it. Refer to [`test/spicepods/search/README.md`](../../test/spicepods/search/README.md) for the table schema.
 
-### Running Vector Search Tests
+Where options are:
 
-Running vector search tests with the testoperator is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.
+- `--sql-pipeline <FILE_OR_SQL>`: A parameterized SQL search pipeline. When set, each query goes to `POST /v1/sql` with this SQL, not to `POST /v1/search`. The value is a path to a file that exists, or the SQL text. A value that ends with `.sql` or has no whitespace must be a file. Thus, a mistyped path fails with `SQL pipeline file not found`, and does not run as SQL.
 
-`testoperator run vector-search [OPTIONS]`
+A SQL pipeline can use these named parameters:
+
+| Parameter | Value |
+|---|---|
+| `:query` | The query text from `test_queries.text`. |
+| `:limit` | The result limit (`10`). |
+
+A SQL pipeline must return these columns:
+
+| Column | Required | Description |
+|---|---|---|
+| `_id` | Yes | The corpus id. It must match `relevance_data."corpus-id"`. |
+| `_score` | No | A numeric score. It is recorded, but evaluation does not use it. |
+
+Rows must be in rank order: the first row is the best match. For example:
+
+```bash
+# SQL in a file
+testoperator run search -p spicepod.yaml --sql-pipeline pipelines/text_search.sql
+
+# SQL text
+testoperator run search -p spicepod.yaml \
+  --sql-pipeline "SELECT _id, _score FROM text_search(corpus, :query) ORDER BY _score DESC LIMIT :limit"
+```
+
+> [!NOTE]
+> Search table functions (`text_search`, `vector_search`, `rrf`) do not accept parameters as arguments yet (#15046). Until that is fixed, a pipeline can use parameters only in other positions, for example in `WHERE` and `LIMIT`.
+
+### Running Text-to-SQL tests
+
+Running text to sql tests with the testoperator is still experimental.
+
+```bash
+testoperator run text-to-sql [OPTIONS]
+```
+Where options are:
+- `--model <MODEL NAME>`: The language model (named in spicepod) to perform text-to-sql.
+- `--queryset-file <FILE_PATH>`: File path to a JSONL of test questions and expected SQL (see `--queryset` for format). Cannot be used in conjunction with `--queryset`
+- `--queryset`: inline JSON array of test questions and expected SQL. Example:
+  ```bash
+    testoperator run text-to-sql --queryset '[ 
+      {"question": "how many sales have I made", "sql": "select count(1) from sales"},
+      {"question": "Who has the most sales?", "sql": "select sold_by from sales group by sold_by order by count(1) desc limit 1"}
+    ]'
+    --model foo
+  ```
+- `--sample-data-enabled`: Whether to use the `sample_data_enabled` HTTP parameter in the `v1/nsql` endpoint. Options: true, false, both. When both, runs `queryset` for both options for `sample_data_enabled`.
+- `--return-sql`: Whether to use the `Accept: application/sql` HTTP header in the `v1/nsql` endpoint. Options: true, false, both. When both, runs `queryset` for both options for `Accept`. 
 
 ### Running Append Tests
 
@@ -255,6 +378,31 @@ Results validation, snapshotting and metrics are not supported with append tests
 
 Append tests are not built by default, as the File connector source generation relies on the `duckdb` crate to generate the source data. Because of this, the append test can significantly increase the testoperator build time. To build with append support, use the `append` feature flag: `cargo build -p testoperator --release --features append`.
 
+### Running Cold-Start Tests
+
+`testoperator run cold-start` starts `spiced` with an empty data directory and measures how long its accelerations take to load and report ready. With `--baseline-spiced-path` it alternates runs of the candidate and a baseline binary, such as the previous release, on the same host and fails when the candidate's median or slowest time to ready exceeds `--max-ready-ratio` times the baseline's median or slowest. `--max-full-compactions` fails a run that commits more full Cayenne compactions than that before it is ready, a bound that does not depend on the host's speed. Every run must load the same row count. Both binaries receive `--cpu-cores` (default 2).
+
+```bash
+testoperator run cold-start \
+  -p 'test/spicepods/cold_start/delta_lake-cayenne[file]-append_unkeyed_sorted.yaml' \
+  -s ./target/release/spiced --baseline-spiced-path ./spiced-v2.3.1 \
+  --runs 3 --max-full-compactions 0 --ready-wait 600
+```
+
+The spicepods in `test/spicepods/cold_start/` read a synthetic Delta Lake table that `test/scripts/cold_start_delta_fixture.py` generates; `.github/workflows/testoperator_run_cold_start.yml` seeds it in MinIO and runs every spicepod nightly.
+
+### Scheduled Runs
+
+`testoperator dispatch <dir> --workflow <workflow>` dispatches one GitHub Actions run per test in the configs under `dir`; `.github/workflows/testoperator_dispatch.yml` runs it on a schedule over the configs in `dispatch/`. A config runs daily unless it sets `schedule: weekly`, which the configs whose source is a hosted service (Databricks, Snowflake, Oracle Cloud, BigQuery, Athena, Glue, DynamoDB, Azure Blob Storage, Spice Cloud) do, as do the source-to-accelerator checks described below. The daily run passes `--schedule daily` and the weekly run `--schedule weekly`; without `--schedule`, as in a manual dispatch, every config is dispatched.
+
+Each source is benchmarked federated, and each accelerator configuration once, from the suite's canonical source: `file[parquet]` for TPC-H and TPC-DS, `s3[parquet]` for ClickBench. An accelerated benchmark measures the accelerator once the data is loaded, so re-running the same accelerator in front of another source repeats a measurement the canonical config already makes, while the source itself is covered by its federated config. An accelerated config from another source belongs in `dispatch/` only when it exercises something that source alone provides, such as `mongodb-duckdb[file]-changes`, which loads through MongoDB change streams. The one other exception is a load into an accelerator whose values no other automated test checks. `mysql-arrow`, `mysql-duckdb[file]` and `databricks[delta_lake]-duckdb[file]` in TPC-H and `spicecloud-duckdb[file]` in TPC-DS keep a validated `bench` for that, on the weekly schedule, without the throughput and load runs.
+
+A `bench` test can set `layout` (one) or `layouts` (a list, one run each) to run its spicepod under an acceleration layout: `testoperator --layout primary_key,indexes,sort` configures those features on every accelerated dataset before `spiced` starts, on each benchmark table's columns in `crates/test-framework/src/layout/` — its unique key, the columns the benchmark joins and filters on, a sort or clustering order other than the generated one, its date column, and a partition expression. The features are `primary_key`, `indexes`, `sort` (`cayenne_sort_columns`, `on_refresh_sort_columns` or `arrow_sort_columns`), `cluster` (`cayenne_cluster_by`), `time_column` and `partition` (`partition_by`). A layout is refused rather than weakened: on an engine (or, for partitioning, a mode) that cannot take a feature, on a spicepod that already sets what it would configure, for Cayenne's `sort` with `cluster`, or when a feature would end up configured on no dataset. The `__test_reference.*` clones carry no acceleration, so `--validate` compares each layout with the same unaccelerated oracle. A layout run reports under its own test name, `<spicepod name>-layout[<features>]`, so its timings stay out of the default layout's metric series, and records no result or explain-plan snapshots: its plans legitimately differ, and `--validate` checks its answers. `testoperator run htap --layout` checks each layout against the source database with the HTAP gates instead. The `*-layouts.yaml` configs under `dispatch/{tpch,tpcds,clickbench}/sf1/accelerated/` run each engine's features alone and in the combinations that interact, and `dispatch/chbench/sf1-layouts/` runs CH-benCH's HTAP and validated bench under layouts each week.
+
+A `bench` test can also set `postgres_version`, which runs the bench workflow's local `postgres_tpch` source (TPC-H and TPC-DS at scale factor 1 or 10, and ClickBench's `s3[parquet]-postgres`) on one of the PostgreSQL release lines in `test/source_versions.json`, or `postgres_version: all` for one run on each of them. That file lists the release lines Spice supports and tests for each federated source database: LTS lines only, oldest first, so the newest is the default. Unset, a run uses the workflow's default line. `tpch/sf1/federated/postgres[catalog]-source_versions.yaml` and `tpcds/sf1/federated/postgres-source_versions.yaml` run their benchmark on every listed line each week. A CH-benCH `bench` takes `postgres_version` for its PostgreSQL source too, and an `htap` test takes `source_version`, a line of its spicepod's source (MySQL for a `mysql*` spicepod, otherwise PostgreSQL) or `all`: `dispatch/chbench/sf1-source-versions/` runs the SF1 PostgreSQL and MySQL Cayenne configs on every listed line each week, on runners that start the source in Docker (the in-cluster sources of `spiceai-dev-xlarge-runners` have fixed versions). The integration suite (`.github/workflows/integration.yml`) reads the same file: its `source-versions` job runs the tests that start a PostgreSQL, MySQL or MongoDB container on every listed line but the newest, which the main run covers.
+
+The release branch the schedule also covers changes only when a fix is cherry-picked onto it, so it dispatches its whole suite once per `spiced` build: a daily run dispatches nothing for it when the build it selects, the newest commit on the branch with a built `spiced`, was already benchmarked by an earlier scheduled run. That record is a workflow artifact kept for 60 days, the repository's artifact-retention limit, so an unchanged build is benchmarked again once that long has passed since its last run. The first scheduled run that finds a build recorded re-runs, once, the failed jobs of every run that build's dispatch created, so a failure that does not reproduce on a second attempt does not stand until the next build. A run that was cancelled is not re-run. Until every first attempt has finished, the build stays unrecorded, and each scheduled run re-runs the first attempts that have failed since.
+
 ### Other Examples
 
 #### Using a Non-System Wide Spiced Binary Path
@@ -262,3 +410,67 @@ Append tests are not built by default, as the File connector source generation r
 ```sh
 testoperator run throughput -p spicepod.yaml -s ./target/debug/spiced --query-set tpch
 ```
+
+### Running queries on existing `spiced` instances
+
+Testoperator supports running query sets against `spiced` instances that are already running. This option is useful for running testoperator quickly, locally, for development or performance comparisons (e.g. between versions, changes, etc).
+
+To run queries on an existing `spiced` instance, ensure your `spiced` instance is running and ready. Then, run testoperator with:
+
+```sh
+testoperator run query --query-set tpch --query-overrides duckdb
+```
+
+Testoperator will run without explain plan or result snapshotting. Result validation is supported with `--validate`. For TPC-DS (and TPC-H at scale factors other than 1) that requires the running instance to already register a complete reference schema covering every query table — testoperator cannot inject `__test_reference.*` clones into a process it did not start. Add those clones with `scripts/add_test_reference_datasets.py` before starting `spiced`, then pass `--validate` (and `--reference-schema __test_reference` if the spicepod does not already qualify the clones under that schema). Telemetry and metrics emission is not supported.
+
+### Driving a distributed cluster via a system adapter
+
+Testoperator can acquire its SUT through an out-of-process JSON-RPC adapter (the same protocol [spicebench](https://github.com/spiceai/spicebench) uses). This is how cluster benchmarks — distributed accelerations and Ballista-style distributed query — are wired up: the adapter provisions the cluster (k8s, Spice Cloud, local docker-compose, …) and returns the Flight SQL URL (and optionally an HTTP base URL) for testoperator to drive queries against.
+
+When `--system-adapter-stdio-cmd` or `--system-adapter-http-url` is set, testoperator skips the local-spawn path entirely: it calls `setup()` on the adapter, runs the benchmark against the returned URLs, and calls `teardown()` at the end (even on failure). The adapter receives the resolved spicepod path and any `--system-adapter-param` key/values in the setup metadata so it can deploy that spicepod to the cluster.
+
+System-adapter mode is supported today by `run bench` and `run throughput`.
+
+#### System Adapter Options
+
+- `--system-adapter-stdio-cmd <CMD>`: Command to spawn as a stdio JSON-RPC adapter (mutually exclusive with `--system-adapter-http-url`).
+- `--system-adapter-stdio-args <STR>`: Space-delimited argument string for the stdio command.
+- `--system-adapter-http-url <URL>`: URL of an already-running HTTP JSON-RPC adapter.
+- `--system-adapter-param KEY=VALUE`: Adapter-specific parameter; passed in the `setup()` metadata map. Repeatable.
+- `--system-adapter-env KEY=VALUE`: Environment variable for the stdio adapter subprocess. Repeatable; stdio-only.
+- `--system-adapter-name <NAME>`: Logical name surfaced as a metric attribute and forwarded to the adapter. Defaults to `system_adapter`.
+
+#### Query Transport Selection
+
+Cluster SUTs typically expose two query interfaces from the scheduler:
+
+- Flight SQL gRPC — exercises the distributed-acceleration code path. This is the default; nothing extra to set.
+- HTTP `POST /v1/queries` — exercises the Ballista (distributed-query) submit-and-poll path. Select this with the existing `--distributed` flag.
+
+The HTTP base URL used by `--distributed` comes from the adapter's `setup` response: testoperator looks for an entry under `endpoints["spice.http.v1.queries"]`, and falls back to deriving the base URL from the Flight URL if the adapter doesn't provide one.
+
+#### Example: distributed accelerations against a local cluster
+
+```sh
+testoperator run bench \
+    -p ./test/spicepods/tpch/sf1/accelerated/distributed/cayenne.yaml \
+    --system-adapter-stdio-cmd ./target/debug/spidapter \
+    --system-adapter-stdio-args "local-spiced" \
+    --system-adapter-param executor_replicas=3 \
+    --query-set tpch \
+    --validate
+```
+
+#### Example: Ballista distributed query against the same cluster
+
+```sh
+testoperator run bench \
+    -p ./test/spicepods/tpch/sf1/distributed/ballista.yaml \
+    --system-adapter-stdio-cmd ./target/debug/spidapter \
+    --system-adapter-stdio-args "local-spiced" \
+    --system-adapter-param executor_replicas=3 \
+    --query-set tpch \
+    --distributed
+```
+
+Local-spawn-only side metrics (process memory, on-disk acceleration size) are skipped when running through a system adapter — the adapter's `metrics()` RPC is the canonical source of SUT-side resource usage for cluster benches.

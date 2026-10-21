@@ -1,0 +1,17 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q7"
+---
++---------------+--------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                       |
++---------------+--------------------------------------------------------------------------------------------+
+| logical_plan  | SubqueryAlias: c                                                                           |
+|               |   Projection: oracle_tpch.TPCH_SF1.ORDERS.O_ORDERKEY AS KEY                                |
+|               |     Limit: skip=0, fetch=10                                                                |
+|               |       TableScan: oracle_tpch.TPCH_SF1.ORDERS projection=[O_ORDERKEY], fetch=10             |
+| physical_plan | ProjectionExec: expr=[O_ORDERKEY@0 as KEY]                                                 |
+|               |   CooperativeExec                                                                          |
+|               |     BytesProcessedExec                                                                     |
+|               |       OracleExec sql=SELECT "O_ORDERKEY" FROM "TPCH_SF1"."ORDERS" FETCH FIRST 10 ROWS ONLY |
+|               |                                                                                            |
++---------------+--------------------------------------------------------------------------------------------+
