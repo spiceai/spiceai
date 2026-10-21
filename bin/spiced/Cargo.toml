@@ -83,6 +83,10 @@ runtime-secrets = { path = "../../crates/runtime-secrets", default-features = fa
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 rustls.workspace = true
+# Not used directly; sets the version floors declared in the workspace `Cargo.toml`.
+rustls-webpki.workspace = true
+webpki-root-certs.workspace = true
+webpki-roots.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
 zeroize = "1.8"
