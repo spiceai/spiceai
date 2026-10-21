@@ -54,16 +54,27 @@ fn cluster_table_wrapper(catalog_name: &str) -> CatalogTableWrapper {
             as Arc<dyn TableProvider>
     })
 }
-use iceberg::{CatalogBuilder, Namespace, NamespaceIdent, io::StorageFactory};
+use futures::StreamExt;
+use futures::stream::BoxStream;
+use iceberg::{
+    CatalogBuilder, Namespace, NamespaceIdent,
+    io::{
+        ADLS_AUTHORITY_HOST, FileRead, FileWrite, GCS_SERVICE_HOST, HF_ENDPOINT, OSS_ENDPOINT,
+        S3_ENDPOINT, Storage, StorageConfig, StorageFactory,
+    },
+};
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, RestCatalog as IcebergRestCatalog, RestCatalogBuilder,
 };
 use iceberg_storage_opendal::{CustomAwsCredentialLoader, OpenDalStorageFactory};
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use opendal::Operator;
+use runtime_datafusion::url_table;
 use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::fmt::Write;
+use std::path::{Component, Path, PathBuf};
 use std::{any::Any, collections::HashMap, sync::Arc};
 use url::Url;
 
@@ -430,7 +441,13 @@ impl CatalogConnector for IcebergCatalog {
         };
 
         props.extend(new_props);
-        let catalog_config = get_rest_catalog(base_uri, props, storage_factory.clone()).await?;
+        let catalog_config = get_rest_catalog(
+            base_uri,
+            props,
+            storage_factory.clone(),
+            format!("catalog '{}'", catalog.name),
+        )
+        .await?;
         let catalog_client = RestCatalog::new(catalog_config);
 
         let catalog_provider = IcebergCatalogProvider::try_new(
@@ -677,14 +694,337 @@ fn default_storage_factory_from_props(props: &HashMap<String, String>) -> Arc<dy
     }
 }
 
+/// Storage properties, as read by the Iceberg storage backends, whose value
+/// selects the host that storage requests and their credentials are sent to.
+const STORAGE_ENDPOINT_PROPS: [&str; 5] = [
+    S3_ENDPOINT,
+    GCS_SERVICE_HOST,
+    ADLS_AUTHORITY_HOST,
+    OSS_ENDPOINT,
+    HF_ENDPOINT,
+];
+
+/// A `StorageFactory` that refuses storage endpoints a REST catalog supplies in
+/// its responses when they target a private, loopback, or link-local host, and
+/// refuses `file://` table and metadata locations the catalog supplies.
+///
+/// A REST catalog's `LoadTableResult.config` (and `/v1/config` defaults and
+/// overrides) is merged into the table's `FileIO` properties, and supplies any
+/// key the Spicepod does not set. Endpoint properties the operator configured
+/// are trusted as-is; any other endpoint value reaching [`StorageFactory::build`]
+/// came from the catalog. The catalog also chooses every location the `FileIO`
+/// reads (metadata, manifests, data files). A `file://` location reads the local
+/// filesystem, so it is refused unless it is inside the `warehouse` the operator
+/// configured. Vended credentials are passed through unchanged.
+#[derive(Debug, Serialize, Deserialize)]
+struct VendedEndpointGuard {
+    inner: Arc<dyn StorageFactory>,
+    operator_endpoints: HashMap<String, String>,
+    /// Operator-configured `warehouse`, when it is a `file://` URL.
+    operator_file_root: Option<String>,
+    component: String,
+}
+
+impl VendedEndpointGuard {
+    fn new(
+        inner: Arc<dyn StorageFactory>,
+        operator_props: &HashMap<String, String>,
+        component: String,
+    ) -> Self {
+        let operator_endpoints = STORAGE_ENDPOINT_PROPS
+            .iter()
+            .filter_map(|key| {
+                operator_props
+                    .get(*key)
+                    .map(|value| ((*key).to_string(), value.clone()))
+            })
+            .collect();
+        let operator_file_root = operator_props.get("warehouse").and_then(|warehouse| {
+            Url::parse(warehouse)
+                .ok()
+                .filter(|url| url.scheme() == "file")
+                .map(|_| warehouse.clone())
+        });
+        Self {
+            inner,
+            operator_endpoints,
+            operator_file_root,
+            component,
+        }
+    }
+}
+
+#[typetag::serde(name = "SpiceVendedEndpointGuard")]
+impl StorageFactory for VendedEndpointGuard {
+    fn build(&self, config: &StorageConfig) -> iceberg::Result<Arc<dyn Storage>> {
+        check_vended_endpoints(
+            config.props(),
+            &self.operator_endpoints,
+            &self.component,
+            url_table::allow_private_hosts(),
+        )?;
+        let inner = self.inner.build(config)?;
+        Ok(Arc::new(GuardedStorage {
+            inner,
+            operator_file_root: self.operator_file_root.clone(),
+            component: self.component.clone(),
+        }))
+    }
+}
+
+/// `Storage` that refuses `file://` locations a catalog vended.
+///
+/// `InputFile` keeps the `Storage` it was built with and calls it on read, so
+/// the check has to live here rather than only in [`Storage::new_input`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GuardedStorage {
+    inner: Arc<dyn Storage>,
+    operator_file_root: Option<String>,
+    component: String,
+}
+
+impl GuardedStorage {
+    fn refuse_local(&self, location: &str) -> iceberg::Result<()> {
+        check_vended_file_location(
+            location,
+            self.operator_file_root.as_deref(),
+            &self.component,
+            url_table::allow_private_hosts(),
+        )
+    }
+}
+
+#[typetag::serde(name = "SpiceGuardedStorage")]
+#[async_trait]
+impl Storage for GuardedStorage {
+    async fn exists(&self, path: &str) -> iceberg::Result<bool> {
+        self.refuse_local(path)?;
+        self.inner.exists(path).await
+    }
+
+    async fn metadata(&self, path: &str) -> iceberg::Result<iceberg::io::FileMetadata> {
+        self.refuse_local(path)?;
+        self.inner.metadata(path).await
+    }
+
+    async fn read(&self, path: &str) -> iceberg::Result<bytes::Bytes> {
+        self.refuse_local(path)?;
+        self.inner.read(path).await
+    }
+
+    async fn reader(&self, path: &str) -> iceberg::Result<Box<dyn FileRead>> {
+        self.refuse_local(path)?;
+        self.inner.reader(path).await
+    }
+
+    async fn write(&self, path: &str, bs: bytes::Bytes) -> iceberg::Result<()> {
+        self.refuse_local(path)?;
+        self.inner.write(path, bs).await
+    }
+
+    async fn writer(&self, path: &str) -> iceberg::Result<Box<dyn FileWrite>> {
+        self.refuse_local(path)?;
+        self.inner.writer(path).await
+    }
+
+    async fn delete(&self, path: &str) -> iceberg::Result<()> {
+        self.refuse_local(path)?;
+        self.inner.delete(path).await
+    }
+
+    async fn delete_prefix(&self, path: &str) -> iceberg::Result<()> {
+        self.refuse_local(path)?;
+        self.inner.delete_prefix(path).await
+    }
+
+    async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> iceberg::Result<()> {
+        let mut collected = Vec::new();
+        while let Some(path) = paths.next().await {
+            self.refuse_local(&path)?;
+            collected.push(path);
+        }
+        self.inner
+            .delete_stream(futures::stream::iter(collected).boxed())
+            .await
+    }
+
+    fn new_input(&self, path: &str) -> iceberg::Result<iceberg::io::InputFile> {
+        self.refuse_local(path)?;
+        Ok(iceberg::io::InputFile::new(
+            Arc::new(self.clone()),
+            path.to_string(),
+        ))
+    }
+
+    fn new_output(&self, path: &str) -> iceberg::Result<iceberg::io::OutputFile> {
+        self.refuse_local(path)?;
+        Ok(iceberg::io::OutputFile::new(
+            Arc::new(self.clone()),
+            path.to_string(),
+        ))
+    }
+}
+
+/// Returns an error for the first storage endpoint in `props` that was not set
+/// by the operator and targets a private, loopback, or link-local host.
+fn check_vended_endpoints(
+    props: &HashMap<String, String>,
+    operator_endpoints: &HashMap<String, String>,
+    component: &str,
+    allow_private_hosts: bool,
+) -> iceberg::Result<()> {
+    if allow_private_hosts {
+        return Ok(());
+    }
+    for key in STORAGE_ENDPOINT_PROPS {
+        let Some(value) = props.get(key) else {
+            continue;
+        };
+        if operator_endpoints.get(key) == Some(value) {
+            continue;
+        }
+        if endpoint_targets_internal_host(value) {
+            return Err(iceberg::Error::new(
+                iceberg::ErrorKind::DataInvalid,
+                vended_endpoint_refused_message(component, key, value),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `endpoint` (a URL, or a bare `host[:port]` that the storage backends
+/// treat as `https://host[:port]`) has a literal internal IP, a well-known
+/// internal hostname, or no host that can be classified.
+fn endpoint_targets_internal_host(endpoint: &str) -> bool {
+    let parsed = Url::parse(endpoint)
+        .ok()
+        .filter(Url::has_host)
+        .or_else(|| Url::parse(&format!("https://{endpoint}")).ok());
+    match parsed.as_ref().and_then(Url::host) {
+        Some(url::Host::Ipv4(ip)) => url_table::is_internal_ip(ip.into()),
+        Some(url::Host::Ipv6(ip)) => url_table::is_internal_ip(ip.into()),
+        Some(url::Host::Domain(domain)) => {
+            domain.is_empty()
+                || url_table::is_blocked_internal_hostname(domain.trim_end_matches('.'))
+        }
+        None => true,
+    }
+}
+
+/// Returns an error when `location` is a `file://` URL the catalog supplied.
+///
+/// A location inside the operator's `file://` warehouse is trusted. `..`
+/// segments are collapsed before that comparison, so a location cannot escape
+/// the warehouse by traversal. `allow_private_hosts` is the same override the
+/// endpoint check uses.
+fn check_vended_file_location(
+    location: &str,
+    operator_file_root: Option<&str>,
+    component: &str,
+    allow_private_hosts: bool,
+) -> iceberg::Result<()> {
+    if allow_private_hosts {
+        return Ok(());
+    }
+    match local_file_path(location) {
+        LocalFilePath::NotFile => Ok(()),
+        LocalFilePath::OutsideLocalhost => Err(iceberg::Error::new(
+            iceberg::ErrorKind::DataInvalid,
+            vended_file_location_refused_message(component, location),
+        )),
+        LocalFilePath::Path(path) => {
+            let inside_operator_warehouse = operator_file_root
+                .and_then(local_file_path_buf)
+                .is_some_and(|root| path.starts_with(root));
+            if inside_operator_warehouse {
+                Ok(())
+            } else {
+                Err(iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    vended_file_location_refused_message(component, location),
+                ))
+            }
+        }
+    }
+}
+
+/// A `file://` location reduced to a local path, or a reason it is not one.
+enum LocalFilePath {
+    /// `location` is not a `file://` URL.
+    NotFile,
+    /// A `file://` URL that does not name a path on this machine.
+    OutsideLocalhost,
+    /// A local path with `.` and `..` collapsed, without reading the filesystem.
+    Path(PathBuf),
+}
+
+fn local_file_path(location: &str) -> LocalFilePath {
+    let Ok(url) = Url::parse(location) else {
+        return LocalFilePath::NotFile;
+    };
+    if url.scheme() != "file" {
+        return LocalFilePath::NotFile;
+    }
+    url.to_file_path()
+        .map_or(LocalFilePath::OutsideLocalhost, |path| {
+            LocalFilePath::Path(normalized_lexical_path(&path))
+        })
+}
+
+fn local_file_path_buf(location: &str) -> Option<PathBuf> {
+    match local_file_path(location) {
+        LocalFilePath::Path(path) => Some(path),
+        LocalFilePath::NotFile | LocalFilePath::OutsideLocalhost => None,
+    }
+}
+
+fn normalized_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn vended_file_location_refused_message(component: &str, location: &str) -> String {
+    format!(
+        "The Iceberg catalog for {component} set a table location to {location:?}, which reads the local filesystem, so the file is not opened and the table cannot be read. If this location is trusted, set the `warehouse` parameter to the directory that contains it, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+        url_table::ALLOW_PRIVATE_HOSTS_ENV
+    )
+}
+
+fn vended_endpoint_refused_message(component: &str, key: &str, value: &str) -> String {
+    let param_hint = if key == S3_ENDPOINT {
+        "set the `s3_endpoint` parameter to it"
+    } else {
+        "configure it in the Spicepod"
+    };
+    format!(
+        "The Iceberg catalog for {component} set `{key}` to {value:?}, a private, loopback, or link-local address, so no storage request is sent to it and the table cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+        url_table::ALLOW_PRIVATE_HOSTS_ENV
+    )
+}
+
 /// Builds an `IcebergRestCatalog` from a base URI and properties.
+///
+/// `component` names the dataset or catalog (e.g. `dataset 'orders'`) in errors.
 pub async fn get_rest_catalog(
     base_uri: String,
     mut props: HashMap<String, String, std::hash::RandomState>,
     storage_factory: Option<Arc<dyn StorageFactory>>,
+    component: String,
 ) -> Result<IcebergRestCatalog> {
     props.insert(REST_CATALOG_PROP_URI.to_string(), base_uri);
-    let factory = storage_factory.unwrap_or_else(|| default_storage_factory_from_props(&props));
+    let inner = storage_factory.unwrap_or_else(|| default_storage_factory_from_props(&props));
+    let factory: Arc<dyn StorageFactory> =
+        Arc::new(VendedEndpointGuard::new(inner, &props, component));
     RestCatalogBuilder::default()
         .with_storage_factory(factory)
         .load("rest", props)
@@ -1145,5 +1485,419 @@ mod tests {
             err.to_string(),
             "Unsupported scheme in warehouse URL: ftp://my-host/path"
         );
+    }
+
+    mod vended_storage_endpoint {
+        use super::super::{
+            GCS_SERVICE_HOST, S3_ENDPOINT, STORAGE_ENDPOINT_PROPS, check_vended_endpoints,
+            check_vended_file_location, get_rest_catalog, vended_endpoint_refused_message,
+            vended_file_location_refused_message,
+        };
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use axum::{Json, Router, routing::get};
+        use iceberg::{Catalog, TableIdent};
+        use parking_lot::Mutex;
+        use serde_json::{Value, json};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use url::Url;
+
+        const MANIFEST_LIST: &str = "s3://testbucket/warehouse/db/t/metadata/snap-1.avro";
+
+        fn load_table_result_at(
+            config: &Value,
+            metadata_location: &str,
+            manifest_list: &str,
+        ) -> Value {
+            json!({
+                "metadata-location": metadata_location,
+                "metadata": {
+                    "format-version": 2,
+                    "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+                    "location": "s3://testbucket/warehouse/db/t",
+                    "last-sequence-number": 1,
+                    "last-updated-ms": 1_700_000_000_000_i64,
+                    "last-column-id": 1,
+                    "current-schema-id": 0,
+                    "schemas": [{"type": "struct", "schema-id": 0, "fields": [
+                        {"id": 1, "name": "id", "required": false, "type": "long"}
+                    ]}],
+                    "default-spec-id": 0,
+                    "partition-specs": [{"spec-id": 0, "fields": []}],
+                    "last-partition-id": 999,
+                    "default-sort-order-id": 0,
+                    "sort-orders": [{"order-id": 0, "fields": []}],
+                    "properties": {},
+                    "current-snapshot-id": 1,
+                    "snapshots": [{
+                        "snapshot-id": 1,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1_700_000_000_000_i64,
+                        "manifest-list": manifest_list,
+                        "summary": {"operation": "append"},
+                        "schema-id": 0
+                    }],
+                    "snapshot-log": [],
+                    "metadata-log": []
+                },
+                "config": config,
+            })
+        }
+
+        /// Serves an Iceberg REST catalog whose table `db.t` vends `config`.
+        async fn start_rest_catalog(config: &Value) -> String {
+            start_rest_catalog_at(
+                config,
+                "s3://testbucket/warehouse/db/t/metadata/v1.metadata.json",
+                MANIFEST_LIST,
+            )
+            .await
+        }
+
+        /// An object store stand-in on a loopback address that records the
+        /// request line of every connection it accepts and answers `404`.
+        struct Sentinel {
+            endpoint: String,
+            requests: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn start_sentinel() -> Sentinel {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the sentinel listener");
+            let endpoint = format!(
+                "http://{}",
+                listener.local_addr().expect("read the sentinel address")
+            );
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&requests);
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let recorded = Arc::clone(&recorded);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0_u8; 8192];
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&buf[..n]);
+                        recorded
+                            .lock()
+                            .push(head.lines().next().unwrap_or_default().to_string());
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                    });
+                }
+            });
+            Sentinel { endpoint, requests }
+        }
+
+        /// Loads `db.t` through `get_rest_catalog`, as the Iceberg connectors
+        /// do, and reads the table's manifest list through its `FileIO`.
+        async fn read_manifest_list(
+            catalog_uri: String,
+            operator_props: HashMap<String, String>,
+        ) -> iceberg::Result<usize> {
+            let catalog =
+                get_rest_catalog(catalog_uri, operator_props, None, "dataset 't'".to_string())
+                    .await
+                    .expect("build the REST catalog");
+            let table = catalog
+                .load_table(&TableIdent::from_strs(["db", "t"]).expect("valid table identifier"))
+                .await
+                .expect("load the table from the REST catalog");
+            let bytes = table.file_io().new_input(MANIFEST_LIST)?.read().await?;
+            Ok(bytes.len())
+        }
+
+        /// Like [`read_manifest_list`], reading `location` instead of the
+        /// default manifest list.
+        async fn read_location(
+            catalog_uri: String,
+            operator_props: HashMap<String, String>,
+            location: &str,
+        ) -> iceberg::Result<usize> {
+            let catalog =
+                get_rest_catalog(catalog_uri, operator_props, None, "dataset 't'".to_string())
+                    .await
+                    .expect("build the REST catalog");
+            let table = catalog
+                .load_table(&TableIdent::from_strs(["db", "t"]).expect("valid table identifier"))
+                .await
+                .expect("load the table from the REST catalog");
+            let bytes = table.file_io().new_input(location)?.read().await?;
+            Ok(bytes.len())
+        }
+
+        async fn start_rest_catalog_at(
+            config: &Value,
+            metadata_location: &str,
+            manifest_list: &str,
+        ) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the REST catalog listener");
+            let addr = listener
+                .local_addr()
+                .expect("read the REST catalog address");
+            let table = load_table_result_at(config, metadata_location, manifest_list);
+            let app = Router::new()
+                .route(
+                    "/v1/config",
+                    get(|| async { Json(json!({"defaults": {}, "overrides": {}})) }),
+                )
+                .route(
+                    "/v1/namespaces/db/tables/t",
+                    get(move || {
+                        let table = table.clone();
+                        async move { Json(table) }
+                    }),
+                );
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            format!("http://{addr}")
+        }
+
+        fn vended_config(endpoint: &str) -> Value {
+            json!({
+                "s3.endpoint": endpoint,
+                "s3.access-key-id": "AKIATEST",
+                "s3.secret-access-key": "testsecret",
+                "s3.region": "us-east-1",
+                "s3.path-style-access": "true",
+            })
+        }
+
+        #[tokio::test]
+        async fn catalog_vended_internal_endpoint_is_refused_without_connecting() {
+            let sentinel = start_sentinel().await;
+            let port = sentinel
+                .endpoint
+                .rsplit(':')
+                .next()
+                .expect("sentinel endpoint has a port")
+                .to_string();
+            let endpoints = [
+                sentinel.endpoint.clone(),
+                format!("localhost:{port}"),
+                "http://169.254.169.254".to_string(),
+                "http://172.30.0.2:18077".to_string(),
+                "http://[::ffff:169.254.169.254]".to_string(),
+                "http://metadata.google.internal".to_string(),
+            ];
+            for endpoint in endpoints {
+                let catalog_uri = start_rest_catalog(&vended_config(&endpoint)).await;
+                let err = read_manifest_list(catalog_uri, HashMap::new())
+                    .await
+                    .expect_err("a vended internal endpoint must not be read");
+                assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid, "{endpoint}");
+                assert_eq!(
+                    err.message(),
+                    format!(
+                        "The Iceberg catalog for dataset 't' set `s3.endpoint` to {endpoint:?}, a private, loopback, or link-local address, so no storage request is sent to it and the table cannot be read. If this endpoint is trusted, set the `s3_endpoint` parameter to it, or set `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg"
+                    ),
+                    "{endpoint}"
+                );
+            }
+            assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn operator_configured_private_endpoint_is_used() {
+            let sentinel = start_sentinel().await;
+            let catalog_uri = start_rest_catalog(&vended_config("http://169.254.169.254")).await;
+            let operator_props = HashMap::from([
+                ("s3.endpoint".to_string(), sentinel.endpoint.clone()),
+                ("s3.access-key-id".to_string(), "minio".to_string()),
+                ("s3.secret-access-key".to_string(), "minio123".to_string()),
+                ("s3.region".to_string(), "us-east-1".to_string()),
+                ("s3.path-style-access".to_string(), "true".to_string()),
+            ]);
+            let err = read_manifest_list(catalog_uri, operator_props)
+                .await
+                .expect_err("the sentinel answers 404");
+            assert_eq!(err.kind(), iceberg::ErrorKind::Unexpected, "{err}");
+            assert_eq!(
+                *sentinel.requests.lock(),
+                vec!["GET /testbucket/warehouse/db/t/metadata/snap-1.avro HTTP/1.1".to_string()]
+            );
+        }
+
+        #[test]
+        fn public_or_absent_vended_endpoint_passes() {
+            let operator = HashMap::new();
+            for endpoint in [
+                "https://s3.us-west-2.amazonaws.com",
+                "https://storage.googleapis.com",
+                "s3.eu-central-1.amazonaws.com",
+                "http://8.8.8.8:9000",
+                "https://minio.example.com:9000",
+            ] {
+                let props = HashMap::from([(S3_ENDPOINT.to_string(), endpoint.to_string())]);
+                check_vended_endpoints(&props, &operator, "dataset 't'", false)
+                    .unwrap_or_else(|e| panic!("{endpoint} must pass: {e}"));
+            }
+            let credentials_only = HashMap::from([
+                ("s3.access-key-id".to_string(), "AKIATEST".to_string()),
+                ("s3.secret-access-key".to_string(), "testsecret".to_string()),
+                ("s3.session-token".to_string(), "token".to_string()),
+            ]);
+            check_vended_endpoints(&credentials_only, &operator, "dataset 't'", false)
+                .expect("vended credentials without an endpoint pass");
+        }
+
+        #[test]
+        fn every_endpoint_property_is_checked() {
+            for key in STORAGE_ENDPOINT_PROPS {
+                let props = HashMap::from([(key.to_string(), "http://10.0.0.5".to_string())]);
+                let err = check_vended_endpoints(&props, &HashMap::new(), "catalog 'ice'", false)
+                    .expect_err("a vended private endpoint is refused");
+                assert_eq!(
+                    err.message(),
+                    vended_endpoint_refused_message("catalog 'ice'", key, "http://10.0.0.5"),
+                );
+            }
+            assert_eq!(
+                vended_endpoint_refused_message(
+                    "catalog 'ice'",
+                    GCS_SERVICE_HOST,
+                    "http://10.0.0.5"
+                ),
+                "The Iceberg catalog for catalog 'ice' set `gcs.service.host` to \"http://10.0.0.5\", a private, loopback, or link-local address, so no storage request is sent to it and the table cannot be read. If this endpoint is trusted, configure it in the Spicepod, or set `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg"
+            );
+        }
+
+        #[test]
+        fn operator_value_is_trusted_only_when_unchanged() {
+            let operator =
+                HashMap::from([(S3_ENDPOINT.to_string(), "http://10.0.0.5:9000".to_string())]);
+            let same = operator.clone();
+            check_vended_endpoints(&same, &operator, "dataset 't'", false)
+                .expect("the operator's own endpoint passes");
+            let replaced = HashMap::from([(
+                S3_ENDPOINT.to_string(),
+                "http://169.254.169.254".to_string(),
+            )]);
+            let err = check_vended_endpoints(&replaced, &operator, "dataset 't'", false)
+                .expect_err("a catalog value replacing the operator's is checked");
+            assert_eq!(
+                err.message(),
+                vended_endpoint_refused_message(
+                    "dataset 't'",
+                    S3_ENDPOINT,
+                    "http://169.254.169.254"
+                )
+            );
+        }
+
+        #[test]
+        fn allow_private_hosts_override_admits_internal_endpoints() {
+            let props = HashMap::from([(
+                S3_ENDPOINT.to_string(),
+                "http://169.254.169.254".to_string(),
+            )]);
+            check_vended_endpoints(&props, &HashMap::new(), "dataset 't'", true)
+                .expect("the override admits internal endpoints");
+        }
+
+        #[tokio::test]
+        async fn catalog_vended_file_location_is_refused_without_opening() {
+            let dir = tempfile::tempdir().expect("create a temporary directory");
+            let secret = dir.path().join("secret.txt");
+            std::fs::write(&secret, b"secret-bytes").expect("write the secret file");
+            let secret_url = Url::from_file_path(&secret)
+                .expect("secret file has a file url")
+                .to_string();
+            let missing = "file:///no/such/iceberg-vended-location";
+            let credentials = json!({
+                "s3.access-key-id": "AKIATEST",
+                "s3.secret-access-key": "testsecret",
+                "s3.region": "us-east-1",
+            });
+            for location in [secret_url.as_str(), missing] {
+                let catalog_uri = start_rest_catalog_at(&credentials, location, location).await;
+                let err = read_location(catalog_uri, HashMap::new(), location)
+                    .await
+                    .expect_err("a vended file location must not be opened");
+                assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid, "{location}");
+                assert_eq!(
+                    err.message(),
+                    vended_file_location_refused_message("dataset 't'", location),
+                    "{location}"
+                );
+            }
+            assert_eq!(
+                std::fs::read(&secret).expect("the secret file is still on disk"),
+                b"secret-bytes"
+            );
+        }
+
+        #[tokio::test]
+        async fn operator_file_warehouse_location_is_not_refused() {
+            let dir = tempfile::tempdir().expect("create a temporary directory");
+            let inside = dir.path().join("snap.avro");
+            std::fs::write(&inside, b"not-avro").expect("write a file inside the warehouse");
+            let inside_url = Url::from_file_path(&inside)
+                .expect("warehouse file has a file url")
+                .to_string();
+            let root = Url::from_file_path(dir.path())
+                .expect("warehouse directory has a file url")
+                .to_string();
+            let catalog_uri =
+                start_rest_catalog_at(&json!({}), inside_url.as_str(), inside_url.as_str()).await;
+            let err = read_location(
+                catalog_uri,
+                HashMap::from([("warehouse".to_string(), root.clone())]),
+                &inside_url,
+            )
+            .await
+            .expect_err("the s3 storage backend does not read file urls");
+            assert!(
+                err.message().contains("Invalid s3 url"),
+                "the guard must let an operator warehouse file through to the storage backend, got: {err}"
+            );
+            let outside = "file:///etc/passwd";
+            let catalog_uri = start_rest_catalog_at(&json!({}), outside, outside).await;
+            let err = read_location(
+                catalog_uri,
+                HashMap::from([("warehouse".to_string(), root)]),
+                outside,
+            )
+            .await
+            .expect_err("a file outside the operator warehouse is refused");
+            assert_eq!(
+                err.message(),
+                vended_file_location_refused_message("dataset 't'", outside)
+            );
+        }
+
+        #[test]
+        fn file_location_traversal_cannot_escape_the_operator_warehouse() {
+            let root = "file:///var/warehouse";
+            let inside = "file:///var/warehouse/db/t/metadata/snap.avro";
+            check_vended_file_location(inside, Some(root), "dataset 't'", false)
+                .expect("a location inside the operator warehouse passes");
+            for location in [
+                "file:///etc/passwd",
+                "file:///var/warehouse/../../etc/passwd",
+                "file:///var/warehouse/%2e%2e/%2e%2e/etc/passwd",
+                "file://localhost/etc/passwd",
+                "file:///var/warehouse-evil/secret",
+            ] {
+                let err = check_vended_file_location(location, Some(root), "dataset 't'", false)
+                    .expect_err("a location outside the warehouse is refused");
+                assert_eq!(
+                    err.message(),
+                    vended_file_location_refused_message("dataset 't'", location),
+                    "{location}"
+                );
+            }
+            check_vended_file_location(inside, None, "dataset 't'", false)
+                .expect_err("without an operator warehouse every file location is refused");
+            check_vended_file_location("file:///etc/passwd", None, "dataset 't'", true)
+                .expect("the private-host override admits file locations");
+            check_vended_file_location("s3://bucket/key", None, "dataset 't'", false)
+                .expect("an object-store location is not a local file");
+        }
     }
 }

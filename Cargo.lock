@@ -17822,6 +17822,7 @@ dependencies = [
  "turso",
  "turso-shared",
  "twox-hash",
+ "typetag",
  "url",
  "util",
  "utoipa 5.5.0",

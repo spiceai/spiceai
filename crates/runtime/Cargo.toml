@@ -195,7 +195,7 @@ search = { path = "../search", default-features = false, features = [
     "text_search",
 ], optional = false }
 secrecy.workspace = true
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive", "rc"] }
 blake3 = { workspace = true, optional = true }
 serde_json.workspace = true
 snafu.workspace = true
@@ -224,6 +224,7 @@ tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 turso-shared = { workspace = true }
 twox-hash.workspace = true
+typetag = "0.2.22"
 url.workspace = true
 util = { path = "../util", features = ["datafusion", "http"] }
 utoipa = { workspace = true, features = ["axum_extras"], optional = true }

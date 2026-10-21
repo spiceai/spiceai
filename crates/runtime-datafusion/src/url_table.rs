@@ -138,13 +138,16 @@ fn validate_azure_url(url_str: &str) -> DFResult<()> {
 }
 
 /// Environment variable that, when set to a truthy value (`1`/`true`/`yes`/`on`),
-/// disables the SSRF guard on `http`/`https` URL tables, allowing them to target
-/// private, loopback, and link-local addresses. Off by default — intended only
-/// for operators who knowingly query an internal HTTP object store.
-const ALLOW_PRIVATE_HOSTS_ENV: &str = "SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS";
+/// disables the SSRF guard on `http`/`https` URL tables and on storage endpoints
+/// and `file://` locations supplied by an Iceberg REST catalog, allowing them to
+/// target private, loopback, and link-local addresses or the local filesystem.
+/// Off by default — intended only for operators who knowingly query an internal
+/// HTTP object store or a local Iceberg warehouse.
+pub const ALLOW_PRIVATE_HOSTS_ENV: &str = "SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS";
 
 /// Whether the SSRF guard is disabled via [`ALLOW_PRIVATE_HOSTS_ENV`].
-fn allow_private_hosts() -> bool {
+#[must_use]
+pub fn allow_private_hosts() -> bool {
     std::env::var(ALLOW_PRIVATE_HOSTS_ENV).is_ok_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
