@@ -6,18 +6,25 @@ rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Size-capped reads of HTTP response bodies, so a response cannot force an unbounded allocation"
+description = "Reads of HTTP response bodies that refuse decompression amplification"
 
 [dependencies]
+# The decoders `reqwest` itself uses (through tower-http), so a body decoded here
+# decodes exactly as one `reqwest` decompresses transparently.
+async-compression = { version = "0.4.42", features = ["tokio", "gzip", "zlib", "brotli", "zstd"] }
 bytes.workspace = true
+futures.workspace = true
 http.workspace = true
 reqwest.workspace = true
 snafu.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tokio-util = { workspace = true, features = ["io"] }
 
 [dev-dependencies]
+brotli = "8.0.2"
 flate2 = "1.1"
 serde_json.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 zstd = "0.13"
 
 [lints]
