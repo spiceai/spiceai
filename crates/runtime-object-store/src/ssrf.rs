@@ -141,7 +141,7 @@ pub fn url_table_destination_guard() -> DestinationGuard {
         is_internal_ip,
         redirect_target_is_internal,
         format!(
-            "URL tables cannot read from private, loopback, or link-local addresses. If this runtime intentionally queries an internal HTTP endpoint, set {ALLOW_PRIVATE_HOSTS_ENV}=true."
+            "URL tables cannot read from private, loopback, or link-local addresses. If this runtime intentionally queries an internal HTTP endpoint, set {ALLOW_PRIVATE_HOSTS_ENV}=true"
         ),
     )
 }
