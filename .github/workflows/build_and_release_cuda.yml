@@ -60,6 +60,13 @@ on:
           - 'release-lto'
         default: 'release'
 
+# A trunk push cancels the CUDA build of any older trunk push, queued or
+# running. Tag and manual runs each get a group of their own, so they never
+# cancel or wait on another run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/trunk' && 'trunk' || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   setup-matrix:
     name: Setup CUDA matrix
