@@ -125,7 +125,7 @@ pub fn check_stream_framing(bytes: &[u8]) -> Result<StreamFraming, ArrowError> {
         };
         let (declared, after_length) = if *prefix == CONTINUATION_MARKER {
             after_prefix.split_first_chunk::<4>().ok_or_else(|| {
-                framing_error(format!(
+                framing_error(&format!(
                     "message {} ends inside its metadata length",
                     framing.messages
                 ))
@@ -141,7 +141,7 @@ pub fn check_stream_framing(bytes: &[u8]) -> Result<StreamFraming, ArrowError> {
             .ok()
             .filter(|&len| len <= after_length.len())
             .ok_or_else(|| {
-                framing_error(format!(
+                framing_error(&format!(
                     "message {} declares {metadata_len} bytes of metadata, but only {} bytes remain",
                     framing.messages,
                     after_length.len()
@@ -149,7 +149,7 @@ pub fn check_stream_framing(bytes: &[u8]) -> Result<StreamFraming, ArrowError> {
             })?;
         let (metadata, after_metadata) = after_length.split_at(metadata_len);
         let message = arrow_ipc::root_as_message(metadata).map_err(|error| {
-            framing_error(format!(
+            framing_error(&format!(
                 "message {} has unreadable metadata: {error}",
                 framing.messages
             ))
@@ -159,7 +159,7 @@ pub fn check_stream_framing(bytes: &[u8]) -> Result<StreamFraming, ArrowError> {
             .ok()
             .filter(|&len| len <= after_metadata.len())
             .ok_or_else(|| {
-                framing_error(format!(
+                framing_error(&format!(
                     "message {} declares a {body_len} byte body, but only {} bytes remain",
                     framing.messages,
                     after_metadata.len()
@@ -178,7 +178,7 @@ pub fn check_stream_framing(bytes: &[u8]) -> Result<StreamFraming, ArrowError> {
     }
 }
 
-fn framing_error(detail: String) -> ArrowError {
+fn framing_error(detail: &str) -> ArrowError {
     ArrowError::ParseError(format!("Arrow IPC stream is malformed: {detail}"))
 }
 
