@@ -522,7 +522,8 @@ fn gauge_export_one_key_per_data_point(
     keys: &[String],
 ) -> ExportMetricsServiceRequest {
     let mut request = gauge_export(metric, 1.0, first_time_unix_nano, Vec::new());
-    let Some(Data::Gauge(gauge)) = &mut request.resource_metrics[0].scope_metrics[0].metrics[0].data
+    let Some(Data::Gauge(gauge)) =
+        &mut request.resource_metrics[0].scope_metrics[0].metrics[0].data
     else {
         unreachable!("gauge_export builds a gauge");
     };

@@ -4270,9 +4270,8 @@ mod tests {
         let engine = Arc::new(FakeQueryEngine::unregistered());
         let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
 
-        let mut data = gauge_with_one_key_per_data_point(
-            (0..MAX_METRIC_ATTRIBUTE_COLUMNS).map(dimension_key),
-        );
+        let mut data =
+            gauge_with_one_key_per_data_point((0..MAX_METRIC_ATTRIBUTE_COLUMNS).map(dimension_key));
         if let Data::Gauge(gauge) = &mut data {
             gauge.data_points[0]
                 .attributes
@@ -4377,7 +4376,9 @@ mod tests {
 
         let request = otlp_request(vec![otlp_metric(
             "svc_requests",
-            Some(gauge_with_one_key_per_data_point([dimension_key(stored - 1)])),
+            Some(gauge_with_one_key_per_data_point([dimension_key(
+                stored - 1,
+            )])),
         )]);
         service
             .export(Request::new(request))
