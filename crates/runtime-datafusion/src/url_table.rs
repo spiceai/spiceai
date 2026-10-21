@@ -247,6 +247,33 @@ async fn validate_http_url_not_internal(url_str: &str) -> DFResult<()> {
     validate_http_url_with_policy(url_str, allow_private_hosts()).await
 }
 
+/// URL the object-store registry should build for a SQL URL table.
+///
+/// `http://` gains `allow_http=true` in the fragment. An existing fragment is
+/// kept, and an explicit `allow_http` value is left as written. `https://` is
+/// unchanged, so a redirect from it cannot switch the fetch to plaintext.
+fn object_store_url_for_sql_table(url: &str) -> DFResult<Url> {
+    let mut parsed = Url::parse(url).map_err(|err| {
+        DataFusionError::Plan(format!("Failed to parse URL table '{url}': {err}"))
+    })?;
+    if parsed.scheme() == "http" {
+        let mut fragment = parsed.fragment().unwrap_or("").to_string();
+        let already_set = fragment.split('&').any(|pair| {
+            pair.split('=')
+                .next()
+                .is_some_and(|key| key == "allow_http")
+        });
+        if !already_set {
+            if !fragment.is_empty() {
+                fragment.push('&');
+            }
+            fragment.push_str("allow_http=true");
+            parsed.set_fragment(Some(&fragment));
+        }
+    }
+    Ok(parsed)
+}
+
 async fn validate_http_url_with_policy(url_str: &str, allow_private: bool) -> DFResult<()> {
     if allow_private {
         return Ok(());
@@ -392,6 +419,13 @@ impl UrlTableFactory for SpiceUrlTableFactory {
         // Prevent SSRF: http/https URL tables must not target internal addresses.
         validate_http_url_not_internal(url).await?;
 
+        // An `http://` SQL URL is the operator asking for plaintext, the same
+        // way an `http://` dataset does. `ListingTableUrl` looks the store up
+        // without the fragment, so register that store here, after the address
+        // check. An `https://` URL stays HTTPS-only, and a redirect to `http://`
+        // is still refused.
+        let store_url = object_store_url_for_sql_table(url)?;
+
         // Parse the URL
         let table_url = ListingTableUrl::parse(url).map_err(|e| {
             DataFusionError::Plan(format!("Failed to parse URL table '{url}': {e}"))
@@ -414,6 +448,13 @@ impl UrlTableFactory for SpiceUrlTableFactory {
             // parking_lot::RwLock::read() returns guard directly (not Result)
             weak_state.read().clone()
         }; // Lock is dropped here
+
+        if store_url.scheme() == "http" {
+            state
+                .runtime_env()
+                .object_store_registry
+                .get_store(&store_url)?;
+        }
 
         // Infer options and schema from the URL
         let config = ListingTableConfig::new(table_url)
@@ -987,5 +1028,201 @@ mod tests {
         validate_http_url_with_policy("http://127.0.0.1/data.parquet", true)
             .await
             .expect("internal host should be allowed when policy permits");
+    }
+
+    #[test]
+    fn http_sql_url_opts_into_plaintext_and_https_does_not() {
+        let http = object_store_url_for_sql_table("http://example.com/data.csv")
+            .expect("an http URL parses");
+        assert_eq!(http.fragment(), Some("allow_http=true"));
+
+        let with_auth =
+            object_store_url_for_sql_table("http://example.com/data.csv#basic_auth=tok")
+                .expect("an http URL with a fragment parses");
+        let fragment = with_auth.fragment().expect("the fragment is kept");
+        assert!(
+            fragment.split('&').any(|pair| pair == "basic_auth=tok"),
+            "{fragment}"
+        );
+        assert!(
+            fragment.split('&').any(|pair| pair == "allow_http=true"),
+            "{fragment}"
+        );
+
+        let explicit =
+            object_store_url_for_sql_table("http://example.com/data.csv#allow_http=false")
+                .expect("an explicit allow_http parses");
+        assert_eq!(explicit.fragment(), Some("allow_http=false"));
+
+        let https = object_store_url_for_sql_table("https://example.com/data.csv")
+            .expect("an https URL parses");
+        assert_eq!(https.fragment(), None);
+    }
+
+    /// One CSV response for the SQL URL-table regression. `HEAD` reports the
+    /// length; `GET` returns the body, including a single byte range.
+    async fn serve_csv_once(
+        mut socket: tokio::net::TcpStream,
+        seen: Arc<parking_lot::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const CSV: &[u8] = b"id\n1\n";
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = match socket.read(&mut tmp).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") || buf.len() > 8192 {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let mut lines = text.split("\r\n");
+        let mut request = lines.next().unwrap_or("").split_whitespace();
+        let method = request.next().unwrap_or("").to_string();
+        let path = request.next().unwrap_or("").to_string();
+        seen.lock().push(format!("{method} {path}"));
+
+        let mut range: Option<(usize, usize)> = None;
+        for line in lines {
+            let Some(spec) = line.split_once(':') else {
+                continue;
+            };
+            if !spec.0.eq_ignore_ascii_case("range") {
+                continue;
+            }
+            let spec = spec.1.trim().strip_prefix("bytes=").unwrap_or("");
+            let Some((start_s, end_s)) = spec.split_once('-') else {
+                continue;
+            };
+            let Ok(start) = start_s.parse::<usize>() else {
+                continue;
+            };
+            let end = end_s
+                .parse::<usize>()
+                .unwrap_or(CSV.len().saturating_sub(1))
+                .min(CSV.len().saturating_sub(1));
+            if start < CSV.len() && start <= end {
+                range = Some((start, end));
+            }
+        }
+
+        let response = if method == "HEAD" {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                CSV.len()
+            )
+            .into_bytes()
+        } else if method == "GET" {
+            let (status, body) = if let Some((start, end)) = range {
+                let slice = &CSV[start..=end];
+                (
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: text/csv\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        CSV.len(),
+                        slice.len()
+                    ),
+                    slice,
+                )
+            } else {
+                (
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        CSV.len()
+                    ),
+                    CSV,
+                )
+            };
+            let mut bytes = status.into_bytes();
+            bytes.extend_from_slice(body);
+            bytes
+        } else {
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        };
+        let _ = socket.write_all(&response).await;
+    }
+
+    #[tokio::test]
+    async fn http_sql_url_table_reaches_an_explicit_http_server() {
+        use datafusion::prelude::{SessionConfig, SessionContext};
+        use runtime_object_store::registry::default_runtime_env;
+
+        struct ClearAllowPrivateHosts;
+        impl Drop for ClearAllowPrivateHosts {
+            fn drop(&mut self) {
+                // The variable is process-global; clear it even when the test fails.
+                unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
+            }
+        }
+        unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
+        let _clear = ClearAllowPrivateHosts;
+
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the csv server binds");
+        let port = listener
+            .local_addr()
+            .expect("the csv server has a port")
+            .port();
+        let seen_server = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen_server = Arc::clone(&seen_server);
+                tokio::spawn(serve_csv_once(socket, seen_server));
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/data.csv");
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new(),
+            default_runtime_env(tokio::runtime::Handle::current()),
+        );
+        let factory = SpiceUrlTableFactory::new();
+        factory.with_state(ctx.state_weak_ref());
+
+        let blocked = factory
+            .try_new(&url)
+            .await
+            .expect_err("an internal http URL is refused before any store is built");
+        assert!(
+            blocked
+                .to_string()
+                .contains("private, loopback, or link-local"),
+            "{blocked}"
+        );
+        assert!(
+            seen.lock().is_empty(),
+            "the refused URL still contacted the server: {blocked}"
+        );
+
+        unsafe { std::env::set_var(ALLOW_PRIVATE_HOSTS_ENV, "true") };
+        let table = factory
+            .try_new(&url)
+            .await
+            .unwrap_or_else(|err| panic!("an explicit http URL loads: {err}"))
+            .expect("the URL is a table");
+        let requests = seen.lock().clone();
+        assert!(
+            requests.iter().any(|request| request.contains("/data.csv")),
+            "the server saw {requests:?}"
+        );
+        assert!(
+            table
+                .schema()
+                .fields()
+                .iter()
+                .any(|field| field.name() == "id"),
+            "schema: {:?}",
+            table.schema()
+        );
     }
 }
