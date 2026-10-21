@@ -70,6 +70,9 @@ use iceberg_storage_opendal::{CustomAwsCredentialLoader, OpenDalStorageFactory};
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use opendal::Operator;
 use runtime_datafusion::url_table;
+
+#[path = "vended_redirect.rs"]
+mod vended_redirect;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -728,7 +731,9 @@ const S3_GLOBAL_ENDPOINT: &str = "https://s3.amazonaws.com";
 /// came from the catalog. The catalog also chooses every location the `FileIO`
 /// reads (metadata, manifests, data files). A `file://` location reads the local
 /// filesystem, so it is refused unless it is inside the `warehouse` the operator
-/// configured. Vended credentials are passed through unchanged.
+/// configured. A redirect from a catalog-vended endpoint is checked again before
+/// it is followed, and refused when the `Location` is internal. Vended
+/// credentials are passed through unchanged.
 #[derive(Debug, Serialize, Deserialize)]
 struct VendedEndpointGuard {
     inner: Arc<dyn StorageFactory>,
@@ -896,6 +901,21 @@ impl GuardedStorage {
         self.refuse_effective_endpoints(location).await
     }
 
+    /// Catalog component when a redirect from this storage must be refused.
+    ///
+    /// Absent when every endpoint is the operator's, and when
+    /// `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS` is set. Read on each call so the
+    /// override applies without rebuilding the catalog.
+    fn redirect_component(&self) -> Option<String> {
+        if url_table::allow_private_hosts()
+            || (self.vended_endpoints.is_empty() && self.vended_s3_region.is_none())
+        {
+            None
+        } else {
+            Some(self.component.clone())
+        }
+    }
+
     /// Refuses a catalog endpoint whose effective host is internal.
     ///
     /// For `s3.endpoint`, the effective host is the one OpenDAL's S3 builder
@@ -1011,42 +1031,52 @@ impl GuardedStorage {
 impl Storage for GuardedStorage {
     async fn exists(&self, path: &str) -> iceberg::Result<bool> {
         self.before_io(path).await?;
-        self.inner.exists(path).await
+        vended_redirect::scope(self.redirect_component(), self.inner.exists(path)).await
     }
 
     async fn metadata(&self, path: &str) -> iceberg::Result<iceberg::io::FileMetadata> {
         self.before_io(path).await?;
-        self.inner.metadata(path).await
+        vended_redirect::scope(self.redirect_component(), self.inner.metadata(path)).await
     }
 
     async fn read(&self, path: &str) -> iceberg::Result<bytes::Bytes> {
         self.before_io(path).await?;
-        self.inner.read(path).await
+        vended_redirect::scope(self.redirect_component(), self.inner.read(path)).await
     }
 
     async fn reader(&self, path: &str) -> iceberg::Result<Box<dyn FileRead>> {
         self.before_io(path).await?;
-        self.inner.reader(path).await
+        let component = self.redirect_component();
+        let inner = vended_redirect::scope(component.clone(), self.inner.reader(path)).await?;
+        Ok(Box::new(vended_redirect::ScopedFileRead {
+            inner,
+            component,
+        }))
     }
 
     async fn write(&self, path: &str, bs: bytes::Bytes) -> iceberg::Result<()> {
         self.before_io(path).await?;
-        self.inner.write(path, bs).await
+        vended_redirect::scope(self.redirect_component(), self.inner.write(path, bs)).await
     }
 
     async fn writer(&self, path: &str) -> iceberg::Result<Box<dyn FileWrite>> {
         self.before_io(path).await?;
-        self.inner.writer(path).await
+        let component = self.redirect_component();
+        let inner = vended_redirect::scope(component.clone(), self.inner.writer(path)).await?;
+        Ok(Box::new(vended_redirect::ScopedFileWrite {
+            inner,
+            component,
+        }))
     }
 
     async fn delete(&self, path: &str) -> iceberg::Result<()> {
         self.before_io(path).await?;
-        self.inner.delete(path).await
+        vended_redirect::scope(self.redirect_component(), self.inner.delete(path)).await
     }
 
     async fn delete_prefix(&self, path: &str) -> iceberg::Result<()> {
         self.before_io(path).await?;
-        self.inner.delete_prefix(path).await
+        vended_redirect::scope(self.redirect_component(), self.inner.delete_prefix(path)).await
     }
 
     async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> iceberg::Result<()> {
@@ -1055,9 +1085,12 @@ impl Storage for GuardedStorage {
             self.before_io(&path).await?;
             collected.push(path);
         }
-        self.inner
-            .delete_stream(futures::stream::iter(collected).boxed())
-            .await
+        vended_redirect::scope(
+            self.redirect_component(),
+            self.inner
+                .delete_stream(futures::stream::iter(collected).boxed()),
+        )
+        .await
     }
 
     fn new_input(&self, path: &str) -> iceberg::Result<iceberg::io::InputFile> {
@@ -2135,6 +2168,10 @@ mod tests {
             set_vended_endpoint_resolver_override, vended_endpoint_refused_message,
             vended_endpoint_rewritten_message, vended_endpoint_unresolved_message,
             vended_file_location_refused_message,
+            vended_redirect::{
+                clear_vended_redirect_connect_override, set_vended_redirect_connect_override,
+                vended_redirect_refused_message,
+            },
         };
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -2976,6 +3013,128 @@ mod tests {
                 .expect("the private-host override admits file locations");
             check_vended_file_location("s3://bucket/key", None, "dataset 't'", false)
                 .expect("an object-store location is not a local file");
+        }
+
+        /// Removes this test's connect override when the test ends.
+        struct ConnectOverride {
+            host: String,
+        }
+
+        impl ConnectOverride {
+            fn set(host: &str, authority: &str) -> Self {
+                set_vended_redirect_connect_override(host, authority);
+                Self {
+                    host: host.to_ascii_lowercase(),
+                }
+            }
+        }
+
+        impl Drop for ConnectOverride {
+            fn drop(&mut self) {
+                clear_vended_redirect_connect_override(&self.host);
+            }
+        }
+
+        /// Answers `302` to `location` and records the request line.
+        async fn start_redirector(location: &str) -> Sentinel {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the redirector");
+            let endpoint = format!(
+                "http://{}",
+                listener.local_addr().expect("read the redirector address")
+            );
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&requests);
+            let location = location.to_string();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let recorded = Arc::clone(&recorded);
+                    let location = location.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0_u8; 8192];
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&buf[..n]);
+                        recorded
+                            .lock()
+                            .push(head.lines().next().unwrap_or_default().to_string());
+                        let response = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+            Sentinel { endpoint, requests }
+        }
+
+        #[tokio::test]
+        async fn catalog_vended_endpoint_redirect_to_loopback_is_refused_without_connecting() {
+            let sentinel = start_sentinel().await;
+            let redirector = start_redirector(&format!("{}/secret", sentinel.endpoint)).await;
+            let authority = redirector
+                .endpoint
+                .trim_start_matches("http://")
+                .to_string();
+            let _connect = ConnectOverride::set("redirect.vended.test", &authority);
+            let _dns = ResolverOverride::set(
+                "redirect.vended.test",
+                Ok(vec![std::net::Ipv4Addr::new(8, 8, 8, 8).into()]),
+            );
+            let endpoint = format!(
+                "http://redirect.vended.test:{}",
+                authority.rsplit(':').next().expect("port")
+            );
+            let catalog_uri = start_rest_catalog(&vended_config(&endpoint)).await;
+            let err = read_manifest_list(catalog_uri, HashMap::new())
+                .await
+                .expect_err("a redirect to loopback must not be followed");
+            let expected = vended_redirect_refused_message(
+                "dataset 't'",
+                &format!("{}/secret", sentinel.endpoint),
+            );
+            assert!(
+                err.to_string().contains(&expected),
+                "expected the redirect refusal in {err}"
+            );
+            assert!(
+                !redirector.requests.lock().is_empty(),
+                "the public endpoint was never contacted, so the redirect was not exercised"
+            );
+            assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn operator_endpoint_redirect_to_loopback_is_followed() {
+            let sentinel = start_sentinel().await;
+            let redirector = start_redirector(&format!("{}/secret", sentinel.endpoint)).await;
+            let mut operator = vended_config(&redirector.endpoint);
+            operator
+                .as_object_mut()
+                .expect("config object")
+                .remove("s3.endpoint");
+            let catalog_uri = start_rest_catalog(&operator).await;
+            let mut props = HashMap::new();
+            props.insert("s3.endpoint".to_string(), redirector.endpoint.clone());
+            props.insert("s3.path-style-access".to_string(), "true".to_string());
+            props.insert("s3.region".to_string(), "us-east-1".to_string());
+            props.insert("s3.access-key-id".to_string(), "AKIATEST".to_string());
+            props.insert("s3.secret-access-key".to_string(), "testsecret".to_string());
+            let err = read_manifest_list(catalog_uri, props)
+                .await
+                .expect_err("the sentinel answers 404");
+            assert!(
+                !err.to_string().contains("redirected storage"),
+                "an operator endpoint redirect must be followed, got: {err}"
+            );
+            assert!(
+                !redirector.requests.lock().is_empty(),
+                "the operator endpoint was not contacted"
+            );
+            assert!(
+                !sentinel.requests.lock().is_empty(),
+                "the operator redirect was not followed: {err}"
+            );
         }
     }
 }
