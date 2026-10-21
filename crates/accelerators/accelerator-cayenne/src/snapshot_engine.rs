@@ -1225,8 +1225,11 @@ mod tests {
             std::fs::create_dir_all(anchor.join(dir)).expect("mkdir");
         }
         std::fs::write(anchor.join("tid/_lookup_index/key/parent.run"), b"run").expect("write");
-        std::fs::write(anchor.join("region=eu/cid/_lookup_index/key/child.run"), b"run")
-            .expect("write");
+        std::fs::write(
+            anchor.join("region=eu/cid/_lookup_index/key/child.run"),
+            b"run",
+        )
+        .expect("write");
         let mut slice = slice_with("tid", "current", &[], &[]);
         slice
             .tables
