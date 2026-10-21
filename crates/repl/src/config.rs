@@ -77,8 +77,11 @@ mod test {
 
     #[test]
     fn test_get_user_agent() {
+        // `uname -r` keeps a localversion suffix. A kernel built from a dirty
+        // tree ends in `+` (`6.12.94+`), which is part of the release, not a
+        // separator.
         let matching_regex = regex::Regex::new(
-            r"repl/\d+\.\d+\.\d+(-beta|-stable|-rc|-unstable)?(\.\d+)? \((Linux|Windows|Darwin)/[\d\w\.\-\_]+ (x86_64|aarch64|i386)\)",
+            r"repl/\d+\.\d+\.\d+(-beta|-stable|-rc|-unstable)?(\.\d+)? \((Linux|Windows|Darwin)/[\d\w.\-_+]+ (x86_64|aarch64|i386)\)",
         )
         .expect("regex should be constructed");
 
