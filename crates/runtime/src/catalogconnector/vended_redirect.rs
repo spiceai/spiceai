@@ -714,7 +714,7 @@ mod tests {
         }
     }
 
-    /// Read one HTTP request, including a body that arrives after the headers.
+    /// Read one `HTTP` request, including a body that arrives after the headers.
     ///
     /// One `read` can return only the header block. These fixtures record that
     /// text and assert on the body, so this waits until the last parsable

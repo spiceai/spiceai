@@ -713,7 +713,7 @@ const STORAGE_ENDPOINT_PROPS: [&str; 5] = [
 /// `client.region` is applied after `s3.region` and wins when both are set.
 const S3_REGION_PROPS: [&str; 2] = ["client.region", "s3.region"];
 
-/// The only endpoint OpenDAL 0.58.2 rewrites with the region.
+/// The only endpoint `OpenDAL` 0.58.2 rewrites with the region.
 const S3_GLOBAL_ENDPOINT: &str = "https://s3.amazonaws.com";
 
 /// A `StorageFactory` that refuses storage endpoints a REST catalog supplies in
@@ -799,7 +799,7 @@ impl StorageFactory for VendedEndpointGuard {
             allow_private_hosts,
         )?;
         // Literal addresses and blocked names are refused above. The host the
-        // storage client actually dials can still differ: OpenDAL's S3 builder
+        // storage client actually dials can still differ: `OpenDAL`'s S3 builder
         // rewrites the endpoint with the bucket from the location, and a domain
         // still has to be resolved. Both happen on the async path, where the
         // location is known, before the inner client is used.
@@ -935,7 +935,7 @@ impl GuardedStorage {
 
     /// Refuses a catalog endpoint whose effective host is internal.
     ///
-    /// For `s3.endpoint`, the effective host is the one OpenDAL's S3 builder
+    /// For `s3.endpoint`, the effective host is the one `OpenDAL`'s S3 builder
     /// dials after it rewrites the endpoint with the location's bucket. Other
     /// endpoints are classified as configured. A domain is resolved here; the
     /// storage client resolves it again when it connects, so this does not pin
@@ -987,7 +987,7 @@ impl GuardedStorage {
     /// Refuses a catalog region that the S3 client substitutes into the global
     /// AWS endpoint, producing an internal host.
     ///
-    /// OpenDAL uses `https://s3.amazonaws.com` when `s3.endpoint` is unset, then
+    /// `OpenDAL` uses `https://s3.amazonaws.com` when `s3.endpoint` is unset, then
     /// replaces that with `https://s3.{region}.amazonaws.com`. A region of
     /// `x@127.0.0.1:port/` makes the URL authority `s3.x@127.0.0.1:port`, so
     /// the client dials loopback. The operator's region, and a region that
@@ -1250,7 +1250,7 @@ fn s3_virtual_host_style(props: &HashMap<String, String>) -> bool {
 
 /// The region the S3 backend will use.
 ///
-/// Matches OpenDAL 0.58.2: a `client.region` or `s3.region` property wins,
+/// Matches `OpenDAL` 0.58.2: a `client.region` or `s3.region` property wins,
 /// including an empty one, and otherwise `AWS_REGION` then
 /// `AWS_DEFAULT_REGION`. An empty `AWS_REGION` does not fall through.
 fn s3_region(props: &HashMap<String, String>) -> String {
@@ -1283,7 +1283,7 @@ fn winning_s3_region(props: &HashMap<String, String>) -> Option<(&str, &str)> {
         .map(|region| ("s3.region", region.as_str()))
 }
 
-/// The endpoint string OpenDAL starts from, before bucket and region rewrites.
+/// The endpoint string `OpenDAL` starts from, before bucket and region rewrites.
 ///
 /// A property wins. Otherwise, unless `s3.disable-config-load` is set,
 /// `AWS_ENDPOINT_URL`, `AWS_ENDPOINT`, or `AWS_S3_ENDPOINT`. The default is
@@ -1345,7 +1345,7 @@ fn catalog_controlled_s3_region(
     })
 }
 
-/// The endpoint after OpenDAL removes `//{bucket}.` and normalizes the URL,
+/// The endpoint after `OpenDAL` removes `//{bucket}.` and normalizes the URL,
 /// before the region template is applied.
 fn s3_endpoint_after_bucket_removal(endpoint: &str, bucket: &str) -> String {
     let mut endpoint = if endpoint.starts_with("http") {
@@ -1361,7 +1361,7 @@ fn s3_endpoint_after_bucket_removal(endpoint: &str, bucket: &str) -> String {
 }
 
 /// `true` when bucket removal leaves the global AWS endpoint, which is the
-/// only endpoint OpenDAL rewrites with the region.
+/// only endpoint `OpenDAL` rewrites with the region.
 fn s3_region_is_substituted(endpoint: &str, bucket: &str) -> bool {
     s3_endpoint_after_bucket_removal(endpoint, bucket) == S3_GLOBAL_ENDPOINT
 }
@@ -1376,7 +1376,7 @@ fn endpoint_flag_is_truthy(value: &str) -> bool {
 
 /// The endpoint string the storage client will use for `location`.
 ///
-/// OpenDAL 0.58.2 `S3Builder::build_endpoint` deletes `//{bucket}.` from
+/// `OpenDAL` 0.58.2 `S3Builder::build_endpoint` deletes `//{bucket}.` from
 /// `s3.endpoint`, then, for virtual-host style, inserts the bucket in front of
 /// the host. Path style leaves the stripped host and prefixes the path with
 /// the bucket. A catalog can set `s3.endpoint` to a public address such as
@@ -1408,7 +1408,7 @@ fn s3_location_bucket(location: &str) -> Option<String> {
     (!bucket.is_empty()).then(|| bucket.to_string())
 }
 
-/// Mirrors OpenDAL 0.58.2 `S3Builder::build_endpoint` for the parts that choose
+/// Mirrors `OpenDAL` 0.58.2 `S3Builder::build_endpoint` for the parts that choose
 /// the host. The global AWS endpoint template is the only rewrite that
 /// substitutes the region.
 fn s3_effective_endpoint(
@@ -1481,9 +1481,7 @@ async fn refusal_for_effective_endpoint(
             vended_endpoint_refused_message(component, key, configured)
         });
     }
-    let Some(domain) = endpoint_domain(effective) else {
-        return None;
-    };
+    let domain = endpoint_domain(effective)?;
     let resolved = resolve_vended_host(domain).await;
     let internal = match &resolved {
         Ok(addrs) if addrs.iter().any(|ip| url_table::is_internal_ip(*ip)) => true,
@@ -1650,9 +1648,7 @@ async fn refusal_for_vended_s3_region(
             component, key, region, effective,
         ));
     }
-    let Some(domain) = endpoint_domain(effective) else {
-        return None;
-    };
+    let domain = endpoint_domain(effective)?;
     let resolved = resolve_vended_host(domain).await;
     let internal = match &resolved {
         Ok(addrs) if addrs.iter().any(|ip| url_table::is_internal_ip(*ip)) => true,
