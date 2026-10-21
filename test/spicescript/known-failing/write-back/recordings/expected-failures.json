@@ -47,7 +47,7 @@
       "who": "default",
       "key": "query: SELECT i, s, d FROM a WHERE id IN (2, 3, 4) ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"s\", row_number: 1, expected: \"\\\"4\\\"\", actual: \"\\\"2\\\"\" }",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"i\", row_number: 1, expected: \"\\\"3\\\"\", actual: \"\\\"2\\\"\" }",
       "group": "write-back"
     }
   ],

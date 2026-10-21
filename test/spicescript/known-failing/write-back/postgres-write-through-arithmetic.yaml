@@ -41,4 +41,4 @@ steps:
   - query: SELECT * FROM a
     eventually: 30s
   - query: SELECT i, s, d FROM a WHERE id IN (2, 3, 4) ORDER BY id
-    expect: { rows: [['3', '2', '4.00'], ['2', '4', '4.00'], ['4', '4', '5.00']] }
+    expect: { rows: [['3', '2', '2.00'], ['3', '4', '3.00'], ['4', '4', '5.00']] }
