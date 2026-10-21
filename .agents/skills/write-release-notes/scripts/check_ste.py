@@ -6,7 +6,7 @@
 # Reads a release notes Markdown file, extracts the author-written prose
 # (summary, highlights, `## What's New` subsections, breaking changes, bug
 # fixes) and reports where that prose breaks the STE writing rules described in
-# `.github/prompts/references/simplified_technical_english.md`.
+# `.agents/skills/write-release-notes/references/simplified_technical_english.md`.
 #
 # Mechanical sections are excluded because their wording is dictated by the
 # release process, not by an author: `## Contributors`, `## Upgrading`,
@@ -21,8 +21,8 @@
 # commit. `--json` prints machine-readable metrics for the eval harness.
 #
 # Usage:
-#   python3 .github/prompts/scripts/check_ste.py docs/release_notes/v2.1.4.md
-#   python3 .github/prompts/scripts/check_ste.py --json docs/release_notes/*.md
+#   python3 .agents/skills/write-release-notes/scripts/check_ste.py docs/release_notes/v2.1.4.md
+#   python3 .agents/skills/write-release-notes/scripts/check_ste.py --json docs/release_notes/*.md
 
 from __future__ import annotations
 
