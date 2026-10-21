@@ -342,9 +342,38 @@ impl Drop for ProxyEnv {
     }
 }
 
+/// `localhost` resolves to `::1` and then `127.0.0.1`. The proxy listens only on the later
+/// address, so pinning the first address would refuse the connection.
+#[tokio::test]
+async fn guard_uses_a_later_proxy_address_when_the_first_refuses() {
+    let (proxy_port, proxy_hits) = forwarding_proxy_on("127.0.0.1:0").await;
+    let (target_port, target_hits) = target().await;
+    let (origin_port, _) =
+        redirecting_origin(format!("http://127.0.0.1:{target_port}/data.csv")).await;
+
+    let options = ClientOptions::new()
+        .with_allow_http(true)
+        .with_proxy_url(format!("http://localhost:{proxy_port}"))
+        .with_connect_timeout(Duration::from_secs(2))
+        .with_timeout(Duration::from_secs(5));
+    let connector =
+        SpawnedReqwestConnector::new(Handle::current()).with_destination_guard(loopback_guard());
+    let body = get(&store_with(origin_port, connector, options))
+        .await
+        .expect("the proxy is reached on a later resolved address");
+
+    assert_eq!(body, BODY);
+    assert!(proxy_hits.load(Ordering::SeqCst) >= 1);
+    assert!(target_hits.load(Ordering::SeqCst) >= 1);
+}
+
 /// Serves one absolute-form HTTP request per connection and counts accepted connections.
 async fn forwarding_proxy() -> (u16, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind("[::1]:0").await.expect("the proxy binds");
+    forwarding_proxy_on("[::1]:0").await
+}
+
+async fn forwarding_proxy_on(bind: &str) -> (u16, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind(bind).await.expect("the proxy binds");
     let port = listener.local_addr().expect("proxy address").port();
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&hits);
