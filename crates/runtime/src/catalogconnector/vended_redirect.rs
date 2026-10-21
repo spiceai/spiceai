@@ -123,11 +123,12 @@ fn redirect_policy(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect
             let message = vended_redirect_refused_message(&component, attempt.url().as_str());
             return attempt.error(message);
         }
-        // A domain still has to be resolved. That lookup is async, so the
-        // policy returns the 3xx and `fetch_with_redirect_policy` decides.
-        if matches!(attempt.url().host(), Some(url::Host::Domain(_))) {
-            return attempt.stop();
-        }
+        // Return every guarded hop. `fetch_with_redirect_policy` applies the
+        // method and body rules and resolves a domain before the next dial.
+        // Following a public address inside `reqwest` and stopping on a later
+        // domain would rebuild that request from the method and body saved
+        // before the first hop, so a 303 that dropped an upload would be undone.
+        return attempt.stop();
     }
     // `reqwest`'s default policy allows ten redirects, then errors.
     if attempt.previous().len() >= 10 {
@@ -786,5 +787,158 @@ mod tests {
                 "status {status} {method} body: {recorded:?}"
             );
         }
+    }
+
+    /// Clears the connect and DNS overrides for the mixed-redirect test.
+    struct MixedRedirectOverrides {
+        hosts: Vec<String>,
+        resolved: String,
+    }
+
+    impl MixedRedirectOverrides {
+        /// Adds `1.2.3.4/32` to loopback so a literal public address can be
+        /// served here. `1.2.3.4` is not in the internal-address set, and an
+        /// address this process can bind is the only way `reqwest` can follow
+        /// that hop without leaving the machine.
+        fn prepare() -> Self {
+            let added = std::process::Command::new("sudo")
+                .args(["-n", "ip", "addr", "add", "1.2.3.4/32", "dev", "lo"])
+                .status()
+                .expect("add 1.2.3.4 to the loopback interface");
+            if !added.success() {
+                let listed = std::process::Command::new("ip")
+                    .args(["addr", "show", "dev", "lo"])
+                    .output()
+                    .expect("list loopback addresses");
+                let text = String::from_utf8_lossy(&listed.stdout);
+                assert!(
+                    text.contains("1.2.3.4"),
+                    "ip addr add 1.2.3.4/32 failed: {added}"
+                );
+            }
+            let resolved = "mixed-target.vended.test";
+            super::super::set_vended_endpoint_resolver_override(
+                resolved,
+                Ok(vec![std::net::Ipv4Addr::new(1, 1, 1, 1).into()]),
+            );
+            Self {
+                hosts: Vec::new(),
+                resolved: resolved.to_string(),
+            }
+        }
+
+        fn point_at(&mut self, authority: &str) {
+            let hosts = [
+                "mixed-redirect.vended.test",
+                "1.2.3.4",
+                "mixed-target.vended.test",
+            ];
+            for host in hosts {
+                super::set_vended_redirect_connect_override(host, authority);
+            }
+            self.hosts = hosts.into_iter().map(str::to_ascii_lowercase).collect();
+        }
+    }
+
+    impl Drop for MixedRedirectOverrides {
+        fn drop(&mut self) {
+            for host in &self.hosts {
+                super::clear_vended_redirect_connect_override(host);
+            }
+            super::super::clear_vended_endpoint_resolver_override(&self.resolved);
+            let _ = std::process::Command::new("sudo")
+                .args(["-n", "ip", "addr", "del", "1.2.3.4/32", "dev", "lo"])
+                .status();
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_vended_mixed_redirect_keeps_the_rewritten_request() {
+        let mut overrides = MixedRedirectOverrides::prepare();
+        let listener = tokio::net::TcpListener::bind("1.2.3.4:0")
+            .await
+            .expect("bind the redirector on the local public address");
+        let addr = listener.local_addr().expect("read the redirector address");
+        let port = addr.port();
+        // Same port as the listener. A literal-IP redirect is dialed by
+        // `reqwest` itself, which does not use the connect override.
+        let middle = format!("http://1.2.3.4:{port}/middle");
+        let object = format!("http://mixed-target.vended.test:{port}/object");
+        let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let recorded = std::sync::Arc::clone(&recorded);
+                let middle = middle.clone();
+                let object = object.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0_u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]);
+                    let line = head.lines().next().unwrap_or_default();
+                    let path = line.split_whitespace().nth(1).unwrap_or_default();
+                    let response = if path == "/middle" {
+                        format!(
+                            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {object}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    } else if path == "/object" {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    } else {
+                        format!(
+                            "HTTP/1.1 303 See Other\r\nLocation: {middle}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    };
+                    recorded.lock().push(head.into_owned());
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        overrides.point_at(&addr.to_string());
+        let _overrides = overrides;
+        let payload = "uploaded-object";
+        let request = http::Request::builder()
+            .method(http::Method::PUT)
+            .uri(format!(
+                "http://mixed-redirect.vended.test:{}/start",
+                addr.port()
+            ))
+            .header(http::header::CONTENT_LENGTH, payload.len())
+            .body(opendal::Buffer::from(payload))
+            .expect("build the upload request");
+        let response = super::scope(
+            Some("dataset 't'".to_string()),
+            super::fetch_with_redirect_policy(request),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("the mixed redirect was not followed: {err}"));
+        let recorded = requests.lock().clone();
+        assert_eq!(response.status(), http::StatusCode::OK, "{recorded:?}");
+        assert_eq!(recorded.len(), 3, "{recorded:?}");
+        assert!(
+            recorded[0].starts_with("PUT /start "),
+            "first hop: {recorded:?}"
+        );
+        assert!(
+            recorded[0].contains("uploaded-object"),
+            "upload left the first hop: {recorded:?}"
+        );
+        assert!(
+            recorded[1].starts_with("GET /middle "),
+            "303 should be GET: {recorded:?}"
+        );
+        assert!(
+            !recorded[1].contains("uploaded-object"),
+            "303 should drop the body: {recorded:?}"
+        );
+        assert!(
+            recorded[2].starts_with("GET /object "),
+            "307 should keep the GET from the 303: {recorded:?}"
+        );
+        assert!(
+            !recorded[2].contains("uploaded-object"),
+            "the dropped upload was restored: {recorded:?}"
+        );
     }
 }
