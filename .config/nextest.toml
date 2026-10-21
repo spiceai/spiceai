@@ -163,7 +163,7 @@ slow-timeout = { period = "120s", terminate-after = 8 }
 # here.
 # Load one local LLM at a time — see the `local-llm-tests` group above.
 [[profile.default.overrides]]
-filter = 'binary_id(=runtime::integration_models) & (test(=models::hf::nsql::huggingface_test_nsql) | test(=models::hf::huggingface_test_chat_completion) | test(=models::hf::huggingface_test_gemma_chat_completion) | test(=models::hf::huggingface_test_gemma4_chat_completion))'
+filter = 'test(=models::hf::nsql::huggingface_test_nsql) | test(=models::hf::huggingface_test_chat_completion) | test(=models::hf::huggingface_test_gemma_chat_completion) | test(=models::hf::huggingface_test_gemma4_chat_completion)'
 test-group = 'local-llm-tests'
 
 [[profile.default.overrides]]
