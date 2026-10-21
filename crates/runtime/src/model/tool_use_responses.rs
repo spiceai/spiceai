@@ -320,9 +320,7 @@ impl ToolUsingResponses {
             // The item still takes one of the round's run slots, so a duplicate does not leave
             // a slot for a distinct id that comes after it.
             if outcomes.contains_key(&call.call_id) {
-                if runs_left > 0 {
-                    runs_left -= 1;
-                }
+                runs_left = runs_left.saturating_sub(1);
                 continue;
             }
             let outcome = self
