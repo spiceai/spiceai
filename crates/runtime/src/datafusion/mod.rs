@@ -179,6 +179,7 @@ pub use runtime_table::table_provider_with_spicepod_metadata;
 pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
+pub(crate) mod sql_depth_guard;
 pub(crate) mod sql_validator;
 pub mod tool_udf;
 pub mod udf;
@@ -6814,6 +6815,7 @@ impl DataFusion {
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
         let statement = planner::parse_sql_statement(sql, session)?;
+        sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
 
@@ -6843,6 +6845,7 @@ impl DataFusion {
     ) -> Result<LogicalPlan, DataFusionError> {
         let dialect = session.config().options().sql_parser.dialect;
         let statement = session.sql_to_statement(sql, &dialect)?;
+        sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
         let spellings =
