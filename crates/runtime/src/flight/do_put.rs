@@ -577,8 +577,8 @@ fn create_response_stream(
                                 let message = format!("The writer abandoned the write to dataset '{path}'.");
                                 tracing::warn!(dataset = %path, "{message}");
                                 // The write fails through its input and is driven until it has
-                                // discarded what it received, with no time limit: a write dropped
-                                // midway can still commit it, as a dual write's source insert does.
+                                // discarded what it received, with no time limit, so the abandon is
+                                // reported only once nothing of the write can still commit.
                                 let failed = batch_tx.send(Err(DataFusionError::Execution(message.clone())));
                                 let mut abandoned = std::pin::pin!(futures::future::join(failed, &mut write_future));
                                 let abandon_start = std::time::Instant::now();

@@ -1487,7 +1487,7 @@ impl RefreshTask {
 
         // A source that records which rows each commit added has its append refresh
         // follow its commits instead of a time window.
-        if let Some(store) = &self.append_cursor_store {
+        if let Some(store) = self.commit_cursor_store(refresh) {
             let federated_provider = self.federated.table_provider().await;
             if let Some(source) = incremental_append_source(federated_provider.as_ref()) {
                 if refresh.override_sql_raw.is_none() {
@@ -1641,6 +1641,18 @@ impl RefreshTask {
         refresh.versions_by_time.is_some() && self.version_ordering(refresh).is_some()
     }
 
+    /// The append cursor store, when the refresh follows the source's commits. A keyed
+    /// refresh that keeps the last arrival of a key reads by time instead: commits carry
+    /// rows of any age, and a late older row would overwrite the newer stored one (#15273).
+    fn commit_cursor_store(&self, refresh: &Refresh) -> Option<&AppendCursorStore> {
+        // Same as `keeps_newest() || version_ordering().is_none()`, reading the key once.
+        let follows_commits = refresh.time_column.is_some()
+            && (refresh.versions_by_time.is_some() || self.version_ordering(refresh).is_none());
+        self.append_cursor_store
+            .as_ref()
+            .filter(|_| follows_commits)
+    }
+
     /// Warns that this append refresh reads by time instead of following the source's
     /// commits, once for each change of reason, and counts it under its reason.
     async fn report_append_fallback(&self, fallback: &Fallback) {
@@ -1671,12 +1683,9 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
     ) -> Result<Option<PinnedRead>, RetryError<super::Error>> {
-        let Some(store) = &self.append_cursor_store else {
+        let Some(store) = self.commit_cursor_store(refresh) else {
             return Ok(None);
         };
-        if refresh.time_column.is_none() {
-            return Ok(None);
-        }
         let federated_provider = self.federated.table_provider().await;
         let Some(source) = incremental_append_source(federated_provider.as_ref()) else {
             return Ok(None);
