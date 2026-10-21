@@ -1170,9 +1170,10 @@ const VENDED_ENDPOINT_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Test stand-in for [`resolve_host_blocking`]. Production builds always use
 /// the system resolver.
 #[cfg(test)]
-static VENDED_ENDPOINT_RESOLVER_OVERRIDE: parking_lot::Mutex<
-    Option<HashMap<String, Result<Vec<IpAddr>, String>>>,
-> = parking_lot::Mutex::new(None);
+type VendedResolverOverride = HashMap<String, Result<Vec<IpAddr>, String>>;
+#[cfg(test)]
+static VENDED_ENDPOINT_RESOLVER_OVERRIDE: parking_lot::Mutex<Option<VendedResolverOverride>> =
+    parking_lot::Mutex::new(None);
 
 #[cfg(test)]
 fn set_vended_endpoint_resolver_override(host: &str, result: Result<Vec<IpAddr>, String>) {
@@ -2629,7 +2630,7 @@ mod tests {
                 S3_ENDPOINT.to_string(),
                 "http://172.30.0.3:9000".to_string(),
             )]);
-            let mut with_endpoint = props.clone();
+            let mut with_endpoint = props;
             with_endpoint.insert(
                 S3_ENDPOINT.to_string(),
                 "http://172.30.0.3:9000".to_string(),

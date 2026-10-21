@@ -210,8 +210,7 @@ fn rewrite_uri(uri: http::Uri) -> http::Uri {
         if let Some(authority) = authority {
             let path = uri
                 .path_and_query()
-                .map(|path| path.as_str().to_string())
-                .unwrap_or_else(|| "/".to_string());
+                .map_or_else(|| "/".to_string(), |path| path.as_str().to_string());
             let scheme = uri.scheme_str().unwrap_or("http");
             if let Ok(rewritten) = format!("{scheme}://{authority}{path}").parse() {
                 return rewritten;

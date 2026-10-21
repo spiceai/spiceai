@@ -666,8 +666,9 @@ mod tests {
     use datafusion::catalog::{MemoryCatalogProvider, MemoryCatalogProviderList};
 
     /// `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS` is process-global. These tests
-    /// set it, so they take this lock for the whole body.
-    static HTTP_URL_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// set it, so they hold this lock across the awaits that read it. A tokio
+    /// mutex is the lock that can stay held across `.await`.
+    static HTTP_URL_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn test_is_url_like() {
@@ -1206,9 +1207,7 @@ mod tests {
                 unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
             }
         }
-        let _env_lock = HTTP_URL_ENV
-            .lock()
-            .expect("the HTTP URL env lock is not poisoned");
+        let _env_lock = HTTP_URL_ENV.lock().await;
         unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
         let _clear = ClearAllowPrivateHosts;
 
@@ -1293,9 +1292,7 @@ mod tests {
                 unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
             }
         }
-        let _env_lock = HTTP_URL_ENV
-            .lock()
-            .expect("the HTTP URL env lock is not poisoned");
+        let _env_lock = HTTP_URL_ENV.lock().await;
         unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
         let _clear = ClearAllowPrivateHosts;
 
@@ -1396,19 +1393,17 @@ mod tests {
         use datafusion::prelude::{SessionConfig, SessionContext};
         use runtime_object_store::registry::{SpiceObjectStoreRegistry, runtime_env_with_registry};
 
+        const EXPECTED_AUTH: &str = "Basic dXNlcjpwYXNz";
+
         struct ClearAllowPrivateHosts;
         impl Drop for ClearAllowPrivateHosts {
             fn drop(&mut self) {
                 unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
             }
         }
-        let _env_lock = HTTP_URL_ENV
-            .lock()
-            .expect("the HTTP URL env lock is not poisoned");
+        let _env_lock = HTTP_URL_ENV.lock().await;
         unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
         let _clear = ClearAllowPrivateHosts;
-
-        const EXPECTED_AUTH: &str = "Basic dXNlcjpwYXNz";
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1426,6 +1421,7 @@ mod tests {
                 let seen_server = Arc::clone(&seen_server);
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    const CSV: &[u8] = b"id\n1\n";
                     let mut buf = Vec::new();
                     let mut tmp = [0u8; 1024];
                     loop {
@@ -1462,7 +1458,6 @@ mod tests {
                             .await;
                         return;
                     }
-                    const CSV: &[u8] = b"id\n1\n";
                     let mut range: Option<(usize, usize)> = None;
                     for line in lines {
                         let Some(spec) = line.split_once(':') else {
