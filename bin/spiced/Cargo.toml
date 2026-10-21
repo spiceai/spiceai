@@ -161,6 +161,7 @@ hashicorp_vault = ["runtime/hashicorp_vault"]
 clickhouse = ["connector-clickhouse"]
 cosmosdb = ["connector-cosmosdb", "runtime/cosmosdb"]
 cuda = ["runtime/cuda"]
+llama_cpp = ["runtime/llama_cpp"]
 databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [

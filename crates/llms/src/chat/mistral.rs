@@ -1082,7 +1082,7 @@ const REASONING_LEVELS: [TemplateReasoningEffort; 4] = [
 /// What a model's chat template does with `reasoning_effort`, learned by rendering its
 /// generation prompt once per value when the model loads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ReasoningSupport {
+pub(super) struct ReasoningSupport {
     /// Turning reasoning off can't stop the model reasoning: the prompt rendered with it off
     /// still opens a reasoning block, as GLM-5.3's does, or matches the template's own
     /// reasoning default, as gpt-oss's does by rendering `Reasoning: medium`.
@@ -1097,7 +1097,7 @@ impl ReasoningSupport {
     /// `enable_thinking` and a level, or returns `None` when the template fails. A template
     /// that fails to render with reasoning off or unset, or at every level, is left
     /// unchecked, so requests reach it as they would without this check.
-    fn from_renders(
+    pub(super) fn from_renders(
         render: impl Fn(Option<bool>, Option<TemplateReasoningEffort>) -> Option<String>,
     ) -> Self {
         let (Some(off), Some(unset)) = (render(Some(false), None), render(None, None)) else {
@@ -1147,7 +1147,7 @@ impl ReasoningSupport {
 /// Whether a rendered prompt starts the model inside a reasoning block, by the test
 /// `mistral.rs` applies to parse the reply: a prompt that ends in `<think>`, or one that
 /// carries Gemma 4's `<|think|>`.
-fn opens_reasoning(prompt: &str) -> bool {
+pub(super) fn opens_reasoning(prompt: &str) -> bool {
     prompt.trim_end().ends_with(THINK_OPEN_TAG) || prompt.contains(GEMMA_THINK_TOKEN)
 }
 
@@ -1161,16 +1161,16 @@ fn names_level(prompt: &str, level: TemplateReasoningEffort) -> bool {
 
 /// The reasoning controls a chat template is rendered with.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ReasoningControls {
-    enable_thinking: Option<bool>,
-    reasoning_effort: Option<TemplateReasoningEffort>,
+pub(super) struct ReasoningControls {
+    pub(super) enable_thinking: Option<bool>,
+    pub(super) reasoning_effort: Option<TemplateReasoningEffort>,
 }
 
 /// The controls for a request's `reasoning_effort`. Unset leaves both to the chat template,
 /// `none` turns reasoning off, and a level turns it on at that level. `minimal` asks for
 /// `low`, the least a template can be asked for. A value the template can't honor is
 /// refused with the message to show the caller.
-fn reasoning_controls(
+pub(super) fn reasoning_controls(
     effort: Option<&ReasoningEffort>,
     support: &ReasoningSupport,
     model: &str,

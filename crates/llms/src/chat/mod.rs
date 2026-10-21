@@ -39,6 +39,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestUserMessageContent, ReasoningEffort,
 };
 
+#[cfg(feature = "llama_cpp")]
+pub mod llama_cpp;
 #[cfg(feature = "local_llm")]
 pub mod mistral;
 pub mod nsql;
@@ -431,6 +433,22 @@ pub async fn create_local_model(
     distributed: Option<DistributedConfig>,
     options: LocalModelOptions<'_>,
 ) -> Result<Arc<dyn Chat>> {
+    // A single-node GGUF model is served by llama.cpp when it is linked in; a ring model
+    // stays on mistral.rs, whose tensor-parallel backend llama.cpp has no counterpart for.
+    #[cfg(feature = "llama_cpp")]
+    if distributed.is_none()
+        && !model_weights.is_empty()
+        && model_weights.iter().all(|w| {
+            Path::new(w)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        })
+    {
+        let weights = model_weights.iter().map(PathBuf::from).collect::<Vec<_>>();
+        return llama_cpp::LlamaCpp::from(&weights, options)
+            .await
+            .map(|x| Arc::new(x) as Arc<dyn Chat>);
+    }
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the
     // pipeline. The returned guard keeps the temp file alive for the model.

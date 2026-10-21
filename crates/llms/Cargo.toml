@@ -50,9 +50,10 @@ tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "4450776632f7e92f5b8b1ac97f56fe3f72cf2618", optional = true } # branch: spiceai (spiceai/mistral.rs#48: DeepSeek-V4.1 decode and reference-parity fixes on #47)
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "4450776632f7e92f5b8b1ac97f56fe3f72cf2618", package = "mistralrs-core", optional = true } # branch: spiceai (spiceai/mistral.rs#48: DeepSeek-V4.1 decode and reference-parity fixes on #47)
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "489244bc3c5ec3b8703390e15c1c6ffbb941e45d", optional = true } # branch: lukim/export-chat-template (spiceai/mistral.rs#49 plus the exported chat-template renderer)
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "489244bc3c5ec3b8703390e15c1c6ffbb941e45d", package = "mistralrs-core", optional = true } # branch: lukim/export-chat-template (spiceai/mistral.rs#49 plus the exported chat-template renderer)
 rand.workspace = true
+llama-cpp-2 = { version = "0.1.160", optional = true, default-features = false }
 
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", features = [
     "candle",
@@ -94,6 +95,7 @@ path = "tests/integration.rs"
 
 [features]
 cuda = [
+    "llama-cpp-2?/cuda",
     "tei_backend/cuda",
     "tei_candle/cuda",
     "mistralrs-core/cuda",
@@ -128,7 +130,11 @@ local_embed = [
     "dep:model2vec-rs",
 ]
 local_llm = ["dep:mistralrs", "dep:mistralrs-core"]
+# Serves single-node GGUF models with llama.cpp instead of mistral.rs. Composes with `cuda`
+# or `metal`; ring (`distributed`) models stay on mistral.rs.
+llama_cpp = ["local_llm", "dep:llama-cpp-2"]
 metal = [
+    "llama-cpp-2?/metal",
     "tei_backend/metal",
     "tei_candle/metal",
     "mistralrs-core/metal",
