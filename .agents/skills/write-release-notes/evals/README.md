@@ -1,7 +1,7 @@
-# writeReleaseNotes evals
+# write-release-notes evals
 
-Regression tests for the `writeReleaseNotes` skill
-(`.github/prompts/writeReleaseNotes.prompt.md`).
+Regression tests for the `write-release-notes` skill
+(`.agents/skills/write-release-notes/SKILL.md`).
 
 Release notes are prose, so most of the quality is a judgement call. These evals
 cover the part that is not: whether the authored prose follows the
@@ -24,7 +24,7 @@ moves and the scorer can assert exact PR coverage.
 3. Score it:
 
    ```bash
-   python3 .github/prompts/evals/score_eval.py \
+   python3 .agents/skills/write-release-notes/evals/score_eval.py \
      --eval create-patch-release --output /path/to/output-dir
    ```
 
@@ -46,7 +46,13 @@ eight shipped PRs with five that must be filtered out (a snapshot update, a
 routine `serde` bump, `Cargo.lock` housekeeping, a revert of something that
 never shipped, a disabled flaky benchmark) plus one dependency bump that *is*
 user-visible. A run that writes beautiful prose about a `Cargo.lock` cleanup has
-failed at the job.
+failed at the job. It also checks the shape: the first paragraph has to say
+that this is a patch release, the highlights hold at most five items, and the
+sections a reader acts on (Breaking Changes, Upgrading) come before the
+background (Contributors) and the changelog, as the inverted pyramid in
+`SKILL.md` orders them. A
+run that promotes every change to a highlight passes every other assertion,
+which is how nine-item highlight lists reached published notes.
 
 `rewrite-to-ste` is the adversarial case for the style rules. The fixture is
 real published v2.1.0 text carrying 15 identifiers, two error codes, four
@@ -60,7 +66,15 @@ subsections is the skill overreaching into the user's editorial decisions. The
 fixture deliberately keeps two checker *warnings* in its existing prose — one
 noun stack and one passive sentence. A run that "helpfully" fixes them fails the
 byte-identical assertion, which is the intended outcome: update mode does not
-re-edit the author's published choices.
+re-edit the author's published choices. The same holds for the opening: a run
+may add a sentence or a highlight for a new change, but every existing opening
+sentence and highlight must survive verbatim and in order. When a new change
+should take over the lead, the skill proposes the new opening in its report.
+
+Whether an opening leads with the right change is a judgement these scorers
+cannot make. Grade it by reading the opening against the ranking in
+`SKILL.md`, or with a blind side-by-side comparison against the previous
+version of the skill.
 
 ## Fixtures
 
