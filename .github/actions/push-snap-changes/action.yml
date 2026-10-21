@@ -44,7 +44,8 @@ runs:
 
         # Every run gets its own branch off the commit it just tested (never an old
         # branch's history) so there is never a divergent base to rebase or merge onto.
-        BRANCH_NAME="snapshot-update/${GITHUB_JOB:-job}-${GITHUB_RUN_ID}"
+        BRANCH_PREFIX="snapshot-update/${GITHUB_JOB:-job}-"
+        BRANCH_NAME="${BRANCH_PREFIX}${GITHUB_RUN_ID}"
 
         # Target the ref the workflow ran on: trunk for the scheduled daily run,
         # the dispatched branch for a manual workflow_dispatch. This keeps the PR
@@ -72,16 +73,23 @@ runs:
         echo "Created snapshot update PR -> ${PR_URL}"
         gh pr merge --squash --auto "${BRANCH_NAME}" || echo "Auto-merge not available for this branch; PR created and requires manual merge."
 
-        # Close any earlier open snapshot-update PR against the same base with the
-        # same title: it carries a snapshot diff against a now-outdated base and is
-        # superseded by the one above. Scope to this base so a manual branch run does
-        # not close the scheduled trunk PRs (or vice versa).
+        # Close any earlier open snapshot-update PR from this same job against the
+        # same base with the same title: it carries a snapshot diff against a
+        # now-outdated base and is superseded by the one above. Scope to this base so
+        # a manual branch run does not close the scheduled trunk PRs (or vice versa).
+        # Scope to this job's branches too: several jobs share the default title
+        # (test-models, test-hf and test-bedrock in integration_models.yml), and each
+        # one's PR holds only the snapshots its own tests wrote, so another job's PR
+        # is not superseded by this one.
         EXISTING_PR_JSON="$(mktemp)"
         gh pr list --state open --base "${BASE_BRANCH}" --limit 100 --json number,title,headRefName,author,body,url > "${EXISTING_PR_JSON}"
-        jq -r --arg title "${PR_TITLE}" --arg url "${PR_URL}" '
+        jq -r --arg title "${PR_TITLE}" --arg url "${PR_URL}" --arg prefix "${BRANCH_PREFIX}" '
           [.[]
             | select(.title == $title)
             | select(.url != $url)
+            # The prefix ends in "-", and a run ID is all digits, so job "test"
+            # does not claim job "test-models" branches.
+            | select(.headRefName | startswith($prefix) and (ltrimstr($prefix) | test("^[0-9]+$")))
             | select(
                 .author.login == "github-actions[bot]"
                 or .author.login == "spiceaibot"
