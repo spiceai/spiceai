@@ -875,6 +875,21 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
     }
 }
 
+/// True when the fragment sets `allow_http` to false, after the same form
+/// decoding the registry uses to build the store. A missing key is not a refusal.
+fn plaintext_is_forbidden(url: &Url) -> datafusion::error::Result<bool> {
+    let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+        .into_owned()
+        .collect();
+    let Some(value) = params.get("allow_http") else {
+        return Ok(false);
+    };
+    let allowed = value.parse::<bool>().map_err(|_| {
+        DataFusionError::Configuration(format!("{value} is not a valid boolean for `allow_http`"))
+    })?;
+    Ok(!allowed)
+}
+
 impl SpiceObjectStoreRegistry {
     /// Keep a store this origin already has. Build a plaintext one only when
     /// the origin has no fragment-built or externally registered store.
@@ -882,11 +897,22 @@ impl SpiceObjectStoreRegistry {
     /// A SQL `http://` URL asks for `allow_http=true` and nothing else.
     /// Replacing a dataset store with that URL would drop credentials and
     /// timeouts already configured for the origin. A bare HTTPS-only entry
-    /// cannot fetch the URL, so that entry is replaced.
+    /// cannot fetch the URL, so that entry is replaced. An explicit
+    /// `allow_http=false` is refused here, before a lookup: the listing table
+    /// passes the fragment through, and building that URL would replace the
+    /// configured store.
     pub fn ensure_plaintext_http_store(
         &self,
         url: &Url,
     ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        if plaintext_is_forbidden(url)? {
+            let host = &url[url::Position::BeforeHost..url::Position::AfterPort];
+            return Err(DataFusionError::Plan(format!(
+                "Failed to read '{}://{host}{}'. `allow_http` is false, so this plaintext address is not fetched.",
+                url.scheme(),
+                url.path(),
+            )));
+        }
         let key = Self::url_key(url);
         if let Some(config) = self.configs.get(&key)
             && matches!(

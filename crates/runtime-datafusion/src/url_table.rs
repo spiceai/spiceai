@@ -1459,5 +1459,56 @@ mod tests {
             "schema: {:?}",
             table.schema()
         );
+
+        // A later URL on this origin that sets `allow_http` to false must not
+        // reuse the plaintext store, including when the key is percent-encoded.
+        // The configured credential has to remain for a following plaintext URL.
+        seen.lock().clear();
+        for fragment in ["allow_http=false", "%61llow_http=false"] {
+            let url = format!("http://127.0.0.1:{port}/must-not-fetch.csv#{fragment}");
+            match factory.try_new(&url).await {
+                Ok(_) => panic!("`{fragment}` was fetched: {:?}", seen.lock()),
+                Err(err) => {
+                    let text = err.to_string();
+                    assert!(
+                        text.contains("`allow_http` is false") && !text.contains("builder error"),
+                        "{fragment}: {text}"
+                    );
+                }
+            }
+        }
+        assert!(
+            seen.lock()
+                .iter()
+                .all(|request| !request.contains("must-not-fetch")),
+            "{:?}",
+            seen.lock()
+        );
+
+        seen.lock().clear();
+        let again = factory
+            .try_new(&format!("http://127.0.0.1:{port}/again.csv"))
+            .await
+            .unwrap_or_else(|err| panic!("a later plaintext URL loads: {err}; {:?}", seen.lock()))
+            .expect("the URL is a table");
+        let again_requests = seen.lock().clone();
+        assert!(
+            again_requests
+                .iter()
+                .any(|request| request.contains("/again.csv"))
+                && again_requests
+                    .iter()
+                    .all(|request| request.ends_with(EXPECTED_AUTH)),
+            "{again_requests:?}"
+        );
+        assert!(
+            again
+                .schema()
+                .fields()
+                .iter()
+                .any(|field| field.name() == "id"),
+            "schema: {:?}",
+            again.schema()
+        );
     }
 }
