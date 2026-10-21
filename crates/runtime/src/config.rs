@@ -165,7 +165,8 @@ pub struct ClusterConfig {
     #[arg(long = "node-mtls-key-file", value_name = "NODE_MTLS_KEY_FILE")]
     pub node_mtls_key_file: Option<String>,
 
-    /// Allow insecure cluster communication without mTLS. WARNING: Only use this flag in development or testing environments and never in production.
+    /// Allow cluster connections without mTLS for local development and testing.
+    /// Use only on a trusted network; cluster connections are not authenticated or encrypted.
     #[arg(long = "allow-insecure-connections", default_value_t = false, action = ArgAction::SetTrue)]
     pub allow_insecure_connections: bool,
 
@@ -180,7 +181,7 @@ pub struct ClusterConfig {
     /// For executors: used during registration to tell the scheduler how to contact this node.
     ///
     /// The fully qualified advertise URL will be constructed as:
-    ///   https://<node-advertise-address>:<port from --node-bind-address> (http:// if --allow-insecure-connections is set)
+    ///   https://<node-advertise-address>:<port from --node-bind-address> (http:// without cluster mTLS)
     #[arg(long = "node-advertise-address", value_name = "NODE_ADVERTISE_ADDRESS")]
     pub node_advertise_address: Option<String>,
 }

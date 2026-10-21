@@ -34,7 +34,10 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use tonic::Status;
+use tonic::service::{Interceptor, InterceptorLayer};
 use tonic::transport::Server;
+use tower::layer::util::{Identity, Stack};
 
 type ClusterServerResult<T> = std::result::Result<T, Error>;
 
@@ -50,6 +53,37 @@ async fn bind_cluster_listener(bind_address: SocketAddr) -> Result<TcpListener, 
             Error::UnableToBindClusterListener { source }
         }
     })
+}
+
+/// Requires cluster mTLS unless the node explicitly allows insecure connections.
+#[derive(Clone, Copy)]
+pub(crate) struct ClusterConnectionGate {
+    mtls_enabled: bool,
+    allow_insecure_connections: bool,
+}
+
+impl Interceptor for ClusterConnectionGate {
+    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        if self.mtls_enabled || self.allow_insecure_connections {
+            Ok(request)
+        } else {
+            Err(Status::permission_denied(
+                "Cluster RPCs require cluster mTLS",
+            ))
+        }
+    }
+}
+
+/// The server builder for the internal cluster port. Every service added to it is behind
+/// [`ClusterConnectionGate`].
+pub(crate) fn internal_cluster_server(
+    mtls_enabled: bool,
+    allow_insecure_connections: bool,
+) -> Server<Stack<InterceptorLayer<ClusterConnectionGate>, Identity>> {
+    Server::builder().layer(InterceptorLayer::new(ClusterConnectionGate {
+        mtls_enabled,
+        allow_insecure_connections,
+    }))
 }
 
 /// Starts the internal cluster gRPC server for scheduler mode.
@@ -79,7 +113,10 @@ pub async fn start_internal_cluster_server(
 
     let cluster_server_config = rt.df.cluster_config.cluster_server_config();
     let mtls_enabled = cluster_server_config.is_some();
-    let mut server = Server::builder();
+    let mut server = internal_cluster_server(
+        mtls_enabled,
+        rt.df.cluster_config.allow_insecure_connections(),
+    );
 
     if mtls_enabled {
         tracing::info!("Cluster mTLS enabled for internal cluster server");
@@ -88,10 +125,6 @@ pub async fn start_internal_cluster_server(
             message: "Cluster mode without mTLS requires the --allow-insecure-connections flag"
                 .to_string(),
         });
-    } else {
-        tracing::warn!(
-            "Cluster mTLS disabled for internal cluster server (--allow-insecure-connections flag is set)"
-        );
     }
 
     let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler)
@@ -123,7 +156,6 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
             executor_streams,
-            mtls_enabled,
         )
     } else {
         ClusterServiceImpl::new(
@@ -134,7 +166,6 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&rt.df),
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
-            mtls_enabled,
         )
     };
 
@@ -200,14 +231,6 @@ pub async fn start_executor_flight_server(
     let cluster_server_config = rt.df.cluster_config.cluster_server_config();
     let has_flight_auth = endpoint_auth.flight_basic_auth.is_some();
 
-    // In executor mode, never allow unauthenticated Flight DoPut without mTLS.
-    // Scheduler-trusted forwarding mode requires authenticated scheduler identity via mTLS.
-    if !has_flight_auth && cluster_server_config.is_none() {
-        return Err(Error::InsecureConfiguration {
-            message: "Executor Flight server requires either API key auth or cluster mTLS. Configure endpoint auth or enable mTLS for scheduler-trusted forwarding.".to_string(),
-        });
-    }
-
     // The executor Flight server is the cluster shuffle endpoint: reducer partitions
     // fetch concurrently over a pooled, multiplexed HTTP/2 connection per peer, and a
     // stage cancellation resets the in-flight fetch streams in bursts. Those legitimate
@@ -228,10 +251,6 @@ pub async fn start_executor_flight_server(
             message: "Cluster mode without mTLS requires the --allow-insecure-connections flag"
                 .to_string(),
         });
-    } else {
-        tracing::warn!(
-            "Cluster mTLS disabled for executor flight server (--allow-insecure-connections flag is set)"
-        );
     }
 
     if !has_flight_auth {

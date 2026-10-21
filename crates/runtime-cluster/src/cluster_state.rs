@@ -315,6 +315,12 @@ impl ClusterStateStore {
         &self.path
     }
 
+    /// The object store the cluster document lives in.
+    #[must_use]
+    pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
+        &self.store
+    }
+
     /// Idempotent first-writer-wins create. Should be called exactly once
     /// per scheduler at startup; subsequent calls are no-ops.
     ///

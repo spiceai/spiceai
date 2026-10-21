@@ -99,7 +99,9 @@ pub use session::SessionStore;
 /// keepalive heartbeat. Write-through forwarding tasks send these periodically
 /// to prevent the executor's `DoPut` idle timeout from firing on streams that
 /// receive data in bursts with long idle gaps between them.
-pub use runtime_cluster::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout, keepalive};
+pub use runtime_cluster::flight_config::{
+    ABANDON_APP_METADATA, KEEPALIVE_APP_METADATA, do_put_idle_timeout, keepalive,
+};
 
 pub struct Service {
     data_update_broadcaster: DataUpdateBroadcaster,
@@ -925,8 +927,8 @@ pub(crate) async fn check_read_only_sql(
         return Ok(None);
     }
     let session = datafusion.ctx.state();
-    let plan = datafusion
-        .create_logical_plan(&session, sql)
+    let (plan, _) = datafusion
+        .create_logical_plan(&session, sql, parameters)
         .await
         .map_err(|e| Status::invalid_argument(format!("Failed to parse SQL: {e}")))?;
     // Bind parameters to the plan so the returned plan is fully resolved.
@@ -1021,6 +1023,9 @@ pub(crate) fn handle_datafusion_error(e: &DataFusionError) -> Status {
                         Status::unavailable(format!(
                             "Acceleration not ready; loading initial data for {dataset_name}"
                         ))
+                    }
+                    SpiceExternalError::PartitionsUnavailable { message } => {
+                        Status::unavailable(message)
                     }
                 }
             } else if let Some(err) = e.downcast_ref::<FlightClientError>() {
@@ -2116,6 +2121,24 @@ mod tests {
             status.message().starts_with("Internal error: bug"),
             "{}",
             status.message()
+        );
+    }
+
+    /// A query a cluster scheduler cannot route yet is `Unavailable`, which
+    /// clients retry, also when the planner wraps the error.
+    #[test]
+    fn unavailable_partitions_are_unavailable() {
+        let message =
+            "Cannot query t: no ready executor serves 1 of its 2 partitions; retry the query";
+        let status = handle_datafusion_error(&DataFusionError::Context(
+            "partitioned_table_scan_rewrite".to_string(),
+            Box::new(DataFusionError::External(
+                SpiceExternalError::partitions_unavailable(message.to_string()),
+            )),
+        ));
+        assert_eq!(
+            (status.code(), status.message()),
+            (tonic::Code::Unavailable, message)
         );
     }
 

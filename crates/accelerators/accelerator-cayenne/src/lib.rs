@@ -38,7 +38,7 @@ use cayenne::{CayennePartitionCreator, ScanViewReuse};
 // half — a metastore on disk that no parameter names — stays in this file, beside the
 // teardown it guards.
 use cayenne::metastore_layout::{
-    absolute_data_dir, fs_probe_path, is_local_path, overlapping_metastore_dir, resolved_data_dir,
+    absolute_data_dir, fs_probe_path, overlapping_metastore_dir, resolved_data_dir,
 };
 use data_components::poly::PolyTableProvider;
 use datafusion::common::arrow::datatypes::SchemaRef;
@@ -1164,7 +1164,7 @@ fn refresh_write_profile(
 /// `cdc_durability: memory`) are for. It is also exactly the set of tables that can
 /// reach the off-pool in-memory CDC tier, so the runtime builder gates the tier's
 /// aggregate byte budget — and the reduced query-pool default that leaves room for
-/// it — on a pod containing one (see `builder::CayenneWorkload`).
+/// it — on a pod containing one (see `runtime_acceleration::CayenneWorkload`).
 fn uses_small_write_refresh_profile(
     source: &dyn AccelerationSource,
     acceleration: &Acceleration,
@@ -1669,31 +1669,23 @@ impl CayenneAccelerator {
         format!("{}/{dataset_name}/", spice_data_base_path())
     }
 
-    /// Resolves the metadata directory for Cayenne catalog storage.
+    /// The directory the Cayenne catalog is stored in for `acceleration`.
     ///
-    /// Priority order:
-    /// 1. `cayenne_metadata_dir` - Explicit custom metadata directory
-    /// 2. `{cayenne_file_path}/metadata` - When `cayenne_file_path` is a local path (not S3)
-    /// 3. `{spice_data_base_path()}/metadata` - Default location
-    ///
-    /// Note: S3 paths are excluded because `SQLite` (used for metadata catalog) cannot run on object storage.
+    /// The rule is [`util::spice_paths::cayenne_metastore_dir`], which the
+    /// Spicepod validation in `app` applies to the same parameters, so a
+    /// configuration that passes validation resolves here to the directory it was
+    /// validated against.
     pub(crate) fn resolve_metadata_dir(acceleration: Option<&Acceleration>) -> String {
-        let Some(accel) = acceleration else {
-            return format!("{}/metadata", spice_data_base_path());
+        let params = acceleration.map(|accel| &accel.params);
+        let param = |key: &str| {
+            params
+                .and_then(|params| params.get(key))
+                .map(String::as_str)
         };
-
-        if let Some(custom_dir) = accel.params.get("cayenne_metadata_dir") {
-            return custom_dir.clone();
-        }
-
-        if let Some(file_path) = accel.params.get("cayenne_file_path")
-            && is_local_path(file_path)
-        {
-            let base = file_path.trim_end_matches('/');
-            return format!("{base}/metadata");
-        }
-
-        format!("{}/metadata", spice_data_base_path())
+        util::spice_paths::cayenne_metastore_dir(
+            param("cayenne_file_path"),
+            param("cayenne_metadata_dir"),
+        )
     }
 
     /// Refuse a configuration whose recreate would delete the shared metastore — see
@@ -7824,6 +7816,8 @@ mod tests {
     /// still what `remove_dir_all` walks.
     #[tokio::test]
     async fn a_local_data_directory_whose_name_contains_a_scheme_separator_is_still_read() {
+        use util::spice_paths::is_local_path;
+
         let app = Arc::new(AppBuilder::new("test").build());
         let base = tempfile::tempdir().expect("temp dir");
 

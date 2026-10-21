@@ -23,16 +23,21 @@ limitations under the License.
 
 pub mod cluster_state;
 pub mod context;
+pub mod control_stream_client;
 pub mod correlated;
+pub mod executor_liveness;
 pub mod executor_registry;
 pub mod executor_selection;
 pub mod flight_config;
 pub mod metadata;
 pub mod metrics;
+pub mod metrics_collector;
 pub mod outbound_broadcaster;
 pub mod partition_load_tracker;
+pub mod pki;
 pub mod scheduler_task_config;
 pub mod service;
+pub mod shared_job_state;
 pub mod store;
 pub mod write_through;
 
@@ -40,15 +45,17 @@ pub use cluster_state::{
     ClusterState, ClusterStateStore, MutateError, MutateOk, MutationOutcome, PartitionScope,
     SchedulerEntry, SchedulerId, TableEntryChanges, UNREGISTERED_TABLE_RETENTION,
 };
+pub use control_stream_client::ControlStreamManager;
 pub use executor_registry::{
     ExecutorRegistration, ExecutorRegistry, FederatedPartitionProvider, Registered,
     RegisteredHandles, TablePartitions,
 };
 pub use metadata::{
-    PartitionMetadata, PartitionValue, TablePartitionMetadata, decode_statistics,
-    encode_partition_exprs, encode_statistics, normalized_table_name, partition_value_to_bytes,
+    PartitionKey, PartitionMetadata, PartitionValue, TablePartitionMetadata, decode_statistics,
+    encode_partition_exprs, encode_statistics, normalized_table_name, partition_key,
+    partition_value_to_bytes,
 };
 pub use outbound_broadcaster::ExecutorOutboundBroadcaster;
-pub use partition_load_tracker::PartitionLoadTracker;
+pub use partition_load_tracker::{LoadedAck, PartitionLoadTracker};
 pub use service::{AssignmentConfig, PartitionService};
-pub use store::{AssignmentRequest, CopyAssignmentsResult, PartitionStore};
+pub use store::{AssignmentRequest, CopyAssignmentsResult, DiscoveryChanges, PartitionStore};

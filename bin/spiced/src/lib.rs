@@ -148,6 +148,7 @@ pub use cloud_connect::{
 mod connection_report;
 pub mod crash_handler;
 mod log_capture;
+pub mod open_file_limit;
 mod runtime_lock;
 pub use runtime_lock::{InstanceClaim, claim_instance_directory};
 #[path = "tracing.rs"]
@@ -460,6 +461,10 @@ pub struct Args {
 
     #[arg(skip)]
     pub open_telemetry_deprecated: bool,
+
+    /// What raising the open file limit at startup did, set by `main`.
+    #[arg(skip)]
+    pub open_file_limit: Option<open_file_limit::OpenFileLimit>,
 }
 
 /// The raw `--token` argument: an unvalidated enrollment-key candidate.
@@ -891,6 +896,10 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         .await;
     }
 
+    if let Some(open_file_limit) = &args.open_file_limit {
+        open_file_limit.log();
+    }
+
     if args.open_telemetry_deprecated {
         tracing::warn!(
             "`--open_telemetry` is deprecated and has no effect; it will be removed in a future version"
@@ -920,11 +929,32 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
         Some("sql_engine") | None => {
             // This needs to be created after tracing is set up, or else task_history events aren't emitted.
-            let cpu_runtime = ManagedTokioRuntime::try_new()
+            //
+            // A pod that streams changes runs its analytical queries at nice 5, so on a
+            // saturated host the change apply, key lookups and the HTTP runtime (nice 0)
+            // keep running promptly while analytics take the CPU they leave, and
+            // compaction and refresh (nice 10) still yield to analytics.
+            let cpu_runtime = if runtime::builder::streams_cdc_changes(app.as_ref()) {
+                ManagedTokioRuntime::builder().with_nice(5).build()
+            } else {
+                ManagedTokioRuntime::try_new()
+            }
+            .boxed()
+            .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+            rt.datafusion().set_cpu_runtime(cpu_runtime);
+
+            // Queries that read a bounded set of rows by primary key run on their own
+            // small runtime, so a lookup does not queue behind the analytical queries
+            // that keep the CPU runtime's workers busy.
+            let interactive_runtime = ManagedTokioRuntime::builder()
+                .with_thread_name("query-interactive")
+                .with_worker_threads(cpu_budget::cpu_budget().interactive_query_worker_threads())
+                .build()
                 .boxed()
                 .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
-            rt.datafusion().set_cpu_runtime(cpu_runtime);
+            rt.datafusion().set_interactive_runtime(interactive_runtime);
 
             // Create a dedicated refresh runtime for acceleration refresh workers and
             // stale-while-revalidate background cache refresh tasks. This isolates refresh
@@ -1213,6 +1243,12 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
              unauthenticated — including write/DDL/DML endpoints. Use `client_auth: required` \
              to reject certificate-less clients, or configure `runtime.auth`."
         );
+    }
+    if let Some(app) = app.as_ref()
+        && let Some(warning) =
+            endpoint_auth.unauthenticated_writes_warning(app, client_auth_mode.into_spicepod())
+    {
+        tracing::warn!("{warning}");
     }
     let endpoint_auth = endpoint_auth.with_identity_source(identity_source);
 

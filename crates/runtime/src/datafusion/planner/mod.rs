@@ -361,6 +361,22 @@ async fn plan_distributed_dml(
     };
 
     if !should_rewrite {
+        // Executors hold this table's rows by partition, so a write the scheduler
+        // applies itself never reaches them, and reads filtered to the recorded
+        // partitions miss its rows.
+        if matches!(expected_op, WriteOp::Insert(_))
+            && ctx.executor_registry.as_ref().is_some_and(|registry| {
+                registry
+                    .federated_partition_store()
+                    .get_cached_table_metadata(&dml.table_name)
+                    .is_some()
+            })
+        {
+            return Err(DataFusionError::Plan(format!(
+                "Cannot write to {}: its rows are partitioned across executors, but this scheduler has not registered its acceleration. Run its CREATE TABLE IF NOT EXISTS ... WITH (acceleration ...) PARTITION BY statement again, then retry the write.",
+                dml.table_name
+            )));
+        }
         return Ok(df_plan);
     }
 

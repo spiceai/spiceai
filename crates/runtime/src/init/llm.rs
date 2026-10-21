@@ -29,7 +29,7 @@ use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 
 impl Runtime {
     /// Loads a chat model from the spicepod, and its Responses API endpoint when
-    /// `capabilities` include one. If an error occurs, no retry attempt is made.
+    /// `capabilities` include one.
     ///
     /// A Responses endpoint that fails to load is left out, so the model is unavailable
     /// on `/v1/responses` while its chat still serves.

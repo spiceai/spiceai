@@ -33,9 +33,15 @@ limitations under the License.
 //! There is no compiler check that a task-history span gets one: a task that
 //! skips [`begin_task_trace`] still records a row, but its log records are not
 //! correlatable. Today only the SQL query path calls it.
+//!
+//! A record logged in a task's span alone — as the query runtime polls a
+//! query's plan, outside the span [`begin_task_trace`] returns — sees only the
+//! span's OpenTelemetry trace id. [`task_history_trace_id`] turns that into the
+//! id the task's row is written under.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
+use dashmap::DashMap;
 use opentelemetry::{
     Context,
     trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState},
@@ -44,6 +50,7 @@ use opentelemetry_sdk::trace::{IdGenerator, RandomIdGenerator};
 use runtime_request_context::RequestContext;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing_subscriber::{Registry, registry::LookupSpan};
 
 /// Name of the span created by [`begin_task_trace`]. It is what prefixes each
 /// console record the task produces: `query{trace_id=…}:`.
@@ -112,6 +119,11 @@ pub fn begin_task_trace(task_span: &Span, request_context: &RequestContext) -> S
 /// already is the span's trace id, and re-declaring it would make the exporter
 /// rewrite every row of the trace to the value it already holds.
 ///
+/// The exporter writes `span`'s row under the pinned id, with the rows of its
+/// trace written before it, which include those of the tasks it started. Until
+/// `span` closes, [`task_history_trace_id`] gives the pinned id for that trace
+/// too.
+///
 /// This should not be used for any span within a HTTP API that has [HTTP Spans](https://opentelemetry.io/docs/specs/semconv/http/http-spans/) created, as they are incompatible (both the `span` input and the span created for the HTTP handler will have the same `parent_span_id`, even though the `input` span would become a child of the HTTP span)
 pub fn record_task_history_trace_id(span: &Span, request_context: &RequestContext) {
     let Some(trace_id) = request_context.client_trace_id() else {
@@ -126,6 +138,87 @@ pub fn record_task_history_trace_id(span: &Span, request_context: &RequestContex
             tracing::info!(target: "task_history", parent: span, trace_id = %trace_id);
         }
     }
+
+    declare_pinned_trace(span, trace_id);
+}
+
+/// The trace id of a log record in the OpenTelemetry trace `trace_id`: the id
+/// a client pinned, while a task of that trace that took it in
+/// [`record_task_history_trace_id`] is open, and otherwise `trace_id` itself.
+///
+/// For a record that can see only the OpenTelemetry context of the task it is
+/// logged in. A client-pinned id is applied when the row is written (see
+/// `TaskSpan::write`), so the span keeps the trace id the SDK generated, and the
+/// pinned id is the one the rows of that task and the tasks it started name.
+#[must_use]
+pub fn task_history_trace_id(trace_id: TraceId) -> TraceId {
+    PINNED_TRACES
+        .get(&trace_id)
+        .map_or(trace_id, |trace| trace.pinned)
+}
+
+/// The OpenTelemetry trace ids whose `runtime.task_history` rows are rewritten
+/// to a client-pinned id, while a task that declared it is open.
+static PINNED_TRACES: LazyLock<DashMap<TraceId, PinnedTrace>> = LazyLock::new(DashMap::new);
+
+struct PinnedTrace {
+    pinned: TraceId,
+    /// The open tasks that declared it. A nested task re-declares its parent's.
+    declarations: usize,
+}
+
+/// One task's entry in [`PINNED_TRACES`], kept in the task span's extensions so
+/// that the span closing withdraws it.
+struct PinnedTraceDeclaration(TraceId);
+
+impl PinnedTraceDeclaration {
+    fn new(trace_id: TraceId, pinned: TraceId) -> Self {
+        PINNED_TRACES
+            .entry(trace_id)
+            .and_modify(|trace| trace.declarations += 1)
+            .or_insert(PinnedTrace {
+                pinned,
+                declarations: 1,
+            });
+        Self(trace_id)
+    }
+}
+
+impl Drop for PinnedTraceDeclaration {
+    fn drop(&mut self) {
+        PINNED_TRACES.remove_if_mut(&self.0, |_, trace| {
+            trace.declarations -= 1;
+            trace.declarations == 0
+        });
+    }
+}
+
+/// Puts `pinned` in [`PINNED_TRACES`] for `span`'s trace until `span` closes.
+fn declare_pinned_trace(span: &Span, pinned: &str) {
+    // Parsed as the exporter parses the override, which it ignores when this
+    // fails.
+    let Some(pinned) = runtime_request_context::normalize_trace_id(pinned)
+        .and_then(|pinned| TraceId::from_hex(&pinned).ok())
+    else {
+        return;
+    };
+    // This starts the span, after which its parent cannot be set. A pinned id
+    // never sets it: `join_propagated_trace` is for an unpinned request.
+    let trace_id = span.context().span().span_context().trace_id();
+    if trace_id == TraceId::INVALID || trace_id == pinned {
+        return;
+    }
+    span.with_subscriber(|(id, dispatch)| {
+        // Without the registry there is nowhere to keep the declaration that
+        // withdraws the entry, so there is no entry.
+        if let Some(task) = dispatch
+            .downcast_ref::<Registry>()
+            .and_then(|registry| registry.span(id))
+        {
+            task.extensions_mut()
+                .replace(PinnedTraceDeclaration::new(trace_id, pinned));
+        }
+    });
 }
 
 /// The trace id to return to the client for work this request has not started
@@ -327,6 +420,7 @@ mod tests {
             .with_trace_parent(Some(TraceParent {
                 trace_id: other_trace,
                 span_id,
+                trace_flags: TraceFlags::SAMPLED,
             }))
             .build();
         assert_eq!(same_trace_parent_span(&conflicting, PINNED), None);
@@ -336,6 +430,7 @@ mod tests {
             .with_trace_parent(Some(TraceParent {
                 trace_id: other_trace,
                 span_id,
+                trace_flags: TraceFlags::SAMPLED,
             }))
             .build();
         assert_eq!(

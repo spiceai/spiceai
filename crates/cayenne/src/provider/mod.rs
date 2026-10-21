@@ -276,10 +276,18 @@ pub enum Error {
     #[snafu(display("Internal error in table '{table}': {message}"))]
     Internal { table: String, message: String },
 
+    /// The process reached its open file limit. Client connections and every other
+    /// open file count against the same limit, so the message names it and keeps
+    /// the operating system's error rather than blaming acceleration files alone.
     #[snafu(display(
-        "Unable to open Cayenne acceleration file ({file_path}). Too many Cayenne acceleration files are open. Try increasing your system's maximum open file count, or increase the size of generated Cayenne files with the parameter \"cayenne_target_file_size_mb\". For more details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#params"
+        "Failed to open Cayenne acceleration file '{file_path}' because the process reached its open file limit{}, which client connections and all other open files also count against. Raise the limit where spiced is started (`ulimit -n`, or the container's `nofile` limit), or write fewer, larger acceleration files with `cayenne_target_file_size_mb`. See: https://spiceai.org/docs/components/data-accelerators/cayenne#params. Cause: {message}",
+        open_file_limit.map_or_else(String::new, |limit| format!(" of {limit}"))
     ))]
-    TooManyOpenFiles { file_path: String },
+    TooManyOpenFiles {
+        file_path: String,
+        open_file_limit: Option<u64>,
+        message: String,
+    },
 
     /// A previous write was interrupted, leaving the table in a potentially
     /// inconsistent state. The staging WAL file must be resolved before the
@@ -2478,6 +2486,7 @@ mod tests {
                 .expect("warm new-schema statistics");
             assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
         }
+        provider.wait_for_scan_file_statistics_persistence().await;
         let before_release = catalog
             .get_snapshot_file_statistics(&metadata.table_id, &metadata.current_snapshot_id, &path)
             .await
@@ -2521,6 +2530,7 @@ mod tests {
             assert_eq!(old_values, vec![(1, 12_345_i128), (2, 67_890_i128)]);
         }
         eprintln!("DECIMAL_FILE_OLD_SCAN {old_values:?}");
+        provider.wait_for_scan_file_statistics_persistence().await;
         let persisted = catalog
             .get_snapshot_file_statistics(&metadata.table_id, &metadata.current_snapshot_id, &path)
             .await

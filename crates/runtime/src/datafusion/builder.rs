@@ -379,7 +379,7 @@ pub struct DataFusionBuilder {
     /// memory pool. `Some` only when dedicated thread pools are enabled AND at
     /// least one enabled Cayenne acceleration can compact into it — a file
     /// acceleration mode on a profile that accumulates files (set by the Runtime
-    /// builder; see [`crate::builder::CayenneWorkload::needs_compaction`]). `None`
+    /// builder; see [`runtime_acceleration::CayenneWorkload::needs_compaction`]). `None`
     /// leaves the full budget to queries and gives compaction no separate pool; it
     /// then accounts against the query pool, as it does with no Cayenne at all.
     compaction_memory_fraction: Option<f64>,
@@ -392,7 +392,7 @@ pub struct DataFusionBuilder {
     /// What the pod's Cayenne accelerations demand of the host, classified by the
     /// Runtime builder from the Spicepod. Gates the coordinated host-memory
     /// partition, which exists solely to leave room for the in-memory CDC tier.
-    cayenne_workload: crate::builder::CayenneWorkload,
+    cayenne_workload: runtime_acceleration::CayenneWorkload,
     /// Whether `runtime.params.dedicated_thread_pool` leaves the dedicated pools on
     /// (set by the Runtime builder; the default is on). The in-memory CDC tier
     /// budget is installed by `install_cayenne_global_budgets`, which `spiced` only
@@ -510,7 +510,7 @@ impl DataFusionBuilder {
             cayenne_footer_cache_mb: None,
             compaction_memory_fraction: None,
             cayenne_reservation_bytes: 0,
-            cayenne_workload: crate::builder::CayenneWorkload::default(),
+            cayenne_workload: runtime_acceleration::CayenneWorkload::default(),
             dedicated_thread_pools_enabled: true,
             duckdb_query_pool_cap: None,
             cayenne_optimizer_rules: CayenneOptimizerRules::default(),
@@ -750,7 +750,7 @@ impl DataFusionBuilder {
     /// What the pod's Cayenne accelerations demand of the host. Gates the
     /// coordinated host-memory partition; see the field docs.
     #[must_use]
-    pub fn cayenne_workload(mut self, workload: crate::builder::CayenneWorkload) -> Self {
+    pub fn cayenne_workload(mut self, workload: runtime_acceleration::CayenneWorkload) -> Self {
         self.cayenne_workload = workload;
         self
     }
@@ -1366,7 +1366,10 @@ impl DataFusionBuilder {
                 // Rules only for distributed query
                 // Accelerated tables
                 ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
-                    Arc::new(AcceleratedPartitionProvider::from_registry(Arc::clone(executor_registry)))
+                    Arc::new(AcceleratedPartitionProvider::from_registry(
+                        Arc::clone(executor_registry),
+                        self.partition_service.as_ref().map(|service| Arc::clone(&service.app)),
+                    ))
                         as Arc<dyn TablePartitionProvider>,
                     &ctx,
                 )));
@@ -1455,6 +1458,7 @@ impl DataFusionBuilder {
             schema_evolve_locks: TokioRwLock::new(HashMap::new()),
             change_generations: super::change_generations::ChangeGenerations::default(),
             bootstrap_owners: parking_lot::Mutex::new(HashMap::new()),
+            snapshot_writers: parking_lot::Mutex::new(HashMap::new()),
             pending_sink_tables: TokioRwLock::new(HashMap::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
@@ -1479,6 +1483,7 @@ impl DataFusionBuilder {
             task_history_captured_output: self.output_preview == OutputPreview::Build,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
+            interactive_runtime: OnceLock::new(),
             refresh_runtime: OnceLock::new(),
             cdc_apply_runtime: OnceLock::new(),
             compaction_runtime: OnceLock::new(),
@@ -2500,10 +2505,10 @@ mod tests {
         SPARK_WINDOW_COLLISIONS, names_already_registered,
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
-    use crate::status;
     #[cfg(not(windows))]
     use data_components::poly::PolyTableProvider;
     use runtime_object_store::registry::SpiceObjectStoreRegistry;
+    use runtime_status as status;
     #[cfg(not(windows))]
     use std::collections::HashMap;
     use std::sync::Arc;
