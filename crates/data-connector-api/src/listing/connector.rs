@@ -17,7 +17,7 @@ limitations under the License.
 use crate::federated::FederatedTableProvider;
 use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
-use data_components::file_schema_drift::{FileSchemaDriftCheckedTable, FileSchemaDriftGuard};
+use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -182,7 +182,7 @@ impl ListingTableTemplate {
             table
         };
         match self.schema_drift_guard() {
-            Some(guard) => Arc::new(FileSchemaDriftCheckedTable::new(table, guard)),
+            Some(guard) => FileSchemaDriftLayer::over(table, guard),
             None => table,
         }
     }

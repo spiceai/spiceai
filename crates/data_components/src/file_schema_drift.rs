@@ -46,20 +46,16 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{ScanArgs, ScanResult, Session},
-    common::{
-        Constraints, Statistics,
-        tree_node::{TreeNode, TreeNodeRecursion},
-    },
-    datasource::{TableProvider, TableType, file_format::FileFormat},
+    common::tree_node::{TreeNode, TreeNodeRecursion},
+    datasource::{TableProvider, file_format::FileFormat},
     error::{DataFusionError, Result as DFResult},
     execution::{config::SessionConfig, object_store::ObjectStoreUrl},
-    logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
     physical_plan::ExecutionPlan,
-    prelude::Expr,
 };
 use datafusion_datasource::{file_scan_config::FileScanConfig, source::DataSourceExec};
 use object_store::ObjectMeta;
 use parking_lot::Mutex;
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 
 /// How many files' schemas are read per round while looking for a column. The newest file
 /// is read alone first because it normally carries every registered column.
@@ -394,138 +390,64 @@ fn read_warning_message(dataset: &str, drift: &Drift) -> String {
     )
 }
 
-/// A file dataset's table with its scans checked by a [`FileSchemaDriftGuard`]. Every other
-/// call passes through to `inner`.
+/// The [`TableLayer`] that checks a file dataset's scans with a [`FileSchemaDriftGuard`].
+/// Every other call, and every layer walk except [`LayerWalk::Passthrough`], goes to the
+/// table beneath.
 #[derive(Debug)]
-pub struct FileSchemaDriftCheckedTable {
-    inner: Arc<dyn TableProvider>,
+pub struct FileSchemaDriftLayer {
     guard: FileSchemaDriftGuard,
 }
 
-impl FileSchemaDriftCheckedTable {
+impl FileSchemaDriftLayer {
     #[must_use]
-    pub fn new(inner: Arc<dyn TableProvider>, guard: FileSchemaDriftGuard) -> Self {
-        Self { inner, guard }
+    pub fn new(guard: FileSchemaDriftGuard) -> Self {
+        Self { guard }
     }
 
-    /// The table this one checks.
+    /// `table` with its scans checked by `guard`.
     #[must_use]
-    pub fn inner(&self) -> &Arc<dyn TableProvider> {
-        &self.inner
+    pub fn over(
+        table: Arc<dyn TableProvider>,
+        guard: FileSchemaDriftGuard,
+    ) -> Arc<dyn TableProvider> {
+        SpiceTable::over(Arc::new(Self::new(guard)), table)
     }
 }
 
-#[deny(clippy::missing_trait_methods)]
 #[async_trait]
-impl TableProvider for FileSchemaDriftCheckedTable {
-    fn schema(&self) -> SchemaRef {
-        self.inner.schema()
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        self.inner.constraints()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
-    }
-
-    fn get_table_definition(&self) -> Option<&str> {
-        self.inner.get_table_definition()
-    }
-
-    fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, LogicalPlan>> {
-        self.inner.get_logical_plan()
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.inner.get_column_default(column)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let plan = self.inner.scan(state, projection, filters, limit).await?;
-        self.guard
-            .check_scan(
-                state,
-                &self.inner.schema(),
-                projection.map(Vec::as_slice),
-                &plan,
-            )
-            .await?;
-        Ok(plan)
+impl TableLayer for FileSchemaDriftLayer {
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind for this
+        // layer without anyone deciding what it should say.
+        match walk {
+            LayerWalk::Read
+            | LayerWalk::CdcDetection
+            | LayerWalk::Source
+            | LayerWalk::Write
+            | LayerWalk::RetentionDelete
+            | LayerWalk::Index => Some(below),
+            // Serving the table beneath in this layer's place would read the files without
+            // the check, so a refresh could load NULLs for a missing column.
+            LayerWalk::Passthrough => None,
+        }
     }
 
     async fn scan_with_args<'a>(
         &self,
+        below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         args: ScanArgs<'a>,
     ) -> DFResult<ScanResult> {
         let projection = args.projection();
-        let result = self.inner.scan_with_args(state, args).await?;
+        let result = below.scan_with_args(state, args).await?;
         self.guard
-            .check_scan(state, &self.inner.schema(), projection, result.plan())
+            .check_scan(state, &below.schema(), projection, result.plan())
             .await?;
         Ok(result)
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    fn statistics(&self) -> Option<Statistics> {
-        self.inner.statistics()
-    }
-
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.insert_into(state, input, insert_op).await
-    }
-
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.delete_from(state, filters).await
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.update(state, assignments, filters).await
-    }
-
-    async fn truncate(&self, state: &dyn Session) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.truncate(state).await
-    }
-
-    async fn merge_into(
-        &self,
-        state: &dyn Session,
-        source: Arc<dyn ExecutionPlan>,
-        merge_schema: datafusion::common::DFSchemaRef,
-        on: Expr,
-        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner
-            .merge_into(state, source, merge_schema, on, clauses)
-            .await
     }
 }
 
@@ -571,7 +493,12 @@ mod tests {
 
     /// A guarded listing table over `dir` with the registered `columns`, as a file dataset
     /// would have registered it before its files changed.
-    fn guarded_table(dir: &Path, columns: &[&str]) -> Arc<FileSchemaDriftCheckedTable> {
+    struct Guarded {
+        table: Arc<dyn TableProvider>,
+        layer: Arc<FileSchemaDriftLayer>,
+    }
+
+    fn guarded_table(dir: &Path, columns: &[&str]) -> Guarded {
         let schema = registered_schema(columns);
         let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::default());
         let url = ListingTableUrl::parse(format!("file://{}/", dir.display())).expect("url");
@@ -580,11 +507,14 @@ mod tests {
                 ListingOptions::new(Arc::clone(&format)).with_file_extension(".parquet"),
             )
             .with_schema(Arc::clone(&schema));
-        let table = Arc::new(ListingTable::try_new(config).expect("listing table"));
-        Arc::new(FileSchemaDriftCheckedTable::new(
-            table,
-            FileSchemaDriftGuard::new("base", schema, format),
-        ))
+        let listing: Arc<dyn TableProvider> =
+            Arc::new(ListingTable::try_new(config).expect("listing table"));
+        let layer = Arc::new(FileSchemaDriftLayer::new(FileSchemaDriftGuard::new(
+            "base", schema, format,
+        )));
+        let table: Arc<dyn TableProvider> =
+            SpiceTable::over(Arc::clone(&layer) as Arc<dyn TableLayer>, listing);
+        Guarded { table, layer }
     }
 
     fn context(refresh: bool) -> SessionContext {
@@ -595,13 +525,9 @@ mod tests {
         SessionContext::new_with_config(config)
     }
 
-    async fn query(
-        table: &Arc<FileSchemaDriftCheckedTable>,
-        refresh: bool,
-        sql: &str,
-    ) -> DFResult<Vec<RecordBatch>> {
+    async fn query(table: &Guarded, refresh: bool, sql: &str) -> DFResult<Vec<RecordBatch>> {
         let ctx = context(refresh);
-        ctx.register_table("base", Arc::clone(table) as Arc<dyn TableProvider>)?;
+        ctx.register_table("base", Arc::clone(&table.table))?;
         ctx.sql(sql).await?.collect().await
     }
 
@@ -648,14 +574,30 @@ mod tests {
             .await
             .expect("a federated read still answers");
         assert_eq!(single_value(&batches), None);
-        assert!(table.guard.state.lock().warned.contains("amount_cents"));
+        assert!(
+            table
+                .layer
+                .guard
+                .state
+                .lock()
+                .warned
+                .contains("amount_cents")
+        );
 
         // A scan that does not read the missing column neither repeats nor re-arms the
         // warning.
         query(&table, false, "SELECT sum(id) FROM base")
             .await
             .expect("read of a present column");
-        assert!(table.guard.state.lock().warned.contains("amount_cents"));
+        assert!(
+            table
+                .layer
+                .guard
+                .state
+                .lock()
+                .warned
+                .contains("amount_cents")
+        );
 
         // Restoring the column clears the warning so a later drop is reported again.
         write_parquet(
@@ -667,7 +609,7 @@ mod tests {
             .await
             .expect("read after restore");
         assert_eq!(single_value(&batches), Some(3));
-        assert!(table.guard.state.lock().warned.is_empty());
+        assert!(table.layer.guard.state.lock().warned.is_empty());
     }
 
     #[tokio::test]
