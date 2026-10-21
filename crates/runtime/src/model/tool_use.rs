@@ -1160,7 +1160,7 @@ fn make_a_stream(
 /// Takes the tool calls of the choice at `choice_index`, accumulated from its chunks, in call
 /// order. Each call is taken once, so a later finish of the same choice cannot give it again.
 fn take_tool_calls(
-    states: &Mutex<HashMap<(i32, i32), ChatCompletionMessageToolCall>>,
+    states: &Mutex<BTreeMap<(i32, i32), ChatCompletionMessageToolCall>>,
     choice_index: u32,
 ) -> Vec<(u32, ChatCompletionMessageToolCall)> {
     let mut states = match states.lock() {
@@ -1170,12 +1170,13 @@ fn take_tool_calls(
             return Vec::new();
         }
     };
-    let mut calls: Vec<(u32, ChatCompletionMessageToolCall)> = states
-        .extract_if(|(choice, _), _| u32::try_from(*choice).ok() == Some(choice_index))
+    let Ok(choice) = i32::try_from(choice_index) else {
+        return Vec::new();
+    };
+    states
+        .extract_if((choice, i32::MIN)..=(choice, i32::MAX), |_, _| true)
         .filter_map(|((_, index), call)| Some((u32::try_from(index).ok()?, call)))
-        .collect();
-    calls.sort_by_key(|(index, _)| *index);
-    calls
+        .collect()
 }
 
 /// `calls` as one chunk each; `None` when there are none.
@@ -1204,7 +1205,7 @@ fn tool_call_chunks(
 /// The tool calls of the choice at `choice_index`, accumulated from its chunks, as one chunk
 /// each in call order; `None` when it made none, or they were already given.
 fn withheld_tool_calls(
-    states: &Mutex<HashMap<(i32, i32), ChatCompletionMessageToolCall>>,
+    states: &Mutex<BTreeMap<(i32, i32), ChatCompletionMessageToolCall>>,
     choice_index: u32,
 ) -> Option<Vec<ChatCompletionMessageToolCallChunk>> {
     tool_call_chunks(take_tool_calls(states, choice_index))
@@ -1281,7 +1282,7 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         };
-        let states = Mutex::new(HashMap::from([
+        let states = Mutex::new(BTreeMap::from([
             ((0, 1), call("b")),
             ((0, 0), call("a")),
             ((1, 0), call("other choice")),
