@@ -160,7 +160,12 @@ impl SpiceModelTool for McpToolWrapper {
             if self.reconnected_after_close(&result).await {
                 result = self.client.read().await.call_tool(params).await;
             }
-            let response = result.boxed()?;
+            // The transport error names the HTTP client type. Keep the
+            // sentence that says what happened to the call.
+            let response = match result {
+                Ok(response) => response,
+                Err(e) => return Err(tool_facing_error_text(&e.to_string()).into()),
+            };
 
             // The transport already bounds each response body; this also
             // covers results from a stdio server.
@@ -243,6 +248,13 @@ impl McpProxy for McpToolWrapper {
         }
         result
     }
+}
+
+/// The text of a transport failure, without the client-type prefix the
+/// transport puts in front of an over-limit response.
+fn tool_facing_error_text(text: &str) -> String {
+    text.find("MCP server '")
+        .map_or_else(|| text.to_string(), |start| text[start..].to_string())
 }
 
 /// The single-line message for a tool result larger than [`MAX_TOOL_RESULT_SIZE`].
@@ -396,6 +408,19 @@ mod tests {
         assert!(
             result_exceeds_limit(&with_structured, len - 1),
             "structuredContent must count toward the limit"
+        );
+    }
+
+    #[test]
+    fn transport_size_error_drops_the_client_type_path() {
+        let raw = "Transport send error: Transport [rmcp::transport::worker::WorkerTransport<runtime_tools::mcp::http_client::BoundedHttpClient>] error: unexpected server response: MCP server 'hostile' sent a response larger than the 16 MiB limit, so the request failed and the response was discarded. Make the MCP tool return a smaller result, for example by paginating it. See https://spiceai.org/docs/components/tools/mcp";
+        assert_eq!(
+            tool_facing_error_text(raw),
+            "MCP server 'hostile' sent a response larger than the 16 MiB limit, so the request failed and the response was discarded. Make the MCP tool return a smaller result, for example by paginating it. See https://spiceai.org/docs/components/tools/mcp"
+        );
+        assert_eq!(
+            tool_facing_error_text("connection reset by peer"),
+            "connection reset by peer"
         );
     }
 
