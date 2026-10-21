@@ -1,5 +1,4 @@
 {
-  "files-federated-stale": 899,
-  "iceberg-equality-delete-nulls": 15,
-  "s3-federated-stale": 727
+  "file-tables-federated-stale": 1626,
+  "iceberg-equality-delete-nulls": 15
 }

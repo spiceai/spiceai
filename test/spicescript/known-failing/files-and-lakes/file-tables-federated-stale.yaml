@@ -1,19 +1,21 @@
-# Known failing: a federated file table keeps its file listing and file
-# metadata, so an added file is not seen, and after files are replaced Parquet
-# reads fail ("Requested range was invalid", "Unexpected PageType") and a CSV
-# query over byte ranges past the new end of a file never returns.
+# Known failing: a federated table of files keeps its file listing and file
+# metadata, so an added file is not seen. After files are replaced, local
+# Parquet reads fail ("Requested range was invalid", "Unexpected PageType"), a
+# local CSV query over byte ranges past the new end of a file never returns,
+# and S3 reads fail ("not found", "Request precondition failure").
 # Move this script to test/spicescript/ once it passes.
-name: files-federated-stale
+name: file-tables-federated-stale
 description: >
-  A federated table of local Parquet or CSV part files, read at query time,
-  answers like the same rows in a database after a part file is added and
-  after every file is replaced.
+  A federated table of Parquet or CSV part files, on local disk or in an
+  S3-compatible store, read at query time, answers like the same rows in a
+  database after a part file is added and after every file is replaced.
 
 sources:
-  lake: { kind: files }
+  lake: { kind: '${matrix.src}' }
   oracle: { kind: postgres }
 
 matrix:
+  src: [files, rustfs]
   format: [parquet, csv]
 
 variants:
@@ -22,11 +24,11 @@ variants:
 spicepod:
   version: v1
   kind: Spicepod
-  name: files-federated-stale
+  name: file-tables-federated-stale
   datasets:
-    - from: 'file://${sources.lake.path}/facts/'
+    - from: '${sources.lake.from_prefix}facts${sources.lake.from_suffix}'
       name: facts
-      params: { file_format: '${matrix.format}' }
+      params: { $merge: '${sources.lake.table_params}', file_format: '${matrix.format}' }
 
 defaults:
   expect: { oracle: oracle }

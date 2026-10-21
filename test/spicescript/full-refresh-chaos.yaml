@@ -6,9 +6,7 @@ description: >
   killed during the refresh that picks them up, it comes back with whole rows
   and then catches up. Readers always see the full row count, and the table
   ends equal to the same rows in PostgreSQL. Run over databases, lakehouse
-  tables, an object store and local files. (On ClickHouse, the refresh retried
-  as the source comes back sometimes loads 0 rows and serves an empty table
-  until the next refresh: an expected failure in recordings/.)
+  tables, an object store and local files.
 
 sources:
   src: { kind: '${matrix.src}' }

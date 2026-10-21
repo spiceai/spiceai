@@ -1,15 +1,17 @@
-name: files-refresh
+name: file-tables-refresh
 description: >
-  A table of local Parquet or CSV part files answers like the same rows in a
-  database when accelerated by full refresh into Cayenne and DuckDB, after the
-  first load, after a part file is added, and after every file is replaced.
-  The federated form is in known-failing/files-and-lakes/files-federated-stale.yaml.
+  A table of Parquet or CSV part files, on local disk or in an S3-compatible
+  store, answers like the same rows in a database when accelerated by full
+  refresh into Cayenne and DuckDB, after the first load, after a part file is
+  added, and after every file is replaced. The federated form is in
+  known-failing/files-and-lakes/file-tables-federated-stale.yaml.
 
 sources:
-  lake: { kind: files }
+  lake: { kind: '${matrix.src}' }
   oracle: { kind: postgres }
 
 matrix:
+  src: [files, rustfs]
   format: [parquet, csv]
 
 variants:
@@ -21,14 +23,15 @@ variants:
 spicepod:
   version: v1
   kind: Spicepod
-  name: files-refresh
+  name: file-tables-refresh
   datasets:
-    - from: 'file://${sources.lake.path}/facts/'
+    - from: '${sources.lake.from_prefix}facts${sources.lake.from_suffix}'
       name: facts
-      params: { file_format: '${matrix.format}' }
+      params: { $merge: '${sources.lake.table_params}', file_format: '${matrix.format}' }
 
 defaults:
   expect: { oracle: oracle }
+  query-timeout: 30s
 
 steps:
   - generate:
