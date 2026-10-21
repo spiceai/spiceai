@@ -433,14 +433,35 @@ impl UrlTableFactory for SpiceUrlTableFactory {
         validate_http_url_not_internal(url).await?;
 
         // An `http://` SQL URL is the operator asking for plaintext, the same
-        // way an `http://` dataset does. `ListingTableUrl` looks the store up
-        // without the fragment, so register that store here, after the address
+        // way an `http://` dataset does. Register that store after the address
         // check. An `https://` URL stays HTTPS-only, and a redirect to `http://`
         // is still refused.
+        //
+        // Schema inference looks the store up with the full listing URL,
+        // fragment included. A fragment that differs from the one just
+        // registered — `client_timeout` without `allow_http`, for example —
+        // rebuilds an HTTPS-only store and replaces the selected one. The
+        // listing URL is therefore fragment-free, and that bare lookup reuses
+        // the store selected here.
         let store_url = object_store_url_for_sql_table(url)?;
+        if store_url.scheme() == "http" {
+            let registry = self.registry.read().clone();
+            let Some(registry) = registry else {
+                return Err(DataFusionError::Plan(format!(
+                    "Failed to read URL table '{url}'. Plaintext HTTP is not set up for this runtime."
+                )));
+            };
+            registry.ensure_plaintext_http_store(&store_url)?;
+        }
+        let listing_url = if store_url.scheme() == "http" {
+            url.split_once('#')
+                .map_or(url, |(without_fragment, _)| without_fragment)
+        } else {
+            url
+        };
 
         // Parse the URL
-        let table_url = ListingTableUrl::parse(url).map_err(|e| {
+        let table_url = ListingTableUrl::parse(listing_url).map_err(|e| {
             DataFusionError::Plan(format!("Failed to parse URL table '{url}': {e}"))
         })?;
 
@@ -461,16 +482,6 @@ impl UrlTableFactory for SpiceUrlTableFactory {
             // parking_lot::RwLock::read() returns guard directly (not Result)
             weak_state.read().clone()
         }; // Lock is dropped here
-
-        if store_url.scheme() == "http" {
-            let registry = self.registry.read().clone();
-            let Some(registry) = registry else {
-                return Err(DataFusionError::Plan(format!(
-                    "Failed to read URL table '{url}'. Plaintext HTTP is not set up for this runtime."
-                )));
-            };
-            registry.ensure_plaintext_http_store(&store_url)?;
-        }
 
         // Infer options and schema from the URL
         let config = ListingTableConfig::new(table_url)
@@ -1269,6 +1280,113 @@ mod tests {
         );
     }
 
+    /// `client_timeout` is an object-store option. The listing lookup must not
+    /// treat that fragment as a new store and drop `allow_http`.
+    #[tokio::test]
+    async fn http_sql_url_fragment_keeps_the_plaintext_store() {
+        use datafusion::prelude::{SessionConfig, SessionContext};
+        use runtime_object_store::registry::{SpiceObjectStoreRegistry, runtime_env_with_registry};
+
+        struct ClearAllowPrivateHosts;
+        impl Drop for ClearAllowPrivateHosts {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
+            }
+        }
+        let _env_lock = HTTP_URL_ENV
+            .lock()
+            .expect("the HTTP URL env lock is not poisoned");
+        unsafe { std::env::remove_var(ALLOW_PRIVATE_HOSTS_ENV) };
+        let _clear = ClearAllowPrivateHosts;
+
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the csv server binds");
+        let port = listener
+            .local_addr()
+            .expect("the csv server has a port")
+            .port();
+        let seen_server = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen_server = Arc::clone(&seen_server);
+                tokio::spawn(serve_csv_once(socket, seen_server));
+            }
+        });
+
+        let registry = Arc::new(SpiceObjectStoreRegistry::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new(),
+            runtime_env_with_registry(Arc::clone(&registry)),
+        );
+        let factory = SpiceUrlTableFactory::new();
+        factory.with_registry(Arc::clone(&registry));
+        factory.with_state(ctx.state_weak_ref());
+        unsafe { std::env::set_var(ALLOW_PRIVATE_HOSTS_ENV, "true") };
+
+        let fragment_url = format!("http://127.0.0.1:{port}/fragment.csv#client_timeout=5s");
+        let table = factory
+            .try_new(&fragment_url)
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "a fragment-bearing http URL loads: {err}; requests={:?}",
+                    seen.lock()
+                )
+            })
+            .expect("the URL is a table");
+        let requests = seen.lock().clone();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("/fragment.csv")),
+            "{requests:?}"
+        );
+        assert!(
+            table
+                .schema()
+                .fields()
+                .iter()
+                .any(|field| field.name() == "id"),
+            "schema: {:?}",
+            table.schema()
+        );
+
+        seen.lock().clear();
+        let again = factory
+            .try_new(&format!("http://127.0.0.1:{port}/after.csv"))
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "a later bare http URL loads: {err}; requests={:?}",
+                    seen.lock()
+                )
+            })
+            .expect("the URL is a table");
+        let again_requests = seen.lock().clone();
+        assert!(
+            again_requests
+                .iter()
+                .any(|request| request.contains("/after.csv")),
+            "{again_requests:?}"
+        );
+        assert!(
+            again
+                .schema()
+                .fields()
+                .iter()
+                .any(|field| field.name() == "id"),
+            "schema: {:?}",
+            again.schema()
+        );
+    }
+
     /// A dataset store for this origin already carries `basic_auth`. The SQL
     /// URL must keep that store. Replacing it with only `allow_http=true`
     /// drops the credential, and the server answers 401.
@@ -1458,6 +1576,41 @@ mod tests {
                 .any(|field| field.name() == "id"),
             "schema: {:?}",
             table.schema()
+        );
+
+        // A different fragment on this origin must reuse the credentialed store.
+        // Building `client_timeout` on its own would replace that store.
+        seen.lock().clear();
+        let timed = factory
+            .try_new(&format!(
+                "http://127.0.0.1:{port}/timed.csv#client_timeout=5s"
+            ))
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "a fragment URL keeps the configured store: {err}; {:?}",
+                    seen.lock()
+                )
+            })
+            .expect("the URL is a table");
+        let timed_requests = seen.lock().clone();
+        assert!(
+            timed_requests
+                .iter()
+                .any(|request| request.contains("/timed.csv"))
+                && timed_requests
+                    .iter()
+                    .all(|request| request.ends_with(EXPECTED_AUTH)),
+            "{timed_requests:?}"
+        );
+        assert!(
+            timed
+                .schema()
+                .fields()
+                .iter()
+                .any(|field| field.name() == "id"),
+            "schema: {:?}",
+            timed.schema()
         );
 
         // A later URL on this origin that sets `allow_http` to false must not
