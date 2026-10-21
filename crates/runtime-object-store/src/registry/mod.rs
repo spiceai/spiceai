@@ -901,6 +901,13 @@ impl SpiceObjectStoreRegistry {
     /// `allow_http=false` is refused here, before a lookup: the listing table
     /// passes the fragment through, and building that URL would replace the
     /// configured store.
+    ///
+    /// # Errors
+    ///
+    /// Returns a plan error when the fragment sets `allow_http` to false, a
+    /// configuration error when that value is not a boolean, or the store
+    /// builder's error when this origin has no store yet and one cannot be
+    /// created.
     pub fn ensure_plaintext_http_store(
         &self,
         url: &Url,
@@ -995,7 +1002,7 @@ impl SpiceObjectStoreRegistry {
 
 // This method uses unwrap_or_default, however it should never fail on the initialization. See
 // RuntimeEnv::default()
-/// A DataFusion runtime whose object-store registry is `registry`.
+/// A `DataFusion` runtime whose object-store registry is `registry`.
 #[must_use]
 pub fn runtime_env_with_registry(registry: Arc<SpiceObjectStoreRegistry>) -> Arc<RuntimeEnv> {
     match RuntimeEnvBuilder::default()
