@@ -75,9 +75,9 @@ use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, factory::default_available_catalogs};
 pub use notify::Error as NotifyError;
+use runtime_status::ComponentStatus;
 use runtime_tls::TlsConfig;
 use snafu::prelude::*;
-use status::ComponentStatus;
 
 use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
@@ -126,7 +126,8 @@ pub mod model;
 pub mod opentelemetry;
 pub mod opentelemetry_logs;
 pub mod opentelemetry_store;
-pub mod otel_push_exporter;
+// Moved to `runtime-otel-push`; re-exported so `runtime::otel_push_exporter` still resolves.
+pub use runtime_otel_push as otel_push_exporter;
 // Host/container resource introspection lives in `runtime-resources`; it names
 // nothing from the runtime. Re-exported so `crate::resource_monitor::…` resolves.
 pub mod resource_monitor {
@@ -150,11 +151,12 @@ pub(crate) mod secrets {
     pub use runtime_secrets::*;
 }
 pub mod cluster;
-mod secrets_preflight;
 mod server_timing;
 pub mod spice_metrics;
+// The status tracker lives in `runtime-status`. Aliased so `runtime::status::…`
+// (used by tests, `spiced` and grouped `crate::{status, …}` imports) still resolves.
+pub use runtime_status as status;
 mod state_location;
-pub mod status;
 pub mod task_history;
 pub mod token_providers;
 pub mod tools;
@@ -2095,7 +2097,7 @@ impl Runtime {
         // round trip, and holding the guard across it stalls a writer (and
         // risks the write-preferring deadlock `Secrets::snapshot` documents).
         let secrets = secrets::Secrets::snapshot(&self.secrets).await;
-        secrets_preflight::run(&app, &secrets).await;
+        runtime_secrets::preflight::run(&app, &secrets).await;
     }
 
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.

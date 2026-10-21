@@ -54,13 +54,13 @@ use runtime_metrics::drasi::{DrasiForwardMetrics, OUTCOME_DISCARDED};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
-use crate::drasi::queue::QueuedBatch;
+use crate::queue::QueuedBatch;
 
 /// Batches retained per component before the oldest is discarded.
-pub(crate) const DEFAULT_MAX_BATCHES: usize = 1024;
+pub const DEFAULT_MAX_BATCHES: usize = 1024;
 
 /// How long to wait between attempts to drain a non-empty store.
-pub(crate) const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+pub const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Schema-metadata key holding the per-batch delivery metadata.
 const METADATA_KEY: &str = "spice.drasi.dead_letter";
@@ -80,7 +80,7 @@ struct BatchMetadata {
 }
 
 #[derive(Debug, Snafu)]
-pub(crate) enum Error {
+pub enum Error {
     #[snafu(display("Failed to prepare the Drasi dead-letter directory {}: {source}", path.display()))]
     PrepareDirectory {
         path: PathBuf,
@@ -116,7 +116,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A component's on-disk dead-letter store.
 #[derive(Debug)]
-pub(crate) struct DeadLetterStore {
+pub struct DeadLetterStore {
     dir: PathBuf,
     component: String,
     max_batches: usize,
@@ -140,8 +140,8 @@ impl DeadLetterStore {
     /// # Errors
     ///
     /// Returns an error if the directory cannot be created or listed.
-    #[cfg(test)]
-    pub(crate) async fn open(dir: PathBuf, component: String, max_batches: usize) -> Result<Self> {
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn open(dir: PathBuf, component: String, max_batches: usize) -> Result<Self> {
         Self::open_with(
             dir,
             component,
@@ -156,7 +156,11 @@ impl DeadLetterStore {
     ///
     /// `transport` is `http` or `redis`. The gauge starts at the number of
     /// batches already on disk, including zero.
-    pub(crate) async fn open_with(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created or listed.
+    pub async fn open_with(
         dir: PathBuf,
         component: String,
         max_batches: usize,
@@ -199,7 +203,7 @@ impl DeadLetterStore {
     ///
     /// Read before every delivery: a non-empty store means new batches must
     /// queue behind what is already pending rather than overtake it.
-    pub(crate) async fn is_empty(&self) -> bool {
+    pub async fn is_empty(&self) -> bool {
         match list_batches(&self.dir).await {
             Ok(pending) => pending.is_empty(),
             Err(e) => {
@@ -215,7 +219,7 @@ impl DeadLetterStore {
     }
 
     /// How many batches have been discarded because the store was full.
-    pub(crate) fn discarded(&self) -> u64 {
+    pub fn discarded(&self) -> u64 {
         self.discarded.load(Ordering::Relaxed)
     }
 
@@ -224,7 +228,7 @@ impl DeadLetterStore {
     /// # Errors
     ///
     /// Returns an error if the batch cannot be encoded or written.
-    pub(crate) async fn append(&self, batch: &QueuedBatch) -> Result<()> {
+    pub async fn append(&self, batch: &QueuedBatch) -> Result<()> {
         self.enforce_cap().await?;
 
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
@@ -270,10 +274,10 @@ impl DeadLetterStore {
     /// first failure so ordering is preserved.
     ///
     /// Returns the number delivered.
-    pub(crate) async fn drain<F, Fut>(&self, deliver: F) -> usize
+    pub async fn drain<F, Fut>(&self, deliver: F) -> usize
     where
         F: Fn(QueuedBatch) -> Fut,
-        Fut: std::future::Future<Output = crate::drasi::queue::Outcome>,
+        Fut: std::future::Future<Output = crate::queue::Outcome>,
     {
         let pending = match list_batches(&self.dir).await {
             Ok(pending) => pending,
@@ -305,14 +309,14 @@ impl DeadLetterStore {
             };
 
             match deliver(batch).await {
-                crate::drasi::queue::Outcome::Delivered => {}
-                crate::drasi::queue::Outcome::Retain => {
+                crate::queue::Outcome::Delivered => {}
+                crate::queue::Outcome::Retain => {
                     // Stop at the first retainable failure: everything after it
                     // is newer, and delivering it now would apply state out of
                     // order.
                     break;
                 }
-                crate::drasi::queue::Outcome::Discard => {
+                crate::queue::Outcome::Discard => {
                     // It can never be delivered, so leaving it here would block
                     // every later batch permanently. Drop it and keep going —
                     // the count is what says the component has a gap. The
@@ -498,30 +502,8 @@ fn decode(bytes: &[u8], path: &Path) -> Result<QueuedBatch> {
         source_commit_ts_ms: metadata.source_commit_ts_ms,
         // Missing on pre-latency files. Use recovery time so a runtime-table
         // redelivery (no source commit) does not record ~56 years of latency.
-        queued_at_ms: metadata
-            .queued_at_ms
-            .unwrap_or_else(crate::drasi::queue::now_ms),
+        queued_at_ms: metadata.queued_at_ms.unwrap_or_else(crate::queue::now_ms),
     })
-}
-
-/// The directory a component's dead-letter store lives in.
-pub(crate) fn store_path(component: &str) -> PathBuf {
-    // Component names are table references (`runtime.task_history`, `orders`),
-    // which can contain characters a path should not take verbatim.
-    let sanitized: String = component
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    PathBuf::from(data_accelerator_api::spice_data_base_path())
-        .join("drasi")
-        .join(sanitized)
 }
 
 #[cfg(test)]
@@ -574,7 +556,7 @@ mod tests {
         store
             .drain(|batch| {
                 seen.lock().expect("not poisoned").push(batch);
-                async { crate::drasi::queue::Outcome::Delivered }
+                async { crate::queue::Outcome::Delivered }
             })
             .await;
 
@@ -599,7 +581,7 @@ mod tests {
         assert!(!store.is_empty().await);
 
         let delivered = store
-            .drain(|_| async { crate::drasi::queue::Outcome::Delivered })
+            .drain(|_| async { crate::queue::Outcome::Delivered })
             .await;
 
         assert_eq!(delivered, 1);
@@ -616,7 +598,7 @@ mod tests {
 
         store.append(&queued("row-1")).await.expect("appends");
         let delivered = store
-            .drain(|_| async { crate::drasi::queue::Outcome::Retain })
+            .drain(|_| async { crate::queue::Outcome::Retain })
             .await;
 
         assert_eq!(delivered, 0);
@@ -645,9 +627,9 @@ mod tests {
                 // The second batch fails.
                 async move {
                     if id == "row-2" {
-                        crate::drasi::queue::Outcome::Retain
+                        crate::queue::Outcome::Retain
                     } else {
-                        crate::drasi::queue::Outcome::Delivered
+                        crate::queue::Outcome::Delivered
                     }
                 }
             })
@@ -676,7 +658,7 @@ mod tests {
                 seen.lock()
                     .expect("not poisoned")
                     .push(ids(&batch.data)[0].clone());
-                async { crate::drasi::queue::Outcome::Delivered }
+                async { crate::queue::Outcome::Delivered }
             })
             .await;
 
@@ -709,7 +691,7 @@ mod tests {
                 seen.lock()
                     .expect("not poisoned")
                     .push(ids(&batch.data)[0].clone());
-                async { crate::drasi::queue::Outcome::Delivered }
+                async { crate::queue::Outcome::Delivered }
             })
             .await;
 
@@ -738,7 +720,7 @@ mod tests {
                 seen.lock()
                     .expect("not poisoned")
                     .push(ids(&batch.data)[0].clone());
-                async { crate::drasi::queue::Outcome::Delivered }
+                async { crate::queue::Outcome::Delivered }
             })
             .await;
 
@@ -768,7 +750,7 @@ mod tests {
                 seen.lock()
                     .expect("not poisoned")
                     .push(ids(&batch.data)[0].clone());
-                async { crate::drasi::queue::Outcome::Delivered }
+                async { crate::queue::Outcome::Delivered }
             })
             .await;
 
@@ -814,7 +796,7 @@ mod tests {
         store.append(&queued("row-1")).await.expect("appends");
 
         let delivered = store
-            .drain(|_| async { crate::drasi::queue::Outcome::Delivered })
+            .drain(|_| async { crate::queue::Outcome::Delivered })
             .await;
 
         assert_eq!(delivered, 1, "the readable batch behind it still lands");
@@ -840,9 +822,9 @@ mod tests {
                 seen.lock().expect("not poisoned").push(id.clone());
                 async move {
                     if id == "poison" {
-                        crate::drasi::queue::Outcome::Discard
+                        crate::queue::Outcome::Discard
                     } else {
-                        crate::drasi::queue::Outcome::Delivered
+                        crate::queue::Outcome::Delivered
                     }
                 }
             })
@@ -863,28 +845,16 @@ mod tests {
         );
         assert_eq!(parse_batch_file_name("notes.txt"), None);
     }
-
-    #[test]
-    fn store_path_sanitizes_a_qualified_table_name() {
-        let path = store_path("runtime.task_history");
-        assert!(path.ends_with("drasi/runtime.task_history"), "{path:?}");
-
-        let path = store_path("weird/../name");
-        assert!(
-            path.ends_with("drasi/weird_.._name"),
-            "a path separator must not escape the store directory: {path:?}"
-        );
-    }
     #[test]
     fn legacy_metadata_without_queued_at_uses_recovery_time() {
-        let before = crate::drasi::queue::now_ms();
+        let before = crate::queue::now_ms();
         let encoded = encode(
             &batch("row-1"),
             r#"{"op_codes":["c"],"primary_key_columns":[["id"]],"source_commit_ts_ms":null}"#,
         )
         .expect("encodes legacy metadata");
         let decoded = decode(&encoded, std::path::Path::new("legacy.arrow")).expect("decodes");
-        let after = crate::drasi::queue::now_ms();
+        let after = crate::queue::now_ms();
         assert!(
             decoded.queued_at_ms >= before && decoded.queued_at_ms <= after,
             "missing queued_at_ms must stamp recovery time, not the Unix epoch; got {}",
