@@ -2814,6 +2814,7 @@ mod tests {
     use futures::StreamExt;
     use futures::stream::{self, BoxStream};
     use std::collections::HashMap;
+    use std::fmt::Write;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2948,7 +2949,7 @@ mod tests {
                 header.push(',');
                 row.push(',');
             }
-            header.push_str(&format!("c{index}"));
+            write!(header, "c{index}").expect("write a csv column name");
             row.push('1');
         }
         format!("{header}\n{row}\n")
@@ -2960,7 +2961,7 @@ mod tests {
             if index > 0 {
                 line.push(',');
             }
-            line.push_str(&format!("\"k{index}\":1"));
+            write!(line, "\"k{index}\":1").expect("write a jsonl key");
         }
         // A second record must not make the probe treat the file as one JSON
         // document. Its keys are a subset, so the merged schema stays the width
