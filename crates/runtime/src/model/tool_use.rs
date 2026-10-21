@@ -1071,25 +1071,41 @@ fn make_a_stream(
                             ChoiceDisposition::RunTools => {}
                         }
 
-                        // A tool call has finished (i.e. we have all chunks), process it. The
-                        // calls run in the order the model made them. A choice that finishes
-                        // later still sees the earlier choices' calls in this map; those ids
-                        // were handled when that choice finished, and they are not run again.
-                        let calls = match tool_call_states.lock() {
-                            Ok(states_lock) => states_lock
-                                .iter()
-                                .sorted_by_key(|(key, _)| **key)
-                                .map(|(_, call)| call.clone())
-                                .collect_vec(),
+                        // A tool call has finished (i.e. we have all chunks), process it. Only
+                        // this choice's calls: another choice may still be streaming arguments
+                        // into the same map. Marking that partial call handled would run it
+                        // unfinished and then drop it when its own choice finished. The calls
+                        // run in the order the model made them. A choice that finishes later
+                        // does not run a call id this choice already handled. The allowance is
+                        // still one for the whole response.
+                        let Ok(finished_choice) = i32::try_from(chat_choice.index) else {
+                            tracing::error!(
+                                "chat_choice.index value {} is too large to fit in an i32",
+                                chat_choice.index
+                            );
+                            return;
+                        };
+                        let (calls, response_spice_calls) = match tool_call_states.lock() {
+                            Ok(states_lock) => {
+                                let response_spice_calls = states_lock
+                                    .values()
+                                    .filter(|call| model.as_spiced_tool(call).is_some())
+                                    .count();
+                                let calls = states_lock
+                                    .iter()
+                                    .filter(|((choice_index, _), _)| {
+                                        *choice_index == finished_choice
+                                    })
+                                    .sorted_by_key(|(key, _)| **key)
+                                    .map(|(_, call)| call.clone())
+                                    .collect_vec();
+                                (calls, response_spice_calls)
+                            }
                             Err(e) => {
                                 tracing::error!("Failed to lock tool_call_states: {}", e);
                                 return;
                             }
                         };
-                        let response_spice_calls = calls
-                            .iter()
-                            .filter(|call| model.as_spiced_tool(call).is_some())
-                            .count();
                         let new_calls = calls
                             .into_iter()
                             .filter(|call| handled_call_ids.insert(call.id.clone()))
@@ -2408,6 +2424,165 @@ mod tests {
         let mut choice_1 = vec!["user: A".to_string(), assistant(1)];
         choice_1.extend(tool_results(1, &not_run));
         assert_eq!(provider.messages(2), choice_1);
+    }
+
+    /// Records the argument string of each `sql` call.
+    struct RecordingSql(parking_lot::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl SpiceModelTool for RecordingSql {
+        fn name(&self) -> Cow<'_, str> {
+            "sql".into()
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().push(arg.to_string());
+            Ok(json!([{ "rows": 3 }]))
+        }
+    }
+
+    /// First response interleaves two choices: choice 1 has only a prefix of its arguments when
+    /// choice 0 finishes, then choice 1's arguments and finish arrive. Later responses answer
+    /// `done`.
+    struct InterleavedSql {
+        requests: parking_lot::Mutex<Vec<CreateChatCompletionRequest>>,
+    }
+
+    impl InterleavedSql {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                requests: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn messages(&self, index: usize) -> Vec<String> {
+            summary(&self.requests.lock()[index].messages)
+        }
+    }
+
+    #[async_trait]
+    impl Chat for InterleavedSql {
+        fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+            None
+        }
+
+        async fn chat_request(
+            &self,
+            req: CreateChatCompletionRequest,
+        ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+            self.requests.lock().push(req);
+            Ok(serde_json::from_value(json!({
+                "id": "scripted", "object": "chat.completion", "created": 0, "model": "scripted",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "done" },
+                    "finish_reason": "stop",
+                }],
+            }))
+            .expect("a valid response"))
+        }
+
+        async fn chat_stream(
+            &self,
+            req: CreateChatCompletionRequest,
+        ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+            let round = {
+                let mut requests = self.requests.lock();
+                requests.push(req);
+                requests.len() - 1
+            };
+            let chunks = if round == 0 {
+                vec![
+                    Ok(choice_chunk(
+                        1,
+                        &json!({
+                            "tool_calls": [{
+                                "index": 0, "id": "call_1", "type": "function",
+                                "function": { "name": "sql", "arguments": "{\"n\":" },
+                            }]
+                        }),
+                        None,
+                    )),
+                    Ok(choice_chunk(
+                        0,
+                        &json!({
+                            "tool_calls": [{
+                                "index": 0, "id": "call_0", "type": "function",
+                                "function": { "name": "sql", "arguments": "{\"n\":1}" },
+                            }]
+                        }),
+                        None,
+                    )),
+                    Ok(choice_chunk(0, &json!({}), Some("tool_calls"))),
+                    Ok(choice_chunk(
+                        1,
+                        &json!({
+                            "tool_calls": [{
+                                "index": 0,
+                                "function": { "arguments": "2}" },
+                            }]
+                        }),
+                        None,
+                    )),
+                    Ok(choice_chunk(1, &json!({}), Some("tool_calls"))),
+                ]
+            } else {
+                vec![
+                    Ok(choice_chunk(
+                        0,
+                        &json!({ "role": "assistant", "content": "done" }),
+                        None,
+                    )),
+                    Ok(choice_chunk(0, &json!({}), Some("stop"))),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    /// A choice that finishes while another choice is still streaming does not run that other
+    /// choice's partial call, and does not consume its id. The call runs when its own choice
+    /// finishes, with the arguments it finished with.
+    #[tokio::test]
+    async fn streamed_interleaved_choices_run_when_each_choice_finishes() {
+        let provider = InterleavedSql::new();
+        let tool = Arc::new(RecordingSql(parking_lot::Mutex::new(Vec::new())));
+        let model = ToolUsingChat::new(
+            Arc::clone(&provider) as Arc<dyn Chat>,
+            vec![Arc::clone(&tool) as Arc<dyn SpiceModelTool>],
+            None,
+        );
+
+        let text = streamed_turn(&model, vec![user("A")])
+            .await
+            .expect("the stream ends");
+        assert_eq!(text, "donedone");
+        assert_eq!(tool.0.lock().as_slice(), [r#"{"n":1}"#, r#"{"n":2}"#]);
+        assert_eq!(provider.requests.lock().len(), 3);
+        assert_eq!(
+            provider.messages(1),
+            [
+                "user: A".to_string(),
+                "assistant calls sql#call_0".to_string(),
+                r#"tool call_0: [{"rows":3}]"#.to_string(),
+            ]
+        );
+        assert_eq!(
+            provider.messages(2),
+            [
+                "user: A".to_string(),
+                "assistant calls sql#call_1".to_string(),
+                r#"tool call_1: [{"rows":3}]"#.to_string(),
+            ]
+        );
     }
 
     /// A request context, authenticated with `api_key` if there is one.
