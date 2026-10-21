@@ -1,0 +1,332 @@
+{
+  "builtins": [
+    {
+      "run": "builtins",
+      "who": "duckdb",
+      "key": "query: SELECT approx_median(qty) AS m FROM cust",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nCatalog Error: Scalar Function with name approx_median does not exist!\\nDid you mean \\\"approx_quantile\\\"?\\n\\nLINE 1: WITH fetch_schema AS ( SELECT approx_median(\\\"cust\\\".\\\"qty\\\") ",
+      "group": "duckdb"
+    },
+    {
+      "run": "builtins",
+      "who": "duckdb",
+      "key": "query: SELECT count(region, customer) AS n FROM cust",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: No function matches the given name and argument types 'count(VARCHAR, VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\tcount(ANY) -> ",
+      "group": "duckdb"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, sha256(name) AS d FROM names ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function sha256(text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\nSQLS",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, sha256(coalesce(name, '')) AS d FROM names WHERE id = 4",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function sha256(text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\nSQLS",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, encode(sha256(name), 'hex') AS h FROM names ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function sha256(text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\nSQLS",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, regexp_count(s, 'a++') AS c FROM rx ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: invalid regular expression: quantifier operand invalid\\nSQLSTATE: 2201B\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/do",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, regexp_count(s, '[^\\x00-\\x4A\\x4C-\\x6A\\x6C-\\x{10FFFF}]|a') AS c FROM rx ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: invalid regular expression: invalid escape \\\\ sequence\\nSQLSTATE: 2201B\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/do",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, regexp_count(s, 'a', 4294967296) AS c FROM rx ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function regexp_count(text, unknown, bigint) does not exist\\nHINT: No function matches the given name and argument types. You might need to add exp",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, regexp_like(s, '\\x{1C89}', 'i') AS v FROM rx ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: invalid regular expression: invalid escape \\\\ sequence\\nSQLSTATE: 2201B\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/do",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, regexp_replace(s, '\\x{1C89}', 'X', 'i') AS v FROM rx ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: invalid regular expression: invalid escape \\\\ sequence\\nSQLSTATE: 2201B\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/do",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, regexp_like(s, 'a++') AS v FROM rx ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: invalid regular expression: quantifier operand invalid\\nSQLSTATE: 2201B\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/do",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT approx_distinct(customer) AS n FROM cust",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function approx_distinct(text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type cas",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT approx_distinct(1) AS a FROM cust",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function approx_distinct(integer) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type ",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT approx_median(qty) AS m FROM cust",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function approx_median(integer) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type ca",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, sha256(customer) AS d FROM cust ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function sha256(text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\nSQLS",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, encode(sha256(customer), 'hex') AS h FROM cust ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function sha256(text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\nSQLS",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, date_part('month', try_cast(ts AS timestamp)) AS m FROM cust ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: syntax error at or near \\\"AS\\\"\\nSQLSTATE: 42601\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/docs/17/index.html\": code:",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, extract(month FROM try_cast(ts AS timestamp)) AS m FROM cust ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: syntax error at or near \\\"AS\\\"\\nSQLSTATE: 42601\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/docs/17/index.html\": code:",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, date_trunc('month', try_cast(ts AS timestamp)) AS m FROM cust ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: syntax error at or near \\\"AS\\\"\\nSQLSTATE: 42601\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/docs/17/index.html\": code:",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT median(qty) AS m FROM cust",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function median(integer) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\nS",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT count(region, customer) AS n FROM cust",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function count(text, text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, count(DISTINCT qty) OVER (PARTITION BY region) AS n FROM cust ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: DISTINCT is not implemented for window functions\\nSQLSTATE: 0A000\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/docs/17/",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_count(s, 'a*') AS c FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"3\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_count(s, 'a|\\b') AS c FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_count(s, '\\d') AS c FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 18, expected: \"\\\"1\\\"\", actual: \"\\\"0\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_like(s, '\\d') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 18, expected: \"\\\"true\\\"\", actual: \"\\\"false\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_like(s, '\\ba') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"true\\\"\", actual: \"\\\"false\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_like(s, '(?i)k') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 19, expected: \"\\\"true\\\"\", actual: \"\\\"false\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, '\\d', 'X') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 18, expected: \"\\\"xyX\\\"\", actual: \"\\\"xy١\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '$2$1') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"ba\\\"\", actual: \"\\\"$2$1\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, 'a*', 'X', 'g') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"XbX\\\"\", actual: \"\\\"XXbX\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id FROM rx WHERE regexp_like(s, '\\d') ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: RowCountMismatch { expected: 2, actual: 1 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\0-\\2\\1') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"ab-ba\\\"\", actual: \"\\\"\\\\\\\\\\\\\\\\0-ba\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\10') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"\\\"\", actual: \"\\\"a0\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\\\1') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"a\\\"\", actual: \"\\\"\\\\\\\\\\\\\\\\1\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\1١') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"\\\"\", actual: \"\\\"a١\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT nth_value(customer, 2 ORDER BY customer) AS n FROM cust WHERE region = 'eu'",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"carol\\\"\", actual: \"\\\"Ångström\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, concat(customer, '-', region) AS c FROM cust ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 5, expected: \"None\", actual: \"\\\"bob-\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, concat(customer, CAST(NULL AS VARCHAR)) AS c FROM cust ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 1, expected: \"None\", actual: \"\\\"carol\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, concat(CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)) AS c FROM cust ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 1, expected: \"None\", actual: \"\\\"\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, concat('', region) AS c FROM cust ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 5, expected: \"None\", actual: \"\\\"\\\"\" }",
+      "group": "federation-postgres"
+    }
+  ]
+}

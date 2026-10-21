@@ -184,11 +184,13 @@ pub use runtime_table::table_provider_with_spicepod_metadata;
 pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
+pub(crate) mod sql_depth_guard;
 pub(crate) mod sql_validator;
 pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
 
+pub(crate) use runtime_datafusion::resolve_table_reference;
 pub use runtime_datafusion::{
     SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_EVAL_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA, SPICE_SCP_SCHEMA, is_spice_internal_dataset, is_spice_internal_schema,
@@ -1550,7 +1552,7 @@ pub struct DataFusion {
     // What the pod's Cayenne accelerations demand of the host, classified from the
     // Spicepod in the Runtime builder. Retained so `spiced` can decide which
     // dedicated thread pools are worth bringing up without re-reading the app.
-    cayenne_workload: crate::builder::CayenneWorkload,
+    cayenne_workload: runtime_acceleration::CayenneWorkload,
     // Cgroup-aware total memory, captured once at build time. `get_total_memory`
     // rebuilds a sysinfo System on every call, so the budget installers read this
     // rather than re-probing.
@@ -2728,7 +2730,7 @@ impl DataFusion {
     /// Spicepod at build time). `spiced` reads this to skip bringing up dedicated
     /// thread pools nothing in the pod can use.
     #[must_use]
-    pub fn cayenne_workload(&self) -> crate::builder::CayenneWorkload {
+    pub fn cayenne_workload(&self) -> runtime_acceleration::CayenneWorkload {
         self.cayenne_workload
     }
 
@@ -6951,6 +6953,7 @@ impl DataFusion {
         parameters: Option<&ParamValues>,
     ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
         let mut statement = planner::parse_sql_statement(sql, session)?;
+        sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
         let placeholders = bind_table_function_args(&mut statement, parameters)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
@@ -6984,6 +6987,7 @@ impl DataFusion {
     ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
         let dialect = session.config().options().sql_parser.dialect;
         let mut statement = session.sql_to_statement(sql, &dialect)?;
+        sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
         let placeholders = bind_table_function_args(&mut statement, parameters)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
@@ -7425,12 +7429,6 @@ pub fn is_schema_mismatch(error: &runtime_query_engine::query_engine::Error) -> 
     inner
         .downcast_ref::<Error>()
         .is_some_and(|e| matches!(e, Error::SchemaMismatch { .. }))
-}
-
-/// Normalizes a table reference to a full table reference with catalog, schema, and table name
-/// so it can be used for comparison.
-pub(crate) fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
-    table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
 }
 
 impl Drop for DataFusion {
@@ -9240,7 +9238,7 @@ mod tests {
 
         fn test_df() -> DataFusion {
             DataFusionBuilder::new(
-                crate::status::RuntimeStatus::new(),
+                runtime_status::RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::default()),
                 tokio::runtime::Handle::current(),
             )

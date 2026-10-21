@@ -39,7 +39,6 @@ use crate::Runtime;
 use crate::component::dataset::snapshot_source::SnapshotSource;
 
 use super::datasets::MessageResponse;
-use super::require_write_access;
 
 const DEFAULT_SNAPSHOTS_LIMIT: usize = 10;
 
@@ -606,9 +605,6 @@ async fn writable_snapshot_manager(
 ) -> Result<SnapshotManager, Box<Response>> {
     if let Some(resp) = snapshots_feature_response() {
         return Err(Box::new(resp));
-    }
-    if let Some(response) = require_write_access().await {
-        return Err(Box::new(response));
     }
 
     let app_lock = tokio::select! {

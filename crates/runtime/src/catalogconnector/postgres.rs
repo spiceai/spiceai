@@ -72,7 +72,7 @@ fn parse_unsupported_type_action(
     }
 }
 
-pub const PREFIX: &str = "pg";
+pub const PREFIX: &str = runtime_component::catalog::POSTGRES_PROVIDER_PREFIX;
 
 /// Connection parameters and `unsupported_type_action` behave identically for a
 /// dataset using the `PostgreSQL` data connector, and are documented with the
