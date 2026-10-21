@@ -193,13 +193,32 @@ fn check_arrow_cast_type_depth(expr: &Expr) -> DFResult<()> {
     let Some(type_expr) = arrow_cast_type_expr(&list.args) else {
         return Ok(());
     };
-    if let Expr::Value(value) = type_expr
-        && let Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) = &value.value
-        && max_paren_depth(s) > MAX_ARROW_TYPE_DEPTH
-    {
+    let Some(type_text) = string_literal_text(type_expr) else {
+        return Ok(());
+    };
+    if max_paren_depth(type_text) > MAX_ARROW_TYPE_DEPTH {
         return Err(too_deep_arrow_type_error(name));
     }
     Ok(())
+}
+
+/// The text of a string literal, after grouping parentheses around it are removed.
+///
+/// `arrow_cast(x, ('Int64'))` parses the type argument as [`Expr::Nested`], not
+/// as a bare literal. Those parentheses are grouping, so the string inside is
+/// still the type the Arrow parser will recurse through.
+fn string_literal_text(expr: &Expr) -> Option<&str> {
+    let mut current = expr;
+    while let Expr::Nested(inner) = current {
+        current = inner.as_ref();
+    }
+    let Expr::Value(value) = current else {
+        return None;
+    };
+    match &value.value {
+        Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => Some(text.as_str()),
+        _ => None,
+    }
 }
 
 /// The type argument of `arrow_cast(expression, datatype)`.
@@ -465,6 +484,37 @@ mod tests {
             err.to_string().contains("arrow_try_cast"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Parentheses around the type literal are grouping. The string inside is
+    /// still the type argument, for both cast functions.
+    #[test]
+    fn rejects_parenthesized_deep_arrow_cast_type() {
+        let open = "List(".repeat(MAX_ARROW_TYPE_DEPTH + 50);
+        let close = ")".repeat(MAX_ARROW_TYPE_DEPTH + 50);
+        let sql = format!("SELECT arrow_cast(NULL, ('{open}Int64{close}'))");
+        let err = depth_check(&sql).expect_err("parenthesized deep arrow_cast type is rejected");
+        assert!(
+            err.to_string().contains("arrow_cast"),
+            "unexpected error: {err}"
+        );
+
+        let sql = format!("SELECT arrow_try_cast(NULL, (('{open}Int64{close}')))");
+        let err =
+            depth_check(&sql).expect_err("parenthesized deep arrow_try_cast type is rejected");
+        assert!(
+            err.to_string().contains("arrow_try_cast"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A shallow parenthesized type is still a normal cast.
+    #[test]
+    fn allows_parenthesized_shallow_arrow_cast_type() {
+        depth_check("SELECT arrow_cast(NULL, ('Int64'))")
+            .expect("a shallow parenthesized type is allowed");
+        depth_check("SELECT arrow_try_cast(NULL, (('Utf8')))")
+            .expect("a shallow double-parenthesized type is allowed");
     }
 
     /// A query wrapped in `COPY (...) TO` is planned, so it is depth-checked.
