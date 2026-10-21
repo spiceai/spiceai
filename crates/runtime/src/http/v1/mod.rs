@@ -121,6 +121,19 @@ pub(crate) async fn current_principal_requires_read_only() -> bool {
         .is_some_and(|principal| !principal_has_write_access(principal))
 }
 
+/// Refuses an OTLP gRPC export from a read-only API key, before the handler reads or stores
+/// the request. The message matches the OTLP/HTTP write check. No principal (authentication
+/// disabled) may write.
+#[must_use = "a denied export must be returned to the client"]
+pub(crate) async fn ensure_otlp_grpc_write_access() -> Result<(), tonic::Status> {
+    if current_principal_requires_read_only().await {
+        return Err(tonic::Status::permission_denied(
+            "API key does not allow write access",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn require_write_access() -> Option<Response> {
     if current_principal_requires_read_only().await {
         Some(
