@@ -28,7 +28,10 @@
         "Breaking change documented with before/after migration",
         "User-visible DuckDB v1.6.0 upgrade recorded",
         "Contributors lists every human author and no bots",
-        "Key identifiers from the PR bodies survive into the notes"
+        "Key identifiers from the PR bodies survive into the notes",
+        "Opening paragraph says this is a patch release",
+        "Breaking Changes and Upgrading come before Contributors and the changelog",
+        "Highlights hold at most five items"
       ]
     },
     {
@@ -73,7 +76,8 @@
         "Original changelog entries are retained",
         "Snapshot and dependency noise stays out of the notes",
         "New contributors added, bots excluded",
-        "New entries carry the substance from the PR bodies"
+        "New entries carry the substance from the PR bodies",
+        "Existing opening sentences and highlights are kept verbatim and in order"
       ]
     }
   ]

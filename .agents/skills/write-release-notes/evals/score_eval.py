@@ -64,6 +64,56 @@ def changelog(text: str) -> str:
     return text[index:] if index != -1 else ""
 
 
+def opening(text: str) -> str:
+    """The first prose paragraph after the `# ` header."""
+    body = text.split("\n", 1)[1] if text.startswith("# ") else text
+    for paragraph in re.split(r"\n\s*\n", body):
+        stripped = paragraph.strip()
+        if stripped and not stripped.startswith(("#", "-", ">", "|", "```")):
+            return stripped
+    return ""
+
+
+def highlights(text: str) -> list[str]:
+    """The bullets of the list introduced by the `Highlights …:` line."""
+    match = re.search(r"^Highlights[^\n]*:[ \t]*$", text, re.M)
+    if not match:
+        return []
+    items = []
+    for line in text[match.end() :].splitlines():
+        if line.startswith("- "):
+            items.append(line)
+        elif line.strip() and not line.startswith(" "):
+            break
+    return items
+
+
+def sentences(paragraph: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[.!?])\s+", paragraph.strip()) if s]
+
+
+def kept_in_order(original: list[str], candidate: str) -> list[str]:
+    """Return the items of `original` that are missing from `candidate` or out of order."""
+    lost, position = [], 0
+    for item in original:
+        found = candidate.find(item, position)
+        if found == -1:
+            lost.append(item)
+        else:
+            position = found + len(item)
+    return lost
+
+
+def top_level_section(text: str, heading: str) -> str:
+    """The body of a `## ` section, up to the next `## ` heading."""
+    start = text.find(heading)
+    if start == -1:
+        return ""
+    rest = text[start + len(heading) :]
+    end = re.search(r"^## ", rest, re.M)
+    return rest[: end.start()] if end else rest
+
+
 def expectation(text: str, passed: bool, evidence: str) -> dict:
     return {"text": text, "passed": bool(passed), "evidence": evidence}
 
@@ -201,7 +251,7 @@ def score_create(path: str) -> list[dict]:
     )
 
     humans = ["lukekim", "sgrebnov", "phillipleblanc", "bjchambers", "Jeadie", "karifabri"]
-    contributors = text[text.find("## Contributors") : text.find("## Breaking Changes")]
+    contributors = top_level_section(text, "## Contributors")
     missing_people = [h for h in humans if h not in contributors]
     bots_present = [b for b in ("dependabot", "github-actions", "claudespice") if b in contributors]
     checks.append(
@@ -229,6 +279,43 @@ def score_create(path: str) -> list[dict]:
             "Key identifiers from the PR bodies survive into the notes",
             not lost,
             f"missing identifiers: {lost}" if lost else f"all {len(facts)} present",
+        )
+    )
+
+    lead = opening(text)
+    checks.append(
+        expectation(
+            "Opening paragraph says this is a patch release",
+            re.search(r"\bpatch release\b", lead, re.IGNORECASE) is not None,
+            f"opening: {lead[:160]!r}",
+        )
+    )
+
+    # Inverted pyramid: the sections a reader acts on come before the
+    # background (contributors) and the changelog.
+    order = [m.group(1) for m in re.finditer(r"^## (.+?)\s*$", text, re.M)]
+
+    def position(name: str) -> int:
+        return next((i for i, h in enumerate(order) if h.startswith(name)), -1)
+
+    acts = [position("Breaking Changes"), position("Upgrading")]
+    after = [position("Contributors"), position("What's Changed")]
+    checks.append(
+        expectation(
+            "Breaking Changes and Upgrading come before Contributors and the changelog",
+            -1 not in acts + after and max(acts) < min(after),
+            f"section order: {order}",
+        )
+    )
+
+    # A patch release names the few changes a reader acts on and counts the
+    # rest. Nine equal highlights promote small fixes to headlines.
+    listed = highlights(text)
+    checks.append(
+        expectation(
+            "Highlights hold at most five items",
+            len(listed) <= 5,
+            f"{len(listed)} highlights",
         )
     )
 
@@ -380,7 +467,7 @@ def score_update(path: str) -> list[dict]:
         )
     )
 
-    contributors = text[text.find("## Contributors") : text.find("## Breaking Changes")]
+    contributors = top_level_section(text, "## Contributors")
     expected_people = ["lukekim", "sgrebnov", "Jeadie", "karifabri"]
     missing_people = [h for h in expected_people if h not in contributors]
     bots = [b for b in ("dependabot", "github-actions") if b in contributors]
@@ -401,6 +488,20 @@ def score_update(path: str) -> list[dict]:
             "New entries carry the substance from the PR bodies",
             not thin,
             f"missing: {thin}" if thin else "all present",
+        )
+    )
+
+    # Update mode may add to the opening, but rewording or reordering the
+    # author's lead is an editorial call the skill reports instead of making.
+    lost_lead = kept_in_order(sentences(opening(original)), opening(text))
+    lost_highlights = kept_in_order(highlights(original), "\n".join(highlights(text)))
+    checks.append(
+        expectation(
+            "Existing opening sentences and highlights are kept verbatim and in order",
+            not lost_lead and not lost_highlights,
+            f"changed or moved: {lost_lead + lost_highlights}"
+            if (lost_lead or lost_highlights)
+            else "all kept",
         )
     )
 

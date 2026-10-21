@@ -172,13 +172,15 @@ the sentence holds three ideas.
 
 ### 12. Describe a bug fix in a fixed order
 
-Symptom, then cause, then the current behaviour. This order lets a reader stop
-as soon as they know the bug is not theirs.
+The fixed symptom, then the cause, then the current behaviour. The first
+sentence names what users saw and says that it no longer happens, so a reader
+can stop as soon as they know the bug is not theirs.
 
-> A federated query with a `LEFT JOIN` returned all rows instead of the filtered
-> rows. *(symptom)* The planner folded the `WHERE` filter into the `JOIN ON`
-> clause, where it does not filter the left side. *(cause)* Filters now stay on
-> the side of the join they came from. *(current behaviour)*
+> A federated query with a `LEFT JOIN` no longer returns all rows when a `WHERE`
+> filter should remove some of them. *(fixed symptom)* The planner folded the
+> `WHERE` filter into the `JOIN ON` clause, where it does not filter the left
+> side. *(cause)* Filters now stay on the side of the join they came from.
+> *(current behaviour)*
 
 ## Rewrite patterns
 
