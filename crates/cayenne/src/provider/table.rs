@@ -3845,6 +3845,17 @@ pub(crate) fn upsert_on_primary_key(
 /// grew (q20's correlated rescans paid it per outer group).
 pub(crate) type InlinedDeletionMaps = crate::provider::mem_tier::InMemTombstones;
 
+/// What [`super::delete::detect_deletion_type_and_read`] reads from a table's
+/// deletion-vector files: deleted positions per data file, deleted keys with their
+/// delete sequence, re-inserted keys with theirs, and the key vectors whose file is
+/// missing.
+type DeletionVectorRead = (
+    HashMap<String, RoaringBitmap>,
+    HashMap<Box<[u8]>, i64>,
+    HashMap<Box<[u8]>, i64>,
+    Vec<super::delete::MissingKeyDeletionVector>,
+);
+
 /// The error a synchronous retention drain gets when the pass is waiting on a recent
 /// write to become durable ([`RetentionPass::DeferredUntilCheckpoint`]).
 ///
@@ -38904,6 +38915,62 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Read the files of `delete_files`, delete-file rows just read from the catalog.
+    ///
+    /// On a table with no primary key, the file of a position deletion vector is
+    /// removed once the commit that replaced or cleared its row lands, which another
+    /// provider of the same table can do between this load's catalog read and its
+    /// file reads. When a read fails and the table's rows are no longer the ones it
+    /// read, it reads again against the rows the catalog holds now: a replacing
+    /// vector holds every position of the one it replaced. A read that fails
+    /// against rows that are still current returns its error.
+    async fn read_deletion_vectors_of_current_rows(
+        catalog: &dyn MetadataCatalog,
+        table_id: &str,
+        mut delete_files: Vec<crate::metadata::DeleteFile>,
+    ) -> CatalogResult<DeletionVectorRead> {
+        const MAX_READS: usize = 8;
+        let mut reads = 1;
+        loop {
+            let read_rows: HashSet<String> = delete_files
+                .iter()
+                .map(|file| file.delete_file_id.clone())
+                .collect();
+            let result = task::spawn_blocking(move || {
+                super::delete::detect_deletion_type_and_read(delete_files)
+            })
+            .await
+            .map_err(|err| CatalogError::InvalidOperation {
+                message: "Deletion vector reader task panicked or was cancelled.".to_string(),
+                source: Box::new(err),
+            })?;
+            let error = match result {
+                Ok(read) => return Ok(read),
+                Err(error) => error,
+            };
+            let current = catalog
+                .get_table_delete_files(table_id)
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to load deletion vectors from catalog.".to_string(),
+                    source: Box::new(e),
+                })?;
+            let rows_moved = current
+                .iter()
+                .map(|file| file.delete_file_id.as_str())
+                .collect::<HashSet<_>>()
+                != read_rows.iter().map(String::as_str).collect();
+            if !rows_moved || reads >= MAX_READS {
+                return Err(CatalogError::InvalidOperation {
+                    message: "Failed to read deletion vectors.".to_string(),
+                    source: Box::new(error),
+                });
+            }
+            reads += 1;
+            delete_files = current;
+        }
+    }
+
     /// Load both position-based and key-based deletion vectors from the catalog.
     ///
     /// This method queries the catalog for delete files and loads them into memory,
@@ -38922,8 +38989,6 @@ impl CayenneTableProvider {
         strategy: PkDeletionStrategy,
         cold_tier_enabled: bool,
     ) -> CatalogResult<PkDeletionStrategyWithCache> {
-        use super::delete::detect_deletion_type_and_read;
-
         // Query catalog for delete files
         let delete_files = catalog
             .get_table_delete_files(table_id)
@@ -39009,24 +39074,12 @@ impl CayenneTableProvider {
             });
         }
 
-        // Read deletion vector files in a blocking task, detecting type from schema
-        // Returns (HashMap<String, RoaringBitmap>, HashMap<Box<[u8]>, i64>,
-        // HashMap<Box<[u8]>, i64>) where:
+        // Read deletion vector files in a blocking task, detecting type from schema:
         // - per_file_row_ids: file path -> bitmap of deleted row positions
         // - deleted_row_keys: PK bytes -> max delete sequence
         let (per_file_row_ids, deleted_row_keys, derived_reinserted, missing_key_dvs) =
-            task::spawn_blocking(move || detect_deletion_type_and_read(delete_files))
-                .await
-                .map_err(|err| CatalogError::InvalidOperation {
-                    message: "Deletion vector reader task panicked or was cancelled.".to_string(),
-                    source: Box::new(err),
-                })
-                .and_then(|result| {
-                    result.map_err(|err| CatalogError::InvalidOperation {
-                        message: "Failed to read deletion vectors.".to_string(),
-                        source: Box::new(err),
-                    })
-                })?;
+            Self::read_deletion_vectors_of_current_rows(catalog.as_ref(), table_id, delete_files)
+                .await?;
 
         // Self-heal any key-based DV whose `.arrow` file is missing. The file-first
         // orphaned-DV sweep unlinks the file before removing its catalog row, so a
@@ -78317,6 +78370,82 @@ mod tests {
                 .is_empty(),
             "a position-based table must persist no inline tombstone"
         );
+    }
+
+    /// A deletion-vector load that read a position vector's row just before a
+    /// delete replaced that vector, and removed its file, reads the replacing row
+    /// instead of failing on the missing file. Another provider of the same table —
+    /// an open, or a catalog refresh — can land in exactly that window.
+    #[tokio::test]
+    async fn deletion_vector_load_reads_the_row_that_replaced_a_removed_vector() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_position_based_table("replaced_vector_load", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
+        )
+        .await;
+        {
+            let _write = provider.write_lock.lock().await;
+            provider
+                .checkpoint_inlined_data()
+                .await
+                .expect("checkpoint inline rows");
+        }
+        let delete = |id: i64| {
+            let provider = provider.clone_for_write();
+            let ctx = ctx.clone();
+            async move {
+                let plan = provider
+                    .delete_from(&ctx.state(), vec![col("id").eq(datafusion_expr::lit(id))])
+                    .await
+                    .expect("delete plan");
+                collect(plan, ctx.task_ctx())
+                    .await
+                    .expect("delete executed");
+            }
+        };
+        let table_id = provider.table_id().to_string();
+
+        delete(1).await;
+        let read_before_replacement = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("delete-file rows");
+        assert_eq!(
+            read_before_replacement.len(),
+            1,
+            "one vector after one delete"
+        );
+        let replaced_path = std::path::PathBuf::from(&read_before_replacement[0].path);
+
+        delete(2).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while replaced_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the replaced vector's file {} was never removed",
+                replaced_path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (positions, _, _, _) = CayenneTableProvider::read_deletion_vectors_of_current_rows(
+            catalog.as_ref(),
+            &table_id,
+            read_before_replacement,
+        )
+        .await
+        .expect("the load reads the replacing vector");
+        assert_eq!(
+            positions.len(),
+            1,
+            "one data file holds deletes: {positions:?}"
+        );
+        let deleted = positions.values().next().expect("the data file's bitmap");
+        assert_eq!(deleted.len(), 2, "both deletes are in the replacing vector");
     }
 
     /// When position deletes are pending and the cached aggregate stats are not
