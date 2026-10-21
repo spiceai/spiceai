@@ -660,18 +660,16 @@ impl std::fmt::Debug for RefreshTask {
 
 /// Which stored rows an append's incoming rows are compared with, by the keep-newest
 /// selection and the exact-row dedupe.
-///
-/// The comparison is always inclusive of the mark: widening the stored side can only
-/// add rows to compare with, never cause a duplicate, so the stored side needs no
-/// `>`/`>=` distinction of its own (the source filter keeps its strict `>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredRowsFrom {
     /// Nothing: a full load overwrites the stored rows, and an append into an empty
     /// acceleration has none.
     None,
-    /// The stored rows at or after a mark: the high-water mark the source filter used,
-    /// or the lowest time the incoming rows can hold.
-    From(u128),
+    /// The stored rows after the high-water mark the source filter used, matching its
+    /// strict `>`.
+    AfterMark(u128),
+    /// The stored rows at or after the lowest time the incoming rows can hold.
+    AtOrAfter(u128),
     /// Every stored row, when no mark is safe.
     All,
 }
@@ -679,12 +677,12 @@ enum StoredRowsFrom {
 impl StoredRowsFrom {
     /// The high-water mark an append read from the acceleration, when it has one.
     fn from_mark(mark: Option<u128>) -> Self {
-        mark.map_or(Self::None, Self::From)
+        mark.map_or(Self::None, Self::AfterMark)
     }
 
     fn from_seed(seed: SeedMark) -> Self {
         match seed {
-            SeedMark::Lowest(nanos) => Self::From(nanos),
+            SeedMark::Lowest(nanos) => Self::AtOrAfter(nanos),
             SeedMark::AllStoredRows(_) => Self::All,
         }
     }
@@ -693,7 +691,8 @@ impl StoredRowsFrom {
     fn filter(self, converter: &TimestampFilterConvert) -> Option<Expr> {
         match self {
             Self::None | Self::All => None,
-            Self::From(mark) => Some(converter.convert_at_or_after_mark(mark)),
+            Self::AfterMark(mark) => Some(converter.convert_high_water_mark(mark)),
+            Self::AtOrAfter(mark) => Some(converter.convert_at_or_after_mark(mark)),
         }
     }
 }
@@ -1933,9 +1932,12 @@ impl RefreshTask {
                     )
                 });
             let start = match stored_from {
-                StoredRowsFrom::From(value) if string_time => value
+                StoredRowsFrom::AfterMark(value) if string_time => value
                     .checked_sub(MAX_UTC_OFFSET_NANOS)
-                    .map_or(StoredRowsFrom::All, StoredRowsFrom::From),
+                    .map_or(StoredRowsFrom::All, StoredRowsFrom::AfterMark),
+                StoredRowsFrom::AtOrAfter(value) if string_time => value
+                    .checked_sub(MAX_UTC_OFFSET_NANOS)
+                    .map_or(StoredRowsFrom::All, StoredRowsFrom::AtOrAfter),
                 other => other,
             };
             // Read when the write first pulls rows, which it does holding the
@@ -2759,12 +2761,7 @@ impl RefreshTask {
         ctx
     }
 
-    /// `high_water_mark` is the mark the source filter was built from. Pass it whenever
-    /// the caller has it: recomputing it here reads `max(time_column)` a second time, and
-    /// a write that lands on the accelerator between the two reads gives this comparison a
-    /// *higher* mark than the source query used. The rows in between are then missing from
-    /// the comparison set and are appended again — the same duplication as widening one
-    /// side without the other (#12492). `None` falls back to deriving it.
+    /// Drops the incoming rows that match a stored row selected by `stored_from`.
     async fn except_existing_records_from(
         &self,
         refresh: &Refresh,
@@ -2779,100 +2776,9 @@ impl RefreshTask {
             return Ok(update);
         };
 
-        let federated_provider = self.federated.table_provider().await;
-
-        // The high-water filter below must widen in step with the source-side filter in
-        // `get_full_or_incremental_append_update`: on a day-granular time column, if the
-        // re-fetched same-day rows are not in this comparison set they pass the dedupe and
-        // get appended a second time, turning the skip into silent duplication (#12492).
-        let mut existing_records = accelerator_df(
-            &Arc::clone(&self.accelerator),
-            &Self::create_refresh_df_context(
-                Arc::clone(&federated_provider),
-                &self.dataset_name,
-                &self.accelerator,
-                self.disable_federation,
-                self.io_runtime.clone(),
-            )
-            .await,
-        )
-        .map_err(find_datafusion_root)
-        .context(super::UnableToScanTableProviderSnafu)?;
-        if let Some(filter) = stored_from.filter(&filter_converter) {
-            existing_records = existing_records
-                .filter(filter)
-                .map_err(find_datafusion_root)
-                .context(super::UnableToScanTableProviderSnafu)?;
-        }
-        let mut existing_records = existing_records
-            .collect()
-            .await
-            .map_err(find_datafusion_root)
-            .context(super::UnableToScanTableProviderSnafu)?;
-
-        // ACID fix for append dedup with nullable time_column:
-        // The > max_time query intentionally excludes older rows (including all
-        // NULL-time rows, since NULL > X is never true). To prevent duplicate
-        // appends of rows that have NULL in the time_column (a real consistency
-        // bug on retry / repeated refresh / source re-emit), we additionally
-        // collect *all* rows where the time column IS NULL. These "timeless"
-        // rows are then available to the exact-row StructArray comparator in
-        // filter_records, which treats two nulls in the same position as Equal
-        // (via make_comparator + Ordering::Equal). Exact duplicate NULL-time
-        // rows are now correctly filtered.
-        //
-        // Devil's advocate / remaining edge case (being really sure):
-        // This loads the *entire historical set* of NULL-time rows on every
-        // append refresh when the column is nullable. For datasets with a very
-        // large number of distinct historical rows that happen to have NULL
-        // time (rare but possible with dirty sources or optional event times),
-        // this can consume significant memory during the dedup phase, potentially
-        // causing OOM in the refresh task. In such cases the >max optimization
-        // is defeated for the NULL subset.
-        //
-        // Mitigation in practice: most append workloads either have non-nullable
-        // time columns, or the number of NULL-time rows is small/bounded. For
-        // high-cardinality NULL time + append, users should prefer defining a
-        // primary key + on_conflict upsert semantics on the accelerator (which
-        // the engine will enforce at write time) or avoid append mode.
-        // We explicitly document the limitation here as part of rigorous
-        // correctness review for the recurring ACID task.
-        //
-        // This is the "comprehensive edge case" coverage for the recurring ACID
-        // task. We only pay the (hopefully small) cost of loading the NULL-time
-        // subset; the > max tail optimization is preserved for the non-null
-        // recent data. If the time_column is non-nullable, we skip this path.
-        // Every stored row is already in the set when no mark narrowed it.
-        if stored_from != StoredRowsFrom::All
-            && let Some(tc) = &refresh.time_column
-            && self
-                .accelerator
-                .schema()
-                .column_with_name(tc)
-                .is_some_and(|(_, f)| f.is_nullable())
-        {
-            let null_time_rows = accelerator_df(
-                &Arc::clone(&self.accelerator),
-                &Self::create_refresh_df_context(
-                    Arc::clone(&federated_provider),
-                    &self.dataset_name,
-                    &self.accelerator,
-                    self.disable_federation,
-                    self.io_runtime.clone(),
-                )
-                .await,
-            )
-            .map_err(find_datafusion_root)
-            .context(super::UnableToScanTableProviderSnafu)?
-            .filter(ident(tc).is_null())
-            .map_err(find_datafusion_root)
-            .context(super::UnableToScanTableProviderSnafu)?
-            .collect()
-            .await
-            .map_err(find_datafusion_root)
-            .context(super::UnableToScanTableProviderSnafu)?;
-            existing_records.extend(null_time_rows);
-        }
+        let existing_records = self
+            .stored_rows_to_compare(refresh, &filter_converter, stored_from)
+            .await?;
 
         // Use the update stream's schema for dedup comparison, not the full federated
         // provider schema. When `refresh_sql` selects a column subset, the incoming
@@ -2955,6 +2861,111 @@ impl RefreshTask {
         }));
 
         Ok(StreamingDataUpdate::new(filtered_data, update_type))
+    }
+
+    /// The stored rows an append compares its incoming rows with: those `stored_from`
+    /// selects, plus every stored row whose time column is NULL.
+    async fn stored_rows_to_compare(
+        &self,
+        refresh: &Refresh,
+        filter_converter: &TimestampFilterConvert,
+        stored_from: StoredRowsFrom,
+    ) -> Result<Vec<RecordBatch>, RetryError<super::Error>> {
+        let federated_provider = self.federated.table_provider().await;
+
+        // The high-water filter below must widen in step with the source-side filter in
+        // `get_full_or_incremental_append_update`: on a day-granular time column, if the
+        // re-fetched same-day rows are not in this comparison set they pass the dedupe and
+        // get appended a second time, turning the skip into silent duplication (#12492).
+        let mut existing_records = accelerator_df(
+            &Arc::clone(&self.accelerator),
+            &Self::create_refresh_df_context(
+                Arc::clone(&federated_provider),
+                &self.dataset_name,
+                &self.accelerator,
+                self.disable_federation,
+                self.io_runtime.clone(),
+            )
+            .await,
+        )
+        .map_err(find_datafusion_root)
+        .context(super::UnableToScanTableProviderSnafu)?;
+        if let Some(filter) = stored_from.filter(filter_converter) {
+            existing_records = existing_records
+                .filter(filter)
+                .map_err(find_datafusion_root)
+                .context(super::UnableToScanTableProviderSnafu)?;
+        }
+        let mut existing_records = existing_records
+            .collect()
+            .await
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?;
+
+        // ACID fix for append dedup with nullable time_column:
+        // The > max_time query intentionally excludes older rows (including all
+        // NULL-time rows, since NULL > X is never true). To prevent duplicate
+        // appends of rows that have NULL in the time_column (a real consistency
+        // bug on retry / repeated refresh / source re-emit), we additionally
+        // collect *all* rows where the time column IS NULL. These "timeless"
+        // rows are then available to the exact-row StructArray comparator in
+        // filter_records, which treats two nulls in the same position as Equal
+        // (via make_comparator + Ordering::Equal). Exact duplicate NULL-time
+        // rows are now correctly filtered.
+        //
+        // Devil's advocate / remaining edge case (being really sure):
+        // This loads the *entire historical set* of NULL-time rows on every
+        // append refresh when the column is nullable. For datasets with a very
+        // large number of distinct historical rows that happen to have NULL
+        // time (rare but possible with dirty sources or optional event times),
+        // this can consume significant memory during the dedup phase, potentially
+        // causing OOM in the refresh task. In such cases the >max optimization
+        // is defeated for the NULL subset.
+        //
+        // Mitigation in practice: most append workloads either have non-nullable
+        // time columns, or the number of NULL-time rows is small/bounded. For
+        // high-cardinality NULL time + append, users should prefer defining a
+        // primary key + on_conflict upsert semantics on the accelerator (which
+        // the engine will enforce at write time) or avoid append mode.
+        // We explicitly document the limitation here as part of rigorous
+        // correctness review for the recurring ACID task.
+        //
+        // This is the "comprehensive edge case" coverage for the recurring ACID
+        // task. We only pay the (hopefully small) cost of loading the NULL-time
+        // subset; the > max tail optimization is preserved for the non-null
+        // recent data. If the time_column is non-nullable, we skip this path.
+        // Every stored row is already in the set when no mark narrowed it.
+        if stored_from != StoredRowsFrom::All
+            && let Some(tc) = &refresh.time_column
+            && self
+                .accelerator
+                .schema()
+                .column_with_name(tc)
+                .is_some_and(|(_, f)| f.is_nullable())
+        {
+            let null_time_rows = accelerator_df(
+                &Arc::clone(&self.accelerator),
+                &Self::create_refresh_df_context(
+                    Arc::clone(&federated_provider),
+                    &self.dataset_name,
+                    &self.accelerator,
+                    self.disable_federation,
+                    self.io_runtime.clone(),
+                )
+                .await,
+            )
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?
+            .filter(ident(tc).is_null())
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?
+            .collect()
+            .await
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?;
+            existing_records.extend(null_time_rows);
+        }
+        Ok(existing_records)
     }
 
     #[expect(clippy::cast_sign_loss)]
@@ -6382,6 +6393,88 @@ mod tests {
         );
     }
 
+    /// An acceleration holding two rows, at `ts = 1_000` and `ts = 2_000`.
+    fn task_with_two_stored_rows() -> RefreshTask {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let stored = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000, 2_000])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("stored batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![stored]])
+                .expect("accelerator mem table"),
+        ) as Arc<dyn TableProvider>;
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
+        ) as Arc<dyn TableProvider>;
+        RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("test_two_stored_rows"),
+            Arc::new(FederatedTable::new_unchecked(federated_table)),
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build()
+    }
+
+    async fn compared_row_count(
+        task: &RefreshTask,
+        refresh: &Refresh,
+        stored_from: StoredRowsFrom,
+    ) -> usize {
+        let converter = task
+            .get_accelerator_filter_converter(refresh)
+            .expect("the time column has a filter converter");
+        task.stored_rows_to_compare(refresh, &converter, stored_from)
+            .await
+            .expect("the comparison set is read")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum()
+    }
+
+    /// Regression test for #15329: the source reads strictly after the high-water mark,
+    /// so no stored row at the mark is compared.
+    #[tokio::test]
+    async fn append_compares_no_stored_row_at_the_high_water_mark() {
+        let task = task_with_two_stored_rows();
+        let refresh = Refresh::new(RefreshMode::Append).time_column("ts".to_string());
+        let mark = high_water_mark(&task, &refresh).await;
+
+        assert_eq!(compared_row_count(&task, &refresh, mark).await, 0);
+    }
+
+    #[tokio::test]
+    async fn append_compares_the_stored_rows_inside_the_overlap_window() {
+        let task = task_with_two_stored_rows();
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .append_overlap(Duration::from_nanos(500));
+        let mark = high_water_mark(&task, &refresh).await;
+
+        assert_eq!(compared_row_count(&task, &refresh, mark).await, 1);
+    }
+
+    /// Incoming rows can hold a commit's lowest time, so stored rows at it are compared.
+    #[tokio::test]
+    async fn append_from_a_commit_compares_the_stored_rows_at_its_lowest_time() {
+        let task = task_with_two_stored_rows();
+        let refresh = Refresh::new(RefreshMode::Append).time_column("ts".to_string());
+
+        let seed = StoredRowsFrom::from_seed(SeedMark::Lowest(2_000));
+
+        assert_eq!(compared_row_count(&task, &refresh, seed).await, 1);
+    }
+
     /// Regression test for append refreshes from `PostgreSQL` into Cayenne.
     ///
     /// `PostgreSQL` `timestamptz` arrives as nanoseconds, while Cayenne stores every timestamp
@@ -6466,7 +6559,7 @@ mod tests {
             .except_existing_records_from(
                 &refresh,
                 StreamingDataUpdate::new(update_stream, UpdateType::Append),
-                StoredRowsFrom::From(0),
+                StoredRowsFrom::AfterMark(0),
             )
             .await
             .expect("Cayenne timestamp normalization should allow append de-duplication");
@@ -6573,7 +6666,7 @@ mod tests {
             .except_existing_records_from(
                 &refresh,
                 StreamingDataUpdate::new(update_stream, UpdateType::Append),
-                StoredRowsFrom::From(0),
+                StoredRowsFrom::AfterMark(0),
             )
             .await
             .expect("Cayenne nanosecond deduplication should succeed");
