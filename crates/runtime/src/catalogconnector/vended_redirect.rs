@@ -295,16 +295,18 @@ fn request_for_redirect(
     request_uri: &http::Uri,
     target: &reqwest::Url,
 ) -> Result<Request<Buffer>> {
-    // 301, 302, and 303 drop the body and become GET, except HEAD, which stays
-    // HEAD. `reqwest` follows operator redirects through `tower-http`, and that
-    // client keeps HEAD on these statuses. 307 and 308 keep the method and the body.
-    let drop_body = matches!(
-        status,
-        http::StatusCode::MOVED_PERMANENTLY | http::StatusCode::FOUND | http::StatusCode::SEE_OTHER
-    );
-    let method = if method == http::Method::HEAD {
-        http::Method::HEAD
-    } else if drop_body {
+    // `reqwest` follows operator redirects through `tower-http` 0.6.
+    // 301 and 302 change only POST into GET and drop that body.
+    // 303 changes every method except HEAD into GET and always drops the body.
+    // 307 and 308 keep the method and the body. HEAD stays HEAD on all of these.
+    let drop_body = match status {
+        http::StatusCode::MOVED_PERMANENTLY | http::StatusCode::FOUND => {
+            method == http::Method::POST
+        }
+        http::StatusCode::SEE_OTHER => true,
+        _ => false,
+    };
+    let method = if drop_body && method != http::Method::HEAD {
         http::Method::GET
     } else {
         method.clone()
@@ -323,7 +325,12 @@ fn request_for_redirect(
         headers.remove(http::header::PROXY_AUTHORIZATION);
     }
     headers.remove(http::header::HOST);
-    if body.is_empty() {
+    if drop_body {
+        headers.remove(http::header::CONTENT_TYPE);
+        headers.remove(http::header::CONTENT_LENGTH);
+        headers.remove(http::header::CONTENT_ENCODING);
+        headers.remove(http::header::TRANSFER_ENCODING);
+    } else if body.is_empty() {
         headers.remove(http::header::CONTENT_LENGTH);
     }
     let uri = target.as_str().parse::<http::Uri>().map_err(|err| {
@@ -702,6 +709,81 @@ mod tests {
                     "HEAD /object HTTP/1.1".to_string(),
                 ],
                 "status {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_vended_put_redirect_keeps_the_upload() {
+        let host = "put-redirect.vended.test";
+        for (status, reason, method, expect_method, expect_body) in [
+            (301_u16, "Moved Permanently", "PUT", "PUT", true),
+            (302, "Found", "PUT", "PUT", true),
+            (302, "Found", "DELETE", "DELETE", true),
+            (303, "See Other", "PUT", "GET", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the redirector");
+            let addr = listener.local_addr().expect("read the redirector address");
+            let other_port = addr.port().wrapping_add(1).max(1);
+            let location = format!("http://{host}:{other_port}/object");
+            let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let recorded = std::sync::Arc::clone(&requests);
+            let redirect_to = location.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let recorded = std::sync::Arc::clone(&recorded);
+                    let redirect_to = redirect_to.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = vec![0_u8; 8192];
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&buf[..n]);
+                        let line = head.lines().next().unwrap_or_default().to_string();
+                        let path = line.split_whitespace().nth(1).unwrap_or_default();
+                        let response = if path == "/object" {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .to_string()
+                        } else {
+                            format!(
+                                "HTTP/1.1 {status} {reason}\r\nLocation: {redirect_to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                        };
+                        recorded.lock().push(head.into_owned());
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+            let _overrides = HeadRedirectOverrides::install(host, &addr.to_string());
+            let payload = "uploaded-object";
+            let request = http::Request::builder()
+                .method(method)
+                .uri(format!("http://{host}:{}/start", addr.port()))
+                .header(http::header::CONTENT_LENGTH, payload.len())
+                .body(opendal::Buffer::from(payload))
+                .expect("build the upload request");
+            let response = super::scope(
+                Some("dataset 't'".to_string()),
+                super::fetch_with_redirect_policy(request),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("status {status} {method} was not followed: {err}"));
+            let recorded = requests.lock().clone();
+            assert_eq!(
+                response.status(),
+                http::StatusCode::OK,
+                "status {status} {method}: {recorded:?}"
+            );
+            assert_eq!(recorded.len(), 2, "status {status} {method}: {recorded:?}");
+            assert!(
+                recorded[1].starts_with(&format!("{expect_method} /object ")),
+                "status {status} {method} followed as {expect_method}: {recorded:?}"
+            );
+            let second_has_body = recorded[1].contains("uploaded-object");
+            assert_eq!(
+                second_has_body, expect_body,
+                "status {status} {method} body: {recorded:?}"
             );
         }
     }

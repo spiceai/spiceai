@@ -257,18 +257,19 @@ fn object_store_url_for_sql_table(url: &str) -> DFResult<Url> {
         DataFusionError::Plan(format!("Failed to parse URL table '{url}': {err}"))
     })?;
     if parsed.scheme() == "http" {
-        let mut fragment = parsed.fragment().unwrap_or("").to_string();
-        let already_set = fragment.split('&').any(|pair| {
-            pair.split('=')
-                .next()
-                .is_some_and(|key| key == "allow_http")
-        });
+        let fragment = parsed.fragment().unwrap_or("");
+        // The registry parses the fragment with the form decoder, which
+        // percent-decodes keys. `%61llow_http` is `allow_http` there, and a
+        // later raw `allow_http=true` would override an explicit `false`.
+        let already_set =
+            url::form_urlencoded::parse(fragment.as_bytes()).any(|(key, _)| key == "allow_http");
         if !already_set {
-            if !fragment.is_empty() {
-                fragment.push('&');
+            let mut next = fragment.to_string();
+            if !next.is_empty() {
+                next.push('&');
             }
-            fragment.push_str("allow_http=true");
-            parsed.set_fragment(Some(&fragment));
+            next.push_str("allow_http=true");
+            parsed.set_fragment(Some(&next));
         }
     }
     Ok(parsed)
@@ -1057,6 +1058,22 @@ mod tests {
         let https = object_store_url_for_sql_table("https://example.com/data.csv")
             .expect("an https URL parses");
         assert_eq!(https.fragment(), None);
+
+        // `%61` is `a`. The registry decodes the key, so this is an explicit
+        // `allow_http=false` and must not gain a second `allow_http=true`.
+        let encoded =
+            object_store_url_for_sql_table("http://example.com/data.csv#%61llow_http=false")
+                .expect("an encoded fragment parses");
+        let fragment = encoded.fragment().expect("the encoded fragment is kept");
+        let keys: Vec<String> = url::form_urlencoded::parse(fragment.as_bytes())
+            .map(|(key, _)| key.into_owned())
+            .filter(|key| key == "allow_http")
+            .collect();
+        assert_eq!(keys, ["allow_http".to_string()], "{fragment}");
+        assert!(
+            !fragment.split('&').any(|pair| pair == "allow_http=true"),
+            "{fragment}"
+        );
     }
 
     /// One CSV response for the SQL URL-table regression. `HEAD` reports the
