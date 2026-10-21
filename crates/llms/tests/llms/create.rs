@@ -139,6 +139,7 @@ pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError
             .as_ref(),
         None,
         None,
+        llms::chat::ReasoningDefault::default(),
     )
     .await
 }
