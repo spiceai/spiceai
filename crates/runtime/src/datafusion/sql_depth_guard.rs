@@ -36,7 +36,7 @@ limitations under the License.
 use std::ops::ControlFlow;
 
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+use datafusion::sql::parser::{CopyToSource, DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
     Array, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Statement as SQLStatement, Value,
     Visit, Visitor,
@@ -68,16 +68,22 @@ pub(crate) const MAX_ARROW_TYPE_DEPTH: usize = 64;
 /// Reject `statement` if any of its expression trees, or any `arrow_cast` type
 /// string it carries, is nested more deeply than the fixed limits above.
 ///
-/// Handles the `sqlparser` statement and the `EXPLAIN` wrapper; the other
-/// `DataFusion` parser extensions (`CREATE EXTERNAL TABLE`, `COPY TO`, `RESET`)
-/// carry no user expression tree that reaches the recursive planner.
+/// Handles the `sqlparser` statement, the `EXPLAIN` wrapper, and a query
+/// nested in `COPY (query) TO`. `COPY <table> TO`, `CREATE EXTERNAL TABLE`,
+/// and `RESET` carry no user expression tree that reaches the recursive planner.
 pub(crate) fn ensure_statement_within_depth_limits(statement: &DFStatement) -> DFResult<()> {
     match statement {
         DFStatement::Statement(sql) => ensure_sql_statement_within_depth_limits(sql),
         DFStatement::Explain(explain) => ensure_statement_within_depth_limits(&explain.statement),
-        DFStatement::CreateExternalTable(_) | DFStatement::CopyTo(_) | DFStatement::Reset(_) => {
-            Ok(())
-        }
+        DFStatement::CopyTo(copy) => match &copy.source {
+            CopyToSource::Query(query) => {
+                let mut collector = DepthCollector { result: Ok(()) };
+                let _ = query.visit(&mut collector);
+                collector.result
+            }
+            CopyToSource::Relation(_) => Ok(()),
+        },
+        DFStatement::CreateExternalTable(_) | DFStatement::Reset(_) => Ok(()),
     }
 }
 
@@ -151,53 +157,91 @@ fn too_deep_expr_error() -> DataFusionError {
     ))
 }
 
-fn too_deep_arrow_type_error() -> DataFusionError {
+fn too_deep_arrow_type_error(function: &str) -> DataFusionError {
     DataFusionError::Plan(format!(
-        "Query rejected: an 'arrow_cast' type string is nested more than {MAX_ARROW_TYPE_DEPTH} \
+        "Query rejected: an '{function}' type string is nested more than {MAX_ARROW_TYPE_DEPTH} \
          levels deep. Simplify the target type."
     ))
 }
 
-/// If `expr` is an `arrow_cast(…, '<type string>')` call, bound the
-/// parenthesis-nesting depth of each string-literal argument.
+/// If `expr` is an `arrow_cast` or `arrow_try_cast` call, bound the
+/// parenthesis-nesting depth of its type argument.
+///
+/// The type is the argument named `datatype`, or the second argument when
+/// none is named (`arrow_cast(expression, datatype)`). A string in the value
+/// being cast is not a type and is not measured here.
 fn check_arrow_cast_type_depth(expr: &Expr) -> DFResult<()> {
     let Expr::Function(function) = expr else {
         return Ok(());
     };
-    let is_arrow_cast = function
+    let Some(name) = function
         .name
         .0
         .last()
         .and_then(|part| part.as_ident())
-        .is_some_and(|ident| ident.value.eq_ignore_ascii_case("arrow_cast"));
-    if !is_arrow_cast {
+        .map(|ident| ident.value.as_str())
+        .filter(|name| {
+            name.eq_ignore_ascii_case("arrow_cast") || name.eq_ignore_ascii_case("arrow_try_cast")
+        })
+    else {
         return Ok(());
-    }
+    };
 
     let FunctionArguments::List(list) = &function.args else {
         return Ok(());
     };
-    for arg in &list.args {
-        let arg_expr = match arg {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+    let Some(type_expr) = arrow_cast_type_expr(&list.args) else {
+        return Ok(());
+    };
+    if let Expr::Value(value) = type_expr
+        && let Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) = &value.value
+        && max_paren_depth(s) > MAX_ARROW_TYPE_DEPTH
+    {
+        return Err(too_deep_arrow_type_error(name));
+    }
+    Ok(())
+}
+
+/// The type argument of `arrow_cast(expression, datatype)`.
+fn arrow_cast_type_expr(args: &[FunctionArg]) -> Option<&Expr> {
+    let named = args.iter().find_map(|arg| match arg {
+        FunctionArg::Named {
+            name,
+            arg: FunctionArgExpr::Expr(expr),
+            ..
+        } if name.value.eq_ignore_ascii_case("datatype") => Some(expr),
+        FunctionArg::ExprNamed {
+            name,
+            arg: FunctionArgExpr::Expr(expr),
+            ..
+        } if expr_is_ident(name, "datatype") => Some(expr),
+        _ => None,
+    });
+    named.or_else(|| {
+        let arg = args.get(1)?;
+        match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
             | FunctionArg::Named {
-                arg: FunctionArgExpr::Expr(e),
+                arg: FunctionArgExpr::Expr(expr),
                 ..
             }
             | FunctionArg::ExprNamed {
-                arg: FunctionArgExpr::Expr(e),
+                arg: FunctionArgExpr::Expr(expr),
                 ..
-            } => e,
-            _ => continue,
-        };
-        if let Expr::Value(value) = arg_expr
-            && let Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) = &value.value
-            && max_paren_depth(s) > MAX_ARROW_TYPE_DEPTH
-        {
-            return Err(too_deep_arrow_type_error());
+            } => Some(expr),
+            _ => None,
         }
+    })
+}
+
+fn expr_is_ident(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(name),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .is_some_and(|ident| ident.value.eq_ignore_ascii_case(name)),
+        _ => false,
     }
-    Ok(())
 }
 
 /// Maximum run of unmatched `(` in `s` — a cheap upper bound on the nesting the
@@ -386,6 +430,64 @@ mod tests {
         let close = ")".repeat(MAX_ARROW_TYPE_DEPTH + 50);
         let sql = format!("SELECT count(arrow_cast(NULL, '{open}Int64{close}'))");
         let _ = depth_check(&sql).expect_err("deep arrow_cast type is rejected");
+    }
+
+    /// Parentheses in the value being cast are not a type string.
+    #[test]
+    fn allows_parenthesized_arrow_cast_value() {
+        let open = "(".repeat(MAX_ARROW_TYPE_DEPTH + 5);
+        let close = ")".repeat(MAX_ARROW_TYPE_DEPTH + 5);
+        let sql = format!("SELECT arrow_cast('{open}hello{close}', 'Utf8')");
+        depth_check(&sql).expect("parentheses in the cast value are allowed");
+    }
+
+    /// A deep type passed by the `datatype` name is still the type argument.
+    #[test]
+    fn rejects_named_arrow_cast_type() {
+        let open = "List(".repeat(MAX_ARROW_TYPE_DEPTH + 50);
+        let close = ")".repeat(MAX_ARROW_TYPE_DEPTH + 50);
+        let sql = format!("SELECT arrow_cast(a, datatype => '{open}Int64{close}') FROM t");
+        let err = depth_check(&sql).expect_err("named datatype is checked");
+        assert!(
+            err.to_string().contains("arrow_cast"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `arrow_try_cast` parses the same type string.
+    #[test]
+    fn rejects_deep_arrow_try_cast_type() {
+        let open = "List(".repeat(MAX_ARROW_TYPE_DEPTH + 50);
+        let close = ")".repeat(MAX_ARROW_TYPE_DEPTH + 50);
+        let sql = format!("SELECT arrow_try_cast(NULL, '{open}Int64{close}')");
+        let err = depth_check(&sql).expect_err("deep arrow_try_cast type is rejected");
+        assert!(
+            err.to_string().contains("arrow_try_cast"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A query wrapped in `COPY (...) TO` is planned, so it is depth-checked.
+    #[test]
+    fn rejects_deep_or_chain_inside_copy_to() {
+        let terms = vec!["1 = 1"; MAX_SQL_EXPR_DEPTH + 500];
+        let sql = format!(
+            "COPY (SELECT * FROM t WHERE {}) TO 'out.parquet'",
+            terms.join(" OR ")
+        );
+        let err = depth_check(&sql).expect_err("COPY query is depth-checked");
+        assert!(
+            err.to_string().contains("nested more than"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A shallow `COPY` query, and `COPY` of a table, pass.
+    #[test]
+    fn allows_shallow_copy_to() {
+        depth_check("COPY (SELECT * FROM t WHERE a > 1) TO 'out.parquet'")
+            .expect("a shallow COPY query passes");
+        depth_check("COPY t TO 'out.parquet'").expect("COPY of a table passes");
     }
 
     /// A shallow, normal `arrow_cast` passes.
