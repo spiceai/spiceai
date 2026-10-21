@@ -52,11 +52,15 @@ use either::Either;
 use futures::Stream;
 use indexmap::IndexMap;
 use llama_cpp_2::{
-    context::{LlamaContext, params::LlamaContextParams},
+    context::{
+        LlamaContext,
+        params::{LlamaContextParams, LlamaContextType},
+    },
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
+    speculative::{MtpSpeculative, MtpSpeculativeParams},
     token::LlamaToken,
 };
 use mistralrs_core::{
@@ -74,6 +78,10 @@ const PROMPT_BATCH: usize = 512;
 
 /// The context size when the model sets no `context_length`.
 const DEFAULT_CONTEXT: u32 = 8192;
+
+/// Draft tokens an MTP head proposes per step. Two measured fastest for Qwen3.8-Flash-Next
+/// on a DGX Spark (53.7 tok/s against 47.5 without a draft, and 42.4 with three).
+const MTP_DRAFT: i32 = 2;
 
 /// How many streamed tokens may wait for a slow client before decoding pauses.
 const STREAM_BUFFER: usize = 64;
@@ -158,9 +166,13 @@ impl LlamaCpp {
                 });
             }
         }
-        let first = first_shard(weights).ok_or_else(|| ChatError::LocalModelNotFound {
+        // An MTP head ships as its own GGUF (`mtp-*.gguf`); it drafts for the model, so it is
+        // loaded beside it rather than as one of its shards.
+        let (drafts, trunk): (Vec<_>, Vec<_>) = weights.iter().cloned().partition(|w| is_mtp_head(w));
+        let first = first_shard(&trunk).ok_or_else(|| ChatError::LocalModelNotFound {
             expected_path: String::new(),
         })?;
+        let draft = drafts.into_iter().next();
         let n_ctx = options
             .context_length
             .and_then(|length| u32::try_from(length).ok())
@@ -171,7 +183,7 @@ impl LlamaCpp {
         let (jobs_tx, jobs_rx) = std_mpsc::channel();
         thread::Builder::new()
             .name("llama-cpp".to_string())
-            .spawn(move || serve(&first, n_ctx, ready_tx, &jobs_rx))
+            .spawn(move || serve(&first, draft.as_deref(), n_ctx, ready_tx, &jobs_rx))
             .map_err(|e| ChatError::FailedToLoadModel { source: Box::new(e) })?;
         let loaded = ready_rx
             .await
@@ -435,6 +447,7 @@ fn render(
 /// The decode thread: loads the model, reports readiness, then runs jobs in order.
 fn serve(
     path: &Path,
+    draft: Option<&Path>,
     n_ctx: Option<NonZeroU32>,
     ready: oneshot::Sender<std::result::Result<Loaded, String>>,
     jobs: &std_mpsc::Receiver<Job>,
@@ -457,16 +470,38 @@ fn serve(
             return;
         }
     };
-    // The context borrows the model, so both live in this frame for the thread's lifetime.
+    let draft_model = match draft.map(|d| {
+        LlamaModel::load_from_file(backend, d, &params.clone().with_load_mtp(true))
+            .map_err(|e| format!("llama.cpp could not load the MTP head '{}': {e}", d.display()))
+    }) {
+        Some(Err(message)) => {
+            let _ = ready.send(Err(message));
+            return;
+        }
+        Some(Ok(model)) => Some(model),
+        None => None,
+    };
+    // The contexts borrow the models, so all of them live in this frame for the thread's
+    // lifetime.
     let context_params = LlamaContextParams::default()
         .with_n_ctx(n_ctx)
         .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX));
-    let mut context = match model.new_context(backend, context_params) {
+    let context = match model.new_context(backend, context_params) {
         Ok(context) => context,
         Err(e) => {
             let _ = ready.send(Err(format!("llama.cpp could not create a context: {e}")));
             return;
         }
+    };
+    let mut decoder = match &draft_model {
+        None => Decoder::Plain(context),
+        Some(draft_model) => match mtp(backend, draft_model, context) {
+            Ok(spec) => Decoder::Mtp(Box::new(spec)),
+            Err(message) => {
+                let _ = ready.send(Err(message));
+                return;
+            }
+        },
     };
     let vocab = model.vocab();
     let special = SpecialTokens {
@@ -482,7 +517,11 @@ fn serve(
     }
     while let Ok(job) = jobs.recv() {
         let events = job.events.clone();
-        let event = match generate(&model, &mut context, job) {
+        let result = match &mut decoder {
+            Decoder::Plain(context) => generate(&model, context, job),
+            Decoder::Mtp(spec) => generate_mtp(&model, spec, job),
+        };
+        let event = match result {
             Ok(outcome) => Event::Done(outcome),
             Err(message) => Event::Failed(message),
         };
@@ -490,59 +529,182 @@ fn serve(
     }
 }
 
-/// Runs one request from an empty KV cache.
-fn generate(
+/// The decode thread's engine: plain decoding, or decoding with an MTP draft head.
+enum Decoder<'m> {
+    Plain(LlamaContext<'m>),
+    Mtp(Box<MtpSpeculative<'m>>),
+}
+
+/// Creates an MTP draft context linked to `context`, as llama.cpp's own server does: an
+/// MTP-type context of the same size, reading the target's hidden states.
+fn mtp<'m>(
+    backend: &LlamaBackend,
+    draft_model: &'m LlamaModel,
+    context: LlamaContext<'m>,
+) -> std::result::Result<MtpSpeculative<'m>, String> {
+    let params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(context.n_ctx()))
+        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
+        .with_context_type(LlamaContextType::Mtp)
+        .with_n_rs_seq(0);
+    let draft = draft_model
+        .new_context_with_ctx_other(backend, params, &context)
+        .map_err(|e| format!("llama.cpp could not create the MTP draft context: {e}"))?;
+    MtpSpeculative::new(
+        context,
+        draft,
+        MtpSpeculativeParams {
+            n_max: MTP_DRAFT,
+            n_min: 0,
+            p_min: 0.0,
+        },
+    )
+    .map_err(|e| format!("llama.cpp could not start MTP drafting: {e}"))
+}
+
+/// What prompt reading needs from either engine.
+trait Target<'m> {
+    fn context(&self) -> &LlamaContext<'m>;
+    fn context_mut(&mut self) -> &mut LlamaContext<'m>;
+    /// Called after every target decode; the MTP head reads the batch's hidden states.
+    fn decoded(&mut self, batch: &LlamaBatch<'_>) -> std::result::Result<(), String>;
+}
+
+impl<'m> Target<'m> for LlamaContext<'m> {
+    fn context(&self) -> &LlamaContext<'m> {
+        self
+    }
+    fn context_mut(&mut self) -> &mut LlamaContext<'m> {
+        self
+    }
+    fn decoded(&mut self, _: &LlamaBatch<'_>) -> std::result::Result<(), String> {
+        Ok(())
+    }
+}
+
+impl<'m> Target<'m> for MtpSpeculative<'m> {
+    fn context(&self) -> &LlamaContext<'m> {
+        self.target_context()
+    }
+    fn context_mut(&mut self) -> &mut LlamaContext<'m> {
+        self.target_context_mut()
+    }
+    fn decoded(&mut self, batch: &LlamaBatch<'_>) -> std::result::Result<(), String> {
+        self.process(batch).map_err(|e| e.to_string())
+    }
+}
+
+/// Tokenizes the prompt and decodes it from an empty KV cache, returning the tokens and the
+/// batch whose last logits predict the first generated token.
+fn read_prompt<'m>(
     model: &LlamaModel,
-    context: &mut LlamaContext<'_>,
-    job: Job,
-) -> std::result::Result<Outcome, String> {
-    context.clear_kv_cache();
-    let vocab = model.vocab();
-    let prompt = vocab.tokenize(job.prompt.as_bytes(), false, true);
-    let n_ctx = usize::try_from(context.n_ctx()).unwrap_or(usize::MAX);
-    if prompt.is_empty() {
+    target: &mut impl Target<'m>,
+    prompt: &str,
+) -> std::result::Result<(Vec<LlamaToken>, LlamaBatch<'static>), String> {
+    target.context_mut().clear_kv_cache();
+    let tokens = model.vocab().tokenize(prompt.as_bytes(), false, true);
+    let n_ctx = usize::try_from(target.context().n_ctx()).unwrap_or(usize::MAX);
+    if tokens.is_empty() {
         return Err("the rendered prompt is empty".to_string());
     }
-    if prompt.len() >= n_ctx {
+    if tokens.len() >= n_ctx {
         return Err(format!(
             "the prompt is {} tokens, and the model's context holds {n_ctx}. Shorten the conversation, or raise `context_length`.",
-            prompt.len()
+            tokens.len()
         ));
     }
-    let prompt_tokens = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
-
     let mut batch = LlamaBatch::new(PROMPT_BATCH, 1);
     let mut pos: i32 = 0;
-    let chunks = prompt.chunks(PROMPT_BATCH).count();
-    for (i, chunk) in prompt.chunks(PROMPT_BATCH).enumerate() {
+    let chunks = tokens.chunks(PROMPT_BATCH).count();
+    for (i, chunk) in tokens.chunks(PROMPT_BATCH).enumerate() {
         batch.clear();
         for (j, &token) in chunk.iter().enumerate() {
             let last = i + 1 == chunks && j + 1 == chunk.len();
             batch.add(token, pos, &[0], last).map_err(|e| e.to_string())?;
             pos += 1;
         }
-        context.decode(&mut batch).map_err(|e| e.to_string())?;
+        target.context_mut().decode(&mut batch).map_err(|e| e.to_string())?;
+        target.decoded(&batch)?;
+    }
+    Ok((tokens, batch))
+}
+
+/// Sends generated tokens to the client, ending at an end-of-generation token, a stop
+/// sequence or the token budget.
+struct Output {
+    events: mpsc::Sender<Event>,
+    limit: Option<usize>,
+    stops: StopMatcher,
+    pending: Vec<u8>,
+    produced: u32,
+}
+
+impl Output {
+    fn new(job: Job) -> (String, Sampling, Self) {
+        let output = Self {
+            events: job.events,
+            limit: job.limit,
+            stops: StopMatcher::new(job.stop),
+            pending: Vec::new(),
+            produced: 0,
+        };
+        (job.prompt, job.sampling, output)
     }
 
-    let mut sampler = sampler(job.sampling);
-    let mut stops = StopMatcher::new(job.stop);
-    let mut pending = Vec::new();
-    let mut produced: u32 = 0;
+    /// Sends one sampled token, or returns why generation ends.
+    fn token(&mut self, model: &LlamaModel, token: LlamaToken) -> Option<FinishReason> {
+        let vocab = model.vocab();
+        if vocab.is_eog(token) {
+            return Some(FinishReason::Stop);
+        }
+        self.produced += 1;
+        self.pending.extend(vocab.token_to_piece(token, true, None));
+        let text = take_utf8(&mut self.pending);
+        let (emit, stopped) = self.stops.push(&text);
+        if self.events.blocking_send(Event::Token(emit)).is_err() || stopped {
+            return Some(FinishReason::Stop);
+        }
+        self.limit
+            .is_some_and(|limit| self.produced as usize >= limit)
+            .then_some(FinishReason::Length)
+    }
+
+    /// Tokens the budget still allows.
+    fn remaining(&self) -> usize {
+        self.limit
+            .map_or(usize::MAX, |limit| limit.saturating_sub(self.produced as usize))
+    }
+
+    fn finish(mut self, finish: FinishReason, prompt_tokens: usize) -> Outcome {
+        let tail = self.stops.finish();
+        if !tail.is_empty() {
+            let _ = self.events.blocking_send(Event::Token(tail));
+        }
+        Outcome {
+            finish,
+            prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
+            completion_tokens: self.produced,
+        }
+    }
+}
+
+/// Runs one request, one token per forward pass.
+fn generate(
+    model: &LlamaModel,
+    context: &mut LlamaContext<'_>,
+    job: Job,
+) -> std::result::Result<Outcome, String> {
+    let (prompt, sampling, mut out) = Output::new(job);
+    let (tokens, mut batch) = read_prompt(model, context, &prompt)?;
+    let n_ctx = usize::try_from(context.n_ctx()).unwrap_or(usize::MAX);
+    let mut pos = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
+    let mut sampler = sampler(sampling);
     let finish = loop {
         let token = sampler.sample(context, batch.n_tokens() - 1);
-        if vocab.is_eog(token) {
-            break FinishReason::Stop;
+        if let Some(finish) = out.token(model, token) {
+            break finish;
         }
-        produced += 1;
-        pending.extend(vocab.token_to_piece(token, true, None));
-        let text = take_utf8(&mut pending);
-        let (emit, stopped) = stops.push(&text);
-        if job.events.blocking_send(Event::Token(emit)).is_err() || stopped {
-            break FinishReason::Stop;
-        }
-        if job.limit.is_some_and(|limit| produced as usize >= limit)
-            || usize::try_from(pos).unwrap_or(usize::MAX) + 1 >= n_ctx
-        {
+        if usize::try_from(pos).unwrap_or(usize::MAX) + 1 >= n_ctx {
             break FinishReason::Length;
         }
         batch.clear();
@@ -550,15 +712,71 @@ fn generate(
         pos += 1;
         context.decode(&mut batch).map_err(|e| e.to_string())?;
     };
-    let tail = stops.finish();
-    if !tail.is_empty() {
-        let _ = job.events.blocking_send(Event::Token(tail));
-    }
-    Ok(Outcome {
-        finish,
-        prompt_tokens,
-        completion_tokens: produced,
-    })
+    Ok(out.finish(finish, tokens.len()))
+}
+
+/// Runs one request with MTP drafting: each forward pass verifies the last token plus up
+/// to [`MTP_DRAFT`] drafted ones, and keeps the drafts the target would have sampled.
+fn generate_mtp(
+    model: &LlamaModel,
+    spec: &mut MtpSpeculative<'_>,
+    job: Job,
+) -> std::result::Result<Outcome, String> {
+    let (prompt, sampling, mut out) = Output::new(job);
+    spec.draft_context_mut().clear_kv_cache();
+    let prompt_tokens = model.vocab().tokenize(prompt.as_bytes(), false, true);
+    spec.begin(&prompt_tokens).map_err(|e| e.to_string())?;
+    let (tokens, mut batch) = read_prompt(model, spec, &prompt)?;
+    let n_ctx = usize::try_from(spec.target_context().n_ctx()).unwrap_or(usize::MAX);
+    let mut history = tokens.clone();
+    let mut n_past = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
+    let mut sampler = sampler(sampling);
+    let mut id = sampler.sample(spec.target_context(), batch.n_tokens() - 1);
+    let finish = 'generate: loop {
+        if let Some(finish) = out.token(model, id) {
+            break finish;
+        }
+        let past = usize::try_from(n_past).unwrap_or(usize::MAX);
+        if past + 1 >= n_ctx {
+            break FinishReason::Length;
+        }
+        let mut draft = spec.draft(n_past, id, &history).map_err(|e| e.to_string())?;
+        draft.truncate(out.remaining().min(n_ctx - past - 1));
+
+        batch.clear();
+        batch.add(id, n_past, &[0], true).map_err(|e| e.to_string())?;
+        for (i, &token) in draft.iter().enumerate() {
+            let at = n_past + 1 + i32::try_from(i).map_err(|e| e.to_string())?;
+            batch.add(token, at, &[0], true).map_err(|e| e.to_string())?;
+        }
+        spec.target_context_mut().decode(&mut batch).map_err(|e| e.to_string())?;
+        spec.process(&batch).map_err(|e| e.to_string())?;
+        history.push(id);
+
+        let mut accepted = 0;
+        let next = loop {
+            let index = i32::try_from(accepted).map_err(|e| e.to_string())?;
+            let token = sampler.sample(spec.target_context(), index);
+            if accepted < draft.len() && token == draft[accepted] {
+                accepted += 1;
+                if let Some(finish) = out.token(model, token) {
+                    break 'generate finish;
+                }
+                history.push(token);
+            } else {
+                break token;
+            }
+        };
+        n_past += 1 + i32::try_from(accepted).map_err(|e| e.to_string())?;
+        // Drop the rejected drafts' cache entries, then let the head roll back its own.
+        spec.target_context_mut()
+            .clear_kv_cache_seq(Some(0), u32::try_from(n_past).ok(), None)
+            .map_err(|e| e.to_string())?;
+        spec.accept(u16::try_from(accepted).unwrap_or(u16::MAX))
+            .map_err(|e| e.to_string())?;
+        id = next;
+    };
+    Ok(out.finish(finish, tokens.len()))
 }
 
 /// Greedy at temperature 0 or unset, as the mistral.rs engine's deterministic default;
@@ -572,6 +790,13 @@ fn sampler(sampling: Sampling) -> LlamaSampler {
         ]),
         _ => LlamaSampler::greedy(),
     }
+}
+
+/// Whether a file is an MTP draft head, by the `mtp-` name the GGUF publishers give them.
+fn is_mtp_head(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("mtp-"))
 }
 
 /// The GGUF a sharded model is opened from: the `-00001-of-` file, or the only file.
