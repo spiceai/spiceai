@@ -736,3 +736,28 @@ async fn a_streamed_loop_runs_spice_tools_in_the_callers_request_context() {
     );
     assert_eq!(*probe.seen.lock(), [true]);
 }
+
+/// A `tool_recursion_limit` of 0 sends the request to the model without Spice's tools and runs
+/// none of the calls it makes, streamed or not.
+#[tokio::test]
+async fn a_zero_recursion_limit_calls_the_model_without_spice_tools() {
+    let call = round("msg_1", &json!([sql_call("toolu_1")]), "tool_use", 100, 10);
+    let scripted = Scripted::new(vec![call.clone(), call.clone()]);
+    let sql = Arc::new(Sql(AtomicUsize::new(0)));
+    let messages = using(&scripted, &sql, 0);
+
+    let message = messages.create(request()).await.expect("a message");
+    assert_eq!(message, call);
+    let streamed = accumulate(&streamed(&messages, request()).await);
+    assert_eq!(streamed["content"], call["content"]);
+    assert_eq!(streamed["stop_reason"], "tool_use");
+    let counted = messages.count_tokens(request()).await.expect("a count");
+    assert_eq!(counted, json!({"input_tokens": 0}));
+
+    assert_eq!(sql.0.load(Ordering::SeqCst), 0);
+    let requests = scripted.requests();
+    assert_eq!(requests.len(), 2);
+    for sent in &requests {
+        assert_eq!(sent.get("tools"), None, "{sent:?}");
+    }
+}

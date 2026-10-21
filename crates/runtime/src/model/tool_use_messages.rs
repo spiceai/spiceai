@@ -26,7 +26,8 @@ limitations under the License.
 //! with `stop_reason: tool_use`, for the client to run the rest. After as many rounds as the
 //! model's `tool_recursion_limit`, Spice runs the last round's calls and the Message ends with
 //! `stop_reason: pause_turn`; the client continues it by sending the conversation back, as it
-//! would for Anthropic's own server tools.
+//! would for Anthropic's own server tools. A `tool_recursion_limit` of 0 sends each request to
+//! the model without Spice's tools, as chat completions and responses do.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -183,7 +184,7 @@ impl ToolUsingMessages {
         Self {
             inner,
             tools: Arc::new(SpiceTools { tools }),
-            recursion_limit: recursion_limit.max(1),
+            recursion_limit,
         }
     }
 }
@@ -355,6 +356,9 @@ fn stop_after_tools(called_client_tools: bool, last_round: bool) -> Option<&'sta
 #[async_trait]
 impl Messages for ToolUsingMessages {
     async fn create(&self, request: MessagesRequest) -> Result<Value, MessagesError> {
+        if self.recursion_limit == 0 {
+            return self.inner.create(request).await;
+        }
         let MessagesRequest {
             mut body,
             betas,
@@ -453,6 +457,9 @@ impl Messages for ToolUsingMessages {
         &self,
         request: MessagesRequest,
     ) -> Result<MessageStream, MessagesError> {
+        if self.recursion_limit == 0 {
+            return self.inner.create_stream(request).await;
+        }
         let MessagesRequest {
             mut body,
             betas,
@@ -520,6 +527,9 @@ impl Messages for ToolUsingMessages {
 
     async fn count_tokens(&self, request: MessagesRequest) -> Result<Value, MessagesError> {
         // Counted with Spice's tools, as the model is sent the request.
+        if self.recursion_limit == 0 {
+            return self.inner.count_tokens(request).await;
+        }
         let MessagesRequest {
             mut body,
             betas,
