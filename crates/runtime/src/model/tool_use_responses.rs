@@ -260,6 +260,19 @@ impl ToolUsingResponses {
             .collect()
     }
 
+    /// The first admitted Spice call in `output` with `call_id`. A later item that reuses the id
+    /// is not this call, so a done event for that later item does not run its arguments.
+    fn first_admitted_spice_call<'a>(
+        &self,
+        output: &'a [OutputItem],
+        call_id: &str,
+    ) -> Option<&'a FunctionToolCall> {
+        self.spice_tool_calls(output)
+            .into_iter()
+            .take(MAX_SPICE_TOOL_CALLS_PER_RESPONSE)
+            .find(|call| call.call_id == call_id)
+    }
+
     /// Runs `call` when `runnable` contains its `call_id`. A call that it does not contain does
     /// not run, and fails with [`tool_call_not_run_message`]. `requested` is how many Spice tool
     /// calls the round made.
@@ -989,14 +1002,20 @@ fn make_responses_stream(
                         let events = match ended_call {
                             Some((call, output_index)) => {
                                 // The runnable set records which call ids may run, not how many
-                                // times. A repeated `output_item.done` for an id already run in
-                                // this round, including a later item that reuses the id, reuses
-                                // that outcome instead of running the tool again.
+                                // times. A repeated done event reuses the outcome. The dispatch
+                                // is the first admitted item with that id, not whichever done
+                                // event arrived first: a later item can reuse the id with
+                                // different arguments.
                                 let outcome = if let Some(outcome) = outcomes.get(&call.call_id) {
                                     outcome.clone()
                                 } else {
+                                    let dispatch = model
+                                        .first_admitted_spice_call(&response.output, &call.call_id)
+                                        .unwrap_or(call);
                                     let outcome = model
-                                        .run_spice_tool_call_if_runnable(call, &runnable, requested)
+                                        .run_spice_tool_call_if_runnable(
+                                            dispatch, &runnable, requested,
+                                        )
                                         .await;
                                     outcomes.insert(call.call_id.clone(), outcome.clone());
                                     outcome
@@ -1013,8 +1032,11 @@ fn make_responses_stream(
                     // output-order selection: the next round needs every call's result.
                     for call in spice_calls {
                         if !outcomes.contains_key(&call.call_id) {
+                            let dispatch = model
+                                .first_admitted_spice_call(&response.output, &call.call_id)
+                                .unwrap_or(call);
                             let outcome = model
-                                .run_spice_tool_call_if_runnable(call, &runnable, requested)
+                                .run_spice_tool_call_if_runnable(dispatch, &runnable, requested)
                                 .await;
                             outcomes.insert(call.call_id.clone(), outcome);
                         }
@@ -2024,6 +2046,8 @@ mod tests {
         id_cycle: Option<usize>,
         /// When set, the first this many items share `call_0_0`. Later items keep distinct ids.
         shared_head: Option<usize>,
+        /// When set, a completed call's arguments are `{"n":index}` rather than `{}`.
+        indexed_arguments: bool,
         requests: Mutex<Vec<CreateResponse>>,
     }
 
@@ -2037,7 +2061,16 @@ mod tests {
             done_indexes: Vec<usize>,
             id_cycle: Option<usize>,
         ) -> Arc<Self> {
-            Self::with_ids(calls, done_indexes, id_cycle, None)
+            Self::with_ids(calls, done_indexes, id_cycle, None, false)
+        }
+
+        /// `with_id_cycle`, and each completed call's arguments are `{"n":index}`.
+        fn with_indexed_cycle(
+            calls: usize,
+            done_indexes: Vec<usize>,
+            id_cycle: usize,
+        ) -> Arc<Self> {
+            Self::with_ids(calls, done_indexes, Some(id_cycle), None, true)
         }
 
         /// The first `shared_head` items share one `call_id`. The rest each have their own.
@@ -2046,7 +2079,7 @@ mod tests {
             done_indexes: Vec<usize>,
             shared_head: usize,
         ) -> Arc<Self> {
-            Self::with_ids(calls, done_indexes, None, Some(shared_head))
+            Self::with_ids(calls, done_indexes, None, Some(shared_head), false)
         }
 
         fn with_ids(
@@ -2054,12 +2087,14 @@ mod tests {
             done_indexes: Vec<usize>,
             id_cycle: Option<usize>,
             shared_head: Option<usize>,
+            indexed_arguments: bool,
         ) -> Arc<Self> {
             Arc::new(Self {
                 calls,
                 done_indexes,
                 id_cycle,
                 shared_head,
+                indexed_arguments,
                 requests: Mutex::new(Vec::new()),
             })
         }
@@ -2091,6 +2126,7 @@ mod tests {
                     &self.done_indexes,
                     self.id_cycle,
                     self.shared_head,
+                    self.indexed_arguments,
                 )
             } else {
                 round_events(round, &["message"])
@@ -2119,6 +2155,7 @@ mod tests {
                         "completed",
                         self.id_cycle,
                         self.shared_head,
+                        self.indexed_arguments,
                     )
                 })
                 .collect();
@@ -2155,6 +2192,7 @@ mod tests {
         status: &str,
         id_cycle: Option<usize>,
         shared_head: Option<usize>,
+        indexed_arguments: bool,
     ) -> Value {
         let mut value = item(round, index, name, status);
         if let Some(object) = value.as_object_mut()
@@ -2164,6 +2202,12 @@ mod tests {
                 "call_id".to_string(),
                 Value::String(call_id_for(round, index, id_cycle, shared_head)),
             );
+            if indexed_arguments && status == "completed" {
+                object.insert(
+                    "arguments".to_string(),
+                    json!(format!(r#"{{"n":{index}}}"#)),
+                );
+            }
         }
         value
     }
@@ -2177,6 +2221,7 @@ mod tests {
         done_indexes: &[usize],
         id_cycle: Option<usize>,
         shared_head: Option<usize>,
+        indexed_arguments: bool,
     ) -> Vec<ResponseStreamEvent> {
         let mut events = vec![json!({
             "type": "response.created", "response": response(round, "in_progress", &[]),
@@ -2185,7 +2230,9 @@ mod tests {
             let item_id = item(round, index, name, "completed")["id"].clone();
             events.push(json!({
                 "type": "response.output_item.added", "output_index": index,
-                "item": item_call(round, index, name, "in_progress", id_cycle, shared_head),
+                "item": item_call(
+                    round, index, name, "in_progress", id_cycle, shared_head, indexed_arguments,
+                ),
             }));
             events.extend([
                 json!({
@@ -2201,13 +2248,31 @@ mod tests {
         for index in done_indexes {
             events.push(json!({
                 "type": "response.output_item.done", "output_index": index,
-                "item": item_call(round, *index, items[*index], "completed", id_cycle, shared_head),
+                "item": item_call(
+                    round,
+                    *index,
+                    items[*index],
+                    "completed",
+                    id_cycle,
+                    shared_head,
+                    indexed_arguments,
+                ),
             }));
         }
         let output_items: Vec<Value> = items
             .iter()
             .enumerate()
-            .map(|(index, name)| item_call(round, index, name, "completed", id_cycle, shared_head))
+            .map(|(index, name)| {
+                item_call(
+                    round,
+                    index,
+                    name,
+                    "completed",
+                    id_cycle,
+                    shared_head,
+                    indexed_arguments,
+                )
+            })
             .collect();
         events.push(json!({
             "type": "response.completed",
@@ -2502,6 +2567,73 @@ mod tests {
             outputs.get(&format!("call_0_{cap}")).map(String::as_str),
             Some(skipped.as_str()),
             "shared head"
+        );
+    }
+
+    /// Records the argument string of each `list_datasets` call.
+    struct RecordingList(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl SpiceModelTool for RecordingList {
+        fn name(&self) -> Cow<'_, str> {
+            "list_datasets".into()
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().push(arg.to_string());
+            Ok(json!(["taxi_trips"]))
+        }
+    }
+
+    /// A later item that reuses an admitted `call_id`, and whose `output_item.done` arrives
+    /// first, does not run its own arguments. The dispatch is the first admitted item's.
+    #[tokio::test]
+    async fn streamed_reordered_reused_id_runs_the_first_admitted_arguments() {
+        let cap = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
+        let calls = cap + 1;
+        let mut done_indexes = vec![cap];
+        done_indexes.extend(0..cap);
+        let provider = DoneOrderResponses::with_indexed_cycle(calls, done_indexes, cap);
+        let tool = Arc::new(RecordingList(Mutex::new(Vec::new())));
+        let events = collect_events(
+            ToolUsingResponses::new(
+                Arc::clone(&provider) as Arc<dyn Responses>,
+                vec![],
+                vec![Arc::clone(&tool) as Arc<dyn SpiceModelTool>],
+                None,
+            )
+            .responses_stream(request(true))
+            .await
+            .expect("a response stream"),
+        )
+        .await;
+        assert!(
+            events
+                .last()
+                .is_some_and(|event| event["type"] == "response.completed")
+        );
+
+        let recorded = tool.0.lock().clone();
+        assert_eq!(recorded.len(), cap);
+        assert_eq!(recorded[0], r#"{"n":0}"#);
+        assert!(
+            !recorded
+                .iter()
+                .any(|arg| arg == &format!(r#"{{"n":{cap}}}"#)),
+            "ran the later item's arguments: {recorded:?}"
+        );
+        let outputs = function_outputs(&provider.input(1));
+        assert_eq!(
+            outputs.get("call_0_0").map(String::as_str),
+            Some("[\"taxi_trips\"]")
         );
     }
 }
