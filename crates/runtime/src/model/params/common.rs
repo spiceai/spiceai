@@ -33,6 +33,10 @@ use runtime_parameters_typed::PassthroughParam;
 /// non-OpenAI providers.
 pub const DEPRECATED_MESSAGE: &str = "The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.";
 
+/// Deprecation note for an override set without the provider's prefix on a provider whose
+/// documented form is `<model_prefix>_<param>`. The runtime still applies it.
+pub const UNPREFIXED_DEPRECATED_MESSAGE: &str = "It still applies, but the documented name has the model provider's prefix, `<model_prefix>_<param>` (for example `hf_temperature`). See: https://spiceai.org/docs/components/models#model-provider-prefix";
+
 /// Runtime tunables every provider accepts (unprefixed), shared by both tables.
 const RUNTIME_TUNABLES: [PassthroughParam; 6] = [
     PassthroughParam::runtime("tools").description("Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery."),
@@ -76,8 +80,9 @@ const OVERRIDES: [&str; 22] = [
 pub const OPENAI_COMMON: &[PassthroughParam] = &openai_common();
 
 /// Common params for every non-OpenAI provider: the runtime tunables, the
-/// override params accepted `{prefix}_`-prefixed (component), and the literal
-/// `openai_`-prefixed forms kept as deprecated aliases.
+/// override params accepted `{prefix}_`-prefixed (component), and two deprecated
+/// aliases for each: the unprefixed name, which the runtime still applies, and the
+/// literal `openai_`-prefixed form.
 pub const PREFIXED_COMMON: &[PassthroughParam] = &prefixed_common();
 
 /// Rate-control tunables for evaluation-only providers (credentials/endpoint are
@@ -94,10 +99,11 @@ pub const EVALUATE_RATE_CONTROLS: &[PassthroughParam] = &[
 // OpenAI: 6 runtime tunables + 22 runtime overrides + (`openai_tools` + 22
 // `openai_*` overrides) deprecated component forms = 51 (legacy PARAM_LEN).
 const OPENAI_LEN: usize = RUNTIME_TUNABLES.len() + OVERRIDES.len() + (1 + OVERRIDES.len());
-// Prefixed: 6 runtime tunables + (`tools` + 22 overrides) component forms +
-// (`openai_tools` + 22 `openai_*` overrides) deprecated runtime forms = 52
-// (legacy PARAM_WITH_DEPRE_LEN).
-const PREFIXED_LEN: usize = RUNTIME_TUNABLES.len() + (1 + OVERRIDES.len()) + (1 + OVERRIDES.len());
+// Prefixed: 6 runtime tunables + (`tools` + 22 overrides) component forms + 22
+// deprecated unprefixed overrides + (`openai_tools` + 22 `openai_*` overrides)
+// deprecated runtime forms = 74.
+const PREFIXED_LEN: usize =
+    RUNTIME_TUNABLES.len() + (1 + OVERRIDES.len()) + OVERRIDES.len() + (1 + OVERRIDES.len());
 
 const fn openai_common() -> [PassthroughParam; OPENAI_LEN] {
     let mut out = [PassthroughParam::runtime(""); OPENAI_LEN];
@@ -152,6 +158,16 @@ const fn prefixed_common() -> [PassthroughParam; PREFIXED_LEN] {
     j = 0;
     while j < OVERRIDES.len() {
         out[i] = PassthroughParam::component(OVERRIDES[j]);
+        i += 1;
+        j += 1;
+    }
+
+    // Deprecated unprefixed override forms. `get_openai_request_overrides` applies
+    // them when the prefixed form is absent, so they are accepted with a deprecation
+    // warning rather than reported as ignored. `tools` is a runtime tunable above.
+    j = 0;
+    while j < OVERRIDES.len() {
+        out[i] = PassthroughParam::runtime(OVERRIDES[j]).deprecated(UNPREFIXED_DEPRECATED_MESSAGE);
         i += 1;
         j += 1;
     }
@@ -229,10 +245,11 @@ mod tests {
 
     #[test]
     fn table_lengths_match_legacy_specs() {
-        // Parity with the retired COMMON_MODEL_PARAMETERS (51) and
-        // COMMON_MODEL_PARAMETERS_WITH_DEPRECATED (52) arrays.
+        // OpenAI keeps parity with the retired COMMON_MODEL_PARAMETERS (51) array.
+        // The prefixed table is the retired COMMON_MODEL_PARAMETERS_WITH_DEPRECATED
+        // (52) plus the 22 deprecated unprefixed overrides.
         assert_eq!(OPENAI_COMMON.len(), 51);
-        assert_eq!(PREFIXED_COMMON.len(), 52);
+        assert_eq!(PREFIXED_COMMON.len(), 74);
     }
 
     fn user_keys(table: &[PassthroughParam], prefix: &str) -> Vec<(String, bool)> {
@@ -255,6 +272,8 @@ mod tests {
     fn prefixed_accepts_prefixed_and_deprecated_openai_overrides() {
         let keys = user_keys(PREFIXED_COMMON, "hf");
         assert!(keys.contains(&("hf_temperature".to_string(), false)));
+        assert!(keys.contains(&("temperature".to_string(), true)));
+        assert!(keys.contains(&("reasoning_effort".to_string(), true)));
         assert!(keys.contains(&("openai_temperature".to_string(), true)));
         assert!(keys.contains(&("hf_tools".to_string(), false)));
         assert!(keys.contains(&("openai_tools".to_string(), true)));

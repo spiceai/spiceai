@@ -860,11 +860,17 @@ fn parse_context_length(params: &FileModelParams) -> Result<Option<usize>, LlmEr
 pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
     let mut request_overrides: HashMap<String, Value> = HashMap::new();
     for &key in OPENAI_DEFAULT_PARAM_KEYS.iter() {
-        if let Some(v) = model.params.get(key) {
-            request_overrides.insert(key.to_string(), v.clone());
-        } else if let Some(v) = model.params.get(&format!("{prefix}_{key}")) {
-            request_overrides.insert(key.to_string(), v.clone());
-        } else if let Some(v) = model.params.get(&format!("openai_{key}")) {
+        // The documented spelling wins: unprefixed for OpenAI, `{prefix}_` for every
+        // other provider. The other spellings are deprecated aliases, read only when
+        // it is absent.
+        let prefixed = format!("{prefix}_{key}");
+        let legacy = format!("openai_{key}");
+        let spellings = if prefix == ModelSource::OpenAi.short_name() {
+            [key, legacy.as_str(), legacy.as_str()]
+        } else {
+            [prefixed.as_str(), key, legacy.as_str()]
+        };
+        if let Some(v) = spellings.iter().find_map(|name| model.params.get(*name)) {
             request_overrides.insert(key.to_string(), v.clone());
         }
     }
@@ -980,6 +986,62 @@ mod test {
         assert_eq!(overrides.len(), 1);
         assert!(overrides.iter().any(|(k, v)| k == "temperature"
             && v == &Value::Number(Number::from_f64(0.7).expect("valid number"))));
+    }
+
+    #[test]
+    fn a_prefixed_override_takes_precedence_over_its_bare_alias() {
+        let mut model = Model::new("hf:test_model", "test_model");
+        model.params.insert(
+            "reasoning_effort".to_string(),
+            Value::String("high".to_string()),
+        );
+        model.params.insert(
+            "hf_reasoning_effort".to_string(),
+            Value::String("low".to_string()),
+        );
+        assert_eq!(
+            get_openai_request_overrides(&model, "hf"),
+            vec![(
+                "reasoning_effort".to_string(),
+                Value::String("low".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn a_bare_override_applies_when_its_prefixed_form_is_absent() {
+        let mut model = Model::new("file:/models/qwen3.gguf", "test_model");
+        model.params.insert(
+            "reasoning_effort".to_string(),
+            Value::String("none".to_string()),
+        );
+        assert_eq!(
+            get_openai_request_overrides(&model, "file"),
+            vec![(
+                "reasoning_effort".to_string(),
+                Value::String("none".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn openai_reads_the_bare_override_before_its_deprecated_prefixed_form() {
+        let mut model = Model::new("openai:gpt-5", "test_model");
+        model.params.insert(
+            "reasoning_effort".to_string(),
+            Value::String("high".to_string()),
+        );
+        model.params.insert(
+            "openai_reasoning_effort".to_string(),
+            Value::String("low".to_string()),
+        );
+        assert_eq!(
+            get_openai_request_overrides(&model, "openai"),
+            vec![(
+                "reasoning_effort".to_string(),
+                Value::String("high".to_string())
+            )]
+        );
     }
 
     #[test]
