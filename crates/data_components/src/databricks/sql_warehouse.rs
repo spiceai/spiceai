@@ -76,16 +76,11 @@ mod datatypes;
 const SQL_WAREHOUSE_MAX_IN_FLIGHT_REQUESTS: usize = 8;
 const SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES: usize = 3;
 const SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES: usize = 14;
-/// The most one result chunk may hold. Databricks documents no per-chunk maximum, so
-/// this sits well above the shared response limit: it exists to bound a hostile or
-/// broken response, not to shape legitimate results.
-const MAX_RESULT_CHUNK_BYTES: usize = 1024 * 1024 * 1024;
-
-/// Decode a JSON response body read under [`http_body_limit::MAX_RESPONSE_BODY_BYTES`].
+/// Decode a JSON response body read under [`http_body_limit::Limit::METADATA`].
 async fn read_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, Error> {
-    http_body_limit::buffer(response, http_body_limit::MAX_RESPONSE_BODY_BYTES)
+    http_body_limit::buffer(response, http_body_limit::Limit::METADATA)
         .await
         .context(ResponseBodySnafu)?
         .json()
@@ -668,7 +663,11 @@ impl FromStr for ResponseStatus {
 }
 
 struct SqlWarehouseApi {
+    /// For the statement and metadata API, whose JSON bodies are read through
+    /// `read_json`.
     client: Client,
+    /// For result chunks, which are bulk data and decompress transparently.
+    chunk_client: Client,
     base_url: String,
     request_semaphore: Arc<Semaphore>,
     http_max_retries: usize,
@@ -691,17 +690,23 @@ impl SqlWarehouseApi {
         request_semaphore: Arc<Semaphore>,
         rate_controller: Option<Arc<RateController>>,
     ) -> Result<Self, Error> {
-        let client = configure_client_builder_with_timeouts(
-            ClientBuilder::new(),
-            config.connect_timeout,
-            config.request_timeout,
-        )
-        .user_agent(super::user_agent())
-        .build()
-        .context(ClientBuildFailedSnafu)?;
+        let builder = || {
+            configure_client_builder_with_timeouts(
+                ClientBuilder::new(),
+                config.connect_timeout,
+                config.request_timeout,
+            )
+            .user_agent(super::user_agent())
+        };
+        // `read_json` decodes these bodies itself, refusing decompression amplification.
+        let client = http_body_limit::decode_manually(builder())
+            .build()
+            .context(ClientBuildFailedSnafu)?;
+        let chunk_client = builder().build().context(ClientBuildFailedSnafu)?;
 
         Ok(Self {
             client,
+            chunk_client,
             base_url: format!("https://{host}"),
             request_semaphore,
             http_max_retries: config.http_max_retries,
@@ -1304,10 +1309,10 @@ impl SqlWarehouseApi {
         self.check_permanently_disabled()?;
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let rate_controller_permit = self.acquire_rate_controller_permit().await?;
-        let response = send_request_with_retry_and_concurrency_limit(
+        let result = send_request_with_retry_and_concurrency_limit(
             "Databricks SQL Warehouse",
             "fetch statement result chunk",
-            || self.client.get(url),
+            || self.chunk_client.get(url),
             &self.retry_config(),
         )
         .await
@@ -1316,14 +1321,10 @@ impl SqlWarehouseApi {
         // storage links). A 403/404 here typically means an expired link,
         // not broken credentials/warehouse configuration.
         .error_for_status()
-        .context(HttpRequestFailedSnafu)?;
-        let result = match http_body_limit::read_bytes(response, MAX_RESULT_CHUNK_BYTES).await {
-            Ok(bytes) => Ok(bytes),
-            Err(http_body_limit::Error::Read { source }) => {
-                Err(Error::HttpRequestFailed { source })
-            }
-            Err(source) => Err(Error::ResponseBody { source }),
-        };
+        .context(HttpRequestFailedSnafu)?
+        .bytes()
+        .await
+        .context(HttpRequestFailedSnafu);
         drop(rate_controller_permit);
         if result.is_ok() {
             self.metrics
@@ -2988,6 +2989,7 @@ mod tests {
         // tests don't race with tokio's auto-advance clock.
         let client = ClientBuilder::new().build().expect("should build client");
         SqlWarehouseApi {
+            chunk_client: client.clone(),
             client,
             base_url: format!("http://127.0.0.1:{port}"),
             request_semaphore: Arc::new(Semaphore::new(max_in_flight_requests)),
@@ -5279,6 +5281,7 @@ mod tests {
         // Create two independent API instances that share the same semaphore.
         let api_a = Arc::new(SqlWarehouseApi {
             client: client.clone(),
+            chunk_client: client.clone(),
             base_url: format!("http://127.0.0.1:{port}"),
             request_semaphore: Arc::clone(&shared_semaphore),
             http_max_retries: SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES,
@@ -5291,6 +5294,7 @@ mod tests {
             rate_controller: None,
         });
         let api_b = Arc::new(SqlWarehouseApi {
+            chunk_client: client.clone(),
             client,
             base_url: format!("http://127.0.0.1:{port}"),
             request_semaphore: Arc::clone(&shared_semaphore),

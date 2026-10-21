@@ -153,8 +153,12 @@ impl UnityCatalog {
             };
         }
 
-        let client = configure_client_builder(reqwest::Client::builder())
-            .user_agent(util::spiceai_user_agent())
+        // Every body is read through `read_json` or `read_bounded_error_body`, which decode
+        // it while refusing decompression amplification.
+        let client = http_body_limit::decode_manually(configure_client_builder(
+            reqwest::Client::builder(),
+        ))
+        .user_agent(util::spiceai_user_agent())
             .build()
             .context(UnableToCreateHttpClientSnafu)?;
 
@@ -510,9 +514,9 @@ impl UnityCatalog {
     }
 
     /// Decode a JSON response body read under
-    /// [`http_body_limit::MAX_RESPONSE_BODY_BYTES`].
+    /// [`http_body_limit::Limit::METADATA`].
     async fn read_json<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T> {
-        http_body_limit::buffer(response, http_body_limit::MAX_RESPONSE_BODY_BYTES)
+        http_body_limit::buffer(response, http_body_limit::Limit::METADATA)
             .await
             .context(ResponseBodySnafu)?
             .json()

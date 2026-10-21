@@ -225,7 +225,7 @@ async fn get_m2m_access_token(
     })
     .await?;
     let response =
-        http_body_limit::buffer(response, http_body_limit::MAX_RESPONSE_BODY_BYTES).await?;
+        http_body_limit::buffer(response, http_body_limit::Limit::METADATA).await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -244,7 +244,9 @@ async fn get_m2m_access_token(
 }
 
 fn build_m2m_token_client() -> Result<reqwest::Client, reqwest::Error> {
-    configure_client_builder(reqwest::Client::builder())
+    // Token responses are read through `http_body_limit`, which decodes them while
+    // refusing decompression amplification.
+    http_body_limit::decode_manually(configure_client_builder(reqwest::Client::builder()))
         .user_agent(util::spiceai_user_agent())
         .build()
 }

@@ -4820,7 +4820,6 @@ dependencies = [
  "futures",
  "graphql-parser",
  "http 1.4.1",
- "http-body-limit",
  "linkme",
  "paste",
  "regex",
@@ -8173,7 +8172,6 @@ version = "2.4.0-unstable"
 dependencies = [
  "async-trait",
  "bytes",
- "http-body-limit",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -10255,13 +10253,17 @@ dependencies = [
 name = "http-body-limit"
 version = "2.4.0-unstable"
 dependencies = [
+ "async-compression",
+ "brotli",
  "bytes",
  "flate2",
+ "futures",
  "http 1.4.1",
  "reqwest 0.13.4",
  "serde_json",
  "snafu",
  "tokio",
+ "tokio-util",
  "zstd",
 ]
 

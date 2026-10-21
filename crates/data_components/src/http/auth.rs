@@ -436,7 +436,9 @@ fn validate_token_url(url: &str) -> Result<()> {
 }
 
 fn build_token_client() -> Result<Client> {
-    configure_client_builder(ClientBuilder::new())
+    // Token responses are read through `http_body_limit`, which decodes them while
+    // refusing decompression amplification.
+    http_body_limit::decode_manually(configure_client_builder(ClientBuilder::new()))
         .user_agent(util::spiceai_user_agent())
         .build()
         .context(BuildClientSnafu)
@@ -485,7 +487,7 @@ async fn exchange_token(
     }
 
     let raw: RawTokenResponse =
-        http_body_limit::buffer(response, http_body_limit::MAX_RESPONSE_BODY_BYTES)
+        http_body_limit::buffer(response, http_body_limit::Limit::METADATA)
             .await
             .context(TokenResponseBodySnafu {
                 url: config.token_url.clone(),
