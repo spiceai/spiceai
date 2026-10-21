@@ -946,7 +946,7 @@ fn configured_changes_scan_view_lag() -> Option<Duration> {
             Ok(ms) => Some(Duration::from_millis(ms)),
             Err(_) => {
                 tracing::warn!(
-                    "Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using default {DEFAULT_CHANGES_SCAN_VIEW_LAG_MS} ms."
+                    "Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using the default bound ({DEFAULT_CHANGES_SCAN_VIEW_LAG_MS} ms, or an eighth of the freshness goal when adaptive tuning runs toward one, whichever is shorter)."
                 );
                 None
             }
