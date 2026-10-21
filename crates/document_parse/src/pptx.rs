@@ -18,12 +18,11 @@ use bytes::Bytes;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use snafu::ResultExt;
-use std::io::Read;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use crate::{
     Document, DocumentParser, DocumentParserFactory, DocumentType, InternalParsingSnafu, Result,
-    archive::open_consistent_archive,
+    archive::{DecompressionBudget, Limits, ensure_text_within_limit, open_consistent_archive},
 };
 
 pub struct PptxParserFactory {}
@@ -54,62 +53,56 @@ impl PptxParser {
 #[async_trait::async_trait]
 impl DocumentParser for PptxParser {
     async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
-        // Cap the decompressed size of each slide entry to defend against
-        // decompression ("zip") bombs: a small malicious .pptx whose slide
-        // XML inflates to many gigabytes would otherwise drive an unbounded
-        // `read_to_string` and OOM the process. 64 MiB is far above any
-        // legitimate slide.
-        const MAX_SLIDE_BYTES: u64 = 64 * 1024 * 1024;
+        let raw = raw.clone();
+        let doc = crate::parse_blocking(DocumentType::Pptx, move || parse_slides(&raw)).await?;
+        Ok(Arc::new(doc))
+    }
+}
 
-        let mut archive = open_consistent_archive(raw, DocumentType::Pptx)?;
+fn parse_slides(raw: &Bytes) -> Result<PptxDocument> {
+    let mut archive = open_consistent_archive(raw, DocumentType::Pptx)?;
 
-        // PPTX layout: slides live at `ppt/slides/slideN.xml`. Sort by
-        // numeric suffix so the rendered text follows presentation order
-        // rather than zip-entry order (which is alphanumeric and mis-orders
-        // slide10 before slide2). `file_names()` reads the central directory
-        // without setting up per-entry decompression, so the enumeration pass
-        // is cheap.
-        let mut slide_paths: Vec<String> = Vec::new();
-        for name in archive.file_names() {
-            let name = name.boxed().context(InternalParsingSnafu {
+    // PPTX layout: slides live at `ppt/slides/slideN.xml`. Sort by
+    // numeric suffix so the rendered text follows presentation order
+    // rather than zip-entry order (which is alphanumeric and mis-orders
+    // slide10 before slide2). `file_names()` reads the central directory
+    // without setting up per-entry decompression, so the enumeration pass
+    // is cheap.
+    let mut slide_paths: Vec<String> = Vec::new();
+    for name in archive.file_names() {
+        let name = name.boxed().context(InternalParsingSnafu {
+            format: DocumentType::Pptx,
+        })?;
+        if is_slide_path(&name) {
+            slide_paths.push(name.into_owned());
+        }
+    }
+    slide_paths.sort_by_key(|p| slide_index(p).unwrap_or(usize::MAX));
+
+    // Only slide parts are read, so embedded media (often far larger than
+    // any slide) never counts against the budget.
+    let mut budget = DecompressionBudget::new(DocumentType::Pptx, Limits::DEFAULT);
+    let mut text_len: u64 = 0;
+    let mut slides: Vec<String> = Vec::with_capacity(slide_paths.len());
+    for path in slide_paths {
+        let entry = archive
+            .by_name(&path)
+            .boxed()
+            .context(InternalParsingSnafu {
                 format: DocumentType::Pptx,
             })?;
-            if is_slide_path(&name) {
-                slide_paths.push(name.into_owned());
-            }
-        }
-        slide_paths.sort_by_key(|p| slide_index(p).unwrap_or(usize::MAX));
-
-        let mut slides: Vec<String> = Vec::with_capacity(slide_paths.len());
-        for path in slide_paths {
-            let entry = archive
-                .by_name(&path)
-                .boxed()
-                .context(InternalParsingSnafu {
-                    format: DocumentType::Pptx,
-                })?;
-            let mut xml = String::new();
-            let read = entry
-                .take(MAX_SLIDE_BYTES + 1)
-                .read_to_string(&mut xml)
-                .boxed()
-                .context(InternalParsingSnafu {
-                    format: DocumentType::Pptx,
-                })?;
-            if read as u64 > MAX_SLIDE_BYTES {
-                return Err(std::io::Error::other(format!(
-                    "PPTX slide '{path}' exceeds the {MAX_SLIDE_BYTES}-byte decompression limit (possible decompression bomb)"
-                )))
-                .boxed()
-                .context(InternalParsingSnafu {
-                    format: DocumentType::Pptx,
-                });
-            }
-            slides.push(extract_slide_text(&xml)?);
-        }
-
-        Ok(Arc::new(PptxDocument { slides }))
+        let xml = String::from_utf8(budget.read_entry(&path, entry)?)
+            .boxed()
+            .context(InternalParsingSnafu {
+                format: DocumentType::Pptx,
+            })?;
+        let text = extract_slide_text(&xml)?;
+        text_len += text.len() as u64;
+        ensure_text_within_limit(text_len, DocumentType::Pptx)?;
+        slides.push(text);
     }
+
+    Ok(PptxDocument { slides })
 }
 
 fn is_slide_path(name: &str) -> bool {
@@ -231,16 +224,16 @@ mod tests {
             panic!("a slide exceeding the decompression cap should be rejected");
         };
         // The cap itself rejected the slide — not a zip or XML failure on the way.
-        let crate::Error::InternalParsingError {
+        let crate::Error::DocumentTooLarge {
             format: DocumentType::Pptx,
-            source,
+            reason,
         } = &err
         else {
-            panic!("expected a PPTX parsing error, got: {err}");
+            panic!("expected a PPTX size-limit error, got: {err}");
         };
         assert_eq!(
-            source.to_string(),
-            "PPTX slide 'ppt/slides/slide1.xml' exceeds the 67108864-byte decompression limit (possible decompression bomb)"
+            reason,
+            "archive entry 'ppt/slides/slide1.xml' decompresses to more than 64 MiB, the per-entry limit"
         );
     }
 
