@@ -250,6 +250,10 @@ roaring = "0.11"
 rusqlite = { version = "0.37.0", features = ["bundled-decimal", "chrono"] }
 rustls = "0.23"
 rustls-pemfile = "2.1.3"
+# Minimum versions for the transitive certificate-verification crate and its
+# trust data; `spiced` declares them to apply the floors.
+rustls-webpki = { version = "0.103.16", default-features = false }
+webpki-roots = "1.0.10"
 rustyline = { version = "17", features = [
     "custom-bindings",
     "with-dirs",
