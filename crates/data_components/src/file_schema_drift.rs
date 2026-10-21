@@ -53,7 +53,6 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 use datafusion_datasource::{file_scan_config::FileScanConfig, source::DataSourceExec};
-use futures::StreamExt;
 use object_store::ObjectMeta;
 use parking_lot::Mutex;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
@@ -293,15 +292,20 @@ impl FileSchemaDriftGuard {
         files: &[ObjectMeta],
     ) -> DFResult<Option<Drift>> {
         let mut remaining: BTreeSet<String> = columns.into_iter().collect();
-        let mut schemas = futures::stream::iter(files)
-            .map(|file| {
-                self.format
-                    .infer_schema(state, store, std::slice::from_ref(file))
-            })
-            .buffered(SCHEMA_PROBE_CONCURRENCY);
-        while let Some(schema) = schemas.next().await {
-            let schema = schema?;
-            remaining.retain(|name| schema.field_with_name(name).is_err());
+        // The newest file alone first: it normally carries every column.
+        let (newest, rest) = files.split_at(files.len().min(1));
+        for chunk in std::iter::once(newest).chain(rest.chunks(SCHEMA_PROBE_CONCURRENCY)) {
+            let probes: Vec<_> = chunk
+                .iter()
+                .map(|file| {
+                    self.format
+                        .infer_schema(state, store, std::slice::from_ref(file))
+                })
+                .collect();
+            for schema in futures::future::join_all(probes).await {
+                let schema = schema?;
+                remaining.retain(|name| schema.field_with_name(name).is_err());
+            }
             if remaining.is_empty() {
                 return Ok(None);
             }
