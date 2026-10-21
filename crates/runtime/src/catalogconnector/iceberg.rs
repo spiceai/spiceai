@@ -708,8 +708,9 @@ const STORAGE_ENDPOINT_PROPS: [&str; 5] = [
 
 /// A `StorageFactory` that refuses storage endpoints a REST catalog supplies in
 /// its responses when they target a private, loopback, or link-local host
-/// (including a hostname that resolves to one), and refuses `file://` table and
-/// metadata locations the catalog supplies.
+/// (including a hostname that resolves to one, and an `s3.endpoint` that the
+/// S3 client rewrites onto such a host using the location's bucket), and
+/// refuses `file://` table and metadata locations the catalog supplies.
 ///
 /// A REST catalog's `LoadTableResult.config` (and `/v1/config` defaults and
 /// overrides) is merged into the table's `FileIO` properties, and supplies any
@@ -767,10 +768,12 @@ impl StorageFactory for VendedEndpointGuard {
             &self.component,
             allow_private_hosts,
         )?;
-        // Literal addresses and blocked names are refused above. A domain still
-        // has to be resolved, and that lookup waits on the network, so it runs
-        // on the async storage path before the inner client is used.
-        let endpoints_to_resolve = vended_domains_to_resolve(
+        // Literal addresses and blocked names are refused above. The host the
+        // storage client actually dials can still differ: OpenDAL's S3 builder
+        // rewrites the endpoint with the bucket from the location, and a domain
+        // still has to be resolved. Both happen on the async path, where the
+        // location is known, before the inner client is used.
+        let vended_endpoints = vended_endpoints(
             config.props(),
             &self.operator_endpoints,
             allow_private_hosts,
@@ -780,8 +783,10 @@ impl StorageFactory for VendedEndpointGuard {
             inner,
             operator_file_root: self.operator_file_root.clone(),
             component: self.component.clone(),
-            endpoints_to_resolve,
-            dns_decision: Arc::new(tokio::sync::OnceCell::new()),
+            vended_endpoints,
+            s3_virtual_host_style: s3_virtual_host_style(config.props()),
+            s3_region: s3_region(config.props()),
+            effective_decisions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }))
     }
 }
@@ -795,22 +800,30 @@ struct GuardedStorage {
     inner: Arc<dyn Storage>,
     operator_file_root: Option<String>,
     component: String,
-    /// Catalog endpoints whose host is a domain. Resolved before the first
-    /// storage call. Empty when every endpoint was a literal address or was set
-    /// by the operator.
-    endpoints_to_resolve: Vec<VendedDomainEndpoint>,
-    /// `Some(message)` once a vended domain has been refused. `None` once every
-    /// vended domain has resolved to public addresses.
-    #[serde(skip)]
-    dns_decision: Arc<tokio::sync::OnceCell<Option<String>>>,
+    /// Endpoint values the catalog supplied. The operator's own values are
+    /// absent. Checked again on each storage call against the host the client
+    /// will dial, which can differ from `value` after the S3 bucket rewrite.
+    vended_endpoints: Vec<VendedEndpoint>,
+    /// `s3.path-style-access` is truthy → false. Matches the Iceberg S3
+    /// backend, whose default is virtual-host style.
+    s3_virtual_host_style: bool,
+    /// `client.region`, or `s3.region` when the client region is unset.
+    s3_region: String,
+    /// Refusal for an effective endpoint, keyed by that endpoint. `Some` is
+    /// the error text; `None` means the effective host was public.
+    #[serde(skip, default = "empty_effective_decisions")]
+    effective_decisions: Arc<parking_lot::Mutex<HashMap<String, Option<String>>>>,
 }
 
-/// A catalog-supplied endpoint whose host still has to be resolved.
+fn empty_effective_decisions() -> Arc<parking_lot::Mutex<HashMap<String, Option<String>>>> {
+    Arc::new(parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// A catalog-supplied endpoint that passed the synchronous literal check.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct VendedDomainEndpoint {
+struct VendedEndpoint {
     key: String,
     value: String,
-    domain: String,
 }
 
 impl GuardedStorage {
@@ -825,44 +838,56 @@ impl GuardedStorage {
 
     async fn before_io(&self, location: &str) -> iceberg::Result<()> {
         self.refuse_local(location)?;
-        self.refuse_resolved_endpoints().await
+        self.refuse_effective_endpoints(location).await
     }
 
-    /// Resolves catalog-supplied domain endpoints and refuses an internal address.
+    /// Refuses a catalog endpoint whose effective host is internal.
     ///
-    /// The storage client resolves the hostname again when it connects, so this
-    /// does not pin the socket to the address checked here. A name that resolves
-    /// to an internal address on this lookup is still refused before that call.
-    async fn refuse_resolved_endpoints(&self) -> iceberg::Result<()> {
-        if self.endpoints_to_resolve.is_empty() || url_table::allow_private_hosts() {
+    /// For `s3.endpoint`, the effective host is the one OpenDAL's S3 builder
+    /// dials after it rewrites the endpoint with the location's bucket. Other
+    /// endpoints are classified as configured. A domain is resolved here; the
+    /// storage client resolves it again when it connects, so this does not pin
+    /// the socket to the address checked here.
+    async fn refuse_effective_endpoints(&self, location: &str) -> iceberg::Result<()> {
+        if self.vended_endpoints.is_empty() || url_table::allow_private_hosts() {
             return Ok(());
         }
-        let message = self
-            .dns_decision
-            .get_or_init(|| self.dns_refusal_message())
-            .await;
-        match message {
-            Some(message) => Err(iceberg::Error::new(
-                iceberg::ErrorKind::DataInvalid,
-                message.clone(),
-            )),
-            None => Ok(()),
-        }
-    }
-
-    async fn dns_refusal_message(&self) -> Option<String> {
-        for endpoint in &self.endpoints_to_resolve {
-            let resolved = resolve_vended_host(endpoint.domain.clone()).await;
-            if let Some(message) = refusal_message_for_resolution(
-                &self.component,
+        for endpoint in &self.vended_endpoints {
+            let effective = effective_storage_endpoint(
                 &endpoint.key,
                 &endpoint.value,
-                resolved,
-            ) {
-                return Some(message);
+                location,
+                self.s3_virtual_host_style,
+                &self.s3_region,
+            );
+            let cache_key = format!("{}|{effective}", endpoint.key);
+            let cached = {
+                let decisions = self.effective_decisions.lock();
+                decisions.get(&cache_key).cloned()
+            };
+            let decision = if let Some(decision) = cached {
+                decision
+            } else {
+                let decision = refusal_for_effective_endpoint(
+                    &self.component,
+                    &endpoint.key,
+                    &endpoint.value,
+                    &effective,
+                )
+                .await;
+                self.effective_decisions
+                    .lock()
+                    .insert(cache_key, decision.clone());
+                decision
+            };
+            if let Some(message) = decision {
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    message,
+                ));
             }
         }
-        None
+        Ok(())
     }
 }
 
@@ -985,8 +1010,11 @@ fn set_vended_endpoint_resolver_override(host: &str, result: Result<Vec<IpAddr>,
 }
 
 #[cfg(test)]
-fn clear_vended_endpoint_resolver_override() {
-    *VENDED_ENDPOINT_RESOLVER_OVERRIDE.lock() = None;
+fn clear_vended_endpoint_resolver_override(host: &str) {
+    let mut overrides = VENDED_ENDPOINT_RESOLVER_OVERRIDE.lock();
+    if let Some(map) = overrides.as_mut() {
+        map.remove(&host.to_ascii_lowercase());
+    }
 }
 
 /// Whether `endpoint` (a URL, or a bare `host[:port]` that the storage backends
@@ -1011,13 +1039,14 @@ fn endpoint_targets_internal_host(endpoint: &str) -> bool {
     }
 }
 
-/// Catalog domain endpoints that still need a DNS lookup. Operator-set values
-/// and values the synchronous check already refuses are omitted.
-fn vended_domains_to_resolve(
+/// Catalog endpoint values that are not the operator's. The synchronous check
+/// has already refused literal internal addresses; these still have to be
+/// judged by the host the storage client will dial.
+fn vended_endpoints(
     props: &HashMap<String, String>,
     operator_endpoints: &HashMap<String, String>,
     allow_private_hosts: bool,
-) -> Vec<VendedDomainEndpoint> {
+) -> Vec<VendedEndpoint> {
     if allow_private_hosts {
         return Vec::new();
     }
@@ -1029,19 +1058,100 @@ fn vended_domains_to_resolve(
         if operator_endpoints.get(key) == Some(value) {
             continue;
         }
-        let Some(domain) = endpoint_domain(value) else {
-            continue;
-        };
-        if url_table::is_blocked_internal_hostname(&domain) {
-            continue;
-        }
-        endpoints.push(VendedDomainEndpoint {
+        endpoints.push(VendedEndpoint {
             key: key.to_string(),
             value: value.clone(),
-            domain,
         });
     }
     endpoints
+}
+
+/// `true` when the S3 backend will use virtual-host style. The Iceberg parser
+/// defaults to virtual-host style and turns it off only for a truthy
+/// `s3.path-style-access`.
+fn s3_virtual_host_style(props: &HashMap<String, String>) -> bool {
+    !props
+        .get("s3.path-style-access")
+        .is_some_and(|value| endpoint_flag_is_truthy(value))
+}
+
+fn s3_region(props: &HashMap<String, String>) -> String {
+    props
+        .get("client.region")
+        .or_else(|| props.get("s3.region"))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Truthy values recognized by the Iceberg S3 property parser.
+fn endpoint_flag_is_truthy(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "true" | "t" | "1" | "on"
+    )
+}
+
+/// The endpoint string the storage client will use for `location`.
+///
+/// OpenDAL 0.58.2 `S3Builder::build_endpoint` deletes `//{bucket}.` from
+/// `s3.endpoint`, then, for virtual-host style, inserts the bucket in front of
+/// the host. Path style leaves the stripped host and prefixes the path with
+/// the bucket. A catalog can set `s3.endpoint` to a public address such as
+/// `http://8.127.0.1` and a location `s3://8/...`. URL parsing then collapses
+/// the stripped host `127.0.1` to `127.0.0.1`, which is loopback. Other
+/// endpoint keys are not rewritten.
+fn effective_storage_endpoint(
+    key: &str,
+    value: &str,
+    location: &str,
+    s3_virtual_host_style: bool,
+    s3_region: &str,
+) -> String {
+    if key == S3_ENDPOINT
+        && let Some(bucket) = s3_location_bucket(location)
+    {
+        return s3_effective_endpoint(value, &bucket, s3_virtual_host_style, s3_region);
+    }
+    value.to_string()
+}
+
+fn s3_location_bucket(location: &str) -> Option<String> {
+    let url = Url::parse(location).ok()?;
+    if !url.scheme().eq_ignore_ascii_case("s3") {
+        return None;
+    }
+    let bucket = url.host_str()?;
+    (!bucket.is_empty()).then(|| bucket.to_string())
+}
+
+/// Mirrors OpenDAL 0.58.2 `S3Builder::build_endpoint` for the parts that choose
+/// the host. The global AWS endpoint template is the only rewrite that
+/// substitutes the region.
+fn s3_effective_endpoint(
+    endpoint: &str,
+    bucket: &str,
+    virtual_host_style: bool,
+    region: &str,
+) -> String {
+    let mut endpoint = if endpoint.starts_with("http") {
+        endpoint.to_string()
+    } else {
+        format!("https://{endpoint}")
+    };
+    endpoint = endpoint.replace(&format!("//{bucket}."), "//");
+    if let Ok(url) = Url::parse(&endpoint) {
+        endpoint = url.to_string().trim_end_matches('/').to_string();
+    }
+    if endpoint == "https://s3.amazonaws.com" {
+        endpoint = format!("https://s3.{region}.amazonaws.com");
+    }
+    if virtual_host_style {
+        endpoint.replace("//", &format!("//{bucket}."))
+    } else {
+        endpoint.push('/');
+        endpoint.push_str(bucket);
+        endpoint
+    }
 }
 
 /// The domain of `endpoint`, lowercased and without a trailing dot.
@@ -1075,6 +1185,54 @@ fn refusal_message_for_resolution(
         Ok(addrs) if !addrs.is_empty() => None,
         Ok(_) | Err(_) => Some(vended_endpoint_unresolved_message(component, key, value)),
     }
+}
+
+/// Classifies the endpoint the storage client will dial.
+///
+/// `configured` is the catalog value. `effective` is that value after the S3
+/// bucket rewrite. When those hosts differ, the error names both.
+async fn refusal_for_effective_endpoint(
+    component: &str,
+    key: &str,
+    configured: &str,
+    effective: &str,
+) -> Option<String> {
+    let rewritten = endpoint_host_label(configured) != endpoint_host_label(effective);
+    if endpoint_targets_internal_host(effective) {
+        return Some(if rewritten {
+            vended_endpoint_rewritten_message(component, key, configured, effective)
+        } else {
+            vended_endpoint_refused_message(component, key, configured)
+        });
+    }
+    let Some(domain) = endpoint_domain(effective) else {
+        return None;
+    };
+    let resolved = resolve_vended_host(domain).await;
+    let internal = match &resolved {
+        Ok(addrs) if addrs.iter().any(|ip| url_table::is_internal_ip(*ip)) => true,
+        Ok(addrs) if !addrs.is_empty() => return None,
+        Ok(_) | Err(_) => false,
+    };
+    if !rewritten {
+        return refusal_message_for_resolution(component, key, configured, resolved);
+    }
+    Some(if internal {
+        vended_endpoint_rewritten_message(component, key, configured, effective)
+    } else {
+        vended_endpoint_rewritten_unresolved_message(component, key, configured, effective)
+    })
+}
+
+fn endpoint_host_label(endpoint: &str) -> Option<String> {
+    let parsed = Url::parse(endpoint)
+        .ok()
+        .filter(Url::has_host)
+        .or_else(|| Url::parse(&format!("https://{endpoint}")).ok());
+    parsed
+        .as_ref()
+        .and_then(Url::host_str)
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
 }
 
 async fn resolve_vended_host(host: String) -> Result<Vec<IpAddr>, String> {
@@ -1214,6 +1372,32 @@ fn vended_endpoint_unresolved_message(component: &str, key: &str, value: &str) -
     let param_hint = endpoint_param_hint(key);
     format!(
         "The Iceberg catalog for {component} set `{key}` to {value:?}, and its host could not be resolved to a public address, so no storage request is sent to it and the table cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+        url_table::ALLOW_PRIVATE_HOSTS_ENV
+    )
+}
+
+fn vended_endpoint_rewritten_message(
+    component: &str,
+    key: &str,
+    value: &str,
+    effective: &str,
+) -> String {
+    let param_hint = endpoint_param_hint(key);
+    format!(
+        "The Iceberg catalog for {component} set `{key}` to {value:?}. The storage client rewrites that to {effective:?}, a private, loopback, or link-local address, so no storage request is sent to it and the table cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+        url_table::ALLOW_PRIVATE_HOSTS_ENV
+    )
+}
+
+fn vended_endpoint_rewritten_unresolved_message(
+    component: &str,
+    key: &str,
+    value: &str,
+    effective: &str,
+) -> String {
+    let param_hint = endpoint_param_hint(key);
+    format!(
+        "The Iceberg catalog for {component} set `{key}` to {value:?}. The storage client rewrites that to {effective:?}, and that host could not be resolved to a public address, so no storage request is sent to it and the table cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
         url_table::ALLOW_PRIVATE_HOSTS_ENV
     )
 }
@@ -1697,8 +1881,9 @@ mod tests {
         use super::super::{
             GCS_SERVICE_HOST, S3_ENDPOINT, STORAGE_ENDPOINT_PROPS, check_vended_endpoints,
             check_vended_file_location, clear_vended_endpoint_resolver_override, get_rest_catalog,
-            refusal_message_for_resolution, set_vended_endpoint_resolver_override,
-            vended_endpoint_refused_message, vended_endpoint_unresolved_message,
+            refusal_message_for_resolution, s3_effective_endpoint,
+            set_vended_endpoint_resolver_override, vended_endpoint_refused_message,
+            vended_endpoint_rewritten_message, vended_endpoint_unresolved_message,
             vended_file_location_refused_message,
         };
         use std::collections::HashMap;
@@ -1910,19 +2095,23 @@ mod tests {
             assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
         }
 
-        /// Drops the process-wide resolver override when the test ends.
-        struct ResolverOverride;
+        /// Removes this test's resolver override when the test ends.
+        struct ResolverOverride {
+            host: String,
+        }
 
         impl ResolverOverride {
             fn set(host: &str, result: Result<Vec<std::net::IpAddr>, String>) -> Self {
                 set_vended_endpoint_resolver_override(host, result);
-                Self
+                Self {
+                    host: host.to_ascii_lowercase(),
+                }
             }
         }
 
         impl Drop for ResolverOverride {
             fn drop(&mut self) {
-                clear_vended_endpoint_resolver_override();
+                clear_vended_endpoint_resolver_override(&self.host);
             }
         }
 
@@ -1944,6 +2133,98 @@ mod tests {
                 vended_endpoint_refused_message("dataset 't'", S3_ENDPOINT, endpoint)
             );
             assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
+        }
+
+        #[test]
+        fn s3_endpoint_bucket_prefix_is_removed() {
+            assert_eq!(
+                s3_effective_endpoint("http://8.127.0.1:18075", "8", false, "us-east-1"),
+                "http://127.0.0.1:18075/8",
+                "path style strips the bucket prefix and URL parsing collapses 127.0.1"
+            );
+            assert_eq!(
+                s3_effective_endpoint("http://8.127.0.0.1:18075", "8", false, "us-east-1"),
+                "http://127.0.0.1:18075/8"
+            );
+            assert_eq!(
+                s3_effective_endpoint("http://public.example.test:9000", "loop", true, "us-east-1"),
+                "http://loop.public.example.test:9000",
+                "virtual-host style puts the bucket in front of the host"
+            );
+            assert_eq!(
+                s3_effective_endpoint("https://s3.amazonaws.com", "warehouse", false, "eu-west-1"),
+                "https://s3.eu-west-1.amazonaws.com/warehouse"
+            );
+        }
+
+        #[tokio::test]
+        async fn catalog_vended_endpoint_rewritten_onto_loopback_is_refused_without_connecting() {
+            let sentinel = start_sentinel().await;
+            let port = sentinel
+                .endpoint
+                .rsplit(':')
+                .next()
+                .expect("sentinel endpoint has a port");
+            let effective = format!("http://127.0.0.1:{port}/8");
+            let cases = [
+                format!("http://8.127.0.1:{port}"),
+                format!("http://8.127.0.0.1:{port}"),
+            ];
+            for endpoint in cases {
+                let catalog_uri = start_rest_catalog_at(
+                    &vended_config(&endpoint),
+                    "s3://8/metadata/v1.metadata.json",
+                    "s3://8/metadata/snap-1.avro",
+                )
+                .await;
+                let err = read_location(catalog_uri, HashMap::new(), "s3://8/metadata/snap-1.avro")
+                    .await
+                    .expect_err("a rewritten loopback endpoint must not be read");
+                assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid, "{endpoint}");
+                assert_eq!(
+                    err.message(),
+                    vended_endpoint_rewritten_message(
+                        "dataset 't'",
+                        S3_ENDPOINT,
+                        &endpoint,
+                        &effective
+                    ),
+                    "{endpoint}"
+                );
+            }
+            assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn operator_endpoint_rewritten_by_the_bucket_is_still_used() {
+            let sentinel = start_sentinel().await;
+            let port = sentinel
+                .endpoint
+                .rsplit(':')
+                .next()
+                .expect("sentinel endpoint has a port");
+            let endpoint = format!("http://8.127.0.0.1:{port}");
+            let catalog_uri = start_rest_catalog_at(
+                &vended_config(&endpoint),
+                "s3://8/metadata/v1.metadata.json",
+                "s3://8/metadata/snap-1.avro",
+            )
+            .await;
+            let operator_props = HashMap::from([
+                (S3_ENDPOINT.to_string(), endpoint),
+                ("s3.access-key-id".to_string(), "minio".to_string()),
+                ("s3.secret-access-key".to_string(), "minio123".to_string()),
+                ("s3.region".to_string(), "us-east-1".to_string()),
+                ("s3.path-style-access".to_string(), "true".to_string()),
+            ]);
+            let err = read_location(catalog_uri, operator_props, "s3://8/metadata/snap-1.avro")
+                .await
+                .expect_err("the sentinel answers 404");
+            assert_eq!(err.kind(), iceberg::ErrorKind::Unexpected, "{err}");
+            assert_eq!(
+                *sentinel.requests.lock(),
+                vec!["GET /8/metadata/snap-1.avro HTTP/1.1".to_string()]
+            );
         }
 
         #[test]
