@@ -3105,6 +3105,51 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn catalog_vended_redirect_to_hostname_resolving_to_loopback_is_refused() {
+            let sentinel = start_sentinel().await;
+            let location = "http://loopback.vended.test:9/secret";
+            let redirector = start_redirector(location).await;
+            let redirector_authority = redirector
+                .endpoint
+                .trim_start_matches("http://")
+                .to_string();
+            let sentinel_authority = sentinel.endpoint.trim_start_matches("http://").to_string();
+            let _connect_redirector =
+                ConnectOverride::set("redirect.vended.test", &redirector_authority);
+            let _connect_target = ConnectOverride::set("loopback.vended.test", &sentinel_authority);
+            let _dns_redirector = ResolverOverride::set(
+                "redirect.vended.test",
+                Ok(vec![std::net::Ipv4Addr::new(8, 8, 8, 8).into()]),
+            );
+            let _dns_target = ResolverOverride::set(
+                "loopback.vended.test",
+                Ok(vec![std::net::Ipv6Addr::LOCALHOST.into()]),
+            );
+            let endpoint = format!(
+                "http://redirect.vended.test:{}",
+                redirector_authority.rsplit(':').next().expect("port")
+            );
+            let catalog_uri = start_rest_catalog(&vended_config(&endpoint)).await;
+            let err = read_manifest_list(catalog_uri, HashMap::new())
+                .await
+                .expect_err("a redirect to a loopback hostname must not be followed");
+            let expected = vended_redirect_refused_message("dataset 't'", location);
+            assert!(
+                err.to_string().contains(&expected),
+                "expected the redirect refusal in {err}"
+            );
+            assert!(
+                !redirector.requests.lock().is_empty(),
+                "the public endpoint was never contacted, so the redirect was not exercised"
+            );
+            assert_eq!(
+                *sentinel.requests.lock(),
+                Vec::<String>::new(),
+                "the loopback hostname was dialed: {err}"
+            );
+        }
+
+        #[tokio::test]
         async fn operator_endpoint_redirect_to_loopback_is_followed() {
             let sentinel = start_sentinel().await;
             let redirector = start_redirector(&format!("{}/secret", sentinel.endpoint)).await;

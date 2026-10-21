@@ -21,8 +21,10 @@ limitations under the License.
 //! call, so a public catalog endpoint can answer `302 Location` with an
 //! internal URL and the client dials it. This transport is installed before
 //! `OpenDAL`'s own default and refuses that hop when the request belongs to a
-//! catalog-vended endpoint. Operator-configured endpoints leave the task-local
-//! unset, so their redirects are unchanged.
+//! catalog-vended endpoint. A redirect to a hostname is resolved first and
+//! refused when any address is internal or the lookup does not return a public
+//! address. Operator-configured endpoints leave the task-local unset, so their
+//! redirects are unchanged.
 
 use std::error::Error as StdError;
 use std::future::Future;
@@ -116,17 +118,54 @@ fn redirect_target_is_refused(target: &reqwest::Url) -> bool {
 }
 
 fn redirect_policy(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect::Action {
-    if let Ok(component) = VENDED_REDIRECT_COMPONENT.try_with(Clone::clone)
-        && redirect_target_is_refused(attempt.url())
-    {
-        let message = vended_redirect_refused_message(&component, attempt.url().as_str());
-        return attempt.error(message);
+    if let Ok(component) = VENDED_REDIRECT_COMPONENT.try_with(Clone::clone) {
+        if redirect_target_is_refused(attempt.url()) {
+            let message = vended_redirect_refused_message(&component, attempt.url().as_str());
+            return attempt.error(message);
+        }
+        // A domain still has to be resolved. That lookup is async, so the
+        // policy returns the 3xx and `fetch_with_redirect_policy` decides.
+        if matches!(attempt.url().host(), Some(url::Host::Domain(_))) {
+            return attempt.stop();
+        }
     }
     // `reqwest`'s default policy allows ten redirects, then errors.
     if attempt.previous().len() >= 10 {
         return attempt.error("too many redirects");
     }
     attempt.follow()
+}
+
+/// `None` when `target` may be dialed. A domain is resolved first; an internal
+/// answer or a failed lookup is refused. Literal addresses are classified by
+/// [`redirect_target_is_refused`].
+async fn vended_redirect_host_refusal(component: &str, target: &reqwest::Url) -> Option<String> {
+    if redirect_target_is_refused(target) {
+        return Some(vended_redirect_refused_message(component, target.as_str()));
+    }
+    let Some(url::Host::Domain(domain)) = target.host() else {
+        return None;
+    };
+    match super::resolve_vended_host(domain.to_string()).await {
+        Ok(addrs) if addrs.iter().any(|ip| is_internal_ip(*ip)) => {
+            Some(vended_redirect_refused_message(component, target.as_str()))
+        }
+        Ok(addrs) if !addrs.is_empty() => None,
+        Ok(_) | Err(_) => Some(vended_redirect_unresolved_message(
+            component,
+            target.as_str(),
+        )),
+    }
+}
+
+fn vended_redirect_unresolved_message(component: &str, target: &str) -> String {
+    format!(
+        "The Iceberg catalog for {component} redirected storage to {target:?}, and its host \
+         could not be resolved to a public address, so the redirect is not followed and the \
+         table cannot be read. If this endpoint is trusted, set the `s3_endpoint` parameter to \
+         it, or set `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true`. \
+         See: https://spiceai.org/docs/components/data-connectors/iceberg"
+    )
 }
 
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -189,7 +228,112 @@ impl HttpTransport for VendedRedirectTransport {
     }
 }
 
-async fn fetch_with_redirect_policy(req: Request<Buffer>) -> Result<Response<HttpBody>> {
+async fn fetch_with_redirect_policy(mut req: Request<Buffer>) -> Result<Response<HttpBody>> {
+    for hop in 0..10 {
+        let request_uri = req.uri().clone();
+        let method = req.method().clone();
+        let headers = req.headers().clone();
+        let version = req.version();
+        let body = req.body().clone();
+        let response = send_once(req).await?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        let Some(component) = VENDED_REDIRECT_COMPONENT.try_with(Clone::clone).ok() else {
+            return Ok(response);
+        };
+        let target = redirect_location(&request_uri, &response)?;
+        if let Some(message) = vended_redirect_host_refusal(&component, &target).await {
+            return Err(Error::new(ErrorKind::Unexpected, message).with_temporary(false));
+        }
+        if hop == 9 {
+            break;
+        }
+        req = request_for_redirect(
+            response.status(),
+            &method,
+            &headers,
+            version,
+            &body,
+            &request_uri,
+            &target,
+        )?;
+    }
+    Err(Error::new(ErrorKind::Unexpected, "too many redirects"))
+}
+
+fn redirect_location(
+    request_uri: &http::Uri,
+    response: &Response<HttpBody>,
+) -> Result<reqwest::Url> {
+    let location = response
+        .headers()
+        .get(http::header::LOCATION)
+        .ok_or_else(|| Error::new(ErrorKind::Unexpected, "redirect has no Location header"))?
+        .to_str()
+        .map_err(|err| {
+            Error::new(ErrorKind::Unexpected, "redirect Location is not valid text").set_source(err)
+        })?;
+    let base = reqwest::Url::parse(&request_uri.to_string()).map_err(|err| {
+        Error::new(ErrorKind::Unexpected, "request url is invalid").set_source(err)
+    })?;
+    base.join(location).map_err(|err| {
+        Error::new(
+            ErrorKind::Unexpected,
+            "redirect Location is not a valid URL",
+        )
+        .set_source(err)
+    })
+}
+
+fn request_for_redirect(
+    status: http::StatusCode,
+    method: &http::Method,
+    headers: &http::HeaderMap,
+    version: http::Version,
+    body: &Buffer,
+    request_uri: &http::Uri,
+    target: &reqwest::Url,
+) -> Result<Request<Buffer>> {
+    // 301, 302, and 303 drop the body and become GET. 307 and 308 keep both.
+    let (method, body) = if matches!(
+        status,
+        http::StatusCode::MOVED_PERMANENTLY | http::StatusCode::FOUND | http::StatusCode::SEE_OTHER
+    ) {
+        (http::Method::GET, Buffer::new())
+    } else {
+        (method.clone(), body.clone())
+    };
+    let mut headers = headers.clone();
+    if !same_redirect_host(request_uri, target) {
+        headers.remove(http::header::AUTHORIZATION);
+        headers.remove(http::header::COOKIE);
+        headers.remove(http::header::PROXY_AUTHORIZATION);
+    }
+    headers.remove(http::header::HOST);
+    if body.is_empty() {
+        headers.remove(http::header::CONTENT_LENGTH);
+    }
+    let uri = target.as_str().parse::<http::Uri>().map_err(|err| {
+        Error::new(ErrorKind::Unexpected, "redirect target is not a valid URI").set_source(err)
+    })?;
+    let mut builder = Request::builder().method(method).uri(uri).version(version);
+    if let Some(map) = builder.headers_mut() {
+        *map = headers;
+    }
+    builder.body(body).map_err(|err| {
+        Error::new(ErrorKind::Unexpected, "redirect request could not be built").set_source(err)
+    })
+}
+
+fn same_redirect_host(request_uri: &http::Uri, target: &reqwest::Url) -> bool {
+    match (request_uri.host(), target.host_str()) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
+}
+
+async fn send_once(req: Request<Buffer>) -> Result<Response<HttpBody>> {
     let uri = rewrite_uri(req.uri().clone());
     let is_head = req.method() == http::Method::HEAD;
     let (parts, body) = req.into_parts();
