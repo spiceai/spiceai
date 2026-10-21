@@ -57,7 +57,7 @@ limitations under the License.
 //! SELECT * FROM 's3://bucket/data/' WHERE year = '2024' AND month = '01'
 //! ```
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
@@ -70,7 +70,11 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion_catalog::UrlTableFactory;
 use parking_lot::RwLock;
-use url::Url;
+use runtime_object_store::ssrf::{
+    ALLOW_PRIVATE_HOSTS_ENV, URL_TABLE_SCHEME_PREFIX, allow_private_hosts,
+    is_blocked_internal_hostname, is_internal_ip,
+};
+use url::{Url, form_urlencoded};
 
 /// Supported URL schemes for direct object store queries.
 const SUPPORTED_SCHEMES: &[&str] = &["s3", "abfs", "abfss", "http", "https", "gs", "gcs"];
@@ -137,82 +141,6 @@ fn validate_azure_url(url_str: &str) -> DFResult<()> {
     )))
 }
 
-/// Environment variable that, when set to a truthy value (`1`/`true`/`yes`/`on`),
-/// disables the SSRF guard on `http`/`https` URL tables, allowing them to target
-/// private, loopback, and link-local addresses. Off by default — intended only
-/// for operators who knowingly query an internal HTTP object store.
-const ALLOW_PRIVATE_HOSTS_ENV: &str = "SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS";
-
-/// Whether the SSRF guard is disabled via [`ALLOW_PRIVATE_HOSTS_ENV`].
-fn allow_private_hosts() -> bool {
-    std::env::var(ALLOW_PRIVATE_HOSTS_ENV).is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
-
-/// Returns `true` if `ip` is in a range that must not be reachable through a
-/// user-supplied `http`/`https` URL: loopback, private/RFC1918, link-local
-/// (incl. the `169.254.169.254` cloud-metadata endpoint), unique-local,
-/// CGNAT, unspecified, multicast, and other reserved ranges. Used to prevent
-/// SSRF — both by the URL-table guard below and by the HTTPS connector's
-/// redirect guard, so the two share one classifier and never diverge.
-#[must_use]
-pub fn is_internal_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_internal_ipv4(v4),
-        // Unwrap IPv4-mapped/-compatible addresses (e.g. `::ffff:169.254.169.254`)
-        // and re-check them as IPv4 so they can't bypass the v4 rules.
-        IpAddr::V6(v6) => match v6.to_ipv4() {
-            Some(v4) => is_internal_ipv4(v4),
-            None => is_internal_ipv6(v6),
-        },
-    }
-}
-
-fn is_internal_ipv4(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    // Only the four oldest, universally-stable classifiers are used as methods;
-    // the rest are explicit prefix checks so behavior is obvious and portable.
-    ip.is_loopback()            // 127.0.0.0/8
-        || ip.is_private()      // 10/8, 172.16/12, 192.168/16
-        || ip.is_link_local()   // 169.254.0.0/16 (incl. 169.254.169.254 metadata)
-        || ip.is_unspecified()  // 0.0.0.0
-        || o[0] == 0                                 // 0.0.0.0/8 "this network"
-        || (o[0] == 100 && (o[1] & 0xc0) == 64)      // 100.64.0.0/10 CGNAT
-        || (o[0] == 198 && (o[1] & 0xfe) == 18)      // 198.18.0.0/15 benchmarking
-        || (o[0] == 192 && o[1] == 0 && o[2] == 2)   // 192.0.2.0/24 TEST-NET-1
-        || (o[0] == 198 && o[1] == 51 && o[2] == 100) // 198.51.100.0/24 TEST-NET-2
-        || (o[0] == 203 && o[1] == 0 && o[2] == 113) // 203.0.113.0/24 TEST-NET-3
-        || o[0] >= 224 // 224.0.0.0/4 multicast, 240.0.0.0/4 reserved, 255.255.255.255 broadcast
-}
-
-fn is_internal_ipv6(ip: Ipv6Addr) -> bool {
-    let first = ip.segments()[0];
-    ip.is_loopback()                  // ::1
-        || ip.is_unspecified()        // ::
-        || (first & 0xfe00) == 0xfc00 // fc00::/7 unique local
-        || (first & 0xffc0) == 0xfe80 // fe80::/10 link local
-        || (first & 0xff00) == 0xff00 // ff00::/8 multicast
-}
-
-/// Returns `true` for hostnames that never legitimately point at a remote
-/// endpoint and must be blocked without needing DNS resolution: `localhost`
-/// (and `*.localhost`, RFC 6761) and the well-known cloud-metadata names.
-/// Shared by the URL-table SSRF guard and the HTTPS connector's redirect guard
-/// (the latter runs in a synchronous closure where DNS resolution isn't
-/// available, so this literal-name check is its first line of defense).
-#[must_use]
-pub fn is_blocked_internal_hostname(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    lower == "localhost"
-        || lower.ends_with(".localhost")
-        || lower == "metadata.google.internal"
-        || lower == "metadata.goog"
-}
-
 /// Upper bound on how long the SSRF guard waits for a host's DNS resolution.
 /// Caps the query-visible wait so a slow or hanging resolver can't stall the
 /// query indefinitely. `spawn_blocking` work can't be cancelled, so the
@@ -230,16 +158,77 @@ fn ssrf_blocked_error(url_str: &str) -> DataFusionError {
     ))
 }
 
+/// Fragment keys a URL table may set on an object-store URL (`s3`, `abfs`, `gs`, ...).
+///
+/// Every other key the object-store builders read — `endpoint`, `allow_http`, credentials,
+/// proxies, identity endpoints — would let a query choose where requests go or which
+/// credentials they carry, so those belong to a configured dataset.
+const OBJECT_STORE_FRAGMENT_KEYS: &[&str] =
+    &["account", "auth", "client_timeout", "region", "url_style"];
+
+/// The object-store builders format `region` and `account` into the provider's endpoint URL,
+/// so a value with URL syntax in it (`@`, `/`, `:`) could replace the host.
+fn is_valid_fragment_value(key: &str, value: &str) -> bool {
+    match key {
+        "region" => {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        }
+        "account" => !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric()),
+        _ => true,
+    }
+}
+
+/// Rejects an object-store URL table whose fragment sets anything but
+/// [`OBJECT_STORE_FRAGMENT_KEYS`], so a query reaches only the provider's own endpoint.
+///
+/// The fragment is decoded as the object-store registry decodes it, so a percent-encoded key
+/// such as `%65ndpoint` is caught. This holds regardless of [`ALLOW_PRIVATE_HOSTS_ENV`].
+fn validate_object_store_fragment(url_str: &str) -> DFResult<()> {
+    let Ok(mut url) = Url::parse(url_str) else {
+        return Ok(());
+    };
+    if matches!(url.scheme(), "http" | "https") {
+        return Ok(());
+    }
+    let Some(fragment) = url.fragment().map(str::to_string) else {
+        return Ok(());
+    };
+    url.set_fragment(None);
+    let location = url.as_str();
+
+    for (key, value) in form_urlencoded::parse(fragment.as_bytes()) {
+        if !OBJECT_STORE_FRAGMENT_KEYS.contains(&key.as_ref()) {
+            return Err(DataFusionError::Plan(format!(
+                "URL table {location:?} sets `{}` in its URL fragment, which a query cannot set because it would choose the object store's endpoint or credentials. A URL table accepts only {}. To read this location, configure a dataset instead. See: https://spiceai.org/docs/components/data-connectors",
+                key.escape_debug(),
+                OBJECT_STORE_FRAGMENT_KEYS
+                    .iter()
+                    .map(|key| format!("`{key}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        if !is_valid_fragment_value(&key, &value) {
+            return Err(DataFusionError::Plan(format!(
+                "URL table {location:?} sets an invalid `{key}` in its URL fragment. A `region` contains only letters, digits, and hyphens, and an `account` only letters and digits."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Guards against SSRF for `http`/`https` URL tables by rejecting URLs whose
 /// host is (or resolves to) an internal address. Object-store schemes (`s3`,
-/// `gs`, `abfs`, ...) are not checked here because they reach a fixed cloud
-/// provider endpoint rather than an arbitrary host.
+/// `gs`, `abfs`, ...) reach the provider's own endpoint, because
+/// [`validate_object_store_fragment`] rejects every endpoint override.
 ///
-/// Note: this resolves DNS and checks the result, then hands the URL to the
-/// object-store HTTP client which resolves again — a determined attacker
-/// controlling DNS could rebind between the two lookups. Blocking literal
-/// internal IPs and resolved-internal hostnames still closes the common cases
-/// (direct metadata-IP access, `localhost`, and names that resolve to RFC1918).
+/// This check gives a clear planning error up front. The URL table's object
+/// store enforces the same classifier again on every address it resolves and
+/// every redirect it follows, which also covers a host whose DNS answer changes
+/// between the two lookups.
 async fn validate_http_url_not_internal(url_str: &str) -> DFResult<()> {
     validate_http_url_with_policy(url_str, allow_private_hosts()).await
 }
@@ -386,11 +375,19 @@ impl UrlTableFactory for SpiceUrlTableFactory {
         // Validate Azure URLs have the required account name
         validate_azure_url(url)?;
 
-        // Prevent SSRF: http/https URL tables must not target internal addresses.
+        // Prevent SSRF: object-store URL tables must not choose their endpoint or
+        // credentials, and http/https URL tables must not target internal addresses.
+        validate_object_store_fragment(url)?;
         validate_http_url_not_internal(url).await?;
 
-        // Parse the URL
-        let table_url = ListingTableUrl::parse(url).map_err(|e| {
+        // http/https URL tables read through their own guarded object store, never a
+        // dataset's store for the same host.
+        let store_url = if url.starts_with("http://") || url.starts_with("https://") {
+            format!("{URL_TABLE_SCHEME_PREFIX}{url}")
+        } else {
+            url.to_string()
+        };
+        let table_url = ListingTableUrl::parse(&store_url).map_err(|e| {
             DataFusionError::Plan(format!("Failed to parse URL table '{url}': {e}"))
         })?;
 
@@ -863,85 +860,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_is_internal_ip_blocks_dangerous_ranges() {
-        use std::str::FromStr;
-
-        // Must be blocked (SSRF targets).
-        for ip in [
-            "127.0.0.1",
-            "127.1.2.3",
-            "169.254.169.254", // AWS/GCP/Azure IMDS
-            "10.0.0.5",
-            "192.168.1.1",
-            "172.16.0.1",
-            "172.31.255.255",
-            "100.64.0.1", // CGNAT
-            "0.0.0.0",
-            "198.18.0.1", // benchmarking
-            "240.0.0.1",  // reserved
-            "255.255.255.255",
-        ] {
-            let addr = IpAddr::from_str(ip).expect("valid ip");
-            assert!(is_internal_ip(addr), "{ip} should be treated as internal");
-        }
-
-        // IPv6 internal ranges.
-        for ip in [
-            "::1",                    // loopback
-            "::",                     // unspecified
-            "fe80::1",                // link local
-            "fc00::1",                // unique local
-            "fd12:3456::1",           // unique local
-            "::ffff:169.254.169.254", // v4-mapped metadata
-            "::ffff:127.0.0.1",       // v4-mapped loopback
-            "ff02::1",                // multicast
-        ] {
-            let addr = IpAddr::from_str(ip).expect("valid ip");
-            assert!(is_internal_ip(addr), "{ip} should be treated as internal");
-        }
-
-        // Must be allowed (legitimate public addresses).
-        for ip in [
-            "8.8.8.8",
-            "1.1.1.1",
-            "93.184.216.34",        // example.com
-            "2606:4700:4700::1111", // Cloudflare DNS
-        ] {
-            let addr = IpAddr::from_str(ip).expect("valid ip");
-            assert!(!is_internal_ip(addr), "{ip} should be treated as public");
-        }
-    }
-
-    #[test]
-    fn test_is_blocked_internal_hostname() {
-        // Well-known internal names blocked without DNS (case-insensitive).
-        for host in [
-            "localhost",
-            "LOCALHOST",
-            "service.localhost",
-            "metadata.google.internal",
-            "metadata.goog",
-        ] {
-            assert!(
-                is_blocked_internal_hostname(host),
-                "{host} should be blocked"
-            );
-        }
-
-        // Legitimate public hostnames must pass (DNS resolution handles these).
-        for host in [
-            "example.com",
-            "localhost.example.com", // not the `.localhost` TLD
-            "metadata.google.com",   // not the metadata sentinel
-        ] {
-            assert!(
-                !is_blocked_internal_hostname(host),
-                "{host} should not be blocked by literal match"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn test_ssrf_guard_blocks_internal_http_urls() {
         // Direct internal IP literals and localhost are blocked (no DNS needed).
@@ -976,6 +894,184 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{url} should be allowed: {e}"));
         }
+    }
+
+    const DATA_CONNECTORS_DOCS: &str = "https://spiceai.org/docs/components/data-connectors";
+
+    /// The factory has no session state, so an error other than the missing state can only
+    /// come from a check that runs before any object store is built or contacted.
+    async fn try_new_without_state(url: &str) -> String {
+        SpiceUrlTableFactory::new()
+            .try_new(url)
+            .await
+            .expect_err("a factory without session state cannot build a table")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn object_store_url_tables_reject_an_endpoint_override() {
+        for (url, location) in [
+            (
+                "s3://bucket/data.parquet#endpoint=http://10.0.0.1:9000",
+                "s3://bucket/data.parquet",
+            ),
+            (
+                "s3://bucket/data/#region=us-east-1&endpoint=http://172.30.0.2:18077&allow_http=true",
+                "s3://bucket/data/",
+            ),
+            (
+                "abfss://container@account.dfs.core.windows.net/data/#endpoint=http://10.0.0.1",
+                "abfss://container@account.dfs.core.windows.net/data/",
+            ),
+            (
+                "abfss://container/data/#account=myaccount&endpoint=http://10.0.0.1",
+                "abfss://container/data/",
+            ),
+            // Percent-encoded `endpoint`, which the object-store registry decodes.
+            (
+                "s3://bucket/data.parquet#%65ndpoint=http://10.0.0.1",
+                "s3://bucket/data.parquet",
+            ),
+        ] {
+            assert_eq!(
+                try_new_without_state(url).await,
+                format!(
+                    "Error during planning: URL table {location:?} sets `endpoint` in its URL fragment, which a query cannot set because it would choose the object store's endpoint or credentials. A URL table accepts only `account`, `auth`, `client_timeout`, `region`, `url_style`. To read this location, configure a dataset instead. See: {DATA_CONNECTORS_DOCS}"
+                ),
+                "{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn object_store_url_tables_reject_credential_and_transport_overrides() {
+        for key in [
+            "key",
+            "secret",
+            "session_token",
+            "iam_role_source",
+            "allow_http",
+            "access_key",
+            "sas_string",
+            "bearer_token",
+            "use_emulator",
+            "msi_endpoint",
+            "authority_host",
+            "proxy_url",
+            "service_account_key",
+            "max_retries",
+        ] {
+            for scheme_url in ["s3://bucket/data.parquet", "gs://bucket/data.parquet"] {
+                let error = try_new_without_state(&format!("{scheme_url}#{key}=x")).await;
+                assert!(
+                    error.contains(&format!("sets `{key}` in its URL fragment")),
+                    "{scheme_url}#{key}: {error}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn object_store_url_tables_reject_a_region_or_account_with_url_syntax() {
+        for url in [
+            "s3://bucket/data.parquet#region=x@10.0.0.1:9000/",
+            "s3://bucket/data.parquet#region=",
+            "abfss://container/data/#account=evil.example.com/",
+            "abfss://container/data/#account=x@10.0.0.1",
+        ] {
+            let error = try_new_without_state(url).await;
+            assert!(
+                error.contains("sets an invalid `region` in its URL fragment")
+                    || error.contains("sets an invalid `account` in its URL fragment"),
+                "{url}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn object_store_url_tables_accept_the_allowed_fragment_keys() {
+        for url in [
+            "s3://bucket/data.parquet",
+            "s3://bucket/data/#region=us-east-1&auth=public&url_style=path&client_timeout=30s",
+            "abfss://container/data/#account=myaccount",
+            "gs://bucket/data/#client_timeout=10s",
+        ] {
+            assert_eq!(
+                try_new_without_state(url).await,
+                "Invalid or Unsupported Configuration: Session state not available for URL table creation",
+                "{url}"
+            );
+        }
+    }
+
+    /// Builds a session whose object store for `store_url` is an in-memory store holding a CSV
+    /// at `path`.
+    async fn session_with_csv(store_url: &str, path: &str) -> datafusion::prelude::SessionContext {
+        use object_store::{ObjectStoreExt, PutPayload, memory::InMemory};
+
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &object_store::path::Path::from(path),
+                PutPayload::from_static(b"id,name\n1,a\n2,b\n"),
+            )
+            .await
+            .expect("the CSV is written");
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_object_store(&Url::parse(store_url).expect("valid store URL"), store);
+        ctx
+    }
+
+    async fn row_count(
+        ctx: &datafusion::prelude::SessionContext,
+        table: Arc<dyn TableProvider>,
+    ) -> usize {
+        let batches = ctx
+            .read_table(table)
+            .expect("the table reads")
+            .collect()
+            .await
+            .expect("the table scans");
+        batches
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn s3_url_table_with_allowed_fragment_builds() {
+        let ctx = session_with_csv("s3://bucket", "data/items.csv").await;
+        let factory = SpiceUrlTableFactory::new();
+        factory.with_state(ctx.state_weak_ref());
+
+        let table = factory
+            .try_new("s3://bucket/data/items.csv#region=us-east-1&auth=public")
+            .await
+            .expect("the table builds")
+            .expect("the URL is a URL table");
+
+        assert_eq!(row_count(&ctx, table).await, 2);
+    }
+
+    /// An `http` URL table reads through the store registered under the URL table scheme, not
+    /// the store a dataset for the same host would use.
+    #[tokio::test]
+    async fn http_url_table_reads_through_the_url_table_store() {
+        let ctx = session_with_csv(
+            &format!("{URL_TABLE_SCHEME_PREFIX}http://8.8.8.8"),
+            "items.csv",
+        )
+        .await;
+        let factory = SpiceUrlTableFactory::new();
+        factory.with_state(ctx.state_weak_ref());
+
+        let table = factory
+            .try_new("http://8.8.8.8/items.csv")
+            .await
+            .expect("the table builds")
+            .expect("the URL is a URL table");
+
+        assert_eq!(row_count(&ctx, table).await, 2);
     }
 
     #[tokio::test]

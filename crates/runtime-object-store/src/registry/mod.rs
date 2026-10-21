@@ -29,13 +29,13 @@ use datafusion::{
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
 };
-use http::{HeaderMap, header::AUTHORIZATION};
+use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, http::HttpBuilder};
-use object_store_spawn::SpawnedReqwestConnector;
+use object_store_spawn::{DestinationGuard, SpawnedReqwestConnector};
 use tokio::runtime::Handle;
 use url::{Url, form_urlencoded::parse};
 
-use crate::http_auth;
+use crate::{http_auth, ssrf};
 
 /// Records how a cached object store entry was built so fragment-aware lookups
 /// can repair a poisoned (env-default) entry without clobbering deliberate
@@ -504,9 +504,32 @@ impl SpiceObjectStoreRegistry {
         Ok(Arc::new(s3_builder.build()?))
     }
 
+    /// Builds the store a URL table reads `target` through. Unless `allow_private` is set, it
+    /// refuses `target` when its host is internal, and refuses every redirect to and every
+    /// resolved address of an internal destination.
+    fn prepare_url_table_http_object_store(
+        &self,
+        target: &Url,
+        allow_private: bool,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        if allow_private {
+            return self.prepare_https_object_store(target, None);
+        }
+        // An IP literal is never resolved, so the guard's address check would not see it.
+        if ssrf::redirect_target_is_internal(target) {
+            let origin = &target[..url::Position::BeforePath];
+            return Err(DataFusionError::Plan(format!(
+                "URL table {origin:?} targets a private, loopback, or link-local address, which is not allowed for SSRF protection. If this runtime intentionally queries an internal HTTP endpoint, set {}=true.",
+                ssrf::ALLOW_PRIVATE_HOSTS_ENV
+            )));
+        }
+        self.prepare_https_object_store(target, Some(ssrf::url_table_destination_guard()))
+    }
+
     fn prepare_https_object_store(
         &self,
         url: &Url,
+        guard: Option<DestinationGuard>,
     ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         // Host and port only: object_store does not send URL user information, and
         // its errors print the base URL.
@@ -535,9 +558,17 @@ impl SpiceObjectStoreRegistry {
                 .with_default_headers(HeaderMap::from_iter([(AUTHORIZATION, authorization)]));
         }
 
+        let mut connector = SpawnedReqwestConnector::new(self.io_runtime.clone());
+        if let Some(guard) = guard {
+            // A guarded connector cannot read `object_store`'s private default user agent.
+            if let Ok(user_agent) = HeaderValue::from_str(&util::spiceai_user_agent()) {
+                client_options = client_options.with_user_agent(user_agent);
+            }
+            connector = connector.with_destination_guard(guard);
+        }
         let builder = HttpBuilder::new()
             .with_url(base_url)
-            .with_http_connector(SpawnedReqwestConnector::new(self.io_runtime.clone()))
+            .with_http_connector(connector)
             .with_client_options(client_options);
 
         Ok(Arc::new(builder.build()?))
@@ -759,8 +790,14 @@ impl SpiceObjectStoreRegistry {
     }
 
     fn get_feature_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        if url.as_str().starts_with(ssrf::URL_TABLE_SCHEME_PREFIX) {
+            let target = ssrf::url_table_target(url).ok_or_else(|| {
+                DataFusionError::Execution(format!("No object store available for: {url:?}"))
+            })?;
+            return self.prepare_url_table_http_object_store(&target, ssrf::allow_private_hosts());
+        }
         if url.as_str().starts_with("https://") || url.as_str().starts_with("http://") {
-            return self.prepare_https_object_store(url);
+            return self.prepare_https_object_store(url, None);
         }
         if url.as_str().starts_with("s3://") {
             return self.prepare_s3_object_store(url);
@@ -1050,6 +1087,152 @@ mod tests {
             "{error}"
         );
         assert_eq!(seen.lock().expect("not poisoned").as_slice(), [None]);
+    }
+
+    /// A loopback origin that redirects every request to a loopback target serving a CSV body;
+    /// returns the origin URL and the number of requests the target received.
+    async fn redirect_to_loopback_target() -> (Url, Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::{Router, http::StatusCode, response::IntoResponse};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        async fn serve(router: Router) -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("the server binds a loopback port");
+            let address = listener.local_addr().expect("the server has an address");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            });
+            address
+        }
+
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&target_hits);
+        let target = serve(Router::new().fallback(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { "id\n1\n" }
+        }))
+        .await;
+        let location = format!("http://{target}/items.csv");
+        let origin =
+            serve(
+                Router::new().fallback(move || {
+                    let location = location.clone();
+                    async move {
+                        (StatusCode::FOUND, [(http::header::LOCATION, location)]).into_response()
+                    }
+                }),
+            )
+            .await;
+        (
+            Url::parse(&format!("http://{origin}/")).expect("valid URL"),
+            target_hits,
+        )
+    }
+
+    async fn get_items(store: &Arc<dyn ObjectStore>) -> object_store::Result<String> {
+        use object_store::ObjectStoreExt;
+
+        let bytes = store
+            .get(&object_store::path::Path::from("items.csv"))
+            .await?
+            .bytes()
+            .await?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn url_table_store_url(target: &Url) -> Url {
+        Url::parse(&format!("{}{target}", ssrf::URL_TABLE_SCHEME_PREFIX))
+            .expect("valid URL table store URL")
+    }
+
+    #[tokio::test]
+    async fn url_table_store_refuses_a_redirect_to_an_internal_address() {
+        use std::sync::atomic::Ordering;
+
+        let (origin, target_hits) = redirect_to_loopback_target().await;
+        // The origin is an IP literal, which the guard does not resolve, so only the redirect
+        // check stands between the request and the loopback target.
+        let store = SpiceObjectStoreRegistry::new(Handle::current())
+            .prepare_https_object_store(&origin, Some(ssrf::url_table_destination_guard()))
+            .expect("the guarded store builds");
+
+        let error = get_items(&store)
+            .await
+            .expect_err("the redirect is refused")
+            .to_string();
+
+        assert!(
+            error.contains("Refused to connect to http://127.0.0.1:")
+                && error.contains(
+                    "URL tables cannot read from private, loopback, or link-local addresses. If this runtime intentionally queries an internal HTTP endpoint, set SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true."
+                ),
+            "{error}"
+        );
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn url_table_store_follows_redirects_when_private_hosts_are_allowed() {
+        use std::sync::atomic::Ordering;
+
+        let (origin, target_hits) = redirect_to_loopback_target().await;
+        let store = SpiceObjectStoreRegistry::new(Handle::current())
+            .prepare_url_table_http_object_store(&origin, true)
+            .expect("the store builds");
+
+        assert_eq!(
+            get_items(&store).await.expect("the redirect is followed"),
+            "id\n1\n"
+        );
+        assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn url_table_store_refuses_an_internal_origin() {
+        let (origin, _) = redirect_to_loopback_target().await;
+        let error = SpiceObjectStoreRegistry::new(Handle::current())
+            .prepare_url_table_http_object_store(&origin, false)
+            .expect_err("a loopback origin is refused")
+            .to_string();
+
+        let origin = origin.as_str().trim_end_matches('/');
+        assert_eq!(
+            error,
+            format!(
+                "Error during planning: URL table {origin:?} targets a private, loopback, or link-local address, which is not allowed for SSRF protection. If this runtime intentionally queries an internal HTTP endpoint, set SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true."
+            )
+        );
+    }
+
+    /// A dataset's HTTP store for a host must not be served to a URL table for the same host,
+    /// and the dataset's store keeps following redirects.
+    #[tokio::test]
+    async fn url_table_and_dataset_stores_for_one_host_are_separate() {
+        use std::sync::atomic::Ordering;
+
+        let (origin, target_hits) = redirect_to_loopback_target().await;
+        let registry = SpiceObjectStoreRegistry::new(Handle::current());
+
+        let dataset_store = registry
+            .get_store(&origin)
+            .expect("the dataset store builds");
+        assert_eq!(
+            get_items(&dataset_store)
+                .await
+                .expect("a dataset store follows redirects"),
+            "id\n1\n"
+        );
+
+        assert!(
+            !ssrf::allow_private_hosts(),
+            "this test needs {} unset",
+            ssrf::ALLOW_PRIVATE_HOSTS_ENV
+        );
+        registry
+            .get_store(&url_table_store_url(&origin))
+            .expect_err("the URL table store for a loopback origin is refused");
+        assert_eq!(target_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
