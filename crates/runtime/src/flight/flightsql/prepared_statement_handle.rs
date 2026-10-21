@@ -141,7 +141,7 @@ mod tests {
             .windows(b"SELECT 1".len())
             .position(|window| window == b"SELECT 1")
             .expect("the query is in the handle");
-        let mut tampered = handle.clone();
+        let mut tampered = handle;
         tampered[query_at + b"SELECT ".len()] = b'2';
         assert_rejected(open_with_key(&KEY, &tampered), "a modified query");
     }
@@ -153,7 +153,7 @@ mod tests {
             .windows(16)
             .position(|window| window == [0x11; 16])
             .expect("the parameters are in the handle");
-        let mut tampered = handle.clone();
+        let mut tampered = handle;
         tampered[parameters_at] ^= 0x01;
         assert_rejected(open_with_key(&KEY, &tampered), "modified parameters");
     }
@@ -189,7 +189,7 @@ mod tests {
                 &format!("handle truncated to {len} bytes"),
             );
         }
-        let mut extended = handle.clone();
+        let mut extended = handle;
         extended.push(0);
         assert_rejected(
             open_with_key(&KEY, &extended),

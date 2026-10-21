@@ -1047,7 +1047,7 @@ mod tests {
             int64_schema()
         );
 
-        let mut over_declared = schema_only.clone();
+        let mut over_declared = schema_only;
         over_declared[4..8].copy_from_slice(&i32::MAX.to_le_bytes());
         let status = decode_parameter_schema(&over_declared)
             .expect_err("an over-declared metadata length must be refused");

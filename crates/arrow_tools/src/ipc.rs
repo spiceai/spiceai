@@ -471,7 +471,7 @@ mod tests {
         fn a_body_one_byte_longer_than_the_stream_is_refused_and_an_exact_fit_passes() {
             let written = stream(&[int_batch()], IpcWriteOptions::default());
             let batch_metadata = metadata_ranges(&written)[1].clone();
-            let body = arrow_ipc::root_as_message(&written[batch_metadata.clone()])
+            let body = arrow_ipc::root_as_message(&written[batch_metadata])
                 .expect("metadata parses")
                 .bodyLength();
             // The batch body is followed by the 8-byte end-of-stream marker, so a body declared
