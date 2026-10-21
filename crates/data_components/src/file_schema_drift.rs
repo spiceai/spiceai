@@ -137,7 +137,8 @@ impl FileSchemaDriftGuard {
     ///
     /// Returns a [`DataFusionError::Plan`] naming the missing columns when `state` is an
     /// acceleration refresh session ([`is_acceleration_refresh`]) and a projected registered
-    /// column is missing from every scanned file, or an error reading a file's schema.
+    /// column is missing from every scanned file. A file schema that cannot be read skips the
+    /// check rather than failing the scan.
     pub async fn check_scan(
         &self,
         state: &dyn Session,
@@ -170,7 +171,16 @@ impl FileSchemaDriftGuard {
                 // Newest first: the registered schema was inferred from the newest file, so
                 // it normally carries every column and ends the probe after one footer.
                 files.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
-                let store = state.runtime_env().object_store(&store_url)?;
+                let store = match state.runtime_env().object_store(&store_url) {
+                    Ok(store) => store,
+                    Err(e) => {
+                        tracing::debug!(
+                            "Dataset '{}': skipping the missing-column check, the object store is not available: {e}",
+                            self.dataset_name
+                        );
+                        return Ok(());
+                    }
+                };
                 let drift = self.find_drift(state, &store, columns, &files).await?;
                 self.state.lock().last_check = Some((fingerprint, drift.clone()));
                 drift
@@ -235,7 +245,18 @@ impl FileSchemaDriftGuard {
             if chunk.is_empty() {
                 continue;
             }
-            let schema = self.format.infer_schema(state, store, chunk).await?;
+            // A file whose schema cannot be read here fails the scan itself if it is
+            // unreadable; the check only reports drift it can prove, so it is skipped.
+            let schema = match self.format.infer_schema(state, store, chunk).await {
+                Ok(schema) => schema,
+                Err(e) => {
+                    tracing::debug!(
+                        "Dataset '{}': skipping the missing-column check, a source file schema could not be read: {e}",
+                        self.dataset_name
+                    );
+                    return Ok(None);
+                }
+            };
             remaining.retain(|name| schema.field_with_name(name).is_err());
             if remaining.is_empty() {
                 return Ok(None);
@@ -312,13 +333,17 @@ fn quoted(columns: &[String]) -> String {
 }
 
 fn column_noun(columns: &[String]) -> &'static str {
-    if columns.len() == 1 { "column" } else { "columns" }
+    if columns.len() == 1 {
+        "column"
+    } else {
+        "columns"
+    }
 }
 
 fn refresh_error_message(dataset: &str, drift: &Drift) -> String {
     let noun = column_noun(&drift.missing);
     format!(
-        "Dataset '{dataset}': registered {noun} {cols} missing from every source file scanned (for example '{file}'). The source schema changed after the dataset was registered, for example a column was renamed or dropped. The refresh was stopped so the accelerated data is not replaced with NULL values; the last loaded data is still served. Restore the {noun} in the source files, or reload the dataset to adopt the new schema.",
+        "Dataset '{dataset}': registered {noun} {cols} missing from every source file scanned (for example '{file}'). The source schema changed after the dataset was registered, for example a column was renamed or dropped. The refresh was stopped so the accelerated data is not replaced with NULL values; the last loaded data is still served. Restore the {noun} in the source files, or restart the runtime to adopt the new schema.",
         cols = quoted(&drift.missing),
         file = drift.example_file,
     )
@@ -327,10 +352,14 @@ fn refresh_error_message(dataset: &str, drift: &Drift) -> String {
 fn read_warning_message(dataset: &str, drift: &Drift) -> String {
     let noun = column_noun(&drift.missing);
     format!(
-        "Dataset '{dataset}': registered {noun} {cols} missing from every source file scanned (for example '{file}'), so queries return NULL for {them}. The source schema changed after the dataset was registered, for example a column was renamed or dropped. Restore the {noun} in the source files, or reload the dataset to adopt the new schema.",
+        "Dataset '{dataset}': registered {noun} {cols} missing from every source file scanned (for example '{file}'), so queries return NULL for {them}. The source schema changed after the dataset was registered, for example a column was renamed or dropped. Restore the {noun} in the source files, or restart the runtime to adopt the new schema.",
         cols = quoted(&drift.missing),
         file = drift.example_file,
-        them = if drift.missing.len() == 1 { "it" } else { "them" },
+        them = if drift.missing.len() == 1 {
+            "it"
+        } else {
+            "them"
+        },
     )
 }
 
@@ -466,5 +495,210 @@ impl TableProvider for FileSchemaDriftCheckedTable {
         self.inner
             .merge_into(state, source, merge_schema, on, clauses)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion::datasource::listing::{
+        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    };
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use std::path::Path;
+
+    fn write_parquet(path: &Path, columns: &[&str], values: &[i64]) {
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|c| Field::new(*c, DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        ));
+        let arrays = columns
+            .iter()
+            .map(|_| Arc::new(Int64Array::from(values.to_vec())) as arrow::array::ArrayRef)
+            .collect();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).expect("batch");
+        let file = std::fs::File::create(path).expect("create parquet file");
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close parquet writer");
+    }
+
+    fn registered_schema(columns: &[&str]) -> SchemaRef {
+        Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|c| Field::new(*c, DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    /// A guarded listing table over `dir` with the registered `columns`, as a file dataset
+    /// would have registered it before its files changed.
+    fn guarded_table(dir: &Path, columns: &[&str]) -> Arc<FileSchemaDriftCheckedTable> {
+        let schema = registered_schema(columns);
+        let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::default());
+        let url = ListingTableUrl::parse(format!("file://{}/", dir.display())).expect("url");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(
+                ListingOptions::new(Arc::clone(&format)).with_file_extension(".parquet"),
+            )
+            .with_schema(Arc::clone(&schema));
+        let table = Arc::new(ListingTable::try_new(config).expect("listing table"));
+        Arc::new(FileSchemaDriftCheckedTable::new(
+            table,
+            FileSchemaDriftGuard::new("base", schema, format),
+        ))
+    }
+
+    fn context(refresh: bool) -> SessionContext {
+        let mut config = SessionConfig::new();
+        if refresh {
+            mark_acceleration_refresh(&mut config);
+        }
+        SessionContext::new_with_config(config)
+    }
+
+    async fn query(
+        table: &Arc<FileSchemaDriftCheckedTable>,
+        refresh: bool,
+        sql: &str,
+    ) -> DFResult<Vec<RecordBatch>> {
+        let ctx = context(refresh);
+        ctx.register_table("base", Arc::clone(table) as Arc<dyn TableProvider>)?;
+        ctx.sql(sql).await?.collect().await
+    }
+
+    fn single_value(batches: &[RecordBatch]) -> Option<i64> {
+        let column = batches[0].column(0);
+        let column = column.as_any().downcast_ref::<Int64Array>().expect("int64");
+        (!column.is_null(0)).then(|| column.value(0))
+    }
+
+    #[tokio::test]
+    async fn refresh_scan_fails_when_a_registered_column_is_renamed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_parquet(
+            &dir.path().join("base.parquet"),
+            &["id", "amount_cents"],
+            &[1, 2],
+        );
+        let table = guarded_table(dir.path(), &["id", "amount_cents"]);
+
+        let before = query(&table, true, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("refresh scan before the rename");
+        assert_eq!(single_value(&before), Some(3));
+
+        write_parquet(&dir.path().join("base.parquet"), &["id", "amt"], &[1, 2, 3]);
+
+        let err = query(&table, true, "SELECT * FROM base")
+            .await
+            .expect_err("a refresh scan must not load NULLs for a renamed column");
+        let message = err.to_string();
+        assert!(message.contains("'amount_cents'"), "{message}");
+        assert!(message.contains("Dataset 'base'"), "{message}");
+        assert!(message.contains("base.parquet"), "{message}");
+        assert!(!message.contains("'id'"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn federated_scan_warns_and_returns_null_when_a_registered_column_is_renamed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_parquet(&dir.path().join("base.parquet"), &["id", "amt"], &[1, 2]);
+        let table = guarded_table(dir.path(), &["id", "amount_cents"]);
+
+        let batches = query(&table, false, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("a federated read still answers");
+        assert_eq!(single_value(&batches), None);
+        assert_eq!(
+            table.guard.state.lock().last_warned.as_deref(),
+            Some(&["amount_cents".to_string()][..]),
+        );
+
+        // Restoring the column clears the warning so a later drop is reported again.
+        write_parquet(
+            &dir.path().join("base.parquet"),
+            &["id", "amount_cents"],
+            &[1, 2],
+        );
+        let batches = query(&table, false, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("read after restore");
+        assert_eq!(single_value(&batches), Some(3));
+        assert!(table.guard.state.lock().last_warned.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_scan_allows_an_added_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_parquet(
+            &dir.path().join("base.parquet"),
+            &["id", "amount_cents", "note"],
+            &[1, 2],
+        );
+        let table = guarded_table(dir.path(), &["id", "amount_cents"]);
+
+        let batches = query(&table, true, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("an added column is ordinary schema evolution");
+        assert_eq!(single_value(&batches), Some(3));
+    }
+
+    #[tokio::test]
+    async fn refresh_scan_allows_older_files_without_a_newer_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_parquet(&dir.path().join("a_old.parquet"), &["id"], &[1]);
+        write_parquet(
+            &dir.path().join("b_new.parquet"),
+            &["id", "amount_cents"],
+            &[2],
+        );
+        let table = guarded_table(dir.path(), &["id", "amount_cents"]);
+
+        let batches = query(&table, true, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("a column some scanned file carries is not drift");
+        assert_eq!(single_value(&batches), Some(2));
+    }
+
+    #[tokio::test]
+    async fn refresh_scan_ignores_a_missing_column_it_does_not_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_parquet(&dir.path().join("base.parquet"), &["id", "amt"], &[1, 2]);
+        let table = guarded_table(dir.path(), &["id", "amount_cents"]);
+
+        let batches = query(&table, true, "SELECT sum(id) FROM base")
+            .await
+            .expect("the renamed column is not read");
+        assert_eq!(single_value(&batches), Some(3));
+        query(&table, true, "SELECT count(*) FROM base")
+            .await
+            .expect("count(*) reads no column");
+    }
+
+    #[test]
+    fn messages_name_every_missing_column() {
+        let drift = Drift {
+            missing: vec!["a".to_string(), "b".to_string()],
+            example_file: "dir/f.parquet".to_string(),
+        };
+        let refresh = refresh_error_message("ds", &drift);
+        assert!(
+            refresh.contains("registered columns 'a', 'b' missing"),
+            "{refresh}"
+        );
+        assert!(
+            refresh.contains("last loaded data is still served"),
+            "{refresh}"
+        );
+        let read = read_warning_message("ds", &drift);
+        assert!(read.contains("queries return NULL for them"), "{read}");
     }
 }
