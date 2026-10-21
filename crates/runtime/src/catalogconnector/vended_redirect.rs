@@ -305,7 +305,9 @@ fn request_for_redirect(
         (method.clone(), body.clone())
     };
     let mut headers = headers.clone();
-    if !same_redirect_host(request_uri, target) {
+    // Scheme, host, and effective port. A new port, or https changing to http,
+    // is a different origin and must not receive the first hop's credentials.
+    if !same_redirect_origin(request_uri, target) {
         headers.remove(http::header::AUTHORIZATION);
         headers.remove(http::header::COOKIE);
         headers.remove(http::header::PROXY_AUTHORIZATION);
@@ -326,11 +328,34 @@ fn request_for_redirect(
     })
 }
 
-fn same_redirect_host(request_uri: &http::Uri, target: &reqwest::Url) -> bool {
-    match (request_uri.host(), target.host_str()) {
-        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+fn same_redirect_origin(request_uri: &http::Uri, target: &reqwest::Url) -> bool {
+    let (Some(left_scheme), Some(left_host), Some(right_host)) = (
+        request_uri.scheme_str(),
+        request_uri.host(),
+        target.host_str(),
+    ) else {
+        return false;
+    };
+    if !left_scheme.eq_ignore_ascii_case(target.scheme())
+        || !left_host.eq_ignore_ascii_case(right_host)
+    {
+        return false;
+    }
+    match (
+        effective_port(left_scheme, request_uri.port_u16()),
+        target.port_or_known_default(),
+    ) {
+        (Some(left), Some(right)) => left == right,
         _ => false,
     }
+}
+
+fn effective_port(scheme: &str, explicit: Option<u16>) -> Option<u16> {
+    explicit.or_else(|| match scheme.to_ascii_lowercase().as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    })
 }
 
 async fn send_once(req: Request<Buffer>) -> Result<Response<HttpBody>> {
@@ -449,4 +474,122 @@ impl http_body::Body for HttpBufferBody {
 #[ctor::ctor(unsafe, priority = early)]
 fn install_vended_redirect_transport() {
     HttpTransporter::install_default(VendedRedirectTransport);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_for_redirect;
+
+    use opendal::Buffer;
+
+    fn signed_headers() -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("credential"),
+        );
+        headers.insert(
+            http::header::COOKIE,
+            http::HeaderValue::from_static("session=fixture"),
+        );
+        headers.insert(
+            http::header::PROXY_AUTHORIZATION,
+            http::HeaderValue::from_static("proxy-credential"),
+        );
+        headers.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("bucket.s3.amazonaws.com"),
+        );
+        headers
+    }
+
+    fn redirected(from: &str, to: &str) -> http::HeaderMap {
+        let request_uri = from.parse().expect("request uri");
+        let target = reqwest::Url::parse(to).expect("target url");
+        let request = request_for_redirect(
+            http::StatusCode::FOUND,
+            &http::Method::GET,
+            &signed_headers(),
+            http::Version::HTTP_11,
+            &Buffer::new(),
+            &request_uri,
+            &target,
+        )
+        .expect("build the redirected request");
+        request.headers().clone()
+    }
+
+    fn assert_credentials_kept(headers: &http::HeaderMap) {
+        assert_eq!(
+            headers
+                .get(http::header::AUTHORIZATION)
+                .expect("authorization")
+                .to_str()
+                .expect("authorization is text"),
+            "credential"
+        );
+        assert_eq!(
+            headers
+                .get(http::header::COOKIE)
+                .expect("cookie")
+                .to_str()
+                .expect("cookie is text"),
+            "session=fixture"
+        );
+        assert_eq!(
+            headers
+                .get(http::header::PROXY_AUTHORIZATION)
+                .expect("proxy authorization")
+                .to_str()
+                .expect("proxy authorization is text"),
+            "proxy-credential"
+        );
+        assert!(
+            headers.get(http::header::HOST).is_none(),
+            "Host is rebuilt for the next hop"
+        );
+    }
+
+    fn assert_credentials_dropped(headers: &http::HeaderMap) {
+        assert!(
+            headers.get(http::header::AUTHORIZATION).is_none(),
+            "authorization crossed origins: {headers:?}"
+        );
+        assert!(
+            headers.get(http::header::COOKIE).is_none(),
+            "cookie crossed origins: {headers:?}"
+        );
+        assert!(
+            headers.get(http::header::PROXY_AUTHORIZATION).is_none(),
+            "proxy authorization crossed origins: {headers:?}"
+        );
+    }
+
+    #[test]
+    fn redirect_keeps_sensitive_headers_only_for_the_same_origin() {
+        assert_credentials_kept(&redirected(
+            "http://bucket.s3.amazonaws.com/key",
+            "http://bucket.s3.amazonaws.com/other",
+        ));
+        assert_credentials_kept(&redirected(
+            "http://bucket.s3.amazonaws.com/key",
+            "http://bucket.s3.amazonaws.com:80/other",
+        ));
+        assert_credentials_kept(&redirected(
+            "https://bucket.s3.amazonaws.com:443/key",
+            "https://BUCKET.s3.amazonaws.com/other",
+        ));
+        assert_credentials_dropped(&redirected(
+            "http://bucket.s3.amazonaws.com/key",
+            "http://bucket.s3.amazonaws.com:8443/other",
+        ));
+        assert_credentials_dropped(&redirected(
+            "https://bucket.s3.amazonaws.com/key",
+            "http://bucket.s3.amazonaws.com/other",
+        ));
+        assert_credentials_dropped(&redirected(
+            "http://bucket.s3.amazonaws.com/key",
+            "http://other.example/other",
+        ));
+    }
 }

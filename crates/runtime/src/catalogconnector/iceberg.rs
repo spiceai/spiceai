@@ -3151,6 +3151,99 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn catalog_vended_redirect_to_another_port_drops_credentials() {
+            let host = "redirect-port.vended.test";
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the redirector");
+            let addr = listener.local_addr().expect("read the redirector address");
+            let other_port = addr.port().wrapping_add(1).max(1);
+            let location = format!("http://{host}:{other_port}/secret");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&requests);
+            let redirect_to = location.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let recorded = Arc::clone(&recorded);
+                    let redirect_to = redirect_to.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0_u8; 8192];
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let path = head
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or_default()
+                            .to_string();
+                        recorded.lock().push(head);
+                        let response = if path == "/secret" || path.starts_with("/secret?") {
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .to_string()
+                        } else {
+                            format!(
+                                "HTTP/1.1 302 Found\r\nLocation: {redirect_to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+            let _connect = ConnectOverride::set(host, &addr.to_string());
+            let _dns =
+                ResolverOverride::set(host, Ok(vec![std::net::Ipv4Addr::new(8, 8, 8, 8).into()]));
+            let endpoint = format!("http://{host}:{}", addr.port());
+            let catalog_uri = start_rest_catalog(&vended_config(&endpoint)).await;
+            let err = read_manifest_list(catalog_uri, HashMap::new())
+                .await
+                .expect_err("the other port answers 404");
+            let recorded = requests.lock().clone();
+            let secret: Vec<_> = recorded
+                .iter()
+                .filter(|raw| request_path(raw) == "/secret")
+                .collect();
+            assert!(
+                !secret.is_empty(),
+                "the other port was not requested: {recorded:?} {err}"
+            );
+            assert!(
+                recorded.iter().any(|raw| {
+                    request_path(raw) != "/secret" && header_present(raw, "authorization")
+                }),
+                "the first hop sent no Authorization, so dropping it was not exercised: {recorded:?}"
+            );
+            for raw in secret {
+                assert!(
+                    !header_present(raw, "authorization")
+                        && !header_present(raw, "cookie")
+                        && !header_present(raw, "proxy-authorization"),
+                    "credentials crossed to port {other_port}: {raw}"
+                );
+            }
+        }
+
+        fn request_path(raw: &str) -> &str {
+            let path = raw
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default();
+            path.split('?').next().unwrap_or(path)
+        }
+
+        fn header_present(raw: &str, name: &str) -> bool {
+            raw.lines().any(|line| {
+                line.split(':')
+                    .next()
+                    .is_some_and(|header| header.trim().eq_ignore_ascii_case(name))
+            })
+        }
+
+        #[tokio::test]
         async fn operator_endpoint_redirect_to_loopback_is_followed() {
             let sentinel = start_sentinel().await;
             let redirector = start_redirector(&format!("{}/secret", sentinel.endpoint)).await;
