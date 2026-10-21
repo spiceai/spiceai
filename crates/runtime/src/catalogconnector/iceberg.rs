@@ -1097,9 +1097,11 @@ fn endpoint_flag_is_truthy(value: &str) -> bool {
 /// `s3.endpoint`, then, for virtual-host style, inserts the bucket in front of
 /// the host. Path style leaves the stripped host and prefixes the path with
 /// the bucket. A catalog can set `s3.endpoint` to a public address such as
-/// `http://8.127.0.1` and a location `s3://8/...`. URL parsing then collapses
-/// the stripped host `127.0.1` to `127.0.0.1`, which is loopback. Other
-/// endpoint keys are not rewritten.
+/// `http://8.127.0.1` and a location whose host is `8` (`s3://`, `s3a://`,
+/// `s3n://`, or a custom scheme such as `minio://`). The S3 backend takes that
+/// host as the bucket for any absolute URL. URL parsing then collapses the
+/// stripped host `127.0.1` to `127.0.0.1`, which is loopback. Other endpoint
+/// keys are not rewritten.
 fn effective_storage_endpoint(
     key: &str,
     value: &str,
@@ -1116,10 +1118,9 @@ fn effective_storage_endpoint(
 }
 
 fn s3_location_bucket(location: &str) -> Option<String> {
+    // `s3_config_build` uses the host of whatever absolute URL it is given.
+    // The same S3 storage accepts `s3`, `s3a`, `s3n`, and custom schemes.
     let url = Url::parse(location).ok()?;
-    if !url.scheme().eq_ignore_ascii_case("s3") {
-        return None;
-    }
     let bucket = url.host_str()?;
     (!bucket.is_empty()).then(|| bucket.to_string())
 }
@@ -1880,11 +1881,11 @@ mod tests {
     mod vended_storage_endpoint {
         use super::super::{
             GCS_SERVICE_HOST, S3_ENDPOINT, STORAGE_ENDPOINT_PROPS, check_vended_endpoints,
-            check_vended_file_location, clear_vended_endpoint_resolver_override, get_rest_catalog,
-            refusal_message_for_resolution, s3_effective_endpoint,
-            set_vended_endpoint_resolver_override, vended_endpoint_refused_message,
-            vended_endpoint_rewritten_message, vended_endpoint_unresolved_message,
-            vended_file_location_refused_message,
+            check_vended_file_location, clear_vended_endpoint_resolver_override,
+            effective_storage_endpoint, get_rest_catalog, refusal_message_for_resolution,
+            s3_effective_endpoint, set_vended_endpoint_resolver_override,
+            vended_endpoint_refused_message, vended_endpoint_rewritten_message,
+            vended_endpoint_unresolved_message, vended_file_location_refused_message,
         };
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -2155,6 +2156,32 @@ mod tests {
                 s3_effective_endpoint("https://s3.amazonaws.com", "warehouse", false, "eu-west-1"),
                 "https://s3.eu-west-1.amazonaws.com/warehouse"
             );
+            let endpoint = "http://8.127.0.1:18075";
+            let effective = "http://127.0.0.1:18075/8";
+            for scheme in ["s3", "s3a", "s3n", "minio"] {
+                assert_eq!(
+                    effective_storage_endpoint(
+                        S3_ENDPOINT,
+                        endpoint,
+                        &format!("{scheme}://8/metadata/snap-1.avro"),
+                        false,
+                        "us-east-1",
+                    ),
+                    effective,
+                    "{scheme}"
+                );
+            }
+            assert_eq!(
+                effective_storage_endpoint(
+                    S3_ENDPOINT,
+                    endpoint,
+                    "file:///tmp/x",
+                    false,
+                    "us-east-1",
+                ),
+                endpoint,
+                "a file URL with no host is not an S3 bucket"
+            );
         }
 
         #[tokio::test]
@@ -2190,6 +2217,30 @@ mod tests {
                         &effective
                     ),
                     "{endpoint}"
+                );
+            }
+            for scheme in ["s3a", "s3n", "minio"] {
+                let location = format!("{scheme}://8/metadata/snap-1.avro");
+                let endpoint = format!("http://8.127.0.1:{port}");
+                let catalog_uri = start_rest_catalog_at(
+                    &vended_config(&endpoint),
+                    &format!("{scheme}://8/metadata/v1.metadata.json"),
+                    &location,
+                )
+                .await;
+                let err = read_location(catalog_uri, HashMap::new(), &location)
+                    .await
+                    .expect_err("a rewritten loopback endpoint must not be read");
+                assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid, "{scheme}");
+                assert_eq!(
+                    err.message(),
+                    vended_endpoint_rewritten_message(
+                        "dataset 't'",
+                        S3_ENDPOINT,
+                        &endpoint,
+                        &effective
+                    ),
+                    "{scheme}"
                 );
             }
             assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
