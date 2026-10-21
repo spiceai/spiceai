@@ -2752,12 +2752,7 @@ impl RefreshTask {
         ctx
     }
 
-    /// `high_water_mark` is the mark the source filter was built from. Pass it whenever
-    /// the caller has it: recomputing it here reads `max(time_column)` a second time, and
-    /// a write that lands on the accelerator between the two reads gives this comparison a
-    /// *higher* mark than the source query used. The rows in between are then missing from
-    /// the comparison set and are appended again — the same duplication as widening one
-    /// side without the other (#12492). `None` falls back to deriving it.
+    /// Drops the incoming rows that match a stored row selected by `stored_from`.
     async fn except_existing_records_from(
         &self,
         refresh: &Refresh,
