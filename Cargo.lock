@@ -17632,6 +17632,7 @@ dependencies = [
  "runtime-execution-plans",
  "runtime-metrics",
  "runtime-object-store",
+ "runtime-otel-push",
  "runtime-parameters",
  "runtime-parameters-typed",
  "runtime-proto",
@@ -17926,6 +17927,7 @@ name = "runtime-cluster"
 version = "2.4.0-unstable"
 dependencies = [
  "app",
+ "arc-swap",
  "arrow",
  "arrow-flight",
  "arrow-ipc",
@@ -17933,6 +17935,9 @@ dependencies = [
  "arrow_tools",
  "async-stream",
  "async-trait",
+ "ballista-core",
+ "ballista-executor",
+ "ballista-scheduler",
  "bytes",
  "dashmap",
  "data_components",
@@ -17946,25 +17951,33 @@ dependencies = [
  "object_store 0.13.2",
  "object_store_occ",
  "opentelemetry 0.32.0",
+ "opentelemetry-prometheus",
  "opentelemetry_sdk 0.32.1",
  "parking_lot",
+ "prometheus",
  "prost 0.14.3",
  "runtime-datafusion",
+ "runtime-metrics",
  "runtime-proto",
  "runtime-request-context",
  "runtime-table-partition",
+ "runtime-tls",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "snafu",
  "spicepod",
  "telemetry",
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tracing",
  "util",
  "uuid 1.23.2",
+ "x509-certificate",
 ]
 
 [[package]]
@@ -17987,8 +18000,10 @@ dependencies = [
  "serde",
  "snafu",
  "spicepod",
+ "tempfile",
  "tracing",
  "util",
+ "yaml",
 ]
 
 [[package]]
@@ -18145,9 +18160,11 @@ dependencies = [
  "percent-encoding",
  "redis",
  "reqwest 0.13.4",
+ "runtime-metrics",
  "serde",
  "serde_json",
  "snafu",
+ "tempfile",
  "tokio",
  "tracing",
  "url",
@@ -18215,6 +18232,29 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "util",
+]
+
+[[package]]
+name = "runtime-otel-push"
+version = "2.4.0-unstable"
+dependencies = [
+ "axum",
+ "futures",
+ "opentelemetry 0.32.0",
+ "opentelemetry-otlp",
+ "opentelemetry-proto 0.32.0",
+ "opentelemetry_sdk 0.32.1",
+ "parking_lot",
+ "reqwest 0.13.4",
+ "snafu",
+ "spicepod",
+ "telemetry",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
  "util",
 ]
 
@@ -18403,6 +18443,7 @@ dependencies = [
 name = "runtime-secrets"
 version = "2.4.0-unstable"
 dependencies = [
+ "app",
  "async-trait",
  "aws-config",
  "aws-credential-types",
