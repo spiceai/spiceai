@@ -42,6 +42,8 @@ mod mtls;
 mod response_outcome;
 mod routes;
 mod server_timing;
+#[cfg(test)]
+mod write_access_tests;
 
 pub mod v1;
 
