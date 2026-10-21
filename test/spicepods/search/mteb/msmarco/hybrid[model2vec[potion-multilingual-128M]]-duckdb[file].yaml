@@ -1,13 +1,76 @@
 version: v1
 kind: Spicepod
 name: hybrid[model2vec[potion-multilingual-128M]]-duckdb[file]
+
+metadata:
+  benchmark_dataset: msmarco_retrieval
+
 datasets:
 
-  # MTEB MSMARCO Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
-  # https://huggingface.co/datasets/mteb/msmarco
+  # MTEB MSMARCO Retrieval, read straight from Hugging Face: https://huggingface.co/datasets/mteb/msmarco
 
-  - from: file:./corpus.parquet
-    name: corpus
+  # The corpus has 7 parquet shards. Each shard is its own dataset, and the
+  # `corpus` view below joins them. Acceleration and search live on the view, so one refresh
+  # of the view reads every shard and builds the search indexes.
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/0.parquet
+    name: corpus_0
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/1.parquet
+    name: corpus_1
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/2.parquet
+    name: corpus_2
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/3.parquet
+    name: corpus_3
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/4.parquet
+    name: corpus_4
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/5.parquet
+    name: corpus_5
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/6.parquet
+    name: corpus_6
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/queries/queries/0.parquet
+    name: test_queries
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/default/test/0.parquet
+    name: relevance_data
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+
+views:
+  - name: corpus
+    sql: |
+      SELECT * FROM corpus_0
+      UNION ALL SELECT * FROM corpus_1
+      UNION ALL SELECT * FROM corpus_2
+      UNION ALL SELECT * FROM corpus_3
+      UNION ALL SELECT * FROM corpus_4
+      UNION ALL SELECT * FROM corpus_5
+      UNION ALL SELECT * FROM corpus_6
     acceleration:
       enabled: true
       engine: duckdb
@@ -22,16 +85,6 @@ datasets:
           - from: potion
             row_id:
               - _id
-
-  - from: file:./queries.parquet
-    name: test_queries
-    acceleration:
-      enabled: true
-
-  - from: file:./data.parquet
-    name: relevance_data
-    acceleration:
-      enabled: true
 
 embeddings:
   - from: model2vec:minishlab/potion-multilingual-128M

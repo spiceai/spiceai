@@ -173,6 +173,7 @@ runtime-execution-plans = { path = "../runtime-execution-plans" }
 runtime-table = { path = "../runtime-table" }
 runtime-resources = { path = "../runtime-resources" }
 runtime-object-store = { path = "../runtime-object-store" }
+runtime-otel-push = { path = "../runtime-otel-push" }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-parameters-typed = { path = "../runtime-parameters-typed" }
 runtime-proto = { path = "../runtime-proto" }
@@ -242,6 +243,7 @@ yaml = { path = "../yaml" }
 
 [dev-dependencies]
 anyhow.workspace = true
+runtime-drasi = { path = "../runtime-drasi", features = ["test-util"] }
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
@@ -511,6 +513,12 @@ path = "tests/cayenne_runtime_tuning.rs"
 [[test]]
 name = "results_cache_growth"
 path = "tests/results_cache_growth.rs"
+
+# Runs in `make nextest`, which must not load `integration` (see `rate_control`).
+[[test]]
+name = "chat_tool_use"
+path = "tests/chat_tool_use.rs"
+required-features = ["models"]
 
 # Runs as its own step in `integration.yml`, with a retry budget sized to fit it.
 [[test]]

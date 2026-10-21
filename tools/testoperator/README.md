@@ -313,11 +313,12 @@ Where `bodies.jsonl` might look like
 
 Search tests send each query in the `test_queries` table to the runtime, then calculate NDCG, recall, MRR, and precision at each rank cutoff `k` against the `relevance_data` table. Search tests support the common options.
 
-`testoperator run search [OPTIONS]`
+`testoperator run search [OPTIONS] -p <SPICEPOD>`
+
+The spicepod loads its own data (for example, parquet files on Hugging Face) and must define the `corpus`, `test_queries`, and `relevance_data` tables. The `benchmark_dataset` metric attribute comes from the spicepod's top-level `metadata.benchmark_dataset` value, or is `custom` when the spicepod does not set it. Refer to [`test/spicepods/search/README.md`](../../test/spicepods/search/README.md) for the table schema.
 
 Where options are:
 
-- `--benchmark-dataset <NAME>`: A built-in MTEB dataset (for example `fiqa_retrieval`). When omitted, the spicepod must define the `corpus`, `test_queries`, and `relevance_data` tables.
 - `--sql-pipeline <FILE_OR_SQL>`: A parameterized SQL search pipeline. When set, each query goes to `POST /v1/sql` with this SQL, not to `POST /v1/search`. The value is a path to a file that exists, or the SQL text. A value that ends with `.sql` or has no whitespace must be a file. Thus, a mistyped path fails with `SQL pipeline file not found`, and does not run as SQL.
 
 A SQL pipeline can use these named parameters:

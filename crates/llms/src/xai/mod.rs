@@ -44,7 +44,7 @@ use runtime_rate_control::RateController;
 use serde_json::json;
 
 use crate::chat::{
-    Chat, Error,
+    ApiErrorKind, Chat, Error,
     nsql::{SqlGeneration, json::JsonSchemaSqlGeneration},
 };
 use crate::openai::default_rate_controller;
@@ -181,9 +181,18 @@ impl Chat for Xai {
             Ok(_) => Ok(()),
             Err(e) => {
                 tracing::error!(target: "task_history", parent: &span, "{e}");
-                Err(Error::ModelNotFound {
-                    model: self.model.clone(),
-                    model_source: "xai".to_string(),
+                // Only a 404 says the model does not exist. Any other refusal, such as a
+                // bad key or an exhausted credit balance, is reported as xAI gave it.
+                if let OpenAIError::ApiError(api) = &e
+                    && ApiErrorKind::of(api) == Some(ApiErrorKind::NotFound)
+                {
+                    return Err(Error::ModelNotFound {
+                        model: self.model.clone(),
+                        model_source: "xai".to_string(),
+                    });
+                }
+                Err(Error::HealthCheckError {
+                    source: Box::new(e),
                 })
             }
         }
