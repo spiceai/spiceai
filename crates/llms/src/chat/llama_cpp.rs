@@ -300,7 +300,7 @@ impl Chat for LlamaCpp {
     ) -> std::result::Result<ChatCompletionResponseStream, OpenAIError> {
         let (rx, reasons) = self.submit(&req)?;
         let id = self.id();
-        let model = req.model.clone();
+        let model = req.model;
         let created = now();
         let state = StreamState {
             rx,
