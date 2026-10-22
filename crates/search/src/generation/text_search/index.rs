@@ -500,7 +500,7 @@ impl FullTextDatabaseIndex {
         search_field: &str,
     ) -> Result<FullTextSearchFieldIndex, super::Error> {
         let mut search_index = FullTextSearchFieldIndex::try_new(
-            self.reader.searcher(),
+            self.reader.clone(),
             search_field.to_string(),
             self.primary_key.clone(),
         )?;
@@ -2191,8 +2191,7 @@ mod tests {
             .await
             .expect("on_write_complete failed");
 
-        // A `FullTextSearchFieldIndex` snapshots the searcher when it is built, so the
-        // post-commit revision needs a freshly built one.
+        // Each search takes a searcher at the latest commit, so the clear is now visible.
         {
             let search_index = index
                 .full_text_search_field_index("content")
