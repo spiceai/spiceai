@@ -40,6 +40,8 @@ mod anthropic;
 mod bedrock;
 mod embedding;
 #[cfg(feature = "duckdb")]
+mod fts_caching_restart;
+#[cfg(feature = "duckdb")]
 mod fts_restart;
 pub(crate) mod hf;
 #[cfg(feature = "duckdb")]

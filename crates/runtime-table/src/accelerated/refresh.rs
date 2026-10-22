@@ -1074,7 +1074,17 @@ impl Refresher {
     ///
     /// Holds the accelerator write lock, so no write lands in the accelerator between the
     /// scan and the indexes it feeds.
+    ///
+    /// A caching-mode dataset is left alone: its accelerator holds every principal's cached
+    /// rows in one table, scoped only by the hidden `__spice_cache_namespace` column, and no
+    /// index carries that scope, so a replay would let a search answer one principal with the
+    /// row ids and match counts of rows another principal cached. Cached rows never reach these
+    /// indexes through the caching write path either.
     async fn rebuild_indexes_from_accelerator(&self) -> super::Result<()> {
+        if self.refresh_mode().await == RefreshMode::Caching {
+            return Ok(());
+        }
+
         let indexes = crate::accelerated::refresh_task::collect_all_indexes(
             &self.accelerator,
             &self.federated,
