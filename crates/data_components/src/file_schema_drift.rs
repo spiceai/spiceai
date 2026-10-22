@@ -434,8 +434,7 @@ fn read_warning_message(dataset: &str, drift: &Drift) -> String {
 }
 
 /// The [`TableLayer`] that checks a file dataset's scans with a [`FileSchemaDriftGuard`].
-/// Every other call, and every layer walk except [`LayerWalk::Passthrough`], goes to the
-/// table beneath.
+/// Every other call, and every layer walk, goes to the table beneath.
 #[derive(Debug)]
 pub struct FileSchemaDriftLayer {
     guard: FileSchemaDriftGuard,
@@ -467,15 +466,17 @@ impl TableLayer for FileSchemaDriftLayer {
         // Exhaustive on purpose: a wildcard would answer a future walk kind for this
         // layer without anyone deciding what it should say.
         match walk {
+            // The check changes no row, column, or type a scan returns: a scan either
+            // returns the plan of the table beneath or fails. So passthrough sees past it
+            // too, and the Iceberg REST API refuses a file dataset because its files are not
+            // an Iceberg table, rather than as a table whose scans Spice changes.
             LayerWalk::Read
             | LayerWalk::CdcDetection
             | LayerWalk::Source
             | LayerWalk::Write
             | LayerWalk::RetentionDelete
-            | LayerWalk::Index => Some(below),
-            // Serving the table beneath in this layer's place would read the files without
-            // the check, so a refresh could load NULLs for a missing column.
-            LayerWalk::Passthrough => None,
+            | LayerWalk::Index
+            | LayerWalk::Passthrough => Some(below),
         }
     }
 
