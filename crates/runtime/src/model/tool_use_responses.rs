@@ -34,7 +34,7 @@ use llms::responses::Error as ResponsesError;
 use llms::responses::Responses;
 use llms::{chat::Error as LlmError, progress::Progress};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -231,10 +231,7 @@ impl ToolUsingResponses {
             .collect()
     }
 
-    /// Runs `call`, a call to one of Spice's tools.
-    ///
-    /// This is one dispatch. A call past the cap, and a `call_id` already run in the round, do
-    /// not reach here, so `tools_used` counts dispatches and not those.
+    /// Runs `call`, a call to one of Spice's tools, and counts it in the request's tools used.
     async fn run_spice_tool_call(&self, call: &FunctionToolCall) -> ToolOutcome {
         tracing::info!(
             target: "task_history",
@@ -250,61 +247,51 @@ impl ToolUsingResponses {
         outcome
     }
 
-    /// The first [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] of `calls`, keyed by `call_id`.
-    /// The first item with an id is the one that runs. A later item that reuses the id does not
-    /// replace it. `calls` is already this round's Spice calls, in output order, so building this
-    /// walks at most 64 of them.
-    fn admitted_spice_calls<'a>(
-        calls: &[&'a FunctionToolCall],
-    ) -> HashMap<&'a str, &'a FunctionToolCall> {
-        let mut admitted = HashMap::new();
-        for call in calls
+    /// The `call_id`s of the first [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] of `calls`, one round's
+    /// Spice tool calls in output order. Only these run.
+    fn admitted_call_ids<'a>(calls: &[&'a FunctionToolCall]) -> HashSet<&'a str> {
+        calls
             .iter()
-            .copied()
             .take(MAX_SPICE_TOOL_CALLS_PER_RESPONSE)
-        {
-            admitted.entry(call.call_id.as_str()).or_insert(call);
-        }
-        admitted
+            .map(|call| call.call_id.as_str())
+            .collect()
     }
 
-    /// Runs the admitted call for `call_id`, or the not-run error when `call_id` is not in
-    /// `admitted`. `requested` is how many Spice tool calls the round made.
-    async fn dispatch_admitted(
+    /// Runs `call` if its `call_id` is `admitted`, and otherwise fails it with
+    /// [`tool_call_not_run_message`] for a round that made `requested` Spice tool calls.
+    async fn run_spice_tool_call_if_admitted(
         &self,
-        call_id: &str,
-        admitted: &HashMap<&str, &FunctionToolCall>,
+        call: &FunctionToolCall,
+        admitted: &HashSet<&str>,
         requested: usize,
     ) -> ToolOutcome {
-        if let Some(call) = admitted.get(call_id) {
+        if admitted.contains(call.call_id.as_str()) {
             self.run_spice_tool_call(call).await
         } else {
             ToolOutcome::Failed(tool_call_not_run_message(requested))
         }
     }
 
-    /// Runs `call`, a call to one of Spice's tools, if `runs_left` allows one more run in its
-    /// round, which made `requested` Spice tool calls. A call past the round's
-    /// [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] does not run, and fails with
-    /// [`tool_call_not_run_message`]. The caller walks the round's Spice calls in output order,
-    /// so the calls that run are the first [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`].
-    async fn run_spice_tool_call_within_limit(
+    /// Answers each of `calls`, one round's Spice tool calls in output order, that has no outcome
+    /// in `outcomes` yet, so a `call_id` runs at most once.
+    async fn answer_spice_tool_calls(
         &self,
-        call: &FunctionToolCall,
-        runs_left: &mut usize,
-        requested: usize,
-    ) -> ToolOutcome {
-        if *runs_left == 0 {
-            return ToolOutcome::Failed(tool_call_not_run_message(requested));
+        calls: &[&FunctionToolCall],
+        admitted: &HashSet<&str>,
+        outcomes: &mut HashMap<String, ToolOutcome>,
+    ) {
+        for call in calls {
+            if !outcomes.contains_key(&call.call_id) {
+                let outcome = self
+                    .run_spice_tool_call_if_admitted(call, admitted, calls.len())
+                    .await;
+                outcomes.insert(call.call_id.clone(), outcome);
+            }
         }
-        *runs_left -= 1;
-        self.run_spice_tool_call(call).await
     }
 
     /// Runs the Spice tool calls in `output`, one round's output from model `model`, and returns
-    /// their outcomes by `call_id`, none when `output` calls no Spice tool. Only the first
-    /// [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] calls run. A repeated `call_id` is not run again
-    /// and keeps the outcome already stored.
+    /// their outcomes by `call_id`, none when `output` calls no Spice tool.
     async fn run_spice_tool_calls(
         &self,
         model: &str,
@@ -312,22 +299,9 @@ impl ToolUsingResponses {
     ) -> HashMap<String, ToolOutcome> {
         let calls = self.spice_tool_calls(output);
         warn_if_over_tool_call_limit(model, calls.len());
-        let mut runs_left = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
         let mut outcomes = HashMap::with_capacity(calls.len());
-        for call in &calls {
-            // A later item that reuses a `call_id` keeps the outcome already stored. Replacing
-            // it would turn a call that ran into the not-run error once the cap is reached.
-            // The item still takes one of the round's run slots, so a duplicate does not leave
-            // a slot for a distinct id that comes after it.
-            if outcomes.contains_key(&call.call_id) {
-                runs_left = runs_left.saturating_sub(1);
-                continue;
-            }
-            let outcome = self
-                .run_spice_tool_call_within_limit(call, &mut runs_left, calls.len())
-                .await;
-            outcomes.insert(call.call_id.clone(), outcome);
-        }
+        self.answer_spice_tool_calls(&calls, &Self::admitted_call_ids(&calls), &mut outcomes)
+            .await;
         outcomes
     }
 
@@ -976,9 +950,7 @@ fn make_responses_stream(
                         req.model.as_deref().unwrap_or_default(),
                         requested,
                     );
-                    // Built once for the round. A done event must not scan `output` again: a
-                    // response can name far more calls than the 64 that run.
-                    let admitted = ToolUsingResponses::admitted_spice_calls(&spice_calls);
+                    let admitted = ToolUsingResponses::admitted_call_ids(&spice_calls);
                     let mut outcomes: HashMap<String, ToolOutcome> = HashMap::new();
                     for event in held {
                         let ended_call = match &event {
@@ -996,20 +968,22 @@ fn make_responses_stream(
                         };
                         let events = match ended_call {
                             Some((call, output_index)) => {
-                                // A repeated done event reuses the outcome. The dispatch is the
-                                // first admitted item with that id, not whichever done event
-                                // arrived first: a later item can reuse the id with different
-                                // arguments.
-                                let outcome = if let Some(outcome) = outcomes.get(&call.call_id) {
-                                    outcome.clone()
-                                } else {
-                                    let outcome = model
-                                        .dispatch_admitted(&call.call_id, &admitted, requested)
-                                        .await;
-                                    outcomes.insert(call.call_id.clone(), outcome.clone());
-                                    outcome
+                                // A repeated end reuses the call's outcome, so it does not run
+                                // the call again.
+                                let outcome = match outcomes.get(&call.call_id) {
+                                    Some(outcome) => outcome.clone(),
+                                    None => {
+                                        model
+                                            .run_spice_tool_call_if_admitted(
+                                                call, &admitted, requested,
+                                            )
+                                            .await
+                                    }
                                 };
-                                client_stream.tool_call_ended(call, output_index, &outcome)
+                                let events =
+                                    client_stream.tool_call_ended(call, output_index, &outcome);
+                                outcomes.insert(call.call_id.clone(), outcome);
+                                events
                             }
                             None => client_stream.events(event, is_spice),
                         };
@@ -1017,16 +991,11 @@ fn make_responses_stream(
                             return;
                         }
                     }
-                    // A call whose end the round did not stream runs too, under the same
-                    // output-order selection: the next round needs every call's result.
-                    for call in spice_calls {
-                        if !outcomes.contains_key(&call.call_id) {
-                            let outcome = model
-                                .dispatch_admitted(&call.call_id, &admitted, requested)
-                                .await;
-                            outcomes.insert(call.call_id.clone(), outcome);
-                        }
-                    }
+                    // A call whose end the round did not stream is answered too: the next round
+                    // needs every call's result.
+                    model
+                        .answer_spice_tool_calls(&spice_calls, &admitted, &mut outcomes)
+                        .await;
 
                     let next_input = model.next_input(
                         to_input_item(req.input.clone()),
@@ -2021,72 +1990,47 @@ mod tests {
         }
     }
 
-    /// A provider whose first round is `calls` Spice tool calls. It streams `output_item.done`
-    /// for `done_indexes` only, in that order, after every call has been added. Later rounds are
-    /// a message. It records every request.
+
+    /// A provider whose first round is `calls` `list_datasets` calls. Streamed, it sends
+    /// `output_item.done` for `done_indexes` only, in that order, after every call has been added.
+    /// Later rounds are a message. It records every request.
     struct DoneOrderResponses {
         calls: usize,
         done_indexes: Vec<usize>,
-        /// When set, item `index`'s `call_id` is `call_0_{index % cycle}` rather than
-        /// `call_0_{index}`.
-        id_cycle: Option<usize>,
-        /// When set, the first this many items share `call_0_0`. Later items keep distinct ids.
-        shared_head: Option<usize>,
-        /// When set, a completed call's arguments are `{"n":index}` rather than `{}`.
-        indexed_arguments: bool,
         requests: Mutex<Vec<CreateResponse>>,
     }
 
     impl DoneOrderResponses {
         fn new(calls: usize, done_indexes: Vec<usize>) -> Arc<Self> {
-            Self::with_id_cycle(calls, done_indexes, None)
-        }
-
-        fn with_id_cycle(
-            calls: usize,
-            done_indexes: Vec<usize>,
-            id_cycle: Option<usize>,
-        ) -> Arc<Self> {
-            Self::with_ids(calls, done_indexes, id_cycle, None, false)
-        }
-
-        /// `with_id_cycle`, and each completed call's arguments are `{"n":index}`.
-        fn with_indexed_cycle(
-            calls: usize,
-            done_indexes: Vec<usize>,
-            id_cycle: usize,
-        ) -> Arc<Self> {
-            Self::with_ids(calls, done_indexes, Some(id_cycle), None, true)
-        }
-
-        /// The first `shared_head` items share one `call_id`. The rest each have their own.
-        fn with_shared_head(
-            calls: usize,
-            done_indexes: Vec<usize>,
-            shared_head: usize,
-        ) -> Arc<Self> {
-            Self::with_ids(calls, done_indexes, None, Some(shared_head), false)
-        }
-
-        fn with_ids(
-            calls: usize,
-            done_indexes: Vec<usize>,
-            id_cycle: Option<usize>,
-            shared_head: Option<usize>,
-            indexed_arguments: bool,
-        ) -> Arc<Self> {
             Arc::new(Self {
                 calls,
                 done_indexes,
-                id_cycle,
-                shared_head,
-                indexed_arguments,
                 requests: Mutex::new(Vec::new()),
             })
         }
 
-        fn input(&self, round: usize) -> Value {
-            serde_json::to_value(&self.requests.lock()[round].input).expect("a serializable input")
+        fn record(&self, req: CreateResponse) -> usize {
+            let mut requests = self.requests.lock();
+            requests.push(req);
+            requests.len() - 1
+        }
+
+        /// The `function_call_output`s of round `round`'s input, by `call_id`.
+        fn function_outputs(&self, round: usize) -> HashMap<String, String> {
+            let input =
+                serde_json::to_value(&self.requests.lock()[round].input).expect("a JSON input");
+            input
+                .as_array()
+                .expect("the next round's input is a list")
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+                .map(|item| {
+                    (
+                        item["call_id"].as_str().expect("a call_id").to_string(),
+                        item["output"].as_str().expect("an output").to_string(),
+                    )
+                })
+                .collect()
         }
     }
 
@@ -2100,20 +2044,36 @@ mod tests {
             &self,
             req: CreateResponse,
         ) -> Result<ResponseStream, OpenAIError> {
-            let mut requests = self.requests.lock();
-            let round = requests.len();
-            requests.push(req);
-            drop(requests);
+            let round = self.record(req);
             let events = if round == 0 {
+                let mut events = vec![json!({
+                    "type": "response.created", "response": response(0, "in_progress", &[]),
+                })];
+                for index in 0..self.calls {
+                    events.push(json!({
+                        "type": "response.output_item.added", "output_index": index,
+                        "item": item(0, index, "list_datasets", "in_progress"),
+                    }));
+                }
+                for &index in &self.done_indexes {
+                    events.push(json!({
+                        "type": "response.output_item.done", "output_index": index,
+                        "item": item(0, index, "list_datasets", "completed"),
+                    }));
+                }
                 let names = vec!["list_datasets"; self.calls];
-                done_order_events(
-                    0,
-                    &names,
-                    &self.done_indexes,
-                    self.id_cycle,
-                    self.shared_head,
-                    self.indexed_arguments,
-                )
+                events.push(json!({
+                    "type": "response.completed",
+                    "response": response(0, "completed", &output(0, &names)),
+                }));
+                events
+                    .into_iter()
+                    .enumerate()
+                    .map(|(sequence_number, mut event)| {
+                        event["sequence_number"] = json!(sequence_number);
+                        serde_json::from_value(event).expect("a valid stream event")
+                    })
+                    .collect()
             } else {
                 round_events(round, &["message"])
             };
@@ -2121,505 +2081,118 @@ mod tests {
         }
 
         async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {
-            let mut requests = self.requests.lock();
-            let round = requests.len();
-            requests.push(req);
-            drop(requests);
+            let round = self.record(req);
             let names = if round == 0 {
                 vec!["list_datasets"; self.calls]
             } else {
                 vec!["message"]
             };
-            let output_items: Vec<Value> = names
-                .iter()
-                .enumerate()
-                .map(|(index, name)| {
-                    item_call(
-                        round,
-                        index,
-                        name,
-                        "completed",
-                        self.id_cycle,
-                        self.shared_head,
-                        self.indexed_arguments,
-                    )
-                })
-                .collect();
             Ok(
-                serde_json::from_value(response(round, "completed", &output_items))
+                serde_json::from_value(response(round, "completed", &output(round, &names)))
                     .expect("a valid response"),
             )
         }
     }
 
-    /// `call_{round}_{index}`, or `call_{round}_{index % cycle}` when `id_cycle` is set.
-    /// The first `shared_head` items share `call_{round}_0`.
-    fn call_id_for(
-        round: usize,
-        index: usize,
-        id_cycle: Option<usize>,
-        shared_head: Option<usize>,
-    ) -> String {
-        if shared_head.is_some_and(|head| index < head) {
-            return format!("call_{round}_0");
-        }
-        let n = match id_cycle {
-            Some(cycle) => index % cycle,
-            None => index,
-        };
-        format!("call_{round}_{n}")
-    }
-
-    /// [`item`] with `call_id` from [`call_id_for`].
-    fn item_call(
-        round: usize,
-        index: usize,
-        name: &str,
-        status: &str,
-        id_cycle: Option<usize>,
-        shared_head: Option<usize>,
-        indexed_arguments: bool,
-    ) -> Value {
-        let mut value = item(round, index, name, status);
-        if let Some(object) = value.as_object_mut()
-            && object.contains_key("call_id")
-        {
-            object.insert(
-                "call_id".to_string(),
-                Value::String(call_id_for(round, index, id_cycle, shared_head)),
-            );
-            if indexed_arguments && status == "completed" {
-                object.insert(
-                    "arguments".to_string(),
-                    json!(format!(r#"{{"n":{index}}}"#)),
-                );
-            }
-        }
-        value
-    }
-
-    /// Round `round`'s stream: every item is added first, then `output_item.done` for
-    /// `done_indexes` in that order. The completed response still lists every item.
-    /// `id_cycle` reuses `call_id`s across items.
-    fn done_order_events(
-        round: usize,
-        items: &[&str],
-        done_indexes: &[usize],
-        id_cycle: Option<usize>,
-        shared_head: Option<usize>,
-        indexed_arguments: bool,
-    ) -> Vec<ResponseStreamEvent> {
-        let mut events = vec![json!({
-            "type": "response.created", "response": response(round, "in_progress", &[]),
-        })];
-        for (index, name) in items.iter().enumerate() {
-            let item_id = item(round, index, name, "completed")["id"].clone();
-            events.push(json!({
-                "type": "response.output_item.added", "output_index": index,
-                "item": item_call(
-                    round, index, name, "in_progress", id_cycle, shared_head, indexed_arguments,
-                ),
-            }));
-            events.extend([
-                json!({
-                    "type": "response.function_call_arguments.delta", "item_id": item_id,
-                    "output_index": index, "delta": "{}",
-                }),
-                json!({
-                    "type": "response.function_call_arguments.done", "item_id": item_id,
-                    "output_index": index, "arguments": "{}",
-                }),
-            ]);
-        }
-        for index in done_indexes {
-            events.push(json!({
-                "type": "response.output_item.done", "output_index": index,
-                "item": item_call(
-                    round,
-                    *index,
-                    items[*index],
-                    "completed",
-                    id_cycle,
-                    shared_head,
-                    indexed_arguments,
-                ),
-            }));
-        }
-        let output_items: Vec<Value> = items
-            .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                item_call(
-                    round,
-                    index,
-                    name,
-                    "completed",
-                    id_cycle,
-                    shared_head,
-                    indexed_arguments,
-                )
-            })
-            .collect();
-        events.push(json!({
-            "type": "response.completed",
-            "response": response(round, "completed", &output_items),
-        }));
-        events
-            .into_iter()
-            .enumerate()
-            .map(|(sequence_number, mut event)| {
-                event["sequence_number"] = json!(sequence_number);
-                serde_json::from_value(event).expect("a valid stream event")
-            })
-            .collect()
-    }
-
-    fn function_outputs(input: &Value) -> HashMap<String, String> {
-        input
-            .as_array()
-            .expect("the next round's input is a list")
-            .iter()
-            .filter_map(|item| {
-                if item["type"] != "function_call_output" {
-                    return None;
+    /// Runs the first round of `provider`, streamed or not, in a request context. Returns how many
+    /// times `list_datasets` ran, the request's tools used, and the next round's function outputs.
+    async fn first_round(
+        provider: &Arc<DoneOrderResponses>,
+        stream: bool,
+    ) -> (usize, usize, HashMap<String, String>) {
+        let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
+        let model = ToolUsingResponses::new(
+            Arc::clone(provider) as Arc<dyn Responses>,
+            vec![],
+            vec![Arc::clone(&tool) as Arc<dyn SpiceModelTool>],
+            None,
+        );
+        let extension = ModelContextExtension::new();
+        let context = Arc::new(RequestContext::builder(Protocol::Http).build());
+        context.insert_extension(extension.clone());
+        context
+            .scope(async {
+                if stream {
+                    let events = collect_events(
+                        model
+                            .responses_stream(request(true))
+                            .await
+                            .expect("a response stream"),
+                    )
+                    .await;
+                    assert_eq!(
+                        events.last().map(|event| event["type"].clone()),
+                        Some(json!("response.completed"))
+                    );
+                } else {
+                    model
+                        .responses_request(request(false))
+                        .await
+                        .expect("a response");
                 }
-                Some((
-                    item["call_id"].as_str()?.to_string(),
-                    item["output"].as_str()?.to_string(),
-                ))
+            })
+            .await;
+        (
+            tool.0.load(Ordering::SeqCst),
+            extension.tools_used(),
+            provider.function_outputs(1),
+        )
+    }
+
+    /// The first round's function outputs when the first 64 of `calls` calls ran.
+    fn first_64_ran(calls: usize) -> HashMap<String, String> {
+        (0..calls)
+            .map(|index| {
+                let output = if index < MAX_SPICE_TOOL_CALLS_PER_RESPONSE {
+                    r#"["taxi_trips"]"#.to_string()
+                } else {
+                    tool_call_not_run_message(calls)
+                };
+                (format!("call_0_{index}"), output)
             })
             .collect()
     }
 
-    /// A streamed round runs the first 64 Spice calls in output order even when their
-    /// `output_item.done` events arrive in another order, or when an early call's end is not
-    /// streamed.
+    /// A streamed round runs the first 64 Spice calls in output order, whatever order their
+    /// `output_item.done` events arrive in, and when an early call's end is not streamed.
     #[tokio::test]
     async fn streamed_tool_calls_past_the_limit_follow_output_order() {
         let calls = MAX_SPICE_TOOL_CALLS_PER_RESPONSE + 1;
-        // Done events for calls 1..=64, then call 0: arrival order would run call 64 and skip
-        // call 0. Output order runs call 0 and skips call 64.
-        let reordered: Vec<usize> = (1..calls).chain(std::iter::once(0)).collect();
-        // Call 0's end is not streamed. The fallback still runs it, and still skips call 64.
+        // Ends for calls 1..=64, then call 0: arrival order would run call 64 and not call 0.
+        let reordered: Vec<usize> = (1..calls).chain([0]).collect();
+        // Call 0's end is not streamed, so it is answered after the stream.
         let missing_first: Vec<usize> = (1..calls).collect();
 
         for done_indexes in [reordered, missing_first] {
             let provider = DoneOrderResponses::new(calls, done_indexes.clone());
-            let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
-            let events = collect_events(
-                ToolUsingResponses::new(
-                    Arc::clone(&provider) as Arc<dyn Responses>,
-                    vec![],
-                    vec![Arc::clone(&tool) as Arc<dyn SpiceModelTool>],
-                    None,
-                )
-                .responses_stream(request(true))
-                .await
-                .expect("a response stream"),
-            )
-            .await;
-            assert!(
-                events
-                    .last()
-                    .is_some_and(|event| event["type"] == "response.completed"),
-                "done order {done_indexes:?} did not finish the stream"
-            );
-
-            let outputs = function_outputs(&provider.input(1));
-            let ran = "[\"taxi_trips\"]";
-            let skipped = tool_call_not_run_message(calls);
-            assert_eq!(
-                outputs.get("call_0_0").map(String::as_str),
-                Some(ran),
-                "done order {done_indexes:?}"
-            );
-            assert_eq!(
-                outputs
-                    .get(&format!("call_0_{}", MAX_SPICE_TOOL_CALLS_PER_RESPONSE - 1))
-                    .map(String::as_str),
-                Some(ran),
-                "done order {done_indexes:?}"
-            );
-            assert_eq!(
-                outputs
-                    .get(&format!("call_0_{MAX_SPICE_TOOL_CALLS_PER_RESPONSE}"))
-                    .map(String::as_str),
-                Some(skipped.as_str()),
-                "done order {done_indexes:?}"
-            );
-            assert_eq!(
-                tool.0.load(Ordering::SeqCst),
-                MAX_SPICE_TOOL_CALLS_PER_RESPONSE,
-                "done order {done_indexes:?}"
-            );
+            let (ran, tools_used, outputs) = first_round(&provider, true).await;
+            assert_eq!(ran, MAX_SPICE_TOOL_CALLS_PER_RESPONSE, "{done_indexes:?}");
+            assert_eq!(tools_used, MAX_SPICE_TOOL_CALLS_PER_RESPONSE, "{done_indexes:?}");
+            assert_eq!(outputs, first_64_ran(calls), "{done_indexes:?}");
         }
     }
 
-    /// Runs `provider`'s stream and returns how many times `list_datasets` ran, plus the next
-    /// round's function outputs by `call_id`.
-    async fn streamed_list_datasets(
-        provider: &Arc<DoneOrderResponses>,
-    ) -> (usize, HashMap<String, String>) {
-        let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
-        let events = collect_events(
-            ToolUsingResponses::new(
-                Arc::clone(provider) as Arc<dyn Responses>,
-                vec![],
-                vec![Arc::clone(&tool) as Arc<dyn SpiceModelTool>],
-                None,
-            )
-            .responses_stream(request(true))
-            .await
-            .expect("a response stream"),
-        )
-        .await;
-        assert!(
-            events
-                .last()
-                .is_some_and(|event| event["type"] == "response.completed"),
-            "the stream did not finish"
-        );
-        (
-            tool.0.load(Ordering::SeqCst),
-            function_outputs(&provider.input(1)),
-        )
-    }
-
-    /// A repeated `output_item.done`, or a later item that reuses an admitted `call_id`, does not
-    /// run the tool again.
+    /// A call whose `output_item.done` is streamed again does not run again.
     #[tokio::test]
-    async fn streamed_tool_calls_do_not_rerun_a_reused_call_id() {
-        let cycle = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
-        let ran = "[\"taxi_trips\"]";
-
-        // 65 distinct calls. Each of the first 64 done events is repeated, then call 64's once.
-        let repeated_dones: Vec<usize> = (0..cycle)
-            .cycle()
-            .take(cycle * 16)
-            .chain(std::iter::once(cycle))
-            .collect();
-        let (ran_count, outputs) =
-            streamed_list_datasets(&DoneOrderResponses::new(cycle + 1, repeated_dones)).await;
-        let skipped = tool_call_not_run_message(cycle + 1);
-        assert_eq!(ran_count, cycle, "repeated done events");
-        assert_eq!(
-            outputs.get("call_0_0").map(String::as_str),
-            Some(ran),
-            "repeated done events"
-        );
-        assert_eq!(
-            outputs
-                .get(&format!("call_0_{}", cycle - 1))
-                .map(String::as_str),
-            Some(ran),
-            "repeated done events"
-        );
-        assert_eq!(
-            outputs.get(&format!("call_0_{cycle}")).map(String::as_str),
-            Some(skipped.as_str()),
-            "repeated done events"
-        );
-
-        // Four times as many items as the cap, call ids cycling through the first 64, one done
-        // event each. Every item's id is in the runnable set; only the first use of each runs.
-        let reused = cycle * 4;
-        let (ran_count, outputs) = streamed_list_datasets(&DoneOrderResponses::with_id_cycle(
-            reused,
-            (0..reused).collect(),
-            Some(cycle),
-        ))
-        .await;
-        assert_eq!(ran_count, cycle, "reused call ids");
-        assert_eq!(outputs.len(), cycle, "reused call ids");
-        assert_eq!(
-            outputs.get("call_0_0").map(String::as_str),
-            Some(ran),
-            "reused call ids"
-        );
-        assert_eq!(
-            outputs
-                .get(&format!("call_0_{}", cycle - 1))
-                .map(String::as_str),
-            Some(ran),
-            "reused call ids"
-        );
+    async fn a_streamed_call_ended_again_does_not_run_again() {
+        let calls = MAX_SPICE_TOOL_CALLS_PER_RESPONSE + 1;
+        // Every end, 16 times over.
+        let done_indexes: Vec<usize> = (0..calls).cycle().take(calls * 16).collect();
+        let provider = DoneOrderResponses::new(calls, done_indexes);
+        let (ran, tools_used, outputs) = first_round(&provider, true).await;
+        assert_eq!(ran, MAX_SPICE_TOOL_CALLS_PER_RESPONSE);
+        assert_eq!(tools_used, MAX_SPICE_TOOL_CALLS_PER_RESPONSE);
+        assert_eq!(outputs, first_64_ran(calls));
     }
 
-    /// The first 64 items share one admitted `call_id`, so the tool runs once. The next 64 have
-    /// distinct ids and are not run. `tools_used` counts the dispatch, not those rejections.
+    /// A call past the limit is not counted in the request's tools used.
     #[tokio::test]
-    async fn streamed_reused_admitted_id_does_not_count_rejected_calls() {
-        let cap = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
-        let calls = cap * 2;
-        let provider = DoneOrderResponses::with_shared_head(calls, (0..calls).collect(), cap);
-        let extension = ModelContextExtension::new();
-        let context = Arc::new(RequestContext::builder(Protocol::Http).build());
-        context.insert_extension(extension.clone());
-
-        let (ran_count, outputs) = context
-            .scope(async move { streamed_list_datasets(&provider).await })
-            .await;
-
-        let ran = "[\"taxi_trips\"]";
-        let skipped = tool_call_not_run_message(calls);
-        assert_eq!(ran_count, 1);
-        assert_eq!(extension.tools_used(), 1);
-        assert_eq!(outputs.len(), cap + 1);
-        assert_eq!(outputs.get("call_0_0").map(String::as_str), Some(ran));
-        assert_eq!(
-            outputs.get(&format!("call_0_{cap}")).map(String::as_str),
-            Some(skipped.as_str())
-        );
-        assert_eq!(
-            outputs
-                .get(&format!("call_0_{}", calls - 1))
-                .map(String::as_str),
-            Some(skipped.as_str())
-        );
-    }
-
-    /// One non-streaming round: how many times `list_datasets` ran, the `tools_used` count, and
-    /// the next round's function outputs by `call_id`.
-    async fn requested_list_datasets(
-        provider: &Arc<DoneOrderResponses>,
-    ) -> (usize, usize, HashMap<String, String>) {
-        let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
-        let extension = ModelContextExtension::new();
-        let context = Arc::new(RequestContext::builder(Protocol::Http).build());
-        context.insert_extension(extension.clone());
-        let provider = Arc::clone(provider);
-        let (ran_count, outputs) = context
-            .scope(async move {
-                let model = ToolUsingResponses::new(
-                    Arc::clone(&provider) as Arc<dyn Responses>,
-                    vec![],
-                    vec![Arc::clone(&tool) as Arc<dyn SpiceModelTool>],
-                    None,
-                );
-                model
-                    .responses_request(request(false))
-                    .await
-                    .expect("a response");
-                (
-                    tool.0.load(Ordering::SeqCst),
-                    function_outputs(&provider.input(1)),
-                )
-            })
-            .await;
-        (ran_count, extension.tools_used(), outputs)
-    }
-
-    /// A non-streaming item past the cap that reuses an earlier `call_id` does not replace that
-    /// call's result with the not-run error. A repeated id still uses up one of the round's run
-    /// slots, so 64 copies of one id followed by 64 distinct ids run the tool once.
-    #[tokio::test]
-    async fn nonstreamed_reused_call_id_keeps_its_result_past_the_limit() {
-        let cap = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
-        let ran = "[\"taxi_trips\"]";
-
-        let tail = cap + 1;
-        let (dispatches, tools_used, outputs) = requested_list_datasets(
-            &DoneOrderResponses::with_id_cycle(tail, Vec::new(), Some(cap)),
-        )
-        .await;
-        assert_eq!(dispatches, cap, "reused tail");
-        assert_eq!(tools_used, cap, "reused tail");
-        assert_eq!(
-            outputs.get("call_0_0").map(String::as_str),
-            Some(ran),
-            "reused tail"
-        );
-        assert!(
-            outputs
-                .values()
-                .all(|output| output != &tool_call_not_run_message(tail)),
-            "reused tail replaced a result: {outputs:?}"
-        );
-
-        let head = cap * 2;
-        let skipped = tool_call_not_run_message(head);
-        let (dispatches, tools_used, outputs) =
-            requested_list_datasets(&DoneOrderResponses::with_shared_head(head, Vec::new(), cap))
-                .await;
-        assert_eq!(dispatches, 1, "shared head");
-        assert_eq!(tools_used, 1, "shared head");
-        assert_eq!(outputs.len(), cap + 1, "shared head");
-        assert_eq!(
-            outputs.get("call_0_0").map(String::as_str),
-            Some(ran),
-            "shared head"
-        );
-        assert_eq!(
-            outputs.get(&format!("call_0_{cap}")).map(String::as_str),
-            Some(skipped.as_str()),
-            "shared head"
-        );
-    }
-
-    /// Records the argument string of each `list_datasets` call.
-    struct RecordingList(Mutex<Vec<String>>);
-
-    #[async_trait]
-    impl SpiceModelTool for RecordingList {
-        fn name(&self) -> Cow<'_, str> {
-            "list_datasets".into()
-        }
-
-        fn description(&self) -> Option<Cow<'_, str>> {
-            None
-        }
-
-        fn parameters(&self) -> Option<Value> {
-            None
-        }
-
-        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-            self.0.lock().push(arg.to_string());
-            Ok(json!(["taxi_trips"]))
-        }
-    }
-
-    /// A later item that reuses an admitted `call_id`, and whose `output_item.done` arrives
-    /// first, does not run its own arguments. The dispatch is the first admitted item's.
-    #[tokio::test]
-    async fn streamed_reordered_reused_id_runs_the_first_admitted_arguments() {
-        let cap = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
-        let calls = cap + 1;
-        let mut done_indexes = vec![cap];
-        done_indexes.extend(0..cap);
-        let provider = DoneOrderResponses::with_indexed_cycle(calls, done_indexes, cap);
-        let tool = Arc::new(RecordingList(Mutex::new(Vec::new())));
-        let events = collect_events(
-            ToolUsingResponses::new(
-                Arc::clone(&provider) as Arc<dyn Responses>,
-                vec![],
-                vec![Arc::clone(&tool) as Arc<dyn SpiceModelTool>],
-                None,
-            )
-            .responses_stream(request(true))
-            .await
-            .expect("a response stream"),
-        )
-        .await;
-        assert!(
-            events
-                .last()
-                .is_some_and(|event| event["type"] == "response.completed")
-        );
-
-        let recorded = tool.0.lock().clone();
-        assert_eq!(recorded.len(), cap);
-        assert_eq!(recorded[0], r#"{"n":0}"#);
-        assert!(
-            !recorded
-                .iter()
-                .any(|arg| arg == &format!(r#"{{"n":{cap}}}"#)),
-            "ran the later item's arguments: {recorded:?}"
-        );
-        let outputs = function_outputs(&provider.input(1));
-        assert_eq!(
-            outputs.get("call_0_0").map(String::as_str),
-            Some("[\"taxi_trips\"]")
-        );
+    async fn tools_used_counts_only_the_calls_that_ran() {
+        let calls = MAX_SPICE_TOOL_CALLS_PER_RESPONSE + 1;
+        let provider = DoneOrderResponses::new(calls, Vec::new());
+        let (ran, tools_used, outputs) = first_round(&provider, false).await;
+        assert_eq!(ran, MAX_SPICE_TOOL_CALLS_PER_RESPONSE);
+        assert_eq!(tools_used, MAX_SPICE_TOOL_CALLS_PER_RESPONSE);
+        assert_eq!(outputs, first_64_ran(calls));
     }
 }

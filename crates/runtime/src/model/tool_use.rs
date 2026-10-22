@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use std::pin::Pin;
@@ -56,12 +56,10 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 
 /// The most Spice tool calls Spice runs from one model response.
 ///
-/// The provider decides how many tool calls a response makes, and every call Spice runs is a
-/// query or search plus its `runtime.task_history` rows, so without a bound one small request
-/// could make a misbehaving or compromised provider run any number of them. A model that calls
-/// tools in parallel makes a handful of calls per response, rarely more than a few dozen; 64
-/// leaves ample room for that while bounding a request at 64 calls per round of
-/// `tool_recursion_limit`. The calls past it are answered with
+/// The provider decides how many tool calls a response makes, and each one Spice runs is a query
+/// or search, so without a bound one request could run any number of them. A model that calls
+/// tools in parallel makes a handful of calls per response; 64 leaves room for that. The first 64
+/// calls, in the order the model made them, run. Each later call is answered with
 /// [`tool_call_not_run_message`] rather than dropped, because the model's next round needs a
 /// result for every call it made.
 pub(crate) const MAX_SPICE_TOOL_CALLS_PER_RESPONSE: usize = 64;
@@ -88,31 +86,6 @@ fn tool_calls_over_limit_warning(model: &str, requested: usize) -> String {
 pub(crate) fn warn_if_over_tool_call_limit(model: &str, requested: usize) {
     if requested > MAX_SPICE_TOOL_CALLS_PER_RESPONSE {
         tracing::warn!("{}", tool_calls_over_limit_warning(model, requested));
-    }
-}
-
-/// How many Spice tool calls one model response may still run.
-///
-/// A streamed response shares one budget across its choices, so a later choice does not start
-/// the allowance over. The next round of the tool loop is its own response and builds its own.
-struct SpiceToolBudget {
-    /// Runs still available in this response.
-    runs_left: usize,
-    /// Spice tool calls this response has made. The warning and the not-run message use it.
-    /// A caller that passes one choice of a larger response sets this to the whole response
-    /// before the calls run; otherwise it stays 0 and becomes the size of the batch.
-    made: usize,
-    /// Whether this response has already logged the over-limit warning.
-    warned: bool,
-}
-
-impl SpiceToolBudget {
-    const fn for_response() -> Self {
-        Self {
-            runs_left: MAX_SPICE_TOOL_CALLS_PER_RESPONSE,
-            made: 0,
-            warned: false,
-        }
     }
 }
 
@@ -279,27 +252,23 @@ impl ToolUsingChat {
     /// `assistant_text` is the text the model wrote beside the tool calls. It is replayed with the
     /// calls: a model that does not see it does not know it already said it, and says it again.
     ///
-    /// Only the first [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] Spice tool calls of this response
-    /// run. `budget` is that allowance: a streamed response passes the same one for every
-    /// choice, and each call after it is used up gets a [`tool_call_not_run_message`] result.
-    /// A repeated call id counts toward that allowance and is not run again. `handled` is the
-    /// ids this response has already admitted, in the order the model made them. `model` names
-    /// the model in the warning that says so.
+    /// `calls_made` is how many Spice tool calls the response from model `model` made before
+    /// these, and is advanced past them. A streamed response with several choices passes the same
+    /// count for each, so the first [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] calls of the whole
+    /// response run and each later one gets [`tool_call_not_run_message`] as its result.
     ///
     /// Returns
     /// - `None` if no spiced runtime tools were used. Note: external tools may still have been
     ///   requested.
     /// - `Some(messages)` if spiced runtime tools were used: the assistant tool-call message,
-    ///   then one tool message per distinct call id. An empty list means every call was a repeat
-    ///   of an id already admitted, so there is no new message for the model. Appended to the
-    ///   round's messages, they are ready to be reprocessed by the model.
+    ///   then one tool message per call. Appended to the round's messages, they are ready to be
+    ///   reprocessed by the model.
     async fn process_tool_calls_and_run_spice_tools(
         &self,
         model: &str,
         assistant_text: &str,
         requested_tools: Vec<ChatCompletionMessageToolCall>,
-        budget: &mut SpiceToolBudget,
-        handled: &mut HashSet<String>,
+        calls_made: &mut usize,
     ) -> Result<Option<Vec<ChatCompletionRequestMessage>>, OpenAIError> {
         let spiced_tools = requested_tools
             .iter()
@@ -319,31 +288,30 @@ impl ToolUsingChat {
             return Ok(None);
         }
 
-        if budget.made < spiced_tools.len() {
-            budget.made = spiced_tools.len();
+        // Tell model the assistant has these tools
+        let mut assistant_message = ChatCompletionRequestAssistantMessageArgs::default();
+        assistant_message.tool_calls(
+            spiced_tools
+                .iter()
+                .map(|t| ChatCompletionMessageToolCalls::Function(t.clone()))
+                .collect::<Vec<_>>(),
+        ); // TODO - should this include non-spiced tools?
+        if !assistant_text.is_empty() {
+            assistant_message.content(assistant_text);
         }
-        if !budget.warned {
-            warn_if_over_tool_call_limit(model, budget.made);
-            budget.warned = budget.made > MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
-        }
+        let assistant_message: ChatCompletionRequestMessage = assistant_message.build()?.into();
+
+        let first = *calls_made;
+        *calls_made += spiced_tools.len();
+        warn_if_over_tool_call_limit(model, *calls_made);
         let mut tool_and_response_content = Vec::with_capacity(spiced_tools.len());
-        let mut ran = 0usize;
-        for t in &spiced_tools {
-            // A later item that reuses a call id still takes one of the round's slots. It does
-            // not run, and it does not get a second result: the id already has one.
-            let repeat = !handled.insert(t.id.clone());
-            if budget.runs_left == 0 {
-                if !repeat {
-                    let not_run = Value::String(tool_call_not_run_message(budget.made));
-                    tool_and_response_content.push((t, not_run));
-                }
+        let mut ran = 0;
+        for (position, t) in (first..).zip(spiced_tools) {
+            if position >= MAX_SPICE_TOOL_CALLS_PER_RESPONSE {
+                let not_run = Value::String(tool_call_not_run_message(*calls_made));
+                tool_and_response_content.push((t, not_run));
                 continue;
             }
-            budget.runs_left -= 1;
-            if repeat {
-                continue;
-            }
-            ran += 1;
             tracing::info!(
                 target: "task_history",
                 progress = Progress::log()
@@ -353,26 +321,10 @@ impl ToolUsingChat {
                     .to_jsonl(),
             );
 
-            let content = self.call_tool(t).await;
+            let content = self.call_tool(&t).await;
             tool_and_response_content.push((t, content));
+            ran += 1;
         }
-        if tool_and_response_content.is_empty() {
-            return Ok(Some(Vec::new()));
-        }
-
-        // Tell model the assistant has these tools. One entry per call id: a repeated id is not
-        // listed again.
-        let mut assistant_message = ChatCompletionRequestAssistantMessageArgs::default();
-        assistant_message.tool_calls(
-            tool_and_response_content
-                .iter()
-                .map(|(t, _)| ChatCompletionMessageToolCalls::Function((*t).clone()))
-                .collect::<Vec<_>>(),
-        ); // TODO - should this include non-spiced tools?
-        if !assistant_text.is_empty() {
-            assistant_message.content(assistant_text);
-        }
-        let assistant_message: ChatCompletionRequestMessage = assistant_message.build()?.into();
 
         tracing::debug!(
             "Ran tools, and retrieved responses: {:?}",
@@ -454,20 +406,12 @@ impl ToolUsingChat {
                 })
                 .collect();
 
-            let mut budget = SpiceToolBudget::for_response();
-            let mut handled_call_ids = HashSet::new();
             match self
-                .process_tool_calls_and_run_spice_tools(
-                    &req.model,
-                    &text,
-                    tool_calls,
-                    &mut budget,
-                    &mut handled_call_ids,
-                )
+                .process_tool_calls_and_run_spice_tools(&req.model, &text, tool_calls, &mut 0)
                 .await?
             {
                 // New messages means we have run spice tools locally, ready to recall model.
-                Some(round) if !round.is_empty() => {
+                Some(round) => {
                     let mut messages = req.messages;
                     messages.extend_from_slice(&round);
                     let next = self
@@ -487,7 +431,7 @@ impl ToolUsingChat {
                         hidden_messages,
                     })
                 }
-                _ => Ok(ToolLoopResponse::without_tools(resp)),
+                None => Ok(ToolLoopResponse::without_tools(resp)),
             }
         })
         .await
@@ -1006,11 +950,10 @@ fn make_a_stream(
                 let tool_call_states: Arc<
                     Mutex<BTreeMap<(i32, i32), ChatCompletionMessageToolCall>>,
                 > = Arc::new(Mutex::new(BTreeMap::new()));
-                // One allowance for this response. Each choice finish spends it, and a call id
-                // already handled is not run or sent to the model again. A recursive round calls
-                // `make_a_stream` of its own and gets a new allowance.
-                let mut budget = SpiceToolBudget::for_response();
-                let mut handled_call_ids = HashSet::new();
+                // The Spice tool calls this response's choices have made, so the cap on them is
+                // one for the whole response. A later round streams from `make_a_stream` of its
+                // own.
+                let mut spice_calls_made = 0;
 
                 let mut chat_output = String::new();
                 // Usage is withheld from every round and sent once, last, as the total across rounds.
@@ -1123,12 +1066,10 @@ fn make_a_stream(
                                 &req.model,
                                 &round_text,
                                 tool_calls_to_process,
-                                &mut budget,
-                                &mut handled_call_ids,
+                                &mut spice_calls_made,
                             )
                             .await
                         {
-                            Ok(Some(round)) if round.is_empty() => continue,
                             Ok(Some(round)) => round,
                             Ok(None) => {
                                 // No Spice tool among the calls: they are the client's, so it
@@ -2463,11 +2404,10 @@ mod tests {
         }
     }
 
-    /// Two choices of 64 Spice calls in one streamed response run 64 calls in all. The second
-    /// choice does not run the first choice's calls again, and its own calls are the ones that
-    /// do not run.
+    /// Two choices of 64 Spice calls in one streamed response run 64 calls in all: the first
+    /// choice's calls run, and the second choice's do not.
     #[tokio::test]
-    async fn streamed_choices_share_one_tool_call_budget() {
+    async fn streamed_choices_share_the_tool_call_limit() {
         let provider = TwoChoiceSql::new();
         let tool = Arc::new(CountingSql(AtomicUsize::new(0)));
         let model = ToolUsingChat::new(
@@ -2513,304 +2453,6 @@ mod tests {
         let mut choice_1 = vec!["user: A".to_string(), assistant(1)];
         choice_1.extend(tool_results(1, &not_run));
         assert_eq!(provider.messages(2), choice_1);
-    }
-
-    /// One streamed choice: the first [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] calls share `call_shared`,
-    /// and the next 64 each have their own id. Later rounds answer `done`.
-    struct SharedHeadSql {
-        requests: parking_lot::Mutex<Vec<CreateChatCompletionRequest>>,
-    }
-
-    impl SharedHeadSql {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                requests: parking_lot::Mutex::new(Vec::new()),
-            })
-        }
-
-        fn messages(&self, index: usize) -> Vec<String> {
-            summary(&self.requests.lock()[index].messages)
-        }
-    }
-
-    fn shared_head_calls() -> Vec<Value> {
-        let cap = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
-        (0..cap * 2)
-            .map(|index| {
-                let id = if index < cap {
-                    "call_shared".to_string()
-                } else {
-                    format!("call_{index}")
-                };
-                json!({
-                    "index": index,
-                    "id": id,
-                    "type": "function",
-                    "function": { "name": "sql", "arguments": "{}" },
-                })
-            })
-            .collect()
-    }
-
-    #[async_trait]
-    impl Chat for SharedHeadSql {
-        fn as_sql(&self) -> Option<&dyn SqlGeneration> {
-            None
-        }
-
-        async fn chat_request(
-            &self,
-            req: CreateChatCompletionRequest,
-        ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-            self.requests.lock().push(req);
-            Ok(serde_json::from_value(json!({
-                "id": "scripted", "object": "chat.completion", "created": 0, "model": "scripted",
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": "done" },
-                    "finish_reason": "stop",
-                }],
-            }))
-            .expect("a valid response"))
-        }
-
-        async fn chat_stream(
-            &self,
-            req: CreateChatCompletionRequest,
-        ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-            let round = {
-                let mut requests = self.requests.lock();
-                requests.push(req);
-                requests.len() - 1
-            };
-            let chunks = if round == 0 {
-                vec![
-                    Ok(choice_chunk(
-                        0,
-                        &json!({ "role": "assistant", "tool_calls": shared_head_calls() }),
-                        None,
-                    )),
-                    Ok(choice_chunk(0, &json!({}), Some("tool_calls"))),
-                ]
-            } else {
-                vec![
-                    Ok(choice_chunk(
-                        0,
-                        &json!({ "role": "assistant", "content": "done" }),
-                        None,
-                    )),
-                    Ok(choice_chunk(0, &json!({}), Some("stop"))),
-                ]
-            };
-            Ok(Box::pin(futures::stream::iter(chunks)))
-        }
-    }
-
-    /// 64 streamed chat items that share one id count as the whole allowance. The 64 distinct
-    /// ids after them do not run. The shared id runs once.
-    #[tokio::test]
-    async fn streamed_repeated_call_id_counts_toward_the_cutoff() {
-        let cap = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
-        let provider = SharedHeadSql::new();
-        let tool = Arc::new(CountingSql(AtomicUsize::new(0)));
-        let model = ToolUsingChat::new(
-            Arc::clone(&provider) as Arc<dyn Chat>,
-            vec![Arc::clone(&tool) as Arc<dyn SpiceModelTool>],
-            None,
-        );
-
-        let text = streamed_turn(&model, vec![user("A")])
-            .await
-            .expect("the stream ends");
-        assert_eq!(text, "done");
-        assert_eq!(tool.0.load(Ordering::SeqCst), 1, "dispatches");
-
-        let ran = json!([{"rows": 3}]).to_string();
-        let not_run = json!(tool_call_not_run_message(cap * 2)).to_string();
-        let shared_line = format!("tool call_shared: {ran}");
-        let past_cutoff = format!("tool call_{cap}: {not_run}");
-        let messages = provider.messages(1);
-        assert_eq!(
-            messages
-                .iter()
-                .find(|line| line.starts_with("tool call_shared:"))
-                .map(String::as_str),
-            Some(shared_line.as_str())
-        );
-        assert_eq!(
-            messages
-                .iter()
-                .find(|line| line.starts_with(&format!("tool call_{cap}:")))
-                .map(String::as_str),
-            Some(past_cutoff.as_str())
-        );
-        assert!(
-            messages.iter().all(|line| {
-                !line.starts_with("tool call_")
-                    || line.starts_with("tool call_shared:")
-                    || line.ends_with(&not_run)
-            }),
-            "a distinct id ran: {messages:?}"
-        );
-    }
-
-    /// Records the argument string of each `sql` call.
-    struct RecordingSql(parking_lot::Mutex<Vec<String>>);
-
-    #[async_trait]
-    impl SpiceModelTool for RecordingSql {
-        fn name(&self) -> Cow<'_, str> {
-            "sql".into()
-        }
-
-        fn description(&self) -> Option<Cow<'_, str>> {
-            None
-        }
-
-        fn parameters(&self) -> Option<Value> {
-            None
-        }
-
-        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-            self.0.lock().push(arg.to_string());
-            Ok(json!([{ "rows": 3 }]))
-        }
-    }
-
-    /// First response interleaves two choices: choice 1 has only a prefix of its arguments when
-    /// choice 0 finishes, then choice 1's arguments and finish arrive. Later responses answer
-    /// `done`.
-    struct InterleavedSql {
-        requests: parking_lot::Mutex<Vec<CreateChatCompletionRequest>>,
-    }
-
-    impl InterleavedSql {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                requests: parking_lot::Mutex::new(Vec::new()),
-            })
-        }
-
-        fn messages(&self, index: usize) -> Vec<String> {
-            summary(&self.requests.lock()[index].messages)
-        }
-    }
-
-    #[async_trait]
-    impl Chat for InterleavedSql {
-        fn as_sql(&self) -> Option<&dyn SqlGeneration> {
-            None
-        }
-
-        async fn chat_request(
-            &self,
-            req: CreateChatCompletionRequest,
-        ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-            self.requests.lock().push(req);
-            Ok(serde_json::from_value(json!({
-                "id": "scripted", "object": "chat.completion", "created": 0, "model": "scripted",
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": "done" },
-                    "finish_reason": "stop",
-                }],
-            }))
-            .expect("a valid response"))
-        }
-
-        async fn chat_stream(
-            &self,
-            req: CreateChatCompletionRequest,
-        ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-            let round = {
-                let mut requests = self.requests.lock();
-                requests.push(req);
-                requests.len() - 1
-            };
-            let chunks = if round == 0 {
-                vec![
-                    Ok(choice_chunk(
-                        1,
-                        &json!({
-                            "tool_calls": [{
-                                "index": 0, "id": "call_1", "type": "function",
-                                "function": { "name": "sql", "arguments": "{\"n\":" },
-                            }]
-                        }),
-                        None,
-                    )),
-                    Ok(choice_chunk(
-                        0,
-                        &json!({
-                            "tool_calls": [{
-                                "index": 0, "id": "call_0", "type": "function",
-                                "function": { "name": "sql", "arguments": "{\"n\":1}" },
-                            }]
-                        }),
-                        None,
-                    )),
-                    Ok(choice_chunk(0, &json!({}), Some("tool_calls"))),
-                    Ok(choice_chunk(
-                        1,
-                        &json!({
-                            "tool_calls": [{
-                                "index": 0,
-                                "function": { "arguments": "2}" },
-                            }]
-                        }),
-                        None,
-                    )),
-                    Ok(choice_chunk(1, &json!({}), Some("tool_calls"))),
-                ]
-            } else {
-                vec![
-                    Ok(choice_chunk(
-                        0,
-                        &json!({ "role": "assistant", "content": "done" }),
-                        None,
-                    )),
-                    Ok(choice_chunk(0, &json!({}), Some("stop"))),
-                ]
-            };
-            Ok(Box::pin(futures::stream::iter(chunks)))
-        }
-    }
-
-    /// A choice that finishes while another choice is still streaming does not run that other
-    /// choice's partial call, and does not consume its id. The call runs when its own choice
-    /// finishes, with the arguments it finished with.
-    #[tokio::test]
-    async fn streamed_interleaved_choices_run_when_each_choice_finishes() {
-        let provider = InterleavedSql::new();
-        let tool = Arc::new(RecordingSql(parking_lot::Mutex::new(Vec::new())));
-        let model = ToolUsingChat::new(
-            Arc::clone(&provider) as Arc<dyn Chat>,
-            vec![Arc::clone(&tool) as Arc<dyn SpiceModelTool>],
-            None,
-        );
-
-        let text = streamed_turn(&model, vec![user("A")])
-            .await
-            .expect("the stream ends");
-        assert_eq!(text, "donedone");
-        assert_eq!(tool.0.lock().as_slice(), [r#"{"n":1}"#, r#"{"n":2}"#]);
-        assert_eq!(provider.requests.lock().len(), 3);
-        assert_eq!(
-            provider.messages(1),
-            [
-                "user: A".to_string(),
-                "assistant calls sql#call_0".to_string(),
-                r#"tool call_0: [{"rows":3}]"#.to_string(),
-            ]
-        );
-        assert_eq!(
-            provider.messages(2),
-            [
-                "user: A".to_string(),
-                "assistant calls sql#call_1".to_string(),
-                r#"tool call_1: [{"rows":3}]"#.to_string(),
-            ]
-        );
     }
 
     /// A request context, authenticated with `api_key` if there is one.

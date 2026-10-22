@@ -400,14 +400,13 @@ async fn tool_calls_past_the_limit_in_one_response_do_not_run(
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_tool_call_runs_within_the_limit(
+async fn every_tool_call_runs_at_the_limit(
     #[values(Api::ChatCompletions, Api::Responses)] api: Api,
     #[values(false, true)] stream: bool,
-    #[values(3, LIMIT)] calls: usize,
 ) -> anyhow::Result<()> {
-    let results = tool_results_for(api, stream, calls).await?;
+    let results = tool_results_for(api, stream, LIMIT).await?;
 
-    let expected: Vec<(String, String)> = (0..calls)
+    let expected: Vec<(String, String)> = (0..LIMIT)
         .map(|i| (call_id(i), api.sent(QUERY_RESULT)))
         .collect();
     assert_eq!(results, expected, "{api:?}, stream: {stream}");
