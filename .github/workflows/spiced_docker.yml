@@ -35,6 +35,15 @@ on:
         required: false
         type: string
         default: all
+      # Declared only here, so a direct dispatch reads it as empty. A called
+      # run inherits its caller's event name, which is `workflow_dispatch`
+      # when build_and_release is dispatched on a tag, so the event name
+      # alone cannot tell a call from a manual run.
+      allow_cuda:
+        description: Allow the CUDA image (needs a CUDA binary on the release)
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       release_tag:
@@ -111,6 +120,7 @@ jobs:
           INPUT_PUBLISH: ${{ inputs.publish && 'true' || 'false' }}
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
           INPUT_TAG_LATEST: ${{ inputs.tag_latest }}
+          INPUT_ALLOW_CUDA: ${{ inputs.allow_cuda }}
           RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
@@ -126,8 +136,11 @@ jobs:
             target_input="${INPUT_TARGET}"
             publish_flag="${INPUT_PUBLISH}"
             release_tag_input="${INPUT_RELEASE_TAG}"
-            # CUDA images are nightly-only: only a manual run builds them.
-            if [ "$event_name" = "workflow_dispatch" ]; then
+            # CUDA images are nightly-only. A direct dispatch may build one;
+            # a call builds one only when its caller asks.
+            if [ -n "${INPUT_ALLOW_CUDA}" ]; then
+              allow_cuda="${INPUT_ALLOW_CUDA}"
+            elif [ "$event_name" = "workflow_dispatch" ]; then
               allow_cuda=true
             else
               allow_cuda=false
