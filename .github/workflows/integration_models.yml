@@ -507,9 +507,51 @@ jobs:
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+  # Rejected AWS keys fail every Bedrock test the same way, each after a 120-second readiness
+  # wait. This asks AWS once, before the build finishes, and names the cause.
+  check-bedrock-credentials:
+    name: Check Bedrock credentials
+    if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Ask AWS STS whether the Bedrock access key is valid
+        shell: bash
+        env:
+          AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
+          AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
+        run: |
+          set -uo pipefail
+          if [ -z "$AWS_BEDROCK_KEY" ] || [ -z "$AWS_BEDROCK_SECRET" ]; then
+            echo "::error::AWS_BEDROCK_KEY or AWS_BEDROCK_SECRET is empty, so the Bedrock tests cannot authenticate. Set both repository secrets."
+            exit 1
+          fi
+          curl --version | head -n 1
+          body=$(mktemp)
+          # GetCallerIdentity needs no IAM permission, so only an invalid key pair fails it. The
+          # key pair reaches curl on stdin, which keeps it out of the process list.
+          status=$(printf 'user = "%s:%s"\n' "$AWS_BEDROCK_KEY" "$AWS_BEDROCK_SECRET" |
+            curl --config - --silent --show-error --max-time 30 --retry 3 \
+              --aws-sigv4 'aws:amz:us-east-1:sts' --output "$body" --write-out '%{http_code}' \
+              'https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15')
+          curl_exit=$?
+          # The body is never printed: a successful one names the AWS account.
+          code=$(sed -n 's:.*<Code>\([A-Za-z]*\)</Code>.*:\1:p' "$body" | head -n 1)
+          rm -f "$body"
+          if [ "$curl_exit" -eq 0 ] && [ "$status" = 200 ]; then
+            echo "AWS accepted the Bedrock credentials."
+          elif [ "$status" = 403 ] && { [ "$code" = InvalidClientTokenId ] || [ "$code" = SignatureDoesNotMatch ]; }; then
+            echo "::error::AWS rejected the Bedrock credentials (${code}): AWS_BEDROCK_KEY and AWS_BEDROCK_SECRET are not a valid access key pair, so every Bedrock test would fail to authenticate and they are not run. Replace both repository secrets with a working key pair."
+            exit 1
+          else
+            # No verdict on the key pair, so the tests still run and report for themselves.
+            echo "::warning::Could not check the Bedrock credentials (curl exit ${curl_exit}, HTTP ${status}${code:+, ${code}}). Running the Bedrock tests anyway."
+          fi
+
   test-bedrock:
     name: Test Bedrock Models
-    needs: build
+    needs: [build, check-bedrock-credentials]
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     # The large pool for the same reason as `test-models`: a Mac mini cannot
     # reliably start this archive's test binary.
