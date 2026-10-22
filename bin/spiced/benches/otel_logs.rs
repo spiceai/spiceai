@@ -28,6 +28,9 @@ limitations under the License.
 //! - `off, in query` and `armed, in query`: the same, with the event logged
 //!   inside a query's trace span and task-history span, where the record also
 //!   looks up the query's trace id.
+//! - `armed, executing`: export armed, with the event logged inside the
+//!   query's task-history span alone, as the query runtime logs while the plan
+//!   executes, where the record looks up the trace id its row is written under.
 //!
 //! The arms are interleaved round by round, so drift on the machine lands on all
 //! of them. Each round logs a burst and then pauses, which lets the batch
@@ -105,10 +108,21 @@ fn armed(export_runtime: &tokio::runtime::Runtime) -> (LogsSink, SdkLoggerProvid
     (sink, provider)
 }
 
+/// Which of a query's spans the events are logged in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Neither: outside any query.
+    None,
+    /// The trace span and the task span, as the query's future is instrumented.
+    Query,
+    /// The task span alone, as the query runtime polls the plan.
+    Executing,
+}
+
 struct Arm {
     name: &'static str,
     dispatch: Dispatch,
-    in_query: bool,
+    scope: Scope,
     samples: Vec<u64>,
 }
 
@@ -117,15 +131,17 @@ fn burst(arm: &mut Arm) {
         let request = RequestContext::builder(Protocol::Http)
             .with_client_trace_id(Some(Arc::from("4bf92f3577b34da6a3ce929d0e0e4736")))
             .build();
-        let task = arm
-            .in_query
+        let task = (arm.scope != Scope::None)
             .then(|| tracing::info_span!(target: "task_history", "sql_query"));
         let trace = task
             .as_ref()
             .map(|task| correlation::begin_task_trace(task, &request));
         // Entered the way a query's future is instrumented: the trace span
         // outside, the task span inside.
-        let _trace = trace.as_ref().map(tracing::Span::enter);
+        let _trace = trace
+            .as_ref()
+            .filter(|_| arm.scope == Scope::Query)
+            .map(tracing::Span::enter);
         let _task = task.as_ref().map(tracing::Span::enter);
         for i in 0..EVENTS_PER_ROUND {
             let start = Instant::now();
@@ -155,36 +171,43 @@ fn main() {
         .expect("export runtime");
     let (armed_sink, armed_provider) = armed(&export_runtime);
     let (armed_query_sink, armed_query_provider) = armed(&export_runtime);
+    let (armed_executing_sink, armed_executing_provider) = armed(&export_runtime);
 
     let mut arms = vec![
         Arm {
             name: "off",
             dispatch: subscriber(None, false),
-            in_query: false,
+            scope: Scope::None,
             samples: Vec::new(),
         },
         Arm {
             name: "unarmed",
             dispatch: subscriber(Some(LogsSink::default()), false),
-            in_query: false,
+            scope: Scope::None,
             samples: Vec::new(),
         },
         Arm {
             name: "armed",
             dispatch: subscriber(Some(armed_sink), false),
-            in_query: false,
+            scope: Scope::None,
             samples: Vec::new(),
         },
         Arm {
             name: "off, in query",
             dispatch: subscriber(None, true),
-            in_query: true,
+            scope: Scope::Query,
             samples: Vec::new(),
         },
         Arm {
             name: "armed, in query",
             dispatch: subscriber(Some(armed_query_sink), true),
-            in_query: true,
+            scope: Scope::Query,
+            samples: Vec::new(),
+        },
+        Arm {
+            name: "armed, executing",
+            dispatch: subscriber(Some(armed_executing_sink), true),
+            scope: Scope::Executing,
             samples: Vec::new(),
         },
     ];
@@ -217,5 +240,6 @@ fn main() {
 
     let _ = armed_provider.shutdown();
     let _ = armed_query_provider.shutdown();
+    let _ = armed_executing_provider.shutdown();
     export_runtime.shutdown_timeout(Duration::from_secs(1));
 }

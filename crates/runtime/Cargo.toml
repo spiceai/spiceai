@@ -102,6 +102,8 @@ linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 evaluate-api = { path = "../evaluate-api" }
 evaluate-chat = { path = "../evaluate-chat" }
+messages-api = { path = "../messages-api" }
+messages-chat = { path = "../messages-chat" }
 model-capabilities = { path = "../model-capabilities" }
 runtime-decide = { path = "../runtime-decide" }
 mediatype = "0.21.0"
