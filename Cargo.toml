@@ -52,6 +52,7 @@ members = [
     "crates/podswatcher",
     "crates/cayenne",
     "crates/runtime-object-store",
+    "crates/runtime-otel-push",
     "crates/runtime-state-location",
     "crates/package",
     "crates/runtime",
@@ -123,6 +124,7 @@ members = [
     "tools/spiceschema",
     "tools/spicepod-validator",
     "tools/spidapter",
+    "tools/spicescript",
     "tools/testoperator",
     "tools/chbench-driver",
     "tools/parsley",
@@ -252,12 +254,12 @@ bigdecimal = "0.4.7"
 blake3 = "1.5"
 byte-unit = "5.1.4"
 bytes = "1.10.0"
-candle = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-core" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-kernels" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-metal-kernels" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-nn" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-transformers" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-core" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-kernels" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-metal-kernels" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-nn" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-transformers" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
 charset = "0.1.5"
 # AEAD for the at-rest delivered-secrets cache. Already in the tree via `hpke`,
 # which uses the same primitive for the sealed-secret wire format.
@@ -416,6 +418,11 @@ roaring = "0.11"
 rusqlite = { version = "0.40", features = ["bundled-decimal", "chrono"] }
 rust_decimal = "1.42"
 rustls = "0.23"
+# Minimum versions for the transitive certificate-verification crates and their
+# trust data; `spiced` declares them to apply the floors.
+rustls-webpki = { version = "0.103.16", default-features = false }
+webpki-root-certs = "1.0.10"
+webpki-roots = "1.0.10"
 schemars = "1.2.1"
 scylla = "1.4.1"
 secrecy = "0.10.3"
@@ -623,11 +630,11 @@ backoff = { path = "crates/backoff" }
 
 # Redirect candle-core / kernels / nn / transformers to the spiceai fork;
 # this matches the git rev pinned in [workspace.dependencies] above.
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
 # candle-index-select-cu is crates.io-sourced by text-embeddings-inference;
 # point it at the spiceai fork, which builds against candle 0.11.
 candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select-cu.git", rev = "75fc0b689b33a327907d36dd479f7d242640ca71" } # spiceai (candle 0.11)
@@ -651,22 +658,22 @@ iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev 
 # a duplicate-key error.
 
 # arrow-rs 59.3 with spice patches (spiceai-59-patches)
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }        # branch: spiceai-59 (arrow 59.3.0)
-arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }  # branch: spiceai-59 (arrow 59.3.0)
-arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }  # branch: spiceai-59 (arrow 59.3.0)
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }   # branch: spiceai-59 (arrow 59.3.0)
-arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }   # branch: spiceai-59 (arrow 59.3.0)
-arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }   # branch: spiceai-59 (arrow 59.3.0)
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" } # branch: spiceai-59 (arrow 59.3.0)
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }      # branch: spiceai-59 (arrow 59.3.0)
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" }        # branch: spiceai-59 (arrow 59.3.0)
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" }  # branch: spiceai-59 (arrow 59.3.0)
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" }  # branch: spiceai-59 (arrow 59.3.0)
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" } # branch: spiceai-59 (arrow 59.3.0)
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" }   # branch: spiceai-59 (arrow 59.3.0)
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" }    # branch: spiceai-59 (arrow 59.3.0)
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" }   # branch: spiceai-59 (arrow 59.3.0)
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" } # branch: spiceai-59 (arrow 59.3.0)
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" }    # branch: spiceai-59 (arrow 59.3.0)
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" }   # branch: spiceai-59 (arrow 59.3.0)
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" }    # branch: spiceai-59 (arrow 59.3.0)
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" }    # branch: spiceai-59 (arrow 59.3.0)
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" } # branch: spiceai-59 (arrow 59.3.0)
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" } # branch: spiceai-59 (arrow 59.3.0)
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" } # branch: spiceai-59 (arrow 59.3.0)
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" }      # branch: spiceai-59 (arrow 59.3.0)
 
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
 vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)

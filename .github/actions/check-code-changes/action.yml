@@ -79,6 +79,9 @@ inputs:
         # harness runs in `lint-rust` too.
         - 'scripts/rust_guard_common.py'
         - 'scripts/test_rust_guard_common.py'
+        # Decides which test binaries `make nextest` builds; its harness runs in `lint-rust`.
+        - 'scripts/nextest_build_targets.py'
+        - 'scripts/test_nextest_build_targets.py'
         - 'docs/dev/fork_patches.md'
         - 'rust-toolchain'
         - 'rust-toolchain.toml'
