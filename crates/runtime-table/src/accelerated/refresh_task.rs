@@ -1227,11 +1227,8 @@ impl RefreshTask {
         let resource_monitor = self.resource_monitor.clone();
         // A source that stops sending mid-stream fails the refresh instead of
         // holding it, and every refresh queued behind it, for ever.
-        let source = super::source_stall::with_stall_timeout(
-            data_update.data,
-            &self.dataset_name.to_string(),
-            super::source_stall::SOURCE_STALL_TIMEOUT,
-        );
+        let source =
+            super::source_stall::with_stall_timeout(data_update.data, dataset_name.to_string());
         let observed_record_batch_stream = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             stream::unfold(
@@ -5273,11 +5270,14 @@ mod tests {
             "a stalled source is retried on a new connection: {error:?}"
         );
         let counted = attempt_refresh_error(&error).expect("counted on the attempt");
-        assert_eq!(refresh_error_reason(counted), metrics::REFRESH_ERROR_REASON_OTHER);
+        assert_eq!(
+            refresh_error_reason(counted),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
         assert!(
             counted
                 .to_string()
-                .contains("The source of dataset 'source_stalled_refresh' stopped sending data mid-refresh: no data for 600s after it started sending"),
+                .contains("The source of dataset 'source_stalled_refresh' stopped sending data"),
             "{counted}"
         );
         assert_eq!(started.elapsed(), timeout, "fails at the stall timeout");

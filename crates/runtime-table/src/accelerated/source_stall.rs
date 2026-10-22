@@ -37,6 +37,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 use futures::{StreamExt, stream};
+use snafu::Snafu;
 
 /// How long a refresh waits for the next batch once its source has started
 /// sending. A source that streams leaves gaps of seconds between batches; a
@@ -44,62 +45,36 @@ use futures::{StreamExt, stream};
 pub(crate) const SOURCE_STALL_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// The error a stalled refresh fails with.
-#[derive(Debug)]
-pub(crate) struct SourceStalled {
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "The source of dataset '{dataset}' stopped sending data mid-refresh: no data for {}s after it started sending, so the connection is treated as lost and the refresh is retried",
+    SOURCE_STALL_TIMEOUT.as_secs()
+))]
+struct SourceStalled {
     dataset: String,
-    waited: Duration,
 }
 
-impl std::fmt::Display for SourceStalled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "The source of dataset '{}' stopped sending data mid-refresh: no data for {}s after it started sending, so the connection is treated as lost and the refresh is retried",
-            self.dataset,
-            self.waited.as_secs()
-        )
-    }
-}
-
-impl std::error::Error for SourceStalled {}
-
-/// `source`, failing with [`SourceStalled`] when it goes `timeout` without a
-/// batch after its first one.
+/// `source`, failing with a retriable [`SourceStalled`] error when it goes
+/// [`SOURCE_STALL_TIMEOUT`] without a batch after its first one.
 pub(crate) fn with_stall_timeout(
     source: SendableRecordBatchStream,
-    dataset: &str,
-    timeout: Duration,
+    dataset: String,
 ) -> SendableRecordBatchStream {
     let schema = source.schema();
-    let dataset = dataset.to_string();
-    let guarded = stream::unfold(
-        (source, false, false),
-        move |(mut source, started, ended)| {
-            let dataset = dataset.clone();
-            async move {
-                if ended {
-                    return None;
-                }
-                let next = if started {
-                    if let Ok(next) = tokio::time::timeout(timeout, source.next()).await {
-                        next
-                    } else {
-                        let error = DataFusionError::External(Box::new(SourceStalled {
-                            dataset,
-                            waited: timeout,
-                        }));
-                        return Some((
-                            Err(check_and_mark_retriable_error(error)),
-                            (source, started, true),
-                        ));
-                    }
-                } else {
-                    source.next().await
-                };
-                next.map(|item| (item, (source, true, false)))
-            }
-        },
-    );
+    let guarded = stream::unfold(Some((source, false, dataset)), |state| async move {
+        let (mut source, started, dataset) = state?;
+        let next = if started {
+            let Ok(next) = tokio::time::timeout(SOURCE_STALL_TIMEOUT, source.next()).await else {
+                let error = DataFusionError::External(Box::new(SourceStalled { dataset }));
+                // Ends the stream, dropping the stalled source.
+                return Some((Err(check_and_mark_retriable_error(error)), None));
+            };
+            next
+        } else {
+            source.next().await
+        };
+        next.map(|item| (item, Some((source, true, dataset))))
+    });
     Box::pin(RecordBatchStreamAdapter::new(schema, guarded))
 }
 
@@ -133,8 +108,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_source_silent_after_its_first_batch_fails_retriably() {
-        let timeout = Duration::from_secs(600);
-        let mut guarded = with_stall_timeout(silent_after(2), "big", timeout);
+        let timeout = SOURCE_STALL_TIMEOUT;
+        let mut guarded = with_stall_timeout(silent_after(2), "big".to_string());
         assert!(guarded.next().await.expect("first").is_ok());
         assert!(guarded.next().await.expect("second").is_ok());
         let silent_from = tokio::time::Instant::now();
@@ -144,53 +119,53 @@ mod tests {
             .expect("a stalled source yields an error")
             .expect_err("not a batch");
         assert_eq!(silent_from.elapsed(), timeout, "fails at the timeout");
-        assert!(is_retriable_error(&error), "retried, not permanent: {error}");
+        assert!(
+            is_retriable_error(&error),
+            "retried, not permanent: {error}"
+        );
         assert!(
             error.to_string().contains(
                 "The source of dataset 'big' stopped sending data mid-refresh: no data for 600s after it started sending, so the connection is treated as lost and the refresh is retried"
             ),
             "{error}"
         );
-        assert!(guarded.next().await.is_none(), "the stream ends after the error");
+        assert!(
+            guarded.next().await.is_none(),
+            "the stream ends after the error"
+        );
     }
 
     /// The timeout bounds each gap between batches, not the whole refresh.
     #[tokio::test(start_paused = true)]
     async fn a_source_slower_than_the_timeout_in_total_is_passed_through() {
-        let timeout = Duration::from_secs(600);
         let slow = stream::unfold(0, |sent| async move {
             if sent == 3 {
                 return None;
             }
-            tokio::time::sleep(Duration::from_secs(500)).await;
+            tokio::time::sleep(SOURCE_STALL_TIMEOUT - Duration::from_secs(1)).await;
             Some((Ok(batch()), sent + 1))
         });
         let source: SendableRecordBatchStream =
             Box::pin(RecordBatchStreamAdapter::new(batch().schema(), slow));
         let started = tokio::time::Instant::now();
-        let rows: Vec<_> = with_stall_timeout(source, "big", timeout).collect().await;
-        assert_eq!(started.elapsed(), Duration::from_secs(1500));
+        let rows: Vec<_> = with_stall_timeout(source, "big".to_string())
+            .collect()
+            .await;
+        assert_eq!(
+            started.elapsed(),
+            3 * (SOURCE_STALL_TIMEOUT - Duration::from_secs(1))
+        );
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(Result::is_ok));
     }
 
     #[tokio::test(start_paused = true)]
     async fn the_wait_for_the_first_batch_is_not_bounded() {
-        let mut guarded = with_stall_timeout(silent_after(0), "big", Duration::from_secs(600));
-        let first = tokio::time::timeout(Duration::from_secs(3600), guarded.next()).await;
-        assert!(first.is_err(), "no error before the source has sent anything");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_source_that_ends_is_passed_through() {
-        let source: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            batch().schema(),
-            stream::iter(vec![Ok(batch()), Ok(batch())]),
-        ));
-        let rows: Vec<_> = with_stall_timeout(source, "big", Duration::from_secs(600))
-            .collect()
-            .await;
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(Result::is_ok));
+        let mut guarded = with_stall_timeout(silent_after(0), "big".to_string());
+        let first = tokio::time::timeout(SOURCE_STALL_TIMEOUT * 6, guarded.next()).await;
+        assert!(
+            first.is_err(),
+            "no error before the source has sent anything"
+        );
     }
 }
