@@ -42,6 +42,9 @@ pub const REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED: &str = "object_generat
 pub const REFRESH_ERROR_REASON_PARQUET_DECODE: &str = "parquet_decode";
 pub const REFRESH_ERROR_REASON_SNAPSHOT_NOT_FOUND: &str = "snapshot_not_found";
 pub const REFRESH_ERROR_REASON_SNAPSHOT_OLDER_THAN_LOADED: &str = "snapshot_older_than_loaded";
+/// The source stopped sending mid-refresh: no batch within the refresh's stall
+/// timeout after its first one.
+pub const REFRESH_ERROR_REASON_SOURCE_STALLED: &str = "source_stalled";
 pub const REFRESH_ERROR_REASON_OTHER: &str = "other";
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("dataset_acceleration"));
