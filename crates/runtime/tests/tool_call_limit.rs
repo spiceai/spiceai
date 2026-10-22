@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The most Spice tool calls Spice runs from one model response, on `/v1/chat/completions` and
-//! `/v1/responses`, streamed and not, against an in-process mock of the `OpenAI` API.
+//! The most Spice tool calls Spice runs from one model response, on `/v1/chat/completions`,
+//! `/v1/responses` and `/v1/messages`, streamed and not, against an in-process mock of the
+//! `OpenAI` API. The Messages API reaches the mock's model through chat completions.
 //!
 //! The mock's model makes as many `sql` calls in one response as the question asks for, then
 //! answers [`ANSWER`] once it has their results. Which calls ran shows in the request that
@@ -68,6 +69,7 @@ fn requested_calls(request: &Value) -> Option<usize> {
 enum Api {
     ChatCompletions,
     Responses,
+    Messages,
 }
 
 impl Api {
@@ -76,7 +78,16 @@ impl Api {
     fn sent(self, text: &str) -> String {
         match self {
             Self::ChatCompletions => Value::String(text.to_string()).to_string(),
-            Self::Responses => text.to_string(),
+            Self::Responses | Self::Messages => text.to_string(),
+        }
+    }
+
+    /// A tool error `text` as `self` sends it to the model: the Messages API's `is_error` result
+    /// reaches a chat model as a message that says it is an error.
+    fn sent_error(self, text: &str) -> String {
+        match self {
+            Self::Messages => format!("Error: {text}"),
+            Self::ChatCompletions | Self::Responses => self.sent(text),
         }
     }
 }
@@ -84,7 +95,9 @@ impl Api {
 /// The tool results in `request`, in order, as each call's ID and result.
 fn tool_results(api: Api, request: &Value) -> Vec<(String, String)> {
     let (items, kind, id, output) = match api {
-        Api::ChatCompletions => (&request["messages"], "tool", "tool_call_id", "content"),
+        Api::ChatCompletions | Api::Messages => {
+            (&request["messages"], "tool", "tool_call_id", "content")
+        }
         Api::Responses => (
             &request["input"],
             "function_call_output",
@@ -93,7 +106,7 @@ fn tool_results(api: Api, request: &Value) -> Vec<(String, String)> {
         ),
     };
     let kind_key = match api {
-        Api::ChatCompletions => "role",
+        Api::ChatCompletions | Api::Messages => "role",
         Api::Responses => "type",
     };
     items
@@ -296,6 +309,13 @@ async fn ask(base_url: &str, api: Api, stream: bool, calls: usize) -> anyhow::Re
             "responses",
             json!({ "model": "gpt", "stream": stream, "input": question(calls) }),
         ),
+        Api::Messages => (
+            "messages",
+            json!({
+                "model": "gpt", "max_tokens": 1024, "stream": stream,
+                "messages": [{ "role": "user", "content": question(calls) }],
+            }),
+        ),
     };
     let response = reqwest::Client::new()
         .post(format!("{base_url}/v1/{path}"))
@@ -330,6 +350,23 @@ async fn ask(base_url: &str, api: Api, stream: bool, calls: usize) -> anyhow::Re
                 .filter(|item| item["type"] == "message")
                 .flat_map(|item| item["content"].as_array().cloned().unwrap_or_default())
                 .filter_map(|content| content["text"].as_str().map(str::to_string))
+                .collect())
+        }
+        (Api::Messages, true) => Ok(body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .filter(|event| event["delta"]["type"] == "text_delta")
+            .filter_map(|event| event["delta"]["text"].as_str().map(str::to_string))
+            .collect()),
+        (Api::Messages, false) => {
+            let body: Value = serde_json::from_str(&body)?;
+            Ok(body["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str().map(str::to_string))
                 .collect())
         }
     }
@@ -376,7 +413,7 @@ fn call_id(i: usize) -> String {
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_calls_past_the_limit_in_one_response_do_not_run(
-    #[values(Api::ChatCompletions, Api::Responses)] api: Api,
+    #[values(Api::ChatCompletions, Api::Responses, Api::Messages)] api: Api,
     #[values(false, true)] stream: bool,
 ) -> anyhow::Result<()> {
     const CALLS: usize = 1000;
@@ -387,11 +424,11 @@ async fn tool_calls_past_the_limit_in_one_response_do_not_run(
     let expected: Vec<(String, String)> = (0..CALLS)
         .map(|i| {
             let result = if i < LIMIT {
-                QUERY_RESULT.to_string()
+                api.sent(QUERY_RESULT)
             } else {
-                not_run(CALLS)
+                api.sent_error(&not_run(CALLS))
             };
-            (call_id(i), api.sent(&result))
+            (call_id(i), result)
         })
         .collect();
     assert_eq!(results, expected, "{api:?}, stream: {stream}");
@@ -401,7 +438,7 @@ async fn tool_calls_past_the_limit_in_one_response_do_not_run(
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_tool_call_runs_at_the_limit(
-    #[values(Api::ChatCompletions, Api::Responses)] api: Api,
+    #[values(Api::ChatCompletions, Api::Responses, Api::Messages)] api: Api,
     #[values(false, true)] stream: bool,
 ) -> anyhow::Result<()> {
     let results = tool_results_for(api, stream, LIMIT).await?;
