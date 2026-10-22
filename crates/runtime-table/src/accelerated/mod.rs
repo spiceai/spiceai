@@ -77,6 +77,7 @@ pub mod fallback_retention;
 pub use fallback_retention::{Error as FallbackRetentionKeepError, FallbackRetentionKeep};
 pub mod federation;
 pub(crate) mod index_rebuild;
+pub mod partition_scope;
 pub mod refresh;
 pub mod refresh_completion;
 pub mod refresh_task;
@@ -92,6 +93,7 @@ pub mod write_back_worker;
 
 pub(crate) use write::WriteMode;
 
+pub use partition_scope::PartitionScope;
 pub use refresh_completion::{
     RefreshCompletion, RefreshCompletionOutcome, RefreshCompletionWaiter, RefreshRequestId,
 };
@@ -166,6 +168,11 @@ pub enum Error {
         "Manual refresh is not supported for `append` mode. Only `full` refresh mode supports manual refreshes."
     ))]
     ManualRefreshIsNotSupported {},
+
+    #[snafu(display(
+        "Failed to reload the partitions this executor serves: the dataset's change stream has stopped."
+    ))]
+    ReloadWorkerStopped {},
 
     #[snafu(display(
         "A refresh must be triggered on the dataset '{parent_dataset}', which will propagate to this table."
@@ -344,6 +351,10 @@ pub struct AcceleratedTable {
     change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
     federated: Arc<FederatedTable>,
     refresh_trigger: Option<mpsc::Sender<Option<RefreshOverrides>>>,
+    /// For a change-stream acceleration on a cluster executor: the partitions
+    /// it serves, and the trigger that reloads them after they change.
+    partition_scope: Option<Arc<PartitionScope>>,
+    reload_trigger: Option<mpsc::Sender<RefreshRequestId>>,
 
     // Async background tasks relevant to the accelerated table (i.e should be stopped when the table is dropped).
     pub handlers: parking_lot::Mutex<Vec<JoinHandle<()>>>,
@@ -488,6 +499,7 @@ pub struct Builder {
     ready_state: ReadyState,
     caching: Option<Arc<Caching>>,
     changes_stream: Option<ChangesStream>,
+    partition_scope: Option<Arc<PartitionScope>>,
     append_stream: Option<ChangesStream>,
     disable_federation: bool,
     write_to_accelerator_only: bool,
@@ -564,6 +576,7 @@ impl Builder {
             ready_state: ReadyState::default(),
             caching: None,
             changes_stream: None,
+            partition_scope: None,
             append_stream: None,
             checkpointer: None,
             synchronize_with: None,
@@ -776,6 +789,14 @@ impl Builder {
         self
     }
 
+    /// Set the partitions a cluster executor serves for the changes stream's
+    /// acceleration, which [`AcceleratedTable::trigger_reload`] then reloads after
+    /// they change. The changes stream itself has to be scoped by the caller.
+    pub fn partition_scope(&mut self, partition_scope: Arc<PartitionScope>) -> &mut Self {
+        self.partition_scope = Some(partition_scope);
+        self
+    }
+
     /// Set the append stream for the accelerated table
     pub fn append_stream(&mut self, append_stream: ChangesStream) -> &mut Self {
         self.append_stream = Some(append_stream);
@@ -977,6 +998,7 @@ impl Builder {
 
         let refresh_completion = RefreshCompletion::new();
 
+        let mut reload_trigger = None;
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
             RefreshMode::Append => {
@@ -1053,7 +1075,7 @@ impl Builder {
                             return AppendStreamRequiredSnafu.fail();
                         };
                         (
-                            refresh::AccelerationRefreshMode::Changes(append_stream),
+                            refresh::AccelerationRefreshMode::Changes(append_stream, None),
                             None,
                         )
                     }
@@ -1079,8 +1101,13 @@ impl Builder {
                 let Some(changes_stream) = self.changes_stream else {
                     return ExpectedChangesStreamSnafu.fail();
                 };
+                let reload_requests = self.partition_scope.as_ref().map(|_| {
+                    let (trigger, requests) = mpsc::channel::<RefreshRequestId>(8);
+                    reload_trigger = Some(trigger);
+                    requests
+                });
                 (
-                    refresh::AccelerationRefreshMode::Changes(changes_stream),
+                    refresh::AccelerationRefreshMode::Changes(changes_stream, reload_requests),
                     None,
                 )
             }
@@ -1508,6 +1535,8 @@ impl Builder {
             change_sink,
             federated: self.federated,
             refresh_trigger,
+            partition_scope: self.partition_scope,
+            reload_trigger,
             handlers: parking_lot::Mutex::new(handlers),
             initial_snapshot: parking_lot::Mutex::new(initial_snapshot),
             changes_drain: std::sync::OnceLock::new(),
@@ -1751,6 +1780,31 @@ impl AcceleratedTable {
         Ok(())
     }
 
+    /// Reloads the partitions a cluster executor serves for a change-stream
+    /// acceleration after they changed. The waiter it returns is answered by that
+    /// reload, not by changes the stream applies meanwhile.
+    ///
+    /// Returns `None` for an acceleration without a partition scope, which
+    /// refreshes through [`Self::trigger_refresh`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the change stream has stopped.
+    pub async fn trigger_reload(&self) -> Result<Option<RefreshCompletionWaiter>> {
+        let (Some(trigger), Some(completion)) =
+            (&self.reload_trigger, self.refresher.refresh_completion())
+        else {
+            return Ok(None);
+        };
+        let id = completion.issue();
+        let waiter = completion.waiter_for(id);
+        if trigger.send(id).await.is_err() {
+            completion.record_terminal_failure(id);
+            return ReloadWorkerStoppedSnafu.fail();
+        }
+        Ok(Some(waiter))
+    }
+
     #[must_use]
     pub fn get_federated_table(&self) -> Arc<FederatedTable> {
         Arc::clone(&self.federated)
@@ -1935,6 +1989,13 @@ impl AcceleratedTable {
         &self,
         filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<()> {
+        if let Some(scope) = &self.partition_scope {
+            scope.set(
+                filters
+                    .clone()
+                    .unwrap_or_else(|| vec![datafusion_expr::lit(true)]),
+            );
+        }
         let mut refresh = self.refresh_params.write().await;
         if let Some(ref mut sql) = refresh.sql {
             sql.set_partition_filters(filters);
