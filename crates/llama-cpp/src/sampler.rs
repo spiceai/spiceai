@@ -133,6 +133,43 @@ impl<'v> Sampler<'v> {
         chain
     }
 
+    /// Applies the sampler to `logits`, the logit of each token by id, as it applies to a
+    /// context's logits, and returns the tokens it leaves to pick from, in the order it
+    /// leaves them.
+    pub fn apply(&mut self, logits: &[f32]) -> Vec<Token> {
+        // llama.cpp's samplers require at least one candidate.
+        if logits.is_empty() {
+            return Vec::new();
+        }
+        let mut data: Vec<sys::llama_token_data> = logits
+            .iter()
+            .enumerate()
+            .map(|(id, &logit)| sys::llama_token_data {
+                id: i32::try_from(id).unwrap_or(i32::MAX),
+                logit,
+                p: 0.0,
+            })
+            .collect();
+        let mut candidates = sys::llama_token_data_array {
+            data: data.as_mut_ptr(),
+            size: data.len(),
+            selected: -1,
+            sorted: false,
+        };
+        // SAFETY: `candidates` points at `data`, which outlives the call. A sampler may
+        // repoint it at a buffer of its own, which lives as long as the sampler.
+        unsafe { sys::llama_sampler_apply(self.raw.as_ptr(), &raw mut candidates) };
+        if candidates.data.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: after the call `candidates` describes `size` live entries, in `data` or in
+        // the sampler's own buffer, and neither changes before they are copied out here.
+        unsafe { std::slice::from_raw_parts(candidates.data, candidates.size) }
+            .iter()
+            .map(|d| Token(d.id))
+            .collect()
+    }
+
     /// Picks the token for output row `index` of the last decoded batch.
     pub fn sample(&mut self, context: &Context<'_>, index: i32) -> Token {
         // SAFETY: the context is live and its last decode marked row `index` for output.
@@ -144,5 +181,56 @@ impl Drop for Sampler<'_> {
     fn drop(&mut self) {
         // SAFETY: the sampler was not handed to a chain, which would own it.
         unsafe { sys::llama_sampler_free(self.raw.as_ptr()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Set in the child process that runs the failed check.
+    const CHILD: &str = "LLAMA_CPP_FAILED_CHECK_CHILD";
+
+    /// llama.cpp is patched to throw on a failed check only while it loads a model, where its
+    /// C API catches the exception. Anywhere else it must abort, as upstream does: these
+    /// functions catch nothing, so an exception would unwind out of the C API into Rust.
+    #[test]
+    fn a_failed_check_outside_a_model_load_aborts_instead_of_throwing() {
+        if std::env::var_os(CHILD).is_some() {
+            let top_p = Sampler::top_p(0.5, 1);
+            let mut empty = sys::llama_token_data_array {
+                data: std::ptr::null_mut(),
+                size: 0,
+                selected: -1,
+                sorted: false,
+            };
+            // SAFETY: an empty candidate array, on which top-p's softmax fails its check.
+            unsafe { sys::llama_sampler_apply(top_p.raw.as_ptr(), &raw mut empty) };
+            return;
+        }
+        let child = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "sampler::tests::a_failed_check_outside_a_model_load_aborts_instead_of_throwing",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("the child test runs");
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(
+            !stderr.contains("exception"),
+            "the failed check threw instead of aborting: {stderr}"
+        );
+        assert!(
+            stderr.contains("GGML_ASSERT(cur_p->size > 0) failed"),
+            "the child did not fail the check: {child:?}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            // SIGABRT is 6 on Linux and macOS.
+            assert_eq!(child.status.signal(), Some(6), "{child:?}");
+        }
     }
 }

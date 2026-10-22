@@ -23,18 +23,20 @@ limitations under the License.
 //!
 //! One thread owns the backend, the model and its context. Requests wait on a channel and
 //! run one at a time from an empty KV cache, and their tokens stream back over a Tokio
-//! channel, so a forward pass never blocks an async worker.
+//! channel, so a forward pass never blocks an async worker. Dropping the model stops that
+//! thread and waits for it to free the model.
 
 use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc as std_mpsc,
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_openai::{
@@ -56,6 +58,13 @@ use llama_cpp::{
     Backend, Batch, Context, ContextParams, Model, ModelParams, Mtp, MtpParams, Sampler, Token,
     Vocab,
 };
+use mistralrs_core::reasoning_parsers::{
+    TagReasoningContext,
+    harmony::is_harmony_template,
+    tag_based::{
+        THINK_OPEN_TAG, is_channel_tag_template, is_gemma_turn_template, is_think_tag_template,
+    },
+};
 use mistralrs_core::{
     AllowedToolChoice, AllowedToolsMode, ChatTemplateValue, MessageContent,
     ReasoningEffort as TemplateReasoningEffort, Tool, ToolCallResponse, ToolCallingMatcher,
@@ -65,8 +74,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use llms::chat::engine::LocalChatEngine;
 use llms::chat::mistral::{
-    ReasoningControls, ReasoningSupport, convert_tool, opens_reasoning, reasoning_controls,
-    request_tool_choice,
+    ReasoningControls, ReasoningSupport, convert_tool, reasoning_controls, request_tool_choice,
 };
 use llms::chat::{
     Chat, Error as ChatError, LocalModelOptions, PagedAttentionMode, Result, message_to_mistral,
@@ -118,12 +126,17 @@ const MTP_DRAFT: i32 = 2;
 /// How many streamed tokens may wait for a slow client before decoding pauses.
 const STREAM_BUFFER: usize = 64;
 
-/// The opening and closing tags of a reasoning block.
-const THINK_OPEN: &str = "<think>";
-const THINK_CLOSE: &str = "</think>";
+/// How long dropping a model waits for its decode thread to stop and free it.
+const UNLOAD_WAIT: Duration = Duration::from_secs(30);
+
+/// Why a request ends early: its decode thread stopped, as when the model is unloaded.
+const DECODE_STOPPED: &str = "the llama.cpp decode thread stopped mid-response";
+
+/// The token Gemma 4 chat templates add to the prompt to turn reasoning on.
+const GEMMA_THINK_TOKEN: &str = "<|think|>";
 
 pub struct LlamaCpp {
-    jobs: std_mpsc::Sender<Job>,
+    decoder: DecodeThread,
     model_name: String,
     template: String,
     special: SpecialTokens,
@@ -141,6 +154,8 @@ struct SpecialTokens {
 /// What the decode thread reports once the model is loaded.
 struct Loaded {
     template: Option<String>,
+    /// `general.architecture`, as the GGUF names it.
+    architecture: Option<String>,
     special: SpecialTokens,
 }
 
@@ -162,13 +177,50 @@ struct Job {
     limit: Option<usize>,
     sampling: Sampling,
     stop: Vec<String>,
-    /// Whether the prompt leaves the model inside a reasoning block.
-    reasons: bool,
+    /// Tells the reply's reasoning apart from its answer, when the chat template marks one.
+    reasoning: Option<TagReasoningContext>,
     /// Reads tool calls out of the content, when the request offers tools.
     tools: Option<ToolCallingMatcher>,
     /// Whether `tool_choice` requires a tool call, so a reply without one fails.
     require_tool_call: bool,
+    /// Set when the decode thread is stopping, which ends the request.
+    stopping: Arc<AtomicBool>,
     events: mpsc::Sender<Event>,
+}
+
+/// The model's decode thread, as the model's handle holds it. Dropping it stops the thread
+/// and waits, for up to [`UNLOAD_WAIT`], until the thread has freed the model, so a model
+/// that is dropped holds no memory afterwards. On Apple GPUs that matters at exit too: ggml
+/// aborts a process that exits with Metal memory still allocated.
+struct DecodeThread {
+    /// The model's name, for the log line when it is slow to stop.
+    model: String,
+    jobs: Option<std_mpsc::Sender<Job>>,
+    stopping: Arc<AtomicBool>,
+    /// Disconnects once the thread has freed everything it held. In a mutex only so the
+    /// model's handle can be shared; only `drop` reads it.
+    freed: Option<Mutex<std_mpsc::Receiver<()>>>,
+}
+
+impl Drop for DecodeThread {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        // Closing the queue ends the thread's loop once a running request stops.
+        drop(self.jobs.take());
+        if let Some(freed) = self.freed.take()
+            && freed
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv_timeout(UNLOAD_WAIT)
+                == Err(std_mpsc::RecvTimeoutError::Timeout)
+        {
+            tracing::debug!(
+                "Model '{}' did not stop decoding within {}s of being dropped; it is freed when it does.",
+                self.model,
+                UNLOAD_WAIT.as_secs()
+            );
+        }
+    }
 }
 
 /// What the decode thread sends back for one request, in order.
@@ -191,6 +243,12 @@ struct Outcome {
 impl LlamaCpp {
     /// Loads a GGUF model. For a sharded GGUF, `weights` lists every shard and llama.cpp
     /// opens the rest from the first.
+    ///
+    /// # Errors
+    ///
+    /// When a weight file is missing, llama.cpp cannot load the model or its MTP head, the
+    /// model has no chat template or writes Harmony replies, or `reasoning_effort` is one
+    /// its chat template refuses.
     pub async fn from(weights: &[PathBuf], options: LocalModelOptions<'_>) -> Result<Self> {
         for weight in weights {
             if !weight.exists() {
@@ -218,13 +276,26 @@ impl LlamaCpp {
         }
         let (ready_tx, ready_rx) = oneshot::channel();
         let (jobs_tx, jobs_rx) = std_mpsc::channel();
+        let (freed_tx, freed_rx) = std_mpsc::channel::<()>();
         let name = options.reasoning.model_name.to_string();
+        let file = file_name(&first);
         thread::Builder::new()
             .name("llama-cpp".to_string())
-            .spawn(move || serve(&name, &first, draft.as_deref(), n_ctx, ready_tx, &jobs_rx))
+            .spawn(move || {
+                serve(&name, &first, draft.as_deref(), n_ctx, ready_tx, &jobs_rx);
+                // Everything `serve` held is freed by now.
+                drop(freed_tx);
+            })
             .map_err(|e| ChatError::FailedToLoadModel {
                 source: Box::new(e),
             })?;
+        // From here on, an early return stops the thread and waits for it to free the model.
+        let decoder = DecodeThread {
+            model: options.reasoning.model_name.to_string(),
+            jobs: Some(jobs_tx),
+            stopping: Arc::new(AtomicBool::new(false)),
+            freed: Some(Mutex::new(freed_rx)),
+        };
         let loaded = ready_rx.await.map_err(|e| ChatError::FailedToLoadModel {
             source: Box::new(e),
         })??;
@@ -238,6 +309,7 @@ impl LlamaCpp {
                     "the GGUF file carries no chat template, and the model sets no `chat_template`"
                         .into(),
             })?;
+        check_reply_format(&template, loaded.architecture, file)?;
 
         let model_name = options.reasoning.model_name.to_string();
         let reasoning_support = {
@@ -273,7 +345,7 @@ impl LlamaCpp {
         }
 
         Ok(Self {
-            jobs: jobs_tx,
+            decoder,
             model_name,
             template,
             special: loaded.special,
@@ -345,7 +417,7 @@ impl LlamaCpp {
         let prompt = self.prompt(&req.messages, reasoning, tools)?;
         let (events, rx) = mpsc::channel(STREAM_BUFFER);
         let job = Job {
-            reasons: opens_reasoning(&prompt),
+            reasoning: reasoning_parser(&self.template, &prompt),
             prompt,
             limit: completion_limit(req),
             sampling: Sampling {
@@ -362,11 +434,14 @@ impl LlamaCpp {
             },
             tools: matcher,
             require_tool_call,
+            stopping: Arc::clone(&self.decoder.stopping),
             events,
         };
-        self.jobs
-            .send(job)
-            .map_err(|_| api_error("the llama.cpp decode thread has stopped"))?;
+        self.decoder
+            .jobs
+            .as_ref()
+            .and_then(|jobs| jobs.send(job).ok())
+            .ok_or_else(|| api_error("the llama.cpp decode thread has stopped"))?;
         Ok(rx)
     }
 
@@ -463,9 +538,7 @@ impl Chat for LlamaCpp {
                         }
                         None => {
                             state.done = true;
-                            break Err(api_error(
-                                "the llama.cpp decode thread stopped mid-response",
-                            ));
+                            break Err(api_error(DECODE_STOPPED));
                         }
                     }
                 };
@@ -494,9 +567,7 @@ impl Chat for LlamaCpp {
                 Some(Event::Done(outcome)) => break outcome,
                 Some(Event::Failed(message)) => return Err(api_error(&message)),
                 None => {
-                    return Err(api_error(
-                        "the llama.cpp decode thread stopped mid-response",
-                    ));
+                    return Err(api_error(DECODE_STOPPED));
                 }
             }
         };
@@ -601,16 +672,14 @@ fn serve(
     // layer still loads without it, and decodes without drafting.
     let model = match Model::load(backend, path, &ModelParams::default().with_load_mtp(true)) {
         Ok(model) => model,
-        Err(with_mtp) => match Model::load(backend, path, &ModelParams::default()) {
-            Ok(model) => {
-                tracing::info!("{}", without_mtp_note(name, &with_mtp));
-                model
-            }
-            Err(_) => {
+        Err(with_mtp) => {
+            let Ok(model) = Model::load(backend, path, &ModelParams::default()) else {
                 let _ = ready.send(Err(load_error(path, with_mtp)));
                 return;
-            }
-        },
+            };
+            tracing::info!("{}", without_mtp_note(name, &with_mtp));
+            model
+        }
     };
     let draft_model = match draft.map(|d| {
         let params = ModelParams::default().with_load_mtp(true);
@@ -674,14 +743,19 @@ fn serve(
         bos: piece(&model, vocab.bos()),
         eos: piece(&model, vocab.eos()),
     };
-    let template = model.chat_template();
+    let loaded = Loaded {
+        template: model.chat_template(),
+        architecture: model.architecture(),
+        special,
+    };
     // Ruled out while a required tool call is outstanding.
     let eog = vocab.eog_tokens();
-    if ready.send(Ok(Loaded { template, special })).is_err() {
+    if ready.send(Ok(loaded)).is_err() {
         return;
     }
     while let Ok(job) = jobs.recv() {
         let events = job.events.clone();
+        let stopping = Arc::clone(&job.stopping);
         let result = match &mut decoder {
             Decoder::Plain(context) => generate(&model, context, job, &eog),
             Decoder::Mtp(spec) => generate_mtp(&model, spec, job, &eog),
@@ -690,7 +764,12 @@ fn serve(
             Ok(outcome) => Event::Done(outcome),
             Err(message) => Event::Failed(message),
         };
-        let _ = events.blocking_send(event);
+        // A stopping thread does not wait for a client that has stopped reading.
+        if stopping.load(Ordering::Relaxed) {
+            let _ = events.try_send(event);
+        } else {
+            let _ = events.blocking_send(event);
+        }
     }
 }
 
@@ -736,16 +815,34 @@ fn load_error(path: &Path, error: llama_cpp::Error) -> ChatError {
         if let Some(end) = rest.find('\'') {
             return ChatError::UnsupportedArchitecture {
                 architecture: rest[..end].to_string(),
-                file: path.file_name().map_or_else(
-                    || path.display().to_string(),
-                    |n| n.to_string_lossy().to_string(),
-                ),
+                file: file_name(path),
             };
         }
     }
     ChatError::FailedToLoadModel {
         source: Box::new(error),
     }
+}
+
+/// A Harmony reply (gpt-oss) is read token by token rather than as text, which this engine
+/// does not do, so a model whose chat template writes one is refused rather than served with
+/// its channel markup in the content.
+fn check_reply_format(template: &str, architecture: Option<String>, file: String) -> Result<()> {
+    if is_harmony_template(template) {
+        return Err(ChatError::UnsupportedArchitecture {
+            architecture: architecture.unwrap_or_else(|| "gpt-oss".to_string()),
+            file,
+        });
+    }
+    Ok(())
+}
+
+/// The file an error names: its name, or the whole path when it has none.
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().to_string(),
+    )
 }
 
 /// The decode thread's engine: plain decoding, or decoding with an MTP draft head.
@@ -811,6 +908,7 @@ fn read_prompt<'m>(
     model: &Model,
     target: &mut impl Target<'m>,
     prompt: &str,
+    stopping: &AtomicBool,
 ) -> std::result::Result<(Vec<Token>, Batch), String> {
     target.context_mut().clear();
     let tokens = model
@@ -831,6 +929,9 @@ fn read_prompt<'m>(
     let mut pos: i32 = 0;
     let chunks = tokens.chunks(PROMPT_BATCH).count();
     for (i, chunk) in tokens.chunks(PROMPT_BATCH).enumerate() {
+        if stopping.load(Ordering::Relaxed) {
+            return Err(DECODE_STOPPED.to_string());
+        }
         batch.clear();
         for (j, &token) in chunk.iter().enumerate() {
             let last = i + 1 == chunks && j + 1 == chunk.len();
@@ -855,13 +956,14 @@ struct Output {
     stops: StopMatcher,
     pending: Vec<u8>,
     produced: u32,
-    think: ThinkSplit,
+    reasoning: Option<TagReasoningContext>,
     tools: Option<ToolSplit>,
     require_tool_call: bool,
     /// Whether tool calls were sent; nothing is sent after them.
     called: bool,
     /// Why reading the tool calls failed, which fails the request.
     failure: Option<String>,
+    stopping: Arc<AtomicBool>,
 }
 
 impl Output {
@@ -872,22 +974,30 @@ impl Output {
             stops: StopMatcher::new(job.stop),
             pending: Vec::new(),
             produced: 0,
-            think: ThinkSplit::new(job.reasons),
+            reasoning: job.reasoning,
             tools: job.tools.map(ToolSplit::new),
             require_tool_call: job.require_tool_call,
             called: false,
             failure: None,
+            stopping: job.stopping,
         };
         (job.prompt, job.sampling, output)
     }
 
     /// Whether generation has left any reasoning block, so `response_format` applies.
     fn in_content(&self) -> bool {
-        !self.think.in_think()
+        !self
+            .reasoning
+            .as_ref()
+            .is_some_and(TagReasoningContext::is_in_think_block)
     }
 
     /// Sends one sampled token, or returns why generation ends.
     fn token(&mut self, model: &Model, token: Token) -> Option<FinishReason> {
+        if self.stopping.load(Ordering::Relaxed) {
+            self.failure = Some(DECODE_STOPPED.to_string());
+            return Some(FinishReason::Stop);
+        }
         let vocab = model.vocab();
         if vocab.is_eog(token) {
             return Some(FinishReason::Stop);
@@ -909,7 +1019,11 @@ impl Output {
 
     /// Whether the client is still there to take `event`.
     fn send(&self, event: Event) -> bool {
-        self.events.blocking_send(event).is_ok()
+        if self.stopping.load(Ordering::Relaxed) {
+            self.events.try_send(event).is_ok()
+        } else {
+            self.events.blocking_send(event).is_ok()
+        }
     }
 
     /// Splits `text` into reasoning and content and sends them; content goes through the
@@ -918,11 +1032,19 @@ impl Output {
         if self.called || text.is_empty() {
             return None;
         }
-        let (reasoning, content) = self.think.push(text);
-        if !reasoning.is_empty() && !self.send(Event::Reasoning(reasoning)) {
+        let (reasoning, content) = match self.reasoning.as_mut() {
+            Some(parser) => {
+                parser.process_text(text);
+                (parser.get_reasoning_delta(), parser.get_content_delta())
+            }
+            None => (None, Some(text.to_string())),
+        };
+        if let Some(reasoning) = reasoning
+            && !self.send(Event::Reasoning(reasoning))
+        {
             return Some(FinishReason::Stop);
         }
-        self.content(content)
+        self.content(content.unwrap_or_default())
     }
 
     fn content(&mut self, content: String) -> Option<FinishReason> {
@@ -969,17 +1091,23 @@ impl Output {
     ) -> std::result::Result<Outcome, String> {
         let mut finish = finish;
         if !self.called {
-            let tail = self.stops.finish();
+            // A character still incomplete when generation ends is replaced, as a lossy
+            // decode of the whole reply would.
+            let mut tail = self.stops.finish();
+            tail.push_str(&String::from_utf8_lossy(&std::mem::take(&mut self.pending)));
             if self.route(&tail) == Some(FinishReason::ToolCalls) {
                 finish = FinishReason::ToolCalls;
             }
         }
-        if !self.called {
-            let (reasoning, content) = self.think.finish();
-            if !reasoning.is_empty() {
+        if !self.called
+            && let Some(parser) = self.reasoning.as_mut()
+        {
+            parser.finalize();
+            let (reasoning, content) = (parser.get_reasoning_delta(), parser.get_content_delta());
+            if let Some(reasoning) = reasoning {
                 self.send(Event::Reasoning(reasoning));
             }
-            if self.content(content) == Some(FinishReason::ToolCalls) {
+            if self.content(content.unwrap_or_default()) == Some(FinishReason::ToolCalls) {
                 finish = FinishReason::ToolCalls;
             }
         }
@@ -1102,7 +1230,7 @@ struct Picker<'v> {
 
 impl<'v> Picker<'v> {
     fn new(
-        vocab: &Vocab<'v>,
+        vocab: Vocab<'v>,
         sampling: &Sampling,
         eog: &[Token],
     ) -> std::result::Result<Self, String> {
@@ -1110,21 +1238,12 @@ impl<'v> Picker<'v> {
             let mut samplers = Vec::new();
             if sampling.ban_eog {
                 let ruled_out: Vec<_> = eog.iter().map(|&t| (t, f32::NEG_INFINITY)).collect();
-                samplers.push(Sampler::logit_bias(vocab, &ruled_out));
+                samplers.push(Sampler::logit_bias(&vocab, &ruled_out));
             }
             if let Some(grammar) = grammar {
-                samplers.push(Sampler::grammar(vocab, grammar).map_err(|e| e.to_string())?);
+                samplers.push(Sampler::grammar(&vocab, grammar).map_err(|e| e.to_string())?);
             }
-            // Greedy at temperature 0 or unset, as the mistral.rs engine's deterministic
-            // default; otherwise top-p then temperature, then a seeded draw.
-            match sampling.temperature {
-                Some(t) if t > 0.0 => {
-                    samplers.push(Sampler::top_p(sampling.top_p.unwrap_or(1.0), 1));
-                    samplers.push(Sampler::temp(t));
-                    samplers.push(Sampler::dist(sampling.seed));
-                }
-                _ => samplers.push(Sampler::greedy()),
-            }
+            samplers.extend(draw(sampling));
             Ok(Sampler::chain(samplers))
         };
         Ok(Self {
@@ -1145,6 +1264,21 @@ impl<'v> Picker<'v> {
     }
 }
 
+/// The samplers that pick the token from those the rest leave: greedy at temperature 0 or
+/// unset, as the mistral.rs engine's deterministic default; otherwise the mistral.rs
+/// engine's order of temperature, then top-p over the tempered probabilities, then a seeded
+/// draw.
+fn draw<'v>(sampling: &Sampling) -> Vec<Sampler<'v>> {
+    match sampling.temperature {
+        Some(t) if t > 0.0 => vec![
+            Sampler::temp(t),
+            Sampler::top_p(sampling.top_p.unwrap_or(1.0), 1),
+            Sampler::dist(sampling.seed),
+        ],
+        _ => vec![Sampler::greedy()],
+    }
+}
+
 /// Runs one request, one token per forward pass.
 fn generate(
     model: &Model,
@@ -1154,8 +1288,8 @@ fn generate(
 ) -> std::result::Result<Outcome, String> {
     let (prompt, sampling, mut out) = Output::new(job);
     let vocab = model.vocab();
-    let mut picker = Picker::new(&vocab, &sampling, eog)?;
-    let (tokens, mut batch) = read_prompt(model, context, &prompt)?;
+    let mut picker = Picker::new(vocab, &sampling, eog)?;
+    let (tokens, mut batch) = read_prompt(model, context, &prompt, &out.stopping)?;
     let n_ctx = usize::try_from(context.n_ctx()).unwrap_or(usize::MAX);
     let mut pos = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
     let finish = loop {
@@ -1184,11 +1318,11 @@ fn generate_mtp(
 ) -> std::result::Result<Outcome, String> {
     let (prompt, sampling, mut out) = Output::new(job);
     let vocab = model.vocab();
-    let mut picker = Picker::new(&vocab, &sampling, eog)?;
+    let mut picker = Picker::new(vocab, &sampling, eog)?;
     spec.draft_mut().clear();
     // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
     // hidden state at each prompt position before `begin`.
-    let (tokens, mut batch) = read_prompt(model, spec, &prompt)?;
+    let (tokens, mut batch) = read_prompt(model, spec, &prompt, &out.stopping)?;
     spec.begin(&tokens).map_err(|e| e.to_string())?;
     let n_ctx = usize::try_from(spec.target().n_ctx()).unwrap_or(usize::MAX);
     let mut history = tokens.clone();
@@ -1289,28 +1423,30 @@ fn piece(model: &Model, token: Token) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Removes and returns the longest valid UTF-8 prefix of `bytes`, keeping an incomplete
-/// trailing character for the next token. Bytes that can never become valid are replaced.
+/// Removes and returns the text `bytes` decode to, keeping an incomplete trailing character
+/// for the next token. Each sequence that can never become valid is replaced, as a lossy
+/// decode replaces it, so the text does not depend on where tokens split the bytes.
 fn take_utf8(bytes: &mut Vec<u8>) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => {
-            let text = text.to_string();
-            bytes.clear();
-            text
+    let mut text = String::with_capacity(bytes.len());
+    let mut kept = 0;
+    let mut chunks = bytes.utf8_chunks().peekable();
+    while let Some(chunk) = chunks.next() {
+        text.push_str(chunk.valid());
+        let invalid = chunk.invalid();
+        if invalid.is_empty() {
+            continue;
         }
-        Err(e) if e.error_len().is_none() => {
-            let valid = e.valid_up_to();
-            let rest = bytes.split_off(valid);
-            let text = String::from_utf8_lossy(bytes).into_owned();
-            *bytes = rest;
-            text
-        }
-        Err(_) => {
-            let text = String::from_utf8_lossy(bytes).into_owned();
-            bytes.clear();
-            text
+        let incomplete = chunks.peek().is_none()
+            && std::str::from_utf8(invalid).is_err_and(|e| e.error_len().is_none());
+        if incomplete {
+            kept = invalid.len();
+        } else {
+            text.push(char::REPLACEMENT_CHARACTER);
         }
     }
+    let consumed = bytes.len() - kept;
+    bytes.drain(..consumed);
+    text
 }
 
 /// Holds back text that could still become a stop sequence, and ends generation at the
@@ -1374,64 +1510,29 @@ fn longest_suffix_prefix(text: &str, pattern: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Splits generated text into reasoning and content at `<think>` and `</think>`.
-struct ThinkSplit {
-    in_think: bool,
-    held: String,
-}
-
-impl ThinkSplit {
-    fn new(in_think: bool) -> Self {
-        Self {
-            in_think,
-            held: String::new(),
-        }
-    }
-
-    fn in_think(&self) -> bool {
-        self.in_think
-    }
-
-    /// The reasoning and content `text` adds, holding back a possible partial tag.
-    fn push(&mut self, text: &str) -> (String, String) {
-        self.held.push_str(text);
-        let (mut reasoning, mut content) = (String::new(), String::new());
-        loop {
-            let tag = if self.in_think {
-                THINK_CLOSE
-            } else {
-                THINK_OPEN
-            };
-            if let Some(at) = self.held.find(tag) {
-                let before: String = self.held.drain(..at).collect();
-                self.held.drain(..tag.len());
-                if self.in_think {
-                    reasoning.push_str(&before);
-                } else {
-                    content.push_str(&before);
-                }
-                self.in_think = !self.in_think;
-                continue;
-            }
-            let keep = longest_suffix_prefix(&self.held, tag);
-            let cut = self.held.len() - keep;
-            let ready: String = self.held.drain(..cut).collect();
-            if self.in_think {
-                reasoning.push_str(&ready);
-            } else {
-                content.push_str(&ready);
-            }
-            return (reasoning, content);
-        }
-    }
-
-    fn finish(&mut self) -> (String, String) {
-        let rest = std::mem::take(&mut self.held);
-        if self.in_think {
-            (rest, String::new())
+/// The parser that tells a reply's reasoning apart from its answer, chosen from the chat
+/// template and the rendered prompt as the mistral.rs engine chooses it: Gemma 4's channel
+/// tags, `<think>` tags (starting inside the block when the prompt opens it), or the Gemma
+/// family's `<unused94>` thought tokens. A template that marks no reasoning gets none, and
+/// the whole reply is content.
+fn reasoning_parser(template: &str, prompt: &str) -> Option<TagReasoningContext> {
+    let harmony = is_harmony_template(template);
+    if is_channel_tag_template(template) && !harmony {
+        Some(if prompt.contains(GEMMA_THINK_TOKEN) {
+            TagReasoningContext::new_gemma_channel_with_implicit_thinking()
         } else {
-            (String::new(), rest)
-        }
+            TagReasoningContext::new_gemma_channel()
+        })
+    } else if is_think_tag_template(template) && !harmony {
+        Some(if prompt.trim_end().ends_with(THINK_OPEN_TAG) {
+            TagReasoningContext::new_in_think_block()
+        } else {
+            TagReasoningContext::new_think_tags()
+        })
+    } else if is_gemma_turn_template(template) {
+        Some(TagReasoningContext::new_gemma_thought())
+    } else {
+        None
     }
 }
 
@@ -1730,7 +1831,10 @@ mod tests {
     }
 
     /// An `Output` for a request offering the weather tool under `choice`, and what it sends.
-    fn output(choice: ToolChoice, reasons: bool) -> (Output, mpsc::Receiver<Event>) {
+    fn output(
+        choice: ToolChoice,
+        reasoning: Option<TagReasoningContext>,
+    ) -> (Output, mpsc::Receiver<Event>) {
         let (events, rx) = mpsc::channel(STREAM_BUFFER);
         let tools = [weather_tool()];
         let matcher = ToolCallingMatcher::new_with_format(choice, Some(&tools), None)
@@ -1740,9 +1844,10 @@ mod tests {
             limit: None,
             sampling: Sampling::default(),
             stop: Vec::new(),
-            reasons,
+            reasoning,
             require_tool_call: matcher.requires_tool_call(),
             tools: Some(matcher),
+            stopping: Arc::default(),
             events,
         };
         let (_, _, out) = Output::new(job);
@@ -1769,7 +1874,7 @@ mod tests {
 
     #[test]
     fn a_tool_call_split_across_tokens_is_held_back_until_generation_ends() {
-        let (mut out, rx) = output(ToolChoice::Auto, false);
+        let (mut out, rx) = output(ToolChoice::Auto, None);
         let pieces = [
             "Let me check.\n",
             "<tool_call>\n{\"name\": \"get_wea",
@@ -1793,7 +1898,7 @@ mod tests {
 
     #[test]
     fn text_after_a_complete_call_ends_generation_with_the_call() {
-        let (mut out, rx) = output(ToolChoice::Auto, false);
+        let (mut out, rx) = output(ToolChoice::Auto, None);
         let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}\n</tool_call>";
         assert_eq!(out.route(call), None);
         assert_eq!(out.route("\nDone."), Some(FinishReason::ToolCalls));
@@ -1814,7 +1919,7 @@ mod tests {
 
     #[test]
     fn an_opener_spelled_across_tokens_is_held_until_it_resolves() {
-        let (mut out, rx) = output(ToolChoice::Auto, false);
+        let (mut out, rx) = output(ToolChoice::Auto, None);
         for piece in [
             "Sure. <",
             "tool",
@@ -1836,7 +1941,7 @@ mod tests {
             ]
         );
         // Text that only looked like an opener is sent once it can't be one.
-        let (mut out, rx) = output(ToolChoice::Auto, false);
+        let (mut out, rx) = output(ToolChoice::Auto, None);
         assert_eq!(out.route("a <"), None);
         assert_eq!(out.route("b"), None);
         out.finish(FinishReason::Stop, 1)
@@ -1846,7 +1951,7 @@ mod tests {
 
     #[test]
     fn a_call_cut_off_by_the_end_of_generation_is_content() {
-        let (mut out, rx) = output(ToolChoice::Auto, false);
+        let (mut out, rx) = output(ToolChoice::Auto, None);
         let cut = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}";
         assert_eq!(out.route(cut), None);
         let outcome = out
@@ -1858,7 +1963,10 @@ mod tests {
 
     #[test]
     fn reasoning_is_not_read_for_tool_calls() {
-        let (mut out, rx) = output(ToolChoice::Auto, true);
+        let (mut out, rx) = output(
+            ToolChoice::Auto,
+            Some(TagReasoningContext::new_in_think_block()),
+        );
         let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call>";
         assert_eq!(out.route(&format!("I could call {call}</think>")), None);
         assert_eq!(out.route("The answer."), None);
@@ -1877,7 +1985,7 @@ mod tests {
 
     #[test]
     fn tool_choice_none_sends_a_call_as_content() {
-        let (mut out, rx) = output(ToolChoice::None, false);
+        let (mut out, rx) = output(ToolChoice::None, None);
         let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call>";
         assert_eq!(out.route(call), None);
         let outcome = out
@@ -1889,7 +1997,7 @@ mod tests {
 
     #[test]
     fn a_required_call_that_never_comes_fails_the_request() {
-        let (mut out, rx) = output(ToolChoice::Required, false);
+        let (mut out, rx) = output(ToolChoice::Required, None);
         assert_eq!(out.route("I won't call anything."), None);
         assert_eq!(
             out.finish(FinishReason::Length, 3).err().as_deref(),
@@ -2062,24 +2170,90 @@ mod tests {
         );
     }
 
+    /// What a reply of `chunks` sends, read with the parser chosen for `template` and
+    /// `prompt`.
+    fn split(template: &str, prompt: &str, chunks: &[&str]) -> Vec<String> {
+        let (events, rx) = mpsc::channel(STREAM_BUFFER);
+        let job = Job {
+            prompt: String::new(),
+            limit: None,
+            sampling: Sampling::default(),
+            stop: Vec::new(),
+            reasoning: reasoning_parser(template, prompt),
+            tools: None,
+            require_tool_call: false,
+            stopping: Arc::default(),
+            events,
+        };
+        let (_, _, mut out) = Output::new(job);
+        for chunk in chunks {
+            assert_eq!(out.route(chunk), None);
+        }
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        sent(rx)
+    }
+
+    const THINKS: &str = "{{ '<think>' }}{{ '</think>' }}";
+    /// The reasoning markers of a Gemma 4 chat template.
+    const GEMMA4: &str = "{{ '<|think|>' }}{{ '<|channel>thought' }}{{ '<channel|>' }}";
+
     #[test]
     fn a_split_tag_is_held_until_it_completes() {
-        let mut split = ThinkSplit::new(true);
-        assert_eq!(split.push("plan</th"), ("plan".to_string(), String::new()));
         assert_eq!(
-            split.push("ink>\n\nanswer"),
-            (String::new(), "\n\nanswer".to_string())
+            split(THINKS, "<think>\n", &["plan</th", "ink>\n\nanswer"]),
+            ["r:plan", "c:\n\nanswer"]
         );
-        assert_eq!(split.finish(), (String::new(), String::new()));
     }
 
     #[test]
     fn a_reply_that_opens_its_own_block_is_split_too() {
-        let mut split = ThinkSplit::new(false);
         assert_eq!(
-            split.push("<think>why</think>42"),
-            ("why".to_string(), "42".to_string())
+            split(THINKS, "", &["<think>why</think>42"]),
+            ["r:why", "c:42"]
         );
+    }
+
+    #[test]
+    fn gemma_4_reasoning_closes_at_its_channel_tag() {
+        // regression: a Gemma 4 reply's answer was read as reasoning to the end
+        let prompt = "<|think|>user\nHi";
+        assert_eq!(
+            split(GEMMA4, prompt, &["<|channel>thought\nplan<chan", "nel|>42"]),
+            ["r:plan", "c:42"]
+        );
+        assert_eq!(
+            split(GEMMA4, prompt, &["thought\nplan<channel|>42"]),
+            ["r:plan", "c:42"]
+        );
+        assert_eq!(split(GEMMA4, "user\nHi", &["42"]), ["c:42"]);
+    }
+
+    #[test]
+    fn a_template_that_marks_no_reasoning_keeps_the_reply_as_content() {
+        assert_eq!(
+            split("{{ messages }}", "<think>", &["<think>why</think>42"]),
+            ["c:<think>why</think>42"]
+        );
+    }
+
+    const HARMONY: &str = "{{ '<|start|>assistant<|channel|>final<|message|>' }}{{ '<|end|>' }}";
+
+    #[test]
+    fn a_harmony_model_is_refused_as_an_unsupported_architecture() {
+        let refused = check_reply_format(
+            HARMONY,
+            Some("gpt-oss".to_string()),
+            "gpt-oss-20b-mxfp4.gguf".to_string(),
+        )
+        .expect_err("a Harmony template is refused");
+        assert_eq!(
+            refused.to_string(),
+            "Architecture 'gpt-oss' in gpt-oss-20b-mxfp4.gguf is not supported by this Spice release. Upgrade Spice, or use a GGUF of a supported architecture: https://spiceai.org/docs/components/models#gguf-architectures"
+        );
+        assert!(reasoning_parser(HARMONY, "").is_none());
+        check_reply_format(THINKS, None, "qwen.gguf".to_string()).expect("a think-tag template");
+        check_reply_format(GEMMA4, None, "gemma.gguf".to_string()).expect("a Gemma 4 template");
     }
 
     #[test]
@@ -2090,10 +2264,115 @@ mod tests {
     }
 
     #[test]
+    fn a_multibyte_stop_sequence_is_cut_on_character_boundaries() {
+        let mut stops = StopMatcher::new(vec!["日本".to_string(), "é!".to_string()]);
+        assert_eq!(
+            stops.push("こんにちは日"),
+            ("こんにちは".to_string(), false)
+        );
+        assert_eq!(stops.push("本語"), (String::new(), true));
+        let mut stops = StopMatcher::new(vec!["é!".to_string()]);
+        // No prefix of `é!` ends inside `é`, so none is tried against the text.
+        assert_eq!(stops.push("ab"), ("ab".to_string(), false));
+        assert_eq!(stops.push("café"), ("caf".to_string(), false));
+        assert_eq!(stops.push("é"), ("é".to_string(), false));
+        assert_eq!(stops.finish(), "é");
+    }
+
+    #[test]
     fn an_incomplete_character_waits_for_the_next_token() {
         let mut bytes = "é".as_bytes()[..1].to_vec();
         assert_eq!(take_utf8(&mut bytes), "");
         bytes.extend(&"é".as_bytes()[1..]);
         assert_eq!(take_utf8(&mut bytes), "é");
+    }
+
+    /// The text `tokens` decode to, token by token.
+    fn decoded(tokens: &[&[u8]]) -> String {
+        let mut bytes = Vec::new();
+        let mut text = String::new();
+        for token in tokens {
+            bytes.extend_from_slice(token);
+            text.push_str(&take_utf8(&mut bytes));
+        }
+        assert!(bytes.is_empty(), "left {bytes:x?}");
+        text
+    }
+
+    #[test]
+    fn an_invalid_byte_does_not_take_the_character_after_it() {
+        // regression: replacing the invalid `ff` also replaced the `c3` that `a9` completes
+        assert_eq!(decoded(&[&[0xff, 0xc3], &[0xa9]]), "\u{fffd}é");
+        assert_eq!(decoded(&[&[0xc3], &[0xc3], &[0xa9]]), "\u{fffd}é");
+        // Every split of the same bytes decodes as a lossy decode of all of them does.
+        let bytes = [
+            0x61, 0xff, 0xe2, 0x82, 0xac, 0xc3, 0xc3, 0xa9, 0xf0, 0x9f, 0x98, 0x80,
+        ];
+        let whole = String::from_utf8_lossy(&bytes);
+        for cut in 0..=bytes.len() {
+            for second in cut..=bytes.len() {
+                let parts = [&bytes[..cut], &bytes[cut..second], &bytes[second..]];
+                assert_eq!(decoded(&parts), whole, "split at {cut} and {second}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_character_cut_off_by_the_end_of_generation_is_replaced() {
+        let (mut out, rx) = output(ToolChoice::Auto, None);
+        out.pending = vec![0xe2, 0x82];
+        out.finish(FinishReason::Length, 1)
+            .expect("the request succeeds");
+        assert_eq!(sent(rx), ["c:\u{fffd}"]);
+    }
+
+    /// The tokens nucleus sampling leaves from `logits` at `temperature` and `top_p`: the
+    /// smallest most-likely set whose probability reaches `top_p`.
+    fn nucleus(logits: &[f32], temperature: f32, top_p: f32) -> Vec<Token> {
+        let scaled: Vec<f64> = logits
+            .iter()
+            .map(|&l| f64::from(l) / f64::from(temperature))
+            .collect();
+        let max = scaled.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let total: f64 = scaled.iter().map(|l| (l - max).exp()).sum();
+        let mut ranked: Vec<(usize, f64)> = scaled
+            .iter()
+            .enumerate()
+            .map(|(id, l)| (id, (l - max).exp() / total))
+            .collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut kept = Vec::new();
+        let mut mass = 0.0;
+        for (id, p) in ranked {
+            kept.push(Token(i32::try_from(id).expect("a small vocabulary")));
+            mass += p;
+            if mass >= f64::from(top_p) {
+                break;
+            }
+        }
+        kept
+    }
+
+    #[test]
+    fn top_p_keeps_the_nucleus_of_the_tempered_distribution() {
+        // regression: top-p ran before temperature, on the untempered distribution
+        let logits = [0.0, -1.0, -2.0, -3.0];
+        for (temperature, top_p) in [(2.0, 0.6), (0.5, 0.9), (1.5, 0.8), (3.0, 0.95)] {
+            let sampling = Sampling {
+                temperature: Some(temperature),
+                top_p: Some(top_p),
+                seed: 7,
+                ..Sampling::default()
+            };
+            let mut chain = Sampler::chain(draw(&sampling));
+            assert_eq!(
+                chain.apply(&logits),
+                nucleus(&logits, temperature, top_p),
+                "temperature {temperature}, top_p {top_p}"
+            );
+        }
+        // The first case tells the orders apart: untempered, top-p keeps only the first token.
+        assert_eq!(nucleus(&logits, 1.0, 0.6), [Token(0)]);
+        assert_eq!(nucleus(&logits, 2.0, 0.6), [Token(0), Token(1)]);
     }
 }

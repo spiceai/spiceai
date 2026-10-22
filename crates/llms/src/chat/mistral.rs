@@ -1147,7 +1147,7 @@ impl ReasoningSupport {
 /// Whether a rendered prompt starts the model inside a reasoning block, by the test
 /// `mistral.rs` applies to parse the reply: a prompt that ends in `<think>`, or one that
 /// carries Gemma 4's `<|think|>`.
-pub fn opens_reasoning(prompt: &str) -> bool {
+fn opens_reasoning(prompt: &str) -> bool {
     prompt.trim_end().ends_with(THINK_OPEN_TAG) || prompt.contains(GEMMA_THINK_TOKEN)
 }
 
@@ -1365,6 +1365,7 @@ fn convert_named_tool(x: &ChatCompletionNamedToolChoice) -> Tool {
     }
 }
 
+#[must_use]
 pub fn convert_tool(x: &ChatCompletionTools) -> Tool {
     match x {
         ChatCompletionTools::Function(tool) => Tool {

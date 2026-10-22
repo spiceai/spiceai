@@ -102,7 +102,7 @@ impl Model {
         }
     }
 
-    /// How many multi-token-prediction (NextN) layers the model carries; a model with one
+    /// How many multi-token-prediction (`NextN`) layers the model carries; a model with one
     /// can draft for itself.
     #[must_use]
     pub fn n_layer_nextn(&self) -> i32 {
@@ -123,6 +123,30 @@ impl Model {
         // SAFETY: checked non-null above; it lives as long as the model.
         let template = unsafe { CStr::from_ptr(template) };
         template.to_str().ok().map(ToString::to_string)
+    }
+
+    /// The model's architecture, as its GGUF's `general.architecture` names it.
+    #[must_use]
+    pub fn architecture(&self) -> Option<String> {
+        let mut buf = vec![0u8; 64];
+        loop {
+            // SAFETY: the key is NUL-terminated and `buf` holds `buf.len()` bytes; llama.cpp
+            // writes at most that many, NUL included, and returns the value's full length.
+            let len = unsafe {
+                sys::llama_model_meta_val_str(
+                    self.raw.as_ptr(),
+                    c"general.architecture".as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                )
+            };
+            let len = usize::try_from(len).ok()?;
+            if len < buf.len() {
+                buf.truncate(len);
+                return String::from_utf8(buf).ok();
+            }
+            buf.resize(len + 1, 0);
+        }
     }
 
     /// Creates a context to decode with.

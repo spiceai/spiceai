@@ -217,6 +217,10 @@ fn bindings(root: &Path) {
         .allowlist_type("spice_mtp.*")
         .allowlist_type("ggml_log_level")
         .allowlist_var("LLAMA_.*")
+        // llama.cpp is C++ behind a C API, and an exception it does not catch would unwind
+        // into Rust, which only an unwinding ABI allows. Rust then aborts where it would
+        // catch it, as llama.cpp's own unhandled exception would.
+        .override_abi(bindgen::Abi::CUnwind, "(llama|spice)_.*")
         .layout_tests(false)
         .generate()
         .expect("bindgen generates the llama.cpp bindings")

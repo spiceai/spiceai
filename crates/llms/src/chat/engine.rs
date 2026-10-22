@@ -29,6 +29,10 @@ use futures::future::BoxFuture;
 
 use super::{Chat, LocalModelOptions, Result};
 
+/// Loads a model from local weight files.
+pub type LoadLocalModel =
+    for<'a> fn(&'a [PathBuf], LocalModelOptions<'a>) -> BoxFuture<'a, Result<Arc<dyn Chat>>>;
+
 /// An engine for local model weights.
 pub struct LocalChatEngine {
     /// The engine's name, as logs and errors give it.
@@ -37,8 +41,7 @@ pub struct LocalChatEngine {
     /// names only, so a remote model can be matched before its files are downloaded.
     pub serves: fn(&[PathBuf]) -> bool,
     /// Loads the model from local weight files.
-    pub load:
-        for<'a> fn(&'a [PathBuf], LocalModelOptions<'a>) -> BoxFuture<'a, Result<Arc<dyn Chat>>>,
+    pub load: LoadLocalModel,
 }
 
 #[linkme::distributed_slice]

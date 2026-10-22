@@ -124,7 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `a6b07b8b9625e552c502c3a7229fd4bb7725bd2e` | `spiceai-0.11.0-df-55` |
-| [llama.cpp](#llamacpp) | `9a24494dae66b8a172fe0bfbed7d454e1f7555b7` | `lukim/b11803-abort-throws` (TEMPORARY: spiceai/llama.cpp#2) |
+| [llama.cpp](#llamacpp) | `2663a92e6aaaac5efda40fdb5ca4e89e79c17673` | `lukim/b11803-abort-throws` (TEMPORARY: spiceai/llama.cpp#2) |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `7cc0c27222c8bd68f858d1fc70300fce4145c3ea` | `lukim/export-tool-call-parser` (TEMPORARY: spiceai/mistral.rs#52) |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
@@ -690,7 +690,7 @@ release, follow `spiceai/README.md` in the fork.
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | Cargo packaging: a root `Cargo.toml` and `spiceai/` make the release the `llama-cpp-src` git dependency, whose build script reports the source directory and release | Cargo cannot fetch the sources, and `crates/llama-cpp`'s build script has no `DEP_LLAMA_CPP_SRC_ROOT` | build | compile-guarded by `crates/llama-cpp` |
-| A failed check in libllama throws instead of aborting: libllama defines `GGML_ABORT_THROWS`, under which `GGML_ABORT` throws a `std::runtime_error` that llama.cpp's C API catches | A GGUF whose metadata fails a `GGML_ASSERT`, such as an unknown `<arch>.classifier.activation`, aborts `spiced` at load instead of failing that model | crash | `an_unknown_classifier_activation_fails_the_load_instead_of_aborting` and `a_corrupted_gguf_fails_its_load_without_taking_the_process_down` (`crates/llama-cpp/tests`) |
+| A failed check while loading a model throws instead of aborting: libllama defines `GGML_ABORT_THROWS`, under which `GGML_ABORT` throws a `std::runtime_error` inside the `llama_abort_throws_scope` that `llama_model_load` opens in the try block that catches it, and aborts as upstream everywhere else | Without the patch, a GGUF whose metadata fails a `GGML_ASSERT`, such as an unknown `<arch>.classifier.activation`, aborts `spiced` at load instead of failing that model. Without its scope, a failed check outside a load throws out of a C API function that catches nothing, into Rust | crash | `an_unknown_classifier_activation_fails_the_load_instead_of_aborting` and `a_corrupted_gguf_fails_its_load_without_taking_the_process_down` (`crates/llama-cpp/tests`) for the load, and `sampler::tests::a_failed_check_outside_a_model_load_aborts_instead_of_throwing` (`crates/llama-cpp/src/sampler.rs`) for everywhere else |
 
 ## candle and its kernel crates
 

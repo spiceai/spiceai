@@ -77,18 +77,18 @@ async fn reasons_by_default_and_answers_after() {
         .await
         .expect("a reply");
     let message = &reply.choices[0].message;
-    assert!(
-        message
-            .reasoning_content
-            .as_deref()
-            .is_some_and(|r| !r.trim().is_empty()),
-        "{message:?}"
-    );
-    assert_eq!(
-        message.content.as_deref().map(str::trim),
-        Some("42"),
-        "{message:?}"
-    );
+    let reasoning = message.reasoning_content.as_deref().unwrap_or_default();
+    let content = message.content.as_deref().unwrap_or_default();
+    assert!(!reasoning.trim().is_empty(), "{message:?}");
+    // The tags split the reply and appear in neither part. The answer's wording differs
+    // between the Metal and CPU backends, which this model's greedy reply is sensitive to.
+    for part in [reasoning, content] {
+        assert!(
+            !part.contains("<think>") && !part.contains("</think>"),
+            "{message:?}"
+        );
+    }
+    assert!(content.contains("42"), "{message:?}");
 }
 
 #[tokio::test]
@@ -254,36 +254,33 @@ async fn beside_tools_a_json_schema_reply_or_a_tool_call_comes_back() {
     ] {
         let reply = model.chat_request(ask(question)).await.expect("a reply");
         let choice = &reply.choices[0];
-        match &choice.message.tool_calls {
-            Some(calls) => {
-                assert_eq!(
-                    choice.finish_reason,
-                    Some(FinishReason::ToolCalls),
-                    "{choice:?}"
-                );
-                assert_eq!(
-                    choice.message.content, None,
-                    "no tag text leaks: {choice:?}"
-                );
-                let ChatCompletionMessageToolCalls::Function(call) = &calls[0] else {
-                    panic!("a function call: {calls:?}");
-                };
-                assert_eq!(call.function.name, "get_weather");
-                let arguments: Value =
-                    serde_json::from_str(&call.function.arguments).expect("JSON arguments");
-                assert!(arguments["city"].is_string(), "{arguments}");
-            }
-            None => {
-                let content = choice.message.content.clone().expect("content");
-                let value: Value =
-                    serde_json::from_str(&content).expect("the reply is the schema's JSON");
-                assert!(value["answer"].is_i64(), "{content}");
-                assert_eq!(
-                    value.as_object().map(serde_json::Map::len),
-                    Some(1),
-                    "{content}"
-                );
-            }
+        if let Some(calls) = &choice.message.tool_calls {
+            assert_eq!(
+                choice.finish_reason,
+                Some(FinishReason::ToolCalls),
+                "{choice:?}"
+            );
+            assert_eq!(
+                choice.message.content, None,
+                "no tag text leaks: {choice:?}"
+            );
+            let ChatCompletionMessageToolCalls::Function(call) = &calls[0] else {
+                panic!("a function call: {calls:?}");
+            };
+            assert_eq!(call.function.name, "get_weather");
+            let arguments: Value =
+                serde_json::from_str(&call.function.arguments).expect("JSON arguments");
+            assert!(arguments["city"].is_string(), "{arguments}");
+        } else {
+            let content = choice.message.content.clone().expect("content");
+            let value: Value =
+                serde_json::from_str(&content).expect("the reply is the schema's JSON");
+            assert!(value["answer"].is_i64(), "{content}");
+            assert_eq!(
+                value.as_object().map(serde_json::Map::len),
+                Some(1),
+                "{content}"
+            );
         }
     }
     // A weather question gets the call.

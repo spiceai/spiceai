@@ -11932,7 +11932,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-src"
 version = "0.1.11803"
-source = "git+https://github.com/spiceai/llama.cpp?rev=9a24494dae66b8a172fe0bfbed7d454e1f7555b7#9a24494dae66b8a172fe0bfbed7d454e1f7555b7"
+source = "git+https://github.com/spiceai/llama.cpp?rev=2663a92e6aaaac5efda40fdb5ca4e89e79c17673#2663a92e6aaaac5efda40fdb5ca4e89e79c17673"
 
 [[package]]
 name = "llguidance"
