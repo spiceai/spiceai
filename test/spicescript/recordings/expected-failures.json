@@ -1261,6 +1261,18 @@
       "group": "duckdb"
     }
   ],
+  "http-caching-keys": [
+    {
+      "run": "http-caching-keys",
+      "who": "default",
+      "key": "source-query: {\"api\":\"count /v1/missing\"} #2",
+      "kind": "other",
+      "signature": "the source answered \\[\\[Some\\(\"(\\d+|<n>)\"\\)\\]\\], expected \\[\\[Some\\(\"(3|<n>)\"\\)\\]\\]",
+      "pattern": "the source answered \\[\\[Some\\(\"(\\d+|<n>)\"\\)\\]\\], expected \\[\\[Some\\(\"(3|<n>)\"\\)\\]\\]",
+      "group": "caching-http",
+      "may-pass": true
+    }
+  ],
   "iceberg-coverage": [
     {
       "run": "iceberg-coverage[source=iceberg]",

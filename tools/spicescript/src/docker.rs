@@ -207,7 +207,9 @@ impl Container {
             .start_container(&self.id, None::<StartContainerOptions<String>>)
             .await
             .with_context(|| format!("Failed to start container {}", self.name))?;
-        self.wait_healthy(Duration::from_mins(2)).await
+        // A database container on a CI runner busy with other jobs can take
+        // over two minutes to become healthy.
+        self.wait_healthy(Duration::from_mins(5)).await
     }
 
     pub async fn stop(&self) -> Result<()> {

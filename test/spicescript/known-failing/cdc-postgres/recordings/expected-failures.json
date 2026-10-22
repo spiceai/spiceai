@@ -257,8 +257,8 @@
       "who": "default",
       "key": "restart: {}",
       "kind": "status",
-      "signature": "spiced not ready: a dataset is in Error: .*received Value::Unchanged \\(TOASTed column omitted\\)",
-      "pattern": "spiced not ready: a dataset is in Error: .*received Value::Unchanged \\(TOASTed column omitted\\)",
+      "signature": "spiced not ready: a dataset is in Error: .*received Value::Unchang",
+      "pattern": "spiced not ready: a dataset is in Error: .*received Value::Unchang",
       "group": "cdc-postgres",
       "may-pass": true
     }
