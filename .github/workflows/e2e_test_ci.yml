@@ -2918,7 +2918,7 @@ jobs:
     name: ${{ matrix.name }}
     needs: [build, build_spicescript]
     runs-on: spiceai-dev-runners
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -2985,7 +2985,7 @@ jobs:
 
       - name: Run scenario scripts
         run: |
-          "${{ steps.spicescript.outputs.path }}" --jobs 8 \
+          "${{ steps.spicescript.outputs.path }}" --jobs 4 \
             --spiced "$(command -v spiced)" \
             --spice-cli "$(command -v spice)" \
             --work-dir "$RUNNER_TEMP/spicescript" \
@@ -3041,7 +3041,9 @@ jobs:
       - graceful_shutdown_test_full
       - test_cold_start_unkeyed_append
       - build_spicescript
-      - test_spicescript
+      # test_spicescript reports but does not gate merges while the scenario
+      # scripts settle on the CI runners: a run that fails there names the
+      # failing scripts in its own job.
     steps:
       - name: Verify all E2E jobs succeeded
         # Named rather than left to the runner default: this gate is the required

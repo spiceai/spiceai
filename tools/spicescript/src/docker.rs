@@ -146,26 +146,31 @@ impl Container {
             }),
             ..Default::default()
         };
-        // A container left behind by an interrupted run would hold the name.
-        let _ = docker
-            .remove_container(
-                &spec.name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-        let created = docker
-            .create_container(
-                Some(CreateContainerOptions {
-                    name: spec.name.as_str(),
-                    platform: None,
-                }),
-                config,
-            )
-            .await
-            .with_context(|| format!("Failed to create container {}", spec.name))?;
+        let created = retry_on_timeout(CREATE_ATTEMPTS, &spec.name, || async {
+            // A container left behind by an interrupted run, or by an attempt
+            // that timed out after Docker had begun creating it, would hold
+            // the name.
+            let _ = docker
+                .remove_container(
+                    &spec.name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            docker
+                .create_container(
+                    Some(CreateContainerOptions {
+                        name: spec.name.as_str(),
+                        platform: None,
+                    }),
+                    config.clone(),
+                )
+                .await
+        })
+        .await
+        .with_context(|| format!("Failed to create container {}", spec.name))?;
         crate::cleanup::track_container(&created.id, &spec.name, spec.network.as_deref());
         let container = Self {
             docker,
@@ -406,6 +411,38 @@ async fn pull_if_missing(docker: &Docker, image: &str) -> Result<()> {
     Ok(())
 }
 
+/// How many times creating a container is tried when Docker does not answer
+/// in time. A daemon busy with many containers at once (several runs on one
+/// host) can take longer than the client's request timeout, and creating the
+/// container again usually succeeds.
+const CREATE_ATTEMPTS: u32 = 3;
+
+/// Runs `attempt` until it succeeds, fails other than by Docker not answering
+/// in time, or has been tried `attempts` times. Each retry is reported in the
+/// script's output, naming `what`.
+async fn retry_on_timeout<T, F, Fut>(
+    attempts: u32,
+    what: &str,
+    mut attempt: F,
+) -> Result<T, bollard::errors::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, bollard::errors::Error>>,
+{
+    let mut tried = 1;
+    loop {
+        match attempt().await {
+            Err(bollard::errors::Error::RequestTimeoutError) if tried < attempts => {
+                crate::runner::emit(&format!(
+                    "   Docker did not answer in time creating {what}; trying again ({tried} of {attempts} attempts made)"
+                ));
+                tried += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// A host port that is free now. Another process could take it before Docker
 /// binds it; the window is small and a collision fails loudly at create time.
 /// A free local port that no other instance of this run has been given. The
@@ -476,5 +513,60 @@ mod port_tests {
             );
             assert!(seen.insert(port), "port {port} was given out twice");
         }
+    }
+}
+
+#[cfg(test)]
+mod create_retry_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use bollard::errors::Error;
+
+    use super::retry_on_timeout;
+
+    #[tokio::test]
+    async fn retries_only_a_timeout_and_only_as_often_as_allowed() {
+        // Two timeouts, then success: three attempts.
+        let calls = AtomicU32::new(0);
+        let got = retry_on_timeout(3, "c", || async {
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => Err(Error::RequestTimeoutError),
+                _ => Ok(7),
+            }
+        })
+        .await;
+        assert_eq!((got.ok(), calls.load(Ordering::SeqCst)), (Some(7), 3));
+
+        // Timeouts every time: gives up after the allowed attempts.
+        let calls = AtomicU32::new(0);
+        let got: Result<(), Error> = retry_on_timeout(3, "c", || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(Error::RequestTimeoutError)
+        })
+        .await;
+        assert!(matches!(got, Err(Error::RequestTimeoutError)), "{got:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // Any other failure is returned at once.
+        let calls = AtomicU32::new(0);
+        let got: Result<(), Error> = retry_on_timeout(3, "c", || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(Error::DockerResponseServerError {
+                status_code: 409,
+                message: "Conflict".into(),
+            })
+        })
+        .await;
+        assert!(
+            matches!(
+                got,
+                Err(Error::DockerResponseServerError {
+                    status_code: 409,
+                    ..
+                })
+            ),
+            "{got:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

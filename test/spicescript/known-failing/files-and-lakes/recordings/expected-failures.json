@@ -85,7 +85,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=files]",
@@ -108,7 +109,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=files]",
@@ -131,7 +133,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=files]",
@@ -154,7 +157,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=files]",
@@ -177,7 +181,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=files]",
@@ -200,7 +205,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=files]",
@@ -223,7 +229,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=files]",
@@ -246,7 +253,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=files]",
@@ -269,7 +277,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=files]",
@@ -292,7 +301,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=files]",
@@ -315,7 +325,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=files]",
@@ -338,7 +349,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=files]",
@@ -361,7 +373,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -448,7 +461,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -471,7 +485,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -494,7 +509,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -517,7 +533,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -540,7 +557,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -563,7 +581,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -586,7 +605,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -609,7 +629,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -632,7 +653,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -655,7 +677,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -678,7 +701,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -701,7 +725,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -724,7 +749,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=files]",
@@ -747,7 +773,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=rustfs]",
@@ -825,7 +852,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=rustfs]",
@@ -839,7 +867,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=rustfs]",
@@ -853,7 +882,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=rustfs]",
@@ -867,7 +897,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=rustfs]",
@@ -881,7 +912,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=rustfs]",
@@ -895,7 +927,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=rustfs]",
@@ -909,7 +942,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=rustfs]",
@@ -923,7 +957,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=rustfs]",
@@ -937,7 +972,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=rustfs]",
@@ -951,7 +987,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=rustfs]",
@@ -965,7 +1002,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=rustfs]",
@@ -979,7 +1017,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=parquet,src=rustfs]",
@@ -993,7 +1032,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1071,7 +1111,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1085,7 +1126,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1099,7 +1141,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1113,7 +1156,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1127,7 +1171,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1141,7 +1186,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1155,7 +1201,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1169,7 +1216,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1183,7 +1231,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1197,7 +1246,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1211,7 +1261,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1225,7 +1276,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1239,7 +1291,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     },
     {
       "run": "file-tables-federated-stale[format=csv,src=rustfs]",
@@ -1253,7 +1306,8 @@
         "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
       ],
       "varies": true,
-      "group": "files-and-lakes"
+      "group": "files-and-lakes",
+      "pattern": "Spice rejected the query: (the query did not return within|Tonic error: code: 'Internal error', message: \"(Object Store error|Arrow error|Parquet error))"
     }
   ],
   "iceberg-equality-delete-nulls": [

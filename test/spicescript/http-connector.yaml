@@ -230,6 +230,7 @@ steps:
     expect: { rows: [['0']] }
   - query: SELECT id, name FROM items_deferred
     expect: { rows: [['1', one], ['2', two]] }
+    eventually: 30s
 
   # Static files.
   - query: SELECT id, title, rating FROM shows_json

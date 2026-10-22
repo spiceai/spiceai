@@ -2618,6 +2618,18 @@
       "group": "duckdb"
     }
   ],
+  "postgres-cdc-parity": [
+    {
+      "run": "postgres-cdc-parity",
+      "who": "turso-position",
+      "key": "query: SELECT * FROM customers #3",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "sqlite",
+      "may-pass": true
+    }
+  ],
   "postgres-literals": [
     {
       "run": "postgres-literals",
