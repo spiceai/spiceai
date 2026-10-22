@@ -464,7 +464,9 @@ async fn header_from_prefix(
     let Some(decoded) = decode_prefix(prefix, compression, options).await? else {
         return Ok(None);
     };
-    if !whole_object && !header_record_complete(&decoded, options.quote, options.escape) {
+    if !whole_object
+        && !header_record_complete(&decoded, options.quote, options.escape, options.comment)
+    {
         return Ok(None);
     }
     parse_header_names(&decoded, options).map(Some)
@@ -488,7 +490,7 @@ async fn decode_prefix(
     loop {
         if let Some(Ok(chunk)) = decoded.next().await {
             acc.extend_from_slice(&chunk);
-            if header_record_complete(&acc, options.quote, options.escape) {
+            if header_record_complete(&acc, options.quote, options.escape, options.comment) {
                 break;
             }
         } else if acc.is_empty() {
@@ -500,11 +502,24 @@ async fn decode_prefix(
     Ok(Some(bytes::Bytes::from(acc)))
 }
 
-/// Whether `bytes` contains a quote-aware CSV record terminator, so a header
-/// parse will not see a field split across the prefix cut.
-fn header_record_complete(bytes: &[u8], quote: u8, escape: Option<u8>) -> bool {
+/// Whether `bytes` contains a quote-aware CSV header record terminator, so a
+/// header parse will not see a field split across the prefix cut.
+///
+/// Leading empty records (and comment records, when `comment` is set) are
+/// skipped first. A prefix that is only blank lines would otherwise look
+/// complete and a later header that straddles the cut would be parsed as a
+/// truncated name list.
+fn header_record_complete(
+    bytes: &[u8],
+    quote: u8,
+    escape: Option<u8>,
+    comment: Option<u8>,
+) -> bool {
+    let mut i = skip_leading_empty_and_comment_records(bytes, comment);
+    if i >= bytes.len() {
+        return false;
+    }
     let mut in_quotes = false;
-    let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
         if in_quotes {
@@ -530,6 +545,26 @@ fn header_record_complete(bytes: &[u8], quote: u8, escape: Option<u8>) -> bool {
         i += 1;
     }
     false
+}
+
+fn skip_leading_empty_and_comment_records(bytes: &[u8], comment: Option<u8>) -> usize {
+    let mut i = 0;
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        i = 3;
+    }
+    loop {
+        while i < bytes.len() && (bytes[i] == b'\n' || bytes[i] == b'\r') {
+            i += 1;
+        }
+        match comment {
+            Some(marker) if i < bytes.len() && bytes[i] == marker => {
+                while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            _ => return i,
+        }
+    }
 }
 
 fn parse_header_names(bytes: &[u8], options: &CsvOptions) -> Result<Vec<String>> {
@@ -795,11 +830,26 @@ mod tests {
 
     #[test]
     fn header_record_complete_is_quote_aware() {
-        assert!(!header_record_complete(b"a,b", b'"', None));
-        assert!(header_record_complete(b"a,b\n1,2\n", b'"', None));
-        assert!(!header_record_complete(b"\"a\nb\",c", b'"', None));
-        assert!(header_record_complete(b"\"a\nb\",c\n", b'"', None));
-        assert!(header_record_complete(b"\"a\"\"b\",c\n", b'"', None));
+        assert!(!header_record_complete(b"a,b", b'"', None, None));
+        assert!(header_record_complete(b"a,b\n1,2\n", b'"', None, None));
+        assert!(!header_record_complete(b"\"a\nb\",c", b'"', None, None));
+        assert!(header_record_complete(b"\"a\nb\",c\n", b'"', None, None));
+        assert!(header_record_complete(b"\"a\"\"b\",c\n", b'"', None, None));
+        assert!(!header_record_complete(b"\n\n", b'"', None, None));
+        assert!(!header_record_complete(b"\n\nid,amo", b'"', None, None));
+        assert!(header_record_complete(b"\n\nid,amount\n", b'"', None, None));
+        assert!(!header_record_complete(
+            b"# note\nid,amo",
+            b'"',
+            None,
+            Some(b'#')
+        ));
+        assert!(header_record_complete(
+            b"# note\nid,amount\n",
+            b'"',
+            None,
+            Some(b'#')
+        ));
     }
 
     #[tokio::test]
@@ -817,7 +867,7 @@ mod tests {
             std::str::from_utf8(prefix).is_err(),
             "the 64 KiB probe must split the euro sign"
         );
-        assert!(!header_record_complete(prefix, b'"', None));
+        assert!(!header_record_complete(prefix, b'"', None, None));
         write_csv(
             &dir.path().join("base.csv"),
             &header,
@@ -870,7 +920,7 @@ mod tests {
         assert!(
             decoded
                 .as_ref()
-                .is_none_or(|bytes| !header_record_complete(bytes, b'"', None)),
+                .is_none_or(|bytes| !header_record_complete(bytes, b'"', None, None)),
             "a 64 KiB bzip2 prefix must not be treated as a complete header"
         );
 
@@ -884,5 +934,32 @@ mod tests {
             .await
             .expect("query after growing the compressed header probe");
         assert_eq!(sums, (Some(500_000), Some(50_000)));
+    }
+
+    #[tokio::test]
+    async fn header_probe_grows_when_leading_blank_lines_push_the_header_across_the_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 65_530 leading newlines put the real header across the 64 KiB cut.
+        // Treating the first blank line as a terminator would parse a truncated
+        // name list (`event_`) instead of growing.
+        let mut text = "\n".repeat(65_530);
+        text.push_str("event_id,user_id,region,amount_cents,ts\n");
+        text.push_str("1,10,us,100,t0\n2,20,eu,200,t1\n");
+        let prefix = text.as_bytes().get(..header_probe_len()).expect("prefix");
+        assert!(
+            !prefix
+                .windows(b"amount_cents".len())
+                .any(|w| w == b"amount_cents"),
+            "the 64 KiB probe must cut through the header name"
+        );
+        assert!(
+            !header_record_complete(prefix, b'"', None, None),
+            "leading blank lines are not a complete header"
+        );
+        std::fs::write(dir.path().join("base.csv"), text).expect("write csv");
+        let sums = query_sums(listing_table(dir.path(), header_format()))
+            .await
+            .expect("query after growing past leading blank records");
+        assert_eq!(sums, (Some(300), Some(30)));
     }
 }
