@@ -1990,7 +1990,6 @@ mod tests {
         }
     }
 
-
     /// A provider whose first round is `calls` `list_datasets` calls. Streamed, it sends
     /// `output_item.done` for `done_indexes` only, in that order, after every call has been added.
     /// Later rounds are a message. It records every request.
@@ -2167,7 +2166,10 @@ mod tests {
             let provider = DoneOrderResponses::new(calls, done_indexes.clone());
             let (ran, tools_used, outputs) = first_round(&provider, true).await;
             assert_eq!(ran, MAX_SPICE_TOOL_CALLS_PER_RESPONSE, "{done_indexes:?}");
-            assert_eq!(tools_used, MAX_SPICE_TOOL_CALLS_PER_RESPONSE, "{done_indexes:?}");
+            assert_eq!(
+                tools_used, MAX_SPICE_TOOL_CALLS_PER_RESPONSE,
+                "{done_indexes:?}"
+            );
             assert_eq!(outputs, first_64_ran(calls), "{done_indexes:?}");
         }
     }
