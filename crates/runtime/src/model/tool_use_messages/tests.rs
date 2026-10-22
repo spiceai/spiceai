@@ -767,11 +767,11 @@ async fn a_zero_recursion_limit_calls_the_model_without_spice_tools() {
 async fn tools_used_counts_only_the_calls_that_ran() {
     let calls = MAX_SPICE_TOOL_CALLS_PER_RESPONSE + 1;
     for stream in [false, true] {
-        let content: Vec<Value> = (0..calls)
+        let sql_calls: Vec<Value> = (0..calls)
             .map(|i| sql_call(&format!("toolu_{i}")))
             .collect();
         let scripted = Scripted::new(vec![
-            round("msg_1", &Value::Array(content), "tool_use", 100, 10),
+            round("msg_1", &Value::Array(sql_calls), "tool_use", 100, 10),
             round(
                 "msg_2",
                 &json!([{"type": "text", "text": "Done."}]),
