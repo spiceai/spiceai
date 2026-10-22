@@ -183,16 +183,6 @@ pub(crate) async fn do_action(
         }
         ActionType::ClosePreparedStatement => {
             tracing::trace!("do_action: ClosePreparedStatement");
-            // Nothing is stored server-side, but the handle is still checked: a handle this
-            // process did not issue is rejected rather than acknowledged.
-            let any = Any::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
-            let cmd: sql::ActionClosePreparedStatementRequest =
-                any.unpack().map_err(to_tonic_err)?.ok_or_else(|| {
-                    Status::invalid_argument(
-                        "Unable to unpack ActionClosePreparedStatementRequest.",
-                    )
-                })?;
-            super::flightsql::prepared_statement_handle::open(&cmd.prepared_statement_handle)?;
             futures::stream::iter(vec![Ok(arrow_flight::Result::default())])
         }
         ActionType::SubmitAsyncQuery => {
