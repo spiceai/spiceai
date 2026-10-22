@@ -36,7 +36,7 @@ use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{
     Acceleration, Engine, Mode, RefreshMode, ZeroResultsAction,
 };
-use crate::component::dataset::{Dataset, OnSchemaChange, ReadyState};
+use crate::component::dataset::{Dataset, DatasetSpec, OnSchemaChange, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::spice_sys::dataset_checkpointer;
@@ -746,21 +746,38 @@ async fn read_refresh_batch(
     .await
 }
 
+/// The plan a rebuilt view acceleration reloads through.
+#[derive(Clone, Copy)]
+enum ViewPlan<'a> {
+    /// Built before the acceleration was created.
+    Built(&'a Arc<dyn TableProvider>),
+    /// Built once the tables the view reads are ready, while the view is served from its
+    /// existing acceleration.
+    Deferred(&'a crate::view::ViewRefreshSource),
+}
+
 /// Whether a rebuilt view acceleration could reload: a row of the view's query can be read
-/// through `view_table` within [`REBUILD_SOURCE_WAIT`]. Planning the view reads none of the
-/// sources its query reads, so only a read shows that they answer.
+/// through its plan within [`REBUILD_SOURCE_WAIT`], building the plan first if it is not
+/// built yet. Planning the view reads none of the sources its query reads, so only a read
+/// shows that they answer. A redefined view is not rebuilt here: it is registered again
+/// from its definition.
 async fn view_readable_for_rebuild(
     ctx: &SessionContext,
     view_name: &TableReference,
-    view_table: &Arc<dyn TableProvider>,
+    view_plan: ViewPlan<'_>,
 ) -> bool {
-    match tokio::time::timeout(
-        REBUILD_SOURCE_WAIT,
-        read_one_row(ctx, Arc::clone(view_table)),
-    )
-    .await
-    {
-        Ok(Ok(())) => true,
+    let read = async {
+        let view_table = match view_plan {
+            ViewPlan::Built(view_table) => Arc::clone(view_table),
+            ViewPlan::Deferred(source) => match source.plan_on_served_schema().await? {
+                Some(view_table) => view_table,
+                None => return Ok(false),
+            },
+        };
+        read_one_row(ctx, view_table).await.map(|()| true)
+    };
+    match tokio::time::timeout(REBUILD_SOURCE_WAIT, read).await {
+        Ok(Ok(readable)) => readable,
         Ok(Err(error)) => {
             let error = error.to_string();
             let cause = util::single_line(&error);
@@ -5191,13 +5208,13 @@ impl DataFusion {
     /// (`acceleration_source::rebuilds_on_settings_change`), so the rebuild loses no row a
     /// reload does not bring back. The reload runs the view's query, which reads sources
     /// that can fail, so the acceleration is dropped only once a row of the query can be
-    /// read through `view_table` ([`view_readable_for_rebuild`]). Until then, the engine
+    /// read through `view_plan` ([`view_readable_for_rebuild`]). Until then, the engine
     /// keeps the settings the acceleration was built with
     /// ([`SettingsRebuild::HeldUntilSourceReadable`]) and the view keeps serving it.
     async fn create_view_accelerator_table(
         &self,
         view: &View,
-        view_table: &Arc<dyn TableProvider>,
+        view_plan: ViewPlan<'_>,
         schema: SchemaRef,
         acceleration_settings: &Acceleration,
         secrets: Arc<TokioRwLock<Secrets>>,
@@ -5207,7 +5224,7 @@ impl DataFusion {
             .await
         {
             Err(dataaccelerator::Error::RebuildRequired { source: cause }) => {
-                if view_readable_for_rebuild(&self.ctx, &view.name, view_table).await {
+                if view_readable_for_rebuild(&self.ctx, &view.name, view_plan).await {
                     self.rebuild_acceleration(view, acceleration_settings, &cause.to_string())
                         .await?;
                     return self
@@ -6422,6 +6439,7 @@ impl DataFusion {
         self: &Arc<Self>,
         view: Arc<View>,
         secrets: Arc<TokioRwLock<Secrets>>,
+        start: crate::view::ViewStart,
     ) -> Result<JoinHandle<Option<ViewRegistration>>> {
         tracing::info!("Initializing view {}", &view.name);
         if self.ctx.table_exist(view.name.clone()).unwrap_or(false) {
@@ -6450,6 +6468,31 @@ impl DataFusion {
         tracing::debug!("Creating view {table} with dependent tables {dependent_table_names:?}");
 
         let register_task: JoinHandle<Option<ViewRegistration>> = spawn(async move {
+            if start == crate::view::ViewStart::ExistingAcceleration
+                && let Some(checkpoint_schema) = view.existing_acceleration_schema().await
+            {
+                return match df_ref
+                    .create_accelerated_view_from_existing(
+                        &view,
+                        statements[0].clone(),
+                        dependent_table_names,
+                        checkpoint_schema,
+                        secrets,
+                    )
+                    .await
+                {
+                    Ok(registration) => registration,
+                    Err(e) => {
+                        tracing::error!("Failed to create view {table}: {e}");
+                        status.update_view(
+                            &table,
+                            status::ComponentStatus::error_with_message(e.to_string()),
+                        );
+                        None
+                    }
+                };
+            }
+
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
             // the tables are created. To handle this, wait until all tables are created.
@@ -6562,6 +6605,82 @@ impl DataFusion {
         view_table: Arc<dyn TableProvider>,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<Option<ViewRegistration>> {
+        let view_table =
+            table_provider_with_spicepod_metadata(view_table, &view.metadata, &view.columns);
+        let schema = view_table.schema();
+        self.register_accelerated_view(
+            view,
+            FederatedTable::new_unchecked(Arc::clone(&view_table)),
+            schema,
+            ViewPlan::Built(&view_table),
+            secrets,
+        )
+        .await
+    }
+
+    /// Registers an accelerated view against its existing acceleration, checkpointed
+    /// with `checkpoint_schema`, without waiting for the tables it reads (`reads`):
+    /// queries are served from the acceleration, and the view's plan is built in the
+    /// background once those tables are ready, when its refreshes resume. This is how
+    /// an accelerated dataset is served before its source answers. Settings that need a
+    /// rebuild wait for those tables within [`REBUILD_SOURCE_WAIT`], as a dataset waits for
+    /// its source ([`view_readable_for_rebuild`]). A plan that no longer matches the
+    /// acceleration registers the view again from its definition
+    /// (see [`crate::view::ViewRefreshSource`]).
+    async fn create_accelerated_view_from_existing(
+        self: &Arc<Self>,
+        view: &Arc<View>,
+        statement: datafusion::sql::parser::Statement,
+        reads: Vec<TableReference>,
+        checkpoint_schema: SchemaRef,
+        secrets: Arc<TokioRwLock<Secrets>>,
+    ) -> Result<Option<ViewRegistration>> {
+        let mut spec = DatasetSpec::new(String::new(), view.name.clone());
+        spec.metadata.clone_from(&view.metadata);
+        spec.columns.clone_from(&view.columns);
+        let served_schema =
+            runtime_table::accelerated::checkpoint_primary_key::without_acceleration_primary_key(
+                Arc::clone(&checkpoint_schema),
+            );
+        let source = crate::view::ViewRefreshSource::new_arc(
+            Arc::clone(&self.ctx),
+            statement,
+            Arc::clone(view),
+            reads,
+            self.runtime_status(),
+            served_schema,
+        );
+        let federated = FederatedTable::new_deferred(
+            Arc::new(spec),
+            Arc::clone(&source) as Arc<dyn runtime_table::refresh_source::RefreshSource>,
+            checkpoint_schema,
+            self.runtime_status().shutdown_token(),
+        );
+        let schema = federated.schema();
+        let registration = self
+            .register_accelerated_view(
+                view,
+                federated,
+                schema,
+                ViewPlan::Deferred(&source),
+                secrets,
+            )
+            .await?;
+        source.mark_registered();
+        Ok(registration)
+    }
+
+    /// Registers `view` accelerated, refreshed from `federated` and serving `schema`. A
+    /// settings change that rebuilds the acceleration drops it only once `view_plan` can
+    /// be read.
+    async fn register_accelerated_view(
+        self: &Arc<Self>,
+        view: &View,
+        federated: FederatedTable,
+        schema: SchemaRef,
+        view_plan: ViewPlan<'_>,
+        secrets: Arc<TokioRwLock<Secrets>>,
+    ) -> Result<Option<ViewRegistration>> {
         let table = &view.name;
 
         let acceleration =
@@ -6571,10 +6690,6 @@ impl DataFusion {
                     name: table.to_string(),
                 })?;
 
-        let view_table =
-            table_provider_with_spicepod_metadata(view_table, &view.metadata, &view.columns);
-        let schema = view_table.schema();
-
         // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
         validate_distributed_engine(
             &self.cluster_config,
@@ -6583,7 +6698,7 @@ impl DataFusion {
         )?;
 
         let accelerated_table_provider = self
-            .create_view_accelerator_table(view, &view_table, schema, acceleration, secrets)
+            .create_view_accelerator_table(view, view_plan, schema, acceleration, secrets)
             .await
             .map_err(|e| Error::UnableToCreateView {
                 reason: match e {
@@ -6623,8 +6738,8 @@ impl DataFusion {
         let mut builder = AcceleratedTable::builder(
             self.runtime_status(),
             table.clone(),
-            Arc::new(FederatedTable::new_unchecked(view_table)),
-            "view".to_string(),
+            Arc::new(federated),
+            runtime_table::accelerated::VIEW_FEDERATED_SOURCE.to_string(),
             accelerated_table_provider,
             refresh,
             self.io_runtime.clone(),
@@ -7388,7 +7503,7 @@ impl Drop for DataFusion {
     }
 }
 
-async fn wait_until_dependent_tables_are_ready(
+pub(crate) async fn wait_until_dependent_tables_are_ready(
     table: &TableReference,
     dependent_tables: &[TableReference],
     runtime_status: &Arc<status::RuntimeStatus>,
