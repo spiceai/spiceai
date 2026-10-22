@@ -148,7 +148,10 @@ use datafusion_federation::{
         SQLFederationProvider, SQLTableSource,
     },
 };
-use datafusion_table_providers::sqlite::sqlite_interval::SQLiteIntervalVisitor;
+use datafusion_table_providers::sqlite::{
+    federation::SQLiteRemoteTable,
+    sqlite_interval::{SQLiteIntervalVisitor, mark_federated_date_operands},
+};
 
 use crate::function_support::{FunctionSupport, unfederate_plan_with_unsupported_functions};
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -1225,8 +1228,10 @@ impl TursoTableProvider {
 
     /// Returns AST analyzer rules for Turso-specific SQL transformations.
     ///
-    /// Uses the shared `SQLiteIntervalVisitor` to convert INTERVAL literals to
-    /// `CAST(date/datetime(col, modifier) AS TEXT)` calls.
+    /// Uses the shared `SQLiteIntervalVisitor` to convert INTERVAL arithmetic to
+    /// `CAST(datetime(col, modifier) AS TEXT)`, or to `date()` for a `DATE`
+    /// operand the logical optimizers marked (`SQLiteRemoteTable` and
+    /// [`SQLExecutor::logical_optimizer`]).
     ///
     /// Also applies `TursoBetweenVisitor` to rewrite numeric `BETWEEN` expressions
     /// into explicit `CAST(... AS REAL)` comparisons, since Turso does not have the
@@ -1346,16 +1351,24 @@ impl TableProvider for TursoTableProvider {
 
 // Federation support for Turso
 impl TursoTableProvider {
-    /// Creates a federated table source for cross-database queries
+    /// Creates a federated table source for cross-database queries.
+    ///
+    /// Its table is `SQLiteRemoteTable`, whose logical optimizer marks every
+    /// `DATE` operand of interval arithmetic on the typed plan before it is
+    /// unparsed: unparsed, a date and a timestamp are both `TEXT`, and only the
+    /// marker tells the interval rewrite to shift a date through `date()` rather
+    /// than `datetime()`.
     fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
         let table_name = TableReference::bare(self.table_name.clone());
         let schema = Arc::clone(&self.schema);
         let fed_provider = Arc::new(SQLFederationProvider::new(self));
 
-        Arc::new(SQLTableSource::new_with_schema(
+        Arc::new(SQLTableSource::new_with_table(
             fed_provider,
-            RemoteTableRef::from(table_name),
-            schema,
+            Arc::new(SQLiteRemoteTable::new(
+                RemoteTableRef::from(table_name),
+                schema,
+            )),
         ))
     }
 
@@ -1417,10 +1430,27 @@ impl SQLExecutor for TursoTableProvider {
         Some(AstAnalyzer::new(vec![Self::turso_ast_analyzer()]))
     }
 
+    /// Unfederates a statement that calls a function Turso does not support,
+    /// and otherwise marks the `DATE` operands of its interval arithmetic for
+    /// [`Self::turso_ast_analyzer`]. The marking runs here as well as in the
+    /// scan's `SQLiteRemoteTable` because the scan's optimizer is not gathered
+    /// for a table that only appears inside a subquery.
     fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
-        let function_support = self.function_support.clone()?;
+        let function_support = self.function_support.clone();
         Some(Box::new(move |plan| {
-            unfederate_plan_with_unsupported_functions(plan, &function_support)
+            let plan = match &function_support {
+                Some(function_support) => {
+                    unfederate_plan_with_unsupported_functions(plan, function_support)?
+                }
+                None => plan,
+            };
+            // An unfederated statement is no longer an extension node and runs
+            // in DataFusion, which needs no marker.
+            if matches!(plan, LogicalPlan::Extension(_)) {
+                mark_federated_date_operands(plan)
+            } else {
+                Ok(plan)
+            }
         }))
     }
 
