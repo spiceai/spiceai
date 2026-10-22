@@ -1087,6 +1087,114 @@ async fn test_cold_tier_upsert_after_promotion_impl(
     Ok(())
 }
 
+test_with_backends!(test_cold_tier_upsert_range_precheck_impl);
+
+/// Total keys hidden by inline tombstones currently recorded for the table.
+async fn inline_tombstone_rows(fixture: &common::TestFixture, table: &CayenneTableProvider) -> i64 {
+    fixture
+        .catalog
+        .get_inlined_deletes(table.table_id())
+        .await
+        .expect("list inlined deletes")
+        .iter()
+        .map(|d| d.delete_count)
+        .sum()
+}
+
+/// Two cold files cover disjoint key ranges. Appending brand-new keys that lie
+/// outside every cold file's range (below, between and above them) must record
+/// no supersede tombstone, because no cold file can hold such a key even when a
+/// file's bloom would falsely report it. Upserting keys that do exist in the
+/// cold files, including each file's minimum and maximum, must leave exactly
+/// one live row per key carrying the latest value. The oracle is an in-memory
+/// map of the same operation history.
+async fn test_cold_tier_upsert_range_precheck_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    use std::collections::BTreeMap;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+    let options = cold_table_options_with_conflict(
+        &fixture,
+        "range_t",
+        &schema,
+        &cold_dir,
+        300_000,
+        Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+    );
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    ctx.register_table("range_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+    let mut oracle: BTreeMap<i64, i64> = BTreeMap::new();
+    for range in [10_000..14_000_i64, 100_000..104_000_i64] {
+        insert_id_range(&table, &schema, range.clone()).await?;
+        for id in range {
+            oracle.insert(id, id * 2);
+        }
+        flush_warm(&table).await;
+        assert!(table.promote_warm_to_cold().await?, "promotion fires");
+    }
+    let cold_files = fixture.catalog.list_cold_tier_files(table.table_id()).await?;
+    assert_eq!(cold_files.len(), 2, "two cold files with disjoint key ranges");
+
+    // (a) Brand-new keys outside both ranges: below, between and above.
+    let before = inline_tombstone_rows(&fixture, &table).await;
+    for range in [0..8_000_i64, 20_000..60_000_i64, 200_000..208_000_i64] {
+        insert_id_range(&table, &schema, range.clone()).await?;
+        for id in range {
+            oracle.insert(id, id * 2);
+        }
+    }
+    let after = inline_tombstone_rows(&fixture, &table).await;
+    assert_eq!(
+        after - before,
+        0,
+        "keys outside every cold file's range must not record tombstones"
+    );
+
+    // (b) Keys present in the cold files, including each file's min and max,
+    // plus keys just outside each range that no file holds.
+    let upserts: Vec<i64> = vec![
+        10_000, 10_001, 12_345, 13_998, 13_999, 100_000, 100_001, 101_234, 103_999, 9_999, 14_000,
+        99_999, 104_000,
+    ];
+    let values: Vec<i64> = upserts.iter().map(|i| i * 10 + 1).collect();
+    for (id, value) in upserts.iter().zip(&values) {
+        oracle.insert(*id, *value);
+    }
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(upserts)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )?;
+    common::insert_batch(table.as_ref(), batch).await?;
+
+    let expected: Vec<(i64, i64)> = oracle.iter().map(|(k, v)| (*k, *v)).collect();
+    let actual = collect_pairs(&ctx, "SELECT id, value FROM range_t ORDER BY id").await?;
+    assert_eq!(actual.len(), expected.len(), "row count matches the oracle");
+    assert_eq!(actual, expected, "every key has exactly its latest version");
+
+    // The result must also hold after the superseded cold copies are rewritten.
+    flush_warm(&table).await;
+    assert!(table.promote_warm_to_cold().await?, "second promotion fires");
+    let actual = collect_pairs(&ctx, "SELECT id, value FROM range_t ORDER BY id").await?;
+    assert_eq!(actual, expected, "latest versions survive the dirty rewrite");
+    Ok(())
+}
+
 /// Arms `cdc_durability: memory` deferral in tests (the runtime installs a real
 /// advancer from the first replayable committer).
 struct NoopSlotAdvancer;

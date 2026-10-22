@@ -15227,10 +15227,19 @@ impl CayenneTableProvider {
             .iter()
             .filter(|f| f.file_size_bytes > 0)
             .collect();
+        let range_converter = self.build_pk_converter(&self.pk_column_indices).ok();
         let mut blooms = Vec::with_capacity(live.len());
         for f in &live {
             if let Some(bloom) = f.pk_bloom.as_deref().and_then(PkBloom::from_bytes) {
-                blooms.push(bloom);
+                let range = range_converter.as_ref().and_then(|converter| {
+                    crate::provider::cold_partition::pk_byte_range_from_manifest(
+                        f,
+                        &self.table_metadata.schema,
+                        &self.pk_column_indices,
+                        converter,
+                    )
+                });
+                blooms.push((bloom, range));
             } else {
                 // A live cold file without a usable bloom means the union would
                 // omit that file's keys. Missing a cold key would let an upsert
@@ -15273,7 +15282,7 @@ impl CayenneTableProvider {
         // An EMPTY view (no live cold files) never probes true, which is complete
         // and correct — stored rather than cleared to keep the invariant
         // "`Bloom` ⇒ view present".
-        let existence = Arc::new(ColdPkExistence::new(blooms));
+        let existence = Arc::new(ColdPkExistence::with_ranges(blooms));
 
         // `cold_pk_existence` is a SHARED slot that the on-conflict apply probes
         // directly, with no snapshot id of its own, so publishing a bloom built for
