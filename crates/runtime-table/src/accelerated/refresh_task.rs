@@ -5277,7 +5277,7 @@ mod tests {
         assert!(
             counted
                 .to_string()
-                .contains("The source of dataset 'source_stalled_refresh' stopped sending data mid-refresh: no data for 180s after it started sending"),
+                .contains("The source of dataset 'source_stalled_refresh' stopped sending data mid-refresh: no data for 600s after it started sending"),
             "{counted}"
         );
         assert_eq!(started.elapsed(), timeout, "fails at the stall timeout");
