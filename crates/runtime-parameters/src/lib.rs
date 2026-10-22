@@ -225,6 +225,7 @@ impl Parameters {
         let secrets = Secrets::snapshot(&secrets).await;
 
         // Try to autoload secrets that might be missing from params.
+        let mut autoloaded = Vec::new();
         for secret_key in all_params.iter().filter(|p| p.secret) {
             let secret_key_with_prefix = if secret_key.name.starts_with(prefix) {
                 secret_key.name.to_string()
@@ -245,6 +246,7 @@ impl Parameters {
                 );
                 // Insert without the prefix into the params
                 params.push((secret_key.name.to_string(), secret));
+                autoloaded.push(secret_key.name.to_string());
             }
         }
 
@@ -296,7 +298,9 @@ impl Parameters {
             }
         }
 
-        Ok(Parameters::new(params, prefix, all_params))
+        let mut parameters = Parameters::new(params, prefix, all_params);
+        parameters.autoloaded = autoloaded;
+        Ok(parameters)
     }
 
     #[must_use]
@@ -309,7 +313,15 @@ impl Parameters {
             params,
             prefix,
             all_params,
+            autoloaded: Vec::new(),
         }
+    }
+
+    /// Whether the parameter `name` was loaded from a secret store because the component did
+    /// not set it, rather than set by the component.
+    #[must_use]
+    pub fn is_autoloaded(&self, name: &str) -> bool {
+        self.autoloaded.iter().any(|loaded| loaded == name)
     }
 
     #[must_use]
@@ -356,6 +368,8 @@ impl Parameters {
     }
 
     pub fn insert(&mut self, key: String, value: SecretString) {
+        // A value set here is the component's own, whatever was loaded before.
+        self.autoloaded.retain(|loaded| *loaded != key);
         if let Some(param) = self.params.iter_mut().find(|p| p.0 == key) {
             param.1 = value;
         } else {
@@ -469,6 +483,9 @@ pub struct Parameters {
     params: Vec<(String, SecretString)>,
     pub(crate) prefix: &'static str,
     all_params: &'static [ParameterSpec],
+    /// The secret parameters loaded from a secret store because the component did not set
+    /// them.
+    autoloaded: Vec<String>,
 }
 
 impl std::fmt::Debug for Parameters {
@@ -1054,6 +1071,50 @@ mod test {
             result.get("service_account"),
             Some(&"/path/to/sa.json".to_string())
         );
+    }
+
+    /// A store holding one secret, as the environment store holds `HF_TOKEN`.
+    struct OneSecret(&'static str);
+
+    #[async_trait::async_trait]
+    impl runtime_secrets::SecretStore for OneSecret {
+        async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+            Ok((key == self.0).then(|| SecretString::from("loaded")))
+        }
+    }
+
+    /// Where a secret parameter came from decides where a component may send it: a value the
+    /// component sets is never reported as loaded, and a loaded one is until the component sets
+    /// it.
+    #[tokio::test]
+    async fn test_is_autoloaded_only_for_a_value_a_secret_store_supplied() {
+        static SPECS: &[ParameterSpec] = &[ParameterSpec::component("token").secret()];
+        let secrets = || {
+            let mut registry = Secrets::new();
+            registry.register_store("env", Arc::new(OneSecret("test_token")));
+            Arc::new(RwLock::new(registry))
+        };
+
+        let mut loaded = Parameters::try_new("test component", vec![], "test", secrets(), SPECS)
+            .await
+            .expect("parameters should build");
+        assert_eq!(loaded.get("token").expose().ok(), Some("loaded"));
+        assert!(loaded.is_autoloaded("token"));
+        loaded.insert("token".to_string(), SecretString::from("set"));
+        assert_eq!(loaded.get("token").expose().ok(), Some("set"));
+        assert!(!loaded.is_autoloaded("token"));
+
+        let set = Parameters::try_new(
+            "test component",
+            vec![("test_token".to_string(), SecretString::from("set"))],
+            "test",
+            secrets(),
+            SPECS,
+        )
+        .await
+        .expect("parameters should build");
+        assert_eq!(set.get("token").expose().ok(), Some("set"));
+        assert!(!set.is_autoloaded("token"));
     }
 
     /// A store whose lookup parks until it is released, standing in for the

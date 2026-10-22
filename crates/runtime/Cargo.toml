@@ -310,7 +310,6 @@ connector-snowflake = { path = "../data-connectors/connector-snowflake" }
 connector-spark = { path = "../data-connectors/connector-spark" }
 connector-spiceai = { path = "../data-connectors/connector-spiceai" }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
-hf-hub = { workspace = true }
 insta = { workspace = true, features = ["json", "redactions"] }
 jsonpath-rust = "0.7.3"
 mongodb.workspace = true

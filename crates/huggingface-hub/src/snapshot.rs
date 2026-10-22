@@ -179,7 +179,8 @@ impl Snapshot {
         let hub = Hub::new(
             HubConfig {
                 endpoint: settings.endpoint.clone(),
-                token: settings.token.as_ref().map(|token| token.secret().clone()),
+                token: settings.token.clone(),
+                token_scope: settings.token_scope,
             },
             Handle::current(),
         )
@@ -563,7 +564,7 @@ fn falls_back(error: &client::Error) -> bool {
             | client::Error::RevisionNotFound { .. }
             | client::Error::EntryNotFound { .. }
             | client::Error::InvalidEndpoint { .. }
-            | client::Error::InvalidToken
+            | client::Error::InvalidToken { .. }
     )
 }
 
