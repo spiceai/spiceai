@@ -27,7 +27,10 @@ use std::time::Duration;
 use crate::acceleration::{csv_dataset, load_runtime_datasets};
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{register_test_connectors, run_query, test_request_context, to_pretty_display},
+    utils::{
+        pushed_down_sql, register_test_connectors, run_query, test_request_context,
+        to_pretty_display,
+    },
 };
 
 const LOAD_TIMEOUT: Duration = Duration::from_mins(1);
@@ -73,18 +76,19 @@ async fn sqlite_accelerator_fails_a_query_sqlite_aborts() -> Result<(), anyhow::
                 &run_query(&rt, "SELECT id, x FROM accelerated ORDER BY id").await?
             );
 
-            // An ungrouped `SUM` fails on the only row it produces, and `abs`
-            // on the third row of a scan, after two rows came back.
+            // An ungrouped `SUM` fails on the only row it produces, and `abs` on
+            // the row whose `x` has no absolute value in an `i64`.
             for (sql, rendering) in [
                 ("SELECT sum(v) AS s FROM accelerated", "sum("),
                 ("SELECT id, abs(x) AS a FROM accelerated", "abs("),
             ] {
                 // `SQLite` evaluates the call, so the error below is its own.
-                let plan = to_pretty_display(&run_query(&rt, &format!("EXPLAIN {sql}")).await?)?
-                    .to_string();
+                let plan = run_query(&rt, &format!("EXPLAIN {sql}")).await?;
+                let remote_sql = pushed_down_sql(&plan)?;
                 assert!(
-                    plan.contains("VirtualExecutionPlan") && plan.contains(rendering),
-                    "`{sql}` must be federated to SQLite; plan was:\n{plan}"
+                    remote_sql.contains(rendering),
+                    "`{sql}` must reach SQLite as {rendering}…); the SQL sent was:\n{remote_sql}\nplan:\n{}",
+                    to_pretty_display(&plan)?
                 );
 
                 match run_query(&rt, sql).await {
