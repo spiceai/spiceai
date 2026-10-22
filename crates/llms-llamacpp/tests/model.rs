@@ -347,3 +347,102 @@ async fn max_tokens_ends_the_reply_at_its_length() {
     assert_eq!(reply.choices[0].finish_reason, Some(FinishReason::Length));
     assert_eq!(reply.usage.map(|u| u.completion_tokens), Some(5));
 }
+
+/// A prompt the model cannot finish in five tokens, asked once, and asked for two choices.
+/// At temperature 0 every choice repeats the single reply.
+fn one_and_two_choices(stream: bool) -> (Value, Value) {
+    let one = json!({
+        "model": "qwen3",
+        "messages": [{ "role": "user", "content": "Write a long story about the sea." }],
+        "temperature": 0,
+        "reasoning_effort": "none",
+        "max_tokens": 5,
+    });
+    let mut two = one.clone();
+    two["n"] = json!(2);
+    two["stream"] = json!(stream);
+    (one, two)
+}
+
+#[tokio::test]
+async fn n_returns_that_many_choices() {
+    let model = qwen3().await;
+    let (one, two) = one_and_two_choices(false);
+    let one = model.chat_request(request(one)).await.expect("a reply");
+    let reply = model.chat_request(request(two)).await.expect("a reply");
+    let expected = one.choices[0].message.content.clone();
+    let choices: Vec<_> = reply
+        .choices
+        .iter()
+        .map(|c| (c.index, c.message.content.clone(), c.finish_reason))
+        .collect();
+    assert_eq!(
+        choices,
+        vec![
+            (0, expected.clone(), Some(FinishReason::Length)),
+            (1, expected, Some(FinishReason::Length)),
+        ]
+    );
+    let prompt_tokens = one.usage.expect("usage").prompt_tokens;
+    assert_eq!(
+        reply
+            .usage
+            .map(|u| (u.prompt_tokens, u.completion_tokens, u.total_tokens)),
+        Some((prompt_tokens, 10, prompt_tokens + 10))
+    );
+}
+
+#[tokio::test]
+async fn n_streams_that_many_choices() {
+    let model = qwen3().await;
+    let (one, two) = one_and_two_choices(true);
+    let one = model.chat_request(request(one)).await.expect("a reply");
+    let mut stream = model.chat_stream(request(two)).await.expect("a stream");
+    let mut choices: Vec<(String, Option<FinishReason>)> = Vec::new();
+    let mut usage = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("a chunk");
+        usage = chunk.usage.or(usage);
+        for choice in chunk.choices {
+            let index = usize::try_from(choice.index).expect("an index fits usize");
+            if choices.len() <= index {
+                choices.resize(index + 1, (String::new(), None));
+            }
+            let (content, finish) = &mut choices[index];
+            content.push_str(choice.delta.content.as_deref().unwrap_or_default());
+            *finish = choice.finish_reason.or(*finish);
+        }
+    }
+    let expected = one.choices[0].message.content.clone().expect("content");
+    assert_eq!(
+        choices,
+        vec![
+            (expected.clone(), Some(FinishReason::Length)),
+            (expected, Some(FinishReason::Length)),
+        ]
+    );
+    let prompt_tokens = one.usage.expect("usage").prompt_tokens;
+    assert_eq!(
+        usage.map(|u| (u.prompt_tokens, u.completion_tokens, u.total_tokens)),
+        Some((prompt_tokens, 10, prompt_tokens + 10))
+    );
+}
+
+#[tokio::test]
+async fn n_of_zero_is_refused() {
+    let Err(error) = qwen3()
+        .await
+        .chat_request(request(json!({
+            "model": "qwen3",
+            "messages": [{ "role": "user", "content": "Hello" }],
+            "n": 0,
+        })))
+        .await
+    else {
+        panic!("`n: 0` should be refused");
+    };
+    assert_eq!(
+        error.to_string(),
+        "invalid args: `n` must be between 1 and 128, the number of choices to generate."
+    );
+}

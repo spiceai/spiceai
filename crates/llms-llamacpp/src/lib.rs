@@ -27,6 +27,7 @@ limitations under the License.
 //! thread and waits for it to free the model.
 
 use std::{
+    collections::VecDeque,
     num::NonZeroU32,
     path::{Path, PathBuf},
     pin::Pin,
@@ -125,6 +126,9 @@ const MTP_DRAFT: i32 = 2;
 
 /// How many streamed tokens may wait for a slow client before decoding pauses.
 const STREAM_BUFFER: usize = 64;
+
+/// The most choices one request may ask for, as `OpenAI`'s `n` allows.
+const MAX_CHOICES: u8 = 128;
 
 /// How long dropping a model waits for its decode thread to stop and free it.
 const UNLOAD_WAIT: Duration = Duration::from_secs(30);
@@ -373,11 +377,13 @@ impl LlamaCpp {
         })
     }
 
-    /// Validates `req`, renders its prompt and queues it on the decode thread.
+    /// Validates `req`, renders its prompt and queues one job per choice on the decode
+    /// thread, which decodes them in turn. The receivers are in choice order.
     fn submit(
         &self,
         req: &CreateChatCompletionRequest,
-    ) -> std::result::Result<mpsc::Receiver<Event>, OpenAIError> {
+    ) -> std::result::Result<Vec<mpsc::Receiver<Event>>, OpenAIError> {
+        let choices = choice_count(req)?;
         let reasoning = reasoning_controls(
             req.reasoning_effort.as_ref(),
             &self.reasoning_support,
@@ -398,51 +404,59 @@ impl LlamaCpp {
             &tools,
             &obliged,
         )?;
-        let matcher = if tools.is_empty() {
-            None
-        } else {
-            Some(
+        // Each choice reads its own reply, so each has its own reader.
+        let matchers = (0..choices)
+            .map(|_| {
+                if tools.is_empty() {
+                    return Ok(None);
+                }
                 ToolCallingMatcher::new_with_format(
-                    tool_choice.unwrap_or(ToolChoice::Auto),
+                    tool_choice.clone().unwrap_or(ToolChoice::Auto),
                     Some(&tools),
                     None,
                 )
-                .map_err(|e| OpenAIError::InvalidArgument(format!("Invalid `tools`: {e}")))?,
-            )
-        };
-        let require_tool_call = matcher
-            .as_ref()
+                .map(Some)
+                .map_err(|e| OpenAIError::InvalidArgument(format!("Invalid `tools`: {e}")))
+            })
+            .collect::<std::result::Result<Vec<_>, OpenAIError>>()?;
+        let require_tool_call = matchers
+            .first()
+            .and_then(Option::as_ref)
             .is_some_and(ToolCallingMatcher::requires_tool_call);
         let ban_eog = require_tool_call && grammar.is_none();
         let prompt = self.prompt(&req.messages, reasoning, tools)?;
-        let (events, rx) = mpsc::channel(STREAM_BUFFER);
-        let job = Job {
-            reasoning: reasoning_parser(&self.template, &prompt),
-            prompt,
-            limit: completion_limit(req),
-            sampling: Sampling {
-                temperature: req.temperature,
-                top_p: req.top_p,
-                seed: rand::random(),
-                grammar,
-                ban_eog,
-            },
-            stop: match &req.stop {
-                Some(StopConfiguration::String(s)) => vec![s.clone()],
-                Some(StopConfiguration::StringArray(s)) => s.clone(),
-                None => Vec::new(),
-            },
-            tools: matcher,
-            require_tool_call,
-            stopping: Arc::clone(&self.decoder.stopping),
-            events,
+        let stop = match &req.stop {
+            Some(StopConfiguration::String(s)) => vec![s.clone()],
+            Some(StopConfiguration::StringArray(s)) => s.clone(),
+            None => Vec::new(),
         };
-        self.decoder
-            .jobs
-            .as_ref()
-            .and_then(|jobs| jobs.send(job).ok())
-            .ok_or_else(|| api_error("the llama.cpp decode thread has stopped"))?;
-        Ok(rx)
+        let stopped = || api_error("the llama.cpp decode thread has stopped");
+        let jobs = self.decoder.jobs.as_ref().ok_or_else(stopped)?;
+        let mut receivers = Vec::with_capacity(choices);
+        for tools in matchers {
+            let (events, rx) = mpsc::channel(STREAM_BUFFER);
+            let job = Job {
+                reasoning: reasoning_parser(&self.template, &prompt),
+                prompt: prompt.clone(),
+                limit: completion_limit(req),
+                // Each choice samples with its own seed, so choices differ above temperature 0.
+                sampling: Sampling {
+                    temperature: req.temperature,
+                    top_p: req.top_p,
+                    seed: rand::random(),
+                    grammar: grammar.clone(),
+                    ban_eog,
+                },
+                stop: stop.clone(),
+                tools,
+                require_tool_call,
+                stopping: Arc::clone(&self.decoder.stopping),
+                events,
+            };
+            jobs.send(job).map_err(|_| stopped())?;
+            receivers.push(rx);
+        }
+        Ok(receivers)
     }
 
     fn id(&self) -> String {
@@ -466,13 +480,15 @@ impl Chat for LlamaCpp {
         &self,
         req: CreateChatCompletionRequest,
     ) -> std::result::Result<ChatCompletionResponseStream, OpenAIError> {
-        let rx = self.submit(&req)?;
+        let choices = self.submit(&req)?.into();
         let id = self.id();
         let model = req.model;
         let created = now();
         let state = StreamState {
-            rx,
+            choices,
+            index: 0,
             first: true,
+            completion_tokens: 0,
             done: false,
         };
         let stream = futures::stream::unfold(state, move |mut state| {
@@ -485,8 +501,8 @@ impl Chat for LlamaCpp {
                 // A streamed delta has no reasoning field, so reasoning is not streamed, as on
                 // the mistral.rs engine; it is in a non-streamed response's `reasoning_content`.
                 let item = loop {
-                    let first = state.first;
-                    match state.rx.recv().await {
+                    let (index, first) = (state.index, state.first);
+                    match state.choices.front_mut()?.recv().await {
                         Some(Event::Reasoning(_)) => {}
                         Some(Event::Content(content)) => {
                             state.first = false;
@@ -494,6 +510,7 @@ impl Chat for LlamaCpp {
                                 &id,
                                 &model,
                                 created,
+                                index,
                                 first,
                                 Some(content),
                                 None,
@@ -512,6 +529,7 @@ impl Chat for LlamaCpp {
                                 &id,
                                 &model,
                                 created,
+                                index,
                                 first,
                                 None,
                                 Some(calls),
@@ -520,16 +538,28 @@ impl Chat for LlamaCpp {
                             ));
                         }
                         Some(Event::Done(outcome)) => {
-                            state.done = true;
+                            state.choices.pop_front();
+                            state.completion_tokens = state
+                                .completion_tokens
+                                .saturating_add(outcome.completion_tokens);
+                            // The next choice starts its own message; the last choice's
+                            // final chunk carries the usage of them all.
+                            state.done = state.choices.is_empty();
+                            state.index += 1;
+                            state.first = true;
+                            let usage = state
+                                .done
+                                .then(|| usage(outcome.prompt_tokens, state.completion_tokens));
                             break Ok(chunk(
                                 &id,
                                 &model,
                                 created,
+                                index,
                                 first,
                                 None,
                                 None,
                                 Some(outcome.finish),
-                                Some(usage(outcome)),
+                                usage,
                             ));
                         }
                         Some(Event::Failed(message)) => {
@@ -556,48 +586,57 @@ impl Chat for LlamaCpp {
         &self,
         req: CreateChatCompletionRequest,
     ) -> std::result::Result<CreateChatCompletionResponse, OpenAIError> {
-        let mut rx = self.submit(&req)?;
-        let (mut reasoning, mut content, mut tool_calls) =
-            (String::new(), String::new(), Vec::new());
-        let outcome = loop {
-            match rx.recv().await {
-                Some(Event::Reasoning(text)) => reasoning.push_str(&text),
-                Some(Event::Content(text)) => content.push_str(&text),
-                Some(Event::ToolCalls(calls)) => tool_calls.extend(calls.iter().map(tool_call)),
-                Some(Event::Done(outcome)) => break outcome,
-                Some(Event::Failed(message)) => return Err(api_error(&message)),
-                None => {
-                    return Err(api_error(DECODE_STOPPED));
+        let mut choices = Vec::new();
+        let (mut prompt_tokens, mut completion_tokens) = (0, 0_u32);
+        for (index, mut rx) in (0..).zip(self.submit(&req)?) {
+            let (mut reasoning, mut content, mut tool_calls) =
+                (String::new(), String::new(), Vec::new());
+            let outcome = loop {
+                match rx.recv().await {
+                    Some(Event::Reasoning(text)) => reasoning.push_str(&text),
+                    Some(Event::Content(text)) => content.push_str(&text),
+                    Some(Event::ToolCalls(calls)) => {
+                        tool_calls.extend(calls.iter().map(tool_call));
+                    }
+                    Some(Event::Done(outcome)) => break outcome,
+                    Some(Event::Failed(message)) => return Err(api_error(&message)),
+                    None => {
+                        return Err(api_error(DECODE_STOPPED));
+                    }
                 }
-            }
-        };
-        let message = ChatCompletionResponseMessage {
-            // With tool calls, text the model wrote beside them is the content, if any.
-            content: if tool_calls.is_empty() {
-                Some(content)
-            } else {
-                non_empty(content)
-            },
-            reasoning_content: non_empty(reasoning),
-            refusal: None,
-            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-            annotations: None,
-            role: Role::Assistant,
-            function_call: None,
-            audio: None,
-        };
+            };
+            let message = ChatCompletionResponseMessage {
+                // With tool calls, text the model wrote beside them is the content, if any.
+                content: if tool_calls.is_empty() {
+                    Some(content)
+                } else {
+                    non_empty(content)
+                },
+                reasoning_content: non_empty(reasoning),
+                refusal: None,
+                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                annotations: None,
+                role: Role::Assistant,
+                function_call: None,
+                audio: None,
+            };
+            // Every choice reads the same prompt, which counts once.
+            prompt_tokens = outcome.prompt_tokens;
+            completion_tokens = completion_tokens.saturating_add(outcome.completion_tokens);
+            choices.push(ChatChoice {
+                index,
+                message,
+                finish_reason: Some(outcome.finish),
+                logprobs: None,
+            });
+        }
         Ok(CreateChatCompletionResponse {
             id: self.id(),
             object: "chat.completion".to_string(),
             created: now(),
             model: req.model,
-            choices: vec![ChatChoice {
-                index: 0,
-                message,
-                finish_reason: Some(outcome.finish),
-                logprobs: None,
-            }],
-            usage: Some(usage(outcome)),
+            choices,
+            usage: Some(usage(prompt_tokens, completion_tokens)),
             service_tier: None,
             system_fingerprint: None,
         })
@@ -605,8 +644,14 @@ impl Chat for LlamaCpp {
 }
 
 struct StreamState {
-    rx: mpsc::Receiver<Event>,
+    /// The choices still to stream, in order; the front one is streaming.
+    choices: VecDeque<mpsc::Receiver<Event>>,
+    /// The front choice's index.
+    index: u32,
+    /// Whether the front choice has sent nothing yet, so its next chunk names the role.
     first: bool,
+    /// The completion tokens of the choices streamed so far.
+    completion_tokens: u32,
     done: bool,
 }
 
@@ -754,6 +799,11 @@ fn serve(
         return;
     }
     while let Ok(job) = jobs.recv() {
+        // A client that has gone, as one that stopped reading before a later choice's turn,
+        // is not decoded for.
+        if job.events.is_closed() {
+            continue;
+        }
         let events = job.events.clone();
         let stopping = Arc::clone(&job.stopping);
         let result = match &mut decoder {
@@ -1738,6 +1788,16 @@ fn prefix_rules(grammar: &str, prefix: &str) -> String {
     out
 }
 
+/// How many choices `req` asks for: its `n`, one when unset.
+fn choice_count(req: &CreateChatCompletionRequest) -> std::result::Result<usize, OpenAIError> {
+    match req.n.unwrap_or(1) {
+        n @ 1..=MAX_CHOICES => Ok(usize::from(n)),
+        _ => Err(OpenAIError::InvalidArgument(format!(
+            "`n` must be between 1 and {MAX_CHOICES}, the number of choices to generate."
+        ))),
+    }
+}
+
 #[expect(deprecated)]
 fn completion_limit(req: &CreateChatCompletionRequest) -> Option<usize> {
     req.max_completion_tokens
@@ -1757,6 +1817,7 @@ fn chunk(
     id: &str,
     model: &str,
     created: u32,
+    index: u32,
     first: bool,
     content: Option<String>,
     tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
@@ -1773,7 +1834,7 @@ fn chunk(
     CreateChatCompletionStreamResponse {
         id: id.to_string(),
         choices: vec![ChatChoiceStream {
-            index: 0,
+            index,
             delta,
             finish_reason,
             logprobs: None,
@@ -1787,11 +1848,13 @@ fn chunk(
     }
 }
 
-fn usage(outcome: Outcome) -> CompletionUsage {
+/// A reply's usage: its prompt, which counts once however many choices read it, and the
+/// completion tokens of every choice.
+fn usage(prompt_tokens: u32, completion_tokens: u32) -> CompletionUsage {
     CompletionUsage {
-        prompt_tokens: outcome.prompt_tokens,
-        completion_tokens: outcome.completion_tokens,
-        total_tokens: outcome.prompt_tokens + outcome.completion_tokens,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
         prompt_tokens_details: None,
         completion_tokens_details: None,
     }
@@ -2429,5 +2492,27 @@ mod tests {
         // The first case tells the orders apart: untempered, top-p keeps only the first token.
         assert_eq!(nucleus(&logits, 1.0, 0.6), [Token(0)]);
         assert_eq!(nucleus(&logits, 2.0, 0.6), [Token(0), Token(1)]);
+    }
+
+    #[test]
+    fn n_asks_for_one_to_128_choices() {
+        let count = |n: Option<u8>| {
+            let mut req: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [{ "role": "user", "content": "Hi" }],
+            }))
+            .expect("a request");
+            req.n = n;
+            choice_count(&req).map_err(|e| e.to_string())
+        };
+        let refused = Err(
+            "invalid args: `n` must be between 1 and 128, the number of choices to generate."
+                .to_string(),
+        );
+        assert_eq!(count(None), Ok(1));
+        assert_eq!(count(Some(1)), Ok(1));
+        assert_eq!(count(Some(128)), Ok(128));
+        assert_eq!(count(Some(0)), refused);
+        assert_eq!(count(Some(129)), refused);
     }
 }
