@@ -32,6 +32,7 @@ limitations under the License.
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::location::RepoId;
@@ -44,6 +45,9 @@ const FILE_MODE: u32 = 0o644;
 
 /// How often a download waiting for another writer's lock on a blob tries again.
 const LOCK_POLL: Duration = Duration::from_millis(250);
+
+/// Tells apart the temporary files of this process's concurrent writes.
+static TEMPORARY_FILES: AtomicU64 = AtomicU64::new(0);
 
 /// The root of a Hub file cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,27 +206,29 @@ impl HubCache {
         if let Some(parent) = file.parent() {
             ensure_dir(parent).await?;
         }
-        match tokio::fs::symlink_metadata(&file).await {
-            Ok(_) => tokio::fs::remove_file(&file).await?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
         // `snapshots/<commit>/<path>` → `../../blobs/<etag>`, one more `..` per folder in
         // `path`.
         let depth = relative.components().count() + 1;
         let target = PathBuf::from("../".repeat(depth)).join("blobs").join(etag);
         let blob = self.blob_path(repo, etag);
-        match symlink(&target, &file).await {
-            Ok(()) => {}
-            // Another writer linked it first: the same blob, so the same file.
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(_) => {
-                if tokio::fs::hard_link(&blob, &file).await.is_err() {
-                    tokio::fs::copy(&blob, &file).await?;
-                }
-            }
+        // The entry is made beside its place and renamed over it, so a concurrent repair or a
+        // reader never finds the place empty.
+        let temporary = temporary_sibling(&file);
+        let made = match symlink(&target, &temporary).await {
+            Ok(()) => Ok(()),
+            Err(_) => match tokio::fs::hard_link(&blob, &temporary).await {
+                Ok(()) => Ok(()),
+                Err(_) => tokio::fs::copy(&blob, &temporary).await.map(|_| ()),
+            },
+        };
+        let published = match made {
+            Ok(()) => tokio::fs::rename(&temporary, &file).await,
+            Err(error) => Err(error),
+        };
+        if published.is_err() {
+            let _ = tokio::fs::remove_file(&temporary).await;
         }
-        Ok(file)
+        published.map(|()| file)
     }
 
     /// Takes the lock on writing the blob `etag`, waiting while another writer holds it.
@@ -365,21 +371,35 @@ async fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     let contents = contents.to_vec();
     tokio::task::spawn_blocking(move || {
         use std::io::Write;
-        let file_name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
-        {
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&contents)?;
-            file.sync_all()?;
+        let temporary = temporary_sibling(&path);
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .and_then(|mut file| {
+                file.write_all(&contents)?;
+                file.sync_all()
+            })
+            .and_then(|()| set_mode(&temporary, false))
+            .and_then(|()| std::fs::rename(&temporary, &path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temporary);
         }
-        set_mode(&temporary, false)?;
-        std::fs::rename(&temporary, &path)
+        written
     })
     .await
     .map_err(io::Error::other)?
+}
+
+/// A path beside `path` that no other write uses, in this process or another sharing the
+/// cache.
+fn temporary_sibling(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let unique = TEMPORARY_FILES.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(".{file_name}.{}.{unique}.tmp", std::process::id()))
 }
 
 async fn symlink(target: &Path, link: &Path) -> io::Result<()> {
@@ -412,5 +432,97 @@ async fn same_file(file: &std::fs::File, path: &Path) -> bool {
     {
         let _ = (file, path);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::location::RepoType;
+
+    const COMMIT: &str = "1111111111111111111111111111111111111111";
+
+    fn repo() -> RepoId {
+        RepoId::new(RepoType::Model, "o", "m").expect("a valid repository")
+    }
+
+    /// Loads that record a revision at the same time each succeed, and the ref they leave
+    /// holds one of their commits whole: never an empty or a torn one, which an offline load
+    /// would then fail to read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_ref_writes_each_succeed_and_leave_a_whole_commit() {
+        let dir = tempfile::tempdir().expect("a cache directory");
+        let cache = HubCache::new(dir.path());
+        let repo = repo();
+        for round in 0..25_u32 {
+            let commits: Vec<String> = (0..16_u32)
+                .map(|writer| format!("{:040x}", round * 16 + writer + 1))
+                .collect();
+            let writes = commits.iter().map(|commit| {
+                let (cache, repo, commit) = (cache.clone(), repo.clone(), commit.clone());
+                tokio::spawn(async move { cache.write_ref(&repo, "main", &commit).await })
+            });
+            for (writer, result) in futures::future::join_all(writes)
+                .await
+                .into_iter()
+                .enumerate()
+            {
+                result
+                    .expect("the write ran")
+                    .unwrap_or_else(|e| panic!("round {round}, writer {writer}: {e}"));
+            }
+            let recorded = cache.read_ref(&repo, "main").await.expect("the ref reads");
+            assert!(
+                recorded
+                    .as_ref()
+                    .is_some_and(|commit| commits.contains(commit)),
+                "round {round}: the ref holds {recorded:?}"
+            );
+        }
+    }
+
+    /// Loads that repair the same snapshot entry at the same time each succeed, and the entry
+    /// ends up as the blob.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_repairs_of_a_snapshot_entry_each_succeed() {
+        let dir = tempfile::tempdir().expect("a cache directory");
+        let cache = HubCache::new(dir.path());
+        let repo = repo();
+        let etag = "a".repeat(64);
+        let blob = cache.blob_path(&repo, &etag);
+        std::fs::create_dir_all(blob.parent().expect("blobs have a folder"))
+            .expect("creates the blobs folder");
+        std::fs::write(&blob, b"weights").expect("writes the blob");
+        let entry = cache.snapshot_dir(&repo, COMMIT).join("model.safetensors");
+        std::fs::create_dir_all(entry.parent().expect("an entry has a folder"))
+            .expect("creates the snapshot folder");
+        for round in 0..25_u32 {
+            // A stale entry: a link to a blob that is gone, which a load repairs.
+            let _ = std::fs::remove_file(&entry);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("../../blobs/gone", &entry).expect("a stale link");
+            #[cfg(windows)]
+            std::fs::write(&entry, b"stale").expect("a stale entry");
+            let repairs = (0..8).map(|_| {
+                let (cache, repo, etag) = (cache.clone(), repo.clone(), etag.clone());
+                tokio::spawn(
+                    async move { cache.link(&repo, COMMIT, "model.safetensors", &etag).await },
+                )
+            });
+            for (writer, result) in futures::future::join_all(repairs)
+                .await
+                .into_iter()
+                .enumerate()
+            {
+                result
+                    .expect("the repair ran")
+                    .unwrap_or_else(|e| panic!("round {round}, writer {writer}: {e}"));
+            }
+            assert_eq!(
+                std::fs::read(&entry).expect("the entry reads"),
+                b"weights",
+                "round {round}"
+            );
+        }
     }
 }

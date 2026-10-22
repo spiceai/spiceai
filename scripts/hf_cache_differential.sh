@@ -83,3 +83,4 @@ PY
     "$kind $repo" "${commit:0:7}" "${#files[@]}" $rc_a $rc_b $rc_c $rc_d "$verdict"
 done
 echo "failures=$failures"
+[ "$failures" -eq 0 ]
