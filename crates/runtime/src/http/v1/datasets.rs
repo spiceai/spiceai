@@ -178,7 +178,7 @@ pub(crate) async fn get(
 }
 
 /// Body returned when `GET /v1/datasets?format=csv` cannot be encoded. The
-/// rust-csv crate error names its GitHub issue tracker; that text is not a
+/// `rust-csv` crate error names its `GitHub` issue tracker; that text is not a
 /// user-facing message.
 const DATASETS_CSV_ERROR_BODY: &str = "Failed to format the dataset list as CSV";
 
@@ -689,8 +689,7 @@ mod tests {
     #[test]
     fn dataset_info_csv_rejects_map_properties() {
         let error = convert_entry_to_csv(&[dataset_item("trips", None, None)])
-            .err()
-            .expect("DatasetInfo CSV should fail when properties is a map");
+            .expect_err("DatasetInfo CSV should fail when properties is a map");
         let message = error.to_string();
         assert!(
             message.contains("serializing maps is not supported"),
@@ -765,7 +764,7 @@ mod tests {
         );
     }
 
-    /// The OpenAPI `text/csv` example must stay 11 columns, matching
+    /// The `OpenAPI` `text/csv` example must stay 11 columns, matching
     /// [`super::DatasetCsvRow`]. Extra commas shift `properties.*` off the header.
     #[test]
     fn openapi_csv_example_rows_match_flat_header() {

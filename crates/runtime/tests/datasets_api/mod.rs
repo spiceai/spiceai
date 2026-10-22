@@ -522,7 +522,7 @@ async fn test_datasets_api_without_status_param() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Tests that `GET /v1/datasets?format=csv` returns HTTP 200 with a header and
+/// Tests that `GET /v1/datasets?format=csv` returns `HTTP` 200 with a header and
 /// rows, including a dataset in `Error` when `status=true`.
 #[tokio::test]
 async fn test_datasets_api_csv_format() -> Result<(), anyhow::Error> {
