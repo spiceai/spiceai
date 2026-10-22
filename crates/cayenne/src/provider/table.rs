@@ -15680,10 +15680,14 @@ impl CayenneTableProvider {
     /// fast path, which reconstructs the index without the full-table scan and
     /// therefore has the same blind spot. Mirrors
     /// [`Self::fold_mem_tier_keys_into_bloom`].
-    fn fold_inflight_staged_keys_into_bloom(staged_keys: &[Arc<PkDigestSet>], bloom: &mut PkBloom) {
+    fn fold_inflight_staged_keys_into_bloom(
+        staged_keys: &[Arc<PkDigestSet>],
+        bloom: &mut GrowingPkBloom,
+        max_bytes: usize,
+    ) {
         for keys in staged_keys {
             for key in keys.iter() {
-                bloom.insert(key.as_ref());
+                bloom.insert(key.as_ref(), max_bytes);
             }
         }
     }
@@ -15752,12 +15756,15 @@ impl CayenneTableProvider {
         mem_snapshots: &[Arc<crate::provider::mem_tier::MemTier>],
         pk_indices: &[usize],
         converter: &RowConverter,
-        bloom: &mut PkBloom,
+        bloom: &mut GrowingPkBloom,
+        max_bytes: usize,
     ) -> Result<()> {
         for tier in mem_snapshots {
             for seg in tier.segments.iter() {
                 for batch in seg.batches.iter() {
-                    Self::insert_batch_pks_into_bloom(batch, pk_indices, converter, bloom)?;
+                    Self::insert_batch_pks_into_bloom(batch, pk_indices, converter, |key| {
+                        bloom.insert(key, max_bytes);
+                    })?;
                 }
             }
         }
@@ -15770,14 +15777,15 @@ impl CayenneTableProvider {
     // snapshot skip the O(total-rows) full keyset rebuild. Works uniformly for
     // local and object-store tables.
 
-    /// Insert one batch's primary keys (no deletion filter — a superset is safe
+    /// Pass one batch's primary keys (no deletion filter — a superset is safe
     /// for the upsert bloom; deleted keys only cost a harmless false positive)
-    /// into `bloom`. `pk_col_indices` are the PK columns' positions in `batch`.
+    /// to `record`, which inserts them into a bloom. `pk_col_indices` are the PK
+    /// columns' positions in `batch`.
     fn insert_batch_pks_into_bloom(
         batch: &RecordBatch,
         pk_col_indices: &[usize],
         converter: &RowConverter,
-        bloom: &mut PkBloom,
+        mut record: impl FnMut(&[u8]),
     ) -> Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -15788,7 +15796,7 @@ impl CayenneTableProvider {
             .collect();
         let rows = converter.convert_columns(&pk_columns)?;
         for row_idx in 0..batch.num_rows() {
-            bloom.insert(rows.row(row_idx).as_ref());
+            record(rows.row(row_idx).as_ref());
         }
         Ok(())
     }
@@ -15814,12 +15822,9 @@ impl CayenneTableProvider {
             .await?;
         let mut stream = datafusion_physical_plan::execute_stream(scan_plan, ctx.task_ctx())?;
         while let Some(batch) = stream.next().await {
-            Self::insert_batch_pks_into_bloom(
-                &batch?,
-                &projected_pk_indices,
-                converter,
-                &mut bloom,
-            )?;
+            Self::insert_batch_pks_into_bloom(&batch?, &projected_pk_indices, converter, |key| {
+                bloom.insert(key);
+            })?;
         }
         Ok(bloom)
     }
@@ -15835,7 +15840,8 @@ impl CayenneTableProvider {
         converter: &RowConverter,
         protected_snapshots: &HashMap<String, i64>,
         inlined_batches: &[RecordBatch],
-        bloom: &mut PkBloom,
+        bloom: &mut GrowingPkBloom,
+        max_bytes: usize,
     ) -> Result<()> {
         let ctx = self.create_session_context();
         let pk_projection = pk_indices.to_vec();
@@ -15857,14 +15863,16 @@ impl CayenneTableProvider {
                     &batch?,
                     &projected_pk_indices,
                     converter,
-                    bloom,
+                    |key| bloom.insert(key, max_bytes),
                 )?;
             }
         }
 
         for batch in inlined_batches {
             // Inlined batches carry the full table schema, so use pk_indices directly.
-            Self::insert_batch_pks_into_bloom(batch, pk_indices, converter, bloom)?;
+            Self::insert_batch_pks_into_bloom(batch, pk_indices, converter, |key| {
+                bloom.insert(key, max_bytes);
+            })?;
         }
         Ok(())
     }
@@ -15964,6 +15972,7 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
         cold_bloom_snapshot: Option<&str>,
+        max_bytes: usize,
     ) -> Result<Option<CachedPkIndex>> {
         if !self.upsert_bloom_eligible() {
             return Ok(None);
@@ -16048,7 +16057,7 @@ impl CayenneTableProvider {
             )
         };
 
-        let Some((mut bloom, blob_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
+        let Some((seed, blob_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
             return Ok(None);
         };
         // Defense in depth: the metastore `checkpoint_snapshot` column and the
@@ -16066,27 +16075,38 @@ impl CayenneTableProvider {
             );
             return Ok(None);
         }
+        // The keys written since the checkpoint go through the growing bloom, so a
+        // large delta lands in new segments rather than saturating the seed, which
+        // is sized for the checkpoint's rows.
+        let mut bloom = GrowingPkBloom::from(seed);
         self.extend_bloom_with_protected_and_inline(
             pk_indices,
             converter,
             &protected_snapshots,
             &inlined_batches,
             &mut bloom,
+            max_bytes,
         )
         .await?;
         // Fold the un-checkpointed RAM mem-tier too: in `cdc_durability: memory` it
         // is post-checkpoint delta just like the protected/inline layers, and a
         // RAM-only key omitted here would false-negative its next update and leak
         // the prior copy (durable over-count). Mirrors `load_existing_pk_index`.
-        Self::fold_mem_tier_keys_into_bloom(&mem_snapshots, pk_indices, converter, &mut bloom)?;
+        Self::fold_mem_tier_keys_into_bloom(
+            &mem_snapshots,
+            pk_indices,
+            converter,
+            &mut bloom,
+            max_bytes,
+        )?;
         // …and the keys of staged appends whose files no scan can see yet.
-        Self::fold_inflight_staged_keys_into_bloom(&staged_keys, &mut bloom);
+        Self::fold_inflight_staged_keys_into_bloom(&staged_keys, &mut bloom, max_bytes);
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
             checkpoint_snapshot = checkpoint_snapshot.as_str(),
             "Loaded PK-index bloom checkpoint; skipped full-table keyset rebuild"
         );
-        Ok(Some(CachedPkIndex::Bloom(bloom.into())))
+        Ok(Some(CachedPkIndex::Bloom(bloom)))
     }
 
     fn process_visible_inlined_batches_into_keyset(
@@ -16417,7 +16437,12 @@ impl CayenneTableProvider {
         // scan. Falls back to the full scan on any miss/mismatch/corruption.
         let existing_keys = if allow_checkpoint {
             match self
-                .try_load_persisted_pk_index(pk_indices, converter, cold_bloom_snapshot)
+                .try_load_persisted_pk_index(
+                    pk_indices,
+                    converter,
+                    cold_bloom_snapshot,
+                    self.effective_single_keyset_budget(),
+                )
                 .await
             {
                 Ok(Some(index)) => index,
@@ -16643,7 +16668,12 @@ impl CayenneTableProvider {
         if n == 1 {
             let index = if allow_checkpoint {
                 match self
-                    .try_load_persisted_pk_index(pk_indices, converter, cold_bloom_snapshot)
+                    .try_load_persisted_pk_index(
+                        pk_indices,
+                        converter,
+                        cold_bloom_snapshot,
+                        self.effective_sharded_keyset_budget(),
+                    )
                     .await
                 {
                     Ok(Some(CachedPkIndex::Exact(keyset))) => {
@@ -75990,7 +76020,12 @@ mod tests {
             .expect("table has a primary key");
         let converter = reopened.build_pk_converter(&pk_indices).expect("converter");
         let loaded = reopened
-            .try_load_persisted_pk_index(&pk_indices, &converter, None)
+            .try_load_persisted_pk_index(
+                &pk_indices,
+                &converter,
+                None,
+                reopened.effective_single_keyset_budget(),
+            )
             .await
             .expect("load persisted index");
         assert!(
@@ -76009,6 +76044,97 @@ mod tests {
             pairs,
             vec![(1, 111), (2, 200), (3, 30), (4, 40), (5, 50)],
             "upserts after a checkpoint-accelerated reopen must stay correct (no drops/duplicates)"
+        );
+    }
+
+    /// A rebuild from the persisted checkpoint bloom records the keys written since
+    /// the checkpoint through the growing bloom, so a large delta lands in new
+    /// segments instead of saturating the checkpoint's seed.
+    #[tokio::test]
+    async fn a_persisted_bloom_rebuild_keeps_room_for_the_delta_since_its_checkpoint() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "persisted_bloom_delta_room",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // The checkpoint bloom covers 10,000 keys at about 13 bits/key.
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch_for_range(Arc::clone(&schema), 0, 10_000)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("append the checkpointed keys");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint to durable");
+        provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("compaction persists the pk-index bloom");
+        // 100,000 keys written after it stay in the RAM tier.
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch_for_range(
+                    Arc::clone(&schema),
+                    10_000,
+                    100_000,
+                )),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("append the delta");
+
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("pk indices")
+            .expect("table has a primary key");
+        let converter = provider.build_pk_converter(&pk_indices).expect("converter");
+        let loaded = provider
+            .try_load_persisted_pk_index(
+                &pk_indices,
+                &converter,
+                None,
+                provider.effective_single_keyset_budget(),
+            )
+            .await
+            .expect("load persisted index")
+            .expect("persisted bloom present after compaction");
+        let CachedPkIndex::Bloom(bloom) = &loaded else {
+            panic!("fast path must return a Bloom");
+        };
+        let rows_of = |start: i64, n: i64| {
+            let batch = id_value_batch_for_range(Arc::clone(&schema), start, n);
+            let cols: Vec<_> = pk_indices
+                .iter()
+                .map(|&i| Arc::clone(batch.column(i)))
+                .collect();
+            converter.convert_columns(&cols).expect("convert keys")
+        };
+        let present = rows_of(0, 110_000);
+        assert!(
+            (0..present.num_rows()).all(|i| bloom.maybe_contains(present.row(i).as_ref())),
+            "every checkpointed and delta key must be present"
+        );
+        let absent = rows_of(10_000_000, 100_000);
+        let false_positives = (0..absent.num_rows())
+            .filter(|&i| bloom.maybe_contains(absent.row(i).as_ref()))
+            .count();
+        // The checkpoint seed alone answers "maybe" for about 0.2% of absent keys;
+        // the same seed holding the delta too answers it for nearly all of them.
+        assert!(
+            false_positives <= 1_000,
+            "{false_positives} of 100,000 absent keys read as present"
         );
     }
 
@@ -76084,7 +76210,12 @@ mod tests {
             .expect("table has a primary key");
         let converter = provider.build_pk_converter(&pk_indices).expect("converter");
         let loaded = provider
-            .try_load_persisted_pk_index(&pk_indices, &converter, None)
+            .try_load_persisted_pk_index(
+                &pk_indices,
+                &converter,
+                None,
+                provider.effective_single_keyset_budget(),
+            )
             .await
             .expect("load persisted index")
             .expect("persisted bloom present after compaction");
