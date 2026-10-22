@@ -4060,9 +4060,6 @@ pub fn refresh_error_reason(error: &super::Error) -> &'static str {
         _ if error_chain_matches(error, looks_like_parquet_decode) => {
             metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
         }
-        _ if error_chain_matches(error, super::source_stall::is_source_stalled_message) => {
-            metrics::REFRESH_ERROR_REASON_SOURCE_STALLED
-        }
         _ => metrics::REFRESH_ERROR_REASON_OTHER,
     }
 }
@@ -5226,10 +5223,10 @@ mod tests {
 
     /// A source that sends a batch and then goes silent, as a connection the network
     /// stopped carrying does, fails the refresh once the stall timeout passes: retried,
-    /// and counted on the attempt under `reason="source_stalled"`. Without the timeout
-    /// the write waits for ever and nothing is counted.
+    /// and counted on the attempt. Without the timeout the write waits for ever and
+    /// nothing is counted.
     #[tokio::test(start_paused = true)]
-    async fn a_source_silent_mid_refresh_fails_retriably_as_source_stalled() {
+    async fn a_source_silent_mid_refresh_fails_retriably() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let accelerator = Arc::new(
             MemTable::try_new(Arc::clone(&schema), vec![vec![]])
@@ -5276,9 +5273,12 @@ mod tests {
             "a stalled source is retried on a new connection: {error:?}"
         );
         let counted = attempt_refresh_error(&error).expect("counted on the attempt");
-        assert_eq!(
-            refresh_error_reason(counted),
-            metrics::REFRESH_ERROR_REASON_SOURCE_STALLED
+        assert_eq!(refresh_error_reason(counted), metrics::REFRESH_ERROR_REASON_OTHER);
+        assert!(
+            counted
+                .to_string()
+                .contains("The source of dataset 'source_stalled_refresh' stopped sending data mid-refresh: no data for 180s after it started sending"),
+            "{counted}"
         );
         assert_eq!(started.elapsed(), timeout, "fails at the stall timeout");
     }

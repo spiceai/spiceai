@@ -25,8 +25,8 @@ limitations under the License.
 //!
 //! Once the source has sent its first batch, a refresh that waits longer than
 //! [`SOURCE_STALL_TIMEOUT`] for the next one fails with a retriable error, so it
-//! is logged, counted in `dataset_acceleration_refresh_errors` under
-//! `reason="source_stalled"`, and retried on a new connection. The wait before
+//! is logged, counted in `dataset_acceleration_refresh_errors`, and retried on
+//! a new connection. The wait before
 //! the first batch is not bounded: a source may take a long time to plan and
 //! start a query.
 
@@ -42,21 +42,18 @@ use futures::{StreamExt, stream};
 /// sending. A source that streams leaves gaps of seconds between batches.
 pub(crate) const SOURCE_STALL_TIMEOUT: Duration = Duration::from_mins(3);
 
-/// The error a stalled refresh fails with. Its text is what
-/// [`is_source_stalled_message`] recognises in an error chain.
+/// The error a stalled refresh fails with.
 #[derive(Debug)]
 pub(crate) struct SourceStalled {
     dataset: String,
     waited: Duration,
 }
 
-const SOURCE_STALLED_MARKER: &str = "stopped sending data mid-refresh";
-
 impl std::fmt::Display for SourceStalled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "The source of dataset '{}' {SOURCE_STALLED_MARKER}: no data for {}s after it started sending, so the connection is treated as lost and the refresh is retried",
+            "The source of dataset '{}' stopped sending data mid-refresh: no data for {}s after it started sending, so the connection is treated as lost and the refresh is retried",
             self.dataset,
             self.waited.as_secs()
         )
@@ -64,11 +61,6 @@ impl std::fmt::Display for SourceStalled {
 }
 
 impl std::error::Error for SourceStalled {}
-
-/// Whether an error's text is a [`SourceStalled`] error's.
-pub(crate) fn is_source_stalled_message(text: &str) -> bool {
-    text.contains(SOURCE_STALLED_MARKER)
-}
 
 /// `source`, failing with [`SourceStalled`] when it goes `timeout` without a
 /// batch after its first one.
@@ -152,9 +144,10 @@ mod tests {
             .expect_err("not a batch");
         assert_eq!(silent_from.elapsed(), timeout, "fails at the timeout");
         assert!(is_retriable_error(&error), "retried, not permanent: {error}");
-        assert!(is_source_stalled_message(&error.to_string()), "{error}");
         assert!(
-            error.to_string().contains("The source of dataset 'big' "),
+            error.to_string().contains(
+                "The source of dataset 'big' stopped sending data mid-refresh: no data for 600s after it started sending, so the connection is treated as lost and the refresh is retried"
+            ),
             "{error}"
         );
         assert!(guarded.next().await.is_none(), "the stream ends after the error");
