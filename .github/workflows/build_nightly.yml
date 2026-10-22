@@ -263,7 +263,14 @@ jobs:
           brew update
           brew list cmake || brew install cmake
           brew install unixodbc
-          echo "RUSTFLAGS=-L /opt/homebrew/lib" >> $GITHUB_ENV
+          # Only the unixodbc keg, never all of /opt/homebrew/lib. A RUSTFLAGS `-L` is searched
+          # before a build script's own `rustc-link-search`, so a static library Homebrew has
+          # linked into /opt/homebrew/lib replaces the vendored one of the same name. `brew
+          # install unixodbc` now pulls in openssl@4 and links its `libcrypto.a` there, so
+          # openssl-sys bundled it instead of the vendored OpenSSL librdkafka was compiled
+          # against, and the link failed on undefined `_ENGINE_*` symbols. The keg holds the
+          # libodbc* families, which is all the odbc build needs from Homebrew.
+          echo "RUSTFLAGS=-L /opt/homebrew/opt/unixodbc/lib" >> $GITHUB_ENV
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
