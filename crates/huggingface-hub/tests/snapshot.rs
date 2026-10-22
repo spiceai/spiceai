@@ -465,6 +465,30 @@ async fn rate_limiting_is_waited_out() {
 }
 
 #[tokio::test]
+async fn a_server_error_is_retried() {
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    fixture.mock.faults(|faults| faults.unavailable = 2);
+
+    let snapshot = fixture.open(None, &[]).await;
+    snapshot
+        .download(&["config.json"])
+        .await
+        .expect("the download succeeds after the retries");
+    let revision_lookups = fixture
+        .mock
+        .seen()
+        .iter()
+        .filter(|seen| seen.path.contains("/revision/"))
+        .count();
+    assert_eq!(
+        revision_lookups, 3,
+        "two answers of HTTP 503, then the revision"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_downloads_of_one_file_download_it_once() {
     let fixture = Fixture::new().await;
     let files = model_files();
