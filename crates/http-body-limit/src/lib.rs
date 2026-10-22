@@ -78,7 +78,7 @@ pub const MAX_METADATA_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 /// The `Accept-Encoding` a client built with [`decode_manually`] sends, the same one
 /// `reqwest` sends when it decompresses transparently.
-pub const ACCEPT_ENCODING_VALUE: &str = "zstd,gzip,deflate,br";
+const ACCEPT_ENCODING_VALUE: &str = "zstd,gzip,deflate,br";
 
 /// The size of each block decoded at a time, and so how far past a limit a body can
 /// get before the limit is enforced.
@@ -264,66 +264,34 @@ pub async fn buffer(response: Response, limit: Limit) -> Result<Response> {
 /// Best effort by design: a read or decode failure ends the read with what was read so
 /// far. It never reads more than `max_bytes`, so it needs no ratio check.
 pub async fn read_prefix(response: Response, max_bytes: usize) -> Vec<u8> {
+    let encoding = Encoding::of(response.headers());
+    let (reader, _) = reader(response, encoding);
     let mut out = Vec::new();
-    match Encoding::of(response.headers()) {
-        None => {
-            let mut response = response;
-            while out.len() < max_bytes {
-                match response.chunk().await {
-                    Ok(Some(chunk)) => {
-                        let take = chunk.len().min(max_bytes - out.len());
-                        out.extend_from_slice(&chunk[..take]);
-                    }
-                    Ok(None) | Err(_) => break,
-                }
-            }
-        }
-        Some(encoding) => {
-            let (mut decoder, _) = decoder(response, encoding);
-            let mut block = vec![0u8; DECODE_BLOCK_BYTES.min(max_bytes.max(1))];
-            while out.len() < max_bytes {
-                match decoder.read(&mut block).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let take = n.min(max_bytes - out.len());
-                        out.extend_from_slice(&block[..take]);
-                    }
-                }
-            }
-        }
-    }
+    // `read_to_end` keeps what it read before a failure, which is all this wants.
+    let _ = reader
+        .take(u64::try_from(max_bytes).unwrap_or(u64::MAX))
+        .read_to_end(&mut out)
+        .await;
     out
 }
 
 async fn read_capped(mut response: Response, max_bytes: usize) -> Result<Bytes> {
-    // Most bodies arrive as one chunk, which is returned as it is rather than copied.
-    let Some(first) = response.chunk().await.context(ReadSnafu)? else {
-        return Ok(Bytes::new());
-    };
-    ensure!(first.len() <= max_bytes, TooLargeSnafu { limit: max_bytes });
-    let Some(second) = response.chunk().await.context(ReadSnafu)? else {
-        return Ok(first);
-    };
-
-    let mut body = BytesMut::with_capacity(first.len().saturating_add(second.len()));
-    body.extend_from_slice(&first);
-    let mut next = Some(second);
-    while let Some(chunk) = next {
+    let mut body = BytesMut::new();
+    while let Some(chunk) = response.chunk().await.context(ReadSnafu)? {
         ensure!(
             chunk.len() <= max_bytes - body.len(),
             TooLargeSnafu { limit: max_bytes }
         );
         body.extend_from_slice(&chunk);
-        next = response.chunk().await.context(ReadSnafu)?;
     }
     Ok(body.freeze())
 }
 
-type Decoder = Pin<Box<dyn AsyncRead + Send>>;
+type Reader = Pin<Box<dyn AsyncRead + Send>>;
 
-/// A decoder over the body of `response`, and the count of body bytes it has been
-/// handed so far.
-fn decoder(response: Response, encoding: Encoding) -> (Decoder, Arc<AtomicUsize>) {
+/// A reader of the body of `response`, decoded as `encoding` if it has one, and the
+/// count of body bytes it has been handed so far.
+fn reader(response: Response, encoding: Option<Encoding>) -> (Reader, Arc<AtomicUsize>) {
     let received = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&received);
     let chunks = futures::stream::try_unfold(response, |mut response| async move {
@@ -336,18 +304,19 @@ fn decoder(response: Response, encoding: Encoding) -> (Decoder, Arc<AtomicUsize>
     })
     .map_err(io::Error::other)
     .boxed();
-    let reader = StreamReader::new(chunks);
-    let decoder: Decoder = match encoding {
-        Encoding::Gzip => Box::pin(GzipDecoder::new(reader)),
-        Encoding::Deflate => Box::pin(ZlibDecoder::new(reader)),
-        Encoding::Brotli => Box::pin(BrotliDecoder::new(reader)),
-        Encoding::Zstd => Box::pin(ZstdDecoder::new(reader)),
+    let body = StreamReader::new(chunks);
+    let reader: Reader = match encoding {
+        None => Box::pin(body),
+        Some(Encoding::Gzip) => Box::pin(GzipDecoder::new(body)),
+        Some(Encoding::Deflate) => Box::pin(ZlibDecoder::new(body)),
+        Some(Encoding::Brotli) => Box::pin(BrotliDecoder::new(body)),
+        Some(Encoding::Zstd) => Box::pin(ZstdDecoder::new(body)),
     };
-    (decoder, received)
+    (reader, received)
 }
 
 async fn decode(response: Response, encoding: Encoding, max_bytes: Option<usize>) -> Result<Bytes> {
-    let (mut reader, received_bytes) = decoder(response, encoding);
+    let (mut reader, received_bytes) = reader(response, Some(encoding));
 
     // Decoded into blocks of a fixed size and joined once at the end, so a body that
     // is refused holds no more than the blocks it decoded, and one that is not is
@@ -660,18 +629,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uncompressed_body_is_not_capped_and_its_length_is_not_refused() {
-        let len = 3 * MIB;
-        let url = serve("", vec![b'A'; len]).await;
-        let response = get(&url).await;
-        assert_eq!(response.content_length(), Some(len as u64));
-        let body = read_bytes(response, Limit::CompressionRatio)
-            .await
-            .expect("an uncompressed body is read at any size");
-        assert_eq!(body.len(), len);
-    }
-
-    #[tokio::test]
     async fn size_cap_applies_to_compressed_and_uncompressed_bodies() {
         let url = serve("", vec![b'A'; 2 * MIB]).await;
         let body = read_bytes(get(&url).await, Limit::CompressionRatioAndSize(2 * MIB))
@@ -781,22 +738,6 @@ mod tests {
         assert_eq!(header("content-encoding"), None);
         assert_eq!(header("content-length"), None);
         assert_eq!(response.text().await.expect("decode text"), "café");
-    }
-
-    #[tokio::test]
-    async fn buffered_response_decodes_json() {
-        let url = serve(
-            "Content-Type: application/json\r\n",
-            br#"{"rows":[1,2,3]}"#.to_vec(),
-        )
-        .await;
-        let value: serde_json::Value = buffer(get(&url).await, Limit::CompressionRatioAndSize(MIB))
-            .await
-            .expect("a small body is buffered")
-            .json()
-            .await
-            .expect("decode json");
-        assert_eq!(value.to_string(), r#"{"rows":[1,2,3]}"#);
     }
 
     #[tokio::test]

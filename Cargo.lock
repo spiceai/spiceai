@@ -10260,7 +10260,6 @@ dependencies = [
  "futures",
  "http 1.4.1",
  "reqwest 0.13.4",
- "serde_json",
  "snafu",
  "tokio",
  "tokio-util",

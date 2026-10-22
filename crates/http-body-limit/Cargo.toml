@@ -23,7 +23,6 @@ tokio-util = { workspace = true, features = ["io"] }
 [dev-dependencies]
 brotli = "8.0.2"
 flate2 = "1.1"
-serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 zstd = "0.13"
 
