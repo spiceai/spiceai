@@ -259,6 +259,7 @@ fn stage(
     payload: &PutPayload,
 ) -> Result<(std::fs::File, Staging), ObjectStoreError> {
     let mut suffix = 1_u64;
+    let mut created_parent = false;
     let (mut file, staging) = loop {
         let mut staging = path.as_os_str().to_owned();
         staging.push(format!("#{suffix}"));
@@ -279,10 +280,11 @@ fn stage(
                 );
             }
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => suffix += 1,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => match path.parent() {
-                Some(parent) => std::fs::create_dir_all(parent).map_err(worker_error)?,
-                None => return Err(worker_error(source)),
-            },
+            Err(source) if source.kind() == io::ErrorKind::NotFound && !created_parent => {
+                let parent = path.parent().ok_or_else(|| worker_error(source))?;
+                std::fs::create_dir_all(parent).map_err(worker_error)?;
+                created_parent = true;
+            }
             Err(source) => return Err(worker_error(source)),
         }
     };
@@ -324,7 +326,7 @@ fn stamp(
         }
         if Instant::now() >= deadline {
             return Err(io::Error::other(format!(
-                "the filesystem kept a modification time at or before {floor_micros} microseconds after the epoch for {COARSE_TIMESTAMP_WAIT:?}, so the new version's ETag could repeat an earlier version's"
+                "the filesystem kept its modification time at or before the directory's last publication for {COARSE_TIMESTAMP_WAIT:?}, so its ETag could repeat an earlier version's; keep this state on a filesystem that stores sub-second timestamps"
             )));
         }
         std::thread::sleep(COARSE_TIMESTAMP_POLL);
@@ -350,7 +352,9 @@ fn publish(
     // that still uses this order.
     let _legacy_guard = lock_file(&root.join(".spice-object-store-occ.lock"))?;
     let directory_guard = lock_file(&publication_lock_path(root, location))?;
+    // `LocalFileSystem` reports a directory at an object's path as no object.
     let current = match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => None,
         Ok(metadata) => Some(metadata),
         Err(source) if source.kind() == io::ErrorKind::NotFound => None,
         Err(source) => return Err(worker_error(source)),
@@ -392,7 +396,12 @@ fn publish(
     let floor = current
         .as_ref()
         .map_or(published, |current| mtime_or_epoch(current).max(published));
-    let modified = stamp(&staged, mtime_or_epoch(&written), floor).map_err(worker_error)?;
+    let modified = stamp(&staged, mtime_or_epoch(&written), floor).map_err(|source| {
+        ObjectStoreError::Generic {
+            store: "LocalConditionalPut",
+            source: format!("Failed to write '{location}': {source}").into(),
+        }
+    })?;
     // Advance the floor before the version becomes visible, so no published
     // version is ever past it.
     directory_guard
@@ -1294,6 +1303,37 @@ mod tests {
         assert!(
             stored <= SystemTime::now(),
             "stored {stored:?} is ahead of the clock"
+        );
+    }
+
+    /// A directory at an object's path is no object, as `LocalFileSystem`
+    /// reports it: an update there finds nothing to replace.
+    #[tokio::test]
+    async fn an_update_at_a_directory_path_finds_no_object() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let store = LocalConditionalPut::new(dir.path()).expect("create store");
+        store
+            .put_opts(
+                &Path::from("test/parent/child.json"),
+                versioned_payload(0),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("create a child, making test/parent a directory");
+
+        let result = store
+            .put_opts(
+                &Path::from("test/parent"),
+                versioned_payload(1),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: Some("any".to_string()),
+                    version: None,
+                })),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ObjectStoreError::NotFound { .. })),
+            "got {result:?}"
         );
     }
 }
