@@ -45,6 +45,8 @@ pub mod expr;
 #[cfg(feature = "datafusion")]
 pub mod session_state;
 #[cfg(feature = "datafusion")]
+pub mod sorted_runs;
+#[cfg(feature = "datafusion")]
 pub mod stream_utils;
 pub mod time;
 pub mod time_format;

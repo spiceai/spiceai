@@ -42,3 +42,8 @@ http = ["dep:http-body", "dep:pin-project", "dep:tokio-util"]
 
 [lints]
 workspace = true
+
+[[bench]]
+harness = false
+name = "sort_plan_latency"
+required-features = ["datafusion"]

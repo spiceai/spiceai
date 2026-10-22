@@ -342,6 +342,20 @@ pub fn set_compaction_runtime_env(env: Arc<RuntimeEnv>) {
     *guard = Some(env);
 }
 
+/// The share of `task_ctx`'s memory pool a sort of maintenance work may plan to
+/// hold: half when it sorts in the compaction pool, which only maintenance uses,
+/// and a quarter in any pool shared with queries, which needs the rest.
+pub(crate) fn maintenance_sort_budget(
+    task_ctx: &datafusion_execution::TaskContext,
+) -> util::sorted_runs::SortBudget {
+    match compaction_runtime_env() {
+        Some(env) if Arc::ptr_eq(&env.memory_pool, task_ctx.memory_pool()) => {
+            util::sorted_runs::SortBudget::Dedicated
+        }
+        _ => util::sorted_runs::SortBudget::Shared,
+    }
+}
+
 /// The dedicated compaction memory environment, if one was injected.
 pub(crate) fn compaction_runtime_env() -> Option<Arc<RuntimeEnv>> {
     COMPACTION_RUNTIME_ENV.read().clone()

@@ -20201,7 +20201,9 @@ impl CayenneTableProvider {
         // it always was: dealing it over more partitions would need a
         // round-robin `RepartitionExec` in front of the sorts, which can
         // deadlock a spilling sort under memory pressure.
-        let ctx = self.create_session_context();
+        // Sorted in the compaction pool where there is one, so a large replace
+        // cannot take memory queries need.
+        let ctx = self.create_compaction_session_context();
         let task_ctx = ctx.task_ctx();
         let input = util::stream_utils::stream_plan(data);
         let ordered = self.order_rewrite_plan(input, &order, &task_ctx)?;
@@ -21007,7 +21009,9 @@ impl CayenneTableProvider {
         // Create a session context and scan the logical table view to get all
         // currently visible rows. The rewrite commit clears deletion/protected
         // snapshot state, so the input stream must have already applied it.
-        let ctx = self.create_session_context();
+        // Read and sorted in the compaction pool where there is one, as the
+        // full compaction is, so the sort cannot take memory queries need.
+        let ctx = self.create_compaction_session_context();
         // The snapshot these rows come from, which the commit below replaces only
         // if the table still points at it. Read before the rows, as the full
         // compaction does: this method holds no `write_lock`, so a whole overwrite
@@ -26312,13 +26316,15 @@ impl CayenneTableProvider {
         &self,
         plan: Arc<dyn ExecutionPlan>,
         order: &RewriteOrder,
-        task_ctx: &datafusion_execution::TaskContext,
+        task_ctx: &Arc<datafusion_execution::TaskContext>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let budget = super::compaction::maintenance_sort_budget(task_ctx);
+        let sort_plan = |plan, columns: &[String]| {
+            util::stream_utils::sort_plan_with_budget(plan, columns, task_ctx, budget)
+        };
         match order {
             RewriteOrder::Unordered => Ok(plan),
-            RewriteOrder::Sorted(sort_columns) => {
-                Ok(util::stream_utils::sort_plan(plan, sort_columns, task_ctx)?)
-            }
+            RewriteOrder::Sorted(sort_columns) => Ok(sort_plan(plan, sort_columns)?),
             RewriteOrder::Curve(indices) => {
                 let columns = plan.schema().fields().len();
                 // One set of bounds for every partition, so all keys share one
@@ -26328,8 +26334,7 @@ impl CayenneTableProvider {
                     indices,
                     self.cluster_column_bounds(indices),
                 )?;
-                let sorted =
-                    util::stream_utils::sort_plan(keyed, std::slice::from_ref(&key), task_ctx)?;
+                let sorted = sort_plan(keyed, std::slice::from_ref(&key))?;
                 Ok(super::clustering::without_cluster_key(sorted, columns)?)
             }
         }

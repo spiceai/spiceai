@@ -32,7 +32,7 @@ use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::{ExecutionPlan, displayable, execute_stream};
 use datafusion::prelude::SessionConfig;
 use futures::TryStreamExt;
-use util::stream_utils::{SORT_PARTITION_WORKING_BYTES, max_sort_partitions, sort_plan};
+use util::stream_utils::sort_plan;
 
 type Row = (Option<i64>, String);
 
@@ -247,94 +247,71 @@ fn bounded_context(pool_bytes: usize, reservation: usize) -> Arc<TaskContext> {
     )
 }
 
-#[test]
-fn sort_width_is_what_half_the_pool_gives_each_sort() {
-    let reservation = 1024 * 1024;
-    let per_sort = reservation + SORT_PARTITION_WORKING_BYTES;
-    for (pool, width) in [
-        (4 * per_sort + 1, 2),
-        (2 * per_sort, 1),
-        // A pool too small for even one sort still sorts, serially.
-        (per_sort / 3, 1),
-        (40 * per_sort, 20),
-    ] {
-        assert_eq!(
-            max_sort_partitions(&bounded_context(pool, reservation)),
-            width,
-            "pool {pool}"
-        );
-    }
-    assert_eq!(max_sort_partitions(&TaskContext::default()), usize::MAX);
+/// A context whose disk manager is disabled: a sort that tries to write a run
+/// fails instead.
+fn no_disk_context(pool_bytes: usize) -> Arc<TaskContext> {
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)))
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        )
+        .build_arc()
+        .expect("runtime");
+    Arc::new(TaskContext::default().with_runtime(runtime))
 }
 
-/// Memory another consumer already holds is not free for these sorts: a pool
-/// with room for every partition's sort when empty sorts them as one once
-/// most of it is taken.
+/// An input that fits in memory is sorted without writing a run: it finishes
+/// with no disk at all. The same rows under a pool too small for them have to
+/// write runs, so with no disk they fail, which shows the first case is not
+/// passing by accident.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn memory_already_held_counts_against_the_sort_width() {
+async fn an_input_that_fits_in_memory_never_touches_disk() {
+    let parts = partitions();
+    let ctx = no_disk_context(1024 * 1024 * 1024);
+    let plan = sort_plan(source(&parts, 250), &["k".to_string()], &ctx).expect("plan builds");
+    assert_ordered(&parts, &run(plan, &ctx).await, asc_nulls_last);
+
+    let payload = "x".repeat(200);
+    let wide: Vec<Vec<Row>> = (0..4_u64)
+        .map(|p| {
+            scrambled(40_000, p + 3)
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| (k, format!("{payload}-{p}-{i}")))
+                .collect()
+        })
+        .collect();
+    let ctx = no_disk_context(8 * 1024 * 1024);
+    let plan = sort_plan(source(&wide, 1_000), &["k".to_string()], &ctx).expect("plan builds");
+    let collected = datafusion::physical_plan::collect(plan, Arc::clone(&ctx)).await;
+    assert!(
+        collected.is_err(),
+        "~35 MB of rows in an 8 MB pool must write runs"
+    );
+}
+
+/// Memory another consumer already holds leaves less for the sort, which then
+/// writes more of its input to disk, but still finishes and orders every row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_held_elsewhere_still_sorts_every_row() {
     use datafusion::execution::memory_pool::MemoryConsumer;
-    let reservation = 1024 * 1024;
-    let per_sort = reservation + SORT_PARTITION_WORKING_BYTES;
-    let parts = partitions();
-    let ctx = bounded_context(2 * parts.len() * per_sort, reservation);
-    assert_eq!(max_sort_partitions(&ctx), parts.len());
+    let payload = "x".repeat(200);
+    let parts: Vec<Vec<Row>> = (0..6_u64)
+        .map(|p| {
+            scrambled(20_000, p + 7)
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| (k, format!("{payload}-{p}-{i}")))
+                .collect()
+        })
+        .collect();
+    let ctx = bounded_context(64 * 1024 * 1024, 1024 * 1024);
     let held = MemoryConsumer::new("concurrent rewrite").register(ctx.memory_pool());
-    held.try_grow((2 * parts.len() - 2) * per_sort)
-        .expect("room to hold");
-    assert_eq!(max_sort_partitions(&ctx), 1);
-    let plan = sort_plan(source(&parts, 250), &["k".to_string()], &ctx).expect("plan builds");
-    assert!(
-        !plan_text(&plan).contains("SortPreservingMergeExec"),
-        "with most of the pool held elsewhere, the partitions sort as one:\n{}",
-        plan_text(&plan)
-    );
+    held.try_grow(54 * 1024 * 1024).expect("room to hold");
+    let plan = sort_plan(source(&parts, 1_000), &["k".to_string()], &ctx).expect("plan builds");
+    assert_ordered(&parts, &run(plan, &ctx).await, asc_nulls_last);
     drop(held);
-    assert_eq!(
-        max_sort_partitions(&ctx),
-        parts.len(),
-        "released memory is free again"
-    );
-}
-
-/// A pool with room for a sort per partition sorts them separately and merges.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_roomy_pool_sorts_every_partition_separately() {
-    let reservation = 1024 * 1024;
-    let parts = partitions();
-    let ctx = bounded_context(
-        2 * parts.len() * (reservation + SORT_PARTITION_WORKING_BYTES),
-        reservation,
-    );
-    let plan = sort_plan(source(&parts, 250), &["k".to_string()], &ctx).expect("plan builds");
-    let text = plan_text(&plan);
-    assert!(
-        text.contains("SortPreservingMergeExec") && !text.contains("CoalescePartitionsExec"),
-        "every partition fits, so each is sorted and they are merged:\n{text}"
-    );
-    assert_ordered(&parts, &run(plan, &ctx).await, asc_nulls_last);
-}
-
-/// A pool without room for a sort per partition sorts them as one, over the
-/// coalesced input — never a subset of sorts, and never a repartition, which
-/// can deadlock a spilling sort.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_tight_pool_sorts_all_partitions_as_one() {
-    let reservation = 1024 * 1024;
-    let ctx = bounded_context(
-        4 * (reservation + SORT_PARTITION_WORKING_BYTES) + 1,
-        reservation,
-    );
-    assert_eq!(max_sort_partitions(&ctx), 2);
-    let parts = partitions();
-    let plan = sort_plan(source(&parts, 250), &["k".to_string()], &ctx).expect("plan builds");
-    let text = plan_text(&plan);
-    assert!(
-        text.contains("CoalescePartitionsExec")
-            && !text.contains("SortPreservingMergeExec")
-            && !text.contains("RepartitionExec"),
-        "five partitions do not fit two sorts, so they are sorted as one:\n{text}"
-    );
-    assert_ordered(&parts, &run(plan, &ctx).await, asc_nulls_last);
 }
 
 /// Under a pool several times smaller than its input, `sort_plan` must still
@@ -393,4 +370,53 @@ async fn already_ordered_partitions_are_only_merged() {
         "ordered partitions need a merge and no sort:\n{text}"
     );
     assert_ordered(&parts, &run(plan, &ctx).await, asc_nulls_last);
+}
+
+/// Partitions that each hold their own range of keys, shuffled within it, plus
+/// one that overlaps two of them and one of NULLs: the ranges that do not
+/// overlap are read one after another without a merge between them, and every
+/// row still comes out in order, in either direction and NULL placement, also
+/// when the pool is small enough that parts of the ranges are written to disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disjoint_key_ranges_are_ordered_without_merging_across_them() {
+    let payload = "x".repeat(200);
+    let range = |lo: i64, n: i64, seed: u64, tag: &str| -> Vec<Row> {
+        let mut keys: Vec<Option<i64>> = (lo..lo + n).map(Some).collect();
+        // A fixed shuffle: reverse, then interleave halves.
+        keys.reverse();
+        let half = keys.len() / 2;
+        let (a, b) = keys.split_at(half);
+        let mixed: Vec<Option<i64>> = a
+            .iter()
+            .zip(b)
+            .flat_map(|(x, y)| [*y, *x])
+            .chain(b.iter().skip(a.len()).copied())
+            .collect();
+        rows(&mixed, &format!("{tag}-{seed}"))
+            .into_iter()
+            .map(|(k, p)| (k, format!("{p}{payload}")))
+            .collect()
+    };
+    let mut parts: Vec<Vec<Row>> = (0..6)
+        .map(|p| range(p * 20_000, 20_000, p.unsigned_abs(), "range"))
+        .collect();
+    // Overlaps the second and third ranges, and repeats a boundary key.
+    parts.push(range(30_000, 20_000, 9, "overlap"));
+    parts.push(rows(&vec![None; 500], "nulls"));
+    for ctx in [
+        Arc::new(TaskContext::default()),
+        bounded_context(16 * 1024 * 1024, 1024 * 1024),
+    ] {
+        let plan = sort_plan(source(&parts, 1_000), &["k".to_string()], &ctx).expect("plan builds");
+        assert_ordered(&parts, &run(plan, &ctx).await, asc_nulls_last);
+        let plan = sort_plan(
+            source(&parts, 1_000),
+            &["k DESC NULLS FIRST".to_string()],
+            &ctx,
+        )
+        .expect("plan builds");
+        assert_ordered(&parts, &run(plan, &ctx).await, |r| {
+            (r.0.is_some(), std::cmp::Reverse(r.0.unwrap_or(0)))
+        });
+    }
 }
