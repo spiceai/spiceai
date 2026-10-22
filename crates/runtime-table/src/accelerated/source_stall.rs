@@ -40,7 +40,7 @@ use futures::{StreamExt, stream};
 
 /// How long a refresh waits for the next batch once its source has started
 /// sending. A source that streams leaves gaps of seconds between batches; a
-/// wait this long means the connection is gone.
+/// wait this long is treated as a lost connection.
 pub(crate) const SOURCE_STALL_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// The error a stalled refresh fails with.
