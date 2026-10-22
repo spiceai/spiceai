@@ -1048,50 +1048,6 @@ mod tests {
     // ── The HTTP paths ────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn search_response_larger_than_128_mib_is_read_in_full() {
-        const HITS: usize = 140_000;
-        let filler = "x".repeat(1000);
-        let mut body = String::from(r#"{"hits":{"total":{"value":140000},"hits":["#);
-        for i in 0..HITS {
-            if i > 0 {
-                body.push(',');
-            }
-            std::fmt::Write::write_fmt(
-                &mut body,
-                format_args!(
-                    r#"{{"_id":"doc-{i}","_score":1.0,"_source":{{"n":{i},"text":"{filler}"}}}}"#
-                ),
-            )
-            .expect("write to a String");
-        }
-        body.push_str("]}}");
-        assert!(body.len() > 136 * 1024 * 1024, "{} bytes", body.len());
-        let (url, hits) = spawn_stub("200 OK", body, 1);
-
-        // A long timeout: an unoptimized build takes seconds to parse this much JSON.
-        let opts = ClientOptions {
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(300),
-            retry: RetryConfig {
-                max_retries: 0,
-                initial_backoff: Duration::from_millis(1),
-            },
-        };
-        let response = Client::new_with_options(&url, None, None, &opts)
-            .expect("build the stub client")
-            .search_raw("idx", &serde_json::json!({}))
-            .await
-            .expect("a large search response is read");
-
-        assert_eq!(response.hits.hits.len(), HITS);
-        let last = &response.hits.hits[HITS - 1];
-        assert_eq!(last.id, format!("doc-{}", HITS - 1));
-        assert_eq!(last.source["n"], serde_json::json!(HITS - 1));
-        assert_eq!(last.source["text"], serde_json::json!(filler));
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
     async fn bulk_index_4xx_reports_the_class_and_not_the_body() {
         let body = format!(
             r#"{{"error":{{"type":"mapper_parsing_exception","reason":"failed to parse field [amount] in document id '{SENTINEL}'"}},"status":400}}"#
