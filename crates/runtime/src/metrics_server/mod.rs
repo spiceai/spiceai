@@ -697,6 +697,10 @@ fn histogram_to_summary_metric(histogram_labels: &[LabelPair], h: &Histogram) ->
 }
 
 /// Lower bound of the first occupied bucket and upper bound of the last.
+///
+/// The last explicit bucket is not an upper bound when `sample_count` is
+/// greater than that bucket's cumulative count: overflow observations sit in
+/// the implicit `+Inf` bucket, which a histogram proto may omit.
 fn occupied_bucket_bounds(h: &Histogram) -> (f64, f64) {
     let mut previous_upper = f64::NEG_INFINITY;
     let mut previous_count = 0_u64;
@@ -718,12 +722,20 @@ fn occupied_bucket_bounds(h: &Histogram) -> (f64, f64) {
         previous_count = count;
     }
 
+    if previous_count < h.get_sample_count() {
+        if !saw_observation {
+            first_lower = previous_upper;
+        }
+        last_upper = f64::INFINITY;
+    }
+
     (first_lower, last_upper)
 }
 
 /// Bucket interpolation can report a quantile no observation could have, given
 /// count, sum, and the occupied bucket. A single observation *is* the
-/// distribution: every quantile is that sample.
+/// distribution: every quantile is that sample, including when interpolation
+/// returns ±Inf because the sample landed in the overflow bucket.
 #[expect(clippy::cast_precision_loss)]
 fn clamp_derived_quantile(
     value: f64,
@@ -732,11 +744,14 @@ fn clamp_derived_quantile(
     first_lower: f64,
     last_upper: f64,
 ) -> f64 {
-    if sample_count == 0 || !value.is_finite() {
+    if sample_count == 0 {
         return value;
     }
     if sample_count == 1 {
         return sample_sum;
+    }
+    if !value.is_finite() {
+        return value;
     }
 
     let others = (sample_count - 1) as f64;
@@ -961,25 +976,31 @@ mod tests {
         registry
     }
 
-    fn histogram_with_single_observation(latency_ms: f64) -> Histogram {
+    fn duration_histogram(latencies: &[f64], include_inf: bool) -> Histogram {
         let mut histogram = Histogram::new();
-        let mut cumulative = 0_u64;
         for &upper in &telemetry::DURATION_MS_HISTOGRAM_BUCKETS {
-            if latency_ms <= upper {
-                cumulative = 1;
-            }
+            let count = latencies
+                .iter()
+                .filter(|&&latency| latency <= upper)
+                .count();
             let mut bucket = Bucket::new();
-            bucket.set_cumulative_count(cumulative);
+            bucket.set_cumulative_count(u64::try_from(count).expect("observation count"));
             bucket.set_upper_bound(upper);
             histogram.bucket.push(bucket);
         }
-        let mut inf = Bucket::new();
-        inf.set_cumulative_count(1);
-        inf.set_upper_bound(f64::INFINITY);
-        histogram.bucket.push(inf);
-        histogram.set_sample_count(1);
-        histogram.set_sample_sum(latency_ms);
+        if include_inf {
+            let mut inf = Bucket::new();
+            inf.set_cumulative_count(u64::try_from(latencies.len()).expect("observation count"));
+            inf.set_upper_bound(f64::INFINITY);
+            histogram.bucket.push(inf);
+        }
+        histogram.set_sample_count(u64::try_from(latencies.len()).expect("observation count"));
+        histogram.set_sample_sum(latencies.iter().copied().sum());
         histogram
+    }
+
+    fn histogram_with_single_observation(latency_ms: f64) -> Histogram {
+        duration_histogram(&[latency_ms], true)
     }
 
     fn labeled_histogram_family(name: &str, series: &[(&str, &str, &Histogram)]) -> MetricFamily {
@@ -1088,10 +1109,11 @@ mod tests {
     }
 
     /// A single refresh of 11.88ms must not report p50=17.5 / p99=24.85, which is
-    /// what interpolating inside the 10–25ms duration bucket does.
+    /// what interpolating inside the 10–25ms duration bucket does. 1_000_000ms
+    /// lands in `+Inf`; interpolation is Inf, and the quantile is still the sample.
     #[test]
     fn single_observation_quantiles_match_the_observed_value() {
-        for latency_ms in [11.88, 217.0] {
+        for latency_ms in [11.88, 217.0, 1_000_000.0] {
             let histogram = histogram_with_single_observation(latency_ms);
             let family = labeled_histogram_family(
                 "dataset_acceleration_refresh_duration_ms",
@@ -1158,6 +1180,82 @@ mod tests {
                 latency_ms,
             );
         }
+    }
+
+    /// Interpolation of one overflow sample is Inf; the quantile is still the
+    /// sample. Count==1 is applied before the non-finite guard so Inf does not
+    /// escape.
+    #[test]
+    fn single_observation_wins_over_non_finite_interpolation() {
+        assert_float_eq(
+            clamp_derived_quantile(f64::INFINITY, 1, 1_000_000.0, 500_000.0, f64::INFINITY),
+            1_000_000.0,
+        );
+    }
+
+    /// Overflow past the last explicit bucket is not bounded by that bucket.
+    /// Without `+Inf`, `[0.2, 1.2, 100, 1_000_000]` interpolates p50 to 2.5,
+    /// and the clamp must keep that rank instead of the last finite bound.
+    #[test]
+    fn overflow_without_inf_bucket_does_not_rewrite_p50() {
+        let latencies = [0.2, 1.2, 100.0, 1_000_000.0];
+        let histogram = duration_histogram(&latencies, false);
+        let last = histogram
+            .get_bucket()
+            .last()
+            .expect("duration histogram has buckets");
+        assert!(
+            last.upper_bound().is_finite(),
+            "fixture must omit the +Inf bucket"
+        );
+        assert!(
+            last.cumulative_count() < histogram.get_sample_count(),
+            "overflow observations must sit past the last explicit bucket"
+        );
+
+        let counts: Vec<u64> = histogram
+            .get_bucket()
+            .iter()
+            .map(Bucket::cumulative_count)
+            .collect();
+        let bounds: Vec<f64> = histogram
+            .get_bucket()
+            .iter()
+            .map(Bucket::upper_bound)
+            .collect();
+        let interpolated_p50 =
+            calculate_percentile(&counts, &bounds, histogram.get_sample_count(), 50.0);
+        assert_float_eq(interpolated_p50, 2.5);
+
+        let (first_lower, last_upper) = occupied_bucket_bounds(&histogram);
+        assert!(
+            last_upper.is_infinite(),
+            "overflow must leave the upper bound open, got {last_upper}"
+        );
+        assert_float_eq(first_lower, 0.1);
+        assert_float_eq(
+            clamp_derived_quantile(
+                interpolated_p50,
+                histogram.get_sample_count(),
+                histogram.get_sample_sum(),
+                first_lower,
+                last_upper,
+            ),
+            interpolated_p50,
+        );
+
+        let family = labeled_histogram_family(
+            "dataset_acceleration_refresh_duration_ms",
+            &[("dataset", "products", &histogram)],
+        );
+        let p50 = histogram_family_to_summary(&family).get_metric()[0]
+            .get_summary()
+            .quantile
+            .iter()
+            .find(|quantile| (quantile.quantile() - 0.5).abs() < f64::EPSILON)
+            .expect("p50 quantile")
+            .value();
+        assert_float_eq(p50, 2.5);
     }
 
     #[tokio::test]
