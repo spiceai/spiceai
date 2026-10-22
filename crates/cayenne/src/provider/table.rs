@@ -13440,14 +13440,16 @@ impl CayenneTableProvider {
         true
     }
 
-    /// Build a bloom existence filter over `keyset`'s keys.
+    /// Build a bloom existence filter over `keyset`'s keys, sized to the
+    /// `max_bytes` the keyset outgrew.
     ///
-    /// Sized for the conversion-time key count with 4× growth headroom
-    /// (~10 bits/key at 4×), capped at `max_bytes`. The bloom cannot grow, so
-    /// later inserts degrade the false-positive rate gradually; a false
-    /// positive is only a redundant tombstone under upsert.
+    /// The bloom cannot grow, and every false positive records a key tombstone
+    /// that the deletion index holds until a bake rewrites data to fold it in. A
+    /// table that keeps receiving new keys would saturate a bloom sized for the
+    /// keys it holds at conversion, so the bloom keeps the whole budget instead:
+    /// no more than the exact keyset was already holding.
     fn bloom_from_keyset(keyset: &CachedPkKeyset, max_bytes: usize) -> PkBloom {
-        let mut bloom = PkBloom::with_expected_keys(keyset.len().saturating_mul(4), max_bytes);
+        let mut bloom = PkBloom::with_byte_budget(max_bytes);
         for key in keyset.rows() {
             bloom.insert(key.as_ref());
         }
@@ -75745,6 +75747,56 @@ mod tests {
         assert!(
             matches!(guard.as_ref(), Some(CachedPkIndex::Bloom(_))),
             "an upsert table over its keyset byte budget must cache a bloom, not drop the cache"
+        );
+    }
+
+    /// A keyset that outgrows its budget converts to a bloom that keeps that
+    /// budget, so a table still receiving new keys after the conversion — an
+    /// append stream — records almost no tombstones for keys it never stored.
+    #[tokio::test]
+    async fn a_converted_bloom_keeps_room_for_the_keys_that_follow() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_budgeted_upsert_table("bloom_headroom", 1, ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // The first write into the empty table installs a bloom outright; dropping
+        // it makes the next write rebuild an exact keyset from the stored rows,
+        // which then grows past the budget (about 11,000 Int64 keys) and converts.
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 1_000),
+        )
+        .await;
+        provider.clear_cached_pk_keyset();
+        for start in (1_000..20_000).step_by(1_000) {
+            insert_batch(
+                &provider,
+                id_value_batch_for_range(Arc::clone(&schema), start, 1_000),
+            )
+            .await;
+        }
+        assert!(
+            matches!(
+                provider.pk_keyset_cache.lock().as_ref(),
+                Some(CachedPkIndex::Bloom(_))
+            ),
+            "precondition: the keyset converted to a bloom"
+        );
+        for start in (20_000..120_000).step_by(10_000) {
+            insert_batch(
+                &provider,
+                id_value_batch_for_range(Arc::clone(&schema), start, 10_000),
+            )
+            .await;
+        }
+
+        // A bloom sized for 4x the keys at conversion is at ~4 bits/key here and
+        // tombstones about 6% of these new keys; the 1 MiB bloom is at ~70.
+        let tombstones = provider.pk_deletion_snapshot().delete_len();
+        assert!(
+            tombstones <= 10,
+            "new keys after the conversion recorded {tombstones} tombstones"
         );
     }
 

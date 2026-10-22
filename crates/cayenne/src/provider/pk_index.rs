@@ -2237,13 +2237,9 @@ impl ShardedPkIndex {
                 .iter_mut()
                 .enumerate()
                 .map(|(shard, keyset)| {
-                    // Right-size per shard: conversion-time keys with 4× growth
-                    // headroom, capped by the per-shard budget split (rationale:
-                    // `bloom_from_keyset`).
-                    let mut bloom = PkBloom::with_expected_keys(
-                        keyset.len().saturating_mul(4),
-                        per_shard_max_bytes,
-                    );
+                    // Each shard keeps its share of the budget, whatever it holds
+                    // today (rationale: `bloom_from_keyset`).
+                    let mut bloom = PkBloom::with_byte_budget(per_shard_max_bytes);
                     for key in keyset.rows() {
                         bloom.insert(key.as_ref());
                     }
