@@ -120,14 +120,14 @@ pub use runtime_api_types::v1::DatasetInfo as DatasetResponseItem;
         ), (
             String = "text/csv",
             example = "
-from,name,replication_enabled,acceleration_enabled,status,error,error_message
-postgres:syncs,daily_journal_accelerated,false,true,Ready,,
-databricks:hive_metastore.default.messages,messages_accelerated,false,true,Error,dataset.auth,Unable to authenticate with datasource credentials
-postgres:aidemo_messages,general,false,false,Initializing,,
+from,name,replication_enabled,acceleration_enabled,status,error,error_message,last_refresh,next_refresh,properties.search,properties.vector_search
+postgres:syncs,daily_journal_accelerated,false,true,Ready,,,,,,unsupported,unsupported
+databricks:hive_metastore.default.messages,messages_accelerated,false,true,Error,dataset.auth,Unable to authenticate with datasource credentials,,,unsupported,unsupported
+postgres:aidemo_messages,general,false,false,Initializing,,,,,,unsupported,unsupported
 "
         ))),
         (status = 500, description = "Internal server error occurred while processing datasets", content((
-            String, example = "An unexpected error occurred while processing datasets"
+            String, example = "Failed to format the dataset list as CSV"
         )))
     )
 ))]
@@ -170,14 +170,79 @@ pub(crate) async fn get(
 
     match params.format {
         Format::Json => (status::StatusCode::OK, Json(resp)).into_response(),
-        Format::Csv => match convert_entry_to_csv(&resp) {
+        Format::Csv => match datasets_to_csv(&resp) {
             Ok(csv) => (status::StatusCode::OK, csv).into_response(),
-            Err(e) => {
-                tracing::error!("Error converting to CSV: {e}");
-                (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-            }
+            Err(e) => datasets_csv_error_response(e),
         },
     }
+}
+
+/// Body returned when `GET /v1/datasets?format=csv` cannot be encoded. The
+/// rust-csv crate error names its GitHub issue tracker; that text is not a
+/// user-facing message.
+const DATASETS_CSV_ERROR_BODY: &str = "Failed to format the dataset list as CSV";
+
+/// Flat CSV row for `GET /v1/datasets?format=csv`.
+///
+/// `csv::Writer::serialize` rejects `HashMap` fields and expands nested structs
+/// into extra columns, so [`DatasetResponseItem`] cannot be written directly.
+#[derive(Debug, Serialize)]
+struct DatasetCsvRow {
+    from: String,
+    name: String,
+    replication_enabled: bool,
+    acceleration_enabled: bool,
+    status: Option<String>,
+    error: Option<String>,
+    error_message: Option<String>,
+    last_refresh: Option<String>,
+    next_refresh: Option<String>,
+    #[serde(rename = "properties.search")]
+    properties_search: Option<String>,
+    #[serde(rename = "properties.vector_search")]
+    properties_vector_search: Option<String>,
+}
+
+impl From<&DatasetResponseItem> for DatasetCsvRow {
+    fn from(item: &DatasetResponseItem) -> Self {
+        Self {
+            from: item.from.clone(),
+            name: item.name.clone(),
+            replication_enabled: item.replication_enabled,
+            acceleration_enabled: item.acceleration_enabled,
+            status: item.status.as_ref().map(ToString::to_string),
+            error: item.error.as_ref().map(|error| error.code.clone()),
+            error_message: item.error_message.clone(),
+            last_refresh: item.last_refresh.clone(),
+            next_refresh: item.next_refresh.clone(),
+            properties_search: json_value_cell(item.properties.get("search")),
+            properties_vector_search: json_value_cell(item.properties.get("vector_search")),
+        }
+    }
+}
+
+fn json_value_cell(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Null) | None => None,
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+fn datasets_to_csv(datasets: &[DatasetResponseItem]) -> Result<String, Box<dyn std::error::Error>> {
+    let rows: Vec<DatasetCsvRow> = datasets.iter().map(DatasetCsvRow::from).collect();
+    convert_entry_to_csv(&rows)
+}
+
+fn datasets_csv_error_response(error: impl std::fmt::Display) -> Response {
+    tracing::error!(
+        "Failed to format the dataset list as CSV, so `GET /v1/datasets?format=csv` cannot be answered. Cause: {error}"
+    );
+    (
+        status::StatusCode::INTERNAL_SERVER_ERROR,
+        DATASETS_CSV_ERROR_BODY.to_string(),
+    )
+        .into_response()
 }
 
 /// The `GET /v1/datasets?status=true` document for the app `rt` serves: every
@@ -580,4 +645,121 @@ fn dataset_properties(ds: &Dataset) -> HashMap<String, Value> {
     );
 
     properties
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DATASETS_CSV_ERROR_BODY, DatasetResponseItem, convert_entry_to_csv, datasets_to_csv,
+        json_value_cell,
+    };
+    use runtime_api_types::v1::{ComponentError, ComponentErrorCategory, ComponentStatus};
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+
+    fn dataset_item(
+        name: &str,
+        status: Option<ComponentStatus>,
+        error_message: Option<&str>,
+    ) -> DatasetResponseItem {
+        let mut properties = HashMap::new();
+        properties.insert("search".to_string(), json!("supported"));
+        properties.insert("vector_search".to_string(), json!("unsupported"));
+        let error = status.as_ref().and_then(|status| {
+            status.is_error().then(|| {
+                ComponentError::from_status_message(ComponentErrorCategory::Dataset, error_message)
+            })
+        });
+        DatasetResponseItem {
+            from: "s3://spiceai-public-datasets/trips.parquet".to_string(),
+            name: name.to_string(),
+            replication_enabled: false,
+            acceleration_enabled: true,
+            properties,
+            status,
+            error,
+            error_message: error_message.map(ToString::to_string),
+            last_refresh: None,
+            next_refresh: None,
+        }
+    }
+
+    #[test]
+    fn dataset_info_csv_rejects_map_properties() {
+        let error = convert_entry_to_csv(&[dataset_item("trips", None, None)])
+            .err()
+            .expect("DatasetInfo CSV should fail when properties is a map");
+        let message = error.to_string();
+        assert!(
+            message.contains("serializing maps is not supported"),
+            "expected rust-csv to reject map properties, got: {message}"
+        );
+    }
+
+    #[test]
+    fn datasets_csv_without_status_flattens_properties() {
+        let csv = datasets_to_csv(&[dataset_item("trips", None, None)]).expect("csv");
+        assert_eq!(
+            csv,
+            "from,name,replication_enabled,acceleration_enabled,status,error,error_message,last_refresh,next_refresh,properties.search,properties.vector_search\n\
+             s3://spiceai-public-datasets/trips.parquet,trips,false,true,,,,,,supported,unsupported\n"
+        );
+    }
+
+    #[test]
+    fn datasets_csv_with_status_includes_error_code() {
+        let csv = datasets_to_csv(&[
+            dataset_item("ready_trips", Some(ComponentStatus::Ready), None),
+            dataset_item(
+                "broken_trips",
+                Some(ComponentStatus::error_with_message(
+                    "UnableToConnectInvalidUsernameOrPassword",
+                )),
+                Some("UnableToConnectInvalidUsernameOrPassword"),
+            ),
+        ])
+        .expect("csv");
+        assert_eq!(
+            csv,
+            "from,name,replication_enabled,acceleration_enabled,status,error,error_message,last_refresh,next_refresh,properties.search,properties.vector_search\n\
+             s3://spiceai-public-datasets/trips.parquet,ready_trips,false,true,Ready,,,,,supported,unsupported\n\
+             s3://spiceai-public-datasets/trips.parquet,broken_trips,false,true,Error,dataset.auth,UnableToConnectInvalidUsernameOrPassword,,,supported,unsupported\n"
+        );
+        let broken = csv
+            .lines()
+            .find(|line| line.contains("broken_trips"))
+            .expect("error dataset row");
+        assert!(
+            broken.contains("dataset.auth"),
+            "error.code should flatten into the error cell: {broken}"
+        );
+        assert!(
+            !csv.contains("serializing maps"),
+            "flat CSV must not leak the rust-csv map error: {csv}"
+        );
+    }
+
+    #[test]
+    fn datasets_csv_error_body_does_not_leak_crate_text() {
+        assert_eq!(
+            DATASETS_CSV_ERROR_BODY,
+            "Failed to format the dataset list as CSV"
+        );
+        assert!(!DATASETS_CSV_ERROR_BODY.contains("BurntSushi"));
+        assert!(!DATASETS_CSV_ERROR_BODY.contains("serializing maps"));
+    }
+
+    #[test]
+    fn json_value_cell_encodes_non_string_properties() {
+        assert_eq!(
+            json_value_cell(Some(&json!("supported"))),
+            Some("supported".to_string())
+        );
+        assert_eq!(json_value_cell(Some(&Value::Null)), None);
+        assert_eq!(json_value_cell(None), None);
+        assert_eq!(
+            json_value_cell(Some(&json!({"enabled": true}))),
+            Some("{\"enabled\":true}".to_string())
+        );
+    }
 }

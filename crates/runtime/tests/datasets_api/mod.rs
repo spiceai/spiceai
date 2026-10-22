@@ -521,3 +521,168 @@ async fn test_datasets_api_without_status_param() -> Result<(), anyhow::Error> {
         })
         .await
 }
+
+/// Tests that `GET /v1/datasets?format=csv` returns HTTP 200 with a header and
+/// rows, including a dataset in `Error` when `status=true`.
+#[tokio::test]
+async fn test_datasets_api_csv_format() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    register_permission_status_provider().await;
+
+    test_request_context()
+        .scope(async {
+            let span = tracing::info_span!("test_datasets_api_csv_format");
+            let _span_guard = span.enter();
+
+            let mut rng = rand::rng();
+            let http_port: u16 = rng.random_range(50000..60000);
+            let flight_port: u16 = http_port + 1;
+
+            let api_config = Config::new()
+                .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
+                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
+
+            let app = app::AppBuilder::new("test_datasets_api_csv")
+                .with_dataset(get_permission_status_dataset("permission_allowed"))
+                .with_dataset(get_permission_status_dataset("permission_denied"))
+                .build();
+
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let cloned_rt = Arc::clone(&rt);
+
+            tokio::spawn(async move {
+                Box::pin(cloned_rt.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            let http_client = reqwest::Client::builder().build()?;
+            assert_server_ready(&http_client, http_port).await;
+
+            let csv_url = format!("http://127.0.0.1:{http_port}/v1/datasets?format=csv");
+            let (status, body) = fetch_csv(&http_client, &csv_url).await;
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "format=csv should return HTTP 200, got {status}: {body}"
+            );
+            assert_csv_is_clean(&body);
+            let (headers, rows) = parse_csv_rows(&body);
+            assert_csv_headers(&headers);
+            let allowed = csv_row(&headers, &rows, "permission_allowed");
+            let denied = csv_row(&headers, &rows, "permission_denied");
+            assert_eq!(csv_field(&headers, allowed, "status"), "");
+            assert_eq!(csv_field(&headers, denied, "status"), "");
+            assert_eq!(csv_field(&headers, denied, "error"), "");
+
+            let csv_status_url =
+                format!("http://127.0.0.1:{http_port}/v1/datasets?format=csv&status=true");
+            let (status, body) = fetch_csv(&http_client, &csv_status_url).await;
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "format=csv&status=true should return HTTP 200, got {status}: {body}"
+            );
+            assert_csv_is_clean(&body);
+            let (headers, rows) = parse_csv_rows(&body);
+            assert_csv_headers(&headers);
+
+            let allowed = csv_row(&headers, &rows, "permission_allowed");
+            assert_eq!(csv_field(&headers, allowed, "status"), "Ready");
+            assert_eq!(csv_field(&headers, allowed, "error"), "");
+            assert_eq!(csv_field(&headers, allowed, "error_message"), "");
+
+            let denied = csv_row(&headers, &rows, "permission_denied");
+            assert_eq!(csv_field(&headers, denied, "status"), "Error");
+            assert_eq!(csv_field(&headers, denied, "error"), "dataset.permission");
+            let error_message = csv_field(&headers, denied, "error_message");
+            assert!(
+                error_message.contains("Insufficient permissions to access")
+                    && error_message.contains("permission_denied"),
+                "CSV error_message should surface the permission failure: {error_message}"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+async fn fetch_csv(http_client: &reqwest::Client, url: &str) -> (reqwest::StatusCode, String) {
+    let response = http_client.get(url).send().await.expect("valid response");
+    let status = response.status();
+    let body = response.text().await.expect("CSV body");
+    (status, body)
+}
+
+fn assert_csv_is_clean(body: &str) {
+    assert!(
+        !body.contains("serializing maps"),
+        "CSV body leaked the rust-csv map error: {body}"
+    );
+    assert!(
+        !body.contains("BurntSushi"),
+        "CSV body leaked rust-csv crate text: {body}"
+    );
+    assert!(
+        !body.contains("found record with"),
+        "CSV body leaked a rust-csv field-count error: {body}"
+    );
+}
+
+fn parse_csv_rows(body: &str) -> (csv::StringRecord, Vec<csv::StringRecord>) {
+    let mut reader = csv::ReaderBuilder::new().from_reader(body.as_bytes());
+    let headers = reader.headers().expect("CSV header").clone();
+    let rows = reader
+        .records()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("CSV rows");
+    (headers, rows)
+}
+
+fn assert_csv_headers(headers: &csv::StringRecord) {
+    for expected in [
+        "from",
+        "name",
+        "replication_enabled",
+        "acceleration_enabled",
+        "status",
+        "error",
+        "error_message",
+        "last_refresh",
+        "next_refresh",
+        "properties.search",
+        "properties.vector_search",
+    ] {
+        assert!(
+            headers.iter().any(|header| header == expected),
+            "CSV header {expected} missing from {headers:?}"
+        );
+    }
+}
+
+fn csv_row<'a>(
+    headers: &csv::StringRecord,
+    rows: &'a [csv::StringRecord],
+    name: &str,
+) -> &'a csv::StringRecord {
+    rows.iter()
+        .find(|row| csv_field(headers, row, "name") == name)
+        .unwrap_or_else(|| panic!("dataset {name} should be in the CSV"))
+}
+
+fn csv_field<'a>(headers: &csv::StringRecord, row: &'a csv::StringRecord, name: &str) -> &'a str {
+    let index = headers
+        .iter()
+        .position(|header| header == name)
+        .expect("CSV column should exist");
+    row.get(index).expect("CSV field should exist")
+}
