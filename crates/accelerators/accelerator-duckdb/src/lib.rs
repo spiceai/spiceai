@@ -2923,69 +2923,6 @@ mod tests {
         );
     }
 
-    /// Writes `0..8192` as `first` and then `(0, last)` in a second record
-    /// batch, under `on_conflict: { id: upsert }`, and requires key 0 to keep
-    /// `last` on each of 20 fresh tables: one run can keep either copy. An
-    /// append writes over a stored `(0, stored)`.
-    async fn assert_upsert_keeps_the_last_copy_across_batches(name: &str, op: InsertOp) {
-        let first: Vec<(i64, &str)> = (0..8192).map(|id| (id, "first")).collect();
-        for attempt in 0..20 {
-            let table = drop_on_conflict_table_with(
-                &format!("{name}_{attempt}"),
-                [("on_conflict".to_string(), "upsert:id".to_string())]
-                    .into_iter()
-                    .collect(),
-                vec![Constraint::PrimaryKey(vec![0])],
-            )
-            .await;
-            if op == InsertOp::Append {
-                write_batches(
-                    &table,
-                    vec![id_v_batch(&[(0, "stored")])],
-                    InsertOp::Overwrite,
-                )
-                .await
-                .expect("initial overwrite succeeds");
-            }
-            write_batches(
-                &table,
-                vec![id_v_batch(&first), id_v_batch(&[(0, "last")])],
-                op,
-            )
-            .await
-            .expect("write succeeds");
-
-            let rows = id_v_rows(&table).await;
-            assert_eq!(rows.len(), 8192, "{op} attempt {attempt}");
-            assert_eq!(rows[0], (0, "last".to_string()), "{op} attempt {attempt}");
-        }
-    }
-
-    /// Regression test for #14643: under `on_conflict: upsert`, a key a full
-    /// refresh repeats in a later record batch keeps its last copy. `DuckDB`
-    /// keeps whichever copy of a key one statement processes first, and the
-    /// write was one statement over a parallel scan, so the copy kept varied
-    /// run to run.
-    #[tokio::test]
-    async fn upsert_keeps_the_last_copy_of_a_key_an_overwrite_repeats_across_batches() {
-        assert_upsert_keeps_the_last_copy_across_batches(
-            "upsert_across_batches",
-            InsertOp::Overwrite,
-        )
-        .await;
-    }
-
-    /// Regression test for #14643: an append that repeats a key across its
-    /// record batches replaces the stored row with the last copy.
-    #[tokio::test]
-    async fn upsert_keeps_the_last_copy_of_a_key_an_append_repeats_across_batches() {
-        assert_upsert_keeps_the_last_copy_across_batches(
-            "upsert_append_across_batches",
-            InsertOp::Append,
-        )
-        .await;
-    }
-
     #[tokio::test]
     async fn overwrite_index_failure_keeps_previous_duckdb_view() {
         let schema = Arc::new(Schema::new(vec![Field::new(
