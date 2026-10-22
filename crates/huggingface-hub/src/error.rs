@@ -215,6 +215,8 @@ impl DownloadError {
             None => requester.to_string(),
         };
         let (cause, fix) = self.cause_and_fix();
+        // A cause can end in the Hub's own message, which may close with a period.
+        let cause = cause.trim_end_matches('.');
         let fix = fix.map_or_else(String::new, |fix| format!(" {fix}."));
         format!(
             "Failed to download {what} from Hugging Face repo '{repo}' (revision '{revision}'): {cause}.{fix} See: {}",
@@ -289,7 +291,7 @@ impl DownloadError {
                 format!(
                     "the Hugging Face Hub could not be reached ({reason}), and the Hugging Face cache does not hold {what}"
                 ),
-                Some("Spice retries the download; check the network connection".to_string()),
+                Some(RETRY_FIX.to_string()),
             ),
             Cause::Unusable { message } => (message.clone(), None),
             Cause::InvalidRepo => (
@@ -393,8 +395,9 @@ fn hub_cause_and_fix(
     }
 }
 
-/// What a user can do while the Hub cannot be reached.
-const RETRY_FIX: &str = "Spice retries the download; check the network connection, or set `HF_HUB_OFFLINE=1` to load from the cache";
+/// What a user can do while the Hub cannot be reached. `HF_HUB_OFFLINE` is no way out: a
+/// load has already fallen back to the cache, and found it lacking, by the time this shows.
+const RETRY_FIX: &str = "Spice retries the download; check the network connection";
 
 /// Why the Hub could not answer, as a short phrase for a warning: `connection timed out`,
 /// `HTTP 503`.

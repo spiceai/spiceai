@@ -569,7 +569,11 @@ async fn a_hub_outage_with_a_cold_cache_fails_with_the_hub_error() {
         .try_open(None, &[])
         .await
         .expect_err("nothing is cached");
-    assert!(error.to_string().contains("returned HTTP 503"), "{error}");
+    // `HF_HUB_OFFLINE` is no way out: the cache holds no snapshot to load.
+    assert_eq!(
+        error.to_string(),
+        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the Hugging Face Hub returned HTTP 503 after 5 attempt(s): The Hub is down. Spice retries the download; check the network connection. See: https://spiceai.org/docs/components/models/huggingface"
+    );
     assert!(!error.is_configuration_error());
 }
 
