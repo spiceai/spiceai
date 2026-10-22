@@ -404,6 +404,19 @@ fn main() {
             dedicated: false,
             wide: true,
         },
+        // A cold promotion's run: wide rows filling about one chunk of a
+        // dedicated pool, as an 8 GiB run does in a 31 GB compaction pool.
+        Shape {
+            name: "wide_cold_run_2_5gb",
+            rows: 9_000_000,
+            partitions: 1,
+            payload_bytes: 0,
+            pool: Some(10 * 1024 * MIB),
+            iterations: 6,
+            layout: Layout::Random,
+            dedicated: true,
+            wide: true,
+        },
         Shape {
             name: "wide_32p_1gb",
             rows: 3_500_000,
