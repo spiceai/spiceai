@@ -41,7 +41,6 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
 };
 use prost::Message;
 
-use super::require_write_access;
 use crate::opentelemetry::Service as MetricsIngestService;
 use crate::opentelemetry_logs::LogsIngestService;
 
@@ -414,7 +413,7 @@ pub(crate) async fn post_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    post(service.as_ref(), &headers, body).await
+    handle(service.as_ref(), &headers, body).await
 }
 
 /// Ingest OTLP logs over HTTP
@@ -450,23 +449,7 @@ pub(crate) async fn post_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    post(service.as_ref(), &headers, body).await
-}
-
-async fn post<S: Signal>(service: &S, headers: &HeaderMap, body: Bytes) -> Response {
-    if let Some(resp) = require_write_access().await {
-        // Answer in the request's encoding when it has one, like every other OTLP error.
-        let Ok(encoding_kind) = content_encoding(headers) else {
-            return resp;
-        };
-        return status_error(
-            encoding_kind,
-            StatusCode::FORBIDDEN,
-            tonic::Code::PermissionDenied,
-            "API key does not allow write access",
-        );
-    }
-    handle(service, headers, body).await
+    handle(service.as_ref(), &headers, body).await
 }
 
 /// Decompresses and decodes an export, as [`decompress`] and [`decode`] do, on the blocking

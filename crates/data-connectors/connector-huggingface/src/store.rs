@@ -132,7 +132,7 @@ fn target(location: &Path) -> object_store::Result<Target<'_>> {
     if !hub::is_commit_sha(commit) {
         return Err(invalid());
     }
-    let repo = RepoId::new(owner, name).map_err(|_| invalid())?;
+    let repo = RepoId::dataset(owner, name).map_err(|_| invalid())?;
     Ok(Target {
         repo,
         commit,
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn listed_objects_keep_their_literal_name() {
-        let repo = RepoId::new("o", "d").expect("a valid repository");
+        let repo = RepoId::dataset("o", "d").expect("a valid repository");
         let entry: TreeEntry = serde_json::from_value(serde_json::json!({
             "type": "file",
             "path": "data~v2/part [1].parquet",

@@ -1,0 +1,43 @@
+name: builtins
+description: >
+  DataFusion's built-in functions (trims, hex, digests, regular expressions,
+  ordered aggregates, windows ignoring NULLs, approximate and statistical
+  aggregates, date parts) answer the same on every acceleration engine and
+  federated to PostgreSQL as DataFusion answers them locally, and reach DuckDB
+  and SQLite only in renderings those engines answer the same.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  # DataFusion evaluates everything: the answer every other place must match.
+  arrow: arrow
+  duckdb: duckdb
+  sqlite: sqlite
+  cayenne: cayenne-file
+  federated: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: builtins
+  datasets:
+    - { from: 'postgres:public.names', name: names, params: '${sources.src.params}' }
+    - { from: 'postgres:public.hexes', name: hexes, params: '${sources.src.params}' }
+    - { from: 'postgres:public.rx', name: rx, params: '${sources.src.params}' }
+    - { from: 'postgres:public.cust', name: cust, params: '${sources.src.params}' }
+    - { from: 'postgres:public.vals', name: vals, params: '${sources.src.params}' }
+    - { from: 'postgres:public.part', name: part, params: '${sources.src.params}' }
+    - { from: 'postgres:public.partsupp', name: partsupp, params: '${sources.src.params}' }
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { part: p_partkey, partsupp: ps_partkey, '*': id }
+  # DataFusion evaluates everything here: every other place must agree.
+  compare-to: arrow
+
+steps:
+  - source-exec:
+      src: { file: seed/builtins-postgres.sql }
+  - start: {}
+  - corpus: corpus/builtins.sql

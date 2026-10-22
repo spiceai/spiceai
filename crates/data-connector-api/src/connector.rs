@@ -260,6 +260,18 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
+    /// Whether a cluster executor can keep an acceleration refreshed by this
+    /// connector's change stream to the partitions it serves.
+    ///
+    /// That takes a change stream that applies by primary key and resumes after
+    /// a replacement of the acceleration by a full read of the federated table,
+    /// which must read the source's current rows; and one that rebuilds from
+    /// the source an acceleration reported as [`AccelerationContents::Unknown`].
+    /// Without it, every executor applies every change.
+    fn supports_partitioned_changes(&self) -> bool {
+        false
+    }
+
     /// The CDC stream for `dataset`, if this connector produces one.
     ///
     /// `async` so that anything the stream needs from `context` — a checkpoint
