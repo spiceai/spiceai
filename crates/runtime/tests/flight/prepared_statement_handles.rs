@@ -82,6 +82,14 @@ fn query_command(handle: Bytes) -> Vec<u8> {
     .encode_to_vec()
 }
 
+fn update_command(handle: Bytes) -> Vec<u8> {
+    CommandPreparedStatementUpdate {
+        prepared_statement_handle: handle,
+    }
+    .as_any()
+    .encode_to_vec()
+}
+
 async fn get_flight_info(
     client: &mut FlightClient,
     handle: Bytes,
@@ -117,14 +125,25 @@ async fn execute(
     do_get(client, ticket.ticket.to_vec()).await
 }
 
-/// Binds `parameters` to `handle` with `DoPut` and returns the handle the runtime hands back.
+/// Binds `parameters` to a query `handle` with `DoPut` and returns the handle the runtime hands
+/// back.
 async fn bind(
     client: &mut FlightClient,
     handle: Bytes,
     parameters: RecordBatch,
 ) -> Result<Bytes, FlightError> {
+    bind_command(client, query_command(handle), parameters).await
+}
+
+/// Binds `parameters` with `DoPut` on a query or update `command` and returns the handle the
+/// runtime hands back.
+async fn bind_command(
+    client: &mut FlightClient,
+    command: Vec<u8>,
+    parameters: RecordBatch,
+) -> Result<Bytes, FlightError> {
     let stream = FlightDataEncoderBuilder::new()
-        .with_flight_descriptor(Some(FlightDescriptor::new_cmd(query_command(handle))))
+        .with_flight_descriptor(Some(FlightDescriptor::new_cmd(command)))
         .build(futures::stream::iter([Ok(parameters)]));
     let results: Vec<_> = client.do_put(stream).await?.try_collect().await?;
     let metadata = results
@@ -214,20 +233,16 @@ async fn a_forged_handle_is_rejected() -> Result<(), anyhow::Error> {
                 "DoGet on a forged query handle",
             );
             expect_invalid_handle(
-                do_get(
-                    &mut client,
-                    CommandPreparedStatementUpdate {
-                        prepared_statement_handle: forged.clone(),
-                    }
-                    .as_any()
-                    .encode_to_vec(),
-                )
-                .await,
+                do_get(&mut client, update_command(forged.clone())).await,
                 "DoGet on a forged update handle",
             );
             expect_invalid_handle(
-                bind(&mut client, forged, int_parameter(1)).await,
+                bind(&mut client, forged.clone(), int_parameter(1)).await,
                 "DoPut on a forged query handle",
+            );
+            expect_invalid_handle(
+                bind_command(&mut client, update_command(forged), int_parameter(1)).await,
+                "DoPut on a forged update handle",
             );
 
             // The runtime is still serving: a handle it issued executes.
@@ -265,6 +280,11 @@ async fn an_issued_handle_executes_and_an_altered_one_is_rejected() -> Result<()
                 int64_values(&execute(&mut client, rebound).await?),
                 vec![100]
             );
+            // Binding through the update command takes the same handle, and the handle it
+            // returns carries the new value.
+            let rebound =
+                bind_command(&mut client, update_command(bound.clone()), int_parameter(5)).await?;
+            assert_eq!(int64_values(&execute(&mut client, rebound).await?), vec![6]);
 
             // Alter the bound parameter value inside the handle: 41 becomes 40.
             let value_at = bound
@@ -286,8 +306,22 @@ async fn an_issued_handle_executes_and_an_altered_one_is_rejected() -> Result<()
                 "DoGet on a handle whose parameters were altered",
             );
             expect_invalid_handle(
-                bind(&mut client, altered_parameters.into(), int_parameter(1)).await,
+                bind(
+                    &mut client,
+                    altered_parameters.clone().into(),
+                    int_parameter(1),
+                )
+                .await,
                 "DoPut on a handle whose parameters were altered",
+            );
+            expect_invalid_handle(
+                bind_command(
+                    &mut client,
+                    update_command(altered_parameters.into()),
+                    int_parameter(1),
+                )
+                .await,
+                "DoPut on an update handle whose parameters were altered",
             );
 
             Ok(())
