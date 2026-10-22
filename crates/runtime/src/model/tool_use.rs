@@ -27,12 +27,13 @@ use llms::chat::{Chat, Result as ChatResult};
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
     ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageToolCall,
-    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
-    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
-    ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionTokensDetails, CompletionUsage,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason, FunctionCall, FunctionObject, PromptTokensDetails, ResponseFormat,
+    ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
+    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
+    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
+    ChatCompletionTools, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
+    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
+    FunctionCallStream, FunctionObject, FunctionType, PromptTokensDetails, ResponseFormat,
     ToolChoiceAllowedMode, ToolChoiceOptions,
 };
 
@@ -1087,51 +1088,29 @@ fn make_a_stream(
                         }
                         match choice_disposition(&chat_choice) {
                             ChoiceDisposition::Forward => {
-                                finished_choices.push(chat_choice);
+                                // Tool calls are withheld until the choice finishes, when it is
+                                // known which are Spice's to run; a finish Spice does not act on
+                                // gives the client the calls whole.
+                                let mut forwarded = chat_choice;
+                                forwarded.delta.tool_calls = if forwarded.finish_reason.is_some() {
+                                    withheld_tool_calls(&tool_call_states, forwarded.index)
+                                } else {
+                                    None
+                                };
+                                finished_choices.push(forwarded);
                                 continue;
                             }
                             ChoiceDisposition::Drop => continue,
                             ChoiceDisposition::RunTools => {}
                         }
 
-                        // A tool call has finished (i.e. we have all chunks), process it. Only
-                        // this choice's calls: another choice may still be streaming arguments
-                        // into the same map. Marking that partial call handled would run it
-                        // unfinished and then drop it when its own choice finished. The calls
-                        // run in the order the model made them. A repeated call id counts toward
-                        // the allowance and is not run again. The allowance is still one for the
-                        // whole response.
-                        let Ok(finished_choice) = i32::try_from(chat_choice.index) else {
-                            tracing::error!(
-                                "chat_choice.index value {} is too large to fit in an i32",
-                                chat_choice.index
-                            );
-                            return;
-                        };
-                        let (calls, response_spice_calls) = match tool_call_states.lock() {
-                            Ok(states_lock) => {
-                                let response_spice_calls = states_lock
-                                    .values()
-                                    .filter(|call| model.as_spiced_tool(call).is_some())
-                                    .count();
-                                let calls = states_lock
-                                    .iter()
-                                    .filter(|((choice_index, _), _)| {
-                                        *choice_index == finished_choice
-                                    })
-                                    .sorted_by_key(|(key, _)| **key)
-                                    .map(|(_, call)| call.clone())
-                                    .collect_vec();
-                                (calls, response_spice_calls)
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to lock tool_call_states: {}", e);
-                                return;
-                            }
-                        };
-                        if calls.is_empty() {
-                            continue;
-                        }
+                        // The choice's tool calls have finished (all their chunks are in), so they
+                        // are taken, once, to be run or given to the client.
+                        let finished_calls = take_tool_calls(&tool_call_states, chat_choice.index);
+                        let tool_calls_to_process = finished_calls
+                            .iter()
+                            .map(|(_, call)| call.clone())
+                            .collect();
 
                         // The text the model wrote this round: what was streamed before the
                         // finish, and any text on the finish itself.
@@ -1139,12 +1118,11 @@ fn make_a_stream(
                         round_text
                             .push_str(chat_choice.delta.content.as_deref().unwrap_or_default());
 
-                        budget.made = response_spice_calls;
                         let round = match model
                             .process_tool_calls_and_run_spice_tools(
                                 &req.model,
                                 &round_text,
-                                calls,
+                                tool_calls_to_process,
                                 &mut budget,
                                 &mut handled_call_ids,
                             )
@@ -1153,8 +1131,11 @@ fn make_a_stream(
                             Ok(Some(round)) if round.is_empty() => continue,
                             Ok(Some(round)) => round,
                             Ok(None) => {
-                                // No spice tools within returned tools, so return as message in stream.
-                                finished_choices.push(chat_choice);
+                                // No Spice tool among the calls: they are the client's, so it
+                                // receives them, whole, with the finish.
+                                let mut finished = chat_choice;
+                                finished.delta.tool_calls = tool_call_chunks(finished_calls);
+                                finished_choices.push(finished);
                                 continue;
                             }
                             Err(e) => {
@@ -1293,6 +1274,60 @@ fn make_a_stream(
     Box::pin(CustomStream { receiver }) as ChatCompletionResponseStream
 }
 
+/// Takes the tool calls of the choice at `choice_index`, accumulated from its chunks, in call
+/// order. Each call is taken once, so a later finish of the same choice cannot give it again.
+fn take_tool_calls(
+    states: &Mutex<BTreeMap<(i32, i32), ChatCompletionMessageToolCall>>,
+    choice_index: u32,
+) -> Vec<(u32, ChatCompletionMessageToolCall)> {
+    let mut states = match states.lock() {
+        Ok(states) => states,
+        Err(e) => {
+            tracing::error!("Failed to lock tool_call_states: {}", e);
+            return Vec::new();
+        }
+    };
+    let Ok(choice) = i32::try_from(choice_index) else {
+        return Vec::new();
+    };
+    states
+        .extract_if((choice, i32::MIN)..=(choice, i32::MAX), |_, _| true)
+        .filter_map(|((_, index), call)| Some((u32::try_from(index).ok()?, call)))
+        .collect()
+}
+
+/// `calls` as one chunk each; `None` when there are none.
+fn tool_call_chunks(
+    calls: Vec<(u32, ChatCompletionMessageToolCall)>,
+) -> Option<Vec<ChatCompletionMessageToolCallChunk>> {
+    if calls.is_empty() {
+        return None;
+    }
+    Some(
+        calls
+            .into_iter()
+            .map(|(index, call)| ChatCompletionMessageToolCallChunk {
+                index,
+                id: Some(call.id),
+                r#type: Some(FunctionType::Function),
+                function: Some(FunctionCallStream {
+                    name: Some(call.function.name),
+                    arguments: Some(call.function.arguments),
+                }),
+            })
+            .collect(),
+    )
+}
+
+/// The tool calls of the choice at `choice_index`, accumulated from its chunks, as one chunk
+/// each in call order; `None` when it made none, or they were already given.
+fn withheld_tool_calls(
+    states: &Mutex<BTreeMap<(i32, i32), ChatCompletionMessageToolCall>>,
+    choice_index: u32,
+) -> Option<Vec<ChatCompletionMessageToolCallChunk>> {
+    tool_call_chunks(take_tool_calls(states, choice_index))
+}
+
 // OpenAI tools must satisfy '^[a-zA-Z0-9_-]+$'. Commonly external tools may have '/' in their name.
 pub fn encode_tool_name(name: &str) -> String {
     if name.contains('/') {
@@ -1360,6 +1395,39 @@ mod tests {
         assert_eq!(
             tool_calls_over_limit_warning("chatm", 20_000),
             "Model 'chatm' made 20000 tool calls in one response, more than the 64 Spice runs from one response, so Spice ran the first 64 and told the model the other 19936 did not run. If the model needs more, prompt it to make fewer tool calls at once. See: https://spiceai.org/docs/features/large-language-models/tools"
+        );
+    }
+
+    #[test]
+    fn a_choices_withheld_tool_calls_are_given_once_in_call_order() {
+        let call = |id: &str| ChatCompletionMessageToolCall {
+            id: id.to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let states = Mutex::new(BTreeMap::from([
+            ((0, 1), call("b")),
+            ((0, 0), call("a")),
+            ((1, 0), call("other choice")),
+        ]));
+        let ids = |chunks: Option<Vec<ChatCompletionMessageToolCallChunk>>| {
+            chunks.map(|chunks| {
+                chunks
+                    .into_iter()
+                    .map(|chunk| (chunk.index, chunk.id.unwrap_or_default()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            ids(withheld_tool_calls(&states, 0)),
+            Some(vec![(0, "a".to_string()), (1, "b".to_string())])
+        );
+        assert_eq!(ids(withheld_tool_calls(&states, 0)), None, "given once");
+        assert_eq!(
+            ids(withheld_tool_calls(&states, 1)),
+            Some(vec![(0, "other choice".to_string())])
         );
     }
 
