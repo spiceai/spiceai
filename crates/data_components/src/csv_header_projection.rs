@@ -54,8 +54,9 @@ use datafusion_datasource_csv::source::{CsvOpener, CsvSource};
 use futures::StreamExt;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 
-/// Bytes of the object prefix read when parsing the header. A header longer than
-/// this is read in a second full-object fetch.
+/// Initial object prefix read when parsing the header. The probe grows from
+/// byte 0 until a quote-aware header record is available, or the whole object
+/// has been read.
 const HEADER_PROBE_BYTES: u64 = 64 * 1024;
 
 /// [`CsvFormat`] that maps each file's header names onto the registered schema.
@@ -423,47 +424,112 @@ async fn read_csv_header(
     options: &CsvOptions,
     compression: FileCompressionType,
 ) -> Result<Vec<String>> {
-    let end = meta.size.min(HEADER_PROBE_BYTES);
-    let prefix = store
-        .get_range(&meta.location, 0..end)
-        .await
-        .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?;
-    let decoded = decode_prefix(prefix, compression).await?;
-    let names = parse_header_names(&decoded, options)?;
-    if !names.is_empty() || meta.size <= HEADER_PROBE_BYTES {
-        return Ok(names);
+    // A 64 KiB prefix is enough for an ordinary header, but it is not a
+    // complete object: a UTF-8 character or a bzip2 block can straddle that
+    // cut. Grow from byte 0 until a quote-aware header record is available,
+    // and only then treat a parse error as a malformed file.
+    let mut end = meta.size.min(HEADER_PROBE_BYTES);
+    loop {
+        let whole_object = end >= meta.size;
+        let prefix = store
+            .get_range(&meta.location, 0..end)
+            .await
+            .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?;
+        match header_from_prefix(prefix, options, compression, whole_object).await {
+            Ok(Some(names)) => return Ok(names),
+            Ok(None) if whole_object => return Ok(Vec::new()),
+            Err(e) if whole_object => return Err(e),
+            Ok(None) | Err(_) => {
+                let next = end
+                    .saturating_mul(2)
+                    .max(end.saturating_add(1))
+                    .min(meta.size);
+                if next == end {
+                    return Ok(Vec::new());
+                }
+                end = next;
+            }
+        }
     }
-    // The prefix had no complete header row; read the object.
-    let object = store
-        .get(&meta.location)
-        .await
-        .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?;
-    let bytes = object
-        .bytes()
-        .await
-        .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?;
-    let decoded = decode_prefix(bytes, compression).await?;
-    parse_header_names(&decoded, options)
 }
 
+/// A prefix that decoded far enough to parse, that needs more bytes, or that
+/// failed in a way only a complete object can settle.
+async fn header_from_prefix(
+    prefix: bytes::Bytes,
+    options: &CsvOptions,
+    compression: FileCompressionType,
+    whole_object: bool,
+) -> Result<Option<Vec<String>>> {
+    let Some(decoded) = decode_prefix(prefix, compression, options).await? else {
+        return Ok(None);
+    };
+    if !whole_object && !header_record_complete(&decoded, options.quote, options.escape) {
+        return Ok(None);
+    }
+    parse_header_names(&decoded, options).map(Some)
+}
+
+/// Decompresses `prefix`. `None` means the prefix is not a complete compressed
+/// stream (grow and retry). An uncompressed prefix is always `Some`.
 async fn decode_prefix(
     prefix: bytes::Bytes,
     compression: FileCompressionType,
-) -> Result<bytes::Bytes> {
+    options: &CsvOptions,
+) -> Result<Option<bytes::Bytes>> {
     if !compression.is_compressed() {
-        return Ok(prefix);
+        return Ok(Some(prefix));
     }
     let stream = futures::stream::once(async move { Ok(prefix) }).boxed();
-    let mut decoded = compression.convert_stream(stream)?;
+    let Ok(mut decoded) = compression.convert_stream(stream) else {
+        return Ok(None);
+    };
     let mut acc = Vec::new();
-    while let Some(chunk) = decoded.next().await {
-        let chunk = chunk?;
-        acc.extend_from_slice(&chunk);
-        if acc.contains(&b'\n') {
+    loop {
+        if let Some(Ok(chunk)) = decoded.next().await {
+            acc.extend_from_slice(&chunk);
+            if header_record_complete(&acc, options.quote, options.escape) {
+                break;
+            }
+        } else if acc.is_empty() {
+            return Ok(None);
+        } else {
             break;
         }
     }
-    Ok(bytes::Bytes::from(acc))
+    Ok(Some(bytes::Bytes::from(acc)))
+}
+
+/// Whether `bytes` contains a quote-aware CSV record terminator, so a header
+/// parse will not see a field split across the prefix cut.
+fn header_record_complete(bytes: &[u8], quote: u8, escape: Option<u8>) -> bool {
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_quotes {
+            if let Some(esc) = escape
+                && b == esc
+                && i + 1 < bytes.len()
+            {
+                i += 2;
+                continue;
+            }
+            if b == quote {
+                if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                    i += 2;
+                    continue;
+                }
+                in_quotes = false;
+            }
+        } else if b == quote {
+            in_quotes = true;
+        } else if b == b'\n' || b == b'\r' {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn parse_header_names(bytes: &[u8], options: &CsvOptions) -> Result<Vec<String>> {
@@ -496,7 +562,12 @@ mod tests {
         ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
     };
     use datafusion::prelude::SessionContext;
+    use std::fmt::Write;
     use std::path::Path;
+
+    fn header_probe_len() -> usize {
+        usize::try_from(HEADER_PROBE_BYTES).expect("header probe fits usize")
+    }
 
     fn write_csv(path: &Path, header: &str, rows: &[&str]) {
         let mut text = String::from(header);
@@ -522,9 +593,17 @@ mod tests {
         dir: &Path,
         format: Arc<dyn FileFormat>,
     ) -> Arc<dyn datafusion::datasource::TableProvider> {
+        listing_table_with_extension(dir, format, ".csv")
+    }
+
+    fn listing_table_with_extension(
+        dir: &Path,
+        format: Arc<dyn FileFormat>,
+        extension: &str,
+    ) -> Arc<dyn datafusion::datasource::TableProvider> {
         let url = ListingTableUrl::parse(format!("file://{}/", dir.display())).expect("url");
         let config = ListingTableConfig::new(url)
-            .with_listing_options(ListingOptions::new(format).with_file_extension(".csv"))
+            .with_listing_options(ListingOptions::new(format).with_file_extension(extension))
             .with_schema(registered_schema());
         Arc::new(ListingTable::try_new(config).expect("listing table"))
     }
@@ -712,5 +791,98 @@ mod tests {
                 "amount_cents".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn header_record_complete_is_quote_aware() {
+        assert!(!header_record_complete(b"a,b", b'"', None));
+        assert!(header_record_complete(b"a,b\n1,2\n", b'"', None));
+        assert!(!header_record_complete(b"\"a\nb\",c", b'"', None));
+        assert!(header_record_complete(b"\"a\nb\",c\n", b'"', None));
+        assert!(header_record_complete(b"\"a\"\"b\",c\n", b'"', None));
+    }
+
+    #[tokio::test]
+    async fn header_probe_grows_when_a_utf8_character_straddles_the_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 65_533 ASCII bytes + ',' + a 3-byte '€' puts the character across
+        // the 64 KiB probe. The header record is only complete after the grow.
+        let header = format!(
+            "{}{}",
+            "n".repeat(65_533),
+            ",€,event_id,user_id,region,amount_cents,ts"
+        );
+        let prefix = header.as_bytes().get(..header_probe_len()).expect("prefix");
+        assert!(
+            std::str::from_utf8(prefix).is_err(),
+            "the 64 KiB probe must split the euro sign"
+        );
+        assert!(!header_record_complete(prefix, b'"', None));
+        write_csv(
+            &dir.path().join("base.csv"),
+            &header,
+            &["x,y,1,10,us,100,t0", "x,y,2,20,eu,200,t1"],
+        );
+        let sums = query_sums(listing_table(dir.path(), header_format()))
+            .await
+            .expect("query after growing the header probe");
+        assert_eq!(sums, (Some(300), Some(30)));
+    }
+
+    async fn compress_bzip2(plain: &[u8]) -> Vec<u8> {
+        let owned = bytes::Bytes::copy_from_slice(plain);
+        let stream = futures::stream::once(async move { Ok(owned) }).boxed();
+        let mut encoded = FileCompressionType::BZIP2
+            .convert_to_compress_stream(stream)
+            .expect("bzip2 encoder");
+        let mut acc = Vec::new();
+        while let Some(chunk) = encoded.next().await {
+            acc.extend_from_slice(&chunk.expect("compress"));
+        }
+        acc
+    }
+
+    #[tokio::test]
+    async fn header_probe_grows_when_bzip2_prefix_does_not_decompress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut csv = String::from("event_id,user_id,region,amount_cents,ts\n");
+        let mut rng = 0x1234_5678_u64;
+        for i in 0..5_000 {
+            rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            writeln!(
+                csv,
+                "{i},10,us,100,{:016x}{:016x}",
+                rng,
+                rng.wrapping_add(1)
+            )
+            .expect("write row");
+        }
+        let compressed = compress_bzip2(csv.as_bytes()).await;
+        assert!(
+            compressed.len() as u64 > HEADER_PROBE_BYTES,
+            "the compressed file must be larger than the first probe"
+        );
+        let prefix = bytes::Bytes::copy_from_slice(&compressed[..header_probe_len()]);
+        let options = CsvOptions::default();
+        let decoded = decode_prefix(prefix, FileCompressionType::BZIP2, &options)
+            .await
+            .expect("incomplete prefix is not an error");
+        assert!(
+            decoded
+                .as_ref()
+                .is_none_or(|bytes| !header_record_complete(bytes, b'"', None)),
+            "a 64 KiB bzip2 prefix must not be treated as a complete header"
+        );
+
+        std::fs::write(dir.path().join("base.csv.bz2"), compressed).expect("write bz2");
+        let format = HeaderProjectedCsvFormat::wrap(Arc::new(
+            CsvFormat::default()
+                .with_has_header(true)
+                .with_file_compression_type(FileCompressionType::BZIP2),
+        ));
+        let sums = query_sums(listing_table_with_extension(dir.path(), format, ".csv.bz2"))
+            .await
+            .expect("query after growing the compressed header probe");
+        assert_eq!(sums, (Some(500_000), Some(50_000)));
     }
 }
