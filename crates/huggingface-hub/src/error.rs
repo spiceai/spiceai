@@ -350,6 +350,9 @@ fn hub_cause_and_fix(
                 TokenSource::Param => {
                     "Set `hf_token` to a token with access to this repo".to_string()
                 }
+                TokenSource::Secret => {
+                    "Update the `hf_token` secret to a token with access to this repo".to_string()
+                }
                 TokenSource::Env(name) => {
                     format!("Set `{name}` to a token with access to this repo, or set `hf_token`")
                 }
@@ -511,6 +514,44 @@ mod tests {
 
     fn repo() -> RepoId {
         RepoId::new(RepoType::Model, "o", "m").expect("a valid repository")
+    }
+
+    /// A token a secret store supplied is named as the secret, with the fix that changes it.
+    #[test]
+    fn a_token_from_a_secret_is_named_as_the_secret() {
+        let secret = || Some(TokenSource::Secret);
+        let prefix = "Failed to download embedding model 'e5' from Hugging Face repo 'o/m' (revision 'main'):";
+        let docs = "See: https://spiceai.org/docs/components/embeddings/huggingface";
+        assert_eq!(
+            error(
+                false,
+                secret(),
+                Cause::Hub(client::Error::TokenRejected {
+                    repo: repo(),
+                    status: 401,
+                    token: secret(),
+                    token_scope: TokenScope::Any,
+                })
+            ),
+            format!(
+                "{prefix} the Hub rejected the token from the `hf_token` secret (HTTP 401). Update the `hf_token` secret to a token with access to this repo. {docs}"
+            )
+        );
+        assert_eq!(
+            error(
+                false,
+                secret(),
+                Cause::Hub(client::Error::Gated {
+                    repo: repo(),
+                    repo_url: "https://huggingface.co/o/m".to_string(),
+                    token: secret(),
+                    token_scope: TokenScope::Any,
+                })
+            ),
+            format!(
+                "{prefix} the repo is gated. Accept its access conditions at https://huggingface.co/o/m with the account the token from the `hf_token` secret belongs to. {docs}"
+            )
+        );
     }
 
     /// Each piece of advice that depends on whether Spice loads the component again: a model

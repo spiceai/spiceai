@@ -1453,6 +1453,7 @@ async fn access_errors_name_where_the_token_came_from() {
     };
     let env = || wrong(TokenSource::Env("HF_TOKEN"));
     let file = || wrong(TokenSource::File("/tokens/hf".into()));
+    let secret = || wrong(TokenSource::Secret);
     let error = |mock: &Mock, token: Option<Token>, token_scope: TokenScope| {
         let connector = connector_with(mock, token, token_scope, &[]);
         let from = if mock.endpoint() == gated.endpoint() {
@@ -1473,6 +1474,18 @@ async fn access_errors_name_where_the_token_came_from() {
         error(&private, file(), TokenScope::Any).await,
         format!(
             "Insufficient permissions to access the dataset t (hf). The Hugging Face Hub rejected the token from '/tokens/hf' for dataset 'o/private' (HTTP 401), which may have expired. Run `hf auth login`, or set `hf_token`. See: {DOCS}"
+        )
+    );
+    assert_eq!(
+        error(&private, secret(), TokenScope::Any).await,
+        format!(
+            "Insufficient permissions to access the dataset t (hf). The Hugging Face Hub rejected the token from the `hf_token` secret for dataset 'o/private' (HTTP 401). Update the secret to a token that is valid and grants read access to the dataset. See: {DOCS}"
+        )
+    );
+    assert_eq!(
+        error(&gated, secret(), TokenScope::Any).await,
+        format!(
+            "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated: accept its access conditions at {gated_url} with the account the token from the `hf_token` secret belongs to. See: {DOCS}"
         )
     );
     assert_eq!(
@@ -2007,7 +2020,7 @@ async fn a_token_the_spicepod_does_not_set_never_goes_to_its_endpoint() {
         (
             hub.clone(),
             loaded(),
-            Some(TokenSource::Param),
+            Some(TokenSource::Secret),
             TokenScope::Any
         )
     );
@@ -2021,7 +2034,18 @@ async fn a_token_the_spicepod_does_not_set_never_goes_to_its_endpoint() {
         (
             mirror.clone(),
             loaded(),
-            Some(TokenSource::Param),
+            Some(TokenSource::Secret),
+            TokenScope::Any
+        )
+    );
+    // ...named after `HF_TOKEN` when that is where it came from, as the environment secret
+    // store reads it for `hf_token`.
+    assert_eq!(
+        resolved(&[], loads_hf_token(), &env(&[("HF_TOKEN", "hf_loaded")])).await,
+        (
+            hub.clone(),
+            loaded(),
+            Some(TokenSource::Env("HF_TOKEN")),
             TokenScope::Any
         )
     );

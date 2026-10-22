@@ -96,6 +96,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub enum TokenSource {
     /// The component's `hf_token` parameter (or one of its aliases).
     Param,
+    /// The `hf_token` secret, which a secret store supplied because the component does not set
+    /// `hf_token`.
+    Secret,
     /// An environment variable.
     Env(&'static str),
     /// The token file `hf auth login` writes.
@@ -106,6 +109,7 @@ impl fmt::Display for TokenSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TokenSource::Param => f.write_str("`hf_token`"),
+            TokenSource::Secret => f.write_str("the `hf_token` secret"),
             TokenSource::Env(name) => write!(f, "`{name}`"),
             TokenSource::File(path) => write!(f, "'{}'", display_path(path)),
         }
@@ -358,13 +362,15 @@ impl Access {
             TokenScope::Spicepod
         };
         let implicit_allowed = token_scope == TokenScope::Any;
-        let param = |secret: &SecretString| Token {
+        let token_from = |secret: &SecretString, source| Token {
             secret: SecretString::from(secret.expose_secret().trim().to_string()),
-            source: TokenSource::Param,
+            source,
         };
         let token = match token.filter(|token| !token.secret().expose_secret().trim().is_empty()) {
-            Some(ParamToken::Spicepod(secret)) => Some(param(&secret)),
-            Some(ParamToken::SecretStore(secret)) if implicit_allowed => Some(param(&secret)),
+            Some(ParamToken::Spicepod(secret)) => Some(token_from(&secret, TokenSource::Param)),
+            Some(ParamToken::SecretStore(secret)) if implicit_allowed => {
+                Some(token_from(&secret, loaded_source(env, &secret)))
+            }
             None if implicit_allowed => implicit_token(env, hf_home(env).as_deref()).await?,
             Some(ParamToken::SecretStore(_)) | None => None,
         };
@@ -375,6 +381,20 @@ impl Access {
             token,
             token_scope,
         })
+    }
+}
+
+/// Where a token a secret store loaded for `hf_token` came from: `HF_TOKEN` when it holds the
+/// same token, as it does when the environment secret store loaded it, else the secret.
+fn loaded_source(env: &impl Environment, secret: &SecretString) -> TokenSource {
+    let loaded = secret.expose_secret().trim();
+    if env
+        .var(HF_TOKEN)
+        .is_some_and(|value| value.trim() == loaded)
+    {
+        TokenSource::Env(HF_TOKEN)
+    } else {
+        TokenSource::Secret
     }
 }
 
@@ -671,7 +691,7 @@ mod tests {
         let public = resolve_with(&env(&[(HF_TOKEN, "hf_env")]), loaded(), None).await;
         assert_eq!(
             token(&public),
-            Some(("hf_loaded".to_string(), TokenSource::Param))
+            Some(("hf_loaded".to_string(), TokenSource::Secret))
         );
         let env_mirror = resolve_with(
             &env(&[(HF_ENDPOINT, "https://mirror.example")]),
@@ -681,8 +701,27 @@ mod tests {
         .await;
         assert_eq!(
             token(&env_mirror),
-            Some(("hf_loaded".to_string(), TokenSource::Param))
+            Some(("hf_loaded".to_string(), TokenSource::Secret))
         );
+    }
+
+    /// A token a secret store loaded is named after `HF_TOKEN` when that holds the same token,
+    /// as it does when the environment secret store loaded it, so an error points at the
+    /// variable the user set rather than at an `hf_token` they never set.
+    #[tokio::test]
+    async fn a_token_from_a_secret_store_is_named_after_hf_token_when_it_holds_it() {
+        let loaded = || Some(ParamToken::SecretStore(SecretString::from("hf_loaded")));
+        let from_env = resolve_with(&env(&[(HF_TOKEN, " hf_loaded\n")]), loaded(), None).await;
+        assert_eq!(
+            token(&from_env),
+            Some(("hf_loaded".to_string(), TokenSource::Env(HF_TOKEN)))
+        );
+        let other = resolve_with(&env(&[(HF_TOKEN, "hf_other")]), loaded(), None).await;
+        assert_eq!(
+            token(&other),
+            Some(("hf_loaded".to_string(), TokenSource::Secret))
+        );
+        assert_eq!(TokenSource::Secret.to_string(), "the `hf_token` secret");
     }
 
     #[tokio::test]
