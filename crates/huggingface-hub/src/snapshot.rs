@@ -58,6 +58,23 @@ pub struct Requester {
     pub name: String,
     /// The page an error links to.
     pub docs_url: &'static str,
+    /// Whether Spice loads the component again after a download fails for a reason other
+    /// than the Spicepod, as it does a model. An error's advice says that Spice retries, or
+    /// that a restart does.
+    pub retried: bool,
+}
+
+impl Requester {
+    /// `Model 'qwen'`: the requester at the start of a sentence.
+    #[must_use]
+    pub fn capitalized(&self) -> String {
+        let mut kind = self.kind.chars();
+        let first = kind
+            .next()
+            .map(|c| c.to_uppercase().collect::<String>())
+            .unwrap_or_default();
+        format!("{first}{} '{}'", kind.as_str(), self.name)
+    }
 }
 
 impl fmt::Display for Requester {
@@ -155,7 +172,7 @@ impl Snapshot {
                     let reason = crate::error::unreachable_reason(&error);
                     tracing::warn!(
                         "{} could not reach the Hugging Face Hub ({reason}), so it loads revision '{revision}' of '{repo}' from the cache at commit {}. Changes to '{revision}' are not seen until the Hub is reachable.",
-                        capitalized(&requester),
+                        requester.capitalized(),
                         short(&commit)
                     );
                     (commit, files, Source::CacheInOutage { reason })
@@ -296,7 +313,7 @@ impl Snapshot {
             if log {
                 tracing::info!(
                     "{} uses Hugging Face repo '{}' {}, already in the cache.",
-                    capitalized(&self.requester),
+                    self.requester.capitalized(),
                     self.repo,
                     self.at_commit()
                 );
@@ -480,16 +497,6 @@ fn report_progress(
 /// The first seven digits of a commit, as the Hub shows it.
 fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
-}
-
-/// `Model 'qwen'`: the requester at the start of a sentence.
-fn capitalized(requester: &Requester) -> String {
-    let mut kind = requester.kind.chars();
-    let first = kind
-        .next()
-        .map(|c| c.to_uppercase().collect::<String>())
-        .unwrap_or_default();
-    format!("{first}{} '{}'", kind.as_str(), requester.name)
 }
 
 fn files_and_size(count: usize, bytes: u64) -> String {

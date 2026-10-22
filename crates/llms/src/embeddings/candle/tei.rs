@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use cache::{CacheProvider, result::embeddings::CachedEmbeddingResult};
 use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use futures::future::join_all;
+use huggingface_hub::Requester;
 use snafu::ResultExt;
 use tei_backend::{Backend, DType, ModelType, Pool};
 use tei_core::{
@@ -44,6 +45,9 @@ use tokenizers::{Tokenizer, TruncationDirection};
 use super::util::{
     LoadedTokenization, download_hf_artifacts, inputs_from_openai, load_tokenization, pool_from_str,
 };
+use crate::hf::HubParams;
+
+const DOCS_URL: &str = "https://spiceai.org/docs/components/embeddings/huggingface";
 
 #[derive(Debug)]
 pub struct TeiEmbed {
@@ -119,10 +123,13 @@ impl TeiEmbed {
         .await
     }
 
+    /// Downloads the model `model_id` (`org/name`) at `revision` from the Hugging Face Hub
+    /// into the Hugging Face cache, for the embedding model `name`, and loads it.
     pub async fn from_hf(
+        name: &str,
         model_id: &str,
         revision: Option<&str>,
-        hf_token: Option<&str>,
+        hub: HubParams<'_>,
         pooling_overwrite: Option<&str>,
         max_seq_length_overwrite: Option<usize>,
         truncation: Option<TruncationDirection>,
@@ -140,7 +147,21 @@ impl TeiEmbed {
             })
             .transpose()?
             .flatten();
-        let model_root = download_hf_artifacts(model_id, revision, hf_token).await?;
+        let requester = Requester {
+            kind: "embedding model",
+            name: name.to_string(),
+            docs_url: DOCS_URL,
+            // Spice loads an embedding model once.
+            retried: false,
+        };
+        let model_root = async {
+            let snapshot = crate::hf::open_model(requester, model_id, revision, hub).await?;
+            download_hf_artifacts(&snapshot).await
+        }
+        .await
+        .map_err(|source| Error::FailedToDownloadModel {
+            source: Box::new(source),
+        })?;
         Self::from_dir(&model_root, pool, max_seq_length_overwrite, truncation).await
     }
 

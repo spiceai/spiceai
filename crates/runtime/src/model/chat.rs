@@ -434,7 +434,7 @@ async fn huggingface(
     };
 
     let model_type = params.model_type.as_deref();
-    let hub = llms::chat::HubParams {
+    let hub = llms::hf::HubParams {
         token: params.hf_token.as_ref(),
         endpoint: params.hf_endpoint.as_deref(),
     };

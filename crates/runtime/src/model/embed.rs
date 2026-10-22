@@ -412,7 +412,10 @@ async fn huggingface(
     params: &embedding_params::huggingface::HuggingFaceEmbeddingParams,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
-    let hf_token = params.hf_token.as_ref().map(ExposeSecret::expose_secret);
+    let hub = llms::hf::HubParams {
+        token: params.hf_token.as_ref(),
+        endpoint: params.hf_endpoint.as_deref(),
+    };
     let pooling = params.pooling.map(embedding_params::Pooling::as_str);
     let truncation = params.truncate.unwrap_or_default().direction();
     if let Some(id) = model_id {
@@ -424,9 +427,10 @@ async fn huggingface(
         let (repo_id, revision) = spicepod::component::model::split_hf_model_id(&id);
         Ok(Arc::new(
             TeiEmbed::from_hf(
+                name,
                 repo_id,
                 revision,
-                hf_token,
+                hub,
                 pooling,
                 params.max_seq_length,
                 truncation,

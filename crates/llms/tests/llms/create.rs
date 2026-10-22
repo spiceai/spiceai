@@ -134,7 +134,7 @@ pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError
         model_id,
         None,
         None,
-        llms::chat::HubParams {
+        llms::hf::HubParams {
             token: token.as_ref(),
             endpoint: None,
         },
