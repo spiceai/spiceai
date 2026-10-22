@@ -415,17 +415,14 @@ pub(crate) fn routes(
     metrics_tls: bool,
     #[cfg(feature = "mcp")] mcp_config: Option<&McpConfig>,
 ) -> Router {
-    let mut authenticated_router = Router::new()
-        .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
+    // Routes that need a principal with write access. The check is a route layer so it runs
+    // after authentication and before each handler's body extractors.
+    let write_router = Router::new()
         .route("/v1/sql/active", get(v1::queries::list_active))
         .route(
             "/v1/sql/{query_id}/cancel",
             post(v1::queries::cancel_active),
         )
-        .route("/v1/status", get(v1::status::get))
-        .route("/v1/catalogs", get(v1::catalogs::get))
-        .route("/v1/functions", get(v1::functions::list))
-        .route("/v1/datasets", get(v1::datasets::get))
         .route("/v1/datasets/{name}/cdc", post(v1::cdc::post))
         // OTLP/HTTP receivers; same handlers as the gRPC receivers on the Flight port.
         .route(v1::otlp::METRICS_PATH, post(v1::otlp::post_metrics))
@@ -439,6 +436,20 @@ pub(crate) fn routes(
             patch(v1::datasets::acceleration),
         )
         .route(
+            "/v1/datasets/{name}/acceleration/snapshots/current",
+            post(v1::snapshots::set_current_snapshot),
+        )
+        .route("/v1/packages/generate", post(v1::packages::generate))
+        .route("/v1/queries/{query_id}/cancel", post(v1::queries::cancel))
+        .route_layer(middleware::from_fn(v1::require_write_access));
+
+    let mut authenticated_router = Router::new()
+        .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
+        .route("/v1/status", get(v1::status::get))
+        .route("/v1/catalogs", get(v1::catalogs::get))
+        .route("/v1/functions", get(v1::functions::list))
+        .route("/v1/datasets", get(v1::datasets::get))
+        .route(
             "/v1/datasets/{name}/acceleration/snapshots",
             get(v1::snapshots::list_snapshots),
         )
@@ -446,12 +457,8 @@ pub(crate) fn routes(
             "/v1/datasets/{name}/acceleration/snapshots/{snapshot_id}",
             get(v1::snapshots::get_snapshot),
         )
-        .route(
-            "/v1/datasets/{name}/acceleration/snapshots/current",
-            post(v1::snapshots::set_current_snapshot),
-        )
         .route("/v1/spicepods", get(v1::spicepods::get))
-        .route("/v1/packages/generate", post(v1::packages::generate));
+        .merge(write_router);
 
     let iceberg_router = Router::new()
         .route("/v1/config", get(v1::iceberg::get_config))
@@ -548,8 +555,7 @@ pub(crate) fn routes(
         .route(
             "/v1/queries/{query_id}/results/chunks/{chunk_index}",
             get(v1::queries::get_chunk),
-        )
-        .route("/v1/queries/{query_id}/cancel", post(v1::queries::cancel));
+        );
 
     authenticated_router = authenticated_router.merge(queries_router);
 
