@@ -116,6 +116,8 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::search::post,
         v1::chat::post,
         v1::responses::post,
+        v1::messages::post,
+        v1::messages::count_tokens,
         v1::models::get,
         v1::workers::get,
         v1::nsql::get_context,
@@ -517,6 +519,14 @@ pub(crate) fn routes(
                 "/v1/responses",
                 post(v1::responses::post).layer(ModelContextLayer),
             )
+            .route(
+                v1::messages::MESSAGES_PATH,
+                post(v1::messages::post).layer(ModelContextLayer),
+            )
+            .route(
+                v1::messages::COUNT_TOKENS_PATH,
+                post(v1::messages::count_tokens),
+            )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route(
                 "/v1/decisions",
@@ -531,7 +541,12 @@ pub(crate) fn routes(
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
-            .layer(Extension(rt.responses_llms()));
+            .layer(Extension(rt.responses_llms()))
+            .layer(Extension(v1::messages::MessagesModels {
+                messages: rt.messages_llms(),
+                chat: rt.completion_llms(),
+                capabilities: rt.model_capabilities(),
+            }));
     }
 
     // Add async queries API routes - registered unconditionally for discoverability and consistency.
@@ -678,6 +693,9 @@ pub(crate) fn routes(
         .merge(authenticated_router)
         .route_layer(middleware::from_fn(super::mtls::mtls_request_layer))
         .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
+        // The Messages API needs every `/v1/messages` error in its error envelope, including the
+        // shutdown, mTLS, auth, and body-limit rejections above, so this wraps them.
+        .route_layer(middleware::from_fn(v1::messages::encode_layer_errors))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&rt.df),
             track_metrics,
@@ -1166,13 +1184,17 @@ const CORS_ALLOWED_HEADERS: &[&str] = &[
     "mcp-name",
     "mcp-session-id",
     "x-api-key",
+    // The Messages API's own headers, which a browser client of `/v1/messages` sends.
+    "anthropic-version",
+    "anthropic-beta",
+    "anthropic-dangerous-direct-browser-access",
 ];
 
 /// Closed-set `Access-Control-Allow-Headers` when a requested name is
 /// not a valid [`HeaderValue`]. Must stay aligned with
 /// [`CORS_ALLOWED_HEADERS`].
 const CORS_ALLOWED_HEADERS_VALUE: HeaderValue = HeaderValue::from_static(
-    "accept, content-type, authorization, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, x-api-key",
+    "accept, content-type, authorization, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access",
 );
 
 fn is_allowed_cors_request_header(name: &str) -> bool {
