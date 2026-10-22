@@ -7983,7 +7983,7 @@
       "type": "object",
       "properties": {
         "iceberg_metadata_path": {
-          "description": "The Iceberg metadata file to read the table from, as a path relative to the table root in `from` (for example, `/metadata/00003-8f2c.metadata.json`) or as a full URL. When set, the table is read from exactly this file, without a catalog. A version hint file (`/metadata/version-hint.text`) is read on every query instead, and names the metadata file to read.",
+          "description": "The Iceberg metadata file to read the table from, as a path relative to the table root in `from` (for example, `/metadata/00003-8f2c.metadata.json`) or as a full URL. When set, the table is read from exactly this file, without a catalog. A version hint file (`/metadata/version-hint.text`) is read on every query instead: it names the metadata file to read, or a version number from which the newest consecutive `v<N>.metadata.json` is read.",
           "type": "string"
         },
         "metadata_path": {
