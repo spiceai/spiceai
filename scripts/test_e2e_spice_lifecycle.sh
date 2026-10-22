@@ -499,6 +499,7 @@ result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=3
 out="${result#*|}"
 assert_eq "fails when the dataset never becomes Ready" "${result%%|*}" "1"
 assert_contains "names the dataset and its status" "$out" "taxi_trips=Initializing"
+assert_contains "blames the dataset, not the runtime" "$out" "Runtime ready, but taxi_trips=Initializing did not report Ready"
 assert_contains "dumps the last /v1/datasets response" "$out" '"status":"Initializing"'
 
 # A sibling that is Ready must not stand in for the dataset being waited on.

@@ -113,7 +113,7 @@ diagnose() {
 
   if [ -n "$DATASETS" ]; then
     echo "--- datasets not Ready ---"
-    if [ -n "$datasets_checked" ]; then
+    if [ -n "$pending" ]; then
       printf '%s\n' "$pending"
       echo "--- last response from ${DATASETS_URL} ---"
       printf '%s\n' "${last_datasets:-(empty)}"
@@ -175,7 +175,6 @@ start=$SECONDS
 last_body=""
 last_datasets=""
 pending=""
-datasets_checked=""
 next_progress=$PROGRESS_EVERY
 
 while :; do
@@ -204,7 +203,6 @@ while :; do
     if [ -n "$DATASETS" ]; then
       last_datasets="$(curl -sS --max-time 5 "$DATASETS_URL" 2>/dev/null || true)"
       pending="$(pending_datasets "$last_datasets")"
-      datasets_checked=1
     fi
     if [ -z "$pending" ]; then
       echo "Runtime ready after $((SECONDS - start))s${datasets_done}."
@@ -214,7 +212,11 @@ while :; do
 
   elapsed=$((SECONDS - start))
   if [ "$elapsed" -ge "$TIMEOUT" ]; then
-    echo "Runtime did not report ready within ${TIMEOUT}s."
+    if [ "$last_body" = "ready" ]; then
+      echo "Runtime ready, but ${pending} did not report Ready within ${TIMEOUT}s."
+    else
+      echo "Runtime did not report ready within ${TIMEOUT}s."
+    fi
     diagnose "$last_body"
     exit 1
   fi
@@ -222,7 +224,7 @@ while :; do
   if [ "$elapsed" -ge "$next_progress" ]; then
     # Echo what it actually said, not just that it is not "ready" — a runtime
     # answering "initializing" is a very different problem from a dead socket.
-    if [ "$last_body" = "ready" ] && [ -n "$pending" ]; then
+    if [ "$last_body" = "ready" ]; then
       echo "  ${elapsed}s — runtime ready, datasets not yet: ${pending}"
     else
       echo "  ${elapsed}s — not ready yet (last response: '${last_body}')"
