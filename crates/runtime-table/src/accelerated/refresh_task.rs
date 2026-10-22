@@ -5261,11 +5261,14 @@ mod tests {
             Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), sent));
         let update = StreamingDataUpdate::new(update_stream, UpdateType::Overwrite);
 
+        let timeout = super::super::source_stall::SOURCE_STALL_TIMEOUT;
         let started = tokio::time::Instant::now();
-        let Err(error) = task
-            .write_streaming_data_update(None, update, None, None)
-            .await
-        else {
+        let Err(error) = tokio::time::timeout(
+            timeout * 2,
+            task.write_streaming_data_update(None, update, None, None),
+        )
+        .await
+        .expect("a refresh whose source went silent must not wait for ever") else {
             panic!("a source silent mid-refresh must fail the refresh");
         };
         assert!(
@@ -5277,10 +5280,7 @@ mod tests {
             refresh_error_reason(counted),
             metrics::REFRESH_ERROR_REASON_SOURCE_STALLED
         );
-        assert!(
-            started.elapsed() >= super::super::source_stall::SOURCE_STALL_TIMEOUT,
-            "not before the stall timeout"
-        );
+        assert_eq!(started.elapsed(), timeout, "fails at the stall timeout");
     }
 
     #[tokio::test]

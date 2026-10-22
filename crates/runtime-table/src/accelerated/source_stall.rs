@@ -39,8 +39,8 @@ use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_
 use futures::{StreamExt, stream};
 
 /// How long a refresh waits for the next batch once its source has started
-/// sending. Far above any gap a streaming source leaves between batches.
-pub(crate) const SOURCE_STALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// sending. A source that streams leaves gaps of seconds between batches.
+pub(crate) const SOURCE_STALL_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// The error a stalled refresh fails with. Its text is what
 /// [`is_source_stalled_message`] recognises in an error chain.
@@ -140,17 +140,44 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_source_silent_after_its_first_batch_fails_retriably() {
-        let mut guarded = with_stall_timeout(silent_after(2), "big", Duration::from_secs(600));
+        let timeout = Duration::from_secs(600);
+        let mut guarded = with_stall_timeout(silent_after(2), "big", timeout);
         assert!(guarded.next().await.expect("first").is_ok());
         assert!(guarded.next().await.expect("second").is_ok());
-        let error = guarded
-            .next()
+        let silent_from = tokio::time::Instant::now();
+        let error = tokio::time::timeout(timeout * 2, guarded.next())
             .await
+            .expect("a stalled source must not be waited on for ever")
             .expect("a stalled source yields an error")
             .expect_err("not a batch");
+        assert_eq!(silent_from.elapsed(), timeout, "fails at the timeout");
         assert!(is_retriable_error(&error), "retried, not permanent: {error}");
         assert!(is_source_stalled_message(&error.to_string()), "{error}");
+        assert!(
+            error.to_string().contains("The source of dataset 'big' "),
+            "{error}"
+        );
         assert!(guarded.next().await.is_none(), "the stream ends after the error");
+    }
+
+    /// The timeout bounds each gap between batches, not the whole refresh.
+    #[tokio::test(start_paused = true)]
+    async fn a_source_slower_than_the_timeout_in_total_is_passed_through() {
+        let timeout = Duration::from_secs(600);
+        let slow = stream::unfold(0, |sent| async move {
+            if sent == 3 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_secs(500)).await;
+            Some((Ok(batch()), sent + 1))
+        });
+        let source: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(batch().schema(), slow));
+        let started = tokio::time::Instant::now();
+        let rows: Vec<_> = with_stall_timeout(source, "big", timeout).collect().await;
+        assert_eq!(started.elapsed(), Duration::from_secs(1500));
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(Result::is_ok));
     }
 
     #[tokio::test(start_paused = true)]
