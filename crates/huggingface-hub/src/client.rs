@@ -225,7 +225,9 @@ fn revision_separator(kind: RepoType) -> char {
 fn token_subject(token: &TokenSource) -> String {
     match token {
         TokenSource::Param => token.to_string(),
-        TokenSource::Env(_) | TokenSource::File(_) => format!("The token from {token}"),
+        TokenSource::Secret | TokenSource::Env(_) | TokenSource::File(_) => {
+            format!("The token from {token}")
+        }
     }
 }
 
@@ -233,7 +235,9 @@ fn token_subject(token: &TokenSource) -> String {
 fn token_object(token: &TokenSource) -> String {
     match token {
         TokenSource::Param => token.to_string(),
-        TokenSource::Env(_) | TokenSource::File(_) => format!("the token from {token}"),
+        TokenSource::Secret | TokenSource::Env(_) | TokenSource::File(_) => {
+            format!("the token from {token}")
+        }
     }
 }
 
@@ -277,6 +281,9 @@ fn token_rejected(
     match token {
         Some(token @ TokenSource::Param) => format!(
             "The Hugging Face Hub rejected {token} for {kind} '{repo}' (HTTP {status}). Check that the token is valid and grants read access to the {kind}. See: {docs}"
+        ),
+        Some(token @ TokenSource::Secret) => format!(
+            "The Hugging Face Hub rejected the token from {token} for {kind} '{repo}' (HTTP {status}). Update the secret to a token that is valid and grants read access to the {kind}. See: {docs}"
         ),
         Some(token @ TokenSource::Env(_)) => format!(
             "The Hugging Face Hub rejected the token from {token} for {kind} '{repo}' (HTTP {status}). Check that the token is valid and grants read access to the {kind}, or set `hf_token`. See: {docs}"
