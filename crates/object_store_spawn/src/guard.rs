@@ -17,8 +17,7 @@ limitations under the License.
 //! Destination checks for [`SpawnedReqwestConnector`](crate::SpawnedReqwestConnector).
 //!
 //! `object_store` builds its `reqwest` client privately and follows up to ten redirects to any
-//! host. A guarded connector builds the client itself instead, from the same
-//! [`ClientOptions`], and adds two checks:
+//! host. A guarded connector builds a minimal client itself and adds two checks:
 //!
 //! - a redirect policy that refuses any hop whose URL the guard blocks, and
 //! - a DNS resolver that refuses a host when any address it resolves to is blocked, so a
@@ -27,26 +26,24 @@ limitations under the License.
 //! Hosts given as IP literals are not resolved, so callers check the first URL themselves;
 //! redirect targets are checked by the policy.
 //!
-//! An HTTP proxy's resolved addresses are installed under a generated name, all of them, so the
-//! proxy hop can try each one. A direct connection still uses the proxy's real hostname and is
-//! checked — a `NO_PROXY` exclusion, or a destination whose scheme does not use that proxy. An
-//! `https://` proxy keeps its hostname because its certificate is checked against that name, and
-//! the resolver checks the name like any other host.
+//! The client applies only `allow_http`, `timeout`, `connect_timeout`, `http1_only`,
+//! `user_agent`, and default headers. Building fails if any other client option differs from
+//! [`ClientOptions::new`], so an option is never silently dropped. Two exceptions pass unapplied:
+//! root certificates, which cannot be read from [`ClientOptions`], and the default
+//! `randomize_addresses`, since the guarded resolver returns addresses in system order.
+//!
+//! Proxies come from `reqwest`'s own `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` lookup.
+//! A proxy hostname goes through the guarded resolver like any other host, so a proxy on a
+//! blocked address is refused with the guard's reason. The guard cannot see the address a proxy
+//! resolves the destination to; the caller's first-URL check and the redirect policy still apply.
 
-use std::{
-    error::Error as StdError,
-    fmt,
-    net::{IpAddr, SocketAddr, ToSocketAddrs},
-    sync::Arc,
-    time::Duration,
-};
+use std::{error::Error as StdError, fmt, net::IpAddr, net::SocketAddr, sync::Arc};
 
 use object_store::{
     ClientConfigKey, ClientOptions,
     client::{HttpError, HttpErrorKind},
 };
 use reqwest::{
-    NoProxy, Proxy,
     dns::{Addrs, Name, Resolve, Resolving},
     redirect,
 };
@@ -56,14 +53,21 @@ use url::Url;
 /// Redirects followed before the request fails; the same limit `object_store`'s client uses.
 const MAX_REDIRECTS: usize = 10;
 
-/// Which destinations a configured proxy applies to. Matches `reqwest`'s `Proxy::http`,
-/// `Proxy::https`, and `Proxy::all`.
-#[derive(Clone, Copy)]
-enum ProxyScope {
-    Http,
-    Https,
-    All,
-}
+/// Client options [`build_client`] does not apply; each must keep its default.
+const UNAPPLIED: &[ClientConfigKey] = &[
+    ClientConfigKey::AllowInvalidCertificates,
+    ClientConfigKey::Http2KeepAliveInterval,
+    ClientConfigKey::Http2KeepAliveTimeout,
+    ClientConfigKey::Http2KeepAliveWhileIdle,
+    ClientConfigKey::Http2MaxFrameSize,
+    ClientConfigKey::Http2Only,
+    ClientConfigKey::PoolIdleTimeout,
+    ClientConfigKey::PoolMaxIdlePerHost,
+    ClientConfigKey::ProxyUrl,
+    ClientConfigKey::ProxyCaCertificate,
+    ClientConfigKey::ProxyExcludes,
+    ClientConfigKey::RandomizeAddresses,
+];
 
 type AddressCheck = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
 type UrlCheck = Arc<dyn Fn(&Url) -> bool + Send + Sync>;
@@ -132,65 +136,26 @@ pub(crate) fn refusal(error: &HttpError) -> Option<HttpError> {
     None
 }
 
-/// Builds the `reqwest` client `object_store` would build from `options`, plus the checks of
-/// `guard`.
-///
-/// Custom root certificates (`ClientOptions::with_root_certificate`) are not readable from
-/// `ClientOptions` and are not applied, and addresses are not shuffled
-/// (`ClientConfigKey::RandomizeAddresses`); callers that rely on either must not use a guard.
+/// Builds a `reqwest` client from `options` with the checks of `guard`.
 pub(crate) fn build_client(
     options: &ClientOptions,
     guard: &DestinationGuard,
 ) -> object_store::Result<reqwest::Client> {
+    let defaults = ClientOptions::new();
     let value = |key: ClientConfigKey| options.get_config_value(&key);
-    let mut builder = reqwest::Client::builder();
-
-    if let Some(user_agent) = value(ClientConfigKey::UserAgent) {
-        builder = builder.user_agent(user_agent);
-    }
-    if let Some(headers) = options.get_default_headers() {
-        builder = builder.default_headers(headers.clone());
-    }
-
-    builder = install_proxies(builder, options)?;
-
-    if let Some(timeout) = duration(value(ClientConfigKey::Timeout))? {
-        builder = builder.timeout(timeout);
-    }
-    if let Some(timeout) = duration(value(ClientConfigKey::ConnectTimeout))? {
-        builder = builder.connect_timeout(timeout);
-    }
-    if let Some(timeout) = duration(value(ClientConfigKey::PoolIdleTimeout))? {
-        builder = builder.pool_idle_timeout(timeout);
-    }
-    if let Some(max) = number(value(ClientConfigKey::PoolMaxIdlePerHost))? {
-        builder = builder.pool_max_idle_per_host(max);
-    }
-    if let Some(interval) = duration(value(ClientConfigKey::Http2KeepAliveInterval))? {
-        builder = builder.http2_keep_alive_interval(interval);
-    }
-    if let Some(timeout) = duration(value(ClientConfigKey::Http2KeepAliveTimeout))? {
-        builder = builder.http2_keep_alive_timeout(timeout);
-    }
-    if flag(value(ClientConfigKey::Http2KeepAliveWhileIdle))? {
-        builder = builder.http2_keep_alive_while_idle(true);
-    }
-    if let Some(size) = number(value(ClientConfigKey::Http2MaxFrameSize))? {
-        let size = u32::try_from(size).map_err(generic)?;
-        builder = builder.http2_max_frame_size(Some(size));
-    }
-    if flag(value(ClientConfigKey::Http1Only))? {
-        builder = builder.http1_only();
-    }
-    if flag(value(ClientConfigKey::Http2Only))? {
-        builder = builder.http2_prior_knowledge();
-    }
-    if flag(value(ClientConfigKey::AllowInvalidCertificates))? {
-        builder = builder.danger_accept_invalid_certs(true);
+    if let Some(key) = UNAPPLIED
+        .iter()
+        .find(|key| options.get_config_value(key) != defaults.get_config_value(key))
+    {
+        return Err(generic(format!(
+            "the guarded HTTP client does not apply `{}`; it only applies `allow_http`, \
+             `timeout`, `connect_timeout`, `http1_only`, `user_agent`, and default headers",
+            key.as_ref()
+        )));
     }
 
     let redirect_guard = guard.clone();
-    builder
+    let mut builder = reqwest::Client::builder()
         // Compression changes `Content-Length`, which `object_store` reads as the object size.
         .no_gzip()
         .no_brotli()
@@ -209,9 +174,24 @@ pub(crate) fn build_client(
         .dns_resolver(Arc::new(GuardedResolver {
             guard: guard.clone(),
         }))
-        .https_only(!flag(value(ClientConfigKey::AllowHttp))?)
-        .build()
-        .map_err(generic)
+        .https_only(!flag(value(ClientConfigKey::AllowHttp))?);
+
+    if let Some(user_agent) = value(ClientConfigKey::UserAgent) {
+        builder = builder.user_agent(user_agent);
+    }
+    if let Some(headers) = options.get_default_headers() {
+        builder = builder.default_headers(headers.clone());
+    }
+    if let Some(timeout) = value(ClientConfigKey::Timeout) {
+        builder = builder.timeout(humantime::parse_duration(&timeout).map_err(generic)?);
+    }
+    if let Some(timeout) = value(ClientConfigKey::ConnectTimeout) {
+        builder = builder.connect_timeout(humantime::parse_duration(&timeout).map_err(generic)?);
+    }
+    if flag(value(ClientConfigKey::Http1Only))? {
+        builder = builder.http1_only();
+    }
+    builder.build().map_err(generic)
 }
 
 /// Resolves with the system resolver and refuses a host if any of its addresses is blocked,
@@ -238,200 +218,11 @@ impl Resolve for GuardedResolver {
     }
 }
 
-/// Installs the proxies `reqwest` would use, with each HTTP proxy pinned to a resolved address.
-///
-/// An explicit `proxy_url` replaces environment proxies, because handing `reqwest` any proxy
-/// turns off its own environment lookup. With no explicit URL, the same variables and precedence
-/// as `hyper-util`'s environment matcher are read here: `ALL_PROXY` fills in for a missing
-/// `HTTP_PROXY` or `HTTPS_PROXY`, and `REQUEST_METHOD` suppresses them the way that matcher does
-/// for CGI.
-fn install_proxies(
-    mut builder: reqwest::ClientBuilder,
-    options: &ClientOptions,
-) -> object_store::Result<reqwest::ClientBuilder> {
-    let value = |key: ClientConfigKey| options.get_config_value(&key);
-    if let Some(proxy_url) = value(ClientConfigKey::ProxyUrl) {
-        if let Some(certificate) = value(ClientConfigKey::ProxyCaCertificate) {
-            let certificate =
-                reqwest::Certificate::from_pem(certificate.as_bytes()).map_err(generic)?;
-            builder = builder.add_root_certificate(certificate);
-        }
-        let url = parse_proxy_url(&proxy_url).ok_or_else(|| invalid("proxy_url", &proxy_url))?;
-        return attach_scoped_proxy(
-            builder,
-            ProxyScope::All,
-            &url,
-            value(ClientConfigKey::ProxyExcludes).as_deref(),
-        );
-    }
-
-    if std::env::var_os("REQUEST_METHOD").is_some() {
-        return Ok(builder);
-    }
-
-    let all = first_env(&["ALL_PROXY", "all_proxy"]);
-    let http = first_env(&["HTTP_PROXY", "http_proxy"]);
-    let https = first_env(&["HTTPS_PROXY", "https_proxy"]);
-    let no_proxy = first_env(&["NO_PROXY", "no_proxy"]);
-    let excludes = nonempty(no_proxy.trim());
-
-    if let Some(raw) = nonempty(http.trim()).or(nonempty(all.trim()))
-        && let Some(url) = http_or_https_proxy(raw)
-    {
-        builder = attach_scoped_proxy(builder, ProxyScope::Http, &url, excludes)?;
-    }
-    if let Some(raw) = nonempty(https.trim()).or(nonempty(all.trim()))
-        && let Some(url) = http_or_https_proxy(raw)
-    {
-        builder = attach_scoped_proxy(builder, ProxyScope::Https, &url, excludes)?;
-    }
-    Ok(builder)
-}
-
-/// This client is built without the `socks` feature. Another scheme is skipped: installing any
-/// proxy turns off `reqwest`'s own environment lookup, so an unrepresentable scheme cannot be
-/// left for that lookup to handle once an HTTP proxy has been installed.
-fn http_or_https_proxy(raw: &str) -> Option<Url> {
-    let url = parse_proxy_url(raw)?;
-    matches!(url.scheme(), "http" | "https").then_some(url)
-}
-
-fn attach_scoped_proxy(
-    mut builder: reqwest::ClientBuilder,
-    scope: ProxyScope,
-    url: &Url,
-    excludes: Option<&str>,
-) -> object_store::Result<reqwest::ClientBuilder> {
-    let pinned = rewrite_http_proxy(url);
-    if !pinned.addresses.is_empty() {
-        let host = pinned
-            .url
-            .host_str()
-            .ok_or_else(|| invalid("proxy_url", pinned.url.as_str()))?;
-        builder = builder.resolve_to_addrs(host, &pinned.addresses);
-    }
-    let mut proxy = match scope {
-        ProxyScope::Http => Proxy::http(pinned.url.as_str()),
-        ProxyScope::Https => Proxy::https(pinned.url.as_str()),
-        ProxyScope::All => Proxy::all(pinned.url.as_str()),
-    }
-    .map_err(generic)?;
-    if let Some(excludes) = excludes {
-        proxy = proxy.no_proxy(NoProxy::from_string(excludes));
-    }
-    Ok(builder.proxy(proxy))
-}
-
-struct RewrittenProxy {
-    url: Url,
-    addresses: Vec<SocketAddr>,
-}
-
-/// Points an `http://` proxy at a generated name that resolves to every address of the
-/// configured host.
-///
-/// The generated name is what the proxy hop connects to, so those addresses are not an exemption
-/// for the real hostname. A direct connection to that hostname still goes through the guarded
-/// resolver. Resolution happens once, while the client is built. `connect` is synchronous, so the
-/// lookup blocks the caller for that one query. An `https://` proxy is left unchanged so
-/// certificate verification still sees its hostname.
-fn rewrite_http_proxy(url: &Url) -> RewrittenProxy {
-    let unchanged = || RewrittenProxy {
-        url: url.clone(),
-        addresses: Vec::new(),
-    };
-    if url.scheme() != "http" || matches!(url.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)))
-    {
-        return unchanged();
-    }
-    let Some(host) = url.host_str() else {
-        return unchanged();
-    };
-    let port = url.port_or_known_default().unwrap_or(80);
-    let Ok(resolved) = (host, port).to_socket_addrs() else {
-        return unchanged();
-    };
-    let addresses: Vec<SocketAddr> = resolved.collect();
-    if addresses.is_empty() {
-        return unchanged();
-    }
-    let mut rewritten = url.clone();
-    let name = format!("spice-pinned-proxy-{}.invalid", random_hex());
-    if rewritten.set_host(Some(&name)).is_err() || rewritten.set_port(Some(port)).is_err() {
-        return unchanged();
-    }
-    RewrittenProxy {
-        url: rewritten,
-        addresses,
-    }
-}
-
-fn random_hex() -> String {
-    use std::fmt::Write;
-
-    let mut bytes = [0_u8; 16];
-    let filled = std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut bytes))
-        .is_ok();
-    if !filled {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        bytes.copy_from_slice(&nanos.to_le_bytes());
-    }
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut hex, byte| {
-            let _ = std::write!(hex, "{byte:02x}");
-            hex
-        })
-}
-
-fn parse_proxy_url(proxy: &str) -> Option<Url> {
-    let proxy = proxy.trim();
-    if proxy.is_empty() {
-        return None;
-    }
-    Url::parse(proxy)
-        .or_else(|_| Url::parse(&format!("http://{proxy}")))
-        .ok()
-}
-
-fn first_env(names: &[&str]) -> String {
-    names
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .unwrap_or_default()
-}
-
-fn nonempty(value: &str) -> Option<&str> {
-    (!value.is_empty()).then_some(value)
-}
-
-fn generic(source: impl StdError + Send + Sync + 'static) -> object_store::Error {
+fn generic(source: impl Into<Box<dyn StdError + Send + Sync>>) -> object_store::Error {
     object_store::Error::Generic {
         store: "HTTP",
-        source: Box::new(source),
+        source: source.into(),
     }
-}
-
-fn invalid(key: &str, value: &str) -> object_store::Error {
-    object_store::Error::Generic {
-        store: "HTTP",
-        source: format!("failed to parse \"{value}\" for {key}").into(),
-    }
-}
-
-fn duration(value: Option<String>) -> object_store::Result<Option<Duration>> {
-    value
-        .map(|v| humantime::parse_duration(&v).map_err(|_| invalid("a duration", &v)))
-        .transpose()
-}
-
-fn number(value: Option<String>) -> object_store::Result<Option<usize>> {
-    value
-        .map(|v| v.parse::<usize>().map_err(|_| invalid("a number", &v)))
-        .transpose()
 }
 
 /// Parses a boolean the way `object_store` does.
@@ -442,6 +233,6 @@ fn flag(value: Option<String>) -> object_store::Result<bool> {
     match value.to_ascii_lowercase().as_str() {
         "1" | "true" | "on" | "yes" | "y" => Ok(true),
         "0" | "false" | "off" | "no" | "n" => Ok(false),
-        _ => Err(invalid("a boolean", &value)),
+        _ => Err(generic(format!("failed to parse \"{value}\" as a boolean"))),
     }
 }

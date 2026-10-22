@@ -15,8 +15,8 @@ bytes.workspace = true
 http-body = "1.0.1"
 humantime.workspace = true
 object_store.workspace = true
-# The `reqwest` major `object_store` builds its client with; the workspace `reqwest` is newer.
-reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls-native-roots"] }
+# `object_store`'s `HttpClient` accepts a `reqwest` 0.12 client; the workspace `reqwest` is 0.13.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 snafu.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "sync"] }
 url.workspace = true

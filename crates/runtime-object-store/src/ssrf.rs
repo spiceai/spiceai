@@ -135,13 +135,18 @@ pub fn url_table_target(url: &Url) -> Option<Url> {
 
 /// What a URL table's HTTP store refuses: any internal resolved address, and any redirect to
 /// an internal IP literal or a well-known internal name.
+///
+/// A proxy from `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` is resolved by the same guard, so a proxy
+/// on a private address is refused unless `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true` is set. The
+/// guard does not see the address a proxy resolves the URL to; the URL's own pre-flight check
+/// and the redirect check still apply.
 #[must_use]
 pub fn url_table_destination_guard() -> DestinationGuard {
     DestinationGuard::new(
         is_internal_ip,
         redirect_target_is_internal,
         format!(
-            "URL tables cannot read from private, loopback, or link-local addresses. If this runtime intentionally queries an internal HTTP endpoint, set {ALLOW_PRIVATE_HOSTS_ENV}=true"
+            "URL tables cannot read from private, loopback, or link-local addresses, including a proxy host that resolves to one. If this runtime intentionally queries an internal HTTP endpoint or uses a private proxy, set {ALLOW_PRIVATE_HOSTS_ENV}=true"
         ),
     )
 }

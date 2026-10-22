@@ -1165,7 +1165,7 @@ mod tests {
         assert!(
             error.contains("Refused to connect to http://127.0.0.1:")
                 && error.contains(
-                    "URL tables cannot read from private, loopback, or link-local addresses. If this runtime intentionally queries an internal HTTP endpoint, set SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true"
+                    "URL tables cannot read from private, loopback, or link-local addresses, including a proxy host that resolves to one. If this runtime intentionally queries an internal HTTP endpoint or uses a private proxy, set SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS=true"
                 ),
             "{error}"
         );
