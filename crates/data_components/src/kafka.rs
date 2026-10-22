@@ -61,6 +61,13 @@ const TOMBSTONE_SCAN_WINDOW: i64 = 100;
 // broker; short enough to stay within the peek timeout budget.
 const PEEK_TRANSIENT_POLL_BACKOFF: Duration = Duration::from_millis(100);
 
+// How long `next_json` keeps polling through transient consumption errors
+// before it returns one. librdkafka reports a failed connection attempt as a
+// consumption error and then tries the next resolved address or reconnects on
+// its own, so the first such error says nothing about whether a message will
+// arrive. Kept equal to the Debezium connector's schema inference timeout.
+const NEXT_MESSAGE_TRANSIENT_BUDGET: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create Kafka consumer: {source}"))]
@@ -539,11 +546,29 @@ impl KafkaConsumer {
     }
 
     /// Receive a JSON message from the Kafka topic.
+    ///
+    /// Transient consumption errors (a refused connection, all brokers
+    /// briefly down) are polled through for up to
+    /// [`NEXT_MESSAGE_TRANSIENT_BUDGET`]; after that the last one is returned.
     pub async fn next_json<K: DeserializeOwned, V: DeserializeOwned>(
         &self,
     ) -> Result<Option<KafkaMessage<'_, K, V>>> {
+        let deadline = Instant::now() + NEXT_MESSAGE_TRANSIENT_BUDGET;
         let mut stream = Box::pin(self.stream_json::<K, V>());
-        stream.next().await.transpose()
+        loop {
+            match stream.next().await {
+                Some(Err(Error::UnableToReceiveMessage { source }))
+                    if is_transient_kafka_consumption_error(&source)
+                        && Instant::now() < deadline =>
+                {
+                    tracing::debug!(
+                        "Transient Kafka error while waiting for a message, polling again: {source}"
+                    );
+                    tokio::time::sleep(PEEK_TRANSIENT_POLL_BACKOFF).await;
+                }
+                next => return next.transpose(),
+            }
+        }
     }
 
     /// Stream JSON messages from the Kafka topic.
@@ -2038,6 +2063,79 @@ mod tests {
         assert!(
             res.is_err(),
             "spurious notify without is_caught_up must not produce a ready envelope"
+        );
+    }
+
+    /// A broker that refuses the first connection attempts must not fail the
+    /// first read: librdkafka reports each refusal as a consumption error and
+    /// then retries, as it does when `localhost` resolves to `::1` first and the
+    /// broker listens on IPv4 only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_json_waits_through_a_broker_that_is_down_at_startup() {
+        use rdkafka::mocking::MockCluster;
+        use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+
+        const BROKER_DOWN_FOR: Duration = Duration::from_secs(3);
+
+        let cluster = MockCluster::new(1).expect("mock cluster");
+        cluster.create_topic("t", 1, 1).expect("create topic");
+        let producer: BaseProducer = ClientConfig::new()
+            .set("bootstrap.servers", cluster.bootstrap_servers())
+            .create()
+            .expect("producer");
+        producer
+            .send(BaseRecord::<(), str>::to("t").payload(r#"{"id": 1}"#))
+            .map_err(|(e, _)| e)
+            .expect("enqueue message");
+        producer
+            .flush(Duration::from_secs(10))
+            .expect("flush message");
+
+        cluster.broker_down(-1).expect("take broker down");
+        let consumer = KafkaConsumer::create_for_dataset(
+            "t",
+            None,
+            &KafkaConfig {
+                brokers: cluster.bootstrap_servers(),
+                security_protocol: "plaintext".to_string(),
+                sasl_mechanism: String::new(),
+                sasl_username: None,
+                sasl_password: None,
+                ssl_ca_location: None,
+                ssl_certificate_location: None,
+                ssl_key_location: None,
+                ssl_key_password: None,
+                enable_ssl_certificate_verification: false,
+                ssl_endpoint_identification_algorithm: SslIdentification::None,
+                consumer_group_id: None,
+                metrics_store: None,
+            },
+        )
+        .expect("consumer");
+        consumer.subscribe("t").expect("subscribe");
+
+        // `MockCluster` is neither `Send` nor `Sync`, so the broker comes back
+        // from a future polled on this task rather than from another thread.
+        let started = Instant::now();
+        let (message, ()) = tokio::join!(
+            tokio::time::timeout(
+                NEXT_MESSAGE_TRANSIENT_BUDGET,
+                consumer.next_json::<Value, Value>(),
+            ),
+            async {
+                tokio::time::sleep(BROKER_DOWN_FOR).await;
+                cluster.broker_up(-1).expect("bring broker up");
+            },
+        );
+        let message = message
+            .expect("a message within the transient budget")
+            .expect("no error once the broker is back")
+            .expect("a message");
+
+        assert_eq!(message.value(), &json!({"id": 1}));
+        assert!(
+            started.elapsed() >= BROKER_DOWN_FOR,
+            "the message arrived before the broker came back up, so the test never exercised a transient error"
         );
     }
 }
