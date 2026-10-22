@@ -20,10 +20,12 @@ use types::{MessageCreateParams, validate_model_variant};
 
 mod chat;
 mod list_models;
+mod messages;
 mod types;
 mod types_stream;
 
 pub use list_models::AnthropicModelLister;
+pub use messages::AnthropicMessages;
 pub use types::AnthropicModelVariant;
 
 use crate::config::{GenericAuthMechanism, HostedModelConfig};
@@ -111,6 +113,38 @@ impl Anthropic {
 
 const ANTHROPIC_DOCS: &str = "https://spiceai.org/docs/components/models/anthropic";
 
+/// The message for a `not_found_error` that Anthropic answered a request to `action` with: see
+/// [`explain_model_not_found`].
+fn model_not_found_message(
+    action: &str,
+    model: &str,
+    model_from_default: bool,
+    endpoint_from_default: bool,
+) -> String {
+    // Reads as a clause of the sentences below, so it carries its own leading comma.
+    let default_note = if model_from_default {
+        ", and that id is the built-in default used when no model id is configured"
+    } else {
+        ""
+    };
+
+    if endpoint_from_default {
+        format!(
+            "Failed to {action} with Anthropic model '{model}': Anthropic does not \
+             serve that model id{default_note}. Anthropic retires model ids over time — set \
+             `from: anthropic:<model_id>` to a model your Anthropic API key can reach. \
+             See: {ANTHROPIC_DOCS}"
+        )
+    } else {
+        format!(
+            "Failed to {action} with Anthropic model '{model}': the API at the \
+             configured `endpoint` reports no such model{default_note}. Check both \
+             `from: anthropic:<model_id>` and `endpoint` — an endpoint that does not route \
+             `/messages` answers with this same error. See: {ANTHROPIC_DOCS}"
+        )
+    }
+}
+
 /// Replaces the message of a `not_found_error` with one that names the model and the parameter to
 /// change. Anthropic sends `model: <id>` and nothing else, so the raw error says neither what went
 /// wrong nor what to do — and when `model_from_default` is set it names a model the user has never
@@ -138,28 +172,12 @@ fn explain_model_not_found(
         other => return other,
     };
 
-    // Reads as a clause of the sentences below, so it carries its own leading comma.
-    let default_note = if model_from_default {
-        ", and that id is the built-in default used when no model id is configured"
-    } else {
-        ""
-    };
-
-    api_error.message = if endpoint_from_default {
-        format!(
-            "Failed to run a chat completion with Anthropic model '{model}': Anthropic does not \
-             serve that model id{default_note}. Anthropic retires model ids over time — set \
-             `from: anthropic:<model_id>` to a model your Anthropic API key can reach. \
-             See: {ANTHROPIC_DOCS}"
-        )
-    } else {
-        format!(
-            "Failed to run a chat completion with Anthropic model '{model}': the API at the \
-             configured `endpoint` reports no such model{default_note}. Check both \
-             `from: anthropic:<model_id>` and `endpoint` — an endpoint that does not route \
-             `/messages` answers with this same error. See: {ANTHROPIC_DOCS}"
-        )
-    };
+    api_error.message = model_not_found_message(
+        "run a chat completion",
+        model,
+        model_from_default,
+        endpoint_from_default,
+    );
 
     OpenAIError::ApiError(api_error)
 }
