@@ -25,6 +25,13 @@ INTERVAL="${SPICE_READY_INTERVAL:-2}"
 # indistinguishable from a hung runner in the Actions UI.
 PROGRESS_EVERY="${SPICE_READY_PROGRESS_EVERY:-15}"
 LOG_FILE="${SPICE_READY_LOG:-spice.log}"
+# Datasets that must also report `Ready`, space-separated. Needed when a step
+# adds a dataset to an already-running runtime (`spice add`): /v1/ready said
+# "ready" before the edit, and the poll can land in the window after the
+# Spicepod watcher fires but before the new dataset starts initializing, so it
+# answers "ready" for a runtime that has not registered the table yet.
+DATASETS="${SPICE_READY_DATASETS:-}"
+DATASETS_URL="${SPICE_READY_DATASETS_URL:-${URL%%/v1/*}/v1/datasets?status=true}"
 
 port_from_url() {
   # http://localhost:8090/v1/ready -> 8090; defaults to 80 when absent.
@@ -104,6 +111,17 @@ diagnose() {
     echo "(no lsof/fuser on this runner)"
   fi
 
+  if [ -n "$DATASETS" ]; then
+    echo "--- datasets not Ready ---"
+    if [ -n "$datasets_checked" ]; then
+      printf '%s\n' "$pending"
+      echo "--- last response from ${DATASETS_URL} ---"
+      printf '%s\n' "${last_datasets:-(empty)}"
+    else
+      echo "(not checked: the runtime never reported ready)"
+    fi
+  fi
+
   echo "--- ${LOG_FILE} ---"
   if [ -f "$LOG_FILE" ]; then
     cat "$LOG_FILE"
@@ -125,10 +143,39 @@ diagnose() {
   echo "::endgroup::"
 }
 
-echo "Waiting up to ${TIMEOUT}s for ${URL} to report ready…"
+# Prints "<name>=<status>" for each of $DATASETS that $1, a
+# /v1/datasets?status=true body, does not report as `Ready`, and nothing when
+# all of them are. A body jq cannot read as a list marks every dataset
+# `unreadable`, so a broken or empty response can never count as ready.
+pending_datasets() {
+  local body="$1" name status out=""
+  for name in $DATASETS; do
+    status="$(printf '%s' "$body" | jq -er --arg n "$name" \
+      'map(select(.name == $n))[0].status // "absent"' 2>/dev/null)" || status="unreadable"
+    [ "$status" = "Ready" ] || out="${out:+${out} }${name}=${status}"
+  done
+  printf '%s' "$out"
+}
+
+if [ -n "$DATASETS" ] && ! command -v jq >/dev/null 2>&1; then
+  echo "::error::Cannot check that '${DATASETS}' reported Ready: jq is not on this runner."
+  exit 1
+fi
+
+datasets_wait=""
+datasets_done=""
+if [ -n "$DATASETS" ]; then
+  datasets_wait=", and for '${DATASETS}' to report Ready"
+  datasets_done=", with '${DATASETS}' Ready"
+fi
+
+echo "Waiting up to ${TIMEOUT}s for ${URL} to report ready${datasets_wait}…"
 
 start=$SECONDS
 last_body=""
+last_datasets=""
+pending=""
+datasets_checked=""
 next_progress=$PROGRESS_EVERY
 
 while :; do
@@ -154,8 +201,15 @@ while :; do
       diagnose "$last_body"
       exit 1
     fi
-    echo "Runtime ready after $((SECONDS - start))s."
-    exit 0
+    if [ -n "$DATASETS" ]; then
+      last_datasets="$(curl -sS --max-time 5 "$DATASETS_URL" 2>/dev/null || true)"
+      pending="$(pending_datasets "$last_datasets")"
+      datasets_checked=1
+    fi
+    if [ -z "$pending" ]; then
+      echo "Runtime ready after $((SECONDS - start))s${datasets_done}."
+      exit 0
+    fi
   fi
 
   elapsed=$((SECONDS - start))
@@ -168,7 +222,11 @@ while :; do
   if [ "$elapsed" -ge "$next_progress" ]; then
     # Echo what it actually said, not just that it is not "ready" — a runtime
     # answering "initializing" is a very different problem from a dead socket.
-    echo "  ${elapsed}s — not ready yet (last response: '${last_body}')"
+    if [ "$last_body" = "ready" ] && [ -n "$pending" ]; then
+      echo "  ${elapsed}s — runtime ready, datasets not yet: ${pending}"
+    else
+      echo "  ${elapsed}s — not ready yet (last response: '${last_body}')"
+    fi
     next_progress=$((elapsed + PROGRESS_EVERY))
   fi
 
