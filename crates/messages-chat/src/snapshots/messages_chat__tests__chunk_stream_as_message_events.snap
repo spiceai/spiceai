@@ -1,0 +1,117 @@
+---
+source: crates/messages-chat/src/tests.rs
+expression: "pretty(&Value::Array(streamed))"
+---
+[
+  {
+    "message": {
+      "content": [],
+      "id": "msg_abc",
+      "model": "gpt",
+      "role": "assistant",
+      "stop_reason": null,
+      "stop_sequence": null,
+      "type": "message",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0
+      }
+    },
+    "type": "message_start"
+  },
+  {
+    "content_block": {
+      "text": "",
+      "type": "text"
+    },
+    "index": 0,
+    "type": "content_block_start"
+  },
+  {
+    "delta": {
+      "text": "Reading ",
+      "type": "text_delta"
+    },
+    "index": 0,
+    "type": "content_block_delta"
+  },
+  {
+    "delta": {
+      "text": "both.",
+      "type": "text_delta"
+    },
+    "index": 0,
+    "type": "content_block_delta"
+  },
+  {
+    "index": 0,
+    "type": "content_block_stop"
+  },
+  {
+    "content_block": {
+      "id": "call_1",
+      "input": {},
+      "name": "read_file",
+      "type": "tool_use"
+    },
+    "index": 1,
+    "type": "content_block_start"
+  },
+  {
+    "delta": {
+      "partial_json": "{\"path\":",
+      "type": "input_json_delta"
+    },
+    "index": 1,
+    "type": "content_block_delta"
+  },
+  {
+    "delta": {
+      "partial_json": "\"a.rs\"}",
+      "type": "input_json_delta"
+    },
+    "index": 1,
+    "type": "content_block_delta"
+  },
+  {
+    "index": 1,
+    "type": "content_block_stop"
+  },
+  {
+    "content_block": {
+      "id": "call_2",
+      "input": {},
+      "name": "read_file",
+      "type": "tool_use"
+    },
+    "index": 2,
+    "type": "content_block_start"
+  },
+  {
+    "delta": {
+      "partial_json": "{\"path\":\"b.rs\"}",
+      "type": "input_json_delta"
+    },
+    "index": 2,
+    "type": "content_block_delta"
+  },
+  {
+    "index": 2,
+    "type": "content_block_stop"
+  },
+  {
+    "delta": {
+      "stop_reason": "tool_use",
+      "stop_sequence": null
+    },
+    "type": "message_delta",
+    "usage": {
+      "cache_read_input_tokens": 100,
+      "input_tokens": 20,
+      "output_tokens": 30
+    }
+  },
+  {
+    "type": "message_stop"
+  }
+]

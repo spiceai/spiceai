@@ -4594,6 +4594,65 @@ mod pool_tests {
             .await
             .expect("close child");
     }
+
+    /// Regression test for #15356: an empty response replaces the entry of the
+    /// request it answers. A GET lookup names no body, and the HTTP connector
+    /// stores its rows with `request_body = ''`, so the replacement keeps the
+    /// POST cached for the same path and query, and the other query's GET.
+    #[tokio::test]
+    async fn an_empty_response_replaces_only_the_entry_of_its_request() {
+        let entry = |query: &str, body: &str, content: &str| {
+            RecordBatch::try_new(
+                row("").schema(),
+                vec![
+                    Arc::new(StringArray::from(vec!["/items"])),
+                    Arc::new(StringArray::from(vec![query])),
+                    Arc::new(StringArray::from(vec![body])),
+                    Arc::new(StringArray::from(vec![content])),
+                ],
+            )
+            .expect("stored entry")
+        };
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let (target, sink, _) = target(
+            &pool,
+            vec![
+                entry("a", "", "get a"),
+                entry("a", r#"{"b":1}"#, "post a"),
+                entry("b", "", "get b"),
+            ],
+        );
+        let filters = vec![
+            col("request_path").eq(lit("/items")),
+            col("request_query").eq(lit("a")),
+        ];
+        let key = compute_cache_key_from_filters_and_namespace(&filters, "public");
+        let ClaimOutcome::Leader(claim) =
+            CacheKeyClaim::acquire(&target.in_flight, key.clone(), None)
+        else {
+            panic!("exclusive claim");
+        };
+        target
+            .writer
+            .send_claimed_and_wait(
+                CacheWriteRequest {
+                    batches: vec![RecordBatch::new_empty(row("").schema())],
+                    filters,
+                    cache_key: key,
+                    namespace_id: "public".into(),
+                    replaces_existing: true,
+                },
+                claim,
+            )
+            .await
+            .expect("the empty response replaces the entry");
+        let mut stored = contents(&target.accelerator).await;
+        stored.sort_unstable();
+        assert_eq!(stored, vec!["get b", "post a"]);
+        sink.close(Duration::from_secs(5))
+            .await
+            .expect("close storage");
+    }
 }
 
 #[cfg(test)]
