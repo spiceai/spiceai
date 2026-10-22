@@ -464,6 +464,19 @@ const MAX_PK_SELECTIVE_RANGE_SPAN: i64 = 32;
 /// `MoR` exceeds the bound and falls through to the post-decode deletion filter.
 const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 2048;
 
+/// Whether a scan pushes the keys its tombstones hide into its scan filters as
+/// `pk NOT IN (...)` (see `vortex_key_delete_pushdown_filter`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TombstonePushdown {
+    /// Push them, so listing and Vortex skip the files and chunks they cover.
+    Apply,
+    /// Leave every hidden row to the deletion filters. A rewrite reads every
+    /// file anyway, and its filters' `rows_deleted` counts are the yield its
+    /// reclaim records (see [`super::deletion_yield`]): a file pruned from the
+    /// scan would remove rows that no filter counts.
+    Skip,
+}
+
 /// Result of a Cayenne CDC append write.
 ///
 /// A write can be fully complete when this value is returned, or it can have a
@@ -4644,14 +4657,6 @@ fn deletion_bytes_over_ceiling(
     over
 }
 
-/// Classify a protected snapshot's on-disk byte size into an LSM-style size
-/// tier. Tier 0 covers everything up to `base_bytes`; each higher tier covers
-/// up to `growth`× the previous tier's ceiling.
-///
-/// Pure and total: returns 0 for `bytes <= base_bytes` or a degenerate
-/// `growth <= 1`, and saturates (stops climbing) on multiplication overflow so
-/// arbitrarily large inputs map to the top representable tier rather than
-/// panicking.
 /// Rows the key deletion filters anywhere in `plan` removed, once it has run:
 /// what a reclaim's tombstones actually hid (see [`super::deletion_yield`]).
 ///
@@ -4676,6 +4681,14 @@ fn rows_deleted_by(plan: &Arc<dyn ExecutionPlan>) -> u64 {
         .fold(own, u64::saturating_add)
 }
 
+/// Classify a protected snapshot's on-disk byte size into an LSM-style size
+/// tier. Tier 0 covers everything up to `base_bytes`; each higher tier covers
+/// up to `growth`× the previous tier's ceiling.
+///
+/// Pure and total: returns 0 for `bytes <= base_bytes` or a degenerate
+/// `growth <= 1`, and saturates (stops climbing) on multiplication overflow so
+/// arbitrarily large inputs map to the top representable tier rather than
+/// panicking.
 fn protected_snapshot_size_tier(bytes: u64, base_bytes: u64, growth: u64) -> u32 {
     if bytes <= base_bytes || growth <= 1 {
         return 0;
@@ -26301,7 +26314,7 @@ impl CayenneTableProvider {
     ) -> Result<(SendableRecordBatchStream, Arc<dyn ExecutionPlan>)> {
         let state = ctx.state();
         let plan = self
-            .plan_scan_from_view(&state, None, &[], None, scan_view)
+            .plan_scan_from_view(&state, None, &[], None, scan_view, TombstonePushdown::Skip)
             .await?;
         let task_ctx = ctx.task_ctx();
         let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
@@ -26333,7 +26346,14 @@ impl CayenneTableProvider {
     ) -> Result<(Arc<dyn ExecutionPlan>, u64)> {
         let (scan_view, generation_before) = self.rewrite_scan_view(ctx).await?;
         let plan = self
-            .plan_scan_from_view(&ctx.state(), None, &[], None, scan_view)
+            .plan_scan_from_view(
+                &ctx.state(),
+                None,
+                &[],
+                None,
+                scan_view,
+                TombstonePushdown::Skip,
+            )
             .await?;
         Ok((plan, generation_before))
     }
@@ -30707,10 +30727,6 @@ impl CayenneTableProvider {
         );
     }
 
-    /// Drop the position deletes that target files of `snapshot_ids` — snapshots
-    /// a committed rewrite replaced, whose files no scan planned after it reads.
-    /// Left in place they would hide no row, but they would still mark the table's
-    /// file statistics inexact.
     /// Whether a scan of this table may remove rows by position delete. A
     /// reclaim whose scan did cannot measure its yield: the position vectors
     /// drop those rows inside the file scan, before any key filter counts them,
@@ -30737,6 +30753,10 @@ impl CayenneTableProvider {
         );
     }
 
+    /// Drop the position deletes that target files of `snapshot_ids` — snapshots
+    /// a committed rewrite replaced, whose files no scan planned after it reads.
+    /// Left in place they would hide no row, but they would still mark the table's
+    /// file statistics inexact.
     fn retire_position_deletions_of<'a>(&self, snapshot_ids: impl Iterator<Item = &'a String>) {
         let cache = self.pk_deletion_strategy.position_cache();
         if cache.load().is_empty() {
@@ -42332,6 +42352,7 @@ impl CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
         scan_view: Arc<ScanView>,
+        tombstone_pushdown: TombstonePushdown,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let warm_files = scan_view.raw.warm_files.clone();
         let mem_tier_any_rows = scan_view.raw.mem_tier_shards.iter().any(|s| !s.is_empty());
@@ -42453,7 +42474,10 @@ impl CayenneTableProvider {
         let effective_filters = rewritten_scan_filters(filters, retention_keep_filter.as_ref());
         let mut scan_filters_owned = effective_filters.unwrap_or_else(|| filters.to_vec());
         let mem_tier_pruning_filters = scan_filters_owned.clone();
-        if let Some(tombstone_filter) = self.vortex_key_delete_pushdown_filter(&deletion_snapshot) {
+        if tombstone_pushdown == TombstonePushdown::Apply
+            && let Some(tombstone_filter) =
+                self.vortex_key_delete_pushdown_filter(&deletion_snapshot)
+        {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
                 "Injected sparse key-delete tombstone exclusion into Vortex scan filters"
@@ -42892,8 +42916,15 @@ impl TableProvider for CayenneTableProvider {
                 hook().await;
             }
         }
-        self.plan_scan_from_view(state, projection, filters, limit, scan_view)
-            .await
+        self.plan_scan_from_view(
+            state,
+            projection,
+            filters,
+            limit,
+            scan_view,
+            TombstonePushdown::Apply,
+        )
+        .await
     }
 
     // Filter-pushdown exactness contract (read before changing the arms below):
@@ -62494,6 +62525,48 @@ mod tests {
         assert_eq!(
             provider.context.effective_reclaim_deletion_index_trigger(),
             4
+        );
+    }
+
+    /// A whole-table reclaim counts the rows of a file whose every row its
+    /// tombstones hide: the rewrite reads that file through its deletion filters
+    /// rather than pruning it from the scan, so a reclaim that removes a row per
+    /// tombstone keeps the configured trigger.
+    #[tokio::test]
+    async fn a_whole_table_reclaim_counts_the_rows_of_files_its_tombstones_hide_whole() {
+        let ctx = SessionContext::new();
+        let config = VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Position,
+            bake_deletion_index_trigger: 2,
+            compaction_background_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "reclaim_whole_file_yield",
+            ctx.runtime_env(),
+            config,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+        insert_batch(&provider, id_value_batch(schema, &[3, 4], &[30, 40])).await;
+        install_int64_deletes(&provider, &[(1, i64::MAX - 1), (2, i64::MAX - 1)]);
+        assert!(
+            provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("the reclaim should not error"),
+            "the reclaim must run"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "reclaim_whole_file_yield").await,
+            vec![(3, 30), (4, 40)],
+        );
+        assert_eq!(
+            provider.context.effective_reclaim_deletion_index_trigger(),
+            2
         );
     }
 
