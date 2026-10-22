@@ -665,12 +665,20 @@ fn histogram_to_summary_metric(histogram_labels: &[LabelPair], h: &Histogram) ->
     let total_sum = h.get_sample_sum();
     let (first_lower, last_upper) = occupied_bucket_bounds(h);
 
-    let cumulative_counts: Vec<u64> = h
+    let mut cumulative_counts: Vec<u64> = h
         .get_bucket()
         .iter()
         .map(Bucket::cumulative_count)
         .collect();
-    let bounds: Vec<f64> = h.get_bucket().iter().map(Bucket::upper_bound).collect();
+    let mut bounds: Vec<f64> = h.get_bucket().iter().map(Bucket::upper_bound).collect();
+
+    // Prometheus proto may omit `+Inf`. Overflow samples still sit past the last
+    // explicit bound, so interpolation must use the same open bucket
+    // `occupied_bucket_bounds` already treats as unbounded.
+    if cumulative_counts.last().copied().unwrap_or(0) < total_count {
+        cumulative_counts.push(total_count);
+        bounds.push(f64::INFINITY);
+    }
 
     let mut summary_proto = prometheus::proto::Summary::new();
 
@@ -735,7 +743,9 @@ fn occupied_bucket_bounds(h: &Histogram) -> (f64, f64) {
 /// Bucket interpolation can report a quantile no observation could have, given
 /// count, sum, and the occupied bucket. A single observation *is* the
 /// distribution: every quantile is that sample, including when interpolation
-/// returns ±Inf because the sample landed in the overflow bucket.
+/// returns ±Inf because the sample landed in the overflow bucket. Several
+/// overflow samples interpolate to Inf as well; that Inf still has a finite
+/// bound from count and sum, so only NaN bypasses the clamp.
 #[expect(clippy::cast_precision_loss)]
 fn clamp_derived_quantile(
     value: f64,
@@ -750,7 +760,7 @@ fn clamp_derived_quantile(
     if sample_count == 1 {
         return sample_sum;
     }
-    if !value.is_finite() {
+    if value.is_nan() {
         return value;
     }
 
@@ -1183,14 +1193,138 @@ mod tests {
     }
 
     /// Interpolation of one overflow sample is `Inf`; the quantile is still the
-    /// sample. A single observation is applied before the non-finite guard so
-    /// `Inf` does not escape.
+    /// sample. A single observation is applied before the NaN guard so `Inf`
+    /// does not escape.
     #[test]
     fn single_observation_wins_over_non_finite_interpolation() {
         assert_float_eq(
             clamp_derived_quantile(f64::INFINITY, 1, 1_000_000.0, 500_000.0, f64::INFINITY),
             1_000_000.0,
         );
+    }
+
+    /// Several overflow samples interpolate to `Inf`. Count and sum still bound
+    /// every observation, so `Inf` must reach the clamp instead of escaping
+    /// through a non-finite guard. NaN is the only bypass.
+    #[test]
+    fn inf_quantile_clamps_to_the_sum_implied_upper_bound() {
+        assert_float_eq(
+            clamp_derived_quantile(f64::INFINITY, 2, 1_200_000.0, 500_000.0, f64::INFINITY),
+            700_000.0,
+        );
+        assert!(
+            clamp_derived_quantile(f64::NAN, 2, 1_200_000.0, 500_000.0, f64::INFINITY).is_nan(),
+            "NaN is not a sample and must not be rewritten to a bound",
+        );
+    }
+
+    /// Two finite overflow samples share `+Inf` — explicit on the proto fixture,
+    /// implicit on a Prometheus `HistogramVec` scrape. Interpolation is `Inf`,
+    /// but count and sum still bound every sample: two `600_000ms` observations
+    /// summing to `1_200_000` cannot exceed `700_000ms`
+    /// (`sample_sum - (n-1) * first_lower`, `first_lower` = `500_000`).
+    #[test]
+    fn multiple_overflow_observations_clamp_inf_quantiles() {
+        let latencies = [600_000.0, 600_000.0];
+        let histogram = duration_histogram(&latencies, true);
+        let last = histogram
+            .get_bucket()
+            .last()
+            .expect("duration histogram has buckets");
+        assert!(
+            last.upper_bound().is_infinite(),
+            "fixture must include the +Inf bucket"
+        );
+        assert_eq!(last.cumulative_count(), histogram.get_sample_count());
+
+        let counts: Vec<u64> = histogram
+            .get_bucket()
+            .iter()
+            .map(Bucket::cumulative_count)
+            .collect();
+        let bounds: Vec<f64> = histogram
+            .get_bucket()
+            .iter()
+            .map(Bucket::upper_bound)
+            .collect();
+        let interpolated_p50 =
+            calculate_percentile(&counts, &bounds, histogram.get_sample_count(), 50.0);
+        assert!(
+            interpolated_p50.is_infinite(),
+            "p50 of two +Inf-bucket samples interpolates to Inf, got {interpolated_p50}"
+        );
+
+        let (first_lower, last_upper) = occupied_bucket_bounds(&histogram);
+        assert_float_eq(first_lower, 500_000.0);
+        assert!(
+            last_upper.is_infinite(),
+            "explicit +Inf is an open upper bound, got {last_upper}"
+        );
+
+        let aggregate_upper = 700_000.0;
+        assert_float_eq(
+            clamp_derived_quantile(
+                interpolated_p50,
+                histogram.get_sample_count(),
+                histogram.get_sample_sum(),
+                first_lower,
+                last_upper,
+            ),
+            aggregate_upper,
+        );
+
+        let family = labeled_histogram_family(
+            "dataset_acceleration_refresh_duration_ms",
+            &[("dataset", "products", &histogram)],
+        );
+        let quantiles: Vec<f64> = histogram_family_to_summary(&family).get_metric()[0]
+            .get_summary()
+            .quantile
+            .iter()
+            .map(prometheus::proto::Quantile::value)
+            .collect();
+        assert_eq!(quantiles.len(), 4);
+        for (idx, value) in quantiles.iter().enumerate() {
+            assert!(
+                value.is_finite(),
+                "quantile[{idx}] must be finite, got {value}"
+            );
+            assert_float_eq(*value, aggregate_upper);
+        }
+
+        let registry = prometheus::Registry::new();
+        let observed = HistogramVec::new(
+            HistogramOpts::new(
+                "dataset_acceleration_refresh_duration_ms",
+                "Duration in milliseconds of a dataset acceleration refresh",
+            )
+            .buckets(telemetry::DURATION_MS_HISTOGRAM_BUCKETS.to_vec()),
+            &["dataset"],
+        )
+        .expect("refresh duration histogram");
+        registry
+            .register(Box::new(observed.clone()))
+            .expect("register refresh duration histogram");
+        observed.with_label_values(&["products"]).observe(600_000.0);
+        observed.with_label_values(&["products"]).observe(600_000.0);
+
+        let text = encode_registry(&registry);
+        let text = std::str::from_utf8(&text).expect("utf8 prometheus text");
+        parse_prometheus_text_strict(text).expect("strict prometheus exposition");
+        let summary_inf = text.lines().any(|line| {
+            line.starts_with("dataset_acceleration_refresh_duration_ms_summary{")
+                && line.contains("+Inf")
+        });
+        assert!(
+            !summary_inf,
+            "derived summary quantiles must be finite, got:\n{text}"
+        );
+        for quantile in ["0.5", "0.9", "0.95", "0.99"] {
+            let needle = format!(
+                "dataset_acceleration_refresh_duration_ms_summary{{dataset=\"products\",quantile=\"{quantile}\"}} 700000"
+            );
+            assert!(text.contains(&needle), "expected {needle} in:\n{text}");
+        }
     }
 
     /// Overflow past the last explicit bucket is not bounded by that bucket.
