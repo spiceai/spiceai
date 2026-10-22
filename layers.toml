@@ -275,6 +275,7 @@ runtime-checkpoint-api = "foundation"
 # changing the default can never silently relocate it away from `cache`/`hf-hub`.
 chat-api = "foundation"
 evaluate-api = "foundation"
+messages-api = "foundation"
 # What each model can serve and the gate every serving path asks; its closure is `spicepod`.
 model-capabilities = "foundation"
 embed-api = "shared-utility"
@@ -321,7 +322,7 @@ yaml = "foundation"
 # tier, but listed here for clarity / auditability). Everything else defaults to
 # `shared-utility`:
 #   app, cache, cayenne, data-accelerator-api, data_components, datafusion-ddl,
-#   datafusion-optimizer-rules, evaluate-chat, llms, package, runtime-acceleration,
+#   datafusion-optimizer-rules, evaluate-chat, llms, messages-chat, package, runtime-acceleration,
 #   runtime-auth, runtime-cluster, runtime-datafusion, runtime-datafusion-udfs,
 #   runtime-decide, runtime-drasi, runtime-parameters, runtime-request-context, runtime-search,
 #   runtime-secrets, runtime-table-partition, runtime-tools, search,
