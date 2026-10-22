@@ -17,6 +17,8 @@ limitations under the License.
 use crate::federated::FederatedTableProvider;
 use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
+use data_components::csv_header_projection::HeaderProjectedCsvFormat;
+use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -109,6 +111,12 @@ pub struct ListingTableTemplate {
     object_store: Arc<dyn ObjectStore>,
     /// Listing extension from [`ListingTableConnector::get_file_format_and_extension`].
     extension: String,
+    /// The dataset name, for schema-drift messages.
+    dataset_name: String,
+    /// Whether scans are checked for registered columns missing from every scanned file
+    /// (see [`data_components::file_schema_drift`]). Off when `schema_source_path` names the
+    /// schema: its columns need not appear in the data files.
+    check_schema_drift: bool,
 }
 
 impl ListingTableTemplate {
@@ -163,7 +171,7 @@ impl ListingTableTemplate {
         table: Arc<ListingTable>,
         table_path: ListingTableUrl,
     ) -> Arc<dyn TableProvider> {
-        if has_location_metadata(table.options()) {
+        let table: Arc<dyn TableProvider> = if has_location_metadata(table.options()) {
             Arc::new(LocationPruningListingTable::new(
                 table,
                 Arc::clone(&self.object_store),
@@ -173,7 +181,25 @@ impl ListingTableTemplate {
             ))
         } else {
             table
+        };
+        match self.schema_drift_guard() {
+            Some(guard) => FileSchemaDriftLayer::over(table, guard),
+            None => table,
         }
+    }
+
+    /// The guard that checks this dataset's scans for registered columns missing from every
+    /// scanned file, or `None` when the check is off or the file format cannot be checked.
+    fn schema_drift_guard(&self) -> Option<FileSchemaDriftGuard> {
+        (self.check_schema_drift
+            && FileSchemaDriftGuard::supports_format(self.options.format.as_ref()))
+        .then(|| {
+            FileSchemaDriftGuard::new(
+                self.dataset_name.clone(),
+                Arc::clone(&self.schema),
+                Arc::clone(&self.options.format),
+            )
+        })
     }
 }
 
@@ -1572,6 +1598,10 @@ pub trait ListingTableConnector: DataConnector {
                 "Enabled single-file ETag/Version caching for {}",
                 dataset.name
             );
+            let cached_table = match template.schema_drift_guard() {
+                Some(guard) => cached_table.with_schema_drift_guard(guard),
+                None => cached_table,
+            };
             return Ok(Arc::new(cached_table));
         }
 
@@ -1677,6 +1707,11 @@ pub trait ListingTableConnector: DataConnector {
             name = dataset.name,
             sanitized_url = schema_infer_url.sanitized_url(),
         );
+
+        // Headered CSV is read by column name. Wrap here, not in
+        // `get_file_format_and_extension`, so Hugging Face can still downcast
+        // the unwrapped `CsvFormat` for its positional commit check.
+        let file_format = HeaderProjectedCsvFormat::wrap(file_format);
 
         // `target_partitions` and `collect_statistics` are read from the scanning
         // session's config at scan time, so they are no longer copied onto the options.
@@ -1788,6 +1823,10 @@ pub trait ListingTableConnector: DataConnector {
             schema: final_schema,
             object_store,
             extension: extension.to_string(),
+            dataset_name: dataset.name.to_string(),
+            // An `ORC` collection infers from the scan path and ignores `schema_source_path`.
+            check_schema_drift: (table_path.is_collection() && listing_extension_is_orc(extension))
+                || !dataset.params.contains_key("schema_source_path"),
         })
     }
 
@@ -2935,6 +2974,161 @@ mod tests {
         } else {
             panic!("Unexpected error");
         }
+    }
+
+    #[tokio::test]
+    async fn get_file_format_and_extension_keeps_unwrapped_csv_format() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
+        let (Some(file_format), _) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv format")
+        else {
+            panic!("expected a CSV file format");
+        };
+        assert!(
+            file_format.as_ref().downcast_ref::<CsvFormat>().is_some(),
+            "Hugging Face downcasts CsvFormat from get_file_format_and_extension"
+        );
+        assert!(
+            file_format
+                .as_ref()
+                .downcast_ref::<HeaderProjectedCsvFormat>()
+                .is_none()
+        );
+    }
+
+    fn write_events_csv(path: &std::path::Path, header: &str, rows: &[&str]) {
+        let mut text = String::from(header);
+        text.push('\n');
+        for row in rows {
+            text.push_str(row);
+            text.push('\n');
+        }
+        std::fs::write(path, text).expect("write csv");
+    }
+
+    async fn csv_listing_sums(
+        provider: Arc<dyn TableProvider>,
+        refresh: bool,
+    ) -> (Option<i64>, Option<i64>) {
+        let mut config = datafusion::prelude::SessionConfig::new();
+        if refresh {
+            data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        }
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let batches = ctx
+            .sql("SELECT sum(amount_cents), sum(user_id) FROM events")
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+        let batch = &batches[0];
+        let amounts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("amount_cents");
+        let users = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("user_id");
+        (
+            (!amounts.is_null(0)).then(|| amounts.value(0)),
+            (!users.is_null(0)).then(|| users.value(0)),
+        )
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_binds_csv_columns_by_header_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.csv");
+        write_events_csv(
+            &path,
+            "event_id,user_id,region,amount_cents,ts",
+            &["1,10,us,100,t0", "2,20,eu,200,t1"],
+        );
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv format")
+        else {
+            panic!("expected a CSV file format");
+        };
+
+        let template = connector
+            .listing_table_template(&dataset, &url, &extension, Arc::clone(&file_format))
+            .await
+            .expect("template");
+        assert!(
+            template
+                .options
+                .format
+                .as_ref()
+                .downcast_ref::<HeaderProjectedCsvFormat>()
+                .is_some(),
+            "listing options must wrap a headered CSV so columns bind by name"
+        );
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30))
+        );
+
+        write_events_csv(
+            &path,
+            "event_id,amount_cents,region,user_id,ts",
+            &["1,100,us,10,t0", "2,200,eu,20,t1"],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "values must follow the header names after a column reorder"
+        );
+
+        write_events_csv(
+            &path,
+            "event_id,user_id,region,amt,ts",
+            &["1,10,us,100,t0", "2,20,eu,200,t1"],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "a renamed column is NULL on a federated read"
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new();
+        data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let message = ctx
+            .sql("SELECT * FROM events")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a refresh scan must not load NULLs for a renamed column")
+            .to_string();
+        assert!(message.contains("'amount_cents'"), "{message}");
+        assert!(message.contains("Dataset 'test'"), "{message}");
     }
 
     #[tokio::test]

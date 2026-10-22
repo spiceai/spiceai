@@ -280,6 +280,7 @@ datafusion-catalog = "55.2.0"
 datafusion-common = "55.2.0"
 datafusion-common-runtime = "55.2.0"
 datafusion-datasource = "55.2.0"
+datafusion-datasource-csv = "55.2.0"
 datafusion-execution = "55.2.0"
 datafusion-expr = "55.2.0"
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "109661cc833e7f8919e1b3c65011ed9db0883312", features = ["sql"] } # branch: spiceai-55

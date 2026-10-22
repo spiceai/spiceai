@@ -6449,6 +6449,7 @@ dependencies = [
  "dataformat-json",
  "datafusion",
  "datafusion-datasource",
+ "datafusion-datasource-csv",
  "datafusion-federation",
  "datafusion-table-providers",
  "db_connection_pool",

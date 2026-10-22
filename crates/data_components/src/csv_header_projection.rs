@@ -1,0 +1,716 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Projects a headered CSV onto the registered schema by column name.
+//!
+//! `DataFusion`'s [`CsvFormat`] binds a provided schema by position and only uses
+//! the header to skip the first row. A file whose columns are reordered then
+//! returns another column's values under the registered names. This wrapper
+//! reads each file's header and maps those names onto the registered schema so
+//! a reorder keeps the values with their header, and a renamed or dropped
+//! column is `NULL` instead of another field's values.
+
+use std::fmt::{self, Formatter};
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions, new_null_array};
+use arrow::compute::cast;
+use arrow::csv::reader::Format as ArrowCsvFormat;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use async_trait::async_trait;
+use datafusion::catalog::Session;
+use datafusion::common::config::CsvOptions;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
+use datafusion::datasource::file_format::{FileFormat, FileMeta};
+use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_expr::projection::ProjectionExprs;
+use datafusion::physical_expr::{LexOrdering, PhysicalExpr};
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan, apply_expression_roots};
+use datafusion_datasource::TableSchema;
+use datafusion_datasource::file::FileSource;
+use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
+use datafusion_datasource::file_sink_config::FileSinkConfig;
+use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
+use datafusion_datasource::metadata::MetadataColumn;
+use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};
+use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource_csv::source::{CsvOpener, CsvSource};
+use futures::StreamExt;
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+
+/// Bytes of the object prefix read when parsing the header. A header longer than
+/// this is read in a second full-object fetch.
+const HEADER_PROBE_BYTES: u64 = 64 * 1024;
+
+/// [`CsvFormat`] that maps each file's header names onto the registered schema.
+#[derive(Debug)]
+pub struct HeaderProjectedCsvFormat {
+    inner: CsvFormat,
+}
+
+impl HeaderProjectedCsvFormat {
+    /// Wraps `format` so a headered CSV is read by name. Other formats, and CSV
+    /// with `has_header` false, are returned unchanged.
+    #[must_use]
+    pub fn wrap(format: Arc<dyn FileFormat>) -> Arc<dyn FileFormat> {
+        let Some(csv) = format.as_ref().downcast_ref::<CsvFormat>() else {
+            return format;
+        };
+        if !csv.has_header().unwrap_or(true) {
+            return format;
+        }
+        Arc::new(Self {
+            inner: CsvFormat::default().with_options(csv.options().clone()),
+        })
+    }
+
+    #[must_use]
+    pub fn options(&self) -> &CsvOptions {
+        self.inner.options()
+    }
+}
+
+#[async_trait]
+impl FileFormat for HeaderProjectedCsvFormat {
+    fn get_ext(&self) -> String {
+        self.inner.get_ext()
+    }
+
+    fn get_ext_with_compression(
+        &self,
+        file_compression_type: &FileCompressionType,
+    ) -> Result<String> {
+        self.inner.get_ext_with_compression(file_compression_type)
+    }
+
+    fn compression_type(&self) -> Option<FileCompressionType> {
+        self.inner.compression_type()
+    }
+
+    async fn infer_schema(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        objects: &[ObjectMeta],
+    ) -> Result<SchemaRef> {
+        self.inner.infer_schema(state, store, objects).await
+    }
+
+    async fn infer_stats(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        table_schema: SchemaRef,
+        object: &ObjectMeta,
+    ) -> Result<datafusion::common::Statistics> {
+        self.inner
+            .infer_stats(state, store, table_schema, object)
+            .await
+    }
+
+    async fn infer_ordering(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        table_schema: SchemaRef,
+        object: &ObjectMeta,
+    ) -> Result<Option<LexOrdering>> {
+        self.inner
+            .infer_ordering(state, store, table_schema, object)
+            .await
+    }
+
+    async fn infer_stats_and_ordering(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        table_schema: SchemaRef,
+        object: &ObjectMeta,
+    ) -> Result<FileMeta> {
+        self.inner
+            .infer_stats_and_ordering(state, store, table_schema, object)
+            .await
+    }
+
+    async fn create_physical_plan(
+        &self,
+        state: &dyn Session,
+        conf: FileScanConfig,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let has_header = self
+            .inner
+            .has_header()
+            .unwrap_or_else(|| state.config_options().catalog.has_header);
+        let newlines_in_values = self
+            .inner
+            .options()
+            .newlines_in_values
+            .unwrap_or_else(|| state.config_options().catalog.newlines_in_values);
+        let mut options = self.inner.options().clone();
+        options.has_header = Some(has_header);
+        options.newlines_in_values = Some(newlines_in_values);
+
+        let table_schema = conf.file_source().table_schema().clone();
+        let mut source = HeaderProjectedCsvSource::new(table_schema, options);
+        if let Some(existing) = conf
+            .file_source()
+            .as_ref()
+            .downcast_ref::<HeaderProjectedCsvSource>()
+        {
+            source.projection = existing.projection.clone();
+            source.batch_size = existing.batch_size;
+        }
+        let config = FileScanConfigBuilder::from(conf)
+            .with_file_compression_type(self.inner.options().compression.into())
+            .with_source(Arc::new(source))
+            .build();
+        Ok(DataSourceExec::from_data_source(config))
+    }
+
+    async fn create_writer_physical_plan(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        state: &dyn Session,
+        conf: FileSinkConfig,
+        order_requirements: Option<datafusion::physical_expr_common::sort_expr::LexRequirement>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner
+            .create_writer_physical_plan(input, state, conf, order_requirements)
+            .await
+    }
+
+    fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
+        let mut options = self.inner.options().clone();
+        if options.has_header.is_none() {
+            options.has_header = Some(true);
+        }
+        Arc::new(HeaderProjectedCsvSource::new(table_schema, options))
+    }
+}
+
+/// [`FileSource`] that remaps each file's header onto the registered file schema.
+#[derive(Clone)]
+struct HeaderProjectedCsvSource {
+    options: CsvOptions,
+    batch_size: Option<usize>,
+    table_schema: TableSchema,
+    projection: SplitProjection,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl HeaderProjectedCsvSource {
+    fn new(table_schema: TableSchema, options: CsvOptions) -> Self {
+        Self {
+            options,
+            batch_size: None,
+            projection: SplitProjection::unprojected(&table_schema),
+            table_schema,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    fn has_header(&self) -> bool {
+        self.options.has_header.unwrap_or(true)
+    }
+
+    fn newlines_in_values(&self) -> bool {
+        self.options.newlines_in_values.unwrap_or(false)
+    }
+}
+
+impl FileSource for HeaderProjectedCsvSource {
+    fn create_file_opener(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        _partition: usize,
+    ) -> Result<Arc<dyn FileOpener>> {
+        let opener = HeaderMappedOpener {
+            options: self.options.clone(),
+            batch_size: self.batch_size.unwrap_or(8192),
+            registered_file_schema: Arc::clone(self.table_schema.file_schema()),
+            file_indices: self.projection.file_indices.clone(),
+            file_compression_type: base_config.file_compression_type,
+            object_store,
+        };
+        ProjectionOpener::try_new(
+            self.projection.clone(),
+            Arc::new(opener),
+            self.table_schema.file_schema(),
+        )
+    }
+
+    fn table_schema(&self) -> &TableSchema {
+        &self.table_schema
+    }
+
+    fn with_metadata_cols(
+        &self,
+        metadata_cols: Vec<MetadataColumn>,
+    ) -> Option<Arc<dyn FileSource>> {
+        let mut source = self.clone();
+        source.table_schema = source.table_schema.with_metadata_cols(metadata_cols);
+        source.projection = SplitProjection::unprojected(&source.table_schema);
+        Some(Arc::new(source))
+    }
+
+    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
+        let mut source = self.clone();
+        source.batch_size = Some(batch_size);
+        Arc::new(source)
+    }
+
+    fn projection(&self) -> Option<&ProjectionExprs> {
+        Some(&self.projection.source)
+    }
+
+    fn metrics(&self) -> &ExecutionPlanMetricsSet {
+        &self.metrics
+    }
+
+    fn file_type(&self) -> &'static str {
+        "csv"
+    }
+
+    fn fmt_extra(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    ", has_header={}, header_projection=true",
+                    self.has_header()
+                )
+            }
+            DisplayFormatType::TreeRender => Ok(()),
+        }
+    }
+
+    fn supports_repartitioning(&self) -> bool {
+        !self.newlines_in_values()
+    }
+
+    fn try_pushdown_projection(
+        &self,
+        projection: &ProjectionExprs,
+    ) -> Result<Option<Arc<dyn FileSource>>> {
+        let mut source = self.clone();
+        let new_projection = self.projection.source.try_merge(projection)?;
+        source.projection =
+            SplitProjection::new_with_table_schema(&self.table_schema, &new_projection);
+        Ok(Some(Arc::new(source)))
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        apply_expression_roots(self.projection.source.iter(), f)
+    }
+}
+
+/// Reads one CSV with the file's header schema, then projects onto the
+/// registered file columns `file_indices` selects, by name.
+struct HeaderMappedOpener {
+    options: CsvOptions,
+    batch_size: usize,
+    registered_file_schema: SchemaRef,
+    file_indices: Vec<usize>,
+    file_compression_type: FileCompressionType,
+    object_store: Arc<dyn ObjectStore>,
+}
+
+impl FileOpener for HeaderMappedOpener {
+    fn open(
+        &self,
+        partitioned_file: datafusion_datasource::PartitionedFile,
+    ) -> Result<FileOpenFuture> {
+        let options = self.options.clone();
+        let batch_size = self.batch_size;
+        let registered = Arc::clone(&self.registered_file_schema);
+        let file_indices = self.file_indices.clone();
+        let compression = self.file_compression_type;
+        let store = Arc::clone(&self.object_store);
+
+        Ok(Box::pin(async move {
+            let header =
+                read_csv_header(&store, &partitioned_file.object_meta, &options, compression)
+                    .await?;
+            let physical = Arc::new(physical_schema(&header, &registered));
+            let target = projected_registered_schema(&registered, &file_indices)?;
+
+            let physical_source = CsvSource::new(physical)
+                .with_csv_options(options)
+                .with_batch_size(batch_size);
+            let Some(physical_source) = physical_source.as_ref().downcast_ref::<CsvSource>() else {
+                return Err(DataFusionError::Internal(
+                    "header-projected CSV reader did not build a CSV source".to_string(),
+                ));
+            };
+            let opener = CsvOpener::new(Arc::new(physical_source.clone()), compression, store);
+            let stream = opener.open(partitioned_file)?.await?;
+            Ok(stream
+                .map(move |batch| batch.and_then(|b| project_record_batch(&b, &target)))
+                .boxed())
+        }))
+    }
+}
+
+fn physical_schema(header: &[String], registered: &Schema) -> Schema {
+    Schema::new(
+        header
+            .iter()
+            .map(|name| {
+                registered
+                    .field_with_name(name)
+                    .ok()
+                    .cloned()
+                    .unwrap_or_else(|| Field::new(name, DataType::Utf8, true))
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn projected_registered_schema(registered: &Schema, file_indices: &[usize]) -> Result<SchemaRef> {
+    Ok(Arc::new(registered.project(file_indices)?))
+}
+
+fn project_record_batch(batch: &RecordBatch, target: &SchemaRef) -> Result<RecordBatch> {
+    let rows = batch.num_rows();
+    let columns: Vec<ArrayRef> = target
+        .fields()
+        .iter()
+        .map(|field| match batch.schema().index_of(field.name()) {
+            Ok(idx) => {
+                let column = Arc::clone(batch.column(idx));
+                if column.data_type() == field.data_type() {
+                    Ok(column)
+                } else {
+                    cast(column.as_ref(), field.data_type()).map_err(DataFusionError::from)
+                }
+            }
+            Err(_) => Ok(new_null_array(field.data_type(), rows)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // `count(*)` projects no file columns; the empty schema still needs the
+    // file's row count so the aggregate is not zero.
+    RecordBatch::try_new_with_options(
+        Arc::clone(target),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(rows)),
+    )
+    .map_err(DataFusionError::from)
+}
+
+async fn read_csv_header(
+    store: &Arc<dyn ObjectStore>,
+    meta: &ObjectMeta,
+    options: &CsvOptions,
+    compression: FileCompressionType,
+) -> Result<Vec<String>> {
+    let end = meta.size.min(HEADER_PROBE_BYTES);
+    let prefix = store
+        .get_range(&meta.location, 0..end)
+        .await
+        .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?;
+    let decoded = decode_prefix(prefix, compression).await?;
+    let names = parse_header_names(&decoded, options)?;
+    if !names.is_empty() || meta.size <= HEADER_PROBE_BYTES {
+        return Ok(names);
+    }
+    // The prefix had no complete header row; read the object.
+    let object = store
+        .get(&meta.location)
+        .await
+        .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?;
+    let bytes = object
+        .bytes()
+        .await
+        .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?;
+    let decoded = decode_prefix(bytes, compression).await?;
+    parse_header_names(&decoded, options)
+}
+
+async fn decode_prefix(
+    prefix: bytes::Bytes,
+    compression: FileCompressionType,
+) -> Result<bytes::Bytes> {
+    if !compression.is_compressed() {
+        return Ok(prefix);
+    }
+    let stream = futures::stream::once(async move { Ok(prefix) }).boxed();
+    let mut decoded = compression.convert_stream(stream)?;
+    let mut acc = Vec::new();
+    while let Some(chunk) = decoded.next().await {
+        let chunk = chunk?;
+        acc.extend_from_slice(&chunk);
+        if acc.contains(&b'\n') {
+            break;
+        }
+    }
+    Ok(bytes::Bytes::from(acc))
+}
+
+fn parse_header_names(bytes: &[u8], options: &CsvOptions) -> Result<Vec<String>> {
+    let mut format = ArrowCsvFormat::default()
+        .with_header(true)
+        .with_delimiter(options.delimiter)
+        .with_quote(options.quote)
+        .with_truncated_rows(true);
+    if let Some(escape) = options.escape {
+        format = format.with_escape(escape);
+    }
+    if let Some(comment) = options.comment {
+        format = format.with_comment(comment);
+    }
+    let (schema, _) = format
+        .infer_schema(std::io::Cursor::new(bytes), Some(0))
+        .map_err(DataFusionError::from)?;
+    Ok(schema
+        .fields()
+        .iter()
+        .map(|field| field.name().trim_start_matches('\u{feff}').to_string())
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, Int64Array, StringArray};
+    use datafusion::datasource::listing::{
+        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    };
+    use datafusion::prelude::SessionContext;
+    use std::path::Path;
+
+    fn write_csv(path: &Path, header: &str, rows: &[&str]) {
+        let mut text = String::from(header);
+        text.push('\n');
+        for row in rows {
+            text.push_str(row);
+            text.push('\n');
+        }
+        std::fs::write(path, text).expect("write csv");
+    }
+
+    fn registered_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int64, true),
+            Field::new("user_id", DataType::Int64, true),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("amount_cents", DataType::Int64, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]))
+    }
+
+    fn listing_table(
+        dir: &Path,
+        format: Arc<dyn FileFormat>,
+    ) -> Arc<dyn datafusion::datasource::TableProvider> {
+        let url = ListingTableUrl::parse(format!("file://{}/", dir.display())).expect("url");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(ListingOptions::new(format).with_file_extension(".csv"))
+            .with_schema(registered_schema());
+        Arc::new(ListingTable::try_new(config).expect("listing table"))
+    }
+
+    async fn query_sums(
+        table: Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> Result<(Option<i64>, Option<i64>)> {
+        let ctx = SessionContext::new();
+        ctx.register_table("base", table)?;
+        let batches = ctx
+            .sql("SELECT sum(amount_cents), sum(user_id) FROM base")
+            .await?
+            .collect()
+            .await?;
+        let batch = &batches[0];
+        let amounts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("amount_cents");
+        let users = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("user_id");
+        Ok((
+            (!amounts.is_null(0)).then(|| amounts.value(0)),
+            (!users.is_null(0)).then(|| users.value(0)),
+        ))
+    }
+
+    fn header_format() -> Arc<dyn FileFormat> {
+        HeaderProjectedCsvFormat::wrap(Arc::new(CsvFormat::default().with_has_header(true)))
+    }
+
+    #[tokio::test]
+    async fn reordered_csv_columns_follow_header_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csv(
+            &dir.path().join("base.csv"),
+            "event_id,user_id,region,amount_cents,ts",
+            &["1,10,us,100,t0", "2,20,eu,200,t1"],
+        );
+        let table = listing_table(dir.path(), header_format());
+        let before = query_sums(Arc::clone(&table))
+            .await
+            .expect("query before reorder");
+        assert_eq!(before, (Some(300), Some(30)));
+
+        write_csv(
+            &dir.path().join("base.csv"),
+            "event_id,amount_cents,region,user_id,ts",
+            &["1,100,us,10,t0", "2,200,eu,20,t1"],
+        );
+        let after = query_sums(table).await.expect("query after reorder");
+        assert_eq!(
+            after,
+            (Some(300), Some(30)),
+            "values must follow the header names, not column position"
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_leading_column_does_not_shift_registered_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csv(
+            &dir.path().join("base.csv"),
+            "note,event_id,user_id,region,amount_cents,ts",
+            &["x,1,10,us,100,t0", "y,2,20,eu,200,t1"],
+        );
+        let table = listing_table(dir.path(), header_format());
+        let sums = query_sums(table)
+            .await
+            .expect("query with an extra leading column");
+        assert_eq!(sums, (Some(300), Some(30)));
+    }
+
+    #[tokio::test]
+    async fn renamed_header_returns_null_for_the_missing_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csv(
+            &dir.path().join("base.csv"),
+            "event_id,user_id,region,amt,ts",
+            &["1,10,us,100,t0", "2,20,eu,200,t1"],
+        );
+        let table = listing_table(dir.path(), header_format());
+        let (amount, user) = query_sums(table)
+            .await
+            .expect("a federated read still answers");
+        assert_eq!(amount, None, "amount_cents is gone from the header");
+        assert_eq!(user, Some(30), "present columns stay bound by name");
+    }
+
+    #[tokio::test]
+    async fn csv_without_a_header_is_not_wrapped() {
+        let format =
+            HeaderProjectedCsvFormat::wrap(Arc::new(CsvFormat::default().with_has_header(false)));
+        assert!(
+            format.as_ref().downcast_ref::<CsvFormat>().is_some(),
+            "positional CSV must keep DataFusion's reader"
+        );
+        assert!(
+            format
+                .as_ref()
+                .downcast_ref::<HeaderProjectedCsvFormat>()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn project_record_batch_fills_missing_columns_with_null() {
+        let physical = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int64, true),
+            Field::new("amount_cents", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&physical),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+            ],
+        )
+        .expect("batch");
+        let target = Arc::new(Schema::new(vec![
+            Field::new("amount_cents", DataType::Int64, true),
+            Field::new("missing", DataType::Utf8, true),
+            Field::new("user_id", DataType::Int64, true),
+        ]));
+        let projected = project_record_batch(&batch, &target).expect("project");
+        let amounts = projected
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("amount");
+        assert_eq!(amounts.values(), &[100, 200]);
+        let missing = projected
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("missing");
+        assert!(missing.is_null(0) && missing.is_null(1));
+        let users = projected
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("user");
+        assert_eq!(users.values(), &[10, 20]);
+    }
+
+    #[test]
+    fn project_record_batch_keeps_row_count_when_no_file_column_is_projected() {
+        let physical = Arc::new(Schema::new(vec![Field::new(
+            "user_id",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&physical),
+            vec![Arc::new(Int64Array::from(vec![10, 20]))],
+        )
+        .expect("batch");
+        let target = Arc::new(Schema::empty());
+        let projected = project_record_batch(&batch, &target).expect("project");
+        assert_eq!(projected.num_rows(), 2);
+        assert_eq!(projected.num_columns(), 0);
+    }
+
+    #[test]
+    fn parse_header_names_strips_bom_and_quoted_commas() {
+        let options = CsvOptions {
+            delimiter: b',',
+            quote: b'"',
+            ..CsvOptions::default()
+        };
+        let names = parse_header_names(
+            "\u{feff}event_id,\"city, state\",amount_cents\n1,\"a, b\",2\n".as_bytes(),
+            &options,
+        )
+        .expect("header");
+        assert_eq!(
+            names,
+            vec![
+                "event_id".to_string(),
+                "city, state".to_string(),
+                "amount_cents".to_string()
+            ]
+        );
+    }
+}
