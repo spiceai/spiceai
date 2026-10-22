@@ -2925,6 +2925,10 @@ pub struct CayenneTableProvider {
     /// clones (via [`Self::clone_for_write`]) share the same cache entry and
     /// can invalidate it for all concurrent readers with a single store.
     inlined_cache: Arc<ArcSwap<InlinedCache>>,
+    /// Serializes inline-cache population so concurrent misses share one
+    /// rebuild instead of each decoding the full inline corpus. Shared across
+    /// writer clones, like [`Self::inlined_cache`].
+    inlined_populate_lock: Arc<tokio::sync::Mutex<()>>,
     /// In-memory CDC durability tier (`cdc_durability: memory`). A sibling
     /// `ArcSwap` of [`Self::inlined_cache`]: in memory mode the inline CDC write
     /// path appends each batch here (an O(1) `Arc` swap) instead of persisting a
@@ -10480,6 +10484,7 @@ impl CayenneTableProvider {
                 batches: Arc::new(Vec::new()),
                 view: Arc::new(Vec::new()),
             }))),
+            inlined_populate_lock: Arc::new(tokio::sync::Mutex::new(())),
             mem_tier: Arc::new(crate::provider::mem_tier::ShardedMemTier::empty(
                 mem_tier_shards,
             )),
@@ -12878,6 +12883,7 @@ impl CayenneTableProvider {
             pending_durable_tombstone_flips: Arc::clone(&self.pending_durable_tombstone_flips),
             pending_tombstone_deltas: Arc::clone(&self.pending_tombstone_deltas),
             inlined_cache: Arc::clone(&self.inlined_cache),
+            inlined_populate_lock: Arc::clone(&self.inlined_populate_lock),
             // Shared so every writer clone appends to / checkpoints the SAME
             // in-memory CDC tier and observes the same slot-advancer handle.
             mem_tier: Arc::clone(&self.mem_tier),
@@ -32650,6 +32656,15 @@ impl CayenneTableProvider {
     /// caller's load and this store, the stored entry simply misses next read and
     /// is recomputed — no data is lost or corrupted.
     async fn populate_inlined_cache(&self, generation: u64) -> Result<()> {
+        // Single-flight: one population at a time. A waiter whose generation the
+        // previous holder already covered returns without rebuilding. The sentinel
+        // (`u64::MAX`) holds no rows, so it never satisfies a waiter.
+        let _populate = self.inlined_populate_lock.lock().await;
+        let cached_generation = self.inlined_cache.load().generation;
+        if cached_generation != u64::MAX && cached_generation >= generation {
+            return Ok(());
+        }
+
         // cycle-5 TASK 1: if the pending tombstone-delta queue has outgrown its
         // cap, take the bounded over-cap path (full rebuild + queue release). The
         // common per-batch single-tombstone case stays well under the cap and
