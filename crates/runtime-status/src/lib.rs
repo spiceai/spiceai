@@ -109,6 +109,20 @@ pub struct RuntimeStatus {
     /// another status. [`Self::release_dataset_ready`] applies those and
     /// returns to `None`.
     dataset_ready_hold: Arc<RwLock<Option<HashSet<TableReference>>>>,
+    /// Outbound Spice Cloud management connection. Kept out of the component
+    /// readiness map so a failed Cloud export cannot flip `/v1/ready`.
+    management: Arc<RwLock<Option<ManagementConnectionStatus>>>,
+}
+
+/// Status of the outbound Spice Cloud management connection.
+///
+/// Reported on `/v1/status` when `management` is configured. Not part of
+/// [`RuntimeStatus::is_ready`]: query serving must stay up if Cloud export
+/// fails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagementConnectionStatus {
+    pub status: ComponentStatus,
+    pub endpoint: String,
 }
 
 impl Default for RuntimeStatus {
@@ -122,6 +136,7 @@ impl Default for RuntimeStatus {
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             shutdown_token: CancellationToken::new(),
             dataset_ready_hold: Arc::new(RwLock::new(None)),
+            management: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -179,6 +194,30 @@ impl RuntimeStatus {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(component_name.to_string());
         }
+    }
+
+    /// Records the outbound Spice Cloud management connection.
+    ///
+    /// Does not register a readiness component. A failed export must not take
+    /// `/v1/ready` down.
+    pub fn update_management(&self, status: ComponentStatus, endpoint: impl Into<String>) {
+        *self
+            .management
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ManagementConnectionStatus {
+                status,
+                endpoint: endpoint.into(),
+            });
+    }
+
+    /// Returns the Spice Cloud management connection when one has been recorded.
+    #[must_use]
+    pub fn management_connection(&self) -> Option<ManagementConnectionStatus> {
+        self.management
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn update_catalog(&self, catalog_name: impl Into<String>, status: ComponentStatus) {
@@ -904,6 +943,34 @@ mod tests {
         assert_eq!(
             status.get_component_status("dataset:test_dataset"),
             Some(ComponentStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn management_error_does_not_block_readiness() {
+        let status = RuntimeStatus::new();
+        status.update_dataset(&TableReference::bare("orders"), ComponentStatus::Ready);
+        assert!(status.is_ready());
+
+        status.update_management(
+            ComponentStatus::error_with_message(
+                "Missing required secret: api_key. Specify a value.",
+            ),
+            "N/A",
+        );
+
+        assert!(
+            status.is_ready(),
+            "a failed Spice Cloud management connection must not flip /v1/ready"
+        );
+        let management = status
+            .management_connection()
+            .expect("management status is recorded");
+        assert!(management.status.is_error());
+        assert_eq!(management.endpoint, "N/A");
+        assert_eq!(
+            management.status.error_message(),
+            Some("Missing required secret: api_key. Specify a value.")
         );
     }
 

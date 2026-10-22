@@ -2173,13 +2173,14 @@ impl Runtime {
             }
         });
 
-        if let Some(cfg) = self
+        let management_cfg = self
             .app
             .read()
             .await
             .as_ref()
-            .and_then(|app| app.management.as_ref())
-            && let Err(err) = management::init_management(Arc::clone(&self), cfg).await
+            .and_then(|app| app.management.clone());
+        if let Some(cfg) = management_cfg
+            && let Err(err) = management::init_management(Arc::clone(&self), &cfg).await
         {
             tracing::error!("Failed to initialize management of the Spice runtime: {err}");
         }

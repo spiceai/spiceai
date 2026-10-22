@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Spice.ai OSS Authors
+Copyright 2025-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -24,6 +25,7 @@ use app::AppBuilder;
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
 use futures::TryStreamExt;
 use rand::RngExt;
+use runtime::status::ComponentStatus;
 use runtime::{Runtime, datafusion::query::QueryBuilder};
 use runtime::{auth::EndpointAuth, config::Config};
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
@@ -78,7 +80,7 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
             let management = Management {
                 enabled: true,
                 api_key: "auth_key_1".to_string(), // Must match the one used in the data export endpoint
-                params: vec![("data_endpoint".to_string(), data_endpoint_url)]
+                params: vec![("data_endpoint".to_string(), data_endpoint_url.clone())]
                     .into_iter()
                     .collect(),
             };
@@ -94,6 +96,13 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
                 .await);
 
             Arc::clone(&rt).load_components().await;
+
+            let management_status = rt
+                .status()
+                .management_connection()
+                .expect("management status is recorded after a successful Cloud export init");
+            assert_eq!(management_status.status, ComponentStatus::Ready);
+            assert_eq!(management_status.endpoint, data_endpoint_url);
 
             // Verify sink table exist after components are loaded.
             if !rt.datafusion().table_exists(&"scp.task_history".into()) {
@@ -243,4 +252,219 @@ async fn execute_query(rt: &Runtime, query: &str) -> Result<Vec<RecordBatch>, an
         .try_collect::<Vec<RecordBatch>>()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to execute query: {e}"))
+}
+
+/// The documented minimal `management:` block: `api_key` only, no `params.region`.
+/// A missing secret must fail on `api_key` rather than the spice.ai dataset key
+/// `spiceai_region` (regression for the documented Cloud Connect happy path).
+#[tokio::test]
+async fn management_minimal_block_missing_secret_errors_before_region() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("runtime::management=debug,integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let management = Management {
+                enabled: true,
+                api_key: "${secrets:MANAGEMENT_TEST_UNSET_API_KEY_9f3a}".to_string(),
+                params: HashMap::new(),
+            };
+
+            let app = AppBuilder::new("management_minimal_missing_secret")
+                .with_management(management)
+                .build();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            Arc::clone(&rt).load_components().await;
+
+            let management_status = rt
+                .status()
+                .management_connection()
+                .expect("failed management init still records status");
+            assert!(
+                management_status.status.is_error(),
+                "missing api_key must be an Error, got {:?}",
+                management_status.status
+            );
+            let message = management_status
+                .status
+                .error_message()
+                .expect("error message");
+            assert!(
+                message.starts_with("Missing required secret: api_key"),
+                "expected the documented api_key secret error before any region error, got: {message}"
+            );
+            assert!(
+                !message.contains("spiceai_region"),
+                "management must not ask for the dataset key spiceai_region: {message}"
+            );
+            assert_eq!(
+                management_status.endpoint,
+                "https://us-east-1-prod-aws-flight.spiceai.io"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Documented minimal `management:` block with a literal api_key and no region.
+/// Must get past the spice.ai `spiceai_region` required-parameter check and
+/// target the Spice Cloud default Flight endpoint (`us-east-1`).
+#[tokio::test]
+async fn management_minimal_block_defaults_region() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("runtime::management=debug,integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let management = Management {
+                enabled: true,
+                api_key: "000000|bogus-minimal-block".to_string(),
+                params: HashMap::new(),
+            };
+
+            let app = AppBuilder::new("management_minimal_block")
+                .with_management(management)
+                .build();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            Arc::clone(&rt).load_components().await;
+
+            let management_status = rt
+                .status()
+                .management_connection()
+                .expect("management init records status for the api_key-only block");
+            assert_eq!(
+                management_status.endpoint, "https://us-east-1-prod-aws-flight.spiceai.io",
+                "the documented minimal block must target the Spice Cloud default region"
+            );
+            if management_status.status.is_error() {
+                let message = management_status
+                    .status
+                    .error_message()
+                    .expect("error message");
+                assert!(
+                    !message.contains("spiceai_region"),
+                    "minimal block must not fail on the dataset key spiceai_region: {message}"
+                );
+                assert!(
+                    !message.contains("Missing required parameter"),
+                    "minimal block must not fail as a missing parameter: {message}"
+                );
+            }
+
+            Ok(())
+        })
+        .await
+}
+
+/// `/v1/status` includes the outbound Spice Cloud management connection when
+/// `management` is configured.
+#[tokio::test]
+async fn management_status_is_exposed_on_v1_status() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("runtime::management=debug,integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let data_endpoint = create_data_export_endpoint().await?;
+            let data_endpoint_url = data_endpoint.endpoint().to_string();
+
+            let management = Management {
+                enabled: true,
+                api_key: "auth_key_1".to_string(),
+                params: vec![("data_endpoint".to_string(), data_endpoint_url.clone())]
+                    .into_iter()
+                    .collect(),
+            };
+
+            let app = AppBuilder::new("management_status_app")
+                .with_runtime(runtime_recording_query_previews())
+                .with_management(management)
+                .build();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            Arc::clone(&rt).load_components().await;
+
+            let (http_port, server_handle, shutdown) = start_http_server(Arc::clone(&rt)).await?;
+            let status_url = format!("http://127.0.0.1:{http_port}/v1/status?format=json");
+            let rows: Vec<serde_json::Value> = reqwest::get(&status_url)
+                .await
+                .map_err(|e| anyhow::anyhow!("GET /v1/status failed: {e}"))?
+                .json()
+                .await
+                .map_err(|e| anyhow::anyhow!("parse /v1/status: {e}"))?;
+
+            let management = rows
+                .iter()
+                .find(|row| {
+                    row.get("name").and_then(serde_json::Value::as_str) == Some("management")
+                })
+                .ok_or_else(|| anyhow::anyhow!("/v1/status omitted management: {rows:?}"))?;
+            assert_eq!(
+                management.get("status").and_then(serde_json::Value::as_str),
+                Some("Ready")
+            );
+            assert_eq!(
+                management
+                    .get("endpoint")
+                    .and_then(serde_json::Value::as_str),
+                Some(data_endpoint_url.as_str())
+            );
+
+            shutdown.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(15), server_handle).await;
+            data_endpoint.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+async fn start_http_server(
+    rt: Arc<Runtime>,
+) -> Result<
+    (
+        u16,
+        JoinHandle<Result<(), runtime::Error>>,
+        CancellationToken,
+    ),
+    anyhow::Error,
+> {
+    let mut rng = rand::rng();
+    let http_port: u16 = rng.random_range(50000..60000);
+    let flight_port: u16 = http_port + 1;
+    let api_config = Config::new()
+        .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
+        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
+
+    let shutdown = CancellationToken::new();
+    let shutdown_token = shutdown.clone();
+    let server_rt = Arc::clone(&rt);
+    let server_handle = tokio::spawn(async move {
+        tokio::select! {
+            result = Box::pin(Arc::clone(&server_rt).start_servers(
+                api_config,
+                None,
+                EndpointAuth::default(),
+            )) => result,
+            () = shutdown_token.cancelled() => {
+                server_rt.shutdown().await;
+                Ok(())
+            },
+        }
+    });
+
+    let ready = wait_until_true(Duration::from_secs(10), || async {
+        reqwest::get(format!("http://127.0.0.1:{http_port}/health"))
+            .await
+            .is_ok()
+    })
+    .await;
+    if !ready {
+        shutdown.cancel();
+        return Err(anyhow::anyhow!(
+            "HTTP server did not become healthy on port {http_port}"
+        ));
+    }
+
+    Ok((http_port, server_handle, shutdown))
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,7 +25,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::{config, status::ComponentStatus};
+use crate::{
+    config,
+    status::{ComponentStatus, ManagementConnectionStatus, RuntimeStatus},
+};
 
 use super::Format;
 
@@ -62,6 +65,8 @@ pub struct ConnectionDetails {
 /// Check Runtime Status
 ///
 /// Return the status of all connections (http, flight, metrics, opentelemetry) in the runtime.
+/// When `management` is configured, an additional `management` entry reports the outbound
+/// Spice Cloud connection.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/status",
@@ -107,13 +112,55 @@ pub(crate) async fn get(
     Extension(cfg): Extension<Arc<config::Config>>,
     Extension(with_metrics): Extension<Option<SocketAddr>>,
     Extension(metrics_tls): Extension<MetricsTlsEnabled>,
+    Extension(runtime_status): Extension<Arc<RuntimeStatus>>,
     Query(params): Query<QueryParams>,
 ) -> Response {
     let cfg = cfg.as_ref();
     let flight_url = cfg.flight_bind_address.to_string();
     let flight_status = get_flight_status(&flight_url).await;
 
-    let details = vec![
+    let metrics_status = match with_metrics {
+        Some(metrics_url) => {
+            match get_metrics_status(&metrics_url.to_string(), metrics_tls.0).await {
+                Ok(status) => status,
+                Err(e) => {
+                    tracing::error!("Error getting metrics status from {metrics_url}: {e}");
+                    ComponentStatus::error_with_message(e.to_string())
+                }
+            }
+        }
+        None => ComponentStatus::Disabled,
+    };
+
+    let details = connection_details(
+        cfg,
+        with_metrics,
+        metrics_status,
+        flight_status,
+        runtime_status.management_connection(),
+    );
+
+    match params.format {
+        Format::Json => (status::StatusCode::OK, Json(details)).into_response(),
+        Format::Csv => match convert_details_to_csv(&details) {
+            Ok(csv) => (status::StatusCode::OK, csv).into_response(),
+            Err(e) => {
+                tracing::error!("Error converting to CSV: {e}");
+                (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        },
+    }
+}
+
+fn connection_details(
+    cfg: &config::Config,
+    metrics_endpoint: Option<SocketAddr>,
+    metrics_status: ComponentStatus,
+    flight_status: ComponentStatus,
+    management: Option<ManagementConnectionStatus>,
+) -> Vec<ConnectionDetails> {
+    let flight_url = cfg.flight_bind_address.to_string();
+    let mut details = vec![
         ConnectionDetails {
             name: "http",
             endpoint: cfg.http_bind_address.to_string(),
@@ -126,38 +173,26 @@ pub(crate) async fn get(
         },
         ConnectionDetails {
             name: "metrics",
-            endpoint: with_metrics.map_or("N/A".to_string(), |addr| addr.to_string()),
-            status: match with_metrics {
-                Some(metrics_url) => {
-                    match get_metrics_status(&metrics_url.to_string(), metrics_tls.0).await {
-                        Ok(status) => status,
-                        Err(e) => {
-                            tracing::error!("Error getting metrics status from {metrics_url}: {e}");
-                            ComponentStatus::error_with_message(e.to_string())
-                        }
-                    }
-                }
-                None => ComponentStatus::Disabled,
-            },
+            endpoint: metrics_endpoint.map_or("N/A".to_string(), |addr| addr.to_string()),
+            status: metrics_status,
         },
         // OpenTelemetry is served on the same gRPC port as Flight
         ConnectionDetails {
             name: "opentelemetry",
-            status: flight_status.clone(),
+            status: flight_status,
             endpoint: flight_url,
         },
     ];
 
-    match params.format {
-        Format::Json => (status::StatusCode::OK, Json(details)).into_response(),
-        Format::Csv => match convert_details_to_csv(&details) {
-            Ok(csv) => (status::StatusCode::OK, csv).into_response(),
-            Err(e) => {
-                tracing::error!("Error converting to CSV: {e}");
-                (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-            }
-        },
+    if let Some(management) = management {
+        details.push(ConnectionDetails {
+            name: "management",
+            endpoint: management.endpoint,
+            status: management.status,
+        });
     }
+
+    details
 }
 
 fn convert_details_to_csv(
@@ -236,5 +271,56 @@ async fn get_metrics_status(
         Ok(ComponentStatus::Ready)
     } else {
         Ok(ComponentStatus::error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> config::Config {
+        config::Config::new()
+    }
+
+    #[test]
+    fn omits_management_when_unconfigured() {
+        let details = connection_details(
+            &test_config(),
+            None,
+            ComponentStatus::Disabled,
+            ComponentStatus::Ready,
+            None,
+        );
+        assert_eq!(details.len(), 4);
+        assert!(details.iter().all(|detail| detail.name != "management"));
+    }
+
+    #[test]
+    fn includes_management_when_configured() {
+        let details = connection_details(
+            &test_config(),
+            None,
+            ComponentStatus::Disabled,
+            ComponentStatus::Ready,
+            Some(ManagementConnectionStatus {
+                status: ComponentStatus::error_with_message(
+                    "Missing required secret: api_key. Specify a value.",
+                ),
+                endpoint: "https://us-east-1-prod-aws-flight.spiceai.io".to_string(),
+            }),
+        );
+        let management = details
+            .iter()
+            .find(|detail| detail.name == "management")
+            .expect("management row");
+        assert_eq!(
+            management.endpoint,
+            "https://us-east-1-prod-aws-flight.spiceai.io"
+        );
+        assert!(management.status.is_error());
+        assert_eq!(
+            management.status.error_message(),
+            Some("Missing required secret: api_key. Specify a value.")
+        );
     }
 }
