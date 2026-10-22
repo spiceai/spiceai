@@ -70557,6 +70557,160 @@ mod tests {
         );
     }
 
+    /// A durable-mode table whose small inserts land in the inline corpus.
+    async fn create_durable_inline_table(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, TempDir) {
+        let (provider, _catalog, tmp) = create_cdc_upsert_table_with_vortex_config(
+            table_name,
+            runtime_env,
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::File,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        (provider, tmp)
+    }
+
+    fn inline_row_count(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    /// A miss that waited on inline-cache population returns without rebuilding
+    /// when the cache stored meanwhile already covers its generation, even if a
+    /// structural change landed after it read that generation. Proven by hiding
+    /// `cayenne_inlined_data` after the first population: the covered population
+    /// succeeds only because it never reads the corpus, and an uncovered one fails.
+    #[tokio::test]
+    async fn inline_cache_population_returns_when_its_generation_is_covered() {
+        let ctx = SessionContext::new();
+        let (provider, tmp) =
+            create_durable_inline_table("inline_population_covered", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
+        )
+        .await;
+
+        // A waiter read this generation before the structural change below.
+        let waiter_generation = provider.inlined_generation();
+        provider
+            .populate_inlined_cache(waiter_generation)
+            .await
+            .expect("first population");
+        provider.bump_inlined_structural_epoch();
+
+        let conn = open_metastore_db(tmp.path());
+        conn.execute_batch(
+            "ALTER TABLE cayenne_inlined_data RENAME TO cayenne_inlined_data_hidden;",
+        )
+        .expect("hide the inline-data table");
+
+        provider
+            .populate_inlined_cache(waiter_generation)
+            .await
+            .expect("a waiter whose generation the cache covers must not rebuild");
+
+        // Control: the live generation is not covered, so it must rebuild, which
+        // the hidden table makes fail.
+        assert!(
+            provider
+                .populate_inlined_cache(provider.inlined_generation())
+                .await
+                .is_err(),
+            "an uncovered generation must rebuild from the corpus"
+        );
+    }
+
+    /// The empty sentinel never covers a waiter: populating from it rebuilds, so
+    /// the inline rows are read rather than served as an empty view.
+    #[tokio::test]
+    async fn inline_cache_population_rebuilds_from_the_empty_sentinel() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_durable_inline_table("inline_population_sentinel", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
+        )
+        .await;
+
+        provider.drop_inlined_cache_for_test();
+        let batches = provider
+            .read_inlined_batches()
+            .await
+            .expect("read the inline corpus");
+        assert_eq!(inline_row_count(&batches), 3);
+    }
+
+    /// A write that advances the generation after the cache was populated is
+    /// visible to the next read: the stored cache does not cover the new
+    /// generation, so population runs.
+    #[tokio::test]
+    async fn inline_cache_population_reads_a_write_newer_than_the_cache() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_durable_inline_table("inline_population_newer_write", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        assert_eq!(
+            inline_row_count(&provider.read_inlined_batches().await.expect("warm the cache")),
+            1
+        );
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+        assert_eq!(
+            inline_row_count(
+                &provider
+                    .read_inlined_batches()
+                    .await
+                    .expect("read after the write")
+            ),
+            2
+        );
+    }
+
+    /// Concurrent misses after a structural change all return the full inline
+    /// corpus, and population completes: waiters on the single-flight lock
+    /// neither see a partial view nor deadlock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_inline_cache_misses_return_the_full_corpus() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_durable_inline_table("inline_population_concurrent", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let ids: Vec<i64> = (0..200).collect();
+        let values: Vec<i64> = ids.iter().map(|id| id * 10).collect();
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &ids, &values)).await;
+
+        let provider = Arc::new(provider);
+        provider.bump_inlined_structural_epoch();
+        let readers: Vec<_> = (0..16)
+            .map(|_| {
+                let provider = Arc::clone(&provider);
+                tokio::spawn(async move { provider.read_inlined_batches().await })
+            })
+            .collect();
+        let results = tokio::time::timeout(
+            Duration::from_secs(30),
+            futures::future::join_all(readers),
+        )
+        .await
+        .expect("concurrent inline-cache population must complete");
+        for result in results {
+            let batches = result
+                .expect("reader task")
+                .expect("read the inline corpus");
+            assert_eq!(inline_row_count(&batches), 200);
+        }
+    }
+
     /// A cold-promotion mem-tier checkpoint serializes with any in-flight mem-tier
     /// checkpoint. A checkpoint holds `mem_checkpoint_lock` across its whole
     /// capture -> encode -> publish -> clear lifecycle, so while one is in flight a
