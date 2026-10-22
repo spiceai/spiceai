@@ -73,16 +73,18 @@ const MAX_OFFSET_BYTES: usize = 0x7FFF_FFFF;
 ///
 /// A sort reserves from the pool of the context it runs in. A pool shared with
 /// queries must keep most of its room for them, so a sort there plans to hold
-/// at most a quarter of it. A pool set aside for maintenance, such as Cayenne's
-/// compaction pool, holds only work like this, so a sort there may plan on half.
-/// Either way every sort in one pool shares at most half of it (see
-/// [`Admission`]), and the pool's limit still binds every reservation.
+/// at most a quarter of it, and every sort in it shares at most half of it (see
+/// [`Admission`]). A pool set aside for maintenance, such as Cayenne's
+/// compaction pool, holds only work like this, so a sort there may plan on all
+/// of it: a promotion's 8 GiB run then sorts in memory instead of spilling half
+/// of itself to merge back. The pool's limit still binds every reservation, and
+/// a sort the pool refuses writes what it holds to disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SortBudget {
     /// A pool shared with queries: a quarter of it.
     #[default]
     Shared,
-    /// A pool set aside for maintenance work: half of it.
+    /// A pool set aside for maintenance work: all of it.
     Dedicated,
 }
 
@@ -91,7 +93,15 @@ impl SortBudget {
     fn bytes(self, limit: usize) -> usize {
         match self {
             SortBudget::Shared => limit / 4,
-            SortBudget::Dedicated => limit / 2,
+            SortBudget::Dedicated => limit,
+        }
+    }
+
+    /// The bytes of a pool of `limit` bytes every sort in it shares.
+    fn shared_by_all(self, limit: usize) -> usize {
+        match self {
+            SortBudget::Shared => limit / 2,
+            SortBudget::Dedicated => limit,
         }
     }
 }
@@ -153,8 +163,8 @@ fn sort_in_runs_with(
     crate::stream_utils::stream_plan(Box::pin(RecordBatchStreamAdapter::new(schema, merged)))
 }
 
-/// Memory admission for every [`sort_in_runs`] sharing one memory pool: half the
-/// pool, in MiB, as semaphore permits. A plan that writes runs holds permits for
+/// Memory admission for every [`sort_in_runs`] sharing one memory pool: their
+/// share of the pool (see [`SortBudget`]), in MiB, as semaphore permits. A plan that writes runs holds permits for
 /// its partitions' chunks until its merged stream is dropped, so large sorts in
 /// the same pool queue behind each other instead of each sizing itself against
 /// the whole pool.
@@ -173,8 +183,10 @@ static ADMISSIONS: LazyLock<Mutex<Vec<PoolAdmission>>> = LazyLock::new(|| Mutex:
 type PoolAdmission = (Weak<dyn MemoryPool>, Arc<Admission>);
 
 impl Admission {
-    /// The admission of `context`'s pool, or `None` for an unbounded pool.
-    fn of(context: &TaskContext) -> Option<Arc<Admission>> {
+    /// The admission of `context`'s pool, or `None` for an unbounded pool. The
+    /// first sort in a pool sizes it by its budget; a pool is either shared with
+    /// queries or set aside for maintenance, so every sort in it has the same one.
+    fn of(context: &TaskContext, budget: SortBudget) -> Option<Arc<Admission>> {
         let pool = context.memory_pool();
         let MemoryLimit::Finite(limit) = pool.memory_limit() else {
             return None;
@@ -187,7 +199,7 @@ impl Admission {
         {
             return Some(Arc::clone(admission));
         }
-        let total = u32::try_from((limit / 2 / MIB).max(1)).unwrap_or(u32::MAX);
+        let total = u32::try_from((budget.shared_by_all(limit) / MIB).max(1)).unwrap_or(u32::MAX);
         let admission = Arc::new(Admission {
             permits: Arc::new(Semaphore::new(total as usize)),
             total,
@@ -922,7 +934,7 @@ async fn sort_then_merge(
         .output_partitioning()
         .partition_count()
         .max(1);
-    let admission = Admission::of(&ctx);
+    let admission = Admission::of(&ctx, config.budget);
     let started = std::time::Instant::now();
     let metrics = ExecutionPlanMetricsSet::new();
     let spill_metrics = SpillMetrics::new(&metrics, 0);
@@ -1829,9 +1841,12 @@ mod tests {
     }
 
     #[test]
-    fn a_sort_in_a_shared_pool_plans_on_a_quarter_of_it_and_in_a_dedicated_one_on_half() {
+    fn a_sort_in_a_shared_pool_plans_on_a_quarter_of_it_and_in_a_dedicated_one_on_all_of_it() {
         assert_eq!(SortBudget::Shared.bytes(400 * MIB), 100 * MIB);
-        assert_eq!(SortBudget::Dedicated.bytes(400 * MIB), 200 * MIB);
+        assert_eq!(SortBudget::Dedicated.bytes(400 * MIB), 400 * MIB);
+        // Every sort in a shared pool together leaves half of it to queries.
+        assert_eq!(SortBudget::Shared.shared_by_all(400 * MIB), 200 * MIB);
+        assert_eq!(SortBudget::Dedicated.shared_by_all(400 * MIB), 400 * MIB);
         assert_eq!(SortBudget::default(), SortBudget::Shared);
     }
 

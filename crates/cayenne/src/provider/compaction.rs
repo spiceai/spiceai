@@ -343,8 +343,8 @@ pub fn set_compaction_runtime_env(env: Arc<RuntimeEnv>) {
 }
 
 /// The share of `task_ctx`'s memory pool a sort of maintenance work may plan to
-/// hold: half when it sorts in the compaction pool, which only maintenance uses,
-/// and a quarter in any pool shared with queries, which needs the rest.
+/// hold: all of the compaction pool, which only maintenance uses, and a quarter
+/// of any pool shared with queries, which needs the rest.
 pub(crate) fn maintenance_sort_budget(
     task_ctx: &datafusion_execution::TaskContext,
 ) -> util::sorted_runs::SortBudget {
