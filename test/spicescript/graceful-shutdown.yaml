@@ -119,4 +119,6 @@ steps:
     oracle-sql: SELECT * FROM service_data
     eventually: 60s
     when: { engine: cayenne }
-  - assert-log: { clean: true }
+  # A refresh in flight when SIGTERM arrives can log this as an ERROR,
+  # though the shutdown is clean and no data is affected.
+  - assert-log: { clean: true, allow: ['ERROR runtime_table::accelerated::refresh_task: Failed to provide stats on the amount of data written into data_(full|drop) *$'] }
