@@ -3737,6 +3737,50 @@ mod tests {
         );
     }
 
+    /// Regression test for #14714: a timestamp shifted by an interval reaches
+    /// Turso as `datetime(ts, '-1 hours')`, which answers
+    /// `YYYY-MM-DD HH:MM:SS[.SSS]` in UTC rather than RFC3339. It is read as
+    /// that UTC instant, not as NULL.
+    #[test]
+    fn a_timestamp_sqlite_datetime_answers_is_read_as_utc() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::{DataType, Field, TimeUnit};
+
+        let rows = vec![
+            vec![TursoValue::Text("2026-10-02 11:34:56".to_string())],
+            vec![TursoValue::Text("2026-10-02 11:34:56.125".to_string())],
+            vec![TursoValue::Text("2026-10-02T11:34:56+00:00".to_string())],
+            vec![TursoValue::Text("2026-10-02".to_string())],
+        ];
+        for tz in [None, Some(Arc::from("+05:00"))] {
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+                true,
+            )]));
+            let batch =
+                TursoTableProvider::values_to_record_batch(&rows, &schema).expect("values convert");
+            let arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("TimestampMicrosecondArray");
+            // 2026-10-02T11:34:56Z
+            let expected = 1_790_940_896_000_000;
+            assert_eq!(
+                arr.iter().collect::<Vec<_>>(),
+                vec![
+                    Some(expected),
+                    Some(expected + 125_000),
+                    Some(expected),
+                    // A date alone is no timestamp `datetime()` answers.
+                    None,
+                ],
+                "time zone {tz:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_rfc3339_timestamp_outside_nanos_range() {
         use arrow::datatypes::{DataType, Field, TimeUnit};

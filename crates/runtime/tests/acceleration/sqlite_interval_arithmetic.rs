@@ -123,29 +123,48 @@ async fn interval_arithmetic_matches_local_evaluation(engine: &str) -> Result<()
 
             // The shifts reach the engine, each through the function its operand's
             // type calls for, so the agreement above is not local evaluation
-            // agreeing with itself.
-            for (sql, rendering) in [
+            // agreeing with itself. A projected shift is federated on both
+            // engines; a filter on one is kept above the `SQLite` scan.
+            for (sql, rendering, not_rendering) in [
                 (
-                    "EXPLAIN SELECT id FROM accelerated \
-                     WHERE ts - INTERVAL '1 hour' < TIMESTAMP '2026-10-02 10:00:00'",
+                    "EXPLAIN SELECT id, ts - INTERVAL '1 hour' AS shifted FROM accelerated",
                     "datetime(",
+                    "date(",
                 ),
                 (
-                    "EXPLAIN SELECT id FROM accelerated WHERE d + INTERVAL '1 day' = DATE '2026-10-03'",
+                    "EXPLAIN SELECT id, d + INTERVAL '1 day' AS next_day FROM accelerated",
                     "date(",
+                    "datetime(",
                 ),
             ] {
                 let plan = to_pretty_display(&run_query(&rt, sql).await?)?.to_string();
                 let remote_sql = executor_sql(&plan);
                 assert!(
-                    remote_sql.contains(rendering),
-                    "{engine}: the shift must reach the engine as {rendering}…); the SQL sent was:\n{remote_sql}\nplan:\n{plan}"
+                    remote_sql.contains(rendering) && !remote_sql.contains(not_rendering),
+                    "{engine}: the shift must reach the engine as {rendering}…) and not as \
+                     {not_rendering}…); the SQL sent was:\n{remote_sql}\nplan:\n{plan}"
                 );
             }
 
             // Pinned rows, so the agreement above is not two engines agreeing on
-            // a wrong answer. A date-only shift kept row 1, whose shifted
-            // timestamp is 11:34:56.
+            // a wrong answer. A date-only shift answered midnight, and kept row 1,
+            // whose shifted timestamp is 11:34:56.
+            assert_batches_eq!(
+                [
+                    "+----+---------------------+",
+                    "| id | shifted             |",
+                    "+----+---------------------+",
+                    "| 1  | 2026-10-02T11:34:56 |",
+                    "| 2  | 2026-10-01T23:30:00 |",
+                    "| 3  | 2026-01-31T22:59:59 |",
+                    "+----+---------------------+",
+                ],
+                &run_query(
+                    &rt,
+                    "SELECT id, ts - INTERVAL '1 hour' AS shifted FROM accelerated ORDER BY id",
+                )
+                .await?
+            );
             assert_batches_eq!(
                 ["+----+", "| id |", "+----+", "| 2  |", "| 3  |", "+----+"],
                 &run_query(
