@@ -1618,6 +1618,9 @@ async fn metrics_scenario(
     assert_eq!(rows(&reader, modules).await?.len(), 3);
 
     // Load a second snapshot, so a rollback to snapshot 0 is older than the loaded one.
+    // SANDBOX ONLY: let the writer publish more snapshots of the 3 rows first, as a
+    // slow runner does.
+    tokio::time::sleep(Duration::from_secs(5)).await;
     std::fs::write(dir.path().join("modules.csv"), GROWN_CSV)?;
     wait_for_rows(&writer, modules, 5).await?;
     // A full refresh publishes a snapshot after every refresh, so snapshots of the 3
