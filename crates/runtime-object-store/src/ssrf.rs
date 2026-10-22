@@ -114,9 +114,6 @@ pub fn redirect_target_is_internal(url: &Url) -> bool {
     }
 }
 
-/// Error returned by a redirect policy that refuses an internal target.
-pub const REDIRECT_TO_INTERNAL_ERROR: &str = "redirect to a private address is not allowed";
-
 /// Scheme prefix under which `http`/`https` URL tables register their object stores.
 ///
 /// A URL table's store refuses internal destinations; a dataset's store for the same host does

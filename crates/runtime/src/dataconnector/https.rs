@@ -987,7 +987,7 @@ impl Https {
                 // closure, so well-known internal names are rejected by literal
                 // match.
                 if ssrf::redirect_target_is_internal(attempt.url()) {
-                    return attempt.error(ssrf::REDIRECT_TO_INTERNAL_ERROR);
+                    return attempt.error("redirect to a private address is not allowed");
                 }
                 attempt.follow()
             }))

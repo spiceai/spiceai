@@ -973,17 +973,34 @@ mod tests {
 
     #[tokio::test]
     async fn object_store_url_tables_reject_a_region_or_account_with_url_syntax() {
-        for url in [
-            "s3://bucket/data.parquet#region=x@10.0.0.1:9000/",
-            "s3://bucket/data.parquet#region=",
-            "abfss://container/data/#account=evil.example.com/",
-            "abfss://container/data/#account=x@10.0.0.1",
+        for (url, location, key) in [
+            (
+                "s3://bucket/data.parquet#region=x@10.0.0.1:9000/",
+                "s3://bucket/data.parquet",
+                "region",
+            ),
+            (
+                "s3://bucket/data.parquet#region=",
+                "s3://bucket/data.parquet",
+                "region",
+            ),
+            (
+                "abfss://container/data/#account=evil.example.com/",
+                "abfss://container/data/",
+                "account",
+            ),
+            (
+                "abfss://container/data/#account=x@10.0.0.1",
+                "abfss://container/data/",
+                "account",
+            ),
         ] {
-            let error = try_new_without_state(url).await;
-            assert!(
-                error.contains("sets an invalid `region` in its URL fragment")
-                    || error.contains("sets an invalid `account` in its URL fragment"),
-                "{url}: {error}"
+            assert_eq!(
+                try_new_without_state(url).await,
+                format!(
+                    "Error during planning: URL table {location:?} sets an invalid `{key}` in its URL fragment. A `region` contains only letters, digits, and hyphens, and an `account` only letters and digits."
+                ),
+                "{url}"
             );
         }
     }

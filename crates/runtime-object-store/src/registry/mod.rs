@@ -561,9 +561,9 @@ impl SpiceObjectStoreRegistry {
         let mut connector = SpawnedReqwestConnector::new(self.io_runtime.clone());
         if let Some(guard) = guard {
             // A guarded connector cannot read `object_store`'s private default user agent.
-            if let Ok(user_agent) = HeaderValue::from_str(&util::spiceai_user_agent()) {
-                client_options = client_options.with_user_agent(user_agent);
-            }
+            let user_agent = HeaderValue::from_str(&util::spiceai_user_agent())
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            client_options = client_options.with_user_agent(user_agent);
             connector = connector.with_destination_guard(guard);
         }
         let builder = HttpBuilder::new()
@@ -1229,9 +1229,14 @@ mod tests {
             "this test needs {} unset",
             ssrf::ALLOW_PRIVATE_HOSTS_ENV
         );
-        registry
+        let error = registry
             .get_store(&url_table_store_url(&origin))
-            .expect_err("the URL table store for a loopback origin is refused");
+            .expect_err("the URL table store for a loopback origin is refused")
+            .to_string();
+        assert!(
+            error.contains("targets a private, loopback, or link-local address"),
+            "{error}"
+        );
         assert_eq!(target_hits.load(Ordering::SeqCst), 1);
     }
 
