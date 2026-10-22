@@ -39,8 +39,8 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::sql::parser::{CopyToSource, DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
     AccessExpr, Expr, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments,
-    JsonPathElem, ListAggOnOverflow, Statement as SQLStatement, Subscript, Value, Visit, Visitor,
-    WindowFrameBound, WindowType,
+    GroupByExpr, JsonPathElem, ListAggOnOverflow, OrderBy, OrderByKind, Query, SelectItem, SetExpr,
+    Statement as SQLStatement, Subscript, Value, Visit, Visitor, WindowFrameBound, WindowType,
 };
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 
@@ -54,8 +54,32 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 /// one because the guard and the planner run on the same worker stack. 512 sits
 /// comfortably below that floor while still admitting any realistic query —
 /// legitimate expressions almost never nest beyond a few dozen levels, and an
-/// `IN` list or `VALUES` clause is wide, not deep, so it is unaffected.
+/// `IN` list or `VALUES` clause is wide, not deep, so it is unaffected. An
+/// expression that becomes a column name overflows sooner in a debug build;
+/// see [`MAX_NAMED_EXPR_DEPTH`].
 pub(crate) const MAX_SQL_EXPR_DEPTH: usize = 512;
+
+/// Maximum nesting depth of an expression whose text becomes a column name:
+/// a `SELECT` item, a `GROUP BY` or query `ORDER BY` expression, or a `VALUES`
+/// cell.
+///
+/// `DataFusion` renders these expressions into their output column name
+/// (`SchemaDisplay`, through `validate_unique_names` for a projection and
+/// `rewrite_in_terms_of_projection` for `ORDER BY`), and that rendering
+/// recurses once per level without the stack growth the planner's own
+/// traversals have. Its frames are several times larger without
+/// optimization: on a default ~2 MiB Tokio worker stack, a debug build aborts
+/// the process on a `SELECT 1+1+…` chain at a depth of ~210 and on an
+/// `ORDER BY id+1+…` chain at ~125, while a `WHERE` or `JOIN … ON` chain of 511
+/// terms still plans. A release build plans every one of these at 511, so it
+/// keeps [`MAX_SQL_EXPR_DEPTH`] and accepts the same queries either way; a
+/// debug build uses 64, about half the lowest debug abort depth and above the
+/// parser's own nesting limit of 50 for parentheses and function arguments.
+pub(crate) const MAX_NAMED_EXPR_DEPTH: usize = if cfg!(debug_assertions) {
+    64
+} else {
+    MAX_SQL_EXPR_DEPTH
+};
 
 /// Maximum parenthesis-nesting depth accepted in an Arrow type string (the
 /// literal second argument of `arrow_cast`).
@@ -121,8 +145,18 @@ struct DepthCollector {
 impl Visitor for DepthCollector {
     type Break = ();
 
+    // Runs before the visitor descends into the query, so an over-deep named
+    // expression is rejected before `pre_visit_expr` walks it.
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if let Err(e) = check_named_expr_depths(query) {
+            self.result = Err(e);
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-        if let Err(e) = check_expr_depth(expr) {
+        if let Err(e) = check_expr_depth(expr, MAX_SQL_EXPR_DEPTH, too_deep_expr_error) {
             self.result = Err(e);
             return ControlFlow::Break(());
         }
@@ -130,15 +164,76 @@ impl Visitor for DepthCollector {
     }
 }
 
-/// Iteratively measure the nesting depth of one expression tree, and the
-/// parenthesis depth of any `arrow_cast` type string within it, using an
-/// explicit work stack so the measurement itself never recurses.
-fn check_expr_depth(root: &Expr) -> DFResult<()> {
+/// Bound the expressions of `query` that become column names by
+/// [`MAX_NAMED_EXPR_DEPTH`].
+///
+/// A subquery in `FROM` or in an expression is a [`Query`] of its own, which
+/// the statement visitor reaches and checks separately.
+fn check_named_expr_depths(query: &Query) -> DFResult<()> {
+    let check = |expr: &Expr| check_expr_depth(expr, MAX_NAMED_EXPR_DEPTH, too_deep_named_error);
+    if let Some(OrderBy {
+        kind: OrderByKind::Expressions(order_by),
+        ..
+    }) = &query.order_by
+    {
+        for item in order_by {
+            check(&item.expr)?;
+        }
+    }
+    let mut bodies: Vec<&SetExpr> = vec![query.body.as_ref()];
+    while let Some(body) = bodies.pop() {
+        match body {
+            SetExpr::Select(select) => {
+                for item in &select.projection {
+                    match item {
+                        SelectItem::UnnamedExpr(expr)
+                        | SelectItem::ExprWithAlias { expr, .. }
+                        | SelectItem::ExprWithAliases { expr, .. } => check(expr)?,
+                        SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(_) => {}
+                    }
+                }
+                if let GroupByExpr::Expressions(group_by, _) = &select.group_by {
+                    for expr in group_by {
+                        check(expr)?;
+                    }
+                }
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                bodies.push(left.as_ref());
+                bodies.push(right.as_ref());
+            }
+            SetExpr::Values(values) => {
+                for row in &values.rows {
+                    for expr in &row.content {
+                        check(expr)?;
+                    }
+                }
+            }
+            SetExpr::Query(_)
+            | SetExpr::Insert(_)
+            | SetExpr::Update(_)
+            | SetExpr::Delete(_)
+            | SetExpr::Merge(_)
+            | SetExpr::Table(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Iteratively measure the nesting depth of one expression tree against
+/// `max_depth`, and the parenthesis depth of any `arrow_cast` type string
+/// within it, using an explicit work stack so the measurement itself never
+/// recurses.
+fn check_expr_depth(
+    root: &Expr,
+    max_depth: usize,
+    too_deep: fn() -> DataFusionError,
+) -> DFResult<()> {
     let mut stack: Vec<(&Expr, usize)> = vec![(root, 1)];
     let mut children: Vec<&Expr> = Vec::new();
     while let Some((expr, depth)) = stack.pop() {
-        if depth > MAX_SQL_EXPR_DEPTH {
-            return Err(too_deep_expr_error());
+        if depth > max_depth {
+            return Err(too_deep());
         }
         check_arrow_cast_type_depth(expr)?;
         children.clear();
@@ -155,6 +250,14 @@ fn too_deep_expr_error() -> DataFusionError {
         "Query rejected: an expression is nested more than {MAX_SQL_EXPR_DEPTH} levels deep. \
          Simplify the query (for example, replace a long chain of OR/AND conditions with an IN list \
          or a join)."
+    ))
+}
+
+fn too_deep_named_error() -> DataFusionError {
+    DataFusionError::Plan(format!(
+        "Query rejected: a selected, grouped, ordered, or VALUES expression is nested more than \
+         {MAX_NAMED_EXPR_DEPTH} levels deep. Simplify the expression (for example, compute part \
+         of a long chain of +, || or AND in a subquery)."
     ))
 }
 
@@ -660,7 +763,8 @@ mod tests {
                 trim_characters: None,
             };
         }
-        let err = check_expr_depth(&expr).expect_err("deep TRIM nesting is rejected");
+        let err = check_expr_depth(&expr, MAX_SQL_EXPR_DEPTH, too_deep_expr_error)
+            .expect_err("deep TRIM nesting is rejected");
         assert!(
             err.to_string().contains("nested more than"),
             "unexpected error: {err}"
@@ -844,6 +948,119 @@ mod tests {
     fn allows_normal_query() {
         depth_check("SELECT a, b FROM t WHERE a > 1 AND b < 2 ORDER BY a LIMIT 10")
             .expect("a normal query passes");
+    }
+
+    /// `n` terms of `+1` after `head`: an expression tree `n` deep.
+    fn plus_chain(head: &str, n: usize) -> String {
+        format!("{head}{}", "+1".repeat(n - 1))
+    }
+
+    /// Each place an expression becomes a column name is held to
+    /// [`MAX_NAMED_EXPR_DEPTH`]: a chain of exactly that many terms passes and
+    /// one more is rejected.
+    #[test]
+    fn named_expressions_are_bounded_at_the_named_cap() {
+        let at = MAX_NAMED_EXPR_DEPTH;
+        let over = MAX_NAMED_EXPR_DEPTH + 1;
+        let shapes: [fn(&str) -> String; 7] = [
+            |e| format!("SELECT {e}"),
+            |e| format!("SELECT {e} AS x"),
+            |e| format!("SELECT id FROM t ORDER BY {e}"),
+            |e| format!("SELECT count(*) FROM t GROUP BY {e}"),
+            |e| format!("SELECT * FROM (VALUES ({e})) v(x)"),
+            |e| format!("SELECT 1 UNION ALL SELECT {e}"),
+            |e| format!("SELECT * FROM (SELECT {e}) s"),
+        ];
+        for shape in shapes {
+            let ok = shape(&plus_chain("id", at));
+            depth_check(&ok).unwrap_or_else(|e| panic!("{ok:.40}… must pass: {e}"));
+            let deep = shape(&plus_chain("id", over));
+            let err = depth_check(&deep).expect_err("one level over the named cap is rejected");
+            assert_eq!(
+                err.to_string(),
+                too_deep_named_error().to_string(),
+                "{deep:.40}…"
+            );
+        }
+    }
+
+    /// A predicate is not rendered as a column name, so it keeps the general
+    /// cap: a `WHERE` chain far over [`MAX_NAMED_EXPR_DEPTH`] passes.
+    #[test]
+    fn predicates_keep_the_general_cap() {
+        let terms = vec!["id = 1"; MAX_SQL_EXPR_DEPTH - 1];
+        depth_check(&format!("SELECT id FROM t WHERE {}", terms.join(" OR ")))
+            .expect("a WHERE chain under the general cap passes");
+        depth_check(&format!(
+            "SELECT a.id FROM t a JOIN t b ON {}",
+            terms.join(" AND ")
+        ))
+        .expect("a JOIN ON chain under the general cap passes");
+    }
+
+    /// Plans `sql` through the runtime's planner on a Tokio worker with the
+    /// default 2 MiB stack `spiced`'s query runtimes run on, so an over-deep
+    /// expression the guard lets through aborts the test process instead of
+    /// passing. The test harness's own threads are larger (`RUST_MIN_STACK`).
+    async fn plan_on_default_worker_stack(sql: String) -> DFResult<()> {
+        let runtime = crate::Runtime::builder().build().await;
+        let df = std::sync::Arc::clone(&runtime.df);
+        let workers = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(2 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("worker runtime builds");
+        let result = workers
+            .spawn(async move {
+                let session = df.ctx.state();
+                df.create_logical_plan(&session, &sql, None)
+                    .await
+                    .map(|_| ())
+            })
+            .await
+            .expect("planning task completes");
+        workers.shutdown_background();
+        result
+    }
+
+    /// Regression test: a `SELECT` or `ORDER BY` chain under the general cap
+    /// overflowed the worker stack while `DataFusion` rendered its column name,
+    /// aborting the process. It is now a planning error.
+    #[tokio::test]
+    async fn deep_named_chains_are_rejected_on_the_worker_stack() {
+        for sql in [
+            format!("SELECT {}", plus_chain("1", 300)),
+            format!(
+                "SELECT id FROM (VALUES (1)) t(id) ORDER BY {}",
+                plus_chain("id", 200)
+            ),
+            format!("SELECT * FROM (VALUES ({})) v(x)", plus_chain("1", 300)),
+        ] {
+            let err = plan_on_default_worker_stack(sql)
+                .await
+                .expect_err("a deep named chain is rejected");
+            assert_eq!(err.to_string(), too_deep_named_error().to_string());
+        }
+    }
+
+    /// Chains at the named cap, and a predicate chain at the general cap, still
+    /// plan on the worker stack.
+    #[tokio::test]
+    async fn chains_at_the_caps_plan_on_the_worker_stack() {
+        let or_terms = vec!["id = 1"; MAX_SQL_EXPR_DEPTH - 1].join(" OR ");
+        for sql in [
+            format!("SELECT {}", plus_chain("1", MAX_NAMED_EXPR_DEPTH)),
+            format!(
+                "SELECT id FROM (VALUES (1)) t(id) ORDER BY {}",
+                plus_chain("id", MAX_NAMED_EXPR_DEPTH)
+            ),
+            format!("SELECT id FROM (VALUES (1)) t(id) WHERE {or_terms}"),
+        ] {
+            plan_on_default_worker_stack(sql.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{sql:.60}… must plan: {e}"));
+        }
     }
 
     #[test]
