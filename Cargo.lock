@@ -6957,6 +6957,7 @@ dependencies = [
  "postcard",
  "prost 0.14.3",
  "serde",
+ "serde_bytes",
  "snafu",
  "tokio",
  "tokio-stream",
