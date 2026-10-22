@@ -43,13 +43,16 @@ Start only this instance, with logs and a pidfile under `$WORK_DIR`:
   --metrics "$METRICS_ADDR"
 ```
 
-Exact process command the helper runs:
+Exact process command the helper runs (cwd is `$WORK_DIR`, so `file:` paths resolve):
 
 ```bash
+cd "$WORK_DIR"
 "$SPICED" --telemetry-enabled=false \
   --http "$HTTP_ADDR" --flight "$FLIGHT_ADDR" --metrics "$METRICS_ADDR" \
-  "$WORK_DIR"
+  .
 ```
+
+The seeded spicepod uses absolute `file:` paths under `$WORK_DIR/data`.
 
 **Ready is `/v1/ready`, not an open port.** Poll `GET http://$HTTP_ADDR/v1/ready` until the status is `200` and the body is `ready` (timeout 90s). A `503`/`not ready` means datasets have not finished loading. After a later refresh failure `/v1/ready` may return `503` again; that is expected and is not a launch failure.
 

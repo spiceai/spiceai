@@ -87,16 +87,18 @@ seed_files() {
 
 seed_spicepod() {
   mkdir -p "${WORK}/data"
-  cat >"${WORK}/spicepod.yaml" <<'YAML'
+  local data
+  data="$(cd "${WORK}/data" && pwd)"
+  cat >"${WORK}/spicepod.yaml" <<YAML
 version: v1
 kind: Spicepod
 name: file-connector-verify
 datasets:
-  - from: file:data/events.csv
+  - from: file:${data}/events.csv
     name: csv_fed
     params:
       file_format: csv
-  - from: file:data/events.csv
+  - from: file:${data}/events.csv
     name: csv_acc
     params:
       file_format: csv
@@ -104,11 +106,11 @@ datasets:
       enabled: true
       engine: arrow
       refresh_mode: full
-  - from: file:data/events.jsonl
+  - from: file:${data}/events.jsonl
     name: json_fed
     params:
       file_format: jsonl
-  - from: file:data/events.jsonl
+  - from: file:${data}/events.jsonl
     name: json_acc
     params:
       file_format: jsonl
@@ -141,6 +143,7 @@ wait_ready() {
   local url="http://${HTTP_ADDR}/v1/ready"
   local deadline=$((SECONDS + 90))
   local last="unreachable"
+  : >"${WORK}/ready.body"
   while (( SECONDS < deadline )); do
     if [[ -f "$(pidfile)" ]]; then
       local pid
@@ -150,8 +153,8 @@ wait_ready() {
       fi
     fi
     local code body
-    code="$(curl -sS -o /tmp/spice-ready-body.$$ -w '%{http_code}' --max-time 2 "$url" || echo 000)"
-    body="$(tr -d '\r' </tmp/spice-ready-body.$$ 2>/dev/null || true)"
+    code="$(curl -sS -o "${WORK}/ready.body" -w '%{http_code}' --max-time 2 "$url" || echo 000)"
+    body="$(tr -d '\r' <"${WORK}/ready.body" 2>/dev/null || true)"
     last="${code} ${body}"
     if [[ "$code" == "200" && "$body" == "ready" ]]; then
       echo "ready: ${url} -> 200 ready"
@@ -172,10 +175,15 @@ cmd_launch() {
   METRICS_ADDR="${METRICS_ADDR:-127.0.0.1:$(free_port)}"
   mkdir -p "$WORK"
   : >"$(logfile)"
-  nohup "$SPICED" --telemetry-enabled=false \
-    --http "$HTTP_ADDR" --flight "$FLIGHT_ADDR" --metrics "$METRICS_ADDR" \
-    "$WORK" >"$(logfile)" 2>&1 &
-  local pid=$!
+  # Resolve `file:` paths and the spicepod from the work directory.
+  local pid
+  pid="$(
+    cd "$WORK" || exit 1
+    nohup "$SPICED" --telemetry-enabled=false \
+      --http "$HTTP_ADDR" --flight "$FLIGHT_ADDR" --metrics "$METRICS_ADDR" \
+      . >"$(logfile)" 2>&1 &
+    echo $!
+  )"
   echo "$pid" >"$(pidfile)"
   printf '%s\n' "$SPICED" >"$(binfile)"
   printf '%s\n' "$HTTP_ADDR" >"${WORK}/http.addr"
@@ -200,8 +208,8 @@ cmd_doctor() {
     [[ "$exe" == "$want" ]] || die "pid $pid exe is ${exe}, expected ${want}"
   fi
   local code body
-  code="$(curl -sS -o /tmp/spice-ready-body.$$ -w '%{http_code}' --max-time 5 "http://${HTTP_ADDR}/v1/ready" || echo 000)"
-  body="$(tr -d '\r' </tmp/spice-ready-body.$$ 2>/dev/null || true)"
+  code="$(curl -sS -o "${WORK}/ready.body" -w '%{http_code}' --max-time 5 "http://${HTTP_ADDR}/v1/ready" || echo 000)"
+  body="$(tr -d '\r' <"${WORK}/ready.body" 2>/dev/null || true)"
   echo "doctor pid=${pid} exe=${exe} ready=${code} ${body}"
   [[ "$code" != "000" ]] || die "/v1/ready is unreachable at ${HTTP_ADDR}"
   local datasets
@@ -277,8 +285,8 @@ datasets_status() {
 ready_capture() {
   local out="$1"
   local code body
-  code="$(curl -sS -o /tmp/spice-ready-body.$$ -w '%{http_code}' --max-time 5 "http://${HTTP_ADDR}/v1/ready" || echo 000)"
-  body="$(tr -d '\r' </tmp/spice-ready-body.$$ 2>/dev/null || true)"
+  code="$(curl -sS -o "${WORK}/ready.body" -w '%{http_code}' --max-time 5 "http://${HTTP_ADDR}/v1/ready" || echo 000)"
+  body="$(tr -d '\r' <"${WORK}/ready.body" 2>/dev/null || true)"
   printf '%s %s\n' "$code" "$body" >"$out"
 }
 
