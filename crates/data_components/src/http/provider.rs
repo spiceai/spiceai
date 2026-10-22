@@ -2132,11 +2132,9 @@ impl HttpTableProvider {
         // the retriable-error classification in `graphql/mod.rs`, which groups
         // is_timeout/is_connect/is_body/is_decode together as transient.
         //
-        // A compressed body is decoded here rather than by `reqwest` (the client is built
-        // with `http_body_limit::decode_manually`), so it can be refused as soon as it
-        // expands past the compression ratio a real response never reaches: a few hundred
-        // kilobytes of gzip would otherwise decode to gigabytes. That refusal is permanent
-        // — asking again gets the same body. An uncompressed body is read as it always was.
+        // The client is built with `http_body_limit::decode_manually`, so a compressed body
+        // is decoded here and refused once it expands past a ratio real responses do not
+        // reach. That refusal is permanent: asking again gets the same body.
         let response = http_body_limit::buffer(response, http_body_limit::Limit::CompressionRatio)
             .io_wait()
             .await

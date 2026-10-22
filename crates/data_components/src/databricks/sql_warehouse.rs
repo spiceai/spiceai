@@ -76,6 +76,7 @@ mod datatypes;
 const SQL_WAREHOUSE_MAX_IN_FLIGHT_REQUESTS: usize = 8;
 const SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES: usize = 3;
 const SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES: usize = 14;
+
 /// Decode a JSON response body read under [`http_body_limit::Limit::METADATA`].
 async fn read_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
