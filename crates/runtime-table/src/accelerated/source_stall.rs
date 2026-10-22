@@ -56,7 +56,7 @@ impl std::fmt::Display for SourceStalled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "The source of dataset '{}' {SOURCE_STALLED_MARKER}: no data for {}s after it started sending. The connection is treated as lost and the refresh is retried.",
+            "The source of dataset '{}' {SOURCE_STALLED_MARKER}: no data for {}s after it started sending, so the connection is treated as lost and the refresh is retried",
             self.dataset,
             self.waited.as_secs()
         )
