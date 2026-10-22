@@ -15,10 +15,12 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 pub mod guardrail;
+mod reasoning;
 pub(super) mod util;
 
 use crate::bedrock::BedrockClient;
 use crate::bedrock::chat::guardrail::GuardRail;
+use crate::bedrock::chat::reasoning::{ReasoningControl, ReasoningRequest};
 use crate::bedrock::chat::util::{
     chat_choice_stream, convert_usage, extract_from_content_block, into_fallible_stream,
     to_api_error, tool_config, try_convert_finish_reason, try_convert_role, value_to_document,
@@ -77,6 +79,7 @@ pub struct BedrockConverse {
     client: Arc<BedrockClient>,
     model_id: String,
     guardrail: Option<GuardRail>,
+    reasoning: ReasoningControl,
 }
 
 impl BedrockConverse {
@@ -84,6 +87,7 @@ impl BedrockConverse {
     pub fn new(client: Arc<BedrockClient>, model_id: String) -> Self {
         Self {
             client,
+            reasoning: ReasoningControl::for_model(&model_id),
             model_id,
             guardrail: None,
         }
@@ -408,14 +412,35 @@ impl BedrockConverse {
         }
     }
 
-    #[expect(clippy::cast_possible_wrap, deprecated)]
-    fn inference_cfg(req: &CreateChatCompletionRequest) -> InferenceConfiguration {
+    #[expect(deprecated)]
+    fn max_tokens(req: &CreateChatCompletionRequest) -> Option<u32> {
+        req.max_completion_tokens.or(req.max_tokens)
+    }
+
+    /// The reasoning settings for `req`'s `reasoning_effort`, in the shape this model takes.
+    fn reasoning_request(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> Result<Option<ReasoningRequest>, OpenAIError> {
+        self.reasoning.request(
+            &self.model_id,
+            req.reasoning_effort.as_ref(),
+            Self::max_tokens(req),
+        )
+    }
+
+    /// `reasoning` replaces the request's `max_tokens` when its thinking budget needs room.
+    #[expect(clippy::cast_possible_wrap)]
+    fn inference_cfg(
+        req: &CreateChatCompletionRequest,
+        reasoning: Option<&ReasoningRequest>,
+    ) -> InferenceConfiguration {
+        let max_tokens = match reasoning {
+            Some(r) => r.max_tokens,
+            None => Self::max_tokens(req),
+        };
         InferenceConfiguration::builder()
-            .set_max_tokens(
-                req.max_completion_tokens
-                    .or(req.max_tokens)
-                    .map(|u| u as i32),
-            )
+            .set_max_tokens(max_tokens.map(|u| u as i32))
             .set_stop_sequences(req.stop.as_ref().map(|stop| match stop {
                 StopConfiguration::String(s) => vec![s.clone()],
                 StopConfiguration::StringArray(arr) => arr.clone(),
@@ -430,7 +455,8 @@ impl BedrockConverse {
         client: &Arc<BedrockClient>,
         req: CreateChatCompletionRequest,
     ) -> Result<ConverseStreamFluentBuilder, OpenAIError> {
-        let inf_cfg = Self::inference_cfg(&req);
+        let reasoning = self.reasoning_request(&req)?;
+        let inf_cfg = Self::inference_cfg(&req, reasoning.as_ref());
         let CreateChatCompletionRequest {
             messages,
             metadata,
@@ -477,7 +503,10 @@ impl BedrockConverse {
             .set_system(Some(system))
             .set_guardrail_config(guardrails)
             .set_output_config(Self::output_config(response_format)?)
-            .set_tool_config(tool_config(tools, tool_choice));
+            .set_tool_config(tool_config(tools, tool_choice))
+            .set_additional_model_request_fields(
+                reasoning.map(|r| r.additional_model_request_fields),
+            );
 
         if let Some(metadata) = metadata {
             // Metadata is a newtype around serde_json::Value - convert and extract object
@@ -496,7 +525,8 @@ impl BedrockConverse {
         client: &Arc<BedrockClient>,
         req: CreateChatCompletionRequest,
     ) -> Result<ConverseFluentBuilder, OpenAIError> {
-        let inf_cfg = Self::inference_cfg(&req);
+        let reasoning = self.reasoning_request(&req)?;
+        let inf_cfg = Self::inference_cfg(&req, reasoning.as_ref());
         let CreateChatCompletionRequest {
             messages,
             metadata,
@@ -543,7 +573,10 @@ impl BedrockConverse {
             .set_system(Some(system))
             .set_guardrail_config(guardrails)
             .set_output_config(Self::output_config(response_format)?)
-            .set_tool_config(tool_config(tools, tool_choice));
+            .set_tool_config(tool_config(tools, tool_choice))
+            .set_additional_model_request_fields(
+                reasoning.map(|r| r.additional_model_request_fields),
+            );
 
         if let Some(metadata) = metadata {
             // Metadata is a newtype around serde_json::Value - convert and extract object
@@ -863,7 +896,83 @@ impl Chat for BedrockConverse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::types::chat::ChatCompletionRequestUserMessageArgs;
+    use async_openai::types::chat::{
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, ReasoningEffort,
+    };
+    use aws_config::{BehaviorVersion, Region, SdkConfig};
+
+    /// A converse model with a client that is never sent a request.
+    fn converse(model_id: &str) -> BedrockConverse {
+        let config = SdkConfig::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::from_static("us-east-1"))
+            .build();
+        BedrockConverse::new(Arc::new(BedrockClient::from(&config)), model_id.to_string())
+    }
+
+    fn request(reasoning_effort: Option<ReasoningEffort>) -> CreateChatCompletionRequest {
+        let mut req = CreateChatCompletionRequestArgs::default()
+            .messages(vec![
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content("ping")
+                    .build()
+                    .expect("user message should build")
+                    .into(),
+            ])
+            .build()
+            .expect("request should build");
+        req.reasoning_effort = reasoning_effort;
+        req
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_reaches_the_converse_request() {
+        // Regression test for #15409: the Converse request had no
+        // `additionalModelRequestFields`, so Bedrock never received the effort. The
+        // expected shape is from the Bedrock extended thinking page.
+        let model = converse("us.anthropic.claude-sonnet-4-5-20250929-v1:0");
+        let expected = Some(value_to_document(
+            json!({"thinking": {"type": "enabled", "budget_tokens": 16384}}),
+        ));
+
+        let req = model.alter_request(request(Some(ReasoningEffort::High)));
+        let bldr = model
+            .to_converse(&model.client, req.clone())
+            .expect("converse request should build");
+        assert_eq!(bldr.get_additional_model_request_fields(), &expected);
+        assert_eq!(
+            bldr.get_inference_config()
+                .as_ref()
+                .and_then(|c| c.max_tokens),
+            Some(20480)
+        );
+
+        let bldr = model
+            .to_converse_stream(&model.client, req)
+            .expect("converse stream request should build");
+        assert_eq!(bldr.get_additional_model_request_fields(), &expected);
+        assert_eq!(
+            bldr.get_inference_config()
+                .as_ref()
+                .and_then(|c| c.max_tokens),
+            Some(20480)
+        );
+    }
+
+    #[tokio::test]
+    async fn no_reasoning_effort_leaves_the_converse_request_unchanged() {
+        let model = converse("us.anthropic.claude-sonnet-4-5-20250929-v1:0");
+        let bldr = model
+            .to_converse(&model.client, model.alter_request(request(None)))
+            .expect("converse request should build");
+        assert_eq!(bldr.get_additional_model_request_fields(), &None);
+        assert_eq!(
+            bldr.get_inference_config()
+                .as_ref()
+                .and_then(|c| c.max_tokens),
+            None
+        );
+    }
 
     #[test]
     fn prompt_cache_point_is_added_to_last_message() {
