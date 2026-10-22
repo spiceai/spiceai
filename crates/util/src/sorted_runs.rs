@@ -1016,12 +1016,13 @@ struct MergeContext {
     sort_ms: u128,
 }
 
-/// The rows of `pieces`, merged into one stream in key order. `report` logs the
-/// merge's plan and outcome, which a sort of one group does.
+/// The rows of `pieces`, merged into one stream in key order. `whole_sort` is
+/// set when the group is every row of the sort: the merge's plan is logged, and
+/// a lone in-memory tail is read inline rather than ahead on a task of its own.
 async fn merge_group(
     pieces: Vec<Piece>,
     merge: Arc<MergeContext>,
-    report: bool,
+    whole_sort: bool,
 ) -> Result<SendableRecordBatchStream> {
     let MergeContext {
         schema,
@@ -1056,10 +1057,10 @@ async fn merge_group(
     if runs.is_empty() {
         return match tails.len() {
             0 => Ok(Box::pin(EmptyRecordBatchStream::new(schema))),
-            // One of several groups reads ahead on a task of its own.
-            1 if report => Ok(tails
+            1 if whole_sort => Ok(tails
                 .remove(0)
                 .into_stream(output_rows, gatherers_per_tail(ctx, 1))),
+            // One of several groups reads ahead on a task of its own.
             1 => Ok(tails
                 .remove(0)
                 .into_merge_input(output_rows, gatherers_per_tail(ctx, 1))),
@@ -1161,7 +1162,7 @@ async fn merge_group(
         runs.insert(at, merged);
     }
     let pre_merge_ms = pre_merge_started.elapsed().as_millis();
-    if report {
+    if whole_sort {
         tracing::debug!(
             partitions,
             chunk_bytes,
