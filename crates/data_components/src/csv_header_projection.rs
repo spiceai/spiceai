@@ -352,7 +352,7 @@ impl FileOpener for HeaderMappedOpener {
             let header =
                 read_csv_header(&store, &partitioned_file.object_meta, &options, compression)
                     .await?;
-            let physical = Arc::new(physical_schema(&header, &registered));
+            let physical = Arc::new(physical_schema(&header, &registered, &file_indices));
             let target = projected_registered_schema(&registered, &file_indices)?;
 
             let physical_source = CsvSource::new(physical)
@@ -372,16 +372,25 @@ impl FileOpener for HeaderMappedOpener {
     }
 }
 
-fn physical_schema(header: &[String], registered: &Schema) -> Schema {
+fn physical_schema(header: &[String], registered: &Schema, file_indices: &[usize]) -> Schema {
     Schema::new(
         header
             .iter()
             .map(|name| {
-                registered
-                    .field_with_name(name)
-                    .ok()
-                    .cloned()
-                    .unwrap_or_else(|| Field::new(name, DataType::Utf8, true))
+                let projected = file_indices
+                    .iter()
+                    .any(|&i| registered.field(i).name() == name);
+                if projected {
+                    registered
+                        .field_with_name(name)
+                        .ok()
+                        .cloned()
+                        .unwrap_or_else(|| Field::new(name, DataType::Utf8, true))
+                } else {
+                    // Unselected columns stay Utf8 so an invalid value in a
+                    // column the query does not read cannot fail the scan.
+                    Field::new(name, DataType::Utf8, true)
+                }
             })
             .collect::<Vec<_>>(),
     )
@@ -465,7 +474,13 @@ async fn header_from_prefix(
         return Ok(None);
     };
     if !whole_object
-        && !header_record_complete(&decoded, options.quote, options.escape, options.comment)
+        && !header_record_complete(
+            &decoded,
+            options.delimiter,
+            options.quote,
+            options.escape,
+            options.comment,
+        )
     {
         return Ok(None);
     }
@@ -490,7 +505,13 @@ async fn decode_prefix(
     loop {
         if let Some(Ok(chunk)) = decoded.next().await {
             acc.extend_from_slice(&chunk);
-            if header_record_complete(&acc, options.quote, options.escape, options.comment) {
+            if header_record_complete(
+                &acc,
+                options.delimiter,
+                options.quote,
+                options.escape,
+                options.comment,
+            ) {
                 break;
             }
         } else if acc.is_empty() {
@@ -511,6 +532,7 @@ async fn decode_prefix(
 /// truncated name list.
 fn header_record_complete(
     bytes: &[u8],
+    delimiter: u8,
     quote: u8,
     escape: Option<u8>,
     comment: Option<u8>,
@@ -520,6 +542,7 @@ fn header_record_complete(
         return false;
     }
     let mut in_quotes = false;
+    let mut at_field_start = true;
     while i < bytes.len() {
         let b = bytes[i];
         if in_quotes {
@@ -537,10 +560,17 @@ fn header_record_complete(
                 }
                 in_quotes = false;
             }
-        } else if b == quote {
+        } else if b == quote && at_field_start {
+            // A quote only opens a field at the start of that field. A quote
+            // mid-field is literal data, not a multiline-field delimiter.
             in_quotes = true;
+            at_field_start = false;
+        } else if b == delimiter {
+            at_field_start = true;
         } else if b == b'\n' || b == b'\r' {
             return true;
+        } else {
+            at_field_start = false;
         }
         i += 1;
     }
@@ -714,6 +744,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unprojected_invalid_int_does_not_fail_selected_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csv(
+            &dir.path().join("base.csv"),
+            "event_id,user_id,region,amount_cents,ts",
+            &["1,10,us,not-an-int,t0", "2,20,eu,also-not-an-int,t1"],
+        );
+        let table = listing_table(dir.path(), header_format());
+        let ctx = SessionContext::new();
+        ctx.register_table("base", table).expect("register");
+        let batches = ctx
+            .sql("SELECT sum(event_id) FROM base")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("an unselected invalid int must not fail the query");
+        let column = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("event_id");
+        assert_eq!((!column.is_null(0)).then(|| column.value(0)), Some(3));
+    }
+
+    #[tokio::test]
+    async fn header_probe_grows_when_a_literal_quote_precedes_a_multiline_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `dummy"tag` is an unquoted field with a literal quote. The next field
+        // is a quoted multiline value whose closer sits past the 64 KiB cut.
+        let mut text = String::from("event_id,user_id,region,dummy\"tag,\"note\n");
+        text.push_str(&"x".repeat(65_536));
+        text.push_str("\",amount_cents,ts\n1,10,us,x,note,100,t0\n2,20,eu,x,note,200,t1\n");
+        let prefix = text.as_bytes().get(..header_probe_len()).expect("prefix");
+        assert!(
+            !prefix
+                .windows(b"amount_cents".len())
+                .any(|w| w == b"amount_cents"),
+            "the 64 KiB probe must cut before amount_cents"
+        );
+        assert!(
+            !header_record_complete(prefix, b',', b'"', None, None),
+            "a quote mid-field must not end the header at the next newline"
+        );
+        std::fs::write(dir.path().join("base.csv"), text).expect("write csv");
+        let sums = query_sums(listing_table(dir.path(), header_format()))
+            .await
+            .expect("query after growing past a literal-quote multiline header");
+        assert_eq!(sums, (Some(300), Some(30)));
+    }
+
+    #[tokio::test]
     async fn reordered_tsv_columns_follow_header_names() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_tsv(
@@ -870,25 +952,81 @@ mod tests {
 
     #[test]
     fn header_record_complete_is_quote_aware() {
-        assert!(!header_record_complete(b"a,b", b'"', None, None));
-        assert!(header_record_complete(b"a,b\n1,2\n", b'"', None, None));
-        assert!(!header_record_complete(b"\"a\nb\",c", b'"', None, None));
-        assert!(header_record_complete(b"\"a\nb\",c\n", b'"', None, None));
-        assert!(header_record_complete(b"\"a\"\"b\",c\n", b'"', None, None));
-        assert!(!header_record_complete(b"\n\n", b'"', None, None));
-        assert!(!header_record_complete(b"\n\nid,amo", b'"', None, None));
-        assert!(header_record_complete(b"\n\nid,amount\n", b'"', None, None));
+        assert!(!header_record_complete(b"a,b", b',', b'"', None, None));
+        assert!(header_record_complete(
+            b"a,b\n1,2\n",
+            b',',
+            b'"',
+            None,
+            None
+        ));
+        assert!(!header_record_complete(
+            b"\"a\nb\",c",
+            b',',
+            b'"',
+            None,
+            None
+        ));
+        assert!(header_record_complete(
+            b"\"a\nb\",c\n",
+            b',',
+            b'"',
+            None,
+            None
+        ));
+        assert!(header_record_complete(
+            b"\"a\"\"b\",c\n",
+            b',',
+            b'"',
+            None,
+            None
+        ));
+        assert!(!header_record_complete(b"\n\n", b',', b'"', None, None));
+        assert!(!header_record_complete(
+            b"\n\nid,amo",
+            b',',
+            b'"',
+            None,
+            None
+        ));
+        assert!(header_record_complete(
+            b"\n\nid,amount\n",
+            b',',
+            b'"',
+            None,
+            None
+        ));
         assert!(!header_record_complete(
             b"# note\nid,amo",
+            b',',
             b'"',
             None,
             Some(b'#')
         ));
         assert!(header_record_complete(
             b"# note\nid,amount\n",
+            b',',
             b'"',
             None,
             Some(b'#')
+        ));
+        // A quote mid-field is literal. The newline after `multi` is inside the
+        // following quoted field, so the prefix is not a finished header.
+        let literal_quote_prefix = b"event_id,dummy\"tag,\"multi\nxxxx";
+        let literal_quote_full = b"event_id,dummy\"tag,\"multi\nxxxx\",amount_cents\n";
+        assert!(!header_record_complete(
+            literal_quote_prefix,
+            b',',
+            b'"',
+            None,
+            None
+        ));
+        assert!(header_record_complete(
+            literal_quote_full,
+            b',',
+            b'"',
+            None,
+            None
         ));
     }
 
@@ -907,7 +1045,7 @@ mod tests {
             std::str::from_utf8(prefix).is_err(),
             "the 64 KiB probe must split the euro sign"
         );
-        assert!(!header_record_complete(prefix, b'"', None, None));
+        assert!(!header_record_complete(prefix, b',', b'"', None, None));
         write_csv(
             &dir.path().join("base.csv"),
             &header,
@@ -960,7 +1098,7 @@ mod tests {
         assert!(
             decoded
                 .as_ref()
-                .is_none_or(|bytes| !header_record_complete(bytes, b'"', None, None)),
+                .is_none_or(|bytes| !header_record_complete(bytes, b',', b'"', None, None)),
             "a 64 KiB bzip2 prefix must not be treated as a complete header"
         );
 
@@ -993,7 +1131,7 @@ mod tests {
             "the 64 KiB probe must cut through the header name"
         );
         assert!(
-            !header_record_complete(prefix, b'"', None, None),
+            !header_record_complete(prefix, b',', b'"', None, None),
             "leading blank lines are not a complete header"
         );
         std::fs::write(dir.path().join("base.csv"), text).expect("write csv");
