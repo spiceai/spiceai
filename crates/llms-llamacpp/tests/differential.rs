@@ -37,7 +37,7 @@ async fn local_gguf() -> PathBuf {
         .remove(0)
 }
 
-/// Questions with one right answer, and that answer.
+/// Questions with one right answer, and that answer, which a reply must end with.
 const CORPUS: &[(&str, &str)] = &[
     (
         "What is the capital of France? Reply with one word.",
@@ -73,6 +73,14 @@ async fn answer(model: &dyn Chat, prompt: &str) -> String {
         .to_string()
 }
 
+/// The reply's last word: `2 + 3 = 5` answers `5`, and `15` does not.
+fn last_word(reply: &str) -> &str {
+    reply
+        .split(|c: char| !c.is_alphanumeric())
+        .rfind(|word| !word.is_empty())
+        .unwrap_or_default()
+}
+
 #[tokio::test]
 async fn both_engines_answer_the_corpus_alike_and_right() {
     let path = local_gguf().await;
@@ -101,9 +109,10 @@ async fn both_engines_answer_the_corpus_alike_and_right() {
             from_llama, from_mistral,
             "the engines' answers to {prompt:?}"
         );
-        assert!(
-            from_llama.contains(expected),
-            "{from_llama:?} answers {prompt:?} with {expected:?}"
+        assert_eq!(
+            last_word(&from_llama),
+            expected,
+            "{from_llama:?} answers {prompt:?}"
         );
     }
 }
