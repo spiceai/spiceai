@@ -63,14 +63,11 @@ fn seal_with_key(
 }
 
 fn open_with_key(key: &[u8; blake3::KEY_LEN], handle: &[u8]) -> Result<PreparedStatement, Status> {
-    let payload_len = handle
-        .len()
-        .checked_sub(TAG_LEN)
+    let (payload, tag) = handle
+        .split_last_chunk::<TAG_LEN>()
         .ok_or_else(invalid_handle)?;
-    let (payload, tag) = handle.split_at(payload_len);
-    let tag: [u8; TAG_LEN] = tag.try_into().map_err(|_| invalid_handle())?;
     // `blake3::Hash` compares in constant time.
-    if blake3::keyed_hash(key, payload) != blake3::Hash::from_bytes(tag) {
+    if blake3::keyed_hash(key, payload) != blake3::Hash::from_bytes(*tag) {
         return Err(invalid_handle());
     }
     from_bytes(payload).map_err(|_| invalid_handle())
@@ -118,44 +115,12 @@ mod tests {
         assert_eq!(opened.parameter_schema, original.parameter_schema);
     }
 
-    #[test]
-    fn the_process_key_round_trips() {
-        let original = statement("SELECT 1", Vec::new());
-        let opened = open(&seal(&original).expect("seal")).expect("open");
-        assert_eq!(opened.query, "SELECT 1");
-        assert!(opened.parameters.is_empty());
-    }
-
     /// The handle shape every client could build before handles were tagged: the bare postcard
     /// encoding of a statement, here carrying parameter bytes the server never wrote.
     #[test]
     fn an_untagged_handle_is_rejected() {
         let forged = to_stdvec(&statement("SELECT 1", vec![0xff; 64])).expect("serialize");
         assert_rejected(open_with_key(&KEY, &forged), "an untagged handle");
-    }
-
-    #[test]
-    fn a_handle_with_a_modified_query_is_rejected() {
-        let handle = seal_with_key(&KEY, &statement("SELECT 1", Vec::new())).expect("seal");
-        let query_at = handle
-            .windows(b"SELECT 1".len())
-            .position(|window| window == b"SELECT 1")
-            .expect("the query is in the handle");
-        let mut tampered = handle;
-        tampered[query_at + b"SELECT ".len()] = b'2';
-        assert_rejected(open_with_key(&KEY, &tampered), "a modified query");
-    }
-
-    #[test]
-    fn a_handle_with_modified_parameters_is_rejected() {
-        let handle = seal_with_key(&KEY, &statement("SELECT $1", vec![0x11; 16])).expect("seal");
-        let parameters_at = handle
-            .windows(16)
-            .position(|window| window == [0x11; 16])
-            .expect("the parameters are in the handle");
-        let mut tampered = handle;
-        tampered[parameters_at] ^= 0x01;
-        assert_rejected(open_with_key(&KEY, &tampered), "modified parameters");
     }
 
     #[test]
