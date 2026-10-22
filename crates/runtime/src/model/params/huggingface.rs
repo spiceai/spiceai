@@ -45,6 +45,9 @@ pub struct HuggingFaceModelParams {
     // one from the secret stores.
     #[param(runtime, alias = "huggingface_token")]
     pub hf_token: Option<SecretString>,
+    /// The Hugging Face Hub endpoint to download the model from, to read through a mirror or proxy of the Hub. Defaults to `HF_ENDPOINT`, then 'https://huggingface.co'.
+    #[param(runtime)]
+    pub hf_endpoint: Option<String>,
     /// Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.
     #[param(runtime, default = "none")]
     pub distributed_backend: DistributedBackendSetting,

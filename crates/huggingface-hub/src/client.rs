@@ -267,6 +267,20 @@ impl TreeEntry {
             .as_ref()
             .map_or(self.oid.as_str(), |lfs| lfs.oid.as_str())
     }
+
+    /// The git object id: the SHA-1 of `blob <size>\0` and the content of a file stored in
+    /// git, or of the LFS pointer of one stored in LFS.
+    #[must_use]
+    pub fn git_oid(&self) -> &str {
+        &self.oid
+    }
+
+    /// The SHA-256 of the content of a file stored in LFS (or Xet); `None` for a file stored in
+    /// git.
+    #[must_use]
+    pub fn lfs_oid(&self) -> Option<&str> {
+        self.lfs.as_ref().map(|lfs| lfs.oid.as_str())
+    }
 }
 
 #[derive(Debug, Deserialize)]

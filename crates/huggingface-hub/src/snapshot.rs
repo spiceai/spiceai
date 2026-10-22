@@ -1,0 +1,590 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! A repository at one commit, downloaded into the cache file by file: what a model,
+//! embedding or reranker loads from.
+//!
+//! [`Snapshot::open`] resolves the revision to a commit and lists the repository's files there;
+//! a component picks the files it needs from [`Snapshot::files`] and [`Snapshot::download`]s
+//! them, getting back a directory in the cache's snapshot layout that an engine loads from
+//! without touching the network.
+//!
+//! When the Hub cannot answer — it is unreachable, or fails with anything but a missing
+//! repository or revision — the snapshot the cache last recorded for the revision is used, with
+//! a warning. With `HF_HUB_OFFLINE` set the Hub is never asked.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use futures::{StreamExt, TryStreamExt};
+use tokio::runtime::Handle;
+
+use crate::cache::{HubCache, relative_path};
+use crate::client::{self, EntryKind, Hub, HubConfig, TreeEntry};
+use crate::download::{self, Checksum, FetchError, Progress};
+use crate::error::{Cause, DownloadContext, DownloadError};
+use crate::location::RepoId;
+use crate::settings::Settings;
+
+/// Files of one repository downloaded at once, as `hf download` does.
+const MAX_CONCURRENT_FILES: usize = 8;
+/// How often a running download logs its progress.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+/// The revision read when none is named.
+pub const DEFAULT_REVISION: &str = "main";
+
+/// The component a download is for, which every log line and error names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requester {
+    /// What the component is, as a message names it: `model`, `embedding model`, `reranker`.
+    pub kind: &'static str,
+    /// The component's name in the Spicepod.
+    pub name: String,
+    /// The page an error links to.
+    pub docs_url: &'static str,
+}
+
+impl fmt::Display for Requester {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} '{}'", self.kind, self.name)
+    }
+}
+
+/// A file of the repository at the snapshot's commit.
+#[derive(Debug, Clone)]
+pub struct RepoFile {
+    /// The path from the repository root, `/`-separated.
+    pub path: String,
+    pub size: u64,
+    /// The Hub's description, which a download needs; `None` for a file only the cache knows.
+    entry: Option<TreeEntry>,
+}
+
+/// Where a snapshot's files come from.
+#[derive(Debug, Clone)]
+enum Origin {
+    Hub,
+    /// The cache alone: `HF_HUB_OFFLINE` is set, or the Hub failed with `reason`.
+    Cache {
+        reason: Option<String>,
+    },
+}
+
+/// A repository at one commit.
+pub struct Snapshot {
+    requester: Requester,
+    repo: RepoId,
+    revision: String,
+    commit: String,
+    files: BTreeMap<String, RepoFile>,
+    origin: Origin,
+    hub: Arc<Hub>,
+    cache: HubCache,
+    settings: Settings,
+}
+
+impl fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("requester", &self.requester)
+            .field("repo", &self.repo)
+            .field("revision", &self.revision)
+            .field("commit", &self.commit)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Snapshot {
+    /// Resolves `revision` (`main` when `None`) of `repo` to a commit and lists its files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the repository or revision does not exist or cannot be read, and
+    /// the cache holds no snapshot of the revision to fall back to.
+    pub async fn open(
+        settings: Settings,
+        requester: Requester,
+        repo: RepoId,
+        revision: Option<&str>,
+    ) -> Result<Self, DownloadError> {
+        let revision = revision
+            .filter(|revision| !revision.is_empty())
+            .unwrap_or(DEFAULT_REVISION)
+            .to_string();
+        let context = DownloadContext::new(&requester, &repo, &revision, &settings);
+        let hub = Hub::new(
+            HubConfig {
+                endpoint: settings.endpoint.clone(),
+                token: settings.token.as_ref().map(|token| token.secret().clone()),
+            },
+            Handle::current(),
+        )
+        .map_err(|source| context.error(None, Cause::Hub(source)))?;
+        let hub = Arc::new(hub);
+        let cache = HubCache::new(settings.cache_dir.clone());
+
+        let (commit, files, origin) = if settings.offline {
+            let (commit, files) = from_cache(&cache, &repo, &revision)
+                .await
+                .ok_or_else(|| context.error(None, Cause::OfflineNotCached { file: None }))?;
+            (commit, files, Origin::Cache { reason: None })
+        } else {
+            match from_hub(&hub, &cache, &repo, &revision).await {
+                Ok((commit, files)) => (commit, files, Origin::Hub),
+                Err(error) if falls_back(&error) => {
+                    let Some((commit, files)) = from_cache(&cache, &repo, &revision).await else {
+                        return Err(context.error(None, Cause::Hub(error)));
+                    };
+                    let reason = crate::error::unreachable_reason(&error);
+                    tracing::warn!(
+                        "{} could not reach the Hugging Face Hub ({reason}), so it loads revision '{revision}' of '{repo}' from the cache at commit {}. Changes to '{revision}' are not seen until the Hub is reachable.",
+                        capitalized(&requester),
+                        short(&commit)
+                    );
+                    (
+                        commit,
+                        files,
+                        Origin::Cache {
+                            reason: Some(reason),
+                        },
+                    )
+                }
+                Err(error) => return Err(context.error(None, Cause::Hub(error))),
+            }
+        };
+        Ok(Self {
+            requester,
+            repo,
+            revision,
+            commit,
+            files,
+            origin,
+            hub,
+            cache,
+            settings,
+        })
+    }
+
+    #[must_use]
+    pub fn repo(&self) -> &RepoId {
+        &self.repo
+    }
+
+    #[must_use]
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    /// The directory the snapshot's files are downloaded into.
+    #[must_use]
+    pub fn dir(&self) -> PathBuf {
+        self.cache.snapshot_dir(&self.repo, &self.commit)
+    }
+
+    /// The repository's files at the commit. When the snapshot comes from the cache alone,
+    /// only the files already cached.
+    pub fn files(&self) -> impl Iterator<Item = &RepoFile> {
+        self.files.values()
+    }
+
+    #[must_use]
+    pub fn file(&self, path: &str) -> Option<&RepoFile> {
+        self.files.get(path)
+    }
+
+    /// Downloads `paths`, as [`Snapshot::download`] does, without logging: for the few small
+    /// files a component reads to decide what else to download.
+    ///
+    /// # Errors
+    ///
+    /// See [`Snapshot::download`].
+    pub async fn fetch_quietly(&self, paths: &[&str]) -> Result<Vec<PathBuf>, DownloadError> {
+        self.fetch(paths, false).await
+    }
+
+    /// Downloads every file in `paths` that is not in the cache yet, at most
+    /// [`MAX_CONCURRENT_FILES`] at a time, and returns their paths in the snapshot directory,
+    /// in the order given.
+    ///
+    /// Logs the files and bytes to download when it starts, the progress every
+    /// [`PROGRESS_INTERVAL`], and the time taken when it ends — or that everything was cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a path is not in the repository, or a download fails.
+    pub async fn download(&self, paths: &[&str]) -> Result<Vec<PathBuf>, DownloadError> {
+        self.fetch(paths, true).await
+    }
+
+    /// An error of this snapshot's download, about `file` when one is named.
+    pub(crate) fn error(&self, file: Option<&str>, cause: Cause) -> DownloadError {
+        DownloadContext::new(&self.requester, &self.repo, &self.revision, &self.settings)
+            .error(file, cause)
+    }
+
+    async fn fetch(&self, paths: &[&str], log: bool) -> Result<Vec<PathBuf>, DownloadError> {
+        let context =
+            DownloadContext::new(&self.requester, &self.repo, &self.revision, &self.settings);
+        let mut missing = Vec::new();
+        let mut located = Vec::with_capacity(paths.len());
+        for &path in paths {
+            // The Hub names the paths; one that would leave the snapshot is never written.
+            let Some(relative) = relative_path(path) else {
+                return Err(context.error(Some(path), Cause::InvalidPath));
+            };
+            let file = self.files.get(path).ok_or_else(|| {
+                context.error(
+                    Some(path),
+                    match &self.origin {
+                        Origin::Hub => Cause::NotInRepo {
+                            commit: self.commit.clone(),
+                        },
+                        Origin::Cache { reason: None } => Cause::OfflineNotCached {
+                            file: Some(path.to_string()),
+                        },
+                        Origin::Cache {
+                            reason: Some(reason),
+                        } => Cause::UnreachableNotCached {
+                            reason: reason.clone(),
+                        },
+                    },
+                )
+            })?;
+            match self
+                .cache
+                .cached_file(&self.repo, &self.commit, path, Some(file.size))
+                .await
+            {
+                Some(cached) => located.push(cached),
+                None => {
+                    let entry = file.entry.clone().ok_or_else(|| {
+                        context.error(
+                            Some(path),
+                            Cause::OfflineNotCached {
+                                file: Some(path.to_string()),
+                            },
+                        )
+                    })?;
+                    located.push(self.dir().join(relative));
+                    missing.push(entry);
+                }
+            }
+        }
+
+        if missing.is_empty() {
+            if log {
+                tracing::info!(
+                    "{} uses Hugging Face repo '{}' at commit {} (revision '{}'), already in the cache.",
+                    capitalized(&self.requester),
+                    self.repo,
+                    short(&self.commit),
+                    self.revision
+                );
+            }
+            return Ok(located);
+        }
+
+        let total: u64 = missing.iter().map(|entry| entry.size).sum();
+        let started = Instant::now();
+        let progress = Arc::new(Progress::default());
+        let _reporter = log.then(|| {
+            tracing::info!(
+                "Downloading {} for {} from Hugging Face repo '{}' at commit {} (revision '{}').",
+                files_and_size(missing.len(), total),
+                self.requester,
+                self.repo,
+                short(&self.commit),
+                self.revision
+            );
+            AbortOnDrop(report_progress(
+                self.requester.clone(),
+                Arc::clone(&progress),
+                total,
+            ))
+        });
+
+        let result = futures::stream::iter(missing)
+            .map(|entry| self.fetch_file(entry, Arc::clone(&progress)))
+            .buffer_unordered(MAX_CONCURRENT_FILES)
+            .try_collect::<Vec<_>>()
+            .await;
+        if let Err((path, error)) = result {
+            return Err(context.error(Some(&path), Cause::Fetch(error)));
+        }
+        if log {
+            tracing::info!(
+                "Downloaded {} from Hugging Face repo '{}' in {}.",
+                self.requester,
+                self.repo,
+                human_duration(started.elapsed())
+            );
+        }
+        Ok(located)
+    }
+}
+
+impl Snapshot {
+    /// Downloads `entry`'s blob and links it into the snapshot directory. A failure names the
+    /// file it was for.
+    async fn fetch_file(
+        &self,
+        entry: TreeEntry,
+        progress: Arc<Progress>,
+    ) -> Result<(), (String, FetchError)> {
+        download::fetch_blob(
+            &self.hub,
+            &self.cache,
+            &self.repo,
+            &self.commit,
+            &entry,
+            &progress,
+        )
+        .await
+        .map_err(|error| (entry.path.clone(), error))?;
+        self.cache
+            .link(
+                &self.repo,
+                &self.commit,
+                &entry.path,
+                Checksum::of(&entry).etag(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|source| {
+                (
+                    entry.path.clone(),
+                    FetchError::Write {
+                        path: self.dir().join(&entry.path),
+                        source,
+                    },
+                )
+            })
+    }
+}
+
+/// Resolves `revision` on the Hub and lists every file at the commit.
+async fn from_hub(
+    hub: &Arc<Hub>,
+    cache: &HubCache,
+    repo: &RepoId,
+    revision: &str,
+) -> Result<(String, BTreeMap<String, RepoFile>), client::Error> {
+    let commit = hub.commit(repo, revision).await?.sha;
+    if let Err(error) = cache.write_ref(repo, revision, &commit).await {
+        tracing::debug!(
+            "Failed to record that revision '{revision}' of Hugging Face {} '{repo}' is commit {commit} in the cache: {error}",
+            repo.kind()
+        );
+    }
+    let entries = hub.list(repo, &commit, "", true).await?;
+    let files = entries
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::File)
+        .map(|entry| {
+            (
+                entry.path.clone(),
+                RepoFile {
+                    path: entry.path.clone(),
+                    size: entry.size,
+                    entry: Some(entry.clone()),
+                },
+            )
+        })
+        .collect();
+    Ok((commit, files))
+}
+
+/// The commit the cache last recorded for `revision`, and the files of it the cache holds.
+async fn from_cache(
+    cache: &HubCache,
+    repo: &RepoId,
+    revision: &str,
+) -> Option<(String, BTreeMap<String, RepoFile>)> {
+    let commit = cache.read_ref(repo, revision).await.ok()??;
+    let cached = cache.cached_files(repo, &commit).await.ok()?;
+    if cached.is_empty() {
+        return None;
+    }
+    let files = cached
+        .into_iter()
+        .map(|file| {
+            (
+                file.path.clone(),
+                RepoFile {
+                    path: file.path,
+                    size: file.size,
+                    entry: None,
+                },
+            )
+        })
+        .collect();
+    Some((commit, files))
+}
+
+/// Whether a load that failed with `error` may use the cache instead: every failure but a
+/// repository, revision or file the Hub says does not exist.
+fn falls_back(error: &client::Error) -> bool {
+    !matches!(
+        error,
+        client::Error::RepoNotFound { .. }
+            | client::Error::RevisionNotFound { .. }
+            | client::Error::EntryNotFound { .. }
+            | client::Error::InvalidEndpoint { .. }
+            | client::Error::InvalidToken
+    )
+}
+
+/// Logs the progress of a download every [`PROGRESS_INTERVAL`] until aborted.
+fn report_progress(
+    requester: Requester,
+    progress: Arc<Progress>,
+    total: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PROGRESS_INTERVAL);
+        interval.tick().await;
+        let mut previous = progress.received();
+        loop {
+            interval.tick().await;
+            let received = progress.received().min(total);
+            let rate = received.saturating_sub(previous) / PROGRESS_INTERVAL.as_secs();
+            previous = received;
+            tracing::info!(
+                "Downloading {requester}: {}.",
+                progress_line(received, total, rate)
+            );
+        }
+    })
+}
+
+/// The first seven digits of a commit, as the Hub shows it.
+fn short(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
+/// `Model 'qwen'`: the requester at the start of a sentence.
+fn capitalized(requester: &Requester) -> String {
+    let mut kind = requester.kind.chars();
+    let first = kind
+        .next()
+        .map(|c| c.to_uppercase().collect::<String>())
+        .unwrap_or_default();
+    format!("{first}{} '{}'", kind.as_str(), requester.name)
+}
+
+fn files_and_size(count: usize, bytes: u64) -> String {
+    let files = if count == 1 { "file" } else { "files" };
+    format!("{count} {files} ({})", human_bytes(bytes))
+}
+
+/// Aborts a background task when dropped, so a load that is cancelled stops its reporting.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+
+/// The decimal unit `bytes` is shown in, as the Hub shows file sizes, and its divisor.
+fn unit_of(bytes: u64) -> (usize, f64) {
+    let mut unit = 0;
+    let mut divisor = 1.0;
+    #[expect(clippy::cast_precision_loss)]
+    let value = bytes as f64;
+    while value / divisor >= 1000.0 && unit < UNITS.len() - 1 {
+        divisor *= 1000.0;
+        unit += 1;
+    }
+    (unit, divisor)
+}
+
+#[expect(clippy::cast_precision_loss)]
+fn in_unit(bytes: u64, divisor: f64) -> f64 {
+    bytes as f64 / divisor
+}
+
+/// `16.4 GB`, `523 B`.
+#[must_use]
+pub fn human_bytes(bytes: u64) -> String {
+    let (unit, divisor) = unit_of(bytes);
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} {}", in_unit(bytes, divisor), UNITS[unit])
+    }
+}
+
+/// `6.1 of 16.4 GB (37%) at 52 MB/s, about 3 min left`: how far a download has got.
+#[must_use]
+pub fn progress_line(received: u64, total: u64, rate: u64) -> String {
+    let (unit, divisor) = unit_of(total);
+    let amounts = if unit == 0 {
+        format!("{received} of {total} B")
+    } else {
+        format!(
+            "{:.1} of {:.1} {}",
+            in_unit(received, divisor),
+            in_unit(total, divisor),
+            UNITS[unit]
+        )
+    };
+    let percent = (u128::from(received) * 100)
+        .checked_div(u128::from(total))
+        .unwrap_or(100);
+    let (rate_unit, rate_divisor) = unit_of(rate);
+    let rate_value = in_unit(rate, rate_divisor);
+    let speed = if rate_value < 10.0 && rate_unit > 0 {
+        format!("{rate_value:.1} {}/s", UNITS[rate_unit])
+    } else {
+        format!("{rate_value:.0} {}/s", UNITS[rate_unit])
+    };
+    let left = if rate == 0 {
+        String::new()
+    } else {
+        let seconds = total.saturating_sub(received) / rate;
+        format!(", about {} left", rough_duration(seconds))
+    };
+    format!("{amounts} ({percent}%) at {speed}{left}")
+}
+
+/// `3 min`, `40 s`, `1 h 4 min`: a remaining time, to the nearest minute once it is that long.
+fn rough_duration(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds} s"),
+        60..3600 => format!("{} min", (seconds + 30) / 60),
+        _ => {
+            let minutes = (seconds + 30) / 60;
+            format!("{} h {} min", minutes / 60, minutes % 60)
+        }
+    }
+}
+
+/// `5 min 12 s`, `3.2 s`, `1 h 4 min`: how long a download took.
+#[must_use]
+pub fn human_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds {
+        0..60 => format!("{:.1} s", duration.as_secs_f64()),
+        60..3600 => format!("{} min {} s", seconds / 60, seconds % 60),
+        _ => format!("{} h {} min", seconds / 3600, (seconds % 3600) / 60),
+    }
+}
