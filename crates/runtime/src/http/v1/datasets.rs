@@ -121,9 +121,9 @@ pub use runtime_api_types::v1::DatasetInfo as DatasetResponseItem;
             String = "text/csv",
             example = "
 from,name,replication_enabled,acceleration_enabled,status,error,error_message,last_refresh,next_refresh,properties.search,properties.vector_search
-postgres:syncs,daily_journal_accelerated,false,true,Ready,,,,,,unsupported,unsupported
+postgres:syncs,daily_journal_accelerated,false,true,Ready,,,,,unsupported,unsupported
 databricks:hive_metastore.default.messages,messages_accelerated,false,true,Error,dataset.auth,Unable to authenticate with datasource credentials,,,unsupported,unsupported
-postgres:aidemo_messages,general,false,false,Initializing,,,,,,unsupported,unsupported
+postgres:aidemo_messages,general,false,false,Initializing,,,,,unsupported,unsupported
 "
         ))),
         (status = 500, description = "Internal server error occurred while processing datasets", content((
@@ -653,7 +653,9 @@ mod tests {
         DATASETS_CSV_ERROR_BODY, DatasetResponseItem, convert_entry_to_csv, datasets_to_csv,
         json_value_cell,
     };
-    use runtime_api_types::v1::{ComponentError, ComponentErrorCategory, ComponentStatus};
+    use runtime_api_types::v1::{
+        ComponentError, ComponentErrorCategory, ComponentErrorType, ComponentStatus,
+    };
     use serde_json::{Value, json};
     use std::collections::HashMap;
 
@@ -761,5 +763,79 @@ mod tests {
             json_value_cell(Some(&json!({"enabled": true}))),
             Some("{\"enabled\":true}".to_string())
         );
+    }
+
+    /// The OpenAPI `text/csv` example must stay 11 columns, matching
+    /// [`super::DatasetCsvRow`]. Extra commas shift `properties.*` off the header.
+    #[test]
+    fn openapi_csv_example_rows_match_flat_header() {
+        let csv = datasets_to_csv(&[
+            DatasetResponseItem {
+                from: "postgres:syncs".to_string(),
+                name: "daily_journal_accelerated".to_string(),
+                replication_enabled: false,
+                acceleration_enabled: true,
+                properties: example_properties(),
+                status: Some(ComponentStatus::Ready),
+                error: None,
+                error_message: None,
+                last_refresh: None,
+                next_refresh: None,
+            },
+            DatasetResponseItem {
+                from: "databricks:hive_metastore.default.messages".to_string(),
+                name: "messages_accelerated".to_string(),
+                replication_enabled: false,
+                acceleration_enabled: true,
+                properties: example_properties(),
+                status: Some(ComponentStatus::error_with_message(
+                    "Unable to authenticate with datasource credentials",
+                )),
+                error: Some(ComponentError {
+                    category: ComponentErrorCategory::Dataset,
+                    error_type: ComponentErrorType::Auth,
+                    code: "dataset.auth".to_string(),
+                }),
+                error_message: Some(
+                    "Unable to authenticate with datasource credentials".to_string(),
+                ),
+                last_refresh: None,
+                next_refresh: None,
+            },
+            DatasetResponseItem {
+                from: "postgres:aidemo_messages".to_string(),
+                name: "general".to_string(),
+                replication_enabled: false,
+                acceleration_enabled: false,
+                properties: example_properties(),
+                status: Some(ComponentStatus::Initializing),
+                error: None,
+                error_message: None,
+                last_refresh: None,
+                next_refresh: None,
+            },
+        ])
+        .expect("csv");
+        assert_eq!(
+            csv,
+            "from,name,replication_enabled,acceleration_enabled,status,error,error_message,last_refresh,next_refresh,properties.search,properties.vector_search\n\
+             postgres:syncs,daily_journal_accelerated,false,true,Ready,,,,,unsupported,unsupported\n\
+             databricks:hive_metastore.default.messages,messages_accelerated,false,true,Error,dataset.auth,Unable to authenticate with datasource credentials,,,unsupported,unsupported\n\
+             postgres:aidemo_messages,general,false,false,Initializing,,,,,unsupported,unsupported\n"
+        );
+        for (line_no, line) in csv.lines().enumerate() {
+            assert_eq!(
+                line.matches(',').count(),
+                10,
+                "OpenAPI example line {line_no} must have 11 fields: {line}"
+            );
+        }
+    }
+
+    fn example_properties() -> HashMap<String, Value> {
+        let mut properties = HashMap::new();
+        properties.insert("search".to_string(), json!("unsupported"));
+        properties.insert("vector_search".to_string(), json!("unsupported"));
+        properties
     }
 }
