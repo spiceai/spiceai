@@ -14,25 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Interval arithmetic federated to a `SQLite` or Turso acceleration is
-//! rendered through `datetime()` for a timestamp and `date()` for a date, so
-//! it keeps a timestamp's time of day and still compares a shifted date equal
-//! to a date literal (#14714). Each query is diffed against the same query
-//! over the unaccelerated source.
+//! Interval arithmetic on a `SQLite` or Turso acceleration answers what local
+//! evaluation answers (#14714). A projected shift reaches the engine through
+//! `datetime()` for a timestamp, which keeps its time of day, and `date()` for
+//! a date. Each case is diffed against the unaccelerated source, and three are
+//! also pinned to their rows.
 
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
-use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
-use spicepod::component::dataset::Dataset;
-use spicepod::param::Params;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::acceleration::load_runtime_datasets;
+use crate::acceleration::{csv_dataset, load_runtime_datasets};
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{register_test_connectors, run_query, test_request_context, to_pretty_display},
+    utils::{
+        federated_sql, register_test_connectors, run_query, test_request_context, to_pretty_display,
+    },
 };
 
 const LOAD_TIMEOUT: Duration = Duration::from_mins(1);
@@ -46,50 +45,52 @@ const ROWS: &str = "id,ts,d\n\
 
 /// Every shape of the report, a whole-day shift of a timestamp, and the date
 /// shifts a `datetime()` rendering would break: a shifted date projected, and
-/// compared with a date literal.
-const CASES: &[&str] = &[
-    "SELECT id, ts - INTERVAL '1 hour' AS shifted FROM {table} ORDER BY id",
-    "SELECT id, ts + INTERVAL '1 day' AS shifted FROM {table} ORDER BY id",
-    "SELECT id, ts - INTERVAL '1 day' AS shifted FROM {table} ORDER BY id",
-    "SELECT id FROM {table} WHERE ts - INTERVAL '1 hour' < TIMESTAMP '2026-10-02 10:00:00' ORDER BY id",
-    "SELECT id FROM {table} WHERE ts + INTERVAL '1 day' > TIMESTAMP '2026-10-03 12:00:00' ORDER BY id",
-    "SELECT id, d + INTERVAL '1 day' AS next_day FROM {table} ORDER BY id",
-    "SELECT id FROM {table} WHERE d + INTERVAL '1 day' = DATE '2026-10-03' ORDER BY id",
-    "SELECT id FROM {table} WHERE d - INTERVAL '1 day' <= DATE '2026-10-01' ORDER BY id",
+/// compared with a date literal. A case with rows is also pinned to them, so
+/// its agreement is not two engines agreeing on a wrong answer.
+const CASES: &[(&str, Option<&[&str]>)] = &[
+    // A date-only shift answered midnight.
+    (
+        "SELECT id, ts - INTERVAL '1 hour' AS shifted FROM {table} ORDER BY id",
+        Some(&[
+            "+----+---------------------+",
+            "| id | shifted             |",
+            "+----+---------------------+",
+            "| 1  | 2026-10-02T11:34:56 |",
+            "| 2  | 2026-10-01T23:30:00 |",
+            "| 3  | 2026-01-31T22:59:59 |",
+            "+----+---------------------+",
+        ]),
+    ),
+    (
+        "SELECT id, ts + INTERVAL '1 day' AS shifted FROM {table} ORDER BY id",
+        None,
+    ),
+    (
+        "SELECT id, ts - INTERVAL '1 day' AS shifted FROM {table} ORDER BY id",
+        None,
+    ),
+    // A date-only shift kept row 1, whose shifted timestamp is 11:34:56.
+    (
+        "SELECT id FROM {table} WHERE ts - INTERVAL '1 hour' < TIMESTAMP '2026-10-02 10:00:00' ORDER BY id",
+        Some(&["+----+", "| id |", "+----+", "| 2  |", "| 3  |", "+----+"]),
+    ),
+    (
+        "SELECT id FROM {table} WHERE ts + INTERVAL '1 day' > TIMESTAMP '2026-10-03 12:00:00' ORDER BY id",
+        None,
+    ),
+    (
+        "SELECT id, d + INTERVAL '1 day' AS next_day FROM {table} ORDER BY id",
+        None,
+    ),
+    (
+        "SELECT id FROM {table} WHERE d + INTERVAL '1 day' = DATE '2026-10-03' ORDER BY id",
+        Some(&["+----+", "| id |", "+----+", "| 1  |", "| 2  |", "+----+"]),
+    ),
+    (
+        "SELECT id FROM {table} WHERE d - INTERVAL '1 day' <= DATE '2026-10-01' ORDER BY id",
+        None,
+    ),
 ];
-
-fn dataset(from: &str, name: &str, engine: Option<&str>) -> Dataset {
-    let mut dataset = Dataset::new(from, name);
-    dataset.params = Some(Params::from_string_map(
-        vec![("file_format".to_string(), "csv".to_string())]
-            .into_iter()
-            .collect(),
-    ));
-    dataset.acceleration = engine.map(|engine| Acceleration {
-        enabled: true,
-        engine: Some(engine.to_string()),
-        mode: Mode::Memory,
-        refresh_mode: Some(RefreshMode::Full),
-        ..Acceleration::default()
-    });
-    dataset
-}
-
-/// The SQL each federated scan in `plan` sends to the engine after its own
-/// rewrites, one per line.
-fn executor_sql(plan: &str) -> String {
-    plan.split("rewritten_executor_sql=")
-        .skip(1)
-        .map(|tail| {
-            tail.split('\n')
-                .next()
-                .unwrap_or_default()
-                .trim_end_matches(|c: char| c == '|' || c.is_whitespace())
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 async fn interval_arithmetic_matches_local_evaluation(engine: &str) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -103,15 +104,15 @@ async fn interval_arithmetic_matches_local_evaluation(engine: &str) -> Result<()
             let from = format!("file://{}", csv.display());
 
             let app = AppBuilder::new("interval_arithmetic")
-                .with_dataset(dataset(&from, "accelerated", Some(engine)))
-                .with_dataset(dataset(&from, "local", None))
+                .with_dataset(csv_dataset(&from, "accelerated", Some(engine)))
+                .with_dataset(csv_dataset(&from, "local", None))
                 .build();
 
             configure_test_datafusion();
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
 
-            for sql in CASES {
+            for (sql, rows) in CASES {
                 let accelerated = run_query(&rt, &sql.replace("{table}", "accelerated")).await?;
                 let local = run_query(&rt, &sql.replace("{table}", "local")).await?;
                 assert_eq!(
@@ -119,6 +120,9 @@ async fn interval_arithmetic_matches_local_evaluation(engine: &str) -> Result<()
                     to_pretty_display(&local)?.to_string(),
                     "{engine}: `{sql}` must agree with local evaluation"
                 );
+                if let Some(rows) = rows {
+                    assert_batches_eq!(*rows, &accelerated);
+                }
             }
 
             // The shifts reach the engine, each through the function its operand's
@@ -137,51 +141,15 @@ async fn interval_arithmetic_matches_local_evaluation(engine: &str) -> Result<()
                     "datetime(",
                 ),
             ] {
-                let plan = to_pretty_display(&run_query(&rt, sql).await?)?.to_string();
-                let remote_sql = executor_sql(&plan);
+                let plan = run_query(&rt, sql).await?;
+                let remote_sql = federated_sql(&plan, "rewritten_executor_sql=")?;
                 assert!(
                     remote_sql.contains(rendering) && !remote_sql.contains(not_rendering),
                     "{engine}: the shift must reach the engine as {rendering}…) and not as \
-                     {not_rendering}…); the SQL sent was:\n{remote_sql}\nplan:\n{plan}"
+                     {not_rendering}…); the SQL sent was:\n{remote_sql}\nplan:\n{}",
+                    to_pretty_display(&plan)?
                 );
             }
-
-            // Pinned rows, so the agreement above is not two engines agreeing on
-            // a wrong answer. A date-only shift answered midnight, and kept row 1,
-            // whose shifted timestamp is 11:34:56.
-            assert_batches_eq!(
-                [
-                    "+----+---------------------+",
-                    "| id | shifted             |",
-                    "+----+---------------------+",
-                    "| 1  | 2026-10-02T11:34:56 |",
-                    "| 2  | 2026-10-01T23:30:00 |",
-                    "| 3  | 2026-01-31T22:59:59 |",
-                    "+----+---------------------+",
-                ],
-                &run_query(
-                    &rt,
-                    "SELECT id, ts - INTERVAL '1 hour' AS shifted FROM accelerated ORDER BY id",
-                )
-                .await?
-            );
-            assert_batches_eq!(
-                ["+----+", "| id |", "+----+", "| 2  |", "| 3  |", "+----+"],
-                &run_query(
-                    &rt,
-                    "SELECT id FROM accelerated \
-                     WHERE ts - INTERVAL '1 hour' < TIMESTAMP '2026-10-02 10:00:00' ORDER BY id",
-                )
-                .await?
-            );
-            assert_batches_eq!(
-                ["+----+", "| id |", "+----+", "| 1  |", "| 2  |", "+----+"],
-                &run_query(
-                    &rt,
-                    "SELECT id FROM accelerated WHERE d + INTERVAL '1 day' = DATE '2026-10-03' ORDER BY id",
-                )
-                .await?
-            );
 
             rt.shutdown().await;
             Ok(())

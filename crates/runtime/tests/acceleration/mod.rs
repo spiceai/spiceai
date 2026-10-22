@@ -188,6 +188,30 @@ pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Opt
     None
 }
 
+/// A CSV file dataset, accelerated in memory by `engine` with full refreshes,
+/// or unaccelerated when `engine` is `None`.
+#[cfg(any(feature = "sqlite", feature = "turso"))]
+pub(crate) fn csv_dataset(
+    from: &str,
+    name: &str,
+    engine: Option<&str>,
+) -> spicepod::component::dataset::Dataset {
+    let mut dataset = spicepod::component::dataset::Dataset::new(from, name);
+    dataset.params = Some(Params::from_string_map(
+        vec![("file_format".to_string(), "csv".to_string())]
+            .into_iter()
+            .collect(),
+    ));
+    dataset.acceleration = engine.map(|engine| spicepod::acceleration::Acceleration {
+        enabled: true,
+        engine: Some(engine.to_string()),
+        mode: Mode::Memory,
+        refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
+        ..spicepod::acceleration::Acceleration::default()
+    });
+    dataset
+}
+
 /// Materializes the runtime's configured datasets — the [`Dataset`] values that
 /// [`wait_for_checkpoints`] needs, which the runtime does not expose directly —
 /// then loads the runtime's components under `load_timeout` and waits for it to

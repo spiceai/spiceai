@@ -19,14 +19,12 @@ limitations under the License.
 //! which answered an empty or truncated result with no error (#14661).
 
 use app::AppBuilder;
+use datafusion::assert_batches_eq;
 use runtime::Runtime;
-use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
-use spicepod::component::dataset::Dataset;
-use spicepod::param::Params;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::acceleration::load_runtime_datasets;
+use crate::acceleration::{csv_dataset, load_runtime_datasets};
 use crate::{
     configure_test_datafusion, init_tracing,
     utils::{register_test_connectors, run_query, test_request_context, to_pretty_display},
@@ -41,23 +39,6 @@ const ROWS: &str = "id,v,x\n\
                     2,9000000000000000000,-2\n\
                     3,9000000000000000000,-9223372036854775808\n";
 
-fn sqlite_accelerated(from: &str, name: &str) -> Dataset {
-    let mut dataset = Dataset::new(from, name);
-    dataset.params = Some(Params::from_string_map(
-        vec![("file_format".to_string(), "csv".to_string())]
-            .into_iter()
-            .collect(),
-    ));
-    dataset.acceleration = Some(Acceleration {
-        enabled: true,
-        engine: Some("sqlite".to_string()),
-        mode: Mode::Memory,
-        refresh_mode: Some(RefreshMode::Full),
-        ..Acceleration::default()
-    });
-    dataset
-}
-
 #[tokio::test]
 async fn sqlite_accelerator_fails_a_query_sqlite_aborts() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -71,7 +52,7 @@ async fn sqlite_accelerator_fails_a_query_sqlite_aborts() -> Result<(), anyhow::
             let from = format!("file://{}", csv.display());
 
             let app = AppBuilder::new("sqlite_query_errors")
-                .with_dataset(sqlite_accelerated(&from, "accelerated"))
+                .with_dataset(csv_dataset(&from, "accelerated", Some("sqlite")))
                 .build();
 
             configure_test_datafusion();
@@ -79,18 +60,17 @@ async fn sqlite_accelerator_fails_a_query_sqlite_aborts() -> Result<(), anyhow::
             load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
 
             // The rows are there, so an empty answer below is not an empty table.
-            assert_eq!(
-                to_pretty_display(
-                    &run_query(&rt, "SELECT id, x FROM accelerated ORDER BY id").await?
-                )?
-                .to_string(),
-                "+----+----------------------+\n\
-                 | id | x                    |\n\
-                 +----+----------------------+\n\
-                 | 1  | 1                    |\n\
-                 | 2  | -2                   |\n\
-                 | 3  | -9223372036854775808 |\n\
-                 +----+----------------------+"
+            assert_batches_eq!(
+                [
+                    "+----+----------------------+",
+                    "| id | x                    |",
+                    "+----+----------------------+",
+                    "| 1  | 1                    |",
+                    "| 2  | -2                   |",
+                    "| 3  | -9223372036854775808 |",
+                    "+----+----------------------+",
+                ],
+                &run_query(&rt, "SELECT id, x FROM accelerated ORDER BY id").await?
             );
 
             // An ungrouped `SUM` fails on the only row it produces, and `abs`

@@ -812,7 +812,11 @@ impl TursoTableProvider {
                 // 1. RFC3339 TEXT (default): Full precision + timezone preservation
                 // 2. INTEGER milliseconds (performance): Millisecond precision only
                 //
-                // The read path automatically detects and converts both formats to the
+                // A computed timestamp can also arrive as the `YYYY-MM-DD HH:MM:SS[.SSS]`
+                // TEXT that SQLite's date and time functions answer in UTC, such as the
+                // `datetime()` a shifted timestamp is rendered through.
+                //
+                // The read path automatically detects and converts each format to the
                 // schema's expected timestamp type and unit.
                 use timestamp_conversion::{MICROS_PER_MILLI, MILLIS_PER_SECOND, NANOS_PER_MILLI};
 
@@ -834,30 +838,22 @@ impl TursoTableProvider {
                             // TEXT format: Parse and convert to target unit.
                             // Use unit-appropriate methods to avoid i64 nanosecond overflow
                             // for dates outside ~1677-2262.
-                            //
-                            // A stored timestamp is RFC3339. A computed one can also be the
-                            // `YYYY-MM-DD HH:MM:SS[.SSS]` text SQLite's `datetime()` answers
-                            // in UTC: the interval rewrite renders `ts - INTERVAL '1 hour'`
-                            // through it.
+                            // A parse failure returns NULL (lenient read behavior).
                             use chrono::{DateTime, NaiveDateTime};
 
-                            let parsed = DateTime::parse_from_rfc3339(text)
+                            DateTime::parse_from_rfc3339(text)
                                 .map(|dt| dt.to_utc())
                                 .or_else(|_| {
                                     NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
                                         .map(|naive| naive.and_utc())
-                                });
-                            if let Ok(dt) = parsed {
-                                match unit {
+                                })
+                                .ok()
+                                .and_then(|dt| match unit {
                                     TimeUnit::Second => Some(dt.timestamp()),
                                     TimeUnit::Millisecond => Some(dt.timestamp_millis()),
                                     TimeUnit::Microsecond => Some(dt.timestamp_micros()),
                                     TimeUnit::Nanosecond => dt.timestamp_nanos_opt(),
-                                }
-                            } else {
-                                // Parse failed, return NULL (lenient read behavior)
-                                None
-                            }
+                                })
                         }
                         TursoValue::Null => None,
                         _ => None,
@@ -1239,9 +1235,8 @@ impl TursoTableProvider {
     /// Returns AST analyzer rules for Turso-specific SQL transformations.
     ///
     /// Uses the shared `SQLiteIntervalVisitor` to convert INTERVAL arithmetic to
-    /// `CAST(datetime(col, modifier) AS TEXT)`, or to `date()` for a `DATE`
-    /// operand the logical optimizers marked (`SQLiteRemoteTable` and
-    /// [`SQLExecutor::logical_optimizer`]).
+    /// `CAST(datetime(col, modifier) AS TEXT)`, or `date()` for a `DATE` operand
+    /// the logical optimizers marked (see [`SQLExecutor::logical_optimizer`]).
     ///
     /// Also applies `TursoBetweenVisitor` to rewrite numeric `BETWEEN` expressions
     /// into explicit `CAST(... AS REAL)` comparisons, since Turso does not have the
@@ -1361,13 +1356,9 @@ impl TableProvider for TursoTableProvider {
 
 // Federation support for Turso
 impl TursoTableProvider {
-    /// Creates a federated table source for cross-database queries.
-    ///
-    /// Its table is `SQLiteRemoteTable`, whose logical optimizer marks every
-    /// `DATE` operand of interval arithmetic on the typed plan before it is
-    /// unparsed: unparsed, a date and a timestamp are both `TEXT`, and only the
-    /// marker tells the interval rewrite to shift a date through `date()` rather
-    /// than `datetime()`.
+    /// Creates a federated table source for cross-database queries. Its table is
+    /// `SQLiteRemoteTable`, whose logical optimizer marks the `DATE` operands of
+    /// interval arithmetic (see [`SQLExecutor::logical_optimizer`]).
     fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
         let table_name = TableReference::bare(self.table_name.clone());
         let schema = Arc::clone(&self.schema);
@@ -1441,17 +1432,16 @@ impl SQLExecutor for TursoTableProvider {
     }
 
     /// Unfederates a statement that calls a function Turso does not support,
-    /// and otherwise marks the `DATE` operands of its interval arithmetic for
-    /// [`Self::turso_ast_analyzer`]. The marking runs here as well as in the
-    /// scan's `SQLiteRemoteTable` because the scan's optimizer is not gathered
-    /// for a table that only appears inside a subquery.
+    /// and otherwise marks the `DATE` operands of its interval arithmetic, so
+    /// [`Self::turso_ast_analyzer`] shifts a date through `date()` and anything
+    /// else through `datetime()`: unparsed, a date and a timestamp are both
+    /// `TEXT`. The scan's `SQLiteRemoteTable` marks them too, but its optimizer
+    /// is not gathered for a table that only appears inside a subquery.
     fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
         let function_support = self.function_support.clone();
         Some(Box::new(move |plan| {
             let plan = match &function_support {
-                Some(function_support) => {
-                    unfederate_plan_with_unsupported_functions(plan, function_support)?
-                }
+                Some(fs) => unfederate_plan_with_unsupported_functions(plan, fs)?,
                 None => plan,
             };
             // An unfederated statement is no longer an extension node and runs
@@ -3753,9 +3743,6 @@ mod tests {
     /// that UTC instant, not as NULL.
     #[test]
     fn a_timestamp_sqlite_datetime_answers_is_read_as_utc() {
-        use arrow::array::TimestampMicrosecondArray;
-        use arrow::datatypes::{DataType, Field, TimeUnit};
-
         let rows = vec![
             vec![TursoValue::Text("2026-10-02 11:34:56".to_string())],
             vec![TursoValue::Text("2026-10-02 11:34:56.125".to_string())],
@@ -3763,7 +3750,7 @@ mod tests {
             vec![TursoValue::Text("2026-10-02".to_string())],
         ];
         for tz in [None, Some(Arc::from("+05:00"))] {
-            let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            let schema = Arc::new(Schema::new(vec![Field::new(
                 "ts",
                 DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
                 true,
