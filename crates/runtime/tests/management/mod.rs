@@ -308,7 +308,7 @@ async fn management_minimal_block_missing_secret_errors_before_region() -> Resul
         .await
 }
 
-/// Documented minimal `management:` block with a literal api_key and no region.
+/// Documented minimal `management:` block with a literal `api_key` and no region.
 /// Must get past the spice.ai `spiceai_region` required-parameter check and
 /// target the Spice Cloud default Flight endpoint (`us-east-1`).
 #[tokio::test]

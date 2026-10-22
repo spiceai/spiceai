@@ -454,7 +454,7 @@ fn optional_secret_param(params: &HashMap<String, SecretString>, key: &str) -> O
 /// Connector params for the Cloud management sink.
 ///
 /// When neither `region` nor `data_endpoint` is set, uses the documented Spice
-/// Cloud default region so the api_key-only `management:` block works.
+/// Cloud default region so the `api_key`-only `management:` block works.
 fn spiceai_sink_params(
     api_key: &SecretString,
     params: &HashMap<String, SecretString>,
