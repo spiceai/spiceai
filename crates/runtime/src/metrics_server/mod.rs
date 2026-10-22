@@ -1013,7 +1013,7 @@ mod tests {
             label.set_name((*label_name).to_string());
             label.set_value((*label_value).to_string());
             let mut metric = Metric::new();
-            metric.set_label(vec![label].into());
+            metric.set_label(vec![label]);
             metric.set_histogram((*histogram).clone());
             family.mut_metric().push(metric);
         }
@@ -1109,8 +1109,8 @@ mod tests {
     }
 
     /// A single refresh of 11.88ms must not report p50=17.5 / p99=24.85, which is
-    /// what interpolating inside the 10–25ms duration bucket does. 1_000_000ms
-    /// lands in `+Inf`; interpolation is Inf, and the quantile is still the sample.
+    /// what interpolating inside the 10–25ms duration bucket does. `1_000_000ms`
+    /// lands in `+Inf`; interpolation is `Inf`, and the quantile is still the sample.
     #[test]
     fn single_observation_quantiles_match_the_observed_value() {
         for latency_ms in [11.88, 217.0, 1_000_000.0] {
@@ -1182,9 +1182,9 @@ mod tests {
         }
     }
 
-    /// Interpolation of one overflow sample is Inf; the quantile is still the
-    /// sample. Count==1 is applied before the non-finite guard so Inf does not
-    /// escape.
+    /// Interpolation of one overflow sample is `Inf`; the quantile is still the
+    /// sample. A single observation is applied before the non-finite guard so
+    /// `Inf` does not escape.
     #[test]
     fn single_observation_wins_over_non_finite_interpolation() {
         assert_float_eq(
