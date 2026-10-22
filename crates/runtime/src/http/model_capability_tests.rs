@@ -32,7 +32,7 @@ use axum::{
 };
 use datafusion::datasource::MemTable;
 use http_body_util::BodyExt;
-use model_capabilities::{Capability, DecisionsBackend, ModelCapabilities};
+use model_capabilities::{Capability, DecisionsBackend, MessagesBackend, ModelCapabilities};
 use runtime_search::search_engine::{SearchEngine, parse_explicit_primary_keys};
 use serde_json::{Value, json};
 use spicepod::component::model::Model;
@@ -357,18 +357,20 @@ enum Path {
     Ai,
     Worker,
     Responses,
+    Messages,
     Decisions,
     AiIf,
     Rerank,
 }
 
 impl Path {
-    const ALL: [Path; 8] = [
+    const ALL: [Path; 9] = [
         Path::ChatCompletions,
         Path::Nsql,
         Path::Ai,
         Path::Worker,
         Path::Responses,
+        Path::Messages,
         Path::Decisions,
         Path::AiIf,
         Path::Rerank,
@@ -409,6 +411,14 @@ impl Path {
                 )
                 .await
             }
+            Path::Messages => {
+                post_json(
+                    routes,
+                    "/v1/messages",
+                    &json!({"model": name, "max_tokens": 16, "messages": [{"role": "user", "content": "ping"}]}),
+                )
+                .await
+            }
             Path::Decisions => {
                 post_json(
                     routes,
@@ -443,7 +453,9 @@ impl Path {
     /// Text that the answer of a call that succeeded contains.
     fn answer(self) -> &'static str {
         match self {
-            Path::ChatCompletions | Path::Worker | Path::Ai | Path::Responses => "pong",
+            Path::ChatCompletions | Path::Worker | Path::Ai | Path::Responses | Path::Messages => {
+                "pong"
+            }
             Path::Nsql => "42",
             Path::Decisions => r#""probability":0.9"#,
             Path::AiIf => "true",
@@ -475,6 +487,11 @@ impl Path {
                     vec![]
                 }
             }
+            Path::Messages => match capabilities.messages() {
+                Some(MessagesBackend::Native) => vec!["/v1/messages"],
+                Some(MessagesBackend::ViaChat) => vec![chat],
+                None => vec![],
+            },
             Path::Decisions | Path::AiIf => decisions,
             // A model with chat reranks through it, even one with native decisions.
             Path::Rerank => {

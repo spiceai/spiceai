@@ -11986,6 +11986,7 @@ dependencies = [
  "insta",
  "itertools 0.14.0",
  "jsonpath-rust",
+ "messages-api",
  "mistralrs",
  "mistralrs-core",
  "model2vec-rs",
@@ -12544,6 +12545,32 @@ checksum = "c73f5c649995a115e1a0220b35e4df0a1294500477f97a91d0660fb5abeb574a"
 dependencies = [
  "libc",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "messages-api"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "messages-chat"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-openai",
+ "async-trait",
+ "chat-api",
+ "criterion 0.7.0",
+ "futures",
+ "insta",
+ "messages-api",
+ "rand 0.10.1",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -17670,6 +17697,8 @@ dependencies = [
  "llms",
  "logos",
  "mediatype",
+ "messages-api",
+ "messages-chat",
  "model-capabilities",
  "moka",
  "mongodb",
