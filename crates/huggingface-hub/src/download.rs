@@ -67,8 +67,8 @@ pub enum FetchError {
     ))]
     Size { received: u64, size: u64 },
 
-    #[snafu(display("the Hub described '{path}' with an invalid content id '{etag}'"))]
-    InvalidEntry { path: String, etag: String },
+    #[snafu(display("the Hub's description of '{path}' has no valid content id"))]
+    InvalidEntry { path: String },
 }
 
 impl FetchError {
@@ -207,13 +207,17 @@ pub async fn fetch_blob(
 ) -> Result<PathBuf, FetchError> {
     let checksum = Checksum::of(entry);
     let etag = checksum.etag().to_string();
-    ensure!(
-        is_valid_etag(&etag),
-        InvalidEntrySnafu {
+    if !is_valid_etag(&etag) {
+        // The Hub masks the content ids of a gated repository's files from an account without
+        // access. Reading a byte of the file gets the Hub to say why.
+        hub.read(repo, commit, &entry.path, Some(GetRange::Bounded(0..1)))
+            .await
+            .context(HubSnafu)?;
+        return InvalidEntrySnafu {
             path: entry.path.clone(),
-            etag
         }
-    );
+        .fail();
+    }
     let blob = cache.blob_path(repo, &etag);
     if is_whole(&blob, entry.size).await {
         return Ok(blob);

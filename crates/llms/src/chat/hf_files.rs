@@ -98,12 +98,9 @@ pub async fn download(snapshot: &Snapshot, gguf: Option<&str>) -> Result<PathBuf
                 ["config.json", "params.json"],
             ] {
                 if !alternatives.iter().any(|name| names.contains(name)) {
-                    return Err(DownloadError::missing_files(
+                    return Err(DownloadError::missing(
                         snapshot,
-                        format!(
-                            "the repo has no '{}' or '{}'",
-                            alternatives[0], alternatives[1]
-                        ),
+                        format!("'{}' or '{}'", alternatives[0], alternatives[1]),
                     ));
                 }
             }
@@ -112,23 +109,20 @@ pub async fn download(snapshot: &Snapshot, gguf: Option<&str>) -> Result<PathBuf
                     let index = snapshot.fetch_quietly(&[SAFETENSOR_INDEX]).await?;
                     let index = index.first().cloned().unwrap_or_default();
                     let contents = tokio::fs::read_to_string(&index).await.map_err(|error| {
-                        DownloadError::missing_files(
+                        DownloadError::unusable(
                             snapshot,
                             format!("'{SAFETENSOR_INDEX}' could not be read ({error})"),
                         )
                     })?;
                     shards(&contents, |shard| names.contains(&shard)).map_err(|why| {
-                        DownloadError::missing_files(
-                            snapshot,
-                            format!("'{SAFETENSOR_INDEX}' {why}"),
-                        )
+                        DownloadError::unusable(snapshot, format!("'{SAFETENSOR_INDEX}' {why}"))
                     })?
                 }
                 Some(Weights::Files(files)) => files,
                 None => {
-                    return Err(DownloadError::missing_files(
+                    return Err(DownloadError::missing(
                         snapshot,
-                        "the repo has no weights the model can load: no 'model.safetensors', 'model-00001-of-0000N.safetensors', 'consolidated.safetensors' or sharded 'pytorch_model-00001-of-0000N.bin' files",
+                        "weights the model can load ('model.safetensors', 'model-00001-of-0000N.safetensors', 'consolidated.safetensors' or sharded 'pytorch_model-00001-of-0000N.bin')",
                     ));
                 }
             };

@@ -32,7 +32,7 @@ use crate::client;
 use crate::download::FetchError;
 use crate::location::{RepoId, RepoType};
 use crate::settings::{self, Settings, TokenSource, display_path};
-use crate::snapshot::Requester;
+use crate::snapshot::{Requester, Source};
 
 /// What a download was for: every message names it.
 #[derive(Debug, Clone)]
@@ -89,20 +89,15 @@ pub(crate) enum Cause {
     Hub(client::Error),
     Fetch(FetchError),
     Settings(settings::Error),
-    /// `HF_HUB_OFFLINE` is set and the revision, or `file`, is not in the cache.
-    OfflineNotCached {
-        file: Option<String>,
+    /// `HF_HUB_OFFLINE` is set and the cache holds no snapshot of the revision.
+    OfflineNoSnapshot,
+    /// Files the component needs (`what`) are not where the snapshot's files came from.
+    Missing {
+        what: String,
+        source: Source,
     },
-    /// The Hub failed (`reason`), and the cached snapshot does not hold the file.
-    UnreachableNotCached {
-        reason: String,
-    },
-    /// The file is not in the repository at `commit`.
-    NotInRepo {
-        commit: String,
-    },
-    /// The repository does not hold what the component needs: `message` says what is missing.
-    Selection {
+    /// The repository's files cannot be used: `message` says why.
+    Unusable {
         message: String,
     },
     /// The repository id is not one the Hub allows.
@@ -161,12 +156,27 @@ impl DownloadError {
         RepoId::new(kind, owner, name).map_err(|_| invalid())
     }
 
-    /// The repository lacks a file `requester` needs; `message` names what is missing.
+    /// Files the component needs are not in the snapshot: not in the repository, or not in the
+    /// cache when the cache is all the load can read. `what` names them, as in "the repo has
+    /// no {what}".
     #[must_use]
-    pub fn missing_files(snapshot: &crate::snapshot::Snapshot, message: impl Into<String>) -> Self {
+    pub fn missing(snapshot: &crate::snapshot::Snapshot, what: impl Into<String>) -> Self {
         snapshot.error(
             None,
-            Cause::Selection {
+            Cause::Missing {
+                what: what.into(),
+                source: snapshot.source().clone(),
+            },
+        )
+    }
+
+    /// The repository's files cannot be used; `message` says why, as the clause after a
+    /// colon.
+    #[must_use]
+    pub fn unusable(snapshot: &crate::snapshot::Snapshot, message: impl Into<String>) -> Self {
+        snapshot.error(
+            None,
+            Cause::Unusable {
                 message: message.into(),
             },
         )
@@ -176,22 +186,20 @@ impl DownloadError {
     /// valid, or a repository that does not hold what the component loads. A refusal from the
     /// Hub is not one: a missing or private repository, a rejected token and a gated
     /// repository can all be fixed on the Hub's side, and a network failure, a full disk or a
-    /// cold offline cache can clear while Spice runs.
+    /// cache `hf download` can fill can clear while Spice runs.
     #[must_use]
     pub fn is_configuration_error(&self) -> bool {
         match &self.cause {
             Cause::Settings(_)
-            | Cause::NotInRepo { .. }
-            | Cause::Selection { .. }
+            | Cause::Unusable { .. }
             | Cause::InvalidPath
             | Cause::InvalidRepo => true,
+            Cause::Missing { source, .. } => matches!(source, Source::Hub),
             Cause::Hub(error) | Cause::Fetch(FetchError::Hub { source: error }) => matches!(
                 error,
                 client::Error::InvalidEndpoint { .. } | client::Error::InvalidToken
             ),
-            Cause::Fetch(_)
-            | Cause::OfflineNotCached { .. }
-            | Cause::UnreachableNotCached { .. } => false,
+            Cause::Fetch(_) | Cause::OfflineNoSnapshot => false,
         }
     }
 
@@ -252,36 +260,38 @@ impl DownloadError {
             Cause::Fetch(error @ FetchError::InvalidEntry { .. }) => (error.to_string(), None),
             // Worded as a cause already, with its own fix.
             Cause::Settings(error) => (error.to_string(), None),
-            Cause::OfflineNotCached { file } => {
-                let cache = display_path(&context.cache_dir);
-                let missing = match file {
-                    Some(file) => format!("'{file}' is"),
-                    None => format!("revision '{}' of the repo is", context.revision),
-                };
-                (
-                    format!(
-                        "`HF_HUB_OFFLINE` is set and {missing} not in the Hugging Face cache at '{cache}'"
-                    ),
-                    Some(format!(
-                        "Run `hf download {} --revision {}` while online, or unset `HF_HUB_OFFLINE`",
-                        context.repo, context.revision
-                    )),
-                )
-            }
-            Cause::UnreachableNotCached { reason } => (
+            Cause::OfflineNoSnapshot => (
                 format!(
-                    "the Hugging Face Hub could not be reached ({reason}), and the cached snapshot does not hold this file"
+                    "`HF_HUB_OFFLINE` is set and revision '{}' of the repo is not in the Hugging Face cache at '{}'",
+                    context.revision,
+                    display_path(&context.cache_dir)
+                ),
+                Some(offline_fix(context)),
+            ),
+            Cause::Missing {
+                what,
+                source: Source::Hub,
+            } => (format!("the repo has no {what}"), None),
+            Cause::Missing {
+                what,
+                source: Source::OfflineCache,
+            } => (
+                format!(
+                    "`HF_HUB_OFFLINE` is set and the Hugging Face cache at '{}' does not hold {what}",
+                    display_path(&context.cache_dir)
+                ),
+                Some(offline_fix(context)),
+            ),
+            Cause::Missing {
+                what,
+                source: Source::CacheInOutage { reason },
+            } => (
+                format!(
+                    "the Hugging Face Hub could not be reached ({reason}), and the Hugging Face cache does not hold {what}"
                 ),
                 Some("Spice retries the download; check the network connection".to_string()),
             ),
-            Cause::NotInRepo { commit } => (
-                format!(
-                    "the repo has no such file at commit {}",
-                    commit.get(..7).unwrap_or(commit)
-                ),
-                None,
-            ),
-            Cause::Selection { message } => (message.clone(), None),
+            Cause::Unusable { message } => (message.clone(), None),
             Cause::InvalidRepo => (
                 "it is not a Hugging Face repo id: use '<owner>/<name>', each 1 to 96 letters, digits, '-', '_' or '.', starting and ending with a letter or digit, without '--' or '..'"
                     .to_string(),
@@ -294,6 +304,14 @@ impl DownloadError {
             ),
         }
     }
+}
+
+/// How to fill the cache `HF_HUB_OFFLINE` reads.
+fn offline_fix(context: &DownloadContext) -> String {
+    format!(
+        "Run `hf download {} --revision {}` while online, or unset `HF_HUB_OFFLINE`",
+        context.repo, context.revision
+    )
 }
 
 /// The cause and fix for an error the Hub returned.

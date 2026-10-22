@@ -448,6 +448,9 @@ async fn hub_handler(State(mock): State<MockHub>, request: Request<Body>) -> Res
             };
             let folder = rest.join("/");
             let recursive = query.contains("recursive=true");
+            // The Hub masks the content ids of a gated repository's LFS files from an account
+            // without access.
+            let masked = repo.gated;
             let mut entries = Vec::new();
             for (path, file) in files {
                 let Some(relative) = (if folder.is_empty() {
@@ -467,7 +470,12 @@ async fn hub_handler(State(mock): State<MockHub>, request: Request<Body>) -> Res
                     "path": path,
                 });
                 if file.lfs {
-                    entry["lfs"] = serde_json::json!({"oid": file.sha256(), "size": file.bytes.len(), "pointerSize": 133});
+                    let oid = if masked {
+                        "*".repeat(64)
+                    } else {
+                        file.sha256()
+                    };
+                    entry["lfs"] = serde_json::json!({"oid": oid, "size": file.bytes.len(), "pointerSize": 133});
                 }
                 entries.push(entry);
             }

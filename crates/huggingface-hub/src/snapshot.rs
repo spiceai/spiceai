@@ -76,14 +76,15 @@ pub struct RepoFile {
     entry: Option<TreeEntry>,
 }
 
-/// Where a snapshot's files come from.
+/// Where a snapshot's files came from, which decides what a file missing from it means.
 #[derive(Debug, Clone)]
-enum Origin {
+pub(crate) enum Source {
+    /// The Hub's listing of the commit.
     Hub,
-    /// The cache alone: `HF_HUB_OFFLINE` is set, or the Hub failed with `reason`.
-    Cache {
-        reason: Option<String>,
-    },
+    /// The cache, read alone because `HF_HUB_OFFLINE` is set.
+    OfflineCache,
+    /// The cache, read alone because the Hub failed (`reason`).
+    CacheInOutage { reason: String },
 }
 
 /// A repository at one commit.
@@ -93,7 +94,7 @@ pub struct Snapshot {
     revision: String,
     commit: String,
     files: BTreeMap<String, RepoFile>,
-    origin: Origin,
+    source: Source,
     hub: Arc<Hub>,
     cache: HubCache,
     settings: Settings,
@@ -139,14 +140,14 @@ impl Snapshot {
         let hub = Arc::new(hub);
         let cache = HubCache::new(settings.cache_dir.clone());
 
-        let (commit, files, origin) = if settings.offline {
+        let (commit, files, source) = if settings.offline {
             let (commit, files) = from_cache(&cache, &repo, &revision)
                 .await
-                .ok_or_else(|| context.error(None, Cause::OfflineNotCached { file: None }))?;
-            (commit, files, Origin::Cache { reason: None })
+                .ok_or_else(|| context.error(None, Cause::OfflineNoSnapshot))?;
+            (commit, files, Source::OfflineCache)
         } else {
             match from_hub(&hub, &cache, &repo, &revision).await {
-                Ok((commit, files)) => (commit, files, Origin::Hub),
+                Ok((commit, files)) => (commit, files, Source::Hub),
                 Err(error) if falls_back(&error) => {
                     let Some((commit, files)) = from_cache(&cache, &repo, &revision).await else {
                         return Err(context.error(None, Cause::Hub(error)));
@@ -157,13 +158,7 @@ impl Snapshot {
                         capitalized(&requester),
                         short(&commit)
                     );
-                    (
-                        commit,
-                        files,
-                        Origin::Cache {
-                            reason: Some(reason),
-                        },
-                    )
+                    (commit, files, Source::CacheInOutage { reason })
                 }
                 Err(error) => return Err(context.error(None, Cause::Hub(error))),
             }
@@ -174,7 +169,7 @@ impl Snapshot {
             revision,
             commit,
             files,
-            origin,
+            source,
             hub,
             cache,
             settings,
@@ -232,6 +227,31 @@ impl Snapshot {
         self.fetch(paths, true).await
     }
 
+    /// `at commit 0a1b2c3 (revision 'main')`, or `at commit 0a1b2c3` when the revision is the
+    /// commit itself.
+    fn at_commit(&self) -> String {
+        if self.revision == self.commit {
+            format!("at commit {}", short(&self.commit))
+        } else {
+            format!(
+                "at commit {} (revision '{}')",
+                short(&self.commit),
+                self.revision
+            )
+        }
+    }
+
+    /// Where the snapshot's files came from.
+    pub(crate) fn source(&self) -> &Source {
+        &self.source
+    }
+
+    /// The component the snapshot is for.
+    #[must_use]
+    pub fn requester(&self) -> &Requester {
+        &self.requester
+    }
+
     /// An error of this snapshot's download, about `file` when one is named.
     pub(crate) fn error(&self, file: Option<&str>, cause: Cause) -> DownloadError {
         DownloadContext::new(&self.requester, &self.repo, &self.revision, &self.settings)
@@ -248,24 +268,16 @@ impl Snapshot {
             let Some(relative) = relative_path(path) else {
                 return Err(context.error(Some(path), Cause::InvalidPath));
             };
-            let file = self.files.get(path).ok_or_else(|| {
+            let missing_file = || {
                 context.error(
-                    Some(path),
-                    match &self.origin {
-                        Origin::Hub => Cause::NotInRepo {
-                            commit: self.commit.clone(),
-                        },
-                        Origin::Cache { reason: None } => Cause::OfflineNotCached {
-                            file: Some(path.to_string()),
-                        },
-                        Origin::Cache {
-                            reason: Some(reason),
-                        } => Cause::UnreachableNotCached {
-                            reason: reason.clone(),
-                        },
+                    None,
+                    Cause::Missing {
+                        what: format!("'{path}'"),
+                        source: self.source.clone(),
                     },
                 )
-            })?;
+            };
+            let file = self.files.get(path).ok_or_else(missing_file)?;
             match self
                 .cache
                 .cached_file(&self.repo, &self.commit, path, Some(file.size))
@@ -273,14 +285,8 @@ impl Snapshot {
             {
                 Some(cached) => located.push(cached),
                 None => {
-                    let entry = file.entry.clone().ok_or_else(|| {
-                        context.error(
-                            Some(path),
-                            Cause::OfflineNotCached {
-                                file: Some(path.to_string()),
-                            },
-                        )
-                    })?;
+                    // A file only the cache knows of is one whose blob went missing.
+                    let entry = file.entry.clone().ok_or_else(missing_file)?;
                     located.push(self.dir().join(relative));
                     missing.push(entry);
                 }
@@ -290,11 +296,10 @@ impl Snapshot {
         if missing.is_empty() {
             if log {
                 tracing::info!(
-                    "{} uses Hugging Face repo '{}' at commit {} (revision '{}'), already in the cache.",
+                    "{} uses Hugging Face repo '{}' {}, already in the cache.",
                     capitalized(&self.requester),
                     self.repo,
-                    short(&self.commit),
-                    self.revision
+                    self.at_commit()
                 );
             }
             return Ok(located);
@@ -305,12 +310,11 @@ impl Snapshot {
         let progress = Arc::new(Progress::default());
         let _reporter = log.then(|| {
             tracing::info!(
-                "Downloading {} for {} from Hugging Face repo '{}' at commit {} (revision '{}').",
+                "Downloading {} for {} from Hugging Face repo '{}' {}.",
                 files_and_size(missing.len(), total),
                 self.requester,
                 self.repo,
-                short(&self.commit),
-                self.revision
+                self.at_commit()
             );
             AbortOnDrop(report_progress(
                 self.requester.clone(),

@@ -551,12 +551,11 @@ async fn a_hub_outage_loads_the_cached_snapshot() {
         .download(&["tokenizer.json"])
         .await
         .expect_err("the tokenizer was never downloaded");
-    assert!(
-        error
-            .to_string()
-            .starts_with("Failed to download 'tokenizer.json' for model 'test' from Hugging Face repo 'o/m' (revision 'main'): "),
-        "{error}"
+    assert_eq!(
+        error.to_string(),
+        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the Hugging Face Hub could not be reached (HTTP 503), and the Hugging Face cache does not hold 'tokenizer.json'. Spice retries the download; check the network connection. See: https://spiceai.org/docs/components/models/huggingface"
     );
+    assert!(!error.is_configuration_error());
 }
 
 #[tokio::test]
@@ -666,18 +665,92 @@ async fn a_gated_repo_names_the_page_that_grants_access() {
     fixture.mock.gate(MODEL);
 
     let snapshot = fixture.open(None, &[("HF_TOKEN", "hf_token")]).await;
+    // A file in git, and an LFS file whose content id the Hub masks from an account without
+    // access: both report the gate, not a malformed listing.
+    for file in ["config.json", "model.safetensors"] {
+        let error = snapshot
+            .download(&[file])
+            .await
+            .expect_err("the repo is gated");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Failed to download '{file}' for model 'test' from Hugging Face repo 'o/m' (revision 'main'): the repo is gated. Accept its access conditions at {}/o/m with the account the token from `HF_TOKEN` belongs to. See: https://spiceai.org/docs/components/models/huggingface",
+                fixture.mock.endpoint()
+            )
+        );
+        assert!(!error.is_configuration_error());
+    }
+
+    let snapshot = fixture.open(None, &[]).await;
     let error = snapshot
-        .download(&["config.json"])
+        .download(&["model.safetensors"])
         .await
         .expect_err("the repo is gated");
     assert_eq!(
         error.to_string(),
         format!(
-            "Failed to download 'config.json' for model 'test' from Hugging Face repo 'o/m' (revision 'main'): the repo is gated. Accept its access conditions at {}/o/m with the account the token from `HF_TOKEN` belongs to. See: https://spiceai.org/docs/components/models/huggingface",
+            "Failed to download 'model.safetensors' for model 'test' from Hugging Face repo 'o/m' (revision 'main'): the repo is gated and no token is set. Accept its access conditions at {}/o/m, then set `hf_token`, set `HF_TOKEN`, or run `hf auth login`. See: https://spiceai.org/docs/components/models/huggingface",
             fixture.mock.endpoint()
         )
     );
+}
+
+#[tokio::test]
+async fn offline_mode_names_a_needed_file_the_cache_lacks() {
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    fixture
+        .open(None, &[])
+        .await
+        .download(&["config.json"])
+        .await
+        .expect("the config downloads");
+
+    let snapshot = fixture.open(None, &[("HF_HUB_OFFLINE", "1")]).await;
+    let error = snapshot
+        .download(&["config.json", "tokenizer.json"])
+        .await
+        .expect_err("the tokenizer was never downloaded");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): `HF_HUB_OFFLINE` is set and the Hugging Face cache at '{}' does not hold 'tokenizer.json'. Run `hf download o/m --revision main` while online, or unset `HF_HUB_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
+            fixture.cache().display()
+        )
+    );
+    // `hf download` can fill the cache while Spice runs: a retry may succeed.
     assert!(!error.is_configuration_error());
+}
+
+#[tokio::test]
+async fn a_connection_failure_keeps_its_kind_through_the_revision_cache() {
+    // A port nothing listens on.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a loopback port");
+    let hub = std::sync::Arc::new(
+        huggingface_hub::Hub::new(
+            huggingface_hub::HubConfig {
+                endpoint: url::Url::parse(&format!("http://{closed}")).expect("a URL"),
+                token: None,
+            },
+            tokio::runtime::Handle::current(),
+        )
+        .expect("a client"),
+    );
+    let repo = RepoId::new(RepoType::Model, "o", "m").expect("a valid repository");
+    let error = hub
+        .commit(&repo, "main")
+        .await
+        .expect_err("nothing listens");
+    // The lookup is shared between concurrent callers through a cache; the error each gets
+    // still says the connection failed, which is what a load that falls back reports.
+    assert!(
+        matches!(&error, huggingface_hub::Error::Request { source, .. } if source.is_connect()),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]

@@ -149,7 +149,9 @@ pub enum Error {
         repo: RepoId,
         endpoint: String,
         attempts: u32,
-        source: reqwest::Error,
+        // Shared so a failure that concurrent callers of one cached lookup receive keeps its
+        // kind: whether the connection failed or timed out is what a caller reports.
+        source: Arc<reqwest::Error>,
     },
 
     #[snafu(display(
@@ -846,7 +848,7 @@ impl Hub {
                     repo: repo.clone(),
                     endpoint: self.config.endpoint.to_string(),
                     attempts: attempts.made,
-                    source,
+                    source: Arc::new(source),
                 });
             }
             tracing::debug!(
@@ -919,7 +921,7 @@ impl Hub {
                 repo: (*repo).clone(),
                 endpoint: self.config.endpoint.to_string(),
                 attempts: attempt,
-                source: source.without_url(),
+                source: Arc::new(source.without_url()),
             })?;
 
             let client = self.http.clone();
@@ -946,7 +948,7 @@ impl Hub {
                         repo: (*repo).clone(),
                         endpoint: self.config.endpoint.to_string(),
                         attempts: attempt,
-                        source: source.without_url(),
+                        source: Arc::new(source.without_url()),
                     });
                 }
             };
@@ -1092,9 +1094,19 @@ impl Error {
                 attempts: *attempts,
                 message: message.clone(),
             },
+            Error::Request {
+                repo,
+                endpoint,
+                attempts,
+                source,
+            } => Error::Request {
+                repo: repo.clone(),
+                endpoint: endpoint.clone(),
+                attempts: *attempts,
+                source: Arc::clone(source),
+            },
             // `reqwest::Error` and `JoinError` are not `Clone`: keep their message.
-            Error::Request { .. }
-            | Error::TaskStopped { .. }
+            Error::TaskStopped { .. }
             | Error::HttpClient { .. }
             | Error::InvalidToken
             | Error::InvalidEndpoint { .. }
