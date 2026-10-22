@@ -783,6 +783,7 @@ jobs:
         with:
           working-directory: test_app
           timeout: '60'
+          datasets: taxi_trips
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
