@@ -14,11 +14,8 @@ proc chat {message}  {
     repl_send "$message\r"
 
     expect {
-        " ERROR " {
-            # allow stream to complete
-            sleep 2
-            send_user "Error detected\n"
-            exit 1
+        -ex $::repl_error_marker {
+            repl_errored "Waiting for the response to \"$message\""
         }
         "chat> " {
             # end of model response
