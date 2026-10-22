@@ -169,6 +169,25 @@ impl ViewRefreshSource {
     pub(crate) fn mark_registered(&self) {
         self.registered.send_replace(true);
     }
+
+    /// The view's plan, built once every table it reads is ready, or `None` when it does
+    /// not serve the acceleration's schema: the view was redefined.
+    pub(crate) async fn plan_on_served_schema(&self) -> Result<Option<Arc<dyn TableProvider>>> {
+        let provider = self.plan().await?;
+        Ok(schema_difference(&self.served_schema, &provider.schema())
+            .is_none()
+            .then_some(provider))
+    }
+
+    async fn plan(&self) -> Result<Arc<dyn TableProvider>> {
+        crate::datafusion::wait_until_dependent_tables_are_ready(
+            &self.view.name,
+            &self.reads,
+            &self.status,
+        )
+        .await;
+        prepare_view(&self.ctx, &self.statement, &self.view).await
+    }
 }
 
 impl std::fmt::Debug for ViewRefreshSource {
@@ -190,13 +209,8 @@ impl RefreshSource for ViewRefreshSource {
     async fn read_provider(
         &self,
     ) -> std::result::Result<Arc<dyn TableProvider>, RefreshSourceError> {
-        crate::datafusion::wait_until_dependent_tables_are_ready(
-            &self.view.name,
-            &self.reads,
-            &self.status,
-        )
-        .await;
-        let provider = prepare_view(&self.ctx, &self.statement, &self.view)
+        let provider = self
+            .plan()
             .await
             .map_err(|e| Box::new(e) as RefreshSourceError)?;
         if schema_difference(&self.served_schema, &provider.schema()).is_some() {
