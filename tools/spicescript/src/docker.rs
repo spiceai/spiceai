@@ -429,26 +429,32 @@ async fn pull_if_missing(docker: &Docker, image: &str) -> Result<()> {
 /// container again usually succeeds.
 const CREATE_ATTEMPTS: u32 = 3;
 
-/// How long to wait before trying again after Docker did not answer in time.
+/// How long to wait before trying again after Docker did not answer in time,
+/// and between lookups of a container a timed-out attempt created.
 const CREATE_RETRY_PAUSE: Duration = Duration::from_secs(2);
+
+/// How many times to look up a container a timed-out attempt created before
+/// giving up on finding it (about a minute at [`CREATE_RETRY_PAUSE`]).
+const ADOPT_LOOKUPS: u32 = 30;
 
 /// Runs `create` until it succeeds, fails other than by Docker not answering
 /// in time, or has been tried `attempts` times, pausing `pause` before each
 /// retry. Once an attempt has timed out, a name conflict (409) means that
 /// attempt's container was created after all, with this name and
-/// configuration: `adopt` then looks it up and its id is used. Each retry is
-/// reported in the script's output, naming `what`.
+/// configuration: `adopt` then looks it up, again after `pause` for as long
+/// as Docker does not know it yet, and its id is used. Each retry is reported
+/// in the script's output, naming `what`.
 async fn create_or_adopt<C, CF, A, AF>(
     attempts: u32,
     pause: Duration,
     what: &str,
     mut create: C,
-    adopt: A,
+    mut adopt: A,
 ) -> Result<String, bollard::errors::Error>
 where
     C: FnMut() -> CF,
     CF: std::future::Future<Output = Result<String, bollard::errors::Error>>,
-    A: FnOnce() -> AF,
+    A: FnMut() -> AF,
     AF: std::future::Future<Output = Result<String, bollard::errors::Error>>,
 {
     let mut tried = 1;
@@ -469,7 +475,21 @@ where
                 crate::runner::emit(&format!(
                     "   a timed-out attempt had created {what}; using that container"
                 ));
-                return adopt().await;
+                // Docker claims the name before the container can be looked
+                // up, so a lookup right after the conflict can find nothing.
+                let mut looked = 1;
+                loop {
+                    match adopt().await {
+                        Err(bollard::errors::Error::DockerResponseServerError {
+                            status_code: 404,
+                            ..
+                        }) if looked < ADOPT_LOOKUPS => {
+                            looked += 1;
+                            tokio::time::sleep(pause).await;
+                        }
+                        found => return found,
+                    }
+                }
             }
             other => return other,
         }
@@ -609,6 +629,36 @@ mod create_retry_tests {
         assert_eq!(
             (got.ok(), calls.load(Ordering::SeqCst)),
             (Some("adopted".into()), 2)
+        );
+
+        // Docker does not know that container yet: the lookup is repeated
+        // until it does.
+        let calls = AtomicU32::new(0);
+        let lookups = AtomicU32::new(0);
+        let got = create_or_adopt(
+            3,
+            no_pause,
+            "c",
+            || async {
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Err(Error::RequestTimeoutError),
+                    _ => Err(conflict()),
+                }
+            },
+            || async {
+                match lookups.fetch_add(1, Ordering::SeqCst) {
+                    0 | 1 => Err(Error::DockerResponseServerError {
+                        status_code: 404,
+                        message: "No such container".into(),
+                    }),
+                    _ => Ok("adopted".to_string()),
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            (got.ok(), lookups.load(Ordering::SeqCst)),
+            (Some("adopted".into()), 3)
         );
 
         // Timeouts every time: gives up after the allowed attempts.
