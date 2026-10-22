@@ -161,6 +161,10 @@ impl DataConnector for DrasiConnector {
         self.inner_connector.supports_changes_stream()
     }
 
+    fn supports_partitioned_changes(&self) -> bool {
+        self.inner_connector.supports_partitioned_changes()
+    }
+
     async fn changes_stream(
         &self,
         context: &dyn ConnectorContext,
