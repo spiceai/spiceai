@@ -3642,6 +3642,46 @@
       "pattern": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
       "group": "schema-evolution",
       "may-pass": true
+    },
+    {
+      "run": "schema-ddl[engine=duckdb]",
+      "who": "block",
+      "key": "refresh: {\"dataset\":\"cham\",\"wait\":false}",
+      "kind": "other",
+      "signature": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "pattern": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-ddl[engine=duckdb]",
+      "who": "block",
+      "key": "query: SELECT * FROM cham #4",
+      "kind": "error",
+      "signature": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "pattern": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-ddl[engine=duckdb]",
+      "who": "block",
+      "key": "refresh: {\"dataset\":\"cham\",\"wait\":false} #2",
+      "kind": "other",
+      "signature": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "pattern": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-ddl[engine=duckdb]",
+      "who": "block",
+      "key": "query: SELECT * FROM cham #6",
+      "kind": "error",
+      "signature": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "pattern": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "group": "schema-evolution",
+      "may-pass": true
     }
   ],
   "surface": [

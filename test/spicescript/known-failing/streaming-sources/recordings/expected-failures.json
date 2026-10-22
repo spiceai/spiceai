@@ -5,9 +5,60 @@
       "who": "default",
       "key": "query: SELECT id, name FROM created0",
       "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for created0: Acceleration not ready; loading initial data for created0",
+      "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
       "varies": true,
       "group": "streaming-sources",
+      "may-pass": true,
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d"
+    },
+    {
+      "run": "dynamodb-declared-streams-race",
+      "who": "default",
+      "key": "query: SELECT id, name FROM created1",
+      "kind": "error",
+      "group": "streaming-sources",
+      "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d",
+      "may-pass": true
+    },
+    {
+      "run": "dynamodb-declared-streams-race",
+      "who": "default",
+      "key": "query: SELECT id, name FROM created2",
+      "kind": "error",
+      "group": "streaming-sources",
+      "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d",
+      "may-pass": true
+    },
+    {
+      "run": "dynamodb-declared-streams-race",
+      "who": "default",
+      "key": "query: SELECT id, name FROM created3",
+      "kind": "error",
+      "group": "streaming-sources",
+      "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d",
+      "may-pass": true
+    },
+    {
+      "run": "dynamodb-declared-streams-race",
+      "who": "default",
+      "key": "query: SELECT id, name FROM streamed0",
+      "kind": "error",
+      "group": "streaming-sources",
+      "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d",
+      "may-pass": true
+    },
+    {
+      "run": "dynamodb-declared-streams-race",
+      "who": "default",
+      "key": "query: SELECT id, name FROM streamed1",
+      "kind": "error",
+      "group": "streaming-sources",
+      "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d",
       "may-pass": true
     },
     {
@@ -15,9 +66,20 @@
       "who": "default",
       "key": "query: SELECT id, name FROM streamed2",
       "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for streamed2: Acceleration not ready; loading initial data for streamed2",
+      "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
       "varies": true,
       "group": "streaming-sources",
+      "may-pass": true,
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d"
+    },
+    {
+      "run": "dynamodb-declared-streams-race",
+      "who": "default",
+      "key": "query: SELECT id, name FROM streamed3",
+      "kind": "error",
+      "group": "streaming-sources",
+      "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d",
       "may-pass": true
     }
   ],

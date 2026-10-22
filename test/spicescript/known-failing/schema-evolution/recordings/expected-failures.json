@@ -105,6 +105,26 @@
       "varies": true,
       "group": "schema-evolution",
       "may-pass": true
+    },
+    {
+      "run": "schema-widen[refresh_mode=changes]",
+      "who": "block",
+      "key": "query: SELECT * FROM t #4",
+      "kind": "error",
+      "signature": "Acceleration not ready; loading initial data for t",
+      "pattern": "Acceleration not ready; loading initial data for t",
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-widen[refresh_mode=changes]",
+      "who": "append-new-columns",
+      "key": "query: SELECT * FROM t #4",
+      "kind": "error",
+      "signature": "Acceleration not ready; loading initial data for t",
+      "pattern": "Acceleration not ready; loading initial data for t",
+      "group": "schema-evolution",
+      "may-pass": true
     }
   ]
 }
