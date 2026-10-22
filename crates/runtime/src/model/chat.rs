@@ -70,20 +70,36 @@ use crate::{
 use runtime_parameters_typed::TypedParams;
 use runtime_secrets::Secrets;
 use runtime_tools::options::SpiceToolsOptions;
+use tools::SpiceModelTool;
 
 pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
 
-/// A loaded chat model, both as `/v1/chat/completions` serves it and as `/v1/decisions`
-/// uses it.
+/// A loaded chat model, as `/v1/chat/completions` serves it, as `/v1/decisions` uses it, and
+/// as `/v1/messages` runs Spice's tools for it.
 pub struct LoadedChatModel {
     /// The model with the runtime tools its Spicepod `tools` param enables.
     pub chat: Arc<dyn Chat>,
     /// The same model — same provider client, system prompt and parameter defaults — with
     /// no runtime tools.
     without_tools: Arc<dyn Chat>,
+    /// The runtime tools its Spicepod `tools` param enables, and the most rounds of calls to
+    /// them one request may run.
+    tools: Vec<Arc<dyn SpiceModelTool>>,
+    tool_recursion_limit: usize,
 }
 
 impl LoadedChatModel {
+    /// The same model with no runtime tools.
+    pub(crate) fn without_tools(&self) -> Arc<dyn Chat> {
+        Arc::clone(&self.without_tools)
+    }
+
+    /// The runtime tools the model's Spicepod `tools` param enables, and the most rounds of
+    /// calls to them one request may run.
+    pub(crate) fn tools(&self) -> (&[Arc<dyn SpiceModelTool>], usize) {
+        (&self.tools, self.tool_recursion_limit)
+    }
+
     /// The evaluator decisions use for this model, which the Spicepod names `name`.
     ///
     /// It calls the model without runtime tools: an evaluation's `state` is untrusted
@@ -139,7 +155,7 @@ pub async fn try_to_chat_model(
 
     let tool_embedding_model = extract_secret!(params, TOOL_EMBEDDING_MODEL_PARAM);
 
-    let (tool_model, tool_offer) = match spice_tool_opt {
+    let (tool_model, tool_offer, tools) = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => {
             let table_allowlist = create_table_allowlist(&component.datasets).map_err(|e| {
                 LlmError::ModelParameterFailed {
@@ -151,11 +167,12 @@ pub async fn try_to_chat_model(
             let tools = prepare_model_tools(Arc::clone(&rt), &opts, tools, tool_embedding_model)
                 .await
                 .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
-            let tool_model = ToolUsingChat::new(Arc::clone(&model), tools, spice_recursion_limit);
+            let tool_model =
+                ToolUsingChat::new(Arc::clone(&model), tools.clone(), spice_recursion_limit);
             let tool_offer = tool_model.tool_offer();
-            (Arc::new(tool_model) as Arc<dyn Chat>, tool_offer)
+            (Arc::new(tool_model) as Arc<dyn Chat>, tool_offer, tools)
         }
-        Some(_) | None => (Arc::clone(&model), ToolOffer::RequestOnly),
+        Some(_) | None => (Arc::clone(&model), ToolOffer::RequestOnly, Vec::new()),
     };
 
     // The Spicepod's request defaults go above the tool loop, so they apply once to each client
@@ -169,6 +186,8 @@ pub async fn try_to_chat_model(
     Ok(LoadedChatModel {
         chat: Arc::new(without_tools.over(tool_model, tool_offer)),
         without_tools: Arc::new(without_tools),
+        tools,
+        tool_recursion_limit: spice_recursion_limit.unwrap_or(DEFAULT_SPICE_TOOL_RECURSION_LIMIT),
     })
 }
 
@@ -347,6 +366,15 @@ fn anthropic(
     model_id: Option<&str>,
     params: &AnthropicModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
+    Ok(Arc::new(anthropic_client(model_id, params)?) as Arc<dyn Chat>)
+}
+
+/// The Anthropic client of a `from: anthropic` model, which serves both its chat completions
+/// and, natively, the Messages API.
+pub(crate) fn anthropic_client(
+    model_id: Option<&str>,
+    params: &AnthropicModelParams,
+) -> Result<Anthropic, LlmError> {
     let api_base = params.endpoint.as_deref();
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
     let auth_token = params.auth_token.as_ref().map(ExposeSecret::expose_secret);
@@ -371,7 +399,7 @@ fn anthropic(
             source: format!("Invalid `anthropic_workspace_id`: {e}").into(),
         })?;
 
-    Ok(Arc::new(anthropic) as Arc<dyn Chat>)
+    Ok(anthropic)
 }
 
 async fn google(
@@ -868,14 +896,25 @@ fn parse_context_length(params: &FileModelParams) -> Result<Option<usize>, LlmEr
 
 // Get OpenAI compatible request parameter overrides.
 // Prioritizes parameters without prefix, then model prefix (e.g., `hf_temperature`), then deprecated (e.g. `openai_temperature`) parameters.
+/// The model's `params` value for the request default `key`, by the documented spelling
+/// first: unprefixed for `OpenAI`, `{prefix}_` for every other provider. The other spellings
+/// are deprecated aliases, read only when it is absent. Chat completions and the Responses
+/// API both read their defaults through this, so the two agree on which value applies.
+pub(crate) fn request_default<'a>(model: &'a Model, prefix: &str, key: &str) -> Option<&'a Value> {
+    let prefixed = format!("{prefix}_{key}");
+    let legacy = format!("openai_{key}");
+    let spellings = if prefix == ModelSource::OpenAi.short_name() {
+        [key, legacy.as_str(), legacy.as_str()]
+    } else {
+        [prefixed.as_str(), key, legacy.as_str()]
+    };
+    spellings.iter().find_map(|name| model.params.get(*name))
+}
+
 pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
     let mut request_overrides: HashMap<String, Value> = HashMap::new();
     for &key in OPENAI_DEFAULT_PARAM_KEYS.iter() {
-        if let Some(v) = model.params.get(key) {
-            request_overrides.insert(key.to_string(), v.clone());
-        } else if let Some(v) = model.params.get(&format!("{prefix}_{key}")) {
-            request_overrides.insert(key.to_string(), v.clone());
-        } else if let Some(v) = model.params.get(&format!("openai_{key}")) {
+        if let Some(v) = request_default(model, prefix, key) {
             request_overrides.insert(key.to_string(), v.clone());
         }
     }
@@ -991,6 +1030,62 @@ mod test {
         assert_eq!(overrides.len(), 1);
         assert!(overrides.iter().any(|(k, v)| k == "temperature"
             && v == &Value::Number(Number::from_f64(0.7).expect("valid number"))));
+    }
+
+    #[test]
+    fn a_prefixed_override_takes_precedence_over_its_bare_alias() {
+        let mut model = Model::new("hf:test_model", "test_model");
+        model.params.insert(
+            "reasoning_effort".to_string(),
+            Value::String("high".to_string()),
+        );
+        model.params.insert(
+            "hf_reasoning_effort".to_string(),
+            Value::String("low".to_string()),
+        );
+        assert_eq!(
+            get_openai_request_overrides(&model, "hf"),
+            vec![(
+                "reasoning_effort".to_string(),
+                Value::String("low".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn a_bare_override_applies_when_its_prefixed_form_is_absent() {
+        let mut model = Model::new("file:/models/qwen3.gguf", "test_model");
+        model.params.insert(
+            "reasoning_effort".to_string(),
+            Value::String("none".to_string()),
+        );
+        assert_eq!(
+            get_openai_request_overrides(&model, "file"),
+            vec![(
+                "reasoning_effort".to_string(),
+                Value::String("none".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn openai_reads_the_bare_override_before_its_deprecated_prefixed_form() {
+        let mut model = Model::new("openai:gpt-5", "test_model");
+        model.params.insert(
+            "reasoning_effort".to_string(),
+            Value::String("high".to_string()),
+        );
+        model.params.insert(
+            "openai_reasoning_effort".to_string(),
+            Value::String("low".to_string()),
+        );
+        assert_eq!(
+            get_openai_request_overrides(&model, "openai"),
+            vec![(
+                "reasoning_effort".to_string(),
+                Value::String("high".to_string())
+            )]
+        );
     }
 
     #[test]
