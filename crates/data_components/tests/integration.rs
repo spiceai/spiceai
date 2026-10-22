@@ -23,4 +23,3 @@ limitations under the License.
 mod elasticsearch_test;
 mod hadoop_catalog_test;
 mod http_provider_test;
-mod http_response_limit_test;
