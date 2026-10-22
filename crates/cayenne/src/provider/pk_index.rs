@@ -747,6 +747,13 @@ impl PkBloom {
         Self::with_num_bits_pow2(budget_bytes.saturating_mul(8))
     }
 
+    /// The bytes [`Self::with_byte_budget`] allocates for `budget_bytes`,
+    /// without allocating them.
+    pub(crate) fn size_for_byte_budget(budget_bytes: usize) -> usize {
+        let want_blocks = (budget_bytes.saturating_mul(8) / SPLIT_BLOCK_BITS).max(1);
+        (1usize << want_blocks.ilog2()) * (SPLIT_BLOCK_BITS / 8)
+    }
+
     /// Right-size a bloom for `expected_keys` at ~10 bits/key, never exceeding
     /// `max_bytes`.
     ///
@@ -1241,15 +1248,8 @@ impl GrowingPkBloom {
         if holds_bits < newest_bytes.saturating_mul(8) {
             return;
         }
-        let room = max_bytes.saturating_sub(self.size_bytes());
-        let next_bytes = newest_bytes
-            .saturating_mul(2)
-            .min(GROWING_PK_BLOOM_MAX_SEGMENT_BYTES)
-            .min(room);
-        // `with_byte_budget` rounds down to a power of two.
-        let next = PkBloom::with_byte_budget(next_bytes);
-        if next.size_bytes() >= newest_bytes && next.size_bytes() <= room {
-            self.segments.push(next);
+        if let Some(next_bytes) = next_segment_bytes(newest_bytes, self.size_bytes(), max_bytes) {
+            self.segments.push(PkBloom::with_byte_budget(next_bytes));
         }
     }
 
@@ -1292,6 +1292,27 @@ impl GrowingPkBloom {
     pub(crate) fn segment_count(&self) -> usize {
         self.segments.len()
     }
+}
+
+/// The size of the segment a full [`GrowingPkBloom`] adds, or `None` when the
+/// budget has no room for one: twice the newest, at most
+/// [`GROWING_PK_BLOOM_MAX_SEGMENT_BYTES`] and the room `max_bytes` leaves beside
+/// `held_bytes`, rounded down as [`PkBloom::with_byte_budget`] allocates it. A
+/// segment smaller than the newest (or than the cap, for a newest above it) is
+/// not worth a probe on every lookup, so the newest keeps taking keys instead.
+///
+/// Decided before anything is allocated: a full filter calls this for every
+/// key it records.
+fn next_segment_bytes(newest_bytes: usize, held_bytes: usize, max_bytes: usize) -> Option<usize> {
+    let room = max_bytes.saturating_sub(held_bytes);
+    let next_bytes = PkBloom::size_for_byte_budget(
+        newest_bytes
+            .saturating_mul(2)
+            .min(GROWING_PK_BLOOM_MAX_SEGMENT_BYTES)
+            .min(room),
+    );
+    let smallest = newest_bytes.min(GROWING_PK_BLOOM_MAX_SEGMENT_BYTES);
+    (next_bytes >= smallest && next_bytes <= room).then_some(next_bytes)
 }
 
 /// Magic ("CPKB") + version for the persisted PK-index bloom sidecar. Bumping
@@ -2567,6 +2588,58 @@ mod tests {
         );
         assert_eq!(bloom.segment_count(), 2, "4 KiB, then one 8 KiB segment");
         assert!((0..100_000).all(|n| bloom.maybe_contains(&key(n))));
+    }
+
+    /// The size a segment would get is decided without allocating it, and is
+    /// exactly what `with_byte_budget` then allocates.
+    #[test]
+    fn size_for_byte_budget_matches_the_allocation() {
+        for budget in [
+            0,
+            1,
+            31,
+            32,
+            33,
+            4095,
+            4096,
+            12 * 1024 * 1024,
+            300 * 1024 * 1024,
+        ] {
+            assert_eq!(
+                PkBloom::size_for_byte_budget(budget),
+                PkBloom::with_byte_budget(budget).size_bytes(),
+                "budget {budget}"
+            );
+        }
+    }
+
+    /// A full bloom grows by twice its newest segment while the budget allows,
+    /// in steps of at most 256 MiB, including from a first segment already
+    /// larger than that; with too little room it adds nothing.
+    #[test]
+    fn next_segment_bytes_doubles_within_the_cap_and_the_budget() {
+        const MIB: usize = 1024 * 1024;
+        assert_eq!(
+            super::next_segment_bytes(8 * MIB, 8 * MIB, 64 * MIB),
+            Some(16 * MIB)
+        );
+        assert_eq!(
+            super::next_segment_bytes(256 * MIB, 256 * MIB, 8192 * MIB),
+            Some(256 * MIB)
+        );
+        assert_eq!(
+            super::next_segment_bytes(512 * MIB, 512 * MIB, 8192 * MIB),
+            Some(256 * MIB)
+        );
+        // 12 MiB of room fits an 8 MiB segment, as large as the newest.
+        assert_eq!(
+            super::next_segment_bytes(8 * MIB, 8 * MIB, 20 * MIB),
+            Some(8 * MIB)
+        );
+        // 4 MiB of room cannot fit a segment as large as the newest 8 MiB.
+        assert_eq!(super::next_segment_bytes(8 * MIB, 8 * MIB, 12 * MIB), None);
+        assert_eq!(super::next_segment_bytes(8 * MIB, 8 * MIB, 8 * MIB), None);
+        assert_eq!(super::next_segment_bytes(8 * MIB, 8 * MIB, 0), None);
     }
 
     /// Recording keys the bloom already holds, as an upsert of stored rows
