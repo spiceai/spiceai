@@ -4856,25 +4856,22 @@ dependencies = [
  "datafusion",
  "futures",
  "glob",
+ "huggingface-hub",
  "linkme",
- "moka",
  "object_store 0.13.2",
  "parking_lot",
  "parquet",
  "percent-encoding",
- "reqwest 0.13.4",
  "runtime-component",
  "runtime-datafusion",
  "runtime-object-store",
  "runtime-parameters",
  "secrecy",
- "serde",
  "serde_json",
  "snafu",
  "tokio",
  "tracing",
  "url",
- "util",
 ]
 
 [[package]]
@@ -10282,6 +10279,27 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
+name = "huggingface-hub"
+version = "2.4.0-unstable"
+dependencies = [
+ "bytes",
+ "chrono",
+ "futures",
+ "moka",
+ "object_store 0.13.2",
+ "percent-encoding",
+ "reqwest 0.13.4",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tracing",
+ "url",
+ "util",
+]
 
 [[package]]
 name = "humansize"
