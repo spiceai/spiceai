@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `hf://datasets/<owner>/<dataset>[@<revision>][/<path>]` dataset locations.
+//! Hugging Face Hub repositories, and `hf://datasets/<owner>/<dataset>[@<revision>][/<path>]`
+//! dataset locations.
 //!
 //! This is the grammar the Hugging Face ecosystem already shares — `huggingface_hub`'s
 //! `HfFileSystem`, `DuckDB` and Polars all read it — so a location copied from a dataset
@@ -32,7 +33,7 @@ use std::fmt;
 
 use snafu::prelude::*;
 
-/// The URL scheme that selects this connector.
+/// The URL scheme of a Hugging Face location, `hf://`.
 pub const SCHEME: &str = "hf";
 const DATASETS: &str = "datasets";
 /// `DuckDB`'s alias for [`PARQUET_CONVERSION_REVISION`].
@@ -66,10 +67,11 @@ pub enum Error {
     // `{value:?}` escapes control characters in the untrusted input, keeping the message on
     // one line.
     #[snafu(display(
-        "Invalid dataset {component} {value:?} in {from:?}: use 1 to 96 letters, digits, '-', '_' or '.', starting and ending with a letter or digit, without '--' or '..'."
+        "Invalid {kind} {component} {value:?} in {from:?}: use 1 to 96 letters, digits, '-', '_' or '.', starting and ending with a letter or digit, without '--' or '..'."
     ))]
     InvalidRepoName {
         from: String,
+        kind: RepoType,
         component: &'static str,
         value: String,
     },
@@ -92,9 +94,56 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// A dataset repository on the Hub, `<owner>/<name>`.
+/// The kind of a repository on the Hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RepoType {
+    Model,
+    Dataset,
+    Space,
+}
+
+impl RepoType {
+    /// The noun a message names a repository of this kind with.
+    #[must_use]
+    pub fn noun(self) -> &'static str {
+        match self {
+            RepoType::Model => "model",
+            RepoType::Dataset => "dataset",
+            RepoType::Space => "space",
+        }
+    }
+
+    /// The collection the Hub's API serves repositories of this kind under: `/api/{plural}`.
+    #[must_use]
+    pub fn plural(self) -> &'static str {
+        match self {
+            RepoType::Model => "models",
+            RepoType::Dataset => DATASETS,
+            RepoType::Space => "spaces",
+        }
+    }
+
+    /// The first path segment of a repository's page and `resolve` URLs: none for a model,
+    /// whose repositories sit at the root of the Hub.
+    #[must_use]
+    pub fn url_prefix(self) -> Option<&'static str> {
+        match self {
+            RepoType::Model => None,
+            RepoType::Dataset | RepoType::Space => Some(self.plural()),
+        }
+    }
+}
+
+impl fmt::Display for RepoType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.noun())
+    }
+}
+
+/// A repository on the Hub, `<owner>/<name>`, of one [`RepoType`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RepoId {
+    kind: RepoType,
     owner: String,
     name: String,
 }
@@ -105,14 +154,32 @@ impl RepoId {
     /// # Errors
     ///
     /// Returns an error if the owner or name is not a valid Hub name.
-    pub fn new(owner: &str, name: &str) -> Result<Self> {
-        let from = format!("{SCHEME}://{DATASETS}/{owner}/{name}");
-        validate_name(&from, "owner", owner)?;
-        validate_name(&from, "name", name)?;
+    pub fn new(kind: RepoType, owner: &str, name: &str) -> Result<Self> {
+        let from = match kind.url_prefix() {
+            Some(prefix) => format!("{SCHEME}://{prefix}/{owner}/{name}"),
+            None => format!("{SCHEME}://{owner}/{name}"),
+        };
+        validate_name(&from, kind, "owner", owner)?;
+        validate_name(&from, kind, "name", name)?;
         Ok(Self {
+            kind,
             owner: owner.to_string(),
             name: name.to_string(),
         })
+    }
+
+    /// A dataset repository id; see [`RepoId::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the owner or name is not a valid Hub name.
+    pub fn dataset(owner: &str, name: &str) -> Result<Self> {
+        Self::new(RepoType::Dataset, owner, name)
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> RepoType {
+        self.kind
     }
 
     #[must_use]
@@ -205,8 +272,8 @@ impl DatasetLocation {
             .fail();
         }
 
-        validate_name(from, "owner", owner)?;
-        validate_name(from, "name", name)?;
+        validate_name(from, RepoType::Dataset, "owner", owner)?;
+        validate_name(from, RepoType::Dataset, "name", name)?;
 
         let path = path.unwrap_or_default();
         let is_folder = path.is_empty() || path.ends_with('/');
@@ -221,6 +288,7 @@ impl DatasetLocation {
 
         Ok(Self {
             repo: RepoId {
+                kind: RepoType::Dataset,
                 owner: owner.to_string(),
                 name: name.to_string(),
             },
@@ -340,7 +408,7 @@ fn decode_revision(from: &str, revision: &str) -> Result<String> {
 /// Applies the Hub's rule for owner and repository names (`huggingface_hub`'s
 /// `validate_repo_id`). The names are interpolated into Hub URLs, so this is also what keeps a
 /// location from addressing anything but a dataset repository.
-fn validate_name(from: &str, component: &'static str, value: &str) -> Result<()> {
+fn validate_name(from: &str, kind: RepoType, component: &'static str, value: &str) -> Result<()> {
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let valid = !value.is_empty()
         && value.len() <= MAX_NAME_LEN
@@ -353,6 +421,7 @@ fn validate_name(from: &str, component: &'static str, value: &str) -> Result<()>
         valid,
         InvalidRepoNameSnafu {
             from,
+            kind,
             component,
             value,
         }
@@ -579,6 +648,7 @@ mod tests {
                 DatasetLocation::parse(from),
                 Err(Error::InvalidRepoName {
                     from: from.to_string(),
+                    kind: RepoType::Dataset,
                     component,
                     value: value.to_string(),
                 }),
