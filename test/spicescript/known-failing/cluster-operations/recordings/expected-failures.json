@@ -72,7 +72,8 @@
       "key": "query: SELECT count(*) AS n FROM t",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Cannot query t: its partitions have not been discovered yet; retry the query: Cannot query t: its partitions have not been discovered yet; retry the query",
-      "group": "cluster-operations"
+      "group": "cluster-operations",
+      "pattern": "Cannot query t: (its partitions have not been discovered yet|no ready executor serves (\\d+|<n>) of its (\\d+|<n>) partitions)"
     },
     {
       "run": "cluster-failed-dataset-empties-others",
@@ -80,7 +81,8 @@
       "key": "query: SELECT * FROM t",
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Cannot query t: its partitions have not been discovered yet; retry the query: Cannot query t: its partitions have not been discovered yet; retry the query",
-      "group": "cluster-operations"
+      "group": "cluster-operations",
+      "pattern": "Cannot query t: (its partitions have not been discovered yet|no ready executor serves (\\d+|<n>) of its (\\d+|<n>) partitions)"
     }
   ],
   "cluster-http-caching": [
