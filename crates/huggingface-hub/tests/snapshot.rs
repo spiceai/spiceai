@@ -26,9 +26,11 @@ use huggingface_hub::settings::{Environment, Settings};
 use huggingface_hub::snapshot::{Requester, Snapshot};
 use huggingface_hub::{RepoId, RepoType};
 
-use crate::mock_hub::{C1, C2, MockFile, MockHub};
+use crate::mock_hub::{C1, C2, MockFile, MockHub, RevisionFiles};
 
 const MODEL: &str = "models/o/m";
+/// The request that resolves `main` of the test model and describes its files.
+const REVISION_DESCRIBED: &str = "/api/models/o/m/revision/main?blobs=true&expand%5B%5D=sha&expand%5B%5D=lastModified&expand%5B%5D=siblings";
 
 /// The environment a test resolves its settings in: the mock's endpoint, a cache in a
 /// temporary directory, and nothing else.
@@ -102,6 +104,18 @@ impl Fixture {
         extra: &[(&'static str, &str)],
     ) -> Result<Snapshot, huggingface_hub::DownloadError> {
         self.try_open_for(requester(), revision, extra).await
+    }
+
+    async fn open_paths(&self, paths: &[&str]) -> Snapshot {
+        Snapshot::open_paths(
+            self.settings(&[]).await,
+            requester(),
+            RepoId::new(RepoType::Model, "o", "m").expect("a valid repository"),
+            None,
+            paths,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the snapshot opens: {e}"))
     }
 
     async fn try_open_for(
@@ -298,6 +312,8 @@ fn modes_under(root: &Path) -> Vec<(String, String)> {
 
 #[tokio::test]
 async fn a_second_load_downloads_nothing() {
+    // The request that resolves the revision describes every file too: a cold load lists
+    // nothing more, and a warm one makes that request alone.
     let fixture = Fixture::new().await;
     fixture.mock.commit(MODEL, C1, model_files());
     fixture.mock.branch(MODEL, "main", C1);
@@ -312,6 +328,7 @@ async fn a_second_load_downloads_nothing() {
         "{:?}",
         fixture.mock.downloads()
     );
+    assert_eq!(fixture.mock.api_paths(), vec![REVISION_DESCRIBED]);
 
     fixture.mock.clear_seen();
     let snapshot = fixture.open(None, &[]).await;
@@ -319,11 +336,7 @@ async fn a_second_load_downloads_nothing() {
         .download(&["config.json", "model.safetensors"])
         .await
         .expect("the files load from the cache");
-    assert!(
-        fixture.mock.downloads().is_empty(),
-        "{:?}",
-        fixture.mock.downloads()
-    );
+    assert_eq!(fixture.mock.seen_paths(), vec![REVISION_DESCRIBED]);
 }
 
 #[tokio::test]
@@ -772,36 +785,13 @@ async fn a_component_spice_loads_once_says_to_restart() {
 
 #[tokio::test]
 async fn open_paths_describes_only_the_files_named() {
-    // A component that reads one file of a repository looks at that file, and never lists a
-    // repository that may hold many. Warm, it costs one request: the answer that names the
-    // commit.
+    // A component that reads one file of a repository describes only that file. Warm, it
+    // costs one request: the answer that names the commit.
     let fixture = Fixture::new().await;
     fixture.mock.commit(MODEL, C1, model_files());
     fixture.mock.branch(MODEL, "main", C1);
-    let open = |paths: &'static [&'static str]| {
-        let fixture = &fixture;
-        async move {
-            Snapshot::open_paths(
-                fixture.settings(&[]).await,
-                requester(),
-                RepoId::new(RepoType::Model, "o", "m").expect("a valid repository"),
-                None,
-                paths,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("the snapshot opens: {e}"))
-        }
-    };
-    let requests = |fixture: &Fixture| -> Vec<String> {
-        fixture
-            .mock
-            .seen()
-            .into_iter()
-            .map(|seen| seen.path)
-            .collect()
-    };
 
-    let snapshot = open(&["tokenizer.json", "absent.json"]).await;
+    let snapshot = fixture.open_paths(&["tokenizer.json", "absent.json"]).await;
     assert_eq!(snapshot.commit(), C1);
     assert_eq!(
         snapshot
@@ -818,13 +808,13 @@ async fn open_paths_describes_only_the_files_named() {
         std::fs::read_to_string(&paths[0]).expect("the file"),
         "{\"version\":\"1.0\"}"
     );
-    let cold = requests(&fixture);
-    assert!(
-        cold.iter()
-            .any(|path| path.starts_with("/o/m/resolve/main/tokenizer.json"))
-            && cold.iter().any(|path| path.contains("/paths-info/"))
-            && !cold.iter().any(|path| path.contains("/tree/")),
-        "{cold:#?}"
+    // Cold: the answer that names the commit describes the file, which is then downloaded.
+    assert_eq!(
+        fixture.mock.seen_paths(),
+        vec![
+            REVISION_DESCRIBED.to_string(),
+            format!("/o/m/resolve/{C1}/tokenizer.json"),
+        ]
     );
     // A file the repository does not have is named when it is downloaded.
     let error = snapshot
@@ -836,17 +826,146 @@ async fn open_paths_describes_only_the_files_named() {
         "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the repo has no 'absent.json'. See: https://spiceai.org/docs/components/models/huggingface"
     );
 
-    // Warm: one request names the commit, and the cached file is used as it is.
+    // Warm: a `HEAD` confirms the commit `main` names is the one the cache holds the file at,
+    // and the cached file is used as it is.
     fixture.mock.clear_seen();
-    let warm = open(&["tokenizer.json"]).await;
+    let warm = fixture.open_paths(&["tokenizer.json"]).await;
     let located = warm
         .download(&["tokenizer.json"])
         .await
         .unwrap_or_else(|e| panic!("the cached file loads: {e}"));
     assert_eq!(located, paths);
     assert_eq!(
-        requests(&fixture),
-        vec!["/o/m/resolve/main/tokenizer.json".to_string()]
+        fixture.mock.seen_paths(),
+        vec!["/o/m/resolve/main/tokenizer.json"]
+    );
+}
+
+#[tokio::test]
+async fn open_paths_follows_a_branch_that_moved() {
+    // The cache holds the file at the commit `main` named before; `main` has moved since, so
+    // the `HEAD` names another commit, at which the file is described and downloaded.
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    fixture
+        .open_paths(&["tokenizer.json"])
+        .await
+        .download(&["tokenizer.json"])
+        .await
+        .unwrap_or_else(|e| panic!("the first commit's file downloads: {e}"));
+    fixture.mock.commit(
+        MODEL,
+        C2,
+        vec![("tokenizer.json", MockFile::text("{\"version\":\"2.0\"}"))],
+    );
+    fixture.mock.branch(MODEL, "main", C2);
+    fixture.mock.clear_seen();
+
+    let snapshot = fixture.open_paths(&["tokenizer.json"]).await;
+    assert_eq!(snapshot.commit(), C2);
+    let paths = snapshot
+        .download(&["tokenizer.json"])
+        .await
+        .unwrap_or_else(|e| panic!("the new commit's file downloads: {e}"));
+    assert_eq!(
+        std::fs::read_to_string(&paths[0]).expect("the file"),
+        "{\"version\":\"2.0\"}"
+    );
+    assert_eq!(
+        fixture.mock.seen_paths(),
+        vec![
+            "/o/m/resolve/main/tokenizer.json".to_string(),
+            REVISION_DESCRIBED.to_string(),
+            format!("/o/m/resolve/{C2}/tokenizer.json"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_endpoint_that_refuses_to_describe_files_is_asked_for_the_revision_alone() {
+    // An endpoint that answers HTTP 400 to the request for the revision with its files'
+    // blobs, a combination `huggingface_hub` never sends: the revision is asked for alone, the
+    // files are listed, and the load downloads as from the Hub.
+    let fixture = Fixture::new().await;
+    let files = model_files();
+    fixture.mock.commit(MODEL, C1, files.clone());
+    fixture.mock.branch(MODEL, "main", C1);
+    fixture
+        .mock
+        .faults(|faults| faults.revision_files = RevisionFiles::Refused);
+
+    let paths = fixture
+        .open(None, &[])
+        .await
+        .download(&["model.safetensors"])
+        .await
+        .unwrap_or_else(|e| panic!("the file downloads: {e}"));
+    assert_eq!(
+        std::fs::read(&paths[0]).expect("the weights"),
+        files[2].1.bytes.as_ref()
+    );
+    assert_eq!(
+        fixture.mock.api_paths(),
+        vec![
+            REVISION_DESCRIBED.to_string(),
+            "/api/models/o/m/revision/main?expand%5B%5D=sha&expand%5B%5D=lastModified".to_string(),
+            format!("/api/models/o/m/tree/{C1}?recursive=true&expand=false"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_endpoint_that_does_not_describe_files_is_listed() {
+    // A mirror that answers the revision without its files: they are listed, or described one
+    // path at a time, and download as from the Hub.
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    fixture
+        .mock
+        .faults(|faults| faults.revision_files = RevisionFiles::Omitted);
+
+    let snapshot = fixture.open(None, &[]).await;
+    let files: Vec<&str> = snapshot.files().map(|file| file.path.as_str()).collect();
+    assert_eq!(
+        files,
+        vec![
+            "config.json",
+            "model.safetensors",
+            "onnx/model.onnx",
+            "tokenizer.json"
+        ]
+    );
+    snapshot
+        .download(&["config.json", "model.safetensors"])
+        .await
+        .unwrap_or_else(|e| panic!("the files download: {e}"));
+    let seen = fixture.mock.seen_paths();
+    assert!(
+        seen.iter()
+            .any(|path| path.starts_with(&format!("/api/models/o/m/tree/{C1}"))),
+        "{seen:#?}"
+    );
+
+    fixture.mock.clear_seen();
+    let path = fixture
+        .open_paths(&["tokenizer.json"])
+        .await
+        .download(&["tokenizer.json"])
+        .await
+        .unwrap_or_else(|e| panic!("the file downloads: {e}"));
+    assert_eq!(
+        std::fs::read_to_string(&path[0]).expect("the file"),
+        "{\"version\":\"1.0\"}"
+    );
+    assert_eq!(
+        fixture.mock.seen_paths(),
+        vec![
+            REVISION_DESCRIBED.to_string(),
+            format!("/api/models/o/m/paths-info/{C1}"),
+            format!("/o/m/resolve/{C1}/tokenizer.json"),
+        ]
     );
 }
 
