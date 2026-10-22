@@ -64,6 +64,10 @@ mod localpod_sync;
 mod on_conflict;
 #[cfg(feature = "sqlite")]
 mod sqlite_builtin_pushdown;
+#[cfg(any(feature = "sqlite", feature = "turso"))]
+mod sqlite_interval_arithmetic;
+#[cfg(feature = "sqlite")]
+mod sqlite_query_errors;
 
 #[cfg(not(target_os = "windows"))]
 mod newest_by_time;
