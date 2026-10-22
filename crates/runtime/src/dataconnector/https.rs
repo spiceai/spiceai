@@ -2250,6 +2250,16 @@ impl ListingTableConnector for HttpListingConnector {
         }
 
         let mut fragment = build_fragments(&self.params, vec!["client_timeout"]);
+        // The operator wrote `http://` in the dataset URL. That is the
+        // permission the object store's `allow_http` setting requires. An
+        // `https://` dataset stays HTTPS-only, so a redirect cannot switch
+        // the fetch to plaintext.
+        if u.scheme() == "http" {
+            if !fragment.is_empty() {
+                fragment.push('&');
+            }
+            fragment.push_str("allow_http=true");
+        }
         if !username.is_empty() || password.is_some() {
             let token = http_auth::register(
                 &u,
@@ -2373,6 +2383,23 @@ mod tests {
         });
 
         dataset
+    }
+
+    #[tokio::test]
+    async fn http_dataset_url_opts_into_plaintext() {
+        let dataset = test_dataset("http://example.com/data/", RefreshMode::Full, None).await;
+        let connector =
+            HttpListingConnector::new(test_params(&[]).await, tokio::runtime::Handle::current());
+        let url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("an http dataset URL is valid");
+        assert_eq!(url.fragment(), Some("allow_http=true"));
+
+        let https = test_dataset("https://example.com/data/", RefreshMode::Full, None).await;
+        let url = connector
+            .get_object_store_url(&https, None)
+            .expect("an https dataset URL is valid");
+        assert_eq!(url.fragment(), Some(""));
     }
 
     fn test_client_identity_pems() -> (String, String) {

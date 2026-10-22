@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `cf084aa85dfdc27b4736208f5c132828020774ea` | `spiceai-55` |
+| [datafusion](#datafusion) | `51790d4017ee62656341c55c30425ed17897add8` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `c5bcad1acdce0a4e3c8e9d488901f55fcf89bd3a` | `spiceai-55` |
@@ -124,7 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `a6b07b8b9625e552c502c3a7229fd4bb7725bd2e` | `spiceai-0.11.0-df-55` |
-| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `4450776632f7e92f5b8b1ac97f56fe3f72cf2618` | `spiceai` |
+| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `d99170d287d6a94c1b1ff0c1622904c8bff704f0` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
@@ -210,7 +210,9 @@ fractional-second precision, and #257, which writes a join key that matches NULL
 as `IS NOT DISTINCT FROM`, #258, the `IoWaitHook` patch
 ([#15049](https://github.com/spiceai/spiceai/issues/15049)), #259, which keeps placeholder type
 inference linear in the depth of an expression, and #260, which carries an eliminated sort's
-fetch through a single-input repartition; the pin is #260's merge commit. None changes a
+fetch through a single-input repartition, #266, which charges each slice of a batch
+`ExternalSorter` is given for that slice's own rows, and #261, which keeps a union input's own
+`ORDER BY` and `LIMIT` inside that input; the pin is #261's merge commit. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
@@ -319,6 +321,8 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Unparser: a join whose keys match NULLs (`NullEquality::NullEqualsNull`) writes them as `IS NOT DISTINCT FROM` (`<=>` for MySQL), in an `EXISTS` correlation and in `ON`, and never as `USING`. `INTERSECT` and `EXCEPT` are always planned as such a semi or anti join, and the optimizer makes one from a join or `EXISTS` compared only with `IS NOT DISTINCT FROM` (spiceai/datafusion#257) | The keys are written as `=`, which is never true on NULL, so the remote engine drops every row with a NULL in a compared column from an `INTERSECT` and keeps it in an `EXCEPT`: on `DuckDB` file acceleration, TPC-DS q38 returns 0 rows instead of 111 and q87 46,704 instead of 46,449 ([#14941](https://github.com/spiceai/spiceai/issues/14941)) | silent (wrong data) | `crates/data_components/src/federation.rs::tests::intersect_and_except_unparse_keys_that_match_nulls`; real-engine guard `crates/runtime/tests/duckdb/mod.rs::duckdb_file_acceleration_set_operations_match_nulls` (`runtime::integration`, run by `integration.yml`) |
 | `IoWaitExt::io_wait` and the process-wide `IoWaitHook` in `common-runtime`, with `SpawnedTask` and `JoinSet` passing spawned work through the hook's `carry_future`/`carry_local_future`/`carry_block` (spiceai/datafusion#258, [#15049](https://github.com/spiceai/spiceai/issues/15049)) | Without the API, the HTTP connector's `io_wait()` calls and `RuntimeBuilder::build`'s `set_io_wait_hook` stop compiling. Without the carry, a wait inside a task DataFusion spawns (`RepartitionExec`, `CoalescePartitionsExec`) never reaches the hook, so a distributed task waiting there on a slow HTTP source holds its executor slot again | build; silent (throughput) for the carry | compile-guarded by `crates/data_components/src/http/provider.rs` and `crates/runtime/src/builder.rs`. The carry is **GAP**: with it disabled, `crates/runtime/tests/cluster/io_wait_lending.rs` still passes for a query whose single-node plan puts `RepartitionExec` over `HttpExec`, so no cluster query here polls a wait under a DataFusion spawn yet; the fork's `common-runtime` tests cover it |
 | `PushdownSort` passes the fetch of a sort it eliminates under a `SortPreservingMergeExec` that keeps that many rows, as a bound on the total output, through nodes that keep every row in order and through a `RepartitionExec` whose input is a single partition, to the node that takes it (fork PR #260, `physical-optimizer/src/pushdown_sort.rs`) | The fetch of an `ORDER BY … LIMIT` stopped above the round-robin repartition the planner puts above a single-partition scan, as a per-partition `LocalLimitExec`. A federated scan below a Spice-only function then received the `ORDER BY` without the `LIMIT`, and the remote sorted and returned every row | silent (perf) | `crates/data_components/src/federation.rs::tests::scan_pushdown::a_limit_above_a_refused_projection_reaches_the_source`, whose `ORDER BY … LIMIT` and `OFFSET` cases fail without it. In the fork, `core/tests/physical_optimizer/pushdown_sort.rs::test_sort_fetch_reaches_source_through_single_input_repartition` and `::test_sort_fetch_stays_above_a_multi_input_repartition`, and `limit_pushdown.rs::nested_limits_separated_by_a_repartition_keep_the_tighter_limit` and `::a_local_limit_over_a_round_robin_repartition_limits_each_partition` |
+| `ExternalSorter` admits a batch that is a slice of a larger one at the size of its own rows: when a copy of the rows needs at most half of what the slice retains, the sorter reserves twice the copy's planned capacity, copies the rows, and holds the copy (fork PR #266, `physical-plan/src/sorts/sort.rs` and `sorts/batch_compaction.rs`) | A grouped aggregate emits its groups as `batch_size` slices of one batch, and every slice is charged for the whole batch, so a `GROUP BY … ORDER BY` over many groups reserves memory quadratic in the group count: it spills long before its rows fill the pool and fails with `ResourcesExhausted` when a slice cannot be admitted (CH-benCHmark Q10 at 1000 warehouses under a 48 GiB pool) | silent (query failure) | `crates/runtime-datafusion/src/fork_backport_guards.rs::a_sort_over_aggregate_output_slices_charges_each_slice_for_its_own_rows` |
+| Unparser: a union input's own `ORDER BY` and `LIMIT` stay inside that input's derived table instead of being written on the union's query after its last operand (fork PR #261) | The input's bound applies to the whole `UNION ALL`, so `u UNION ALL (SELECT … FROM v ORDER BY a DESC LIMIT 1)` federated to `DuckDB` returns one row instead of `u`'s rows plus one ([#14737](https://github.com/spiceai/spiceai/issues/14737)) | silent (wrong data) | `crates/runtime/tests/duckdb/mod.rs::duckdb_federated_union_keeps_each_inputs_own_bound` (`runtime::integration`, run by `integration.yml`). In the fork, the `test_union_input_*` cases in `datafusion/sql/tests/cases/plan_to_sql.rs` |
 
 ## arrow-rs
 
@@ -630,10 +634,12 @@ Upstream [EricLBuehler/mistral.rs](https://github.com/EricLBuehler/mistral.rs) a
 [huggingface/text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference).
 
 The `mistral.rs` fork's tree is upstream tag `v0.9.4` (`440093545`) plus the Spice
-patches. They landed on `spiceai` as the merge of spiceai/mistral.rs#47 (`ea48c06b`),
-and spiceai/mistral.rs#48, squash-merged as `44507766`, adds the DeepSeek-V4.1 decode fixes
-on top, so `git diff v0.9.4 44507766` is the whole fork delta. #47 built it in
-32 commits. The first replays the Spice patches from the `v0.9.0` line: `glm-dsa`
+patches. They landed on `spiceai` as the merge of spiceai/mistral.rs#47 (`ea48c06b`);
+spiceai/mistral.rs#48, squash-merged as `44507766`, adds the DeepSeek-V4.1 decode fixes
+on top, and spiceai/mistral.rs#49, squash-merged as `d99170d2`, the DeepSeek-V4.1 and
+GLM-5.3 decode speedups on top of that, so `git diff v0.9.4 d99170d2` is the whole fork
+delta. #47 built it in 32 commits. The first replays the Spice patches from the
+`v0.9.0` line: `glm-dsa`
 GGUF loading, the i-quant MoE fallback, ring tensor parallelism past two ranks,
 multi-node NCCL on the GGUF path, and the `spiceai/candle` pin. The rest add the GGUF
 graphs that serve Qwen3.8-Flash-Next (`qwen4exp`), DeepSeek-V4.1-Flash (`deepseek41`)
@@ -662,6 +668,7 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 | `mistral.rs`: chat templates render with Jinja loop controls (`minijinja` `loop_controls`) | A template that uses `{% break %}` or `{% continue %}` fails to render, so every chat request to that model returns HTTP 500; GLM-5.3-Flash's uses `break` seven times | request failure | **GAP** |
 | `mistral.rs`: a request that sets neither `enable_thinking` nor `reasoning_effort` leaves `enable_thinking` undefined in the chat template, so each template applies its own default | Every template is rendered with thinking on; DeepSeek-V4.1 then keeps its whole reply inside an unclosed `<think>` block and `content` comes back empty | silent (wrong text) | **GAP** |
 | `mistral.rs`: `deepseek41` decode computes what its prefill and the reference graph compute: one rope rotation per tensor on CUDA, window keys at their own positions, the compressor's rope base on compressed layers, the indexer's top-k, and the routed experts' SwiGLU clamp, with each SwiGLU limit read as one value or one per layer (spiceai/mistral.rs#48) | DeepSeek-V4.1-Flash degenerates after its first few tokens (`Count from 1 to 40` gives `1, 2, 2, 2 2 2…`), and drifts from the reference past 128 and 512 tokens | silent (wrong text) | **GAP** — guarded in the fork, not here: `decoding_a_token_matches_prefilling_through_it` and its `_on_cuda` twin, `a_compressed_layer_rotates_with_the_compressor_base`, `an_index_source_attends_to_only_the_compressed_rows_it_picked`, `the_picked_rows_restrict_the_compressed_keys_and_not_the_window`, `the_gather_path_clamps_swiglu_inputs_to_the_limit` and `the_swiglu_limits_load_as_one_value_or_one_per_layer` |
+| `mistral.rs`: `deepseek41` and `glm5-next` decode run fewer, larger kernels: the hyper-connection sinkhorn as one CUDA kernel, the hyper-connection and engram projections oriented once at load with the engram projection kept quantized, the attention heads folded into one matmul over the key they share (DeepSeek-V4.1's MQA, GLM-5.3's MLA latent), and GLM-5.3's KDA causal convolution on the device (spiceai/mistral.rs#49) | DeepSeek-V4.1-Flash decodes at about 5.3 tokens/s on the 3-node ring instead of 10.5, and GLM-5.3-Flash at 5.8 instead of 8.6 on one node | silent (perf) | **GAP** — a perf-only row; the fork guards that each fast path computes what it replaced, and only runs there: `hyper_coeff_takes_the_gguf_out_in_matrix_oriented_at_load`, `an_engram_layer_runs_through_its_quantized_projection`, `folding_the_heads_into_one_matmul_matches_broadcasting_the_keys`, `the_fused_sinkhorn_matches_the_tensor_ops_on_cuda` and `the_device_convolution_matches_the_host_loop` |
 | `mistral.rs`: GGUF `eot_token_id` and `eom_token_id` stop generation, as `eos_token_id` does | GLM-5.3-Flash's reply runs past `<|user|>` into an invented next turn until `max_tokens` | silent (wrong text) | **GAP** |
 | `mistral.rs`: a `distributed` build serves a single-node model, and a ring head keeps a second request queued while one runs | A model without `distributed_backend` never finishes loading in a `distributed` build, and a second request to a ring deadlocks every rank at the next all-reduce | load failure / hang | **GAP** |
 | `text-embeddings-inference`: Spice integration + candle re-pointing | Local embedding models fail to load | build | compile-guarded |
@@ -735,7 +742,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**35 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**36 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -823,6 +830,8 @@ without becoming a flaky timing test:
 
 13. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
+    `mistral.rs` `deepseek41` and `glm5-next` decode kernels (spiceai/mistral.rs#49), which
+    no suite here trends yet — their evidence is the DGX Spark decode A/B in that PR;
     `snowflake-rs` streaming batches (memory, not latency — but see the
     `snowflake-rs` note above: it is blocked with the rest of that fork);
     `async-openai` retry-after handling; `datafusion`'s `IoWaitHook` carry through
