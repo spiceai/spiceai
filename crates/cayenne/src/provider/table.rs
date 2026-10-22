@@ -65,10 +65,11 @@ use super::on_conflict::{
 use super::pk_deletion_mode::{AutoDeletionMode, AutoKeyTableKind, PkDeletionMode, TableStorage};
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
-    CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
-    PendingPkKeys, PkBloom, PkCheckoutGuard, PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome,
-    RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
-    pk_digest, pk_digest_bytes, serialize_pk_bloom_sidecar, shard_of_pk,
+    CheckedOutShardedPkIndex, ColdPkExistence, GrowingPkBloom, PK_INDEX_PERSIST_MAX_BYTES,
+    PendingPkExistence, PendingPkKeys, PkBloom, PkCheckoutGuard, PkDigestSet, PkExistenceRef,
+    PkKeysetInsertOutcome, RowLocation, ShardedPkIndex, approx_captured_file_bytes,
+    deserialize_pk_bloom_sidecar, pk_digest, pk_digest_bytes, serialize_pk_bloom_sidecar,
+    shard_of_pk,
 };
 use super::pk_validation::null_primary_key_message;
 use super::protected_merge_claims::{ProtectedMergeClaimGuard, ProtectedMergeClaims};
@@ -13440,12 +13441,13 @@ impl CayenneTableProvider {
         true
     }
 
-    /// Build a bloom existence filter over `keyset`'s keys.
+    /// Build a bloom existence filter over `keyset`'s keys: the first segment
+    /// of the index's [`GrowingPkBloom`].
     ///
     /// Sized for the conversion-time key count with 4× growth headroom
-    /// (~10 bits/key at 4×), capped at `max_bytes`. The bloom cannot grow, so
-    /// later inserts degrade the false-positive rate gradually; a false
-    /// positive is only a redundant tombstone under upsert.
+    /// (~10 bits/key at 4×), capped at `max_bytes`, so the conversion allocates
+    /// for the keys the table holds rather than for its whole budget. Later
+    /// segments take the keys that follow.
     fn bloom_from_keyset(keyset: &CachedPkKeyset, max_bytes: usize) -> PkBloom {
         let mut bloom = PkBloom::with_expected_keys(keyset.len().saturating_mul(4), max_bytes);
         for key in keyset.rows() {
@@ -13511,7 +13513,7 @@ impl CayenneTableProvider {
     /// table-wide index (see `first_load_pk`).
     pub(crate) fn install_first_load_pk_bloom(&self, bloom: PkBloom) {
         let (_, checkout) = self.take_cached_pk_index();
-        self.store_cached_pk_index(CachedPkIndex::Bloom(bloom), checkout);
+        self.store_cached_pk_index(CachedPkIndex::Bloom(bloom.into()), checkout);
     }
 
     pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex, checkout: PkCheckoutGuard) {
@@ -13587,7 +13589,7 @@ impl CayenneTableProvider {
                 for key in keys.iter() {
                     bloom.insert(key.as_ref());
                 }
-                index = CachedPkIndex::Bloom(bloom);
+                index = CachedPkIndex::Bloom(bloom.into());
             }
         }
         if replayed_keys > 0 {
@@ -13640,7 +13642,7 @@ impl CayenneTableProvider {
                         max_bytes,
                         "Converting over-budget primary-key keyset to a bounded bloom existence filter"
                     );
-                    CachedPkIndex::Bloom(Self::bloom_from_keyset(&keyset, max_bytes))
+                    CachedPkIndex::Bloom(Self::bloom_from_keyset(&keyset, max_bytes).into())
                 } else {
                     // DoNothing needs exact answers; drop and rebuild next batch
                     // rather than risk a bloom false positive dropping a new row.
@@ -14000,7 +14002,7 @@ impl CayenneTableProvider {
         match index {
             CachedPkIndex::Bloom(bloom) => {
                 for key in keys.iter() {
-                    bloom.insert(key.as_ref());
+                    bloom.insert(key.as_ref(), max_bytes);
                 }
                 true
             }
@@ -14118,7 +14120,7 @@ impl CayenneTableProvider {
                         // reads as a new PK and writes a duplicate live row —
                         // backfill the whole batch, as the single-keyset path
                         // below has always done.
-                        index.record_keys_after_degrade(keys);
+                        index.record_keys_after_degrade(keys, per_shard);
                     } else {
                         drop_index = true;
                     }
@@ -14195,7 +14197,7 @@ impl CayenneTableProvider {
                     max_bytes,
                     "Converting over-budget primary-key keyset to a bounded bloom existence filter on incremental update"
                 );
-                index = CachedPkIndex::Bloom(bloom);
+                index = CachedPkIndex::Bloom(bloom.into());
             } else {
                 tracing::debug!(
                     table = self.table_metadata.table_name.as_str(),
@@ -14281,7 +14283,7 @@ impl CayenneTableProvider {
                 // The bounded insert stopped at the budget, so the keys after the
                 // stop are absent from the blooms it converted — backfill the whole
                 // batch (see `record_keys_after_degrade`).
-                index.record_keys_after_degrade(keys);
+                index.record_keys_after_degrade(keys, per_shard);
             }
         }
 
@@ -16079,7 +16081,7 @@ impl CayenneTableProvider {
             checkpoint_snapshot = checkpoint_snapshot.as_str(),
             "Loaded PK-index bloom checkpoint; skipped full-table keyset rebuild"
         );
-        Ok(Some(CachedPkIndex::Bloom(bloom)))
+        Ok(Some(CachedPkIndex::Bloom(bloom.into())))
     }
 
     fn process_visible_inlined_batches_into_keyset(
@@ -16472,7 +16474,7 @@ impl CayenneTableProvider {
                 Vec::from(blooms)
                     .into_iter()
                     .next()
-                    .unwrap_or_else(|| PkBloom::with_byte_budget(0)),
+                    .unwrap_or_else(|| PkBloom::with_byte_budget(0).into()),
             ),
         })
     }
@@ -17132,7 +17134,7 @@ impl CayenneTableProvider {
     /// delete" for an absent key, so a split buys nothing there.
     fn bloom_split_shard_batch(
         batch: &RecordBatch,
-        bloom: &PkBloom,
+        bloom: &GrowingPkBloom,
         cold_existence: Option<&ColdPkExistence>,
         pending_existence: Option<&PendingPkExistence>,
         pk_indices: &[usize],
@@ -35658,7 +35660,13 @@ impl CayenneTableProvider {
             if !record_keys.is_empty()
                 && let Some(index) = self.sharded_pk_keyset_cache.lock().as_mut()
             {
-                index.record_keys_in_shard(shard_id, record_keys, &RowLocation::MEM_TIER);
+                let per_shard = self.effective_sharded_keyset_budget() / index.shard_count().max(1);
+                index.record_keys_in_shard(
+                    shard_id,
+                    record_keys,
+                    &RowLocation::MEM_TIER,
+                    per_shard,
+                );
             }
             // INVARIANT — a mem-tier append must NOT bump `inlined_generation`
             // or `inlined_structural_epoch`: it never mutates the metastore
@@ -75745,6 +75753,66 @@ mod tests {
         assert!(
             matches!(guard.as_ref(), Some(CachedPkIndex::Bloom(_))),
             "an upsert table over its keyset byte budget must cache a bloom, not drop the cache"
+        );
+    }
+
+    /// An upsert table whose keyset converts to a bloom and then keeps receiving
+    /// new keys, as an append stream does, records almost no tombstones for keys
+    /// it never stored: the bloom grows instead of saturating.
+    #[tokio::test]
+    async fn a_converted_bloom_keeps_room_for_the_keys_that_follow() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_budgeted_upsert_table("bloom_headroom", 1, ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // The first write into the empty table installs a bloom outright; dropping
+        // it makes the next write rebuild an exact keyset from the stored rows,
+        // which then grows past the 1 MiB budget (about 11,000 Int64 keys) and
+        // converts.
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 1_000),
+        )
+        .await;
+        provider.clear_cached_pk_keyset();
+        for start in (1_000..20_000).step_by(1_000) {
+            insert_batch(
+                &provider,
+                id_value_batch_for_range(Arc::clone(&schema), start, 1_000),
+            )
+            .await;
+        }
+        assert!(
+            matches!(
+                provider.pk_keyset_cache.lock().as_ref(),
+                Some(CachedPkIndex::Bloom(_))
+            ),
+            "precondition: the keyset converted to a bloom"
+        );
+        for start in (20_000..120_000).step_by(10_000) {
+            insert_batch(
+                &provider,
+                id_value_batch_for_range(Arc::clone(&schema), start, 10_000),
+            )
+            .await;
+        }
+
+        // A bloom fixed at its conversion size tombstones about 6% of these
+        // 100,000 new keys.
+        let tombstones = provider.pk_deletion_snapshot().delete_len();
+        assert!(
+            tombstones <= 50,
+            "new keys after the conversion recorded {tombstones} tombstones"
+        );
+        assert!(
+            provider
+                .pk_keyset_cache
+                .lock()
+                .as_ref()
+                .map_or(0, CachedPkIndex::approx_bytes)
+                <= 1024 * 1024,
+            "the bloom must stay within its 1 MiB budget"
         );
     }
 
