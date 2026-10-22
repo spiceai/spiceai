@@ -942,14 +942,13 @@ fn configured_changes_scan_view_lag() -> Option<Duration> {
         // A set-but-invalid value is a misconfiguration; warn (don't silently
         // swallow it) before falling back, mirroring `parse_env_u64`. `{raw:?}`
         // escapes control characters so untrusted input cannot inject log lines.
-        match raw.trim().parse::<u64>() {
-            Ok(ms) => Some(Duration::from_millis(ms)),
-            Err(_) => {
-                tracing::warn!(
-                    "Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using the default bound ({DEFAULT_CHANGES_SCAN_VIEW_LAG_MS} ms, or an eighth of the freshness goal when adaptive tuning runs toward one, whichever is shorter)."
-                );
-                None
-            }
+        if let Ok(ms) = raw.trim().parse::<u64>() {
+            Some(Duration::from_millis(ms))
+        } else {
+            tracing::warn!(
+                "Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using the default bound ({DEFAULT_CHANGES_SCAN_VIEW_LAG_MS} ms, or an eighth of the freshness goal when adaptive tuning runs toward one, whichever is shorter)."
+            );
+            None
         }
     });
     *CONFIGURED
