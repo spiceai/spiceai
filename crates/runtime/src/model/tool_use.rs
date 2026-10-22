@@ -252,10 +252,11 @@ impl ToolUsingChat {
     /// `assistant_text` is the text the model wrote beside the tool calls. It is replayed with the
     /// calls: a model that does not see it does not know it already said it, and says it again.
     ///
-    /// `calls_made` is how many Spice tool calls the response from model `model` made before
-    /// these, and is advanced past them. A streamed response with several choices passes the same
-    /// count for each, so the first [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] calls of the whole
-    /// response run and each later one gets [`tool_call_not_run_message`] as its result.
+    /// `calls_made` is how many Spice tool calls the response made before these, and is advanced
+    /// past them. A streamed response with several choices passes the same count for each, so the
+    /// first [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] calls of the whole response run and each later
+    /// one gets [`tool_call_not_run_message`] as its result. The caller warns once the response's
+    /// total is known.
     ///
     /// Returns
     /// - `None` if no spiced runtime tools were used. Note: external tools may still have been
@@ -265,7 +266,6 @@ impl ToolUsingChat {
     ///   reprocessed by the model.
     async fn process_tool_calls_and_run_spice_tools(
         &self,
-        model: &str,
         assistant_text: &str,
         requested_tools: Vec<ChatCompletionMessageToolCall>,
         calls_made: &mut usize,
@@ -303,7 +303,6 @@ impl ToolUsingChat {
 
         let first = *calls_made;
         *calls_made += spiced_tools.len();
-        warn_if_over_tool_call_limit(model, *calls_made);
         let mut tool_and_response_content = Vec::with_capacity(spiced_tools.len());
         let mut ran = 0;
         for (position, t) in (first..).zip(spiced_tools) {
@@ -406,10 +405,12 @@ impl ToolUsingChat {
                 })
                 .collect();
 
-            match self
-                .process_tool_calls_and_run_spice_tools(&req.model, &text, tool_calls, &mut 0)
-                .await?
-            {
+            let mut calls_made = 0;
+            let round = self
+                .process_tool_calls_and_run_spice_tools(&text, tool_calls, &mut calls_made)
+                .await?;
+            warn_if_over_tool_call_limit(&req.model, calls_made);
+            match round {
                 // New messages means we have run spice tools locally, ready to recall model.
                 Some(round) => {
                     let mut messages = req.messages;
@@ -1063,7 +1064,6 @@ fn make_a_stream(
 
                         let round = match model
                             .process_tool_calls_and_run_spice_tools(
-                                &req.model,
                                 &round_text,
                                 tool_calls_to_process,
                                 &mut spice_calls_made,
@@ -1196,6 +1196,7 @@ fn make_a_stream(
                             }
                     }
                 }
+                warn_if_over_tool_call_limit(&req.model, spice_calls_made);
 
                 if wants_usage
                     && let Some(mut chunk) = usage_chunk
@@ -2300,8 +2301,7 @@ mod tests {
         Ok(text)
     }
 
-    /// A provider whose first response is two choices of [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`]
-    /// `sql` calls each. Choice 0 finishes before choice 1's calls are streamed. Later responses
+    /// A provider whose first response is two choices of [`CHOICE_SQL_CALLS`] `sql` calls each. Choice 0 finishes before choice 1's calls are streamed. Later responses
     /// answer `done`. It records every request.
     struct TwoChoiceSql {
         requests: parking_lot::Mutex<Vec<CreateChatCompletionRequest>>,
@@ -2331,8 +2331,11 @@ mod tests {
         .expect("a valid stream chunk")
     }
 
+    /// One past the limit, so each choice on its own goes over it.
+    const CHOICE_SQL_CALLS: usize = MAX_SPICE_TOOL_CALLS_PER_RESPONSE + 1;
+
     fn choice_sql_calls(choice: u32) -> Vec<Value> {
-        (0..MAX_SPICE_TOOL_CALLS_PER_RESPONSE)
+        (0..CHOICE_SQL_CALLS)
             .map(|index| {
                 json!({
                     "index": index,
@@ -2404,10 +2407,30 @@ mod tests {
         }
     }
 
-    /// Two choices of 64 Spice calls in one streamed response run 64 calls in all: the first
-    /// choice's calls run, and the second choice's do not.
+    /// Two choices of 65 Spice calls in one streamed response run 64 calls in all: the first 64
+    /// of choice 0. The response is warned about once, with its total of 130 calls.
     #[tokio::test]
     async fn streamed_choices_share_the_tool_call_limit() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if let Ok(mut g) = self.0.lock() {
+                    g.extend_from_slice(buf);
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
         let provider = TwoChoiceSql::new();
         let tool = Arc::new(CountingSql(AtomicUsize::new(0)));
         let model = ToolUsingChat::new(
@@ -2416,9 +2439,18 @@ mod tests {
             None,
         );
 
-        let text = streamed_turn(&model, vec![user("A")])
-            .await
-            .expect("the stream ends");
+        let sink = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let text = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            streamed_turn(&model, vec![user("A")])
+                .await
+                .expect("the stream ends")
+        };
         assert_eq!(text, "donedone");
         assert_eq!(
             tool.0.load(Ordering::SeqCst),
@@ -2426,32 +2458,49 @@ mod tests {
         );
         assert_eq!(provider.requests.lock().len(), 3);
 
+        let logged = String::from_utf8(sink.0.lock().expect("capture buffer").clone())
+            .expect("captured log is UTF-8");
+        let warnings: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains("tool calls in one response"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "one warning per response; got: {logged}");
+        assert!(
+            warnings[0].contains(&tool_calls_over_limit_warning(
+                "scripted",
+                CHOICE_SQL_CALLS * 2
+            )),
+            "the warning names the response's total; got: {logged}"
+        );
+
         let ran = json!([{"rows": 3}]).to_string();
-        let not_run = json!(tool_call_not_run_message(
-            MAX_SPICE_TOOL_CALLS_PER_RESPONSE * 2
-        ))
-        .to_string();
         let assistant = |choice: u32| {
             format!(
                 "assistant calls {}",
-                (0..MAX_SPICE_TOOL_CALLS_PER_RESPONSE)
+                (0..CHOICE_SQL_CALLS)
                     .map(|index| format!("sql#call_{choice}_{index}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
         };
-        let tool_results = |choice: u32, content: &str| {
-            (0..MAX_SPICE_TOOL_CALLS_PER_RESPONSE)
-                .map(|index| format!("tool call_{choice}_{index}: {content}"))
-                .collect::<Vec<_>>()
+        let tool_result = |choice: u32, index: usize, content: &str| {
+            format!("tool call_{choice}_{index}: {content}")
         };
+        let not_run = |requested: usize| json!(tool_call_not_run_message(requested)).to_string();
 
         let mut choice_0 = vec!["user: A".to_string(), assistant(0)];
-        choice_0.extend(tool_results(0, &ran));
+        choice_0.extend((0..MAX_SPICE_TOOL_CALLS_PER_RESPONSE).map(|i| tool_result(0, i, &ran)));
+        choice_0.push(tool_result(
+            0,
+            MAX_SPICE_TOOL_CALLS_PER_RESPONSE,
+            &not_run(CHOICE_SQL_CALLS),
+        ));
         assert_eq!(provider.messages(1), choice_0);
 
         let mut choice_1 = vec!["user: A".to_string(), assistant(1)];
-        choice_1.extend(tool_results(1, &not_run));
+        choice_1.extend(
+            (0..CHOICE_SQL_CALLS).map(|i| tool_result(1, i, &not_run(CHOICE_SQL_CALLS * 2))),
+        );
         assert_eq!(provider.messages(2), choice_1);
     }
 
