@@ -24,7 +24,8 @@ use crate::{
     component::view::{View, ViewBuilder},
     datafusion::{DeferredRefreshOutcome, resolve_table_reference},
     secrets::Secrets,
-    status, view,
+    status,
+    view::{self, ViewStart},
 };
 use app::App;
 use datafusion::{
@@ -226,7 +227,10 @@ impl Runtime {
     /// which is what every view did before. Each dataset the view reads only in
     /// a subquery also gets up to a minute to be registered once its load has
     /// ended, as `register_view` waits for a missing `FROM` table. A view a
-    /// Spicepod change has already taken over is left to that change.
+    /// Spicepod change has already taken over is left to that change. An
+    /// accelerated view with an existing acceleration to serve from waits for
+    /// nothing: it registers from that acceleration, and refreshes once what it
+    /// reads is ready.
     ///
     /// Returns the tasks loading the views.
     pub(crate) fn load_views(
@@ -375,7 +379,8 @@ impl Runtime {
                         .dedup()
                         .collect()
                 };
-                if !pending().is_empty() {
+                let served_from_acceleration = view.existing_acceleration_schema().await.is_some();
+                if !served_from_acceleration && !pending().is_empty() {
                     runtime
                         .status
                         .update_view(&view.name, status::ComponentStatus::Initializing);
@@ -414,15 +419,19 @@ impl Runtime {
                 // registered: a Spicepod change that replaces it stops the load and
                 // registers the replacement itself. Planning the view before then
                 // fails it for good, so give each dataset it reads only in a
-                // subquery its own minute to be registered.
-                for table in &subquery_datasets {
-                    let deadline = tokio::time::Instant::now() + SUBQUERY_DATASET_GRACE;
-                    while !runtime.df.table_exists(table) && tokio::time::Instant::now() < deadline
-                    {
-                        tokio::select! {
-                            () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
-                            () = shutdown.cancelled() => return,
-                            () = superseded.cancelled() => return,
+                // subquery its own minute to be registered. A view served from its
+                // acceleration builds its plan only once what it reads is ready.
+                if !served_from_acceleration {
+                    for table in &subquery_datasets {
+                        let deadline = tokio::time::Instant::now() + SUBQUERY_DATASET_GRACE;
+                        while !runtime.df.table_exists(table)
+                            && tokio::time::Instant::now() < deadline
+                        {
+                            tokio::select! {
+                                () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                                () = shutdown.cancelled() => return,
+                                () = superseded.cancelled() => return,
+                            }
                         }
                     }
                 }
@@ -430,9 +439,13 @@ impl Runtime {
                     return;
                 }
                 let secrets = runtime.secrets();
-                if let Err(e) =
-                    runtime.load_view_signalling(&view, secrets, Some(done), Some(view_load))
-                {
+                if let Err(e) = runtime.load_view_signalling(
+                    &view,
+                    secrets,
+                    Some(done),
+                    Some(view_load),
+                    ViewStart::ExistingAcceleration,
+                ) {
                     let view_name = &view.name;
                     tracing::error!("Unable to load view {view_name}: {e}");
                 }
@@ -671,7 +684,21 @@ impl Runtime {
     }
 
     fn load_view(self: Arc<Self>, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
-        self.load_view_signalling(view, secrets, None, None)
+        self.load_view_signalling(view, secrets, None, None, ViewStart::ExistingAcceleration)
+    }
+
+    /// Registers `view` again from its definition, after the plan of its registration
+    /// from its existing acceleration showed that acceleration was built from another
+    /// definition.
+    pub(crate) async fn reregister_view_from_definition(self: Arc<Self>, view: Arc<View>) {
+        self.status
+            .update_view(&view.name, status::ComponentStatus::Refreshing);
+        Arc::clone(&self).remove_view(&view.name).await;
+        let secrets = self.secrets();
+        if let Err(e) = self.load_view_signalling(&view, secrets, None, None, ViewStart::Definition)
+        {
+            tracing::error!("Unable to load view {}: {e}", view.name);
+        }
     }
 
     /// Like [`Self::load_view`], holding `registered` until the view's registration
@@ -683,10 +710,11 @@ impl Runtime {
         secrets: Arc<RwLock<Secrets>>,
         registered: Option<tokio_util::sync::DropGuard>,
         startup_load: Option<crate::init::view_loads::ViewLoad>,
+        start: ViewStart,
     ) -> Result<()> {
         let df = Arc::clone(&self.df);
         let register_task = df
-            .register_view(Arc::clone(view), secrets)
+            .register_view(Arc::clone(view), secrets, start)
             .context(UnableToAttachViewSnafu)
             .inspect_err(|e| {
                 self.status.update_view(
