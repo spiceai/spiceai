@@ -38,6 +38,7 @@ members = [
     "crates/google-genai",
     "crates/hash-index",
     "crates/key-index",
+    "crates/llama-cpp",
     "crates/llms",
     "crates/chat-api",
     "crates/embed-api",

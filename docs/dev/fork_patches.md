@@ -124,6 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `a6b07b8b9625e552c502c3a7229fd4bb7725bd2e` | `spiceai-0.11.0-df-55` |
+| [llama.cpp](#llamacpp) | `c54c51f83591bee7695e9be8263217ab29e8aa55` | `spiceai-b11803` (tag `b11803-spiceai.1`; upstream release `b11803`) |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `dc73261eb0db949b6e114ae4fd355ac112296266` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
@@ -667,6 +668,19 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 | `mistral.rs`: a `distributed` build serves a single-node model, and a ring head keeps a second request queued while one runs | A model without `distributed_backend` never finishes loading in a `distributed` build, and a second request to a ring deadlocks every rank at the next all-reduce | load failure / hang | **GAP** |
 | `text-embeddings-inference`: Spice integration + candle re-pointing | Local embedding models fail to load | build | compile-guarded |
 | `text-embeddings-inference`: pooling/model-loading fixes | Embeddings differ from the reference implementation | silent (wrong vectors) | **GAP** |
+
+## llama.cpp
+
+Upstream [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The fork carries
+upstream releases unchanged: each `spiceai-<release>` branch is the upstream release tag
+plus the packaging commits, and the pin is its tagged tip, `<release>-spiceai.<n>`.
+`crates/llama-cpp` builds the sources
+with CMake and binds the part of the C API Spice's GGUF engine uses. To move to a new
+release, follow `spiceai/README.md` in the fork.
+
+| Patch | What breaks if it is lost | Loss | Guard |
+|---|---|---|---|
+| Cargo packaging: a root `Cargo.toml` and `spiceai/` make the release the `llama-cpp-src` git dependency, whose build script reports the source directory and release | Cargo cannot fetch the sources, and `crates/llama-cpp`'s build script has no `DEP_LLAMA_CPP_SRC_ROOT` | build | compile-guarded by `crates/llama-cpp` |
 
 ## candle and its kernel crates
 

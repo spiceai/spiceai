@@ -8803,15 +8803,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
-name = "find_cuda_helper"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f9e65c593dd01ac77daad909ea4ad17f0d6d1776193fc8ea766356177abdad"
-dependencies = [
- "glob",
-]
-
-[[package]]
 name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11926,31 +11917,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "llama-cpp-2"
-version = "0.1.160"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b98e9f0971b7454a25a550f0bd4577f35b94570be32f8f8dc08d94f4cb2873fe"
-dependencies = [
- "enumflags2",
- "llama-cpp-sys-2",
- "thiserror 2.0.18",
- "tracing",
- "tracing-core",
-]
-
-[[package]]
-name = "llama-cpp-sys-2"
-version = "0.1.160"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "912d8a0522acec022ae07d099366234067c8af6a18570a603f0749b7bb927e9a"
+name = "llama-cpp"
+version = "2.4.0-unstable"
 dependencies = [
  "bindgen 0.72.1",
  "cc",
  "cmake",
- "find_cuda_helper",
- "glob",
- "walkdir",
+ "llama-cpp-src",
+ "snafu",
+ "tracing",
 ]
+
+[[package]]
+name = "llama-cpp-src"
+version = "0.1.11803"
+source = "git+https://github.com/spiceai/llama.cpp?rev=c54c51f83591bee7695e9be8263217ab29e8aa55#c54c51f83591bee7695e9be8263217ab29e8aa55"
 
 [[package]]
 name = "llguidance"
@@ -11998,7 +11979,7 @@ dependencies = [
  "insta",
  "itertools 0.14.0",
  "jsonpath-rust",
- "llama-cpp-2",
+ "llama-cpp",
  "mistralrs",
  "mistralrs-core",
  "model2vec-rs",
