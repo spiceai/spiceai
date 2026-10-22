@@ -531,11 +531,14 @@ jobs:
           body=$(mktemp)
           # GetCallerIdentity needs no IAM permission, so only an invalid key pair fails it. The
           # key pair reaches curl on stdin, which keeps it out of the process list.
+          # `shell: bash` runs with -e, so a curl failure is captured here rather than ending
+          # the step before the fallback below.
+          curl_exit=0
           status=$(printf 'user = "%s:%s"\n' "$AWS_BEDROCK_KEY" "$AWS_BEDROCK_SECRET" |
             curl --config - --silent --show-error --max-time 30 --retry 3 \
               --aws-sigv4 'aws:amz:us-east-1:sts' --output "$body" --write-out '%{http_code}' \
-              'https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15')
-          curl_exit=$?
+              'https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15') ||
+            curl_exit=$?
           # The body is never printed: a successful one names the AWS account.
           code=$(sed -n 's:.*<Code>\([A-Za-z]*\)</Code>.*:\1:p' "$body" | head -n 1)
           rm -f "$body"
