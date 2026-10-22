@@ -180,8 +180,14 @@ fn severity(level: Level) -> Severity {
 /// Inside a query, the trace id is the query's — the id `spice-trace-id`
 /// returned and the `runtime.task_history` row stores, including one the client
 /// pinned — and the span id is that of the innermost task-history span, when
-/// task history is recording. Inside any other recorded task, both are that
-/// task's own. Otherwise there is none.
+/// task history is recording. Inside any other recorded task, the span id is
+/// that task's own and the trace id is its trace's, or the id a client pinned
+/// for that trace (see [`correlation::task_history_trace_id`]). Otherwise there
+/// is none.
+///
+/// A record logged while the query runtime polls a query's plan is inside the
+/// query's task span but not its trace span, so its trace id comes from the
+/// task: the id the client pinned, when it pinned one.
 fn trace_context<S>(event: &Event<'_>, ctx: &Context<'_, S>) -> Option<(TraceId, SpanId)>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
@@ -194,7 +200,10 @@ where
     match query {
         Some(trace_id) if task.is_valid() => Some((trace_id, task.span_id())),
         Some(trace_id) => Some((trace_id, SpanId::INVALID)),
-        None if task.is_valid() => Some((task.trace_id(), task.span_id())),
+        None if task.is_valid() => Some((
+            correlation::task_history_trace_id(task.trace_id()),
+            task.span_id(),
+        )),
         None => None,
     }
 }
