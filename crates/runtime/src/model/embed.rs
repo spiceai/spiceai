@@ -37,7 +37,7 @@ use runtime_secrets::{Secrets, get_params_with_secrets};
 use object_store::ObjectStoreExt;
 
 #[cfg(feature = "models")]
-use llms::embeddings::candle::{download_hf_file, tei::TeiEmbed};
+use llms::embeddings::candle::tei::TeiEmbed;
 use llms::embeddings::{Embed, Error as EmbedError};
 #[cfg(feature = "models")]
 use llms::model2vec::Model2Vec;
@@ -686,7 +686,7 @@ async fn openai(
             HashMap::default()
         };
 
-        let bytz = get_bytes_for_file(tokenizer_file.path.as_str(), &file_params)
+        let bytz = get_bytes_for_file(&component.name, tokenizer_file.path.as_str(), &file_params)
             .await
             .map_err(|source| EmbedError::FailedToCreateTokenizer { source })?;
 
@@ -702,15 +702,19 @@ async fn openai(
 ///   - Huggingface URLs, e.g. `<https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/blob/main/tokenizer.json>`.
 ///   - Huggingface `FssSpec`: `hf://[<repo_type_prefix>]<repo_id>[@<revision>]/<path/in/repo>`.
 async fn get_bytes_for_file(
+    component: &str,
     url: &str,
     params: &HashMap<String, SecretString>,
 ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(not(feature = "models"))]
-    let _ = params;
+    let _ = (component, params);
 
     #[cfg(feature = "models")]
     {
-        match url.split('/').collect_vec().as_slice() {
+        use llms::hf::RepoType;
+        let hf_token = params.get("hf_token");
+        let segments = url.split('/').collect_vec();
+        let (kind, org_id, model_id_revision, file) = match segments.as_slice() {
             [
                 "https:",
                 "",
@@ -722,62 +726,38 @@ async fn get_bytes_for_file(
                 file @ ..,
             ] => {
                 return get_file_from_hf(
-                    None,
-                    org_id,
-                    model_id,
+                    component,
+                    RepoType::Model,
+                    &format!("{org_id}/{model_id}"),
                     Some(branch),
-                    file.join("/").as_str(),
-                    params
-                        .get("hf_token")
-                        .map(secrecy::ExposeSecret::expose_secret),
+                    &file.join("/"),
+                    hf_token,
                 )
                 .await;
             }
             ["hf:", "", "datasets", org_id, model_id_revision, file @ ..] => {
-                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-
-                return get_file_from_hf(
-                    Some("datasets"),
-                    org_id,
-                    model_id,
-                    branch,
-                    file.join("/").as_str(),
-                    params
-                        .get("hf_token")
-                        .map(secrecy::ExposeSecret::expose_secret),
-                )
-                .await;
+                (RepoType::Dataset, *org_id, *model_id_revision, file)
             }
             ["hf:", "", "spaces", org_id, model_id_revision, file @ ..] => {
-                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-                return get_file_from_hf(
-                    Some("spaces"),
-                    org_id,
-                    model_id,
-                    branch,
-                    file.join("/").as_str(),
-                    params
-                        .get("hf_token")
-                        .map(secrecy::ExposeSecret::expose_secret),
-                )
-                .await;
+                (RepoType::Space, *org_id, *model_id_revision, file)
             }
             ["hf:", "", "models", org_id, model_id_revision, file @ ..]
             | ["hf:", "", org_id, model_id_revision, file @ ..] => {
-                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-                return get_file_from_hf(
-                    Some("models"),
-                    org_id,
-                    model_id,
-                    branch,
-                    file.join("/").as_str(),
-                    params
-                        .get("hf_token")
-                        .map(secrecy::ExposeSecret::expose_secret),
-                )
-                .await;
+                (RepoType::Model, *org_id, *model_id_revision, file)
             }
-            _ => {}
+            _ => (RepoType::Model, "", "", &[][..]),
+        };
+        if !org_id.is_empty() {
+            let (model_id, revision) = parse_model_id_w_revision(model_id_revision);
+            return get_file_from_hf(
+                component,
+                kind,
+                &format!("{org_id}/{model_id}"),
+                revision,
+                &file.join("/"),
+                hf_token,
+            )
+            .await;
         }
     }
 
@@ -808,28 +788,31 @@ fn parse_model_id_w_revision(model_w_revision: &str) -> (&str, Option<&str>) {
 
 #[cfg(feature = "models")]
 async fn get_file_from_hf(
-    repo_type: Option<&str>,
-    org_id: &str,
-    model_id: &str,
-    branch: Option<&str>,
+    component: &str,
+    kind: llms::hf::RepoType,
+    repo: &str,
+    revision: Option<&str>,
     file: &str,
-    hf_token: Option<&str>,
+    hf_token: Option<&SecretString>,
 ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-    match download_hf_file(
-        format!("{org_id}/{model_id}").as_str(),
-        branch,
-        repo_type,
-        file,
-        hf_token,
-    )
-    .await
-    {
-        Ok(path) => {
-            let bytz = fs::read(path).await.boxed()?;
-            Ok(bytz.into())
-        }
-        Err(e) => Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-            "Downloaded HF url, but failed to get local path. Error: {e:?}"
-        ))),
-    }
+    let requester = llms::hf::Requester {
+        kind: "embedding model",
+        name: component.to_string(),
+        docs_url: "https://spiceai.org/docs/components/embeddings",
+        // Spice loads an embedding model once.
+        retried: false,
+    };
+    let hub = llms::hf::HubParams {
+        token: hf_token,
+        // The file's own `hf_token`, never loaded from a secret store.
+        token_in_spicepod: true,
+        endpoint: None,
+    };
+    let snapshot = llms::hf::open_paths(requester, kind, repo, revision, hub, &[file]).await?;
+    let path = snapshot
+        .download(&[file])
+        .await?
+        .pop()
+        .ok_or("the download returned no file")?;
+    Ok(fs::read(path).await?.into())
 }
