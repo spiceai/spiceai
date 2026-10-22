@@ -13582,14 +13582,17 @@ impl CayenneTableProvider {
                     replay_over_budget = true;
                     break;
                 }
-                let mut bloom = match &index {
+                // Recorded through the growing bloom, which can add segments as the
+                // batch fills the seed, however far past the budget the batch goes.
+                let mut bloom: GrowingPkBloom = match &index {
                     CachedPkIndex::Exact(keyset) => Self::bloom_from_keyset(keyset, max_bytes),
                     CachedPkIndex::Bloom(_) => PkBloom::with_byte_budget(max_bytes),
-                };
-                for key in keys.iter() {
-                    bloom.insert(key.as_ref());
                 }
-                index = CachedPkIndex::Bloom(bloom.into());
+                .into();
+                for key in keys.iter() {
+                    bloom.insert(key.as_ref(), max_bytes);
+                }
+                index = CachedPkIndex::Bloom(bloom);
             }
         }
         if replayed_keys > 0 {
@@ -14184,12 +14187,14 @@ impl CayenneTableProvider {
 
         if convert_to_bloom {
             if self.upsert_bloom_eligible() {
-                let mut bloom = match &index {
+                // Recorded through the growing bloom (see the checkout replay above).
+                let mut bloom: GrowingPkBloom = match &index {
                     CachedPkIndex::Exact(keyset) => Self::bloom_from_keyset(keyset, max_bytes),
                     CachedPkIndex::Bloom(_) => PkBloom::with_byte_budget(max_bytes),
-                };
+                }
+                .into();
                 for key in keys.iter() {
-                    bloom.insert(key.as_ref());
+                    bloom.insert(key.as_ref(), max_bytes);
                 }
                 tracing::debug!(
                     table = self.table_metadata.table_name.as_str(),
@@ -14197,7 +14202,7 @@ impl CayenneTableProvider {
                     max_bytes,
                     "Converting over-budget primary-key keyset to a bounded bloom existence filter on incremental update"
                 );
-                index = CachedPkIndex::Bloom(bloom.into());
+                index = CachedPkIndex::Bloom(bloom);
             } else {
                 tracing::debug!(
                     table = self.table_metadata.table_name.as_str(),
@@ -75753,6 +75758,56 @@ mod tests {
         assert!(
             matches!(guard.as_ref(), Some(CachedPkIndex::Bloom(_))),
             "an upsert table over its keyset byte budget must cache a bloom, not drop the cache"
+        );
+    }
+
+    /// A write that alone carries the keyset far past its budget converts it with
+    /// the whole batch recorded through the growing bloom, so the conversion
+    /// leaves no dense segment behind for the keys that follow.
+    #[tokio::test]
+    async fn a_conversion_by_one_large_write_keeps_the_bloom_sparse() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_budgeted_upsert_table("bloom_large_write", 1, ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // The first write installs a bloom outright; dropping it makes the next
+        // write rebuild an exact keyset of about 10,000 keys, under the 1 MiB budget.
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 1_000),
+        )
+        .await;
+        provider.clear_cached_pk_keyset();
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 1_000, 9_000),
+        )
+        .await;
+        assert!(
+            matches!(
+                provider.pk_keyset_cache.lock().as_ref(),
+                Some(CachedPkIndex::Exact(_))
+            ),
+            "precondition: 10,000 keys fit the exact keyset"
+        );
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 10_000, 100_000),
+        )
+        .await;
+        for start in (110_000..210_000).step_by(10_000) {
+            insert_batch(
+                &provider,
+                id_value_batch_for_range(Arc::clone(&schema), start, 10_000),
+            )
+            .await;
+        }
+
+        let tombstones = provider.pk_deletion_snapshot().delete_len();
+        assert!(
+            tombstones <= 50,
+            "new keys after a conversion by one large write recorded {tombstones} tombstones"
         );
     }
 
