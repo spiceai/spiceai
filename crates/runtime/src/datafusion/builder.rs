@@ -891,10 +891,8 @@ impl DataFusionBuilder {
             compaction_bytes
         });
 
-        let spice_object_store_registry =
-            Arc::new(SpiceObjectStoreRegistry::new(self.io_runtime.clone()));
         let object_store_registry: Arc<dyn ObjectStoreRegistry> =
-            Arc::clone(&spice_object_store_registry) as Arc<dyn ObjectStoreRegistry>;
+            Arc::new(SpiceObjectStoreRegistry::new(self.io_runtime.clone()));
         // Build the dedicated compaction environment from the requested carved
         // budget, sharing the query environment's object-store registry so
         // compaction reads/writes the same stores while accounting memory
@@ -1342,7 +1340,6 @@ impl DataFusionBuilder {
         // This is opt-in via `runtime.params.url_tables=enabled`
         if self.url_tables_enabled {
             let url_table_factory = Arc::new(SpiceUrlTableFactory::new());
-            url_table_factory.with_registry(Arc::clone(&spice_object_store_registry));
             let current_catalog_list = Arc::clone(ctx.state().catalog_list());
             let dynamic_catalog_list = Arc::new(DynamicUrlCatalogList::new(
                 current_catalog_list,
