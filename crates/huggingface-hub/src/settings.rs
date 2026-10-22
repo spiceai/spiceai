@@ -150,6 +150,11 @@ impl fmt::Debug for Token {
 
 impl Token {
     #[must_use]
+    pub fn new(secret: SecretString, source: TokenSource) -> Self {
+        Self { secret, source }
+    }
+
+    #[must_use]
     pub fn secret(&self) -> &SecretString {
         &self.secret
     }
@@ -157,6 +162,28 @@ impl Token {
     #[must_use]
     pub fn source(&self) -> &TokenSource {
         &self.source
+    }
+}
+
+/// Which tokens an endpoint receives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenScope {
+    /// The public Hub or `HF_ENDPOINT`: any token, wherever it was set.
+    Any,
+    /// An `hf_endpoint` the Spicepod sets: only an `hf_token` the Spicepod sets.
+    Spicepod,
+}
+
+impl TokenScope {
+    /// How a message tells a user who sent no token to set one.
+    #[must_use]
+    pub fn how_to_set(self) -> &'static str {
+        match self {
+            TokenScope::Any => "set `hf_token`, set `HF_TOKEN`, or run `hf auth login`",
+            TokenScope::Spicepod => {
+                "set `hf_token` (a token from `HF_TOKEN` or `hf auth login` goes only to the public Hub or `HF_ENDPOINT`)"
+            }
+        }
     }
 }
 
@@ -184,6 +211,7 @@ pub struct Settings {
     pub endpoint: Url,
     pub endpoint_source: EndpointSource,
     pub token: Option<Token>,
+    pub token_scope: TokenScope,
     /// The root of the Hub's file cache: `models--<owner>--<name>/` and its siblings.
     pub cache_dir: PathBuf,
     /// The root of `hf-xet`'s shard cache.
@@ -238,6 +266,70 @@ impl Settings {
         endpoint: Option<&str>,
     ) -> Result<Self> {
         let var = |name: &str| env.var(name).filter(|value| !value.trim().is_empty());
+        let Access {
+            endpoint,
+            endpoint_source,
+            token,
+            token_scope,
+        } = Access::resolve_in(env, token, endpoint).await?;
+        let hf_home = hf_home(env);
+        let cache_dir = var(HF_HUB_CACHE)
+            .or_else(|| var(HUGGINGFACE_HUB_CACHE))
+            .map(|cache| expand_home(&cache, env))
+            .or_else(|| hf_home.as_ref().map(|home| home.join("hub")))
+            .context(NoCacheDirectorySnafu)?;
+        let xet_cache_dir = var(HF_XET_CACHE)
+            .map(|cache| expand_home(&cache, env))
+            .or_else(|| hf_home.as_ref().map(|home| home.join("xet")))
+            .context(NoCacheDirectorySnafu)?;
+
+        Ok(Self {
+            endpoint,
+            endpoint_source,
+            token,
+            token_scope,
+            cache_dir,
+            xet_cache_dir,
+            offline: is_true(var(HF_HUB_OFFLINE).as_deref())
+                || is_true(var(TRANSFORMERS_OFFLINE).as_deref()),
+            xet_disabled: is_true(var(HF_HUB_DISABLE_XET).as_deref()),
+        })
+    }
+}
+
+/// What a component that keeps no cache reads the Hub with, a dataset's stream: the endpoint
+/// and the token, resolved as [`Settings::resolve`] resolves them.
+#[derive(Debug, Clone)]
+pub struct Access {
+    pub endpoint: Url,
+    pub endpoint_source: EndpointSource,
+    pub token: Option<Token>,
+    pub token_scope: TokenScope,
+}
+
+impl Access {
+    /// Resolves the endpoint and the token of a component with the given `hf_token` and
+    /// `hf_endpoint` parameters from the process environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an endpoint is not a valid Hub URL, or the token file exists but
+    /// cannot be read.
+    pub async fn resolve(token: Option<ParamToken>, endpoint: Option<&str>) -> Result<Self> {
+        Self::resolve_in(&ProcessEnvironment, token, endpoint).await
+    }
+
+    /// [`Access::resolve`] in `env`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Access::resolve`].
+    pub async fn resolve_in(
+        env: &impl Environment,
+        token: Option<ParamToken>,
+        endpoint: Option<&str>,
+    ) -> Result<Self> {
+        let var = |name: &str| env.var(name).filter(|value| !value.trim().is_empty());
 
         let env_endpoint = var(HF_ENDPOINT)
             .map(|endpoint| parse_endpoint(&endpoint, EndpointSource::Env))
@@ -254,29 +346,18 @@ impl Settings {
             },
         };
 
-        let hf_home = var(HF_HOME)
-            .map(|home| expand_home(&home, env))
-            .or_else(|| var(XDG_CACHE_HOME).map(|xdg| expand_home(&xdg, env).join("huggingface")))
-            .or_else(|| {
-                env.home_dir()
-                    .map(|home| home.join(".cache").join("huggingface"))
-            });
-        let cache_dir = var(HF_HUB_CACHE)
-            .or_else(|| var(HUGGINGFACE_HUB_CACHE))
-            .map(|cache| expand_home(&cache, env))
-            .or_else(|| hf_home.as_ref().map(|home| home.join("hub")))
-            .context(NoCacheDirectorySnafu)?;
-        let xet_cache_dir = var(HF_XET_CACHE)
-            .map(|cache| expand_home(&cache, env))
-            .or_else(|| hf_home.as_ref().map(|home| home.join("xet")))
-            .context(NoCacheDirectorySnafu)?;
-
         // A token the Spicepod does not set goes only to an endpoint set where it was: the
         // public Hub or `HF_ENDPOINT`, never a Spicepod's `hf_endpoint`.
-        let implicit_allowed = endpoint.origin() == default_endpoint.origin()
+        let token_scope = if endpoint.origin() == default_endpoint.origin()
             || env_endpoint
                 .as_ref()
-                .is_some_and(|env_endpoint| env_endpoint.origin() == endpoint.origin());
+                .is_some_and(|env_endpoint| env_endpoint.origin() == endpoint.origin())
+        {
+            TokenScope::Any
+        } else {
+            TokenScope::Spicepod
+        };
+        let implicit_allowed = token_scope == TokenScope::Any;
         let param = |secret: &SecretString| Token {
             secret: SecretString::from(secret.expose_secret().trim().to_string()),
             source: TokenSource::Param,
@@ -284,7 +365,7 @@ impl Settings {
         let token = match token.filter(|token| !token.secret().expose_secret().trim().is_empty()) {
             Some(ParamToken::Spicepod(secret)) => Some(param(&secret)),
             Some(ParamToken::SecretStore(secret)) if implicit_allowed => Some(param(&secret)),
-            None if implicit_allowed => implicit_token(env, hf_home.as_deref()).await?,
+            None if implicit_allowed => implicit_token(env, hf_home(env).as_deref()).await?,
             Some(ParamToken::SecretStore(_)) | None => None,
         };
 
@@ -292,13 +373,21 @@ impl Settings {
             endpoint,
             endpoint_source,
             token,
-            cache_dir,
-            xet_cache_dir,
-            offline: is_true(var(HF_HUB_OFFLINE).as_deref())
-                || is_true(var(TRANSFORMERS_OFFLINE).as_deref()),
-            xet_disabled: is_true(var(HF_HUB_DISABLE_XET).as_deref()),
+            token_scope,
         })
     }
+}
+
+/// `HF_HOME`, else `$XDG_CACHE_HOME/huggingface`, else `~/.cache/huggingface`.
+fn hf_home(env: &impl Environment) -> Option<PathBuf> {
+    let var = |name: &str| env.var(name).filter(|value| !value.trim().is_empty());
+    var(HF_HOME)
+        .map(|home| expand_home(&home, env))
+        .or_else(|| var(XDG_CACHE_HOME).map(|xdg| expand_home(&xdg, env).join("huggingface")))
+        .or_else(|| {
+            env.home_dir()
+                .map(|home| home.join(".cache").join("huggingface"))
+        })
 }
 
 /// The token from the environment or the token file, in `huggingface_hub`'s order.

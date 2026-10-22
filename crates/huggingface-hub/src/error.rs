@@ -31,7 +31,7 @@ use snafu::prelude::*;
 use crate::client;
 use crate::download::FetchError;
 use crate::location::{RepoId, RepoType};
-use crate::settings::{self, Settings, TokenSource, display_path};
+use crate::settings::{self, Settings, TokenScope, TokenSource, display_path};
 use crate::snapshot::{Requester, Source};
 
 /// What a download was for: every message names it.
@@ -42,6 +42,7 @@ pub(crate) struct DownloadContext {
     repo: String,
     revision: String,
     token: Option<TokenSource>,
+    token_scope: TokenScope,
     cache_dir: PathBuf,
 }
 
@@ -57,6 +58,7 @@ impl DownloadContext {
             repo: repo.to_string(),
             revision: revision.to_string(),
             token: settings.token.as_ref().map(|token| token.source().clone()),
+            token_scope: settings.token_scope,
             cache_dir: settings.cache_dir.clone(),
         }
     }
@@ -70,6 +72,7 @@ impl DownloadContext {
                 .unwrap_or(crate::snapshot::DEFAULT_REVISION)
                 .to_string(),
             token: None,
+            token_scope: TokenScope::Any,
             cache_dir: PathBuf::new(),
         }
     }
@@ -197,7 +200,7 @@ impl DownloadError {
             Cause::Missing { source, .. } => matches!(source, Source::Hub),
             Cause::Hub(error) | Cause::Fetch(FetchError::Hub { source: error }) => matches!(
                 error,
-                client::Error::InvalidEndpoint { .. } | client::Error::InvalidToken
+                client::Error::InvalidEndpoint { .. } | client::Error::InvalidToken { .. }
             ),
             Cause::Fetch(_) | Cause::OfflineNoSnapshot => false,
         }
@@ -229,7 +232,7 @@ impl DownloadError {
         let context = self.context.as_ref();
         let token = context.token.as_ref();
         let retried = context.requester.retried;
-        let no_token_fix = "set `hf_token`, set `HF_TOKEN`, or run `hf auth login`";
+        let no_token_fix = context.token_scope.how_to_set();
         match self.cause.as_ref() {
             Cause::Hub(error)
             | Cause::Fetch(FetchError::Hub {
@@ -481,6 +484,15 @@ mod tests {
     use super::*;
 
     fn error(retried: bool, token: Option<TokenSource>, cause: Cause) -> String {
+        scoped_error(retried, token, TokenScope::Any, cause)
+    }
+
+    fn scoped_error(
+        retried: bool,
+        token: Option<TokenSource>,
+        token_scope: TokenScope,
+        cause: Cause,
+    ) -> String {
         let context = DownloadContext {
             requester: Requester {
                 kind: "embedding model",
@@ -491,6 +503,7 @@ mod tests {
             repo: "o/m".to_string(),
             revision: "main".to_string(),
             token,
+            token_scope,
             cache_dir: PathBuf::from("/cache"),
         };
         context.error(None, cause).to_string()
@@ -516,6 +529,8 @@ mod tests {
             Cause::Hub(client::Error::RateLimited {
                 repo: repo(),
                 reset_hint: String::new(),
+                token: None,
+                token_scope: TokenScope::Any,
             })
         };
         let corrupted = || {
@@ -557,6 +572,10 @@ mod tests {
             (
                 error(false, env_token(), rate_limited()),
                 "the Hub kept rate-limiting requests. Restart Spice once the limit resets.",
+            ),
+            (
+                scoped_error(true, None, TokenScope::Spicepod, rate_limited()),
+                "the Hub kept rate-limiting requests. Spice retries the download; to raise the limit, set `hf_token` (a token from `HF_TOKEN` or `hf auth login` goes only to the public Hub or `HF_ENDPOINT`).",
             ),
             (
                 error(true, None, corrupted()),
