@@ -116,9 +116,8 @@ pub struct RuntimeStatus {
 
 /// Status of the outbound Spice Cloud management connection.
 ///
-/// Reported on `/v1/status` when `management` is configured. Not part of
-/// [`RuntimeStatus::is_ready`]: query serving must stay up if Cloud export
-/// fails.
+/// Recorded for diagnostics and tests. Not part of [`RuntimeStatus::is_ready`]:
+/// query serving must stay up if Cloud export fails.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManagementConnectionStatus {
     pub status: ComponentStatus,
