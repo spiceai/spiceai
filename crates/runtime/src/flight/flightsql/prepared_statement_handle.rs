@@ -115,6 +115,45 @@ mod tests {
         assert_eq!(opened.parameter_schema, original.parameter_schema);
     }
 
+    /// A handle is the postcard encoding of the statement followed by its tag. Postcard writes the
+    /// fields in order: a string or byte field as a varint length and then its bytes, and an
+    /// `Option` as a `0` or `1` marker before the value.
+    #[test]
+    fn a_handle_is_the_postcard_encoding_of_the_statement_and_its_tag() {
+        let parameters: Vec<u8> = (0..200).collect();
+        let mut with_parameters = vec![9];
+        with_parameters.extend_from_slice(b"SELECT $1");
+        with_parameters.extend_from_slice(&[0xc8, 0x01]);
+        with_parameters.extend_from_slice(&parameters);
+        with_parameters.extend_from_slice(&[1, 3, 1, 2, 3]);
+
+        let mut without_parameters = vec![8];
+        without_parameters.extend_from_slice(b"SELECT 1");
+        without_parameters.extend_from_slice(&[0, 0]);
+
+        let cases = [
+            (statement("SELECT $1", parameters), with_parameters),
+            (
+                PreparedStatement {
+                    query: "SELECT 1".to_string(),
+                    parameters: Vec::new(),
+                    parameter_schema: None,
+                },
+                without_parameters,
+            ),
+        ];
+        for (original, payload) in cases {
+            let mut handle = payload.clone();
+            handle.extend_from_slice(blake3::keyed_hash(&KEY, &payload).as_bytes());
+            assert_eq!(seal_with_key(&KEY, &original).expect("seal"), handle);
+
+            let opened = open_with_key(&KEY, &handle).expect("the handle opens");
+            assert_eq!(opened.query, original.query);
+            assert_eq!(opened.parameters, original.parameters);
+            assert_eq!(opened.parameter_schema, original.parameter_schema);
+        }
+    }
+
     /// The handle shape every client could build before handles were tagged: the bare postcard
     /// encoding of a statement, here carrying parameter bytes the server never wrote.
     #[test]

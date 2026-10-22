@@ -187,10 +187,12 @@ fn rewrite_sql_with_type_casts(sql: &str, schema: &SchemaRef) -> String {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PreparedStatement {
     pub(super) query: String,
+    #[serde(with = "serde_bytes")]
     pub(super) parameters: Vec<u8>,
     /// Parameter schema - stores the Arrow schema of bound parameters from `DoPut`
     /// This schema provides type information for each parameter (e.g., Int64, Utf8, etc.)
     /// and is used to create a properly typed logical plan during execution
+    #[serde(with = "serde_bytes")]
     pub(super) parameter_schema: Option<Vec<u8>>,
 }
 

@@ -200,6 +200,7 @@ search = { path = "../search", default-features = false, features = [
 ], optional = false }
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive", "rc"] }
+serde_bytes.workspace = true
 blake3.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
