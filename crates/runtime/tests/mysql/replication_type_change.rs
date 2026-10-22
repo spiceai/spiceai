@@ -32,9 +32,11 @@ use anyhow::anyhow;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
+use datafusion::common::TableReference;
 use futures::TryStreamExt;
 use mysql_async::prelude::Queryable;
 use runtime::Runtime;
+use runtime::status::ComponentStatus;
 use spicepod::acceleration::{Acceleration, OnConflictBehavior, RefreshMode};
 use spicepod::component::dataset::{Dataset, OnSchemaChange};
 use spicepod::param::Params;
@@ -332,6 +334,27 @@ async fn mysql_duckdb_sync_all_columns_never_stores_a_rounded_value() -> Result<
         .await
 }
 
+/// Wait for `table`'s dataset to report the error its change stream stopped
+/// with, and return the message. Called right after the `ALTER`, before any row
+/// change follows it, so the error can only come from the `ALTER` itself.
+async fn wait_for_stream_error(rt: &Runtime, table: &str) -> Result<String, anyhow::Error> {
+    let name = TableReference::from(table);
+    let deadline = std::time::Instant::now() + CHANGE_PROPAGATION_TIMEOUT;
+    loop {
+        let status = rt.status().get_dataset_status(&name);
+        if let Some(ComponentStatus::Error(Some(message))) = status {
+            return Ok(message);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "timed out waiting for dataset {table} to report the error its stream stopped \
+                 with after the `ALTER`; last status {status:?}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Assert `table` never gains row `id` within the bound the other changes in
 /// this file arrive within: the stream stopped at the `ALTER`.
 async fn assert_never_applied(rt: &Runtime, table: &str, id: i64) -> Result<(), anyhow::Error> {
@@ -354,7 +377,8 @@ async fn assert_never_applied(rt: &Runtime, table: &str, id: i64) -> Result<(), 
 /// An integer column that becomes a `DECIMAL` stops the stream at the `ALTER`
 /// rather than adopting a layout whose first fractional value fails to apply:
 /// no accelerator widens an integer to a decimal, so even an integer-valued
-/// change after it is not applied.
+/// change after it is not applied. The dataset reports why, and how to
+/// re-bootstrap, before any row change follows the `ALTER`.
 #[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_integer_to_decimal_stops_the_stream() -> Result<(), anyhow::Error> {
@@ -380,6 +404,19 @@ async fn mysql_cayenne_integer_to_decimal_stops_the_stream() -> Result<(), anyho
                 &format!("ALTER TABLE {table} MODIFY k DECIMAL(12,2)"),
             )
             .await?;
+            let message = wait_for_stream_error(&rt, table).await?;
+            assert_eq!(
+                message,
+                format!(
+                    "External error: ALTER TABLE on source table mysqldb.{table} (statement: \
+                     ALTER TABLE {table} MODIFY k DECIMAL(12,2)) cannot be adopted mid-stream: \
+                     Schema mismatch: column 'k' changed type from `int` to `decimal(12,2)` and \
+                     the acceleration cannot change an integer column to a decimal with a \
+                     fractional part, so a fractional value would fail to apply. Update the \
+                     dataset schema to match the new table definition, or re-bootstrap by \
+                     setting `mysql_replication_invalid_checkpoint_behavior: restart`."
+                )
+            );
             exec(&pool, &format!("INSERT INTO {table} VALUES (4, 7)")).await?;
             assert_never_applied(&rt, table, 4).await
         })
@@ -429,8 +466,8 @@ async fn mysql_cayenne_integer_to_zero_scale_decimal_keeps_applying() -> Result<
 }
 
 /// Under `block` a `FLOAT` column keeps its registered `Float32` type, so a
-/// `DOUBLE` it becomes stops the stream rather than storing `16777217` rounded
-/// to `16777216`.
+/// `DOUBLE` it becomes stops the stream at the `ALTER` rather than storing
+/// `16777217` rounded to `16777216`.
 #[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_cayenne_block_float_to_double_stops_the_stream() -> Result<(), anyhow::Error> {
@@ -452,6 +489,18 @@ async fn mysql_cayenne_block_float_to_double_stops_the_stream() -> Result<(), an
             )
             .await?;
             exec(&pool, &format!("ALTER TABLE {table} MODIFY k DOUBLE")).await?;
+            let message = wait_for_stream_error(&rt, table).await?;
+            assert_eq!(
+                message,
+                format!(
+                    "External error: ALTER TABLE on source table mysqldb.{table} (statement: \
+                     ALTER TABLE {table} MODIFY k DOUBLE) cannot be adopted mid-stream: Schema \
+                     mismatch: column 'k' changed type from `float` to `double` and the column \
+                     stays `Float32`, which would round the new values. Update the dataset \
+                     schema to match the new table definition, or re-bootstrap by setting \
+                     `mysql_replication_invalid_checkpoint_behavior: restart`."
+                )
+            );
             exec(&pool, &format!("INSERT INTO {table} VALUES (4, 16777217)")).await?;
             assert_never_applied(&rt, table, 4).await
         })
