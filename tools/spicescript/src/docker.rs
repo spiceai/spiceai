@@ -146,35 +146,45 @@ impl Container {
             }),
             ..Default::default()
         };
-        let created = retry_on_timeout(CREATE_ATTEMPTS, CREATE_RETRY_PAUSE, &spec.name, || async {
-            // A container left behind by an interrupted run, or by an attempt
-            // that timed out after Docker had begun creating it, would hold
-            // the name.
-            let _ = docker
-                .remove_container(
-                    &spec.name,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
-            docker
-                .create_container(
-                    Some(CreateContainerOptions {
-                        name: spec.name.as_str(),
-                        platform: None,
-                    }),
-                    config.clone(),
-                )
-                .await
-        })
+        // A container left behind by an interrupted run would hold the name.
+        let _ = docker
+            .remove_container(
+                &spec.name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let created_id = create_or_adopt(
+            CREATE_ATTEMPTS,
+            CREATE_RETRY_PAUSE,
+            &spec.name,
+            || async {
+                docker
+                    .create_container(
+                        Some(CreateContainerOptions {
+                            name: spec.name.as_str(),
+                            platform: None,
+                        }),
+                        config.clone(),
+                    )
+                    .await
+                    .map(|created| created.id)
+            },
+            || async {
+                docker
+                    .inspect_container(&spec.name, None)
+                    .await
+                    .map(|found| found.id.unwrap_or_default())
+            },
+        )
         .await
         .with_context(|| format!("Failed to create container {}", spec.name))?;
-        crate::cleanup::track_container(&created.id, &spec.name, spec.network.as_deref());
+        crate::cleanup::track_container(&created_id, &spec.name, spec.network.as_deref());
         let container = Self {
             docker,
-            id: created.id,
+            id: created_id,
             name: spec.name,
             ports,
             network: spec.network,
@@ -415,50 +425,52 @@ async fn pull_if_missing(docker: &Docker, image: &str) -> Result<()> {
 /// in time. A daemon busy with many containers at once (several runs on one
 /// host) can take longer than the client's request timeout, and creating the
 /// container again usually succeeds.
-const CREATE_ATTEMPTS: u32 = 4;
+const CREATE_ATTEMPTS: u32 = 3;
 
-/// How long to wait before trying again, so that a create Docker was still
-/// working on when the client gave up can finish and be removed.
+/// How long to wait before trying again after Docker did not answer in time.
 const CREATE_RETRY_PAUSE: Duration = Duration::from_secs(2);
 
-/// Runs `attempt` until it succeeds, fails other than by Docker not answering
+/// Runs `create` until it succeeds, fails other than by Docker not answering
 /// in time, or has been tried `attempts` times, pausing `pause` before each
-/// retry. Once an attempt has timed out, a name conflict (409) is retried too:
-/// that attempt's container was created after all, and `attempt` removes it
-/// before creating again. Each retry is reported in the script's output,
-/// naming `what`.
-async fn retry_on_timeout<T, F, Fut>(
+/// retry. Once an attempt has timed out, a name conflict (409) means that
+/// attempt's container was created after all, with this name and
+/// configuration: `adopt` then looks it up and its id is used. Each retry is
+/// reported in the script's output, naming `what`.
+async fn create_or_adopt<C, CF, A, AF>(
     attempts: u32,
     pause: Duration,
     what: &str,
-    mut attempt: F,
-) -> Result<T, bollard::errors::Error>
+    mut create: C,
+    adopt: A,
+) -> Result<String, bollard::errors::Error>
 where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, bollard::errors::Error>>,
+    C: FnMut() -> CF,
+    CF: std::future::Future<Output = Result<String, bollard::errors::Error>>,
+    A: FnOnce() -> AF,
+    AF: std::future::Future<Output = Result<String, bollard::errors::Error>>,
 {
     let mut tried = 1;
     let mut timed_out = false;
     loop {
-        let result = attempt().await;
-        let reason = match &result {
-            Err(bollard::errors::Error::RequestTimeoutError) => {
+        match create().await {
+            Err(bollard::errors::Error::RequestTimeoutError) if tried < attempts => {
                 timed_out = true;
-                "Docker did not answer in time creating"
+                crate::runner::emit(&format!(
+                    "   Docker did not answer in time creating {what}; trying again ({tried} of {attempts} attempts made)"
+                ));
+                tried += 1;
+                tokio::time::sleep(pause).await;
             }
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 409, ..
-            }) if timed_out => "a timed-out attempt had created",
-            _ => return result,
-        };
-        if tried >= attempts {
-            return result;
+            }) if timed_out => {
+                crate::runner::emit(&format!(
+                    "   a timed-out attempt had created {what}; using that container"
+                ));
+                return adopt().await;
+            }
+            other => return other,
         }
-        crate::runner::emit(&format!(
-            "   {reason} {what}; trying again ({tried} of {attempts} attempts made)"
-        ));
-        tried += 1;
-        tokio::time::sleep(pause).await;
     }
 }
 
@@ -542,7 +554,7 @@ mod create_retry_tests {
 
     use bollard::errors::Error;
 
-    use super::retry_on_timeout;
+    use super::create_or_adopt;
 
     fn conflict() -> Error {
         Error::DockerResponseServerError {
@@ -552,49 +564,80 @@ mod create_retry_tests {
     }
 
     #[tokio::test]
-    async fn retries_a_timeout_and_the_conflict_it_leaves_and_only_as_often_as_allowed() {
+    async fn retries_a_timeout_and_adopts_the_container_it_created() {
         let no_pause = Duration::ZERO;
+        let never = || async { Err::<String, Error>(Error::RequestTimeoutError) };
+
         // Two timeouts, then success: three attempts.
         let calls = AtomicU32::new(0);
-        let got = retry_on_timeout(3, no_pause, "c", || async {
-            match calls.fetch_add(1, Ordering::SeqCst) {
-                0 | 1 => Err(Error::RequestTimeoutError),
-                _ => Ok(7),
-            }
-        })
+        let got = create_or_adopt(
+            3,
+            no_pause,
+            "c",
+            || async {
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 | 1 => Err(Error::RequestTimeoutError),
+                    _ => Ok("new".to_string()),
+                }
+            },
+            never,
+        )
         .await;
-        assert_eq!((got.ok(), calls.load(Ordering::SeqCst)), (Some(7), 3));
+        assert_eq!(
+            (got.ok(), calls.load(Ordering::SeqCst)),
+            (Some("new".into()), 3)
+        );
 
-        // A timeout whose container then holds the name: the conflict is
-        // retried, and the next attempt succeeds.
+        // A timeout whose container then holds the name: that container is
+        // adopted.
         let calls = AtomicU32::new(0);
-        let got = retry_on_timeout(4, no_pause, "c", || async {
-            match calls.fetch_add(1, Ordering::SeqCst) {
-                0 => Err(Error::RequestTimeoutError),
-                1 => Err(conflict()),
-                _ => Ok(7),
-            }
-        })
+        let got = create_or_adopt(
+            3,
+            no_pause,
+            "c",
+            || async {
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Err(Error::RequestTimeoutError),
+                    _ => Err(conflict()),
+                }
+            },
+            || async { Ok("adopted".to_string()) },
+        )
         .await;
-        assert_eq!((got.ok(), calls.load(Ordering::SeqCst)), (Some(7), 3));
+        assert_eq!(
+            (got.ok(), calls.load(Ordering::SeqCst)),
+            (Some("adopted".into()), 2)
+        );
 
         // Timeouts every time: gives up after the allowed attempts.
         let calls = AtomicU32::new(0);
-        let got: Result<(), Error> = retry_on_timeout(3, no_pause, "c", || async {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Err(Error::RequestTimeoutError)
-        })
+        let got = create_or_adopt(
+            3,
+            no_pause,
+            "c",
+            || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(Error::RequestTimeoutError)
+            },
+            never,
+        )
         .await;
         assert!(matches!(got, Err(Error::RequestTimeoutError)), "{got:?}");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
-        // A conflict with no timeout before it, or any other failure, is
-        // returned at once.
+        // A conflict with no timeout before it is returned at once, without
+        // adopting anything.
         let calls = AtomicU32::new(0);
-        let got: Result<(), Error> = retry_on_timeout(3, no_pause, "c", || async {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Err(conflict())
-        })
+        let got = create_or_adopt(
+            3,
+            no_pause,
+            "c",
+            || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(conflict())
+            },
+            || async { Ok("adopted".to_string()) },
+        )
         .await;
         assert!(
             matches!(

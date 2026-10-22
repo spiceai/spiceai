@@ -667,6 +667,18 @@
       "group": "clickhouse"
     }
   ],
+  "debezium-direct-chaos": [
+    {
+      "run": "debezium-direct-chaos",
+      "who": "default",
+      "key": "query: SELECT * FROM acct #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "debezium",
+      "may-pass": true
+    }
+  ],
   "ducklake-coverage": [
     {
       "run": "ducklake-coverage[source=ducklake]",
@@ -3596,6 +3608,28 @@
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"182\\\"\" }",
       "group": "sqlite"
+    }
+  ],
+  "schema-ddl": [
+    {
+      "run": "schema-ddl[engine=duckdb]",
+      "who": "block",
+      "key": "refresh: {\"dataset\":\"cham\",\"wait\":false} #3",
+      "kind": "other",
+      "signature": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "pattern": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-ddl[engine=duckdb]",
+      "who": "block",
+      "key": "query: SELECT * FROM cham #8",
+      "kind": "error",
+      "signature": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "pattern": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "group": "schema-evolution",
+      "may-pass": true
     }
   ],
   "surface": [
