@@ -29,7 +29,6 @@ use async_openai::types::embeddings::{
 use async_trait::async_trait;
 use cache::{CacheProvider, key::CacheKey, result::embeddings::CachedEmbeddingResult};
 use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
-use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
 use tokio::{runtime::Handle, task};
 
@@ -80,10 +79,12 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "When preparing an embedding model, an issue occurred with the Huggingface API. {source}. Verify the model configuration, and try again."
-    ))]
-    FailedWithHFApi { source: HfApiError },
+    /// Downloading the model from the Hugging Face Hub failed. The source names the model, the
+    /// cause and the fix, so it is the whole message.
+    #[snafu(display("{source}"))]
+    FailedToDownloadModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display(
         "An unsupported model source was specified in the 'from' parameter: '{from}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/embeddings"

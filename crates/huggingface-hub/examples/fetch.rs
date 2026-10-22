@@ -57,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kind: "example",
         name: "fetch".to_string(),
         docs_url: "https://spiceai.org/docs/components/models/huggingface",
+        retried: false,
     };
     let snapshot = Snapshot::open(settings, requester, repo, Some(revision)).await?;
     let paths: Vec<&str> = paths.iter().map(String::as_str).collect();

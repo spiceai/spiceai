@@ -211,17 +211,25 @@ pub async fn try_to_rerank_model(
             // `org/model:revision`; recover the two halves before the repo id
             // reaches the Hub (same convention as embeddings/models).
             let (repo_id, revision) = spicepod::component::model::split_hf_model_id(&model_id);
+            // Parsing loads an `hf_token` the Spicepod does not set from the secret stores.
+            let token_in_spicepod = ["hf_token", "api_key"]
+                .iter()
+                .any(|key| params.contains_key(*key));
             let typed =
                 HuggingFaceRerankerParams::try_from_params(&component_name, params, &secrets)
                     .await
                     .map_err(|e| params_err(&component.name, e))?;
-            let hf_token = typed.hf_token.as_ref().map(ExposeSecret::expose_secret);
+            let hub = llms::hf::HubParams {
+                token: typed.hf_token.as_ref(),
+                token_in_spicepod,
+                endpoint: typed.hf_endpoint.as_deref(),
+            };
             let truncation = typed.truncate.unwrap_or_default().direction();
             let r = TeiRerank::from_hf(
                 component.name.clone(),
                 repo_id,
                 revision,
-                hf_token,
+                hub,
                 typed.max_seq_length,
                 truncation,
             )
