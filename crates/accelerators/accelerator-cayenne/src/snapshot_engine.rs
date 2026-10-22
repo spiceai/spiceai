@@ -81,9 +81,17 @@ fn slice_archive_path(dataset_name: &str) -> String {
 }
 
 /// File names (relative to `metadata_dir`) that must be excluded from the
-/// archive. Cayenne always opens the metastore in WAL journal mode, so the
-/// `-wal` and `-shm` sidecars may be present alongside `cayenne.db`.
-const METASTORE_FILES: &[&str] = &["cayenne.db", "cayenne.db-wal", "cayenne.db-shm"];
+/// archive: every file either metastore backend keeps beside `cayenne.db`.
+/// The `SQLite` metastore runs in WAL journal mode, so its `-wal` and `-shm`
+/// sidecars may be present; the Turso metastore keeps its MVCC log in
+/// `-log` (and may also leave a `-wal`). A reader holds its own copies of
+/// these files, so an archived one fails the restore's checksum check.
+const METASTORE_FILES: &[&str] = &[
+    "cayenne.db",
+    "cayenne.db-wal",
+    "cayenne.db-shm",
+    "cayenne.db-log",
+];
 
 /// Errors raised by the Cayenne snapshot engine.
 #[derive(Debug, Snafu)]
@@ -568,7 +576,13 @@ mod tests {
     use std::sync::Arc;
 
     async fn fresh_catalog(dir: &std::path::Path) -> Arc<CayenneCatalog> {
-        let conn = format!("sqlite://{}/cayenne.db", dir.display());
+        catalog_with_scheme(dir, "sqlite").await
+    }
+
+    /// A catalog on the metastore backend `scheme` selects: `sqlite` or
+    /// `libsql` (Turso).
+    async fn catalog_with_scheme(dir: &std::path::Path, scheme: &str) -> Arc<CayenneCatalog> {
+        let conn = format!("{scheme}://{}/cayenne.db", dir.display());
         let catalog = Arc::new(CayenneCatalog::new(conn).expect("catalog"));
         catalog.init().await.expect("init");
         catalog
@@ -1002,6 +1016,135 @@ mod tests {
         );
         assert!(reader_data.join(&table_id).join(&second).is_dir());
         assert_eq!(rows, 50, "the archive restores the refreshed table");
+    }
+
+    /// A writer's table `trips` holding ids `1..=100`, with its metastore on
+    /// the Turso backend. Returns the catalog and the snapshot directories.
+    async fn turso_writer(root: &Path) -> (Arc<CayenneCatalog>, Vec<(PathBuf, String)>) {
+        use arrow::array::{Int64Array, RecordBatch};
+        use cayenne::CayenneTableProviderBuilder;
+        use datafusion::datasource::TableProvider;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+
+        let metadata_dir = root.join("metadata");
+        let data_dir = root.join("trips");
+        std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let catalog = catalog_with_scheme(&metadata_dir, "libsql").await;
+        let ctx = SessionContext::new();
+        let table = CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .create(CreateTableOptions {
+            table_name: "trips".to_string(),
+            schema: schema(),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir.to_string_lossy().into_owned(),
+            partition_column: None,
+            vortex_config: cayenne::metadata::VortexConfig::default(),
+        })
+        .await
+        .expect("create table");
+        let batch = RecordBatch::try_new(
+            schema(),
+            vec![Arc::new(Int64Array::from((1..=100).collect::<Vec<i64>>()))],
+        )
+        .expect("batch");
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema(), None).expect("exec");
+        let plan = table
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .expect("plan");
+        collect(plan, ctx.task_ctx()).await.expect("write");
+        let dirs = vec![
+            (metadata_dir, "metadata/".to_string()),
+            (data_dir, "data/".to_string()),
+        ];
+        (catalog, dirs)
+    }
+
+    /// The Turso metastore keeps an MVCC log, `cayenne.db-log`, beside
+    /// `cayenne.db`. Every metastore file the writer has on disk must be left
+    /// out of its snapshot, whichever backend wrote it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn turso_metastore_files_are_left_out_of_the_snapshot() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (catalog, dirs) = turso_writer(tmp.path()).await;
+        let (metadata_dir, data_dir) = (dirs[0].0.clone(), dirs[1].0.clone());
+        let plan =
+            CayenneSnapshotEngine::new(catalog as Arc<dyn MetadataCatalog>, "trips", data_dir)
+                .prepare_directory_snapshot(&dirs, "trips")
+                .await
+                .expect("prepare");
+
+        let mut on_disk: Vec<String> = std::fs::read_dir(&metadata_dir)
+            .expect("list metadata")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with("cayenne.db"))
+            .collect();
+        on_disk.sort();
+        assert!(
+            on_disk.iter().any(|name| name == "cayenne.db-log"),
+            "the Turso metastore writes its MVCC log: {on_disk:?}"
+        );
+        let archived: Vec<&String> = on_disk
+            .iter()
+            .filter(|name| !plan.skip_relative_paths.contains(&PathBuf::from(name)))
+            .collect();
+        assert!(
+            archived.is_empty(),
+            "metastore files the snapshot would archive: {archived:?} (on disk: {on_disk:?})"
+        );
+    }
+
+    /// A reader restoring a snapshot opens its own Turso metastore first, so
+    /// its own `cayenne.db-log` already exists when the archive is extracted.
+    /// Extraction keeps existing files only if their checksum matches the
+    /// archive's copy, so a snapshot carrying the writer's log can never
+    /// restore. With the log left out, the reader restores every row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn turso_metastore_snapshot_restores_into_a_reader_with_its_own_metastore() {
+        use runtime_acceleration::snapshot::directory_archive::archive_directories_to_file_with_plan;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (catalog, dirs) = turso_writer(&tmp.path().join("writer")).await;
+        let plan = CayenneSnapshotEngine::new(
+            catalog as Arc<dyn MetadataCatalog>,
+            "trips",
+            dirs[1].0.clone(),
+        )
+        .prepare_directory_snapshot(&dirs, "trips")
+        .await
+        .expect("prepare");
+        let skip: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
+        let extras: Vec<(String, Vec<u8>)> = plan
+            .extra_entries
+            .into_iter()
+            .map(|e| (e.archive_path, e.bytes))
+            .collect();
+        let tar = tmp.path().join("snapshot.tar");
+        archive_directories_to_file_with_plan(&dirs, &tar, &skip, &extras, &[])
+            .await
+            .expect("archive");
+
+        let reader = tmp.path().join("reader");
+        let (_, rows) = restore_with_scheme(&tar, &reader, "libsql").await;
+        assert!(
+            reader.join("metadata").join("cayenne.db-log").is_file(),
+            "the reader keeps its own Turso metastore log"
+        );
+        assert_eq!(rows, 100, "the reader restores every row of the snapshot");
     }
 
     #[tokio::test]
@@ -2015,6 +2158,16 @@ mod tests {
     /// Extracts `tar` under `root` into a fresh metastore and opens the table;
     /// returns the reader's data directory and the restored row count.
     async fn restore(tar: &std::path::Path, root: &std::path::Path) -> (PathBuf, usize) {
+        restore_with_scheme(tar, root, "sqlite").await
+    }
+
+    /// [`restore`] into a reader whose metastore is on the backend `scheme`
+    /// selects.
+    async fn restore_with_scheme(
+        tar: &std::path::Path,
+        root: &std::path::Path,
+        scheme: &str,
+    ) -> (PathBuf, usize) {
         use arrow::array::RecordBatch;
         use cayenne::CayenneTableProviderBuilder;
         use datafusion::datasource::TableProvider;
@@ -2027,7 +2180,7 @@ mod tests {
         let data_dir = root.join("trips");
         std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
         std::fs::create_dir_all(&data_dir).expect("mkdir data");
-        let catalog = fresh_catalog(&metadata_dir).await;
+        let catalog = catalog_with_scheme(&metadata_dir, scheme).await;
         extract_archive_file_with_options(
             tar,
             root,
