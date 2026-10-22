@@ -338,20 +338,28 @@ async fn management_minimal_block_defaults_region() -> Result<(), anyhow::Error>
                 management_status.endpoint, "https://us-east-1-prod-aws-flight.spiceai.io",
                 "the documented minimal block must target the Spice Cloud default region"
             );
-            if management_status.status.is_error() {
-                let message = management_status
-                    .status
-                    .error_message()
-                    .expect("error message");
-                assert!(
-                    !message.contains("spiceai_region"),
-                    "minimal block must not fail on the dataset key spiceai_region: {message}"
-                );
-                assert!(
-                    !message.contains("Missing required parameter"),
-                    "minimal block must not fail as a missing parameter: {message}"
-                );
-            }
+            assert!(
+                management_status.status.is_error(),
+                "a bogus api_key must fail Cloud init, got {:?}",
+                management_status.status
+            );
+            let message = management_status
+                .status
+                .error_message()
+                .expect("error message");
+            let lowered = message.to_ascii_lowercase();
+            assert!(
+                lowered.contains("handshake") || lowered.contains("invalid api key"),
+                "minimal block must reach Flight auth, not fail earlier: {message}"
+            );
+            assert!(
+                !lowered.contains("spiceai_region"),
+                "minimal block must not fail on the dataset key spiceai_region: {message}"
+            );
+            assert!(
+                !lowered.contains("missing required parameter"),
+                "minimal block must not fail as a missing parameter: {message}"
+            );
 
             Ok(())
         })
