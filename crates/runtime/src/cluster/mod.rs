@@ -22,7 +22,6 @@ use crate::cluster::partition::{
 };
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::jobs::JobExecutor;
-use crate::status::ComponentStatus;
 use crate::{
     CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_ASSIGNMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
     FailedToRegisterSchedulerSnafu, FailedToStartClusterExecutorSnafu,
@@ -65,6 +64,7 @@ use runtime_proto::{
     GetAppDefinitionRequest, GetDdlCatchupRequest, GetSchedulersRequest, TaskCancelInfo,
 };
 use runtime_secrets::Secrets;
+use runtime_status::ComponentStatus;
 use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -601,28 +601,26 @@ fn update_scheduler_pollers(
 pub(crate) mod accelerated_partition_provider;
 pub(crate) use runtime_cluster::cluster_state;
 mod composite_flight_service;
-mod control_stream_client;
 pub mod datafusion;
 mod heartbeat;
-pub mod metrics_collector;
 pub mod partition;
-pub mod pki;
 mod reaper;
 pub(crate) mod scheduler_registry;
 mod servers;
 mod service;
-pub(crate) mod shared_job_state;
 
 use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
 pub use cluster_state::{ClusterStateStore, SchedulerEntry};
-pub use control_stream_client::ControlStreamManager;
 pub use heartbeat::{SchedulerHeartbeat, SchedulerHeartbeatStore};
 pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
 pub use reaper::{Reaper, ReaperOutcome};
+pub use runtime_cluster::ControlStreamManager;
 pub use runtime_cluster::ExecutorOutboundBroadcaster;
 use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
 pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
+// Moved to `runtime-cluster`; re-exported so `runtime::cluster::{metrics_collector, pki}` still resolve.
+pub use runtime_cluster::{metrics_collector, pki};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, remote_scheduler_addresses};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
@@ -641,7 +639,7 @@ pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 ///
 /// * All three pieces (server cert, client verifier, outbound
 ///   `ClientTlsConfig`) live in a single
-///   [`crate::cluster::pki::ClusterPkiBundle`] backed by one
+///   [`pki::ClusterPkiBundle`] backed by one
 ///   `ArcSwap<ClusterPkiSnapshot>`. When any of CA / cert / key change
 ///   on disk we re-parse and validate the **whole** bundle; if anything
 ///   is invalid the previous snapshot is kept (last-known-good).
@@ -677,7 +675,7 @@ struct ClusterTlsConfigInner {
     /// Atomic bundle of (server cert+key, client verifier, outbound
     /// `ClientTlsConfig`). All three rotate together via a single
     /// `ArcSwap` swap inside the bundle.
-    bundle: Arc<crate::cluster::pki::ClusterPkiBundle>,
+    bundle: Arc<pki::ClusterPkiBundle>,
     /// Drop-guard for the watcher. In the centralized path the binary
     /// owns the [`runtime_tls::TlsControl`] for the whole process; this
     /// `Arc` is purely a safety net so the watcher dispatcher outlives
@@ -712,8 +710,8 @@ impl ClusterTlsConfig {
         // Build + register the atomic bundle. `try_new` performs the
         // initial parse + chain validation before returning, so any
         // bad starting state surfaces here as an `io::Error`.
-        let bundle = crate::cluster::pki::ClusterPkiBundle::try_new(
-            &crate::cluster::pki::ClusterPkiPaths {
+        let bundle = pki::ClusterPkiBundle::try_new(
+            &pki::ClusterPkiPaths {
                 ca: ca_path_buf.clone(),
                 cert: cert_path_buf.clone(),
                 key: key_path_buf.clone(),
@@ -774,13 +772,13 @@ impl ClusterTlsConfig {
     /// tests that introspect the bundle (e.g. fingerprint comparisons).
     #[must_use]
     #[doc(hidden)]
-    pub fn bundle_for_tests(&self) -> Arc<crate::cluster::pki::ClusterPkiBundle> {
+    pub fn bundle_for_tests(&self) -> Arc<pki::ClusterPkiBundle> {
         Arc::clone(&self.inner.bundle)
     }
 }
 
 /// Logged when a cluster node is started with `--allow-insecure-connections`.
-const INSECURE_CONNECTIONS_DEPRECATION_WARNING: &str = "`--allow-insecure-connections` is deprecated and no longer allows insecure cluster connections: without cluster mTLS, cluster RPCs are refused, so executors cannot join a scheduler. Set `--node-mtls-ca-certificate-file`, `--node-mtls-certificate-file` and `--node-mtls-key-file`; create certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`. The flag will be removed in a future release.";
+const INSECURE_CONNECTIONS_WARNING: &str = "Cluster connections are not authenticated or encrypted because `--allow-insecure-connections` is set. Use only on a trusted network for local development and testing. For secure clusters, create certificates with `spice cluster tls init` and `spice cluster tls add <node-name>` and set the `--node-mtls-*` flags.";
 
 fn io_other<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
@@ -881,7 +879,7 @@ impl ResolvedClusterConfig {
 
             if !missing_flags.is_empty() {
                 let certificate_hint = if tls_config.is_none() {
-                    " Create cluster certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`."
+                    " Create cluster certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`, or use `--allow-insecure-connections` for local development and testing."
                 } else {
                     ""
                 };
@@ -894,8 +892,8 @@ impl ResolvedClusterConfig {
                 ));
             }
 
-            if config.allow_insecure_connections {
-                tracing::warn!("{INSECURE_CONNECTIONS_DEPRECATION_WARNING}");
+            if tls_config.is_none() && config.allow_insecure_connections {
+                tracing::warn!("{INSECURE_CONNECTIONS_WARNING}");
             }
         }
 
@@ -1642,7 +1640,7 @@ pub async fn initialize_cluster_executor(
 
     let partition_update_handler_rt = Arc::clone(&rt);
     let partition_update_handler: Option<
-        crate::cluster::control_stream_client::PartitionUpdateHandler,
+        runtime_cluster::control_stream_client::PartitionUpdateHandler,
     > = Some(Arc::new(move |new_partitions, removed_partitions| {
         let rt = Arc::clone(&partition_update_handler_rt);
         Box::pin(async move {
@@ -1654,7 +1652,7 @@ pub async fn initialize_cluster_executor(
 
     let refresh_dataset_handler_rt = Arc::clone(&rt);
     let refresh_dataset_handler: Option<
-        crate::cluster::control_stream_client::RefreshDatasetHandler,
+        runtime_cluster::control_stream_client::RefreshDatasetHandler,
     > = Some(Arc::new(move |dataset_name, overrides_json| {
         let rt = Arc::clone(&refresh_dataset_handler_rt);
         Box::pin(async move {
@@ -2252,7 +2250,7 @@ async fn create_scheduler_server(
                 .boxed()
                 .context(FailedToStartClusterSchedulerSnafu)?,
         );
-        Arc::new(shared_job_state::SharedJobState::new(
+        Arc::new(runtime_cluster::shared_job_state::SharedJobState::new(
             metrics_node_id,
             store,
             base_prefix,
@@ -2682,16 +2680,16 @@ mod tests {
                 err.to_string(),
                 "Cluster mode requires the following flags: --node-mtls-ca-certificate-file, \
                  --node-mtls-certificate-file, --node-mtls-key-file. Create cluster certificates \
-                 with `spice cluster tls init` and `spice cluster tls add <node-name>`.",
+                 with `spice cluster tls init` and `spice cluster tls add <node-name>`, or use \
+                 `--allow-insecure-connections` for local development and testing.",
                 "{node}"
             );
         }
     }
 
-    /// The deprecated flag still parses and still lets a node start without cluster mTLS
-    /// files; the node then refuses every cluster RPC.
+    /// Local development nodes can explicitly opt out of cluster mTLS.
     #[test]
-    fn deprecated_insecure_connections_flag_still_starts_a_node() {
+    fn insecure_connections_flag_starts_a_node_without_mtls() {
         use super::ResolvedClusterConfig;
         use crate::config::{ClusterConfig, ClusterRole};
         use clap::Parser;
@@ -2704,12 +2702,12 @@ mod tests {
             "127.0.0.1",
             "--allow-insecure-connections",
         ])
-        .expect("--allow-insecure-connections should still parse");
+        .expect("--allow-insecure-connections should parse");
         assert!(config.allow_insecure_connections);
         assert_eq!(config.role, Some(ClusterRole::Scheduler));
 
         let resolved = ResolvedClusterConfig::try_new(config)
-            .expect("a node started with the deprecated flag should still start");
+            .expect("a node started with the insecure flag should start");
         assert!(!resolved.tls_enabled());
     }
 

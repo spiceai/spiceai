@@ -255,6 +255,160 @@ fn a_record_in_a_query_carries_the_trace_id_with_task_history_off() {
     );
 }
 
+/// Runs `log` on another thread inside `span` alone, the way the query runtime
+/// polls a query's plan: `run_record_batch_stream_on_runtime` instruments its
+/// driver with the task span and nothing else, so a connector logging during
+/// the scan has no trace span in scope.
+fn on_query_runtime(span: &tracing::Span, log: impl FnOnce() + Send) {
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    std::thread::scope(|scope| {
+        scope.spawn(|| tracing::dispatcher::with_default(&dispatch, || span.in_scope(log)));
+    });
+}
+
+fn pinned_trace_id() -> TraceId {
+    TraceId::from_hex(PINNED).expect("a valid trace id")
+}
+
+/// A record logged while the query executes carries the id the client pinned,
+/// like one logged while it is planned. Regression test for #15357, where it
+/// carried the trace id the SDK generated for the task span, which the
+/// `runtime.task_history` row replaces with the pinned one.
+#[test]
+fn a_record_logged_while_the_query_executes_carries_the_pinned_trace_id() {
+    let mut task_span_id = SpanId::INVALID;
+    let records = exported_by(true, || {
+        let task = tracing::info_span!(target: "task_history", "sql_query");
+        let _trace = correlation::begin_task_trace(&task, &pinned_request());
+        task_span_id = task.context().span().span_context().span_id();
+        on_query_runtime(&task, || {
+            tracing::debug!(target: "data_components::http::provider", "Pagination page 0: 1 rows fetched, total so far: 1");
+        });
+    });
+
+    assert_ne!(
+        task_span_id,
+        SpanId::INVALID,
+        "task history numbered the task"
+    );
+    assert_eq!(
+        trace_contexts(&records),
+        vec![Some((pinned_trace_id(), task_span_id))]
+    );
+}
+
+/// `runtime.task_history` writes every row of the query's trace under the
+/// pinned id, so a record in a task the query started carries it too, with
+/// that task's own span id.
+#[test]
+fn a_record_in_a_task_the_query_started_carries_the_pinned_trace_id() {
+    let mut child_span_id = SpanId::INVALID;
+    let records = exported_by(true, || {
+        let task = tracing::info_span!(target: "task_history", "sql_query");
+        let _trace = correlation::begin_task_trace(&task, &pinned_request());
+        let child = task.in_scope(|| tracing::info_span!(target: "task_history", "ballista_stage"));
+        child_span_id = child.context().span().span_context().span_id();
+        on_query_runtime(&child, || {
+            tracing::warn!(target: "data_components", "connection reset by peer");
+        });
+    });
+
+    assert_ne!(
+        child_span_id,
+        SpanId::INVALID,
+        "task history numbered the child"
+    );
+    assert_eq!(
+        trace_contexts(&records),
+        vec![Some((pinned_trace_id(), child_span_id))]
+    );
+}
+
+/// A nested query declares the pinned id its parent declared. It finishing
+/// first must not take the id from the parent's records.
+#[test]
+fn a_nested_query_finishing_first_leaves_the_parent_its_pinned_trace_id() {
+    let mut task_span_id = SpanId::INVALID;
+    let records = exported_by(true, || {
+        let request = pinned_request();
+        let task = tracing::info_span!(target: "task_history", "sql_query");
+        let _trace = correlation::begin_task_trace(&task, &request);
+        task_span_id = task.context().span().span_context().span_id();
+        task.in_scope(|| {
+            let nested = tracing::info_span!(target: "task_history", "sql_query");
+            let _nested_trace = correlation::begin_task_trace(&nested, &request);
+        });
+        on_query_runtime(&task, || {
+            tracing::warn!(target: "data_components", "connection reset by peer");
+        });
+    });
+
+    assert_eq!(
+        trace_contexts(&records),
+        vec![Some((pinned_trace_id(), task_span_id))]
+    );
+}
+
+/// The tasks other than a query that take a pinned id — chat, NSQL, responses,
+/// decisions — declare it the same way, and their records carry it.
+#[test]
+fn a_record_in_another_task_that_took_a_pinned_id_carries_it() {
+    let mut task_span_id = SpanId::INVALID;
+    let records = exported_by(true, || {
+        let task = tracing::info_span!(target: "task_history", "ai_chat");
+        correlation::record_task_history_trace_id(&task, &pinned_request());
+        task_span_id = task.context().span().span_context().span_id();
+        task.in_scope(|| {
+            tracing::warn!(target: "llms::chat", "the model returned no choices");
+        });
+    });
+
+    assert_eq!(
+        trace_contexts(&records),
+        vec![Some((pinned_trace_id(), task_span_id))]
+    );
+}
+
+/// A task's pinned id is kept as long as the task span is open, which can be
+/// after its trace span closes, and no longer: the ids are kept process-wide,
+/// so one that outlived its task would leak an entry per pinned query.
+#[test]
+fn a_pinned_trace_id_is_kept_while_its_task_is_open() {
+    exported_by(true, || {
+        let task = tracing::info_span!(target: "task_history", "sql_query");
+        let trace = correlation::begin_task_trace(&task, &pinned_request());
+        let task_trace_id = task.context().span().span_context().trace_id();
+        assert_ne!(
+            task_trace_id,
+            TraceId::INVALID,
+            "task history numbered the task"
+        );
+        assert_ne!(
+            task_trace_id,
+            pinned_trace_id(),
+            "the SDK numbered the task"
+        );
+        assert_eq!(
+            correlation::task_history_trace_id(task_trace_id),
+            pinned_trace_id()
+        );
+
+        drop(trace);
+        assert_eq!(
+            correlation::task_history_trace_id(task_trace_id),
+            pinned_trace_id(),
+            "the task span alone keeps it"
+        );
+
+        drop(task);
+        assert_eq!(
+            correlation::task_history_trace_id(task_trace_id),
+            task_trace_id,
+            "a closed task keeps nothing"
+        );
+    });
+}
+
 #[test]
 fn a_record_in_another_recorded_task_carries_that_tasks_ids() {
     let mut task = None;
@@ -994,6 +1148,191 @@ datasets:
         0,
         "`signals: [logs]` sends no metrics"
     );
+}
+
+/// Serves a one-row JSON array at every path on a loopback port, as the origin
+/// of an `http` dataset.
+fn serve_items(rt: &tokio::runtime::Runtime) -> SocketAddr {
+    let app = axum::Router::new().fallback(|| async {
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            r#"[{"id":2,"name":"widget"}]"#,
+        )
+    });
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .expect("bind the dataset origin");
+    let address = listener.local_addr().expect("the origin has an address");
+    rt.spawn(async move { axum::serve(listener, app).await });
+    address
+}
+
+/// Every record a query logs carries the trace id its response returns and its
+/// `runtime.task_history` row stores, whether the client pinned that id with
+/// `spice-trace-id`, pinned it with `traceparent`, or pinned nothing — the
+/// records the HTTP connector logs on the query runtime while the plan executes
+/// included. Regression test for #15357.
+#[cfg(unix)]
+#[test]
+fn every_record_of_a_query_carries_the_trace_id_it_returns() {
+    const PAGE_LOGGED: &str = "Pagination page 0: 1 rows fetched, total so far: 1";
+    const TRACEPARENT_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+
+    let rt = tokio::runtime::Runtime::new().expect("receiver runtime");
+    let inbox = Inbox::default();
+    let (receiver, _) = serve_grpc(&rt, inbox.clone());
+    let origin = serve_items(&rt);
+
+    let dir = tempfile::tempdir().expect("create the spicepod directory");
+    std::fs::write(
+        dir.path().join("spicepod.yaml"),
+        format!(
+            "version: v1
+kind: Spicepod
+name: otel-logs-trace-ids
+runtime:
+  telemetry:
+    otel_exporter:
+      endpoint: {receiver}
+      signals: [logs]
+datasets:
+  - from: http://{origin}
+    name: items
+    check_availability: disabled
+    params:
+      file_format: json
+      request_query_filters: enabled
+      allowed_request_paths: /**/**
+"
+        ),
+    )
+    .expect("write the spicepod");
+
+    let http = unused_local_addr();
+    // The connector logs the pages it reads at `debug`.
+    let mut child =
+        spawn(spiced_in(dir.path(), http).env("SPICED_LOG", "data_components=debug,info"));
+    inbox.wait_for_spiced(Some(&mut child), "registering the dataset", STARTUP, |r| {
+        r.body.starts_with("Dataset items registered")
+    });
+
+    let client = reqwest::Client::new();
+    let queries = [
+        (
+            "spice-trace-id",
+            Some(("spice-trace-id", PINNED.to_string())),
+        ),
+        (
+            "traceparent",
+            Some((
+                "traceparent",
+                format!("00-{TRACEPARENT_TRACE}-00f067aa0ba902b7-01"),
+            )),
+        ),
+        ("no pinned id", None),
+    ];
+    // Each query's case, the trace id it returned, and its task's span id.
+    let mut ran = Vec::new();
+    for (n, (case, pin)) in queries.into_iter().enumerate() {
+        // A distinct query string per case, so each reaches the origin.
+        let mut request = client
+            .post(format!("http://{http}/v1/sql"))
+            .header("Content-Type", "text/plain")
+            .body(format!(
+                "SELECT * FROM items WHERE request_path = '/items' AND request_query = 'id={n}'"
+            ));
+        if let Some((header, value)) = &pin {
+            request = request.header(*header, value);
+        }
+        let (status, returned, body) = rt
+            .block_on(async {
+                let response = request.send().await?;
+                let returned = response
+                    .headers()
+                    .get("spice-trace-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                Ok::<_, reqwest::Error>((response.status(), returned, response.text().await?))
+            })
+            .expect("send the query");
+        assert!(status.is_success(), "{case}: the query succeeds: {body}");
+        let returned = returned.unwrap_or_else(|| panic!("{case}: the response names its trace"));
+        match case {
+            "spice-trace-id" => assert_eq!(returned, PINNED, "{case}"),
+            "traceparent" => assert_eq!(returned, TRACEPARENT_TRACE, "{case}"),
+            _ => {}
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let span_id = loop {
+            let rows: serde_json::Value = rt
+                .block_on(async {
+                    client
+                        .post(format!("http://{http}/v1/sql"))
+                        .header("Content-Type", "text/plain")
+                        .body(format!(
+                            "SELECT span_id FROM runtime.task_history WHERE trace_id = '{returned}' AND task = 'sql_query'"
+                        ))
+                        .send()
+                        .await?
+                        .json()
+                        .await
+                })
+                .expect("query runtime.task_history");
+            if let Some(span_id) = rows
+                .as_array()
+                .and_then(|rows| rows.first())
+                .and_then(|row| row["span_id"].as_str())
+            {
+                break span_id.to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{case}: the query never reached runtime.task_history under {returned}"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        };
+
+        // Matched by span id alone: the trace id is what is under test.
+        inbox.wait_for_spiced(
+            Some(&mut child),
+            &format!("{case}: from the query's scan"),
+            Duration::from_secs(30),
+            |r| r.span_id == span_id && r.body == PAGE_LOGGED,
+        );
+        ran.push((case, returned, span_id));
+    }
+
+    // A graceful shutdown exports every record still queued, so none of the
+    // queries' records is left unchecked.
+    let status = terminate(&mut child);
+    assert!(
+        status.success(),
+        "spiced exits cleanly: {status}\n{}",
+        child.report()
+    );
+    let exported = inbox.all();
+    for (case, returned, span_id) in ran {
+        let logged: Vec<(&str, &str)> = exported
+            .iter()
+            .filter(|r| r.span_id == span_id)
+            .map(|r| (r.trace_id.as_str(), r.body.as_str()))
+            .collect();
+        let bodies: Vec<&str> = logged.iter().map(|(_, body)| *body).collect();
+        for logged_during_execution in [
+            "Detected file format from Content-Type header: json",
+            PAGE_LOGGED,
+        ] {
+            assert!(
+                bodies.contains(&logged_during_execution),
+                "{case}: the scan logged {logged_during_execution:?}: {bodies:#?}"
+            );
+        }
+        assert!(
+            logged.iter().all(|(trace_id, _)| *trace_id == returned),
+            "{case}: every record of the query carries {returned}: {logged:#?}"
+        );
+    }
 }
 
 /// HTTP end to end, on the documented `/v1/metrics` endpoint: a runtime that

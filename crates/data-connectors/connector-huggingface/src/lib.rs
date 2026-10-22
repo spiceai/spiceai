@@ -54,12 +54,14 @@ use snafu::prelude::*;
 use tokio::runtime::Handle;
 use url::Url;
 
-pub mod hub;
-pub mod location;
 pub mod store;
 pub mod table;
 #[cfg(test)]
 mod tests;
+
+// The Hub client and `hf://` locations live in `huggingface-hub`, the one client every
+// component reads the Hub through; they keep their names here.
+use huggingface_hub::{client as hub, location};
 
 use hub::{Commit, EntryKind, Hub, HubConfig};
 use location::DatasetLocation;

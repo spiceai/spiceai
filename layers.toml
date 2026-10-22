@@ -274,16 +274,23 @@ runtime-checkpoint-api = "foundation"
 # changing the default can never silently relocate it away from `cache`/`hf-hub`.
 chat-api = "foundation"
 evaluate-api = "foundation"
+messages-api = "foundation"
 # What each model can serve and the gate every serving path asks; its closure is `spicepod`.
 model-capabilities = "foundation"
 embed-api = "shared-utility"
+# The Hugging Face Hub client: models, embeddings, rerankers and the Hugging Face data
+# connector all read the Hub through it.
+huggingface-hub = "shared-utility"
 rerank-api = "foundation"
 runtime-cloud-connect = "foundation"
 runtime-datafusion-index = "foundation"
 runtime-tls = "foundation"
 spice-table = "foundation"
 runtime-metrics = "foundation"
-runtime-object-store = "foundation"
+# shared-utility, not foundation: `state` resolves the state store's params through
+# runtime-parameters and runtime-secrets (both shared-utility).
+runtime-object-store = "shared-utility"
+runtime-otel-push = "foundation"
 runtime-parameter-spec = "foundation"
 runtime-parameters-typed = "foundation"
 runtime-proto = "foundation"
@@ -317,7 +324,7 @@ yaml = "foundation"
 # tier, but listed here for clarity / auditability). Everything else defaults to
 # `shared-utility`:
 #   app, cache, cayenne, data-accelerator-api, data_components, datafusion-ddl,
-#   datafusion-optimizer-rules, evaluate-chat, llms, package, runtime-acceleration,
+#   datafusion-optimizer-rules, evaluate-chat, llms, messages-chat, package, runtime-acceleration,
 #   runtime-auth, runtime-cluster, runtime-datafusion, runtime-datafusion-udfs,
 #   runtime-decide, runtime-drasi, runtime-parameters, runtime-request-context, runtime-search,
 #   runtime-secrets, runtime-table-partition, runtime-tools, search,

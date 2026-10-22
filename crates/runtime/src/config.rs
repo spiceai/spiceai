@@ -165,8 +165,8 @@ pub struct ClusterConfig {
     #[arg(long = "node-mtls-key-file", value_name = "NODE_MTLS_KEY_FILE")]
     pub node_mtls_key_file: Option<String>,
 
-    /// Deprecated, and will be removed. No longer allows insecure cluster connections: without
-    /// cluster mTLS, cluster RPCs are refused. Set the `--node-mtls-*` flags instead.
+    /// Allow cluster connections without mTLS for local development and testing.
+    /// Use only on a trusted network; cluster connections are not authenticated or encrypted.
     #[arg(long = "allow-insecure-connections", default_value_t = false, action = ArgAction::SetTrue)]
     pub allow_insecure_connections: bool,
 
