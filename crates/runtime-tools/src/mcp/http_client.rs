@@ -116,6 +116,28 @@ impl BoundedHttpClient {
         message
     }
 
+    /// The over-limit failure for a POST whose body was not read in full.
+    ///
+    /// A request gets a JSON-RPC error, so only that call fails. A transport
+    /// error would reach the caller as a closed transport, which reconnects
+    /// and sends the same request again.
+    fn too_large_response(
+        &self,
+        request_id: Option<RequestId>,
+        session_id: Option<String>,
+    ) -> HttpResult<StreamableHttpPostResponse> {
+        let message = self.too_large();
+        match request_id {
+            Some(id) => Ok(StreamableHttpPostResponse::Json(
+                too_large_error(message, id),
+                session_id,
+            )),
+            None => Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                message,
+            ))),
+        }
+    }
+
     /// Reads the whole body, or returns `None` as soon as it is known to
     /// exceed [`MAX_TOOL_RESULT_SIZE`] — from `Content-Length` before reading
     /// anything, otherwise once the bytes received cross the limit.
@@ -139,6 +161,10 @@ impl BoundedHttpClient {
     }
 }
 
+fn too_large_error(message: String, id: RequestId) -> ServerJsonRpcMessage {
+    ServerJsonRpcMessage::error(ErrorData::internal_error(message, None), Some(id))
+}
+
 /// The SSE body of a POST, cut off once the bytes received exceed
 /// [`MAX_TOOL_RESULT_SIZE`].
 ///
@@ -146,11 +172,10 @@ impl BoundedHttpClient {
 /// carries the response to that one request (plus any progress notifications
 /// before it), so its total is bounded by the size of that response.
 ///
-/// rmcp treats an error inside a POST stream as fatal to the whole transport,
-/// which would fail every call in flight and make the caller reconnect and
-/// fetch the oversized response again. So when the POST was a request, the
-/// stream invalidates any partial event and then sends a JSON-RPC error for
-/// that request: only that call fails.
+/// rmcp reports an error inside a POST stream to the caller as a closed
+/// transport, which reconnects and sends the request again. So when the POST
+/// was a request, the stream invalidates any partial event and then sends a
+/// JSON-RPC error for that request.
 struct BoundedByteStream {
     inner: BoxStream<'static, reqwest::Result<Bytes>>,
     client: BoundedHttpClient,
@@ -168,10 +193,8 @@ impl BoundedByteStream {
         let Some(id) = self.request_id.take() else {
             return Err(ResponseBodyError::TooLarge { message });
         };
-        let error = ServerJsonRpcMessage::error(ErrorData::internal_error(message, None), Some(id));
-        let json = serde_json::to_string(&error).map_err(|e| ResponseBodyError::TooLarge {
-            message: e.to_string(),
-        })?;
+        let json = serde_json::to_string(&too_large_error(message.clone(), id))
+            .map_err(|_| ResponseBodyError::TooLarge { message })?;
         // Do not begin with a blank line. Bytes already forwarded may hold a
         // complete `data:` field, and a blank line would dispatch it as a
         // success for this request. `data: x` continues that field so the
@@ -298,28 +321,6 @@ impl StreamableHttpClient for BoundedHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> HttpResult<StreamableHttpPostResponse> {
-        self.post_message_with_max_sse_event_size(
-            uri,
-            message,
-            session_id,
-            auth_header,
-            custom_headers,
-            MAX_TOOL_RESULT_SIZE,
-        )
-        .await
-    }
-
-    async fn post_message_with_max_sse_event_size(
-        &self,
-        uri: Arc<str>,
-        message: ClientJsonRpcMessage,
-        session_id: Option<Arc<str>>,
-        auth_header: Option<String>,
-        custom_headers: HashMap<HeaderName, HeaderValue>,
-        // The whole response is bounded by `MAX_TOOL_RESULT_SIZE`, which the
-        // transport config also sets as its event limit.
-        _max_sse_event_size: usize,
-    ) -> HttpResult<StreamableHttpPostResponse> {
         let mut request = self
             .inner
             .post(uri.as_ref())
@@ -381,15 +382,15 @@ impl StreamableHttpClient for BoundedHttpClient {
         let is_json = content_type
             .as_deref()
             .is_some_and(|ct| ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()));
+        let request_id = match &message {
+            ClientJsonRpcMessage::Request(request) => Some(request.id.clone()),
+            _ => None,
+        };
 
         if !status.is_success() {
             let body = match self.read_body(response).await {
                 Ok(Some(body)) => String::from_utf8_lossy(&body).into_owned(),
-                Ok(None) => {
-                    return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                        format!("HTTP {status}: {}", self.too_large()),
-                    )));
-                }
+                Ok(None) => return self.too_large_response(request_id, session_id),
                 Err(_) => "<failed to read response body>".to_string(),
             };
             // A non-success response may still carry a JSON-RPC error worth
@@ -417,10 +418,6 @@ impl StreamableHttpClient for BoundedHttpClient {
 
         match content_type.as_deref() {
             Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
-                let request_id = match &message {
-                    ClientJsonRpcMessage::Request(request) => Some(request.id.clone()),
-                    _ => None,
-                };
                 let bytes = BoundedByteStream {
                     inner: response.bytes_stream().boxed(),
                     client: self.clone(),
@@ -435,9 +432,7 @@ impl StreamableHttpClient for BoundedHttpClient {
             }
             Some(_) if is_json => {
                 let Some(body) = self.read_body(response).await? else {
-                    return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                        self.too_large(),
-                    )));
+                    return self.too_large_response(request_id, session_id);
                 };
                 // A malformed body (e.g. a 200 to a notification without an
                 // `id`) is treated as accepted rather than failing.
@@ -476,26 +471,6 @@ impl StreamableHttpClient for BoundedHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> HttpResult<BoxStream<'static, Result<Sse, SseError>>> {
-        self.get_stream_with_max_sse_event_size(
-            uri,
-            session_id,
-            last_event_id,
-            auth_header,
-            custom_headers,
-            MAX_TOOL_RESULT_SIZE,
-        )
-        .await
-    }
-
-    async fn get_stream_with_max_sse_event_size(
-        &self,
-        uri: Arc<str>,
-        session_id: Option<Arc<str>>,
-        last_event_id: Option<String>,
-        auth_header: Option<String>,
-        custom_headers: HashMap<HeaderName, HeaderValue>,
-        max_sse_event_size: usize,
-    ) -> HttpResult<BoxStream<'static, Result<Sse, SseError>>> {
         self.inner
             .get_stream_with_max_sse_event_size(
                 uri,
@@ -503,7 +478,7 @@ impl StreamableHttpClient for BoundedHttpClient {
                 last_event_id,
                 auth_header,
                 custom_headers,
-                max_sse_event_size.min(MAX_TOOL_RESULT_SIZE),
+                MAX_TOOL_RESULT_SIZE,
             )
             .await
     }
@@ -745,6 +720,14 @@ mod tests {
         body
     }
 
+    /// How the over-limit JSON-RPC error reaches the caller of the tool.
+    fn too_large_call_error() -> String {
+        format!(
+            "Mcp error: -32603: {}",
+            response_too_large_message(SERVER_NAME)
+        )
+    }
+
     fn text_result(bytes: usize) -> Value {
         json!([{"type": "text", "text": "X".repeat(bytes)}])
     }
@@ -775,14 +758,10 @@ mod tests {
         let (url, upstream) = start_upstream(true).await;
         let catalog = connect(url).await;
         let result = call(&catalog, "flood", &json!({"mode": "sse_sealed"})).await;
-        let error = result.expect_err("the sealed success must not be returned");
-        assert!(
-            error.contains(&response_too_large_message(SERVER_NAME)),
-            "the error must be the size limit, got: {error}"
-        );
-        assert!(
-            !error.contains("SEALED_OK"),
-            "the success payload must not be delivered, got: {error}"
+        assert_eq!(
+            result,
+            Err(too_large_call_error()),
+            "the sealed success must not be returned"
         );
         assert_eq!(upstream.flood_requests.load(Ordering::SeqCst), 1);
     }
@@ -796,15 +775,10 @@ mod tests {
             let catalog = connect(url).await;
 
             let result = call(&catalog, "flood", &json!({"mode": mode})).await;
-            let error = result.expect_err("an over-limit result must fail the call");
-            assert!(
-                error.contains(&response_too_large_message(SERVER_NAME)),
-                "mode={mode}: the error must say the response was over the limit, got: {error}"
-            );
-            assert!(
-                error.len() < 4096,
-                "mode={mode}: the error must not carry the response, got {} bytes",
-                error.len()
+            assert_eq!(
+                result,
+                Err(too_large_call_error()),
+                "mode={mode}: the call must fail with only the size-limit error"
             );
             assert_eq!(
                 upstream.flood_requests.load(Ordering::SeqCst),
