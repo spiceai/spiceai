@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+pub(crate) mod api_error;
 mod auth_error;
 pub mod chat;
 pub mod embed;

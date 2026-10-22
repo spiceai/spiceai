@@ -236,6 +236,20 @@ impl ApiErrorKind {
         Self::named(error.code.as_deref()).or_else(|| Self::named(error.r#type.as_deref()))
     }
 
+    /// The error `type` that [`Self::of`] reads back as `self`, for a provider whose own
+    /// errors do not have the `OpenAI` shape.
+    #[must_use]
+    pub fn error_type(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request_error",
+            Self::Authentication => "authentication_error",
+            Self::PermissionDenied => "permission_error",
+            Self::NotFound => "not_found_error",
+            Self::RateLimited => "rate_limit_error",
+            Self::InsufficientQuota => "insufficient_quota",
+        }
+    }
+
     fn named(name: Option<&str>) -> Option<Self> {
         match name? {
             "invalid_request_error" => Some(Self::InvalidRequest),
@@ -577,7 +591,28 @@ mod tests {
         ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest, FunctionCall,
     };
 
-    use super::{Chat, Error, Result, SqlGeneration, message_to_content};
+    use super::{ApiErrorKind, Chat, Error, Result, SqlGeneration, message_to_content};
+    use async_openai::error::ApiError;
+
+    #[test]
+    fn each_error_type_reads_back_as_its_kind() {
+        for kind in [
+            ApiErrorKind::InvalidRequest,
+            ApiErrorKind::Authentication,
+            ApiErrorKind::PermissionDenied,
+            ApiErrorKind::NotFound,
+            ApiErrorKind::RateLimited,
+            ApiErrorKind::InsufficientQuota,
+        ] {
+            let error = ApiError {
+                message: String::new(),
+                r#type: Some(kind.error_type().to_string()),
+                param: None,
+                code: None,
+            };
+            assert_eq!(ApiErrorKind::of(&error), Some(kind));
+        }
+    }
 
     /// A tool-call-only assistant turn, in the shape a client replays one.
     #[expect(deprecated)]
