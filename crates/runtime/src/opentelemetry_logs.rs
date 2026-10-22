@@ -521,12 +521,7 @@ impl LogsService for LogsIngestService {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> std::result::Result<Response<ExportLogsServiceResponse>, Status> {
-        // The OTLP/HTTP route checks this before decoding; gRPC reaches here first.
-        if crate::http::v1::current_principal_requires_read_only().await {
-            return Err(Status::permission_denied(
-                "API key does not allow write access",
-            ));
-        }
+        crate::http::v1::ensure_otlp_grpc_write_access().await?;
         let request = request.into_inner();
         let records = log_record_count(&request);
         if records == 0 {
@@ -624,6 +619,7 @@ pub fn create_logs_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::spicepod::component::runtime::ApiKey;
     use arrow::array::{Array, AsArray};
     use arrow::datatypes::{Int32Type, TimestampNanosecondType, UInt32Type};
     use datafusion::datasource::TableProvider;
@@ -635,9 +631,11 @@ mod tests {
     use opentelemetry_proto::tonic::logs::v1::{ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use parking_lot::Mutex;
+    use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
     use runtime_query_engine::query_engine::Error as QueryEngineError;
     use runtime_query_engine::query_engine::QueryRequest;
     use runtime_query_engine::query_engine::Result as QueryEngineResult;
+    use runtime_request_context::{Protocol, RequestContext, RequestContextBuilder};
 
     const RECEIVED: u64 = 1_700_000_000_000_000_000;
 
@@ -1378,6 +1376,33 @@ mod tests {
             status.message(),
             "Failed to write to the OpenTelemetry logs dataset 'otel_logs'; retry the export"
         );
+        assert!(engine.writes.lock().is_empty());
+    }
+
+    fn context_with_api_key(key: ApiKey) -> Arc<RequestContext> {
+        let context = Arc::new(RequestContextBuilder::new(Protocol::Flight).build());
+        context
+            .set_auth_principal(Arc::new(key) as AuthPrincipalRef)
+            .expect("auth principal should be set");
+        context
+    }
+
+    /// A read-only API key must not persist an OTLP logs export. The logs dataset is writable,
+    /// so a missing principal check would store the records.
+    #[tokio::test]
+    async fn otlp_grpc_read_only_api_key_is_denied_and_writes_nothing() {
+        let engine = FakeQueryEngine::new(&["otel_logs"], &[]);
+        let service = service(&engine, &["otel_logs"]);
+
+        let status = context_with_api_key(ApiKey::ReadOnly {
+            key: "read-only".to_string(),
+        })
+        .scope(service.export(Request::new(records(3))))
+        .await
+        .expect_err("a read-only API key must not export logs");
+
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(status.message(), "API key does not allow write access");
         assert!(engine.writes.lock().is_empty());
     }
 }

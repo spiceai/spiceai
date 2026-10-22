@@ -17,6 +17,7 @@ limitations under the License.
 use self::append_cursor::AppendCursorStore;
 use super::refresh::Refresh;
 use super::refresh::get_timestamp;
+use super::refresh_completion::RefreshRequestId;
 use super::sink::AccelerationSink;
 use super::synchronized_table::SynchronizedTable;
 use crate::accelerated::caching::CacheRefreshHelper;
@@ -279,6 +280,8 @@ pub struct RefreshTaskBuilder {
     /// Per-dataset `cdc_*` parameter overrides drawn from
     /// `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    /// Requests to reload a change stream's served partitions.
+    reload_requests: Option<tokio::sync::mpsc::Receiver<RefreshRequestId>>,
     /// The cache keys a write is pending for, shared with the caching scan and
     /// its batched writer. `RefreshMode::Caching`'s periodic stale-row refresh
     /// replaces the entries it refreshes, so it has to claim each key for the
@@ -323,6 +326,7 @@ impl RefreshTaskBuilder {
             engine_type_rewrites: &[],
             snapshot_refresh_state: None,
             cdc_param_overrides: None,
+            reload_requests: None,
             in_flight_revalidations: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -475,6 +479,17 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Provide the requests that reload a change stream's served partitions;
+    /// see [`crate::accelerated::AcceleratedTable::trigger_reload`].
+    #[must_use]
+    pub fn with_reload_requests(
+        mut self,
+        reload_requests: Option<tokio::sync::mpsc::Receiver<RefreshRequestId>>,
+    ) -> RefreshTaskBuilder {
+        self.reload_requests = reload_requests;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> RefreshTask {
         let semaphore = self
@@ -542,6 +557,7 @@ impl RefreshTaskBuilder {
             change_sink: tokio::sync::OnceCell::new_with(self.change_sink),
             cache_write_sender: self.cache_write_sender,
             cdc_param_overrides: self.cdc_param_overrides,
+            reload_requests: parking_lot::Mutex::new(self.reload_requests),
             in_flight_revalidations: self.in_flight_revalidations,
             append_cursor_store: self.append_cursor_store,
             last_append_fallback: parking_lot::Mutex::new(None),
@@ -631,6 +647,10 @@ pub struct RefreshTask {
     cache_write_sender: Option<super::caching::CacheWriteSender>,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    /// Requests to reload a change stream's served partitions, taken by the
+    /// change stream when it starts.
+    pub(crate) reload_requests:
+        parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<RefreshRequestId>>>,
     in_flight_revalidations: super::caching::InFlightRevalidations,
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<AppendCursorStore>,

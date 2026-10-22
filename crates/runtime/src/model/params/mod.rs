@@ -103,6 +103,87 @@ mod tests {
         Arc::new(RwLock::new(runtime_secrets::Secrets::new()))
     }
 
+    /// What the typed-params crate logs while `parse` runs, one line per event.
+    async fn typed_params_warnings<F: std::future::Future>(parse: F) -> String {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct CapturedLogs(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLogs {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let logs = CapturedLogs::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .without_time()
+            .with_level(false)
+            .with_target(false)
+            .with_writer(logs.clone())
+            .with_filter(
+                tracing_subscriber::filter::Targets::new()
+                    .with_target("runtime_parameters_typed", tracing::Level::TRACE),
+            );
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        parse.await;
+        String::from_utf8_lossy(&logs.0.lock()).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_bare_override_on_a_prefixed_provider_warns_as_a_deprecated_alias() {
+        // The runtime applies `reasoning_effort` for a `hf` model, so the warning must not
+        // say it is ignored.
+        let warnings = typed_params_warnings(async {
+            huggingface::HuggingFaceModelParams::try_from_params(
+                "model huggingface",
+                params(&[("hf_token", "hf_abc"), ("reasoning_effort", "low")]),
+                &empty_secrets(),
+            )
+            .await
+            .expect("huggingface params should deserialize");
+        })
+        .await;
+        assert_eq!(
+            warnings.trim_end(),
+            format!(
+                "Parameter 'reasoning_effort' is deprecated for model huggingface: {}",
+                common::UNPREFIXED_DEPRECATED_MESSAGE
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prefixed_override_logs_nothing() {
+        let warnings = typed_params_warnings(async {
+            huggingface::HuggingFaceModelParams::try_from_params(
+                "model huggingface",
+                params(&[("hf_token", "hf_abc"), ("hf_reasoning_effort", "low")]),
+                &empty_secrets(),
+            )
+            .await
+            .expect("huggingface params should deserialize");
+        })
+        .await;
+        assert_eq!(warnings, "");
+    }
+
     #[tokio::test]
     async fn openai_defaults_and_overrides_are_accepted() {
         // Common override params (temperature, prefixed and legacy openai_ forms)
