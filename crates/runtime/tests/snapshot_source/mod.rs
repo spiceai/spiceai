@@ -1618,10 +1618,22 @@ async fn metrics_scenario(
     assert_eq!(rows(&reader, modules).await?.len(), 3);
 
     // Load a second snapshot, so a rollback to snapshot 0 is older than the loaded one.
-    // SANDBOX ONLY: let the writer publish more snapshots of the 3 rows first, as a
-    // slow runner does.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // SANDBOX ONLY: a slow store. Pause RustFS while the writer loads the grown file, so
+    // its snapshot of the 5 rows is still uploading when the writer serves them.
+    container.pause().await?;
     std::fs::write(dir.path().join("modules.csv"), GROWN_CSV)?;
+    let mut paused_at = Instant::now();
+    while rows(&writer, modules).await?.len() != 5 {
+        if paused_at.elapsed() > Duration::from_secs(8) {
+            // An upload of the 3 rows was in flight: let it finish, then pause again.
+            container.unpause().await?;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            container.pause().await?;
+            paused_at = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    container.unpause().await?;
     wait_for_rows(&writer, modules, 5).await?;
     // A full refresh publishes a snapshot after every refresh, so snapshots of the 3
     // rows can follow snapshot 0 before the writer reads the grown file. The refresh
