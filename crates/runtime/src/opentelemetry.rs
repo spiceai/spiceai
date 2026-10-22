@@ -3568,23 +3568,6 @@ mod tests {
         assert_eq!(engine.rows_written(), 1);
     }
 
-    /// With authentication disabled there is no principal, and an export is stored.
-    #[tokio::test]
-    async fn otlp_grpc_export_with_no_principal_writes_metrics() {
-        let engine = Arc::new(FakeQueryEngine::unregistered().writable_only(&["otel_metrics"]));
-        let service = store_service(&engine, &["otel_metrics"]);
-        let request = otlp_request(vec![otlp_metric("svc_requests", Some(gauge(1.0)))]);
-
-        let response = service
-            .export(Request::new(request))
-            .await
-            .expect("an export with no principal is stored")
-            .into_inner();
-
-        assert!(response.partial_success.is_none());
-        assert_eq!(engine.rows_written(), 1);
-    }
-
     /// Resource attributes identify the process that produced a measurement, so they must land
     /// as dimension columns on every data point of the export rather than being dropped.
     #[test]

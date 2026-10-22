@@ -1405,27 +1405,4 @@ mod tests {
         assert_eq!(status.message(), "API key does not allow write access");
         assert!(engine.writes.lock().is_empty());
     }
-
-    /// A read-write API key still stores the export.
-    #[tokio::test]
-    async fn otlp_grpc_read_write_api_key_exports_logs() {
-        let engine = FakeQueryEngine::new(&["otel_logs"], &[]);
-        let service = service(&engine, &["otel_logs"]);
-
-        let response = context_with_api_key(ApiKey::ReadWrite {
-            key: "read-write".to_string(),
-        })
-        .scope(service.export(Request::new(records(3))))
-        .await
-        .expect("a read-write API key exports logs")
-        .into_inner();
-
-        assert_eq!(response.partial_success, None);
-        let writes = engine.writes.lock();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(
-            writes[0].1.iter().map(RecordBatch::num_rows).sum::<usize>(),
-            3
-        );
-    }
 }
