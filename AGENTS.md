@@ -292,4 +292,6 @@ For any feature: if it adds or changes user-facing surface, get the signed-off E
 
 `brew install rust cmake protobuf && make install-dev`; `export PATH="$PATH:$HOME/.spice/bin"`. Copy `.vscode/settings.json.template` → `.vscode/settings.json` (gitignored): rust-analyzer runs clippy with `-Dclippy::pedantic -Dclippy::unwrap_used -Dclippy::clone_on_ref_ptr`, so lints fail locally, not just in CI.
 
+Agent skills live in `.agents/skills/<name>/SKILL.md` ([Agent Skills format](https://agentskills.io/specification)), which Codex, Copilot, Cursor, and Gemini CLI load directly; `.claude/skills` is a symlink to it for Claude Code. Add new skills there, not as harness-specific prompt files.
+
 Key docs: `docs/PRINCIPLES.md`, `docs/EXTENSIBILITY.md`, `docs/dev/style_guide.md`, `docs/dev/error_handling.md`, `docs/dev/stacked_prs.md`, `CONTRIBUTING.md`, `docs/decisions/`, `docs/threat_models/`; [Spice docs](https://spiceai.org/docs), [Cookbook](https://github.com/spiceai/cookbook).

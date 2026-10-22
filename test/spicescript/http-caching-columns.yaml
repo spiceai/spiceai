@@ -1,0 +1,95 @@
+name: http-caching-columns
+description: >
+  Cayenne `refresh_mode: caching` over an HTTP API whose JSON responses are
+  decomposed into named columns: reads of one request that differ only in
+  predicates on response columns share its one cached response; a read the
+  cached response cannot answer fetches it again, and the new response
+  replaces the request's rows rather than being added beside them; a 503
+  past the TTL is answered from the stale rows inside the stale-if-error
+  window, and with an unbounded window however old they are.
+
+sources:
+  api: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-caching-columns
+  runtime:
+    caching: { sql_results: { enabled: false } }
+  datasets:
+    - from: ${sources.api.url}/v1
+      name: d
+      params: &api { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      columns: &cols
+        - name: request_path
+        - name: rank
+        - name: query
+        - name: extra
+          metadata: { json_object: '*' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 10m } }
+    - from: ${sources.api.url}/v1
+      name: stale
+      params: *api
+      columns: *cols
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 2s, caching_stale_if_error: 1h } }
+    - from: ${sources.api.url}/v1
+      name: forever
+      params: *api
+      columns: *cols
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 1s, caching_stale_if_error: enabled } }
+
+defaults:
+  cluster-partition-by: { '*': request_path }
+
+steps:
+  - source-exec:
+      api:
+        - "{ path: /v1/items, headers: { content-type: application/json }, body: '[{\"rank\": 1, \"query\": \"a\"}, {\"rank\": 2, \"query\": \"b\"}]' }"
+        - "{ path: /v1/s, headers: { content-type: application/json }, body: '[{\"rank\": 1, \"query\": \"s\"}]' }"
+        - "{ path: /v1/f, headers: { content-type: application/json }, body: '[{\"rank\": 1, \"query\": \"f\"}]' }"
+  - start: {}
+
+  # One request, read through different response predicates: one fetch.
+  - query: SELECT rank, query FROM d WHERE request_path = '/items' AND rank = 1
+    expect: { rows: [['1', a]] }
+  - query: SELECT count(*) AS n FROM d
+    expect: { rows: [['2']] }
+    eventually: 10s
+  - query: SELECT rank, query FROM d WHERE request_path = '/items' AND rank = 2
+    expect: { rows: [['2', b]] }
+  - query: SELECT rank FROM d WHERE request_path = '/items' AND query = 'a'
+    expect: { rows: [['1']] }
+  - source-query: { api: count /v1/items }
+    expect: { rows: [['1']] }
+
+  # A rank the cached response lacks is fetched; the refill replaces the
+  # request's rows.
+  - source-exec: { api: "{ path: /v1/items, headers: { content-type: application/json }, body: '[{\"rank\": 1, \"query\": \"a\"}, {\"rank\": 2, \"query\": \"b\"}, {\"rank\": 3, \"query\": \"c\"}]' }" }
+  - query: SELECT rank, query FROM d WHERE request_path = '/items' AND rank = 3
+    expect: { rows: [['3', c]] }
+  - source-query: { api: count /v1/items }
+    expect: { rows: [['2']] }
+  - query: SELECT rank FROM d ORDER BY rank
+    expect: { rows: [['1'], ['2'], ['3']] }
+    eventually: 10s
+  - query: SELECT rank, query FROM d WHERE request_path = '/items' ORDER BY rank
+    expect: { rows: [['1', a], ['2', b], ['3', c]] }
+
+  # A 503 past the TTL, inside the window: the stale decomposed row, not an
+  # empty answer.
+  - query: SELECT rank, query FROM stale WHERE request_path = '/s' AND rank = 1
+    expect: { rows: [['1', s]] }
+  - query: SELECT rank, query FROM forever WHERE request_path = '/f' AND rank = 1
+    expect: { rows: [['1', f]] }
+  - source-exec:
+      api:
+        - "{ path: /v1/s, status: 503, body: 'origin fault: status 503' }"
+        - "{ path: /v1/f, status: 503, body: 'origin fault: status 503' }"
+  - sleep: 4s
+  - query: SELECT rank, query FROM stale WHERE request_path = '/s' AND rank = 1
+    expect: { rows: [['1', s]] }
+  - query: SELECT rank, query FROM forever WHERE request_path = '/f' AND rank = 1
+    expect: { rows: [['1', f]] }
+  - source-query: { api: count /v1/s }
+    expect: { rows: [['2']] }

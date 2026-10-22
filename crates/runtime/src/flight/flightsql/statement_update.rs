@@ -32,7 +32,10 @@ use tonic::{Response, Status};
 use crate::{
     config::ClusterRole,
     datafusion::{query::QueryBuilder, request_context_extension::get_current_datafusion},
-    flight::{Service, handle_query_error, metrics, to_tonic_err, util::set_flightsql_protocol},
+    flight::{
+        Service, handle_datafusion_error, handle_query_error, metrics, to_tonic_err,
+        util::set_flightsql_protocol,
+    },
 };
 use runtime_auth::AuthRequestContext;
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -79,6 +82,11 @@ pub(crate) async fn do_put(
 
     let sql = &cmd.query;
     tracing::trace!("do_put_statement_update: {sql}");
+
+    // Reject pathologically deep SQL before it reaches the recursive planner,
+    // which would otherwise overflow the worker stack and abort the process.
+    crate::datafusion::sql_depth_guard::ensure_sql_within_depth_limits(sql)
+        .map_err(|e| handle_datafusion_error(&e))?;
 
     let dml_table = match datafusion.ctx.state().create_logical_plan(sql).await {
         Ok(LogicalPlan::Dml(dml)) => Some(dml.table_name),

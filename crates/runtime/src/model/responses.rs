@@ -184,11 +184,7 @@ async fn construct_model(
 pub fn get_openai_responses_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
     let mut request_overrides: HashMap<String, Value> = HashMap::new();
     for &key in OPENAI_RESPONSES_DEFAULT_PARAM_KEYS.iter() {
-        if let Some(value) = model.params.get(key) {
-            request_overrides.insert(key.to_string(), value.clone());
-        } else if let Some(value) = model.params.get(&format!("{prefix}_{key}")) {
-            request_overrides.insert(key.to_string(), value.clone());
-        } else if let Some(value) = model.params.get(&format!("openai_{key}")) {
+        if let Some(value) = crate::model::chat::request_default(model, prefix, key) {
             request_overrides.insert(key.to_string(), value.clone());
         }
     }
@@ -301,6 +297,26 @@ fn xai(model_id: Option<&str>, params: &XaiModelParams) -> Result<Arc<dyn Respon
 mod tests {
     use super::*;
     use spicepod::component::model::Model;
+
+    #[test]
+    fn a_prefixed_responses_override_takes_precedence_over_its_bare_alias() {
+        let mut model = Model::new("azure:gpt-4o", "test_model");
+        model.params.insert(
+            "prompt_cache_key".to_string(),
+            Value::String("bare".to_string()),
+        );
+        model.params.insert(
+            "azure_prompt_cache_key".to_string(),
+            Value::String("prefixed".to_string()),
+        );
+        assert_eq!(
+            get_openai_responses_request_overrides(&model, "azure"),
+            vec![(
+                "prompt_cache_key".to_string(),
+                Value::String("prefixed".to_string())
+            )]
+        );
+    }
 
     #[test]
     fn test_get_openai_responses_request_overrides_with_prompt_cache() {
