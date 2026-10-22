@@ -464,6 +464,19 @@ const MAX_PK_SELECTIVE_RANGE_SPAN: i64 = 32;
 /// `MoR` exceeds the bound and falls through to the post-decode deletion filter.
 const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 2048;
 
+/// Whether a scan pushes the keys its tombstones hide into its scan filters as
+/// `pk NOT IN (...)` (see `vortex_key_delete_pushdown_filter`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TombstonePushdown {
+    /// Push them, so listing and Vortex skip the files and chunks they cover.
+    Apply,
+    /// Leave every hidden row to the deletion filters. A rewrite reads every
+    /// file anyway, and its filters' `rows_deleted` counts are the yield its
+    /// reclaim records (see [`super::deletion_yield`]): a file pruned from the
+    /// scan would remove rows that no filter counts.
+    Skip,
+}
+
 /// Result of a Cayenne CDC append write.
 ///
 /// A write can be fully complete when this value is returned, or it can have a
@@ -4642,6 +4655,30 @@ fn deletion_bytes_over_ceiling(
     )]
     let over = resident_bytes as f64 > *limit as f64 * DELETION_INDEX_MEMORY_CEILING_FRACTION;
     over
+}
+
+/// Rows the key deletion filters anywhere in `plan` removed, once it has run:
+/// what a reclaim's tombstones actually hid (see [`super::deletion_yield`]).
+///
+/// Read from the filters themselves, not from every node: a wrapper such as
+/// `CayenneAccelerationExec` reports its child's metrics as its own, so a sum
+/// over every node would count a wrapped filter's rows twice.
+fn rows_deleted_by(plan: &Arc<dyn ExecutionPlan>) -> u64 {
+    let is_deletion_filter = plan.downcast_ref::<KeyBasedDeletionFilterExec>().is_some()
+        || plan.downcast_ref::<Int64PkDeletionFilterExec>().is_some();
+    let own = if is_deletion_filter {
+        plan.metrics()
+            .and_then(|metrics| metrics.sum_by_name("rows_deleted"))
+            .map_or(0, |value| {
+                u64::try_from(value.as_usize()).unwrap_or(u64::MAX)
+            })
+    } else {
+        0
+    };
+    plan.children()
+        .into_iter()
+        .map(rows_deleted_by)
+        .fold(own, u64::saturating_add)
 }
 
 /// Classify a protected snapshot's on-disk byte size into an LSM-style size
@@ -21014,7 +21051,7 @@ impl CayenneTableProvider {
         // can run while it sorts, and the snapshot current at commit time would
         // then be the overwrite's.
         let replaced_snapshot_id = self.get_current_snapshot_id();
-        let (sorted_stream, _) = self.visible_file_stream_for_rewrite(&ctx, &order).await?;
+        let (sorted_stream, _, _) = self.visible_file_stream_for_rewrite(&ctx, &order).await?;
 
         // Write sorted data to a new snapshot directory. Because SortExec lazily
         // reads input files via DataSourceExec, writing to a separate directory
@@ -21328,7 +21365,10 @@ impl CayenneTableProvider {
         // to bake more often, a trade priced against the incremental bake's write
         // amplification, and this path is a full rewrite instead. See
         // `CayenneContext::configured_deletion_index_trigger`.
-        let trigger_len = self.context.configured_deletion_index_trigger();
+        // Scaled by the rows the last reclaim found the tombstones hiding: a full
+        // rewrite that removes none of the table's rows is the costliest way to
+        // learn that its tombstones hid nothing.
+        let trigger_len = self.context.effective_reclaim_deletion_index_trigger();
         let over_memory_ceiling = self.deletion_index_over_memory_ceiling();
         if deletion_index_len < trigger_len && !over_memory_ceiling {
             return ReclaimDecision::NotDue;
@@ -25531,11 +25571,12 @@ impl CayenneTableProvider {
         // is the ordered one: executing it executes the scan, so the rewrite
         // pins its inputs exactly where the fenced scan does.
 
-        let (stream, scope, generation_before, snapshot_id_before): (
+        let (stream, scope, generation_before, snapshot_id_before, rewrite_plan): (
             SendableRecordBatchStream,
             RewriteScope,
             u64,
             String,
+            Arc<dyn ExecutionPlan>,
         ) = if uses_position_deletes {
             let snapshot_id_before = self.get_current_snapshot_id();
             // Drain the RAM tier and the inline memtable FIRST, for the same
@@ -25550,7 +25591,7 @@ impl CayenneTableProvider {
                 self.checkpoint_inlined_data().await?;
             }
             let folded_before = self.protected_snapshot_ids();
-            let (stream, generation_before) =
+            let (stream, generation_before, rewrite_plan) =
                 self.visible_file_stream_for_rewrite(&ctx, &order).await?;
             if folded_before != self.protected_snapshot_ids() {
                 tracing::debug!(
@@ -25573,6 +25614,7 @@ impl CayenneTableProvider {
                 },
                 generation_before,
                 snapshot_id_before,
+                rewrite_plan,
             )
         } else {
             let (scan_view, scope, generation_before, snapshot_id_before) = {
@@ -25664,11 +25706,20 @@ impl CayenneTableProvider {
                     hook().await;
                 }
             }
-            let stream = self
+            let (stream, rewrite_plan) = self
                 .rewrite_stream_from_view(&ctx, &order, scan_view)
                 .await?;
-            (stream, scope, generation_before, snapshot_id_before)
+            (
+                stream,
+                scope,
+                generation_before,
+                snapshot_id_before,
+                rewrite_plan,
+            )
         };
+
+        // Read before the clear below retires the rewritten files' position deletes.
+        let rewrite_position_deletes = self.holds_position_deletes();
 
         // The whole-table reclaim of an `auto` table on position deletes sizes what
         // it captured, the current snapshot and every protected snapshot it folds,
@@ -26085,6 +26136,9 @@ impl CayenneTableProvider {
 
             self.listing_table.store(new_listing_table);
             self.update_current_snapshot_id(&new_snapshot_id);
+            // As for the bake: a tombstone recorded meanwhile only shrinks the
+            // difference, which overstates the yield.
+            let held_before_clear = self.pk_deletion_snapshot().delete_len();
             match &scope {
                 // This rewrite always captures a folded set, so `All` is
                 // unreachable here; treat it as the conservative wholesale clear
@@ -26118,6 +26172,9 @@ impl CayenneTableProvider {
                     );
                 }
             }
+            let reclaimed =
+                held_before_clear.saturating_sub(self.pk_deletion_snapshot().delete_len());
+            self.record_reclaim_yield(&rewrite_plan, rewrite_position_deletes, reclaimed);
 
             // [sound output_ordering attestation] This rewrite consolidated the
             // entire snapshot into a single globally-sorted, non-overlapping run
@@ -26254,29 +26311,30 @@ impl CayenneTableProvider {
         ctx: &SessionContext,
         order: &RewriteOrder,
         scan_view: Arc<ScanView>,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<(SendableRecordBatchStream, Arc<dyn ExecutionPlan>)> {
         let state = ctx.state();
         let plan = self
-            .plan_scan_from_view(&state, None, &[], None, scan_view)
+            .plan_scan_from_view(&state, None, &[], None, scan_view, TombstonePushdown::Skip)
             .await?;
         let task_ctx = ctx.task_ctx();
         let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
-        Ok(datafusion_physical_plan::execute_stream(ordered, task_ctx)?)
+        let stream = datafusion_physical_plan::execute_stream(Arc::clone(&ordered), task_ctx)?;
+        Ok((stream, ordered))
     }
 
     async fn visible_file_stream_for_rewrite(
         &self,
         ctx: &SessionContext,
         order: &RewriteOrder,
-    ) -> Result<(SendableRecordBatchStream, u64)> {
+    ) -> Result<(SendableRecordBatchStream, u64, Arc<dyn ExecutionPlan>)> {
         let (plan, generation_before) = self.rewrite_scan_plan(ctx).await?;
         let task_ctx = ctx.task_ctx();
         let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
         // Executing the ordered plan executes the scan beneath it (each
         // operator executes its input when it is executed), so the stream
         // pins the same scan inputs, at the same point, as the scan alone did.
-        let stream = datafusion_physical_plan::execute_stream(ordered, task_ctx)?;
-        Ok((stream, generation_before))
+        let stream = datafusion_physical_plan::execute_stream(Arc::clone(&ordered), task_ctx)?;
+        Ok((stream, generation_before, ordered))
     }
 
     /// The scan plan [`Self::visible_file_stream_for_rewrite`] reads, and the
@@ -26288,7 +26346,14 @@ impl CayenneTableProvider {
     ) -> Result<(Arc<dyn ExecutionPlan>, u64)> {
         let (scan_view, generation_before) = self.rewrite_scan_view(ctx).await?;
         let plan = self
-            .plan_scan_from_view(&ctx.state(), None, &[], None, scan_view)
+            .plan_scan_from_view(
+                &ctx.state(),
+                None,
+                &[],
+                None,
+                scan_view,
+                TombstonePushdown::Skip,
+            )
             .await?;
         Ok((plan, generation_before))
     }
@@ -28899,6 +28964,9 @@ impl CayenneTableProvider {
         } else {
             UnionExec::try_new(plans)?
         };
+        // Kept to read its deletion filters' counts once the stream is drained.
+        let bake_plan = Arc::clone(&merged_plan);
+        let bake_position_deletes = self.holds_position_deletes();
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
@@ -29108,6 +29176,9 @@ impl CayenneTableProvider {
             // the prefix cutoff may still hide one (the output applies deletions
             // above the fence).
             let off_fence_cutoff = prune_cutoff.min(fence_max_delete_seq);
+            // A writer recording a tombstone meanwhile only shrinks the difference,
+            // which overstates the yield: the error is toward baking as before.
+            let held_before_prune = self.pk_deletion_snapshot().delete_len();
             // Boxed: the bake is one of the crate's largest futures (see
             // `snapshot_bytes_for_merge_budget`), and the prune's state need not grow it.
             Box::pin(self.prune_deletion_index_after_bake(
@@ -29117,6 +29188,9 @@ impl CayenneTableProvider {
                 &old_ids,
             ))
             .await?;
+            let reclaimed =
+                held_before_prune.saturating_sub(self.pk_deletion_snapshot().delete_len());
+            self.record_reclaim_yield(&bake_plan, bake_position_deletes, reclaimed);
         }
 
         if clean_prefix_holds {
@@ -30650,6 +30724,32 @@ impl CayenneTableProvider {
             cutoff,
             folded_protected = folded_protected_ids.len(),
             "Pruned deletion caches after sequence-fenced full rewrite"
+        );
+    }
+
+    /// Whether a scan of this table may remove rows by position delete. A
+    /// reclaim whose scan did cannot measure its yield: the position vectors
+    /// drop those rows inside the file scan, before any key filter counts them,
+    /// while the tombstones that twin them are still taken out of the index.
+    fn holds_position_deletes(&self) -> bool {
+        !self.pk_deletion_strategy.position_cache().load().is_empty()
+    }
+
+    /// Record a reclaim's yield (see [`super::deletion_yield`]), unless its scan
+    /// ran with position deletes it could not count, in which case the yield
+    /// measured before it stands.
+    fn record_reclaim_yield(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        position_deletes_applied: bool,
+        tombstones_reclaimed: usize,
+    ) {
+        if position_deletes_applied {
+            return;
+        }
+        self.context.record_deletion_index_yield(
+            rows_deleted_by(plan),
+            u64::try_from(tombstones_reclaimed).unwrap_or(u64::MAX),
         );
     }
 
@@ -42252,6 +42352,7 @@ impl CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
         scan_view: Arc<ScanView>,
+        tombstone_pushdown: TombstonePushdown,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let warm_files = scan_view.raw.warm_files.clone();
         let mem_tier_any_rows = scan_view.raw.mem_tier_shards.iter().any(|s| !s.is_empty());
@@ -42373,7 +42474,10 @@ impl CayenneTableProvider {
         let effective_filters = rewritten_scan_filters(filters, retention_keep_filter.as_ref());
         let mut scan_filters_owned = effective_filters.unwrap_or_else(|| filters.to_vec());
         let mem_tier_pruning_filters = scan_filters_owned.clone();
-        if let Some(tombstone_filter) = self.vortex_key_delete_pushdown_filter(&deletion_snapshot) {
+        if tombstone_pushdown == TombstonePushdown::Apply
+            && let Some(tombstone_filter) =
+                self.vortex_key_delete_pushdown_filter(&deletion_snapshot)
+        {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
                 "Injected sparse key-delete tombstone exclusion into Vortex scan filters"
@@ -42812,8 +42916,15 @@ impl TableProvider for CayenneTableProvider {
                 hook().await;
             }
         }
-        self.plan_scan_from_view(state, projection, filters, limit, scan_view)
-            .await
+        self.plan_scan_from_view(
+            state,
+            projection,
+            filters,
+            limit,
+            scan_view,
+            TombstonePushdown::Apply,
+        )
+        .await
     }
 
     // Filter-pushdown exactness contract (read before changing the arms below):
@@ -43799,7 +43910,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                 CompactionKind::Bake,
                 CompactionOutcome::DeclinedNotKeyMode,
             );
-        } else if deletion_index_len < self.context.bake_deletion_index_trigger()
+        } else if deletion_index_len < self.context.effective_bake_deletion_index_trigger()
             && !over_mem_ceiling
         {
             // The trigger's INPUT is exported as `cayenne_deletion_index_len` on
@@ -43813,7 +43924,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
             );
         }
         if key_mode
-            && (deletion_index_len >= self.context.bake_deletion_index_trigger()
+            && (deletion_index_len >= self.context.effective_bake_deletion_index_trigger()
                 || over_mem_ceiling)
         {
             maintenance_metrics::track_trigger(
@@ -43968,9 +44079,9 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                     .unwrap_or(0),
                 // Read through the same accessor the bake gate reads, not the
                 // controller's own value, so an experiment that pins the trigger
-                // reports the value actually in force.
+                // reports the value actually in force, yield backoff included.
                 bake_deletion_index_trigger: u64::try_from(
-                    self.context.bake_deletion_index_trigger(),
+                    self.context.effective_bake_deletion_index_trigger(),
                 )
                 .unwrap_or(0),
                 target_file_size_mb: u64::try_from(
@@ -62237,6 +62348,320 @@ mod tests {
             key.deletion_index_reclaim_trigger(),
             None,
             "a key-delete table reclaims through the bake and must not be rewritten whole"
+        );
+    }
+
+    /// A bake whose tombstones name keys that were never stored — what an upsert
+    /// leaves behind when its existence filter answers "maybe" for a fresh key —
+    /// removes no rows, so the table waits for the most tombstones the backoff
+    /// allows before it bakes again.
+    #[tokio::test]
+    async fn a_bake_whose_tombstones_hide_no_rows_backs_its_trigger_off() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_futile_yield",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+        let configured = provider.context.bake_deletion_index_trigger();
+        assert_eq!(
+            provider.context.effective_bake_deletion_index_trigger(),
+            configured
+        );
+
+        install_int64_deletes(&provider, &[(1_000, 15), (1_001, 15), (1_002, 15)]);
+        assert!(
+            provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("bake should not error"),
+            "the older prefix {{0,1}} must bake"
+        );
+        assert_eq!(
+            provider.context.effective_bake_deletion_index_trigger(),
+            configured * usize::try_from(super::super::deletion_yield::MAX_BACKOFF).expect("small"),
+        );
+    }
+
+    /// A bake whose tombstone hides a stored row measures full yield and keeps
+    /// the configured trigger.
+    #[tokio::test]
+    async fn a_bake_whose_tombstones_hide_rows_keeps_its_trigger() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) =
+            build_seq_prefix_fixture("bake_full_yield", ctx.runtime_env(), &[10, 20, 30, 40, 50])
+                .await;
+        let configured = provider.context.bake_deletion_index_trigger();
+        install_int64_deletes(&provider, &[(0, 15)]);
+        assert!(
+            provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("bake should not error"),
+            "the older prefix {{0,1}} must bake"
+        );
+        assert_eq!(
+            provider.context.effective_bake_deletion_index_trigger(),
+            configured
+        );
+    }
+
+    /// A bake whose tombstones hide a row for half of them measures half yield
+    /// and doubles its trigger: each removed row is counted once, however the
+    /// plan wraps the deletion filter that removed it.
+    #[tokio::test]
+    async fn a_bake_counts_each_removed_row_once() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) =
+            build_seq_prefix_fixture("bake_half_yield", ctx.runtime_env(), &[10, 20, 30, 40, 50])
+                .await;
+        let configured = provider.context.bake_deletion_index_trigger();
+        install_int64_deletes(&provider, &[(0, 15), (1_000, 15)]);
+        assert!(
+            provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("bake should not error"),
+            "the older prefix {{0,1}} must bake"
+        );
+        assert_eq!(
+            provider.context.effective_bake_deletion_index_trigger(),
+            2 * configured
+        );
+    }
+
+    /// A reclaim on an `auto` table still on position deletes, whose tombstones
+    /// twin the position deletes of real upserts, removes a row per tombstone even
+    /// though the scan's position vectors remove those rows before any key filter
+    /// sees them, so it keeps the configured trigger.
+    #[tokio::test]
+    async fn a_whole_table_reclaim_of_real_upserts_keeps_its_trigger() {
+        let ctx = SessionContext::new();
+        let config = VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Auto,
+            bake_deletion_index_trigger: 2,
+            compaction_background_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "reclaim_real_upserts",
+            ctx.runtime_env(),
+            config,
+        )
+        .await;
+        assert!(
+            provider.should_capture_positions(),
+            "precondition: a small auto-mode table records position deletes"
+        );
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
+        )
+        .await;
+        // Record the rows' file positions, so the upserts below conflict with
+        // located rows and write a position delete beside each key tombstone.
+        provider
+            .run_position_capture()
+            .await
+            .expect("position capture should not error");
+        insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[11, 21, 31])).await;
+        assert!(
+            provider.deletion_index_reclaim_trigger().is_some(),
+            "precondition: the upserts' tombstones are over the trigger of two"
+        );
+        provider.forget_auto_reclaim_pace();
+        assert!(
+            provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("the reclaim should not error"),
+            "the reclaim must run"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "reclaim_real_upserts").await,
+            vec![(1, 11), (2, 21), (3, 31)],
+        );
+        assert_eq!(
+            provider.context.effective_reclaim_deletion_index_trigger(),
+            2
+        );
+    }
+
+    /// A whole-table reclaim whose tombstones hide a row for half of them doubles
+    /// its trigger, counting each row once whatever wraps its deletion filter.
+    #[tokio::test]
+    async fn a_whole_table_reclaim_counts_each_removed_row_once() {
+        let ctx = SessionContext::new();
+        let config = VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Position,
+            bake_deletion_index_trigger: 2,
+            compaction_background_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "reclaim_half_yield",
+            ctx.runtime_env(),
+            config,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
+        install_int64_deletes(&provider, &[(1, i64::MAX - 1), (1_000, i64::MAX - 1)]);
+        assert!(
+            provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("the reclaim should not error"),
+            "the reclaim must run"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "reclaim_half_yield").await,
+            vec![(2, 20), (3, 30)],
+        );
+        assert_eq!(
+            provider.context.effective_reclaim_deletion_index_trigger(),
+            4
+        );
+    }
+
+    /// A whole-table reclaim counts the rows of a file whose every row its
+    /// tombstones hide: the rewrite reads that file through its deletion filters
+    /// rather than pruning it from the scan, so a reclaim that removes a row per
+    /// tombstone keeps the configured trigger.
+    #[tokio::test]
+    async fn a_whole_table_reclaim_counts_the_rows_of_files_its_tombstones_hide_whole() {
+        let ctx = SessionContext::new();
+        let config = VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Position,
+            bake_deletion_index_trigger: 2,
+            compaction_background_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "reclaim_whole_file_yield",
+            ctx.runtime_env(),
+            config,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+        insert_batch(&provider, id_value_batch(schema, &[3, 4], &[30, 40])).await;
+        install_int64_deletes(&provider, &[(1, i64::MAX - 1), (2, i64::MAX - 1)]);
+        assert!(
+            provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("the reclaim should not error"),
+            "the reclaim must run"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "reclaim_whole_file_yield").await,
+            vec![(3, 30), (4, 40)],
+        );
+        assert_eq!(
+            provider.context.effective_reclaim_deletion_index_trigger(),
+            2
+        );
+    }
+
+    /// A reclaim whose scan ran with position deletes cannot count the rows they
+    /// removed, so it records no yield and the trigger it had stands.
+    #[tokio::test]
+    async fn a_reclaim_over_position_deletes_keeps_the_yield_it_had() {
+        use super::super::deletion_strategy::PositionDeletionVector;
+
+        let ctx = SessionContext::new();
+        let config = VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Position,
+            bake_deletion_index_trigger: 2,
+            compaction_background_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "reclaim_position_deletes",
+            ctx.runtime_env(),
+            config,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
+        provider
+            .pk_deletion_strategy
+            .position_cache()
+            .store(Arc::new(HashMap::from([(
+                "/elsewhere/file.vortex".to_string(),
+                Arc::new(PositionDeletionVector::new(
+                    roaring::RoaringBitmap::from_iter([0u32]),
+                )),
+            )])));
+        install_int64_deletes(&provider, &[(1_000, 10), (1_001, 11), (1_002, 12)]);
+        assert!(
+            provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("the reclaim should not error"),
+            "the reclaim must run"
+        );
+        assert_eq!(
+            provider.context.effective_reclaim_deletion_index_trigger(),
+            2
+        );
+    }
+
+    /// The whole-table reclaim of a position-mode table measures its yield the same
+    /// way, and a reclaim that removed no rows moves its own trigger.
+    #[tokio::test]
+    async fn a_whole_table_reclaim_that_removes_no_rows_backs_its_trigger_off() {
+        let ctx = SessionContext::new();
+        let config = VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Position,
+            bake_deletion_index_trigger: 2,
+            compaction_background_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "reclaim_futile_yield",
+            ctx.runtime_env(),
+            config,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
+
+        install_int64_deletes(&provider, &[(1_000, 10), (1_001, 11), (1_002, 12)]);
+        assert!(
+            provider.deletion_index_reclaim_trigger().is_some(),
+            "precondition: three tombstones are over the trigger of two"
+        );
+        assert!(
+            provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("the reclaim should not error"),
+            "the reclaim must run"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "reclaim_futile_yield").await,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "tombstones for keys never stored hide no rows"
+        );
+        assert_eq!(
+            provider.context.effective_reclaim_deletion_index_trigger(),
+            2 * usize::try_from(super::super::deletion_yield::MAX_BACKOFF).expect("small"),
+        );
+        install_int64_deletes(&provider, &[(2_000, 20), (2_001, 21), (2_002, 22)]);
+        assert_eq!(
+            provider.deletion_index_reclaim_trigger(),
+            None,
+            "the index size that forced the last reclaim no longer forces one"
         );
     }
 
