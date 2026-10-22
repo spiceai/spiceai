@@ -149,7 +149,9 @@ pub enum Error {
         repo: RepoId,
         endpoint: String,
         attempts: u32,
-        source: reqwest::Error,
+        // Shared so a failure that concurrent callers of one cached lookup receive keeps its
+        // kind: whether the connection failed or timed out is what a caller reports.
+        source: Arc<reqwest::Error>,
     },
 
     #[snafu(display(
@@ -266,6 +268,20 @@ impl TreeEntry {
         self.lfs
             .as_ref()
             .map_or(self.oid.as_str(), |lfs| lfs.oid.as_str())
+    }
+
+    /// The git object id: the SHA-1 of `blob <size>\0` and the content of a file stored in
+    /// git, or of the LFS pointer of one stored in LFS.
+    #[must_use]
+    pub fn git_oid(&self) -> &str {
+        &self.oid
+    }
+
+    /// The SHA-256 of the content of a file stored in LFS (or Xet); `None` for a file stored in
+    /// git.
+    #[must_use]
+    pub fn lfs_oid(&self) -> Option<&str> {
+        self.lfs.as_ref().map(|lfs| lfs.oid.as_str())
     }
 }
 
@@ -797,7 +813,8 @@ impl Hub {
     }
 
     /// Sends an API request and reads its whole body, returning the body and the response
-    /// headers.
+    /// headers. A redirect within the Hub's origin is followed: the Hub moves the API of a
+    /// renamed repository to its new name that way.
     ///
     /// A body that breaks off part way, by a reset connection or a read timeout, is requested
     /// again like a request that failed to connect, from the same budget of attempts: an API
@@ -811,7 +828,7 @@ impl Hub {
         url: Url,
         form: Option<String>,
     ) -> Result<(HeaderMap, Bytes)> {
-        let request = HubRequest {
+        let mut request = HubRequest {
             repo,
             revision,
             method,
@@ -820,8 +837,22 @@ impl Hub {
             form,
         };
         let mut attempts = Attempts::new();
+        let mut redirects = 0;
         loop {
             let mut response = self.send_with_retry(&request, &mut attempts).await?;
+            if response.status().is_redirection() {
+                ensure!(
+                    redirects < MAX_REDIRECTS,
+                    UnexpectedResponseSnafu {
+                        repo: repo.clone(),
+                        message: format!("a request redirected more than {MAX_REDIRECTS} times"),
+                    }
+                );
+                redirects += 1;
+                self.follow_redirect(&mut request, &response)?;
+                attempts = Attempts::new();
+                continue;
+            }
             let headers = std::mem::take(response.headers_mut());
             let source = match response.bytes().await {
                 Ok(body) => return Ok((headers, body)),
@@ -832,7 +863,7 @@ impl Hub {
                     repo: repo.clone(),
                     endpoint: self.config.endpoint.to_string(),
                     attempts: attempts.made,
-                    source,
+                    source: Arc::new(source),
                 });
             }
             tracing::debug!(
@@ -842,6 +873,52 @@ impl Hub {
             );
             attempts.wait(None).await;
         }
+    }
+
+    /// Points `request` at the location the redirect `response` names. Only a location on the
+    /// Hub's origin is followed: an API response anywhere else is not the Hub's.
+    fn follow_redirect(
+        &self,
+        request: &mut HubRequest<'_>,
+        response: &reqwest::Response,
+    ) -> Result<()> {
+        let repo = request.repo;
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|location| request.url.join(location).ok())
+            .context(UnexpectedResponseSnafu {
+                repo: repo.clone(),
+                message: "a request redirected without a location".to_string(),
+            })?;
+        ensure!(
+            self.is_endpoint_origin(&location),
+            UnexpectedResponseSnafu {
+                repo: repo.clone(),
+                message: format!(
+                    "a request redirected off the Hub, to {}, which was not followed",
+                    location.origin().ascii_serialization()
+                ),
+            }
+        );
+        tracing::debug!(
+            "Following the Hub's redirect of a request for Hugging Face {} '{repo}' to {}",
+            repo.kind(),
+            location.path()
+        );
+        // A 303, and a 301 or 302 after a POST, continue as a GET (RFC 9110, section 15.4); a
+        // 307 or 308 repeats the request as it was.
+        let status = response.status();
+        if status == StatusCode::SEE_OTHER
+            || (matches!(status, StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND)
+                && request.method == Method::POST)
+        {
+            request.method = Method::GET;
+            request.form = None;
+        }
+        request.url = location;
+        Ok(())
     }
 
     async fn request(
@@ -905,7 +982,7 @@ impl Hub {
                 repo: (*repo).clone(),
                 endpoint: self.config.endpoint.to_string(),
                 attempts: attempt,
-                source: source.without_url(),
+                source: Arc::new(source.without_url()),
             })?;
 
             let client = self.http.clone();
@@ -932,7 +1009,7 @@ impl Hub {
                         repo: (*repo).clone(),
                         endpoint: self.config.endpoint.to_string(),
                         attempts: attempt,
-                        source: source.without_url(),
+                        source: Arc::new(source.without_url()),
                     });
                 }
             };
@@ -1078,9 +1155,19 @@ impl Error {
                 attempts: *attempts,
                 message: message.clone(),
             },
+            Error::Request {
+                repo,
+                endpoint,
+                attempts,
+                source,
+            } => Error::Request {
+                repo: repo.clone(),
+                endpoint: endpoint.clone(),
+                attempts: *attempts,
+                source: Arc::clone(source),
+            },
             // `reqwest::Error` and `JoinError` are not `Clone`: keep their message.
-            Error::Request { .. }
-            | Error::TaskStopped { .. }
+            Error::TaskStopped { .. }
             | Error::HttpClient { .. }
             | Error::InvalidToken
             | Error::InvalidEndpoint { .. }

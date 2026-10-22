@@ -3305,7 +3305,10 @@ impl RefreshTask {
     fn is_view_acceleration(&self) -> bool {
         match &*self.federated {
             FederatedTable::Immediate(provider) => provider.table_type() == TableType::View,
-            FederatedTable::Deferred(_) => false,
+            // A view served from its existing acceleration has no plan to ask yet.
+            FederatedTable::Deferred(_) => {
+                self.federated_source.as_deref() == Some(super::VIEW_FEDERATED_SOURCE)
+            }
         }
     }
 
