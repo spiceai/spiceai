@@ -30,10 +30,34 @@ pub enum Error {
 
     #[snafu(display(
         "Unsupported Arrow type for a Qdrant payload value: {arrow_type}. \
-        Store the column with a supported type (boolean, integer, float, string, or fixed-size list of floats), \
-        or exclude it from the index payload."
+        Store the column as a boolean, integer, float, decimal, string, date, time, timestamp, \
+        or fixed-size list, or exclude it from the index payload. See: https://spiceai.org/docs/components/vectors"
     ))]
     UnsupportedPayloadType { arrow_type: String },
+
+    #[snafu(display(
+        "Refused to delete from Qdrant collection '{collection}' with an empty filter, which would delete every point. \
+        This is a bug in Spice. Report it at https://github.com/spiceai/spiceai/issues"
+    ))]
+    EmptyDeleteFilter { collection: String },
+
+    #[snafu(display(
+        "Failed to read column '{column}' from Qdrant: a stored payload value does not match the column type {arrow_type} ({detail}). \
+        Recreate the Qdrant collection, or set a new `qdrant_collection`, so Spice writes every point with the dataset's current schema. \
+        See: https://spiceai.org/docs/components/vectors"
+    ))]
+    PayloadDecode {
+        column: String,
+        arrow_type: String,
+        detail: String,
+    },
+
+    #[snafu(display(
+        "Failed to read an embedding from Qdrant: the exact vector stored in payload key `spice_vector` is malformed ({detail}). \
+        Recreate the Qdrant collection, or set a new `qdrant_collection`, so Spice writes every point again. \
+        See: https://spiceai.org/docs/components/vectors"
+    ))]
+    VectorDecode { detail: String },
 
     #[snafu(display(
         "Qdrant collection '{collection}' already exists with {actual}, but the index requires {expected}. \

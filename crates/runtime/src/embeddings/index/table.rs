@@ -600,6 +600,8 @@ async fn wrap_table_as_index_qdrant(
         )));
     };
 
+    let mut collections_in_use = super::qdrant::collections_in_use(&inner_table_provider);
+
     for (column, config) in embedding_columns {
         let chunking = config.chunking.as_ref().filter(|cfg| cfg.enabled);
         let (augmented_columns, index_schema) = match chunking {
@@ -619,8 +621,10 @@ async fn wrap_table_as_index_qdrant(
             augmented_columns,
             Arc::clone(secrets),
             partition_by,
+            &collections_in_use,
         )
         .await?;
+        collections_in_use.insert(qdrant_index.collection.clone(), column.clone());
 
         let metadata_columns = qdrant_index.metadata_columns.clone();
         let embedder = Arc::clone(&qdrant_index.compute_query);

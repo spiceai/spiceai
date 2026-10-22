@@ -18,6 +18,7 @@ mod write;
 
 use std::any::Any;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -29,8 +30,10 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion_expr::LogicalPlanBuilder;
 use futures::{StreamExt, TryStreamExt};
 use llms::embeddings::Embed;
+use parking_lot::Mutex;
 use qdrant::QdrantStore;
-use spice_table::{Index, WriteWindow};
+use qdrant::proto::{Condition, Filter, PointId};
+use spice_table::{GroupPruning, Index, WriteWindow};
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::{MAX_CONCURRENT_INDEX_WRITES, SearchIndex, VectorIndex, embedding_col};
@@ -114,11 +117,60 @@ pub struct QdrantIndex {
 
     pub batch_write_rows: usize,
 
-    /// Payload field name that holds the partition value, when partitioning is enabled.
-    pub partition_key: Option<String>,
+    /// The dataset whose points this index writes, reads, and deletes. Other points in the
+    /// collection are never touched.
+    pub dataset: String,
 
-    /// Source column the partition value is read from.
-    pub partition_column: Option<String>,
+    pub write_generation: Arc<WriteGeneration>,
+}
+
+/// The generation stamped on every point a [`QdrantIndex`] writes.
+///
+/// A [`WriteWindow::ReplaceAll`] window starts a new generation, and when it completes the
+/// dataset's points of every other generation are deleted in one filtered request. A write
+/// that lands while the window is open, a CDC upsert included, carries the new generation and
+/// survives. Sink windows on one table never overlap, so each window start ends the previous
+/// window, including one whose write was dropped before it completed or failed.
+#[derive(Debug)]
+pub struct WriteGeneration {
+    /// Held for reading across each write, and for writing while a full refresh starts a new
+    /// generation, so no write stamps the old generation after the window opened.
+    current: tokio::sync::RwLock<i64>,
+    replacing: Mutex<Option<i64>>,
+}
+
+impl Default for WriteGeneration {
+    fn default() -> Self {
+        Self {
+            current: tokio::sync::RwLock::new(next_generation(0)),
+            replacing: Mutex::new(None),
+        }
+    }
+}
+
+/// Microseconds since the Unix epoch, and always above `current`, so a new generation never
+/// repeats one a point already carries, even when the clock moves back.
+fn next_generation(current: i64) -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
+    now.max(current.saturating_add(1))
+}
+
+impl WriteGeneration {
+    async fn start(&self, window: WriteWindow) {
+        if window == WriteWindow::ReplaceAll {
+            let mut current = self.current.write().await;
+            *current = next_generation(*current);
+            *self.replacing.lock() = Some(*current);
+        } else {
+            *self.replacing.lock() = None;
+        }
+    }
+
+    fn take_replacing(&self) -> Option<i64> {
+        self.replacing.lock().take()
+    }
 }
 
 #[async_trait]
@@ -145,6 +197,7 @@ impl SearchIndex for QdrantIndex {
         let table: Arc<dyn TableProvider> = Arc::new(QdrantQueryTable::new(
             Arc::clone(&self.client),
             self.collection.clone(),
+            self.dataset.clone(),
             vec![],
             DEFAULT_QDRANT_VECTOR_SEARCH_LIMIT,
             Arc::clone(&schema),
@@ -173,6 +226,7 @@ impl VectorIndex for QdrantIndex {
         let table: Arc<dyn TableProvider> = Arc::new(QdrantListTable::new(
             Arc::clone(&self.client),
             self.collection.clone(),
+            self.dataset.clone(),
             Arc::clone(&schema),
             embedding_col(&self.embedded_column),
             self.dims,
@@ -210,12 +264,6 @@ impl Index for QdrantIndex {
             }
         }
 
-        if let Some(partition_column) = &self.partition_column
-            && !cols.contains(partition_column)
-        {
-            cols.push(partition_column.clone());
-        }
-
         cols
     }
 
@@ -234,8 +282,40 @@ impl Index for QdrantIndex {
             .await
     }
 
-    async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {
+    async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
+        self.write_generation.start(window).await;
         Ok(())
+    }
+
+    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
+        self.write_generation.take_replacing();
+        Ok(())
+    }
+
+    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
+        let Some(generation) = self.write_generation.take_replacing() else {
+            return Ok(());
+        };
+        let mut stale = Filter::must([self.dataset_condition()]);
+        stale.must_not.push(Condition::matches(
+            qdrant::payload::GENERATION_KEY,
+            generation,
+        ));
+        self.client
+            .delete_by_filter(&self.collection, stale)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        true
+    }
+
+    async fn truncate(&self) -> Result<(), DataFusionError> {
+        self.client
+            .delete_by_filter(&self.collection, Filter::must([self.dataset_condition()]))
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
@@ -243,9 +323,37 @@ impl Index for QdrantIndex {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
+
+    fn deletes_by_partial_key(&self) -> bool {
+        true
+    }
+
+    async fn delete_group_remainder(
+        &self,
+        group_columns: &[String],
+        members: RecordBatch,
+    ) -> Result<(), DataFusionError> {
+        write::delete_group_remainder(self, group_columns, &members)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    fn group_pruning(&self) -> GroupPruning {
+        GroupPruning::Complete
+    }
 }
 
 impl QdrantIndex {
+    /// Point ids include the dataset, so two datasets sharing a collection never overwrite
+    /// each other's points.
+    fn point_id(&self, key: &str) -> PointId {
+        qdrant::payload::point_id_from_values(&[self.dataset.clone(), key.to_string()])
+    }
+
+    fn dataset_condition(&self) -> Condition {
+        Condition::matches(qdrant::payload::DATASET_KEY, self.dataset.clone())
+    }
+
     fn metadata_fields(&self) -> Vec<Field> {
         let embedding_name = embedding_col(&self.embedded_column);
         self.metadata_columns

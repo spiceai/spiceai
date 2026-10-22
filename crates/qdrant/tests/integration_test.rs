@@ -166,7 +166,7 @@ async fn collection_lifecycle_upsert_search_scroll_delete() {
     let mut offset: Option<PointId> = None;
     loop {
         let page = store
-            .scroll(&collection, 2, offset.clone())
+            .scroll(&collection, 2, offset.clone(), None)
             .await
             .expect("scroll");
         seen.extend(ids_of(&page.points));
@@ -222,5 +222,133 @@ async fn collection_lifecycle_upsert_search_scroll_delete() {
     assert_eq!(
         replaced[0].payload.get("tag").and_then(|v| v.kind.as_ref()),
         Some(&Kind::StringValue("updated".to_string()))
+    );
+}
+
+async fn all_ids(store: &Arc<dyn QdrantStore>, collection: &str) -> Vec<PointId> {
+    let mut ids = Vec::new();
+    let mut offset = None;
+    loop {
+        let page = store
+            .scroll(collection, 1000, offset, None)
+            .await
+            .expect("scroll");
+        ids.extend(page.points.into_iter().filter_map(|p| p.id));
+        match page.next_page_offset {
+            Some(next) => offset = Some(next),
+            None => return ids,
+        }
+    }
+}
+
+fn owned_point(id_key: &str, dataset: &str, generation: i64) -> PointData {
+    let mut point = point(id_key, vec![1.0, 0.0], "a");
+    point.payload.insert(
+        qdrant::payload::DATASET_KEY.to_string(),
+        string_value(dataset),
+    );
+    point.payload.insert(
+        qdrant::payload::GENERATION_KEY.to_string(),
+        generation.into(),
+    );
+    point
+}
+
+#[tokio::test]
+async fn filtered_deletes_and_scrolls_stay_inside_one_dataset() {
+    let store = connect().await;
+    let collection = unique_collection("spice-qdrant-delete-it");
+    store
+        .ensure_collection(&collection, 2, Distance::Dot)
+        .await
+        .expect("ensure collection");
+    let mut points: Vec<PointData> = (0..2500)
+        .map(|i| owned_point(&format!("docs-{i}"), "docs", if i < 2000 { 1 } else { 2 }))
+        .collect();
+    points.push(owned_point("other-0", "other", 1));
+    points.push(point("foreign-0", vec![1.0, 0.0], "a"));
+    store
+        .upsert(&collection, points, 0)
+        .await
+        .expect("upsert points");
+    assert_eq!(all_ids(&store, &collection).await.len(), 2502);
+
+    let docs = Condition::matches(qdrant::payload::DATASET_KEY, "docs".to_string());
+    let page = store
+        .scroll(&collection, 5000, None, Some(Filter::must([docs.clone()])))
+        .await
+        .expect("filtered scroll");
+    assert_eq!(page.points.len(), 2500);
+
+    let err = store
+        .delete_by_filter(&collection, Filter::default())
+        .await
+        .expect_err("an empty filter must be refused");
+    assert!(
+        matches!(err, qdrant::Error::EmptyDeleteFilter { .. }),
+        "expected EmptyDeleteFilter, got {err}"
+    );
+    assert_eq!(all_ids(&store, &collection).await.len(), 2502);
+
+    let mut stale = Filter::must([docs.clone()]);
+    stale
+        .must_not
+        .push(Condition::matches(qdrant::payload::GENERATION_KEY, 2));
+    store
+        .delete_by_filter(&collection, stale)
+        .await
+        .expect("delete older generations of 'docs'");
+    let ids = all_ids(&store, &collection).await;
+    assert_eq!(
+        ids.len(),
+        502,
+        "500 current 'docs' points, 'other', and the foreign point"
+    );
+    for kept in ["docs-2000", "docs-2499", "other-0", "foreign-0"] {
+        assert!(
+            ids.contains(&qdrant::payload::point_id_from_values(&[kept.to_string()])),
+            "{kept} must survive"
+        );
+    }
+
+    store
+        .delete_by_filter(&collection, Filter::must([docs]))
+        .await
+        .expect("delete every 'docs' point");
+    let ids = all_ids(&store, &collection).await;
+    assert_eq!(ids.len(), 2);
+
+    store
+        .delete_by_ids(&collection, ids)
+        .await
+        .expect("delete by id");
+    assert!(all_ids(&store, &collection).await.is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_ensure_collection_calls_all_succeed() {
+    let store = connect().await;
+    let collection = unique_collection("spice-qdrant-race-it");
+    let attempts = (0..8).map(|_| {
+        let store = Arc::clone(&store);
+        let collection = collection.clone();
+        tokio::spawn(async move {
+            store
+                .ensure_collection(&collection, 4, Distance::Cosine)
+                .await
+        })
+    });
+    for attempt in futures::future::join_all(attempts).await {
+        attempt
+            .expect("task")
+            .expect("every concurrent ensure_collection must succeed");
+    }
+    let err = store
+        .ensure_collection(&collection, 3, Distance::Cosine)
+        .await
+        .expect_err("a mismatched collection still fails");
+    assert!(
+        matches!(err, qdrant::Error::CollectionMismatch { .. }),
+        "{err}"
     );
 }

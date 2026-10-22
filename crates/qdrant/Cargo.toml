@@ -26,6 +26,7 @@ description = "Qdrant gRPC vector-store client for Spice.ai runtime"
 arrow.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 qdrant-client = { workspace = true }
 snafu.workspace = true
 tokio.workspace = true
@@ -33,6 +34,7 @@ uuid = { workspace = true, features = ["v5"] }
 tracing.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
 tokio.workspace = true
 
 [lints]

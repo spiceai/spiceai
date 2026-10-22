@@ -72,6 +72,7 @@ pub trait QueryEmbedder: std::fmt::Debug + Send + Sync {
 pub struct QdrantQueryTable {
     client: Arc<dyn QdrantStore>,
     collection: String,
+    dataset: String,
     query_vector: Vec<f32>,
     pub k: usize,
     schema: SchemaRef,
@@ -88,6 +89,7 @@ impl QdrantQueryTable {
     pub fn new(
         client: Arc<dyn QdrantStore>,
         collection: String,
+        dataset: String,
         query_vector: Vec<f32>,
         k: usize,
         schema: SchemaRef,
@@ -100,6 +102,7 @@ impl QdrantQueryTable {
         Self {
             client,
             collection,
+            dataset,
             query_vector,
             k,
             schema,
@@ -270,8 +273,10 @@ impl TableProvider for QdrantQueryTable {
             )));
         }
         let projected_schema = project_schema(&self.schema, projection)?;
-        let filter =
-            super::filter::convert_filters_to_qdrant(&self.schema, &self.embedding_column, filters);
+        let mut filter =
+            super::filter::convert_filters_to_qdrant(&self.schema, &self.embedding_column, filters)
+                .unwrap_or_default();
+        filter.must.push(dataset_condition(&self.dataset));
         Ok(Arc::new(QdrantQueryExec {
             client: Arc::clone(&self.client),
             collection: self.collection.clone(),
@@ -282,7 +287,7 @@ impl TableProvider for QdrantQueryTable {
             dims: self.dims,
             projected_schema: Arc::clone(&projected_schema),
             projection: projection.cloned(),
-            filter,
+            filter: Some(filter),
             query_text: self.query_text.clone(),
             embedder: self.embedder.clone(),
             score_semantics: self.score_semantics,
@@ -294,6 +299,12 @@ impl TableProvider for QdrantQueryTable {
             )),
         }))
     }
+}
+
+/// Restricts a search or scroll to the points `dataset` wrote, so points another dataset or
+/// writer stored in the same collection never come back as rows.
+fn dataset_condition(dataset: &str) -> qdrant::proto::Condition {
+    qdrant::proto::Condition::matches(qdrant::payload::DATASET_KEY, dataset.to_string())
 }
 
 fn search_results_to_batch(
@@ -340,7 +351,10 @@ fn build_embedding_array(
                 flat.extend(vector);
                 nulls.push(true);
             }
-            Err(message) if result.payload.contains_key(embedding_column) => {
+            Err(message)
+                if result.payload.contains_key(embedding_column)
+                    || result.payload.contains_key(qdrant::payload::VECTOR_KEY) =>
+            {
                 return Err(DataFusionError::Execution(message));
             }
             Err(_) => {
@@ -364,31 +378,22 @@ fn build_payload_array(
     results: &[SearchResult],
     field: &Field,
 ) -> Result<ArrayRef, DataFusionError> {
-    let columns: Vec<ArrayRef> = results
+    let null = qdrant::proto::Value {
+        kind: Some(qdrant::proto::value::Kind::NullValue(0)),
+    };
+    let values: Vec<&qdrant::proto::Value> = results
         .iter()
-        .map(|result| {
-            let value = result
-                .payload
-                .get(field.name())
-                .unwrap_or(&qdrant::proto::Value {
-                    kind: Some(qdrant::proto::value::Kind::NullValue(0)),
-                });
-            qdrant::payload::qdrant_value_to_arrow(value, field.data_type())
-        })
+        .map(|result| result.payload.get(field.name()).unwrap_or(&null))
         .collect();
-    if columns.is_empty() {
-        return Ok(arrow::array::new_null_array(field.data_type(), 0) as ArrayRef);
-    }
-    let refs: Vec<&dyn arrow::array::Array> = columns.iter().map(AsRef::as_ref).collect();
-    let combined = arrow::compute::concat(&refs)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    Ok(combined)
+    qdrant::payload::payload_values_to_arrow(&values, field)
+        .map_err(|e| DataFusionError::External(Box::new(e)))
 }
 
 #[derive(Debug)]
 pub struct QdrantListTable {
     client: Arc<dyn QdrantStore>,
     collection: String,
+    dataset: String,
     schema: SchemaRef,
     embedding_column: String,
     dims: i32,
@@ -399,6 +404,7 @@ impl QdrantListTable {
     pub fn new(
         client: Arc<dyn QdrantStore>,
         collection: String,
+        dataset: String,
         schema: SchemaRef,
         embedding_column: String,
         dims: i32,
@@ -406,6 +412,7 @@ impl QdrantListTable {
         Self {
             client,
             collection,
+            dataset,
             schema,
             embedding_column,
             dims,
@@ -417,6 +424,7 @@ impl QdrantListTable {
 struct QdrantListExec {
     client: Arc<dyn QdrantStore>,
     collection: String,
+    dataset: String,
     schema: SchemaRef,
     embedding_column: String,
     dims: i32,
@@ -470,6 +478,7 @@ impl ExecutionPlan for QdrantListExec {
         struct ScrollState {
             client: Arc<dyn QdrantStore>,
             collection: String,
+            dataset: String,
             schema: SchemaRef,
             embedding_column: String,
             dims: i32,
@@ -484,6 +493,7 @@ impl ExecutionPlan for QdrantListExec {
         let state = ScrollState {
             client: Arc::clone(&self.client),
             collection: self.collection.clone(),
+            dataset: self.dataset.clone(),
             schema: Arc::clone(&self.schema),
             embedding_column: self.embedding_column.clone(),
             dims: self.dims,
@@ -502,6 +512,7 @@ impl ExecutionPlan for QdrantListExec {
                     &s.collection,
                     qdrant::DEFAULT_SCROLL_PAGE_SIZE,
                     s.offset.clone(),
+                    Some(qdrant::proto::Filter::must([dataset_condition(&s.dataset)])),
                 )
                 .await
             {
@@ -586,6 +597,7 @@ impl TableProvider for QdrantListTable {
         Ok(Arc::new(QdrantListExec {
             client: Arc::clone(&self.client),
             collection: self.collection.clone(),
+            dataset: self.dataset.clone(),
             schema: Arc::clone(&self.schema),
             embedding_column: self.embedding_column.clone(),
             dims: self.dims,
@@ -601,10 +613,16 @@ impl TableProvider for QdrantListTable {
     }
 }
 
-#[expect(clippy::cast_sign_loss)]
+/// The point's exact vector from [`qdrant::payload::VECTOR_KEY`] when it has one, else the
+/// vector Qdrant stored, which is exact for every distance except cosine.
+#[expect(clippy::cast_sign_loss, reason = "dims is positive")]
 fn dense_vector(result: &SearchResult, dims: i32) -> Result<Vec<f32>, String> {
-    let Some(vector) = &result.vector else {
-        return Err("Qdrant search result did not include the vector".to_string());
+    let vector = match result.payload.get(qdrant::payload::VECTOR_KEY) {
+        Some(exact) => qdrant::payload::decode_vector(exact).map_err(|e| e.to_string())?,
+        None => result
+            .vector
+            .clone()
+            .ok_or_else(|| "Qdrant search result did not include the vector".to_string())?,
     };
     if vector.len() != dims as usize {
         return Err(format!(
@@ -613,7 +631,7 @@ fn dense_vector(result: &SearchResult, dims: i32) -> Result<Vec<f32>, String> {
             vector.len()
         ));
     }
-    Ok(vector.clone())
+    Ok(vector)
 }
 
 #[cfg(test)]
@@ -659,6 +677,47 @@ mod tests {
 
         let empty = build_embedding_array(&[], "embedding", 4).expect("array");
         assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn the_exact_vector_in_the_payload_wins_over_the_normalized_one() {
+        let model = vec![0.1f32, 0.2, 0.3];
+        let mut exact =
+            result_with_vector(Some(vec![0.267_261_24, 0.534_522_5, 0.801_783_7]), false);
+        exact.payload.insert(
+            qdrant::payload::VECTOR_KEY.to_string(),
+            qdrant::payload::encode_vector(&model),
+        );
+        let array = build_embedding_array(&[exact], "embedding", 3).expect("array");
+        let values = array
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("fixed-size list")
+            .value(0);
+        let values = values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("f32 values");
+        assert_eq!(
+            values
+                .values()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            model.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+
+        let mut malformed = result_with_vector(Some(vec![1.0, 0.0, 0.0]), false);
+        malformed
+            .payload
+            .insert(qdrant::payload::VECTOR_KEY.to_string(), "AAA=".into());
+        let err = build_embedding_array(&[malformed], "embedding", 3)
+            .expect_err("a malformed exact vector must not fall back to NULL");
+        assert!(
+            err.to_string()
+                .contains("payload key `spice_vector` is malformed"),
+            "{err}"
+        );
     }
 
     #[test]

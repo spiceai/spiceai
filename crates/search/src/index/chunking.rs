@@ -155,6 +155,11 @@ impl Index for ChunkedSearchIndex {
         self.inner.on_write_complete().await
     }
 
+    /// Every chunk lives in the inner index's own store, so a truncate empties that store.
+    async fn truncate(&self) -> DataFusionResult<()> {
+        self.inner.truncate().await
+    }
+
     /// `keys` is shaped by [`SearchIndex::primary_fields`], which excludes
     /// [`CHUNKED_INDEX_CHUNK_KEY`] — so every chunk row for a given outer key must go, not just
     /// one. `self.inner`'s own key includes the chunk id, whose values this doesn't know.
@@ -1240,6 +1245,10 @@ impl Index for ChunkedVectorIndex {
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         self.delegate.on_write_complete().await
+    }
+
+    async fn truncate(&self) -> DataFusionResult<()> {
+        self.delegate.truncate().await
     }
 
     /// See [`ChunkedSearchIndex::delete_by_keys`] — same outer-key-to-chunk resolution, with the

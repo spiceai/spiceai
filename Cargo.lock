@@ -16129,6 +16129,8 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "async-trait",
+ "base64 0.22.1",
+ "futures",
  "qdrant-client",
  "snafu",
  "tokio",

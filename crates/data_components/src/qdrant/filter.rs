@@ -21,8 +21,11 @@ use std::collections::HashSet;
 use arrow_schema::SchemaRef;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
+use std::time::{Duration, SystemTime};
+
 use qdrant::proto::{
-    Condition, FieldCondition, Filter, Match, Range, RepeatedIntegers, r#match::MatchValue,
+    Condition, DatetimeRange, FieldCondition, Filter, Match, Range, RepeatedIntegers,
+    r#match::MatchValue,
 };
 
 /// Returns `true` when `expr` can be pushed to Qdrant exactly.
@@ -119,6 +122,25 @@ fn scalar_to_f64(scalar: &ScalarValue) -> Option<f64> {
     }
 }
 
+/// Qdrant compares datetimes in microseconds, so a nanosecond timestamp is never pushed.
+fn scalar_to_datetime(scalar: &ScalarValue) -> Option<SystemTime> {
+    let micros = match scalar {
+        ScalarValue::Date32(Some(days)) => i64::from(*days).checked_mul(86_400_000_000)?,
+        ScalarValue::Date64(Some(ms)) | ScalarValue::TimestampMillisecond(Some(ms), _) => {
+            ms.checked_mul(1_000)?
+        }
+        ScalarValue::TimestampSecond(Some(s), _) => s.checked_mul(1_000_000)?,
+        ScalarValue::TimestampMicrosecond(Some(us), _) => *us,
+        _ => return None,
+    };
+    let offset = Duration::from_micros(micros.unsigned_abs());
+    if micros >= 0 {
+        SystemTime::UNIX_EPOCH.checked_add(offset)
+    } else {
+        SystemTime::UNIX_EPOCH.checked_sub(offset)
+    }
+}
+
 fn scalar_to_string(scalar: &ScalarValue) -> Option<String> {
     match scalar {
         ScalarValue::Utf8(Some(v))
@@ -143,6 +165,16 @@ fn keyword_equals(field: &str, value: String) -> Condition {
 }
 
 fn equality_condition(field: &str, scalar: &ScalarValue) -> Option<Condition> {
+    if let Some(at) = scalar_to_datetime(scalar) {
+        return Some(Condition::datetime_range(
+            field,
+            DatetimeRange {
+                gte: Some(at.into()),
+                lte: Some(at.into()),
+                ..Default::default()
+            },
+        ));
+    }
     if let Some(value) = scalar_to_string(scalar) {
         return Some(keyword_equals(field, value));
     }
@@ -166,6 +198,29 @@ fn equality_condition(field: &str, scalar: &ScalarValue) -> Option<Condition> {
 }
 
 fn range_condition(field: &str, op: Operator, scalar: &ScalarValue) -> Option<Condition> {
+    if let Some(at) = scalar_to_datetime(scalar) {
+        let at = Some(at.into());
+        let range = match op {
+            Operator::Lt => DatetimeRange {
+                lt: at,
+                ..Default::default()
+            },
+            Operator::LtEq => DatetimeRange {
+                lte: at,
+                ..Default::default()
+            },
+            Operator::Gt => DatetimeRange {
+                gt: at,
+                ..Default::default()
+            },
+            Operator::GtEq => DatetimeRange {
+                gte: at,
+                ..Default::default()
+            },
+            _ => return None,
+        };
+        return Some(Condition::datetime_range(field, range));
+    }
     let value = scalar_to_f64(scalar)?;
     let range = match op {
         Operator::Lt => Range {
@@ -492,6 +547,41 @@ mod tests {
             }
             other => panic!("expected a must filter, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dates_and_microsecond_timestamps_push_as_datetime_ranges() {
+        use std::time::{Duration, SystemTime};
+        let range = |expr: &Expr| match convert(expr)
+            .and_then(|c| c.condition_one_of)
+            .expect("condition")
+        {
+            qdrant::proto::condition::ConditionOneOf::Field(field) => {
+                field.datetime_range.expect("datetime range")
+            }
+            other => panic!("expected a field condition, got {other:?}"),
+        };
+        let after_epoch = |micros: u64| SystemTime::UNIX_EPOCH + Duration::from_micros(micros);
+
+        let day = range(&col("id").gt_eq(lit(ScalarValue::Date32(Some(19_726)))));
+        assert_eq!(day.gte, Some(after_epoch(1_704_326_400_000_000).into()));
+
+        let at = range(&col("id").eq(lit(ScalarValue::TimestampMicrosecond(
+            Some(1_704_112_215_123_456),
+            None,
+        ))));
+        assert_eq!(at.gte, Some(after_epoch(1_704_112_215_123_456).into()));
+        assert_eq!(at.lte, at.gte);
+
+        let before_epoch = range(&col("id").lt(lit(ScalarValue::Date32(Some(-1)))));
+        assert_eq!(
+            before_epoch.lt,
+            Some((SystemTime::UNIX_EPOCH - Duration::from_hours(24)).into())
+        );
+
+        assert!(!supports(
+            &col("id").eq(lit(ScalarValue::TimestampNanosecond(Some(1), None)))
+        ));
     }
 
     #[test]
