@@ -802,6 +802,11 @@ impl RefreshTask {
     /// Returns an error if the source cannot be queried, the refresh SQL fails to
     /// plan or execute, or the resulting data cannot be written to the accelerator.
     pub async fn run(&self, refresh: Refresh) -> super::Result<RefreshOutcome> {
+        // Wait for a source not reached yet before taking a refresh slot: the wait lasts
+        // as long as the source is down, and an accelerated view's source is the tables
+        // it reads, whose own refreshes need a slot.
+        let _ = self.federated.try_wait_table_provider().await;
+
         // Limit parallel refreshes via a semaphore
         let _permit = self.semaphore.acquire().await;
 
