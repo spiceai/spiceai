@@ -37,6 +37,7 @@ members = [
     "crates/result-compare",
     "crates/google-genai",
     "crates/hash-index",
+    "crates/huggingface-hub",
     "crates/key-index",
     "crates/llama-cpp",
     "crates/llms-llamacpp",

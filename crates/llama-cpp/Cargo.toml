@@ -12,7 +12,7 @@ version.workspace = true
 autotests = false
 
 [dependencies]
-llama-cpp-src = { git = "https://github.com/spiceai/llama.cpp", rev = "2663a92e6aaaac5efda40fdb5ca4e89e79c17673" } # branch: lukim/b11803-abort-throws (spiceai/llama.cpp#2 on #1: upstream release b11803, the Cargo packaging, and failed checks that throw while a model loads)
+llama-cpp-src = { git = "https://github.com/spiceai/llama.cpp", rev = "2663a92e6aaaac5efda40fdb5ca4e89e79c17673" } # branch: lukim/b11803-abort-throws (spiceai/llama.cpp#2, which spiceai/llama.cpp#3 lands on spiceai-b11803: upstream release b11803, the Cargo packaging, and failed checks that throw while a model loads)
 snafu.workspace = true
 tracing.workspace = true
 
