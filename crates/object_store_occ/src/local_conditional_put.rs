@@ -31,7 +31,9 @@ limitations under the License.
 //! `ETag`, and an update built on the older version would replace the newer
 //! one. So each staged version's modification time is moved past every version
 //! its directory has published, recorded as the lock file's own modification
-//! time, before the version is published.
+//! time, before the version is published. On a filesystem that stores coarser
+//! times than a millisecond, the writer waits for the clock to pass that time
+//! instead of stamping the version ahead of the clock.
 //!
 //! Copies, renames, and multipart uploads are delegated and publish without
 //! the lock, so write a key that conditional updates guard through `put_opts`
@@ -164,13 +166,32 @@ fn write_worker(
 
 /// How far past the directory's last publication a staged version's
 /// modification time is moved, tried in order until the filesystem stores a
-/// time past it: one microsecond, the `ETag`'s resolution, then steps that
-/// survive millisecond and two-second timestamp resolution.
-const STAMP_STEPS: [Duration; 3] = [
-    Duration::from_micros(1),
-    Duration::from_millis(1),
-    Duration::from_secs(2),
-];
+/// time past it: one microsecond, the `ETag`'s resolution, then a step that
+/// survives millisecond timestamp resolution.
+const STAMP_STEPS: [Duration; 2] = [Duration::from_micros(1), Duration::from_millis(1)];
+
+/// How long a filesystem that stores coarser times than a millisecond, such
+/// as FAT's two seconds, may wait for the clock to pass the floor.
+const COARSE_TIMESTAMP_WAIT: Duration = Duration::from_secs(5);
+
+const COARSE_TIMESTAMP_POLL: Duration = Duration::from_millis(50);
+
+/// A file whose modification time can be read and set: the staged file, or a
+/// test double for a filesystem with coarse timestamps.
+trait Timestamped {
+    fn modified(&self) -> io::Result<SystemTime>;
+    fn set_modified(&self, time: SystemTime) -> io::Result<()>;
+}
+
+impl Timestamped for std::fs::File {
+    fn modified(&self) -> io::Result<SystemTime> {
+        self.metadata()?.modified()
+    }
+
+    fn set_modified(&self, time: SystemTime) -> io::Result<()> {
+        std::fs::File::set_modified(self, time)
+    }
+}
 
 /// `LocalFileSystem` reads an unavailable modification time as the epoch.
 fn modified(metadata: &std::fs::Metadata) -> SystemTime {
@@ -239,26 +260,38 @@ fn stage(
     }
 }
 
-/// Moves the staged file's modification time past `floor`, at the `ETag`'s
-/// microsecond resolution, and returns the staged file's metadata.
-fn stamp(staged: &std::fs::File, floor: SystemTime) -> Result<std::fs::Metadata, ObjectStoreError> {
+/// Moves the staged file's stored modification time past `floor`, at the
+/// `ETag`'s microsecond resolution.
+fn stamp(staged: &impl Timestamped, floor: SystemTime) -> io::Result<()> {
     let floor = micros(floor);
-    let mut metadata = staged.metadata().map_err(worker_error)?;
-    for step in STAMP_STEPS {
-        if micros(modified(&metadata)) > floor {
-            return Ok(metadata);
-        }
-        staged
-            .set_modified(UNIX_EPOCH + Duration::from_micros(floor) + step)
-            .map_err(worker_error)?;
-        metadata = staged.metadata().map_err(worker_error)?;
+    let past_floor = || Ok::<_, io::Error>(micros(staged.modified()?) > floor);
+    if past_floor()? {
+        return Ok(());
     }
-    if micros(modified(&metadata)) > floor {
-        Ok(metadata)
-    } else {
-        Err(worker_error(io::Error::other(format!(
-            "the filesystem kept a modification time at or before {floor} microseconds after the epoch, so the new version's ETag could repeat an earlier version's"
-        ))))
+    for step in STAMP_STEPS {
+        staged.set_modified(UNIX_EPOCH + Duration::from_micros(floor) + step)?;
+        if past_floor()? {
+            return Ok(());
+        }
+    }
+    // No time just past the floor survives this filesystem's resolution. A
+    // larger step would put the version ahead of the clock, and every write
+    // faster than the resolution would push it further ahead, while heartbeat
+    // and retention checks read the modification time as when it was written.
+    // So wait for the clock to pass the floor. This thread is the dedicated
+    // writer, not a Tokio worker.
+    let deadline = std::time::Instant::now() + COARSE_TIMESTAMP_WAIT;
+    loop {
+        staged.set_modified(SystemTime::now())?;
+        if past_floor()? {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "the filesystem kept a modification time at or before {floor} microseconds after the epoch for {COARSE_TIMESTAMP_WAIT:?}, so the new version's ETag could repeat an earlier version's"
+            )));
+        }
+        std::thread::sleep(COARSE_TIMESTAMP_POLL);
     }
 }
 
@@ -275,6 +308,7 @@ fn publish(
             implementer: "LocalConditionalPut".into(),
         });
     }
+    let path = inner.path_to_filesystem(location)?;
     let legacy_path = root.join(".spice-object-store-occ.lock");
     let directory_path = publication_lock_path(root, location);
     if let Some(parent) = directory_path.parent() {
@@ -285,7 +319,6 @@ fn publish(
     // that still uses this order.
     let _legacy_guard = lock_file(&legacy_path)?;
     let directory_guard = lock_file(&directory_path)?;
-    let path = inner.path_to_filesystem(location)?;
     let current = match std::fs::metadata(&path) {
         Ok(metadata) => Some(metadata),
         Err(source) if source.kind() == io::ErrorKind::NotFound => None,
@@ -332,7 +365,8 @@ fn publish(
         .max()
         .unwrap_or(UNIX_EPOCH);
     let (staged, staging) = stage(&path, payload)?;
-    let published = stamp(&staged, floor).and_then(|metadata| {
+    let published = stamp(&staged, floor).map_err(worker_error).and_then(|()| {
+        let metadata = staged.metadata().map_err(worker_error)?;
         // Advance the floor before the version becomes visible, so no
         // published version is ever past it.
         directory_guard
@@ -1193,5 +1227,45 @@ mod tests {
         let get = store.get(&path).await.expect("get after update");
         assert_eq!(updated.e_tag, get.meta.e_tag, "update");
         assert_eq!(get.bytes().await.expect("read bytes").as_ref(), b"00000002");
+    }
+
+    /// A staged file on a filesystem that stores whole seconds.
+    struct WholeSecondFile(std::cell::Cell<SystemTime>);
+
+    impl Timestamped for WholeSecondFile {
+        fn modified(&self) -> io::Result<SystemTime> {
+            Ok(self.0.get())
+        }
+
+        fn set_modified(&self, time: SystemTime) -> io::Result<()> {
+            let seconds = time
+                .duration_since(UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_secs();
+            self.0.set(UNIX_EPOCH + Duration::from_secs(seconds));
+            Ok(())
+        }
+    }
+
+    /// On a filesystem whose timestamps cannot hold a time just past the
+    /// floor, the version's time still moves past it without running ahead of
+    /// the clock, which heartbeat and retention checks read as when the object
+    /// was written.
+    #[test]
+    fn a_coarse_timestamp_waits_for_the_clock_instead_of_running_ahead() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after the epoch");
+        let floor = UNIX_EPOCH + Duration::from_secs(now.as_secs());
+        let staged = WholeSecondFile(std::cell::Cell::new(floor));
+
+        stamp(&staged, floor).expect("stamp past the floor");
+
+        let stored = staged.0.get();
+        assert!(stored > floor, "stored {stored:?} is not past {floor:?}");
+        assert!(
+            stored <= SystemTime::now(),
+            "stored {stored:?} is ahead of the clock"
+        );
     }
 }
