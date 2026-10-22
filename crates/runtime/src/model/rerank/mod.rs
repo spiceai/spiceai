@@ -215,13 +215,16 @@ pub async fn try_to_rerank_model(
                 HuggingFaceRerankerParams::try_from_params(&component_name, params, &secrets)
                     .await
                     .map_err(|e| params_err(&component.name, e))?;
-            let hf_token = typed.hf_token.as_ref().map(ExposeSecret::expose_secret);
+            let hub = llms::hf::HubParams {
+                token: typed.hf_token.as_ref(),
+                endpoint: typed.hf_endpoint.as_deref(),
+            };
             let truncation = typed.truncate.unwrap_or_default().direction();
             let r = TeiRerank::from_hf(
                 component.name.clone(),
                 repo_id,
                 revision,
-                hf_token,
+                hub,
                 typed.max_seq_length,
                 truncation,
             )

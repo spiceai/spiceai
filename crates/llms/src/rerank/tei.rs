@@ -28,6 +28,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use futures::future::join_all;
+use huggingface_hub::Requester;
 use snafu::ResultExt;
 use tei_backend::{Backend, DType, ModelType};
 use tei_core::{infer::Infer, queue::Queue};
@@ -36,7 +37,10 @@ use tokenizers::TruncationDirection;
 use crate::embeddings::candle::util::{
     download_hf_artifacts, link_files_into_tmp_dir, load_tokenization,
 };
+use crate::hf::HubParams;
 use crate::rerank::{Error, LocalModelLoadFailedSnafu, Rerank, Result};
+
+const DOCS_URL: &str = "https://spiceai.org/docs/features/search/rerank";
 
 /// A cross-encoder reranker running in-process via the candle TEI backend.
 ///
@@ -63,23 +67,33 @@ impl std::fmt::Debug for TeiRerank {
 }
 
 impl TeiRerank {
-    /// Download a reranker model from `HuggingFace` and load it as a
-    /// cross-encoder classifier.
+    /// Downloads the model `model_id` (`org/name`) at `revision` from the Hugging Face Hub
+    /// into the Hugging Face cache, for the reranker `name`, and loads it as a cross-encoder
+    /// classifier.
     pub async fn from_hf(
         name: impl Into<String>,
         model_id: &str,
         revision: Option<&str>,
-        hf_token: Option<&str>,
+        hub: HubParams<'_>,
         max_seq_length_overwrite: Option<usize>,
         truncation: Option<TruncationDirection>,
     ) -> Result<Self> {
         let name = name.into();
-        let model_root = download_hf_artifacts(model_id, revision, hf_token)
-            .await
-            .map_err(|e| Error::LocalModelLoadFailed {
-                model: name.clone(),
-                source: Box::new(e),
-            })?;
+        let requester = Requester {
+            kind: "reranker",
+            name: name.clone(),
+            docs_url: DOCS_URL,
+            // Spice loads a reranker once.
+            retried: false,
+        };
+        let model_root = async {
+            let snapshot = crate::hf::open_model(requester, model_id, revision, hub).await?;
+            download_hf_artifacts(&snapshot).await
+        }
+        .await
+        .map_err(|source| Error::FailedToDownloadModel {
+            source: Box::new(source),
+        })?;
         Self::from_dir(name, &model_root, max_seq_length_overwrite, truncation).await
     }
 
