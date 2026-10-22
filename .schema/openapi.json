@@ -861,6 +861,169 @@
         }
       }
     },
+    "/v1/messages": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Create a message",
+        "description": "Answers a conversation in the shape of the Anthropic Messages API, so Anthropic SDKs and\ntools work by pointing their base URL at Spice. `model` names any chat model in the\nSpicepod: a model with `from: anthropic` receives the request as sent, and any other model\nreceives it translated into a chat completion. The request and the response, streamed\n(`\"stream\": true`) or not, follow the Messages API reference:\n<https://docs.claude.com/en/api/messages>.",
+        "operationId": "post_messages",
+        "parameters": [
+          {
+            "name": "anthropic-version",
+            "in": "header",
+            "description": "The Messages API version. Accepted for compatibility; `2023-06-01` is the only version.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "anthropic-beta",
+            "in": "header",
+            "description": "Comma-separated beta features, forwarded to models with `from: anthropic`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "A Messages API request.",
+          "content": {
+            "application/json": {
+              "schema": {},
+              "example": {
+                "model": "claude",
+                "max_tokens": 1024,
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Hello!"
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The model's message, or with `\"stream\": true`, its stream of server-sent events",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "id": "msg_01XFDUDYJgAACzvnptvVoYEL",
+                  "type": "message",
+                  "role": "assistant",
+                  "model": "claude",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "Hello! How can I help you today?"
+                    }
+                  ],
+                  "stop_reason": "end_turn",
+                  "stop_sequence": null,
+                  "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 12
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request is invalid, or asks for something the model cannot serve",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "type": "error",
+                  "error": {
+                    "type": "invalid_request_error",
+                    "message": "model: Field required"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The model was not found",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "type": "error",
+                  "error": {
+                    "type": "not_found_error",
+                    "message": "model 'claude' not found"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model failed to load"
+          }
+        }
+      }
+    },
+    "/v1/messages/count_tokens": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Count tokens in a message",
+        "description": "Counts the input tokens of a Messages API request, as the model would be sent it, Spice's\nsystem prompt and tools included. Only a model with `from: anthropic` counts tokens: a count\nis specific to the model's tokenizer. The request and response follow the Messages API\nreference: <https://docs.claude.com/en/api/messages-count-tokens>.",
+        "operationId": "post_messages_count_tokens",
+        "requestBody": {
+          "description": "A Messages API request, without `max_tokens`.",
+          "content": {
+            "application/json": {
+              "schema": {},
+              "example": {
+                "model": "claude",
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Hello!"
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The input token count",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "input_tokens": 10
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request is invalid, or the model cannot count tokens"
+          },
+          "404": {
+            "description": "The model was not found"
+          }
+        }
+      }
+    },
     "/v1/metrics": {
       "post": {
         "tags": [
