@@ -124,7 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `a6b07b8b9625e552c502c3a7229fd4bb7725bd2e` | `spiceai-0.11.0-df-55` |
-| [llama.cpp](#llamacpp) | `2663a92e6aaaac5efda40fdb5ca4e89e79c17673` | `lukim/b11803-abort-throws` (TEMPORARY: spiceai/llama.cpp#3) |
+| [llama.cpp](#llamacpp) | `1082d1983689a13315cdf2a80d9bd0bbdd572da2` | `spiceai-b11803` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `aa8e8d43949970b91fb42a2243b4f60f810d9bbd` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
