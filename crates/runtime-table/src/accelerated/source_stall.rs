@@ -110,8 +110,8 @@ mod tests {
     async fn a_source_silent_after_its_first_batch_fails_retriably() {
         let timeout = SOURCE_STALL_TIMEOUT;
         let mut guarded = with_stall_timeout(silent_after(2), "big".to_string());
-        assert!(guarded.next().await.expect("first").is_ok());
-        assert!(guarded.next().await.expect("second").is_ok());
+        guarded.next().await.expect("first").expect("a batch");
+        guarded.next().await.expect("second").expect("a batch");
         let silent_from = tokio::time::Instant::now();
         let error = tokio::time::timeout(timeout * 2, guarded.next())
             .await
@@ -138,11 +138,12 @@ mod tests {
     /// The timeout bounds each gap between batches, not the whole refresh.
     #[tokio::test(start_paused = true)]
     async fn a_source_slower_than_the_timeout_in_total_is_passed_through() {
-        let slow = stream::unfold(0, |sent| async move {
+        let gap = SOURCE_STALL_TIMEOUT.saturating_sub(Duration::from_secs(1));
+        let slow = stream::unfold(0, move |sent| async move {
             if sent == 3 {
                 return None;
             }
-            tokio::time::sleep(SOURCE_STALL_TIMEOUT - Duration::from_secs(1)).await;
+            tokio::time::sleep(gap).await;
             Some((Ok(batch()), sent + 1))
         });
         let source: SendableRecordBatchStream =
@@ -151,10 +152,7 @@ mod tests {
         let rows: Vec<_> = with_stall_timeout(source, "big".to_string())
             .collect()
             .await;
-        assert_eq!(
-            started.elapsed(),
-            3 * (SOURCE_STALL_TIMEOUT - Duration::from_secs(1))
-        );
+        assert_eq!(started.elapsed(), 3 * gap);
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(Result::is_ok));
     }
