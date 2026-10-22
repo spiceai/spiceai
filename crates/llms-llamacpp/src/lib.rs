@@ -1003,9 +1003,19 @@ impl Output {
             return Some(FinishReason::Stop);
         }
         self.produced += 1;
-        self.pending.extend(vocab.token_to_piece(token, true));
+        self.bytes(&vocab.token_to_piece(token, true))
+    }
+
+    /// Sends the text a token's bytes complete, or returns why generation ends.
+    fn bytes(&mut self, piece: &[u8]) -> Option<FinishReason> {
+        self.pending.extend_from_slice(piece);
         let text = take_utf8(&mut self.pending);
         let (emit, stopped) = self.stops.push(&text);
+        if stopped {
+            // The reply ends at the stop sequence, so nothing after it is sent, not even the
+            // start of a character that `finish` would otherwise send as a replacement.
+            self.pending.clear();
+        }
         if let Some(finish) = self.route(&emit) {
             return Some(finish);
         }
@@ -2324,6 +2334,51 @@ mod tests {
         out.finish(FinishReason::Length, 1)
             .expect("the request succeeds");
         assert_eq!(sent(rx), ["c:\u{fffd}"]);
+    }
+
+    /// The content a reply of `pieces` sends when the request stops at `STOP`.
+    fn stopped_at(pieces: &[&[u8]]) -> String {
+        let (events, rx) = mpsc::channel(STREAM_BUFFER);
+        let job = Job {
+            prompt: String::new(),
+            limit: None,
+            sampling: Sampling::default(),
+            stop: vec!["STOP".to_string()],
+            reasoning: None,
+            tools: None,
+            require_tool_call: false,
+            stopping: Arc::default(),
+            events,
+        };
+        let (_, _, mut out) = Output::new(job);
+        let finish = pieces
+            .iter()
+            .find_map(|piece| out.bytes(piece))
+            .unwrap_or(FinishReason::Length);
+        out.finish(finish, 1).expect("the request succeeds");
+        sent(rx)
+            .into_iter()
+            .map(|event| {
+                event
+                    .strip_prefix("c:")
+                    .map(ToString::to_string)
+                    .expect("only content is sent")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nothing_after_a_stop_sequence_is_sent() {
+        // regression: an incomplete character after the stop sequence was sent as U+FFFD
+        let reply = "beforeSTOPéafter".as_bytes();
+        assert_eq!(stopped_at(&[reply]), "before");
+        for cut in 0..=reply.len() {
+            assert_eq!(
+                stopped_at(&[&reply[..cut], &reply[cut..]]),
+                "before",
+                "split at byte {cut}"
+            );
+        }
     }
 
     /// The tokens nucleus sampling leaves from `logits` at `temperature` and `top_p`: the
