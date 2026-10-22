@@ -56,26 +56,27 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 /// legitimate expressions almost never nest beyond a few dozen levels, and an
 /// `IN` list or `VALUES` clause is wide, not deep, so it is unaffected. An
 /// expression that becomes a column name overflows sooner in a debug build;
-/// see [`MAX_NAMED_EXPR_DEPTH`].
-pub(crate) const MAX_SQL_EXPR_DEPTH: usize = 512;
+/// see [`MAX_UNPROTECTED_EXPR_DEPTH`].
+pub const MAX_SQL_EXPR_DEPTH: usize = 512;
 
-/// Maximum nesting depth of an expression whose text becomes a column name:
-/// a `SELECT` item, a `GROUP BY` or query `ORDER BY` expression, or a `VALUES`
-/// cell.
+/// Maximum nesting depth of an expression that is walked by recursion without
+/// `DataFusion`'s `recursive_protection` stack growth: a `SELECT` item, a
+/// `GROUP BY` or query `ORDER BY` expression, or a `VALUES` cell, whose text
+/// becomes a column name, and a `/v1/search` `where` condition.
 ///
-/// `DataFusion` renders these expressions into their output column name
-/// (`SchemaDisplay`, through `validate_unique_names` for a projection and
-/// `rewrite_in_terms_of_projection` for `ORDER BY`), and that rendering
-/// recurses once per level without the stack growth the planner's own
-/// traversals have. Its frames are several times larger without
-/// optimization: on a default ~2 MiB Tokio worker stack, a debug build aborts
-/// the process on a `SELECT 1+1+…` chain at a depth of ~210 and on an
-/// `ORDER BY id+1+…` chain at ~125, while a `WHERE` or `JOIN … ON` chain of 511
-/// terms still plans. A release build plans every one of these at 511, so it
+/// `DataFusion` renders a column name with `SchemaDisplay` (through
+/// `validate_unique_names` for a projection and
+/// `rewrite_in_terms_of_projection` for `ORDER BY`), and a search request's
+/// cache key clones and hashes its `where` condition. Each recurses once per
+/// level, and the frames are several times larger without optimization: on a
+/// default ~2 MiB Tokio worker stack, a debug build aborts the process on a
+/// `SELECT 1+1+…` chain at a depth of ~210 and on an `ORDER BY id+1+…` chain
+/// at ~125, while a SQL `WHERE` or `JOIN … ON` chain of 511 terms still
+/// plans. A release build plans every one of these SQL shapes at 511, so it
 /// keeps [`MAX_SQL_EXPR_DEPTH`] and accepts the same queries either way; a
 /// debug build uses 64, about half the lowest debug abort depth and above the
 /// parser's own nesting limit of 50 for parentheses and function arguments.
-pub(crate) const MAX_NAMED_EXPR_DEPTH: usize = if cfg!(debug_assertions) {
+pub const MAX_UNPROTECTED_EXPR_DEPTH: usize = if cfg!(debug_assertions) {
     64
 } else {
     MAX_SQL_EXPR_DEPTH
@@ -88,7 +89,7 @@ pub(crate) const MAX_NAMED_EXPR_DEPTH: usize = if cfg!(debug_assertions) {
 /// depth cap, so `arrow_cast(NULL, 'List(List(… Int64 …))')` overflows the
 /// stack at a nesting of roughly 200 in a debug build. 64 is far below that and
 /// far above any real nested type (a handful of `List`/`Struct`/`Map` levels).
-pub(crate) const MAX_ARROW_TYPE_DEPTH: usize = 64;
+pub const MAX_ARROW_TYPE_DEPTH: usize = 64;
 
 /// Reject `statement` if any of its expression trees, or any `arrow_cast` type
 /// string it carries, is nested more deeply than the fixed limits above.
@@ -96,7 +97,11 @@ pub(crate) const MAX_ARROW_TYPE_DEPTH: usize = 64;
 /// Handles the `sqlparser` statement, the `EXPLAIN` wrapper, and a query
 /// nested in `COPY (query) TO`. `COPY <table> TO`, `CREATE EXTERNAL TABLE`,
 /// and `RESET` carry no user expression tree that reaches the recursive planner.
-pub(crate) fn ensure_statement_within_depth_limits(statement: &DFStatement) -> DFResult<()> {
+///
+/// # Errors
+///
+/// Returns [`DataFusionError::Plan`] naming the exceeded limit.
+pub fn ensure_statement_within_depth_limits(statement: &DFStatement) -> DFResult<()> {
     match statement {
         DFStatement::Statement(sql) => ensure_sql_statement_within_depth_limits(sql),
         DFStatement::Explain(explain) => ensure_statement_within_depth_limits(&explain.statement),
@@ -118,12 +123,30 @@ pub(crate) fn ensure_statement_within_depth_limits(statement: &DFStatement) -> D
 /// For entry points that only hold the SQL text. Parsing is iterative in
 /// `sqlparser` for flat chains and does not overflow; only the subsequent
 /// recursive planning does, which this guards.
-pub(crate) fn ensure_sql_within_depth_limits(sql: &str) -> DFResult<()> {
+///
+/// # Errors
+///
+/// Returns the parser's error, or [`DataFusionError::Plan`] naming the
+/// exceeded limit.
+pub fn ensure_sql_within_depth_limits(sql: &str) -> DFResult<()> {
     let statements = DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {})?;
     for statement in &statements {
         ensure_statement_within_depth_limits(statement)?;
     }
     Ok(())
+}
+
+/// Reject a standalone filter expression, such as a `/v1/search` `where`
+/// condition, nested more deeply than [`MAX_UNPROTECTED_EXPR_DEPTH`].
+///
+/// Call it right after parsing, before anything clones, hashes, or formats
+/// the expression.
+///
+/// # Errors
+///
+/// Returns [`DataFusionError::Plan`] naming the limit.
+pub fn ensure_filter_within_depth_limit(expr: &Expr) -> DFResult<()> {
+    check_expr_depth(expr, MAX_UNPROTECTED_EXPR_DEPTH, too_deep_filter_error)
 }
 
 fn ensure_sql_statement_within_depth_limits(statement: &SQLStatement) -> DFResult<()> {
@@ -165,12 +188,12 @@ impl Visitor for DepthCollector {
 }
 
 /// Bound the expressions of `query` that become column names by
-/// [`MAX_NAMED_EXPR_DEPTH`].
+/// [`MAX_UNPROTECTED_EXPR_DEPTH`].
 ///
 /// A subquery in `FROM` or in an expression is a [`Query`] of its own, which
 /// the statement visitor reaches and checks separately.
 fn check_named_expr_depths(query: &Query) -> DFResult<()> {
-    let check = |expr: &Expr| check_expr_depth(expr, MAX_NAMED_EXPR_DEPTH, too_deep_named_error);
+    let check = |expr: &Expr| check_expr_depth(expr, MAX_UNPROTECTED_EXPR_DEPTH, too_deep_named_error);
     if let Some(OrderBy {
         kind: OrderByKind::Expressions(order_by),
         ..
@@ -256,8 +279,15 @@ fn too_deep_expr_error() -> DataFusionError {
 fn too_deep_named_error() -> DataFusionError {
     DataFusionError::Plan(format!(
         "Query rejected: a selected, grouped, ordered, or VALUES expression is nested more than \
-         {MAX_NAMED_EXPR_DEPTH} levels deep. Simplify the expression (for example, compute part \
+         {MAX_UNPROTECTED_EXPR_DEPTH} levels deep. Simplify the expression (for example, compute part \
          of a long chain of +, || or AND in a subquery)."
+    ))
+}
+
+fn too_deep_filter_error() -> DataFusionError {
+    DataFusionError::Plan(format!(
+        "it is nested more than {MAX_UNPROTECTED_EXPR_DEPTH} levels deep. Simplify it (for \
+         example, replace a long chain of OR conditions with an IN list)."
     ))
 }
 
@@ -956,12 +986,12 @@ mod tests {
     }
 
     /// Each place an expression becomes a column name is held to
-    /// [`MAX_NAMED_EXPR_DEPTH`]: a chain of exactly that many terms passes and
+    /// [`MAX_UNPROTECTED_EXPR_DEPTH`]: a chain of exactly that many terms passes and
     /// one more is rejected.
     #[test]
     fn named_expressions_are_bounded_at_the_named_cap() {
-        let at = MAX_NAMED_EXPR_DEPTH;
-        let over = MAX_NAMED_EXPR_DEPTH + 1;
+        let at = MAX_UNPROTECTED_EXPR_DEPTH;
+        let over = MAX_UNPROTECTED_EXPR_DEPTH + 1;
         let shapes: [fn(&str) -> String; 7] = [
             |e| format!("SELECT {e}"),
             |e| format!("SELECT {e} AS x"),
@@ -985,7 +1015,7 @@ mod tests {
     }
 
     /// A predicate is not rendered as a column name, so it keeps the general
-    /// cap: a `WHERE` chain far over [`MAX_NAMED_EXPR_DEPTH`] passes.
+    /// cap: a `WHERE` chain far over [`MAX_UNPROTECTED_EXPR_DEPTH`] passes.
     #[test]
     fn predicates_keep_the_general_cap() {
         let terms = vec!["id = 1"; MAX_SQL_EXPR_DEPTH - 1];
@@ -998,69 +1028,30 @@ mod tests {
         .expect("a JOIN ON chain under the general cap passes");
     }
 
-    /// Plans `sql` through the runtime's planner on a Tokio worker with the
-    /// default 2 MiB stack `spiced`'s query runtimes run on, so an over-deep
-    /// expression the guard lets through aborts the test process instead of
-    /// passing. The test harness's own threads are larger (`RUST_MIN_STACK`).
-    async fn plan_on_default_worker_stack(sql: String) -> DFResult<()> {
-        let runtime = crate::Runtime::builder().build().await;
-        let df = std::sync::Arc::clone(&runtime.df);
-        let workers = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_stack_size(2 * 1024 * 1024)
-            .enable_all()
-            .build()
-            .expect("worker runtime builds");
-        let result = workers
-            .spawn(async move {
-                let session = df.ctx.state();
-                df.create_logical_plan(&session, &sql, None)
-                    .await
-                    .map(|_| ())
-            })
-            .await
-            .expect("planning task completes");
-        workers.shutdown_background();
-        result
+    fn parse_filter(sql: &str) -> Expr {
+        datafusion::sql::sqlparser::parser::Parser::new(&PostgreSqlDialect {})
+            .try_with_sql(sql)
+            .expect("test filter tokenizes")
+            .parse_expr()
+            .expect("test filter parses")
     }
 
-    /// Regression test: a `SELECT` or `ORDER BY` chain under the general cap
-    /// overflowed the worker stack while `DataFusion` rendered its column name,
-    /// aborting the process. It is now a planning error.
-    #[tokio::test]
-    async fn deep_named_chains_are_rejected_on_the_worker_stack() {
-        for sql in [
-            format!("SELECT {}", plus_chain("1", 300)),
+    /// A standalone filter of exactly [`MAX_UNPROTECTED_EXPR_DEPTH`] terms
+    /// passes and one more is rejected.
+    #[test]
+    fn filter_is_bounded_at_the_unprotected_cap() {
+        let at = vec!["true"; MAX_UNPROTECTED_EXPR_DEPTH].join(" AND ");
+        ensure_filter_within_depth_limit(&parse_filter(&at)).expect("a filter at the cap passes");
+        let over = vec!["true"; MAX_UNPROTECTED_EXPR_DEPTH + 1].join(" AND ");
+        let err = ensure_filter_within_depth_limit(&parse_filter(&over))
+            .expect_err("one level over the cap is rejected");
+        assert_eq!(
+            err.message(),
             format!(
-                "SELECT id FROM (VALUES (1)) t(id) ORDER BY {}",
-                plus_chain("id", 200)
-            ),
-            format!("SELECT * FROM (VALUES ({})) v(x)", plus_chain("1", 300)),
-        ] {
-            let err = plan_on_default_worker_stack(sql)
-                .await
-                .expect_err("a deep named chain is rejected");
-            assert_eq!(err.to_string(), too_deep_named_error().to_string());
-        }
-    }
-
-    /// Chains at the named cap, and a predicate chain at the general cap, still
-    /// plan on the worker stack.
-    #[tokio::test]
-    async fn chains_at_the_caps_plan_on_the_worker_stack() {
-        let or_terms = vec!["id = 1"; MAX_SQL_EXPR_DEPTH - 1].join(" OR ");
-        for sql in [
-            format!("SELECT {}", plus_chain("1", MAX_NAMED_EXPR_DEPTH)),
-            format!(
-                "SELECT id FROM (VALUES (1)) t(id) ORDER BY {}",
-                plus_chain("id", MAX_NAMED_EXPR_DEPTH)
-            ),
-            format!("SELECT id FROM (VALUES (1)) t(id) WHERE {or_terms}"),
-        ] {
-            plan_on_default_worker_stack(sql.clone())
-                .await
-                .unwrap_or_else(|e| panic!("{sql:.60}… must plan: {e}"));
-        }
+                "it is nested more than {MAX_UNPROTECTED_EXPR_DEPTH} levels deep. Simplify it \
+                 (for example, replace a long chain of OR conditions with an IN list)."
+            )
+        );
     }
 
     #[test]
