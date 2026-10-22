@@ -416,7 +416,11 @@ impl DataAccelerator for SqliteAccelerator {
         data_accelerator_api::relocated_file(source, &live_file, "sqlite_file", &[], dir)
     }
 
-    async fn release_relocated(&self, source: &dyn AccelerationSource) {
+    async fn release_relocated(
+        &self,
+        source: &dyn AccelerationSource,
+        _registry: &AcceleratorEngineRegistry,
+    ) {
         if let Ok(path) = self.sqlite_file_path(source) {
             self.sqlite_factory.invalidate_file_instance(path).await;
         }

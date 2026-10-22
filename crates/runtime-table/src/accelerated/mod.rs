@@ -2410,8 +2410,8 @@ impl AcceleratedTable {
                         accelerator_limit,
                     )
                     .await?;
-                if pinned_copy_lease.is_some() || self.pin_status.serves_pin() {
-                    // The pinned snapshot's rows are all a pinned dataset serves, so a
+                if pinned_copy_lease.is_some() || self.pin_status.serves_pinned_snapshot() {
+                    // A pinned snapshot's rows are all a table serving one serves, so a
                     // scan of them never falls back to the source.
                     input
                 } else {

@@ -573,7 +573,11 @@ impl DataAccelerator for TursoAccelerator {
         data_accelerator_api::relocated_file(source, &live_file, "turso_file", &[], dir)
     }
 
-    async fn release_relocated(&self, source: &dyn AccelerationSource) {
+    async fn release_relocated(
+        &self,
+        source: &dyn AccelerationSource,
+        _registry: &AcceleratorEngineRegistry,
+    ) {
         if let Ok(path) = self.turso_file_path(source) {
             self.pools.lock().await.remove(&path);
         }
@@ -611,6 +615,10 @@ impl DataAccelerator for TursoAccelerator {
             pool,
             dataset_name.to_string(),
         )))
+    }
+
+    async fn release_sidecar_for_path(&self, path: &str) {
+        self.pools.lock().await.remove(path);
     }
 
     async fn sidecar(

@@ -3820,9 +3820,25 @@ impl DataAccelerator for CayenneAccelerator {
         Some(acceleration)
     }
 
-    async fn release_relocated(&self, source: &dyn AccelerationSource) {
+    async fn release_relocated(
+        &self,
+        source: &dyn AccelerationSource,
+        registry: &AcceleratorEngineRegistry,
+    ) {
         let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
         self.relocated_catalogs.lock().remove(&metadata_dir);
+        // A Turso metastore's pool for the copy's checkpoints is the Turso engine's; see
+        // `sidecar`.
+        let turso_metastore = source
+            .acceleration()
+            .and_then(|a| a.params.get("cayenne_metastore"))
+            .is_some_and(|metastore| metastore == "turso");
+        if turso_metastore && let Some(turso) = registry.get_accelerator_engine(Engine::Turso).await
+        {
+            turso
+                .release_sidecar_for_path(&format!("{metadata_dir}/cayenne.db"))
+                .await;
+        }
     }
 
     fn acceleration_layout(&self, source: &dyn AccelerationSource) -> AccelerationLayout {

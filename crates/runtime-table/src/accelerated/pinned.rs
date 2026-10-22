@@ -135,37 +135,62 @@ impl PinState {
 /// A table's [`PinState`], shared by what loads its pinned snapshot, its scans, and
 /// what reports it.
 #[derive(Debug)]
-pub struct PinStatus(watch::Sender<PinState>);
+pub struct PinStatus {
+    state: watch::Sender<PinState>,
+    /// The pinned snapshot the table last served, while it still serves it: a table
+    /// that cannot load the snapshot the pin moves to keeps serving this one.
+    served_pin: parking_lot::Mutex<Option<u64>>,
+}
 
 impl Default for PinStatus {
     fn default() -> Self {
-        Self(watch::Sender::new(PinState::default()))
+        Self {
+            state: watch::Sender::new(PinState::default()),
+            served_pin: parking_lot::Mutex::new(None),
+        }
     }
 }
 
 impl PinStatus {
     #[must_use]
     pub fn get(&self) -> PinState {
-        self.0.borrow().clone()
+        self.state.borrow().clone()
     }
 
     /// Whether the table serves the snapshot its dataset is pinned to.
     #[must_use]
     pub fn serves_pin(&self) -> bool {
-        self.0.borrow().serves_pin()
+        self.state.borrow().serves_pin()
+    }
+
+    /// Whether the table serves a snapshot it served as its dataset's pin: the pinned
+    /// one, or the one it keeps serving because it cannot load the snapshot the pin
+    /// moved to.
+    #[must_use]
+    pub fn serves_pinned_snapshot(&self) -> bool {
+        let serves = self.state.borrow().serves;
+        serves.is_some() && serves == *self.served_pin.lock()
     }
 
     /// The state, and each change to it.
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<PinState> {
-        self.0.subscribe()
+        self.state.subscribe()
     }
 
     /// Replaces the state. Returns whether it changed other than in a reason's details,
     /// and notifies subscribers only then.
     #[must_use]
     pub fn set(&self, state: PinState) -> bool {
-        self.0.send_if_modified(|current| {
+        {
+            let mut served_pin = self.served_pin.lock();
+            if state.serves_pin() {
+                *served_pin = state.serves;
+            } else if state.serves != *served_pin {
+                *served_pin = None;
+            }
+        }
+        self.state.send_if_modified(|current| {
             let changed = current.differs_from(&state);
             *current = state;
             changed

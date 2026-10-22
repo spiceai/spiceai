@@ -4591,6 +4591,7 @@ impl DataFusion {
                     acceleration_engine,
                     Arc::clone(&publisher),
                     Arc::clone(&storage_schema),
+                    accelerated_table_provider.schema(),
                     constraints.clone(),
                     Arc::clone(&secrets),
                     Arc::clone(&self.ctx),

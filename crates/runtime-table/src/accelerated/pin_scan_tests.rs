@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::pinned::PinState;
+use super::pinned::{NotServed, PinState};
 use super::{Builder, ZeroResultsAction, refresh};
 use crate::federated::FederatedTable;
 use arrow::{
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 
 /// A serving reader with `on_zero_results: use_source` falls back to its source when its
-/// snapshot has no matching rows, except while the snapshot it serves is the pinned one.
+/// snapshot has no matching rows, except while it serves a snapshot it served as the pin.
 #[tokio::test]
 async fn a_table_serving_the_pin_never_falls_back_to_the_source() {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -82,6 +82,19 @@ async fn a_table_serving_the_pin_never_falls_back_to_the_source() {
         rows().await,
         0,
         "the pinned snapshot's rows are all it serves"
+    );
+
+    let _ = table.pin_status().set(PinState {
+        pinned: Some(40),
+        serves: Some(41),
+        not_served: Some(NotServed::LoadFailed {
+            reason: "the directory is read-only".to_string(),
+        }),
+    });
+    assert_eq!(
+        rows().await,
+        0,
+        "the pin moved to a snapshot it cannot load: it keeps serving only the snapshot it served as the pin"
     );
 
     let _ = table.pin_status().set(PinState {

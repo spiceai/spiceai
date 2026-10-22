@@ -856,6 +856,10 @@ pub trait DataAccelerator: Send + Sync {
         })
     }
 
+    /// Closes the database at `path` that [`Self::sidecar_for_path`] opened, so its file
+    /// can be deleted.
+    async fn release_sidecar_for_path(&self, _path: &str) {}
+
     /// Drops an existing table from the acceleration engine.
     ///
     /// Used by `file_update` mode to remove a table whose schema is incompatible with
@@ -1007,8 +1011,14 @@ pub trait DataAccelerator: Send + Sync {
     }
 
     /// Closes what this engine holds open for a copy made with [`Self::relocated`], so
-    /// the copy's files can be deleted. `source` carries the relocated settings.
-    async fn release_relocated(&self, _source: &dyn AccelerationSource) {}
+    /// the copy's files can be deleted. `source` carries the relocated settings, and
+    /// `registry` holds the engines that opened databases for the copy.
+    async fn release_relocated(
+        &self,
+        _source: &dyn AccelerationSource,
+        _registry: &AcceleratorEngineRegistry,
+    ) {
+    }
 
     /// Optional engine-specific [`SnapshotEngine`] used for snapshot create/extract.
     ///

@@ -772,7 +772,11 @@ impl DataAccelerator for DuckDBAccelerator {
         )
     }
 
-    async fn release_relocated(&self, source: &dyn AccelerationSource) {
+    async fn release_relocated(
+        &self,
+        source: &dyn AccelerationSource,
+        _registry: &AcceleratorEngineRegistry,
+    ) {
         if let Ok(path) = self.duckdb_file_path(source) {
             self.duckdb_factory.invalidate_file_instance(path).await;
         }

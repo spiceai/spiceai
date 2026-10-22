@@ -53,6 +53,8 @@ pub(super) struct PinnedSnapshotCopies {
     publisher: Arc<SnapshotManager>,
     /// The schema the live acceleration was created with.
     schema: SchemaRef,
+    /// The schema the live acceleration's table reports, in its engine's types.
+    table_schema: SchemaRef,
     constraints: Option<Constraints>,
     secrets: Arc<RwLock<Secrets>>,
     ctx: Arc<SessionContext>,
@@ -71,6 +73,7 @@ impl PinnedSnapshotCopies {
         engine: AccelerationEngine,
         publisher: Arc<SnapshotManager>,
         schema: SchemaRef,
+        table_schema: SchemaRef,
         constraints: Option<Constraints>,
         secrets: Arc<RwLock<Secrets>>,
         ctx: Arc<SessionContext>,
@@ -84,7 +87,9 @@ impl PinnedSnapshotCopies {
         let probe = accelerator.relocated(dataset, &table_dir)?;
         let mut probe_dataset = dataset.clone();
         probe_dataset.acceleration = Some(probe);
-        accelerator.release_relocated(&probe_dataset).await;
+        accelerator
+            .release_relocated(&probe_dataset, &registry)
+            .await;
         let claimed = tokio::task::spawn_blocking({
             let table_dir = table_dir.clone();
             move || claim(&table_dir)
@@ -109,6 +114,7 @@ impl PinnedSnapshotCopies {
             engine,
             publisher,
             schema,
+            table_schema,
             constraints,
             secrets,
             ctx,
@@ -191,7 +197,7 @@ impl PinnedSnapshotCopies {
             .acceleration
             .as_ref()
             .ok_or("the copy has no acceleration")?;
-        Ok(self
+        let provider = self
             .registry
             .create_accelerator_table(
                 copy.name.clone(),
@@ -202,7 +208,11 @@ impl PinnedSnapshotCopies {
                 Some(&copy),
                 Arc::clone(&self.ctx),
             )
-            .await?)
+            .await?;
+        // A snapshot that holds no schema of its own, such as Cayenne's, reports the
+        // dataset's current schema, so the table opened is checked against the live one.
+        refuse_different_columns(&provider.schema(), &self.table_schema)?;
+        Ok(provider)
     }
 }
 
@@ -234,7 +244,9 @@ impl PinnedCopyLoader for PinnedSnapshotCopies {
 
     async fn release(&self, snapshot_id: u64) {
         if let Some(copy) = self.copy_dataset(snapshot_id) {
-            self.accelerator.release_relocated(&copy).await;
+            self.accelerator
+                .release_relocated(&copy, &self.registry)
+                .await;
         }
         remove_dir(&self.copy_dir(snapshot_id)).await;
     }
