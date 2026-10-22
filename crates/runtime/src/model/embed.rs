@@ -155,6 +155,8 @@ pub async fn try_to_embedding(
         }),
         #[cfg(feature = "models")]
         EmbeddingPrefix::HuggingFace => {
+            // Parsing loads an `hf_token` the Spicepod does not set from the secret stores.
+            let token_in_spicepod = params.contains_key("hf_token");
             let typed = embedding_params::huggingface::HuggingFaceEmbeddingParams::try_from_params(
                 &component_name,
                 params,
@@ -162,7 +164,14 @@ pub async fn try_to_embedding(
             )
             .await
             .map_err(params_err)?;
-            huggingface(&component.name, model_id, &typed, embeddings_cache.clone()).await
+            huggingface(
+                &component.name,
+                model_id,
+                &typed,
+                token_in_spicepod,
+                embeddings_cache.clone(),
+            )
+            .await
         }
         #[cfg(not(feature = "models"))]
         EmbeddingPrefix::HuggingFace => Err(EmbedError::UnknownModelSource {
@@ -410,10 +419,12 @@ async fn huggingface(
     name: &String,
     model_id: Option<String>,
     params: &embedding_params::huggingface::HuggingFaceEmbeddingParams,
+    token_in_spicepod: bool,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let hub = llms::hf::HubParams {
         token: params.hf_token.as_ref(),
+        token_in_spicepod,
         endpoint: params.hf_endpoint.as_deref(),
     };
     let pooling = params.pooling.map(embedding_params::Pooling::as_str);
