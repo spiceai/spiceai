@@ -1618,11 +1618,22 @@ async fn metrics_scenario(
     assert_eq!(rows(&reader, modules).await?.len(), 3);
 
     // Load a second snapshot, so a rollback to snapshot 0 is older than the loaded one.
+    // Copied continuously: the writer can publish a snapshot of the unchanged rows
+    // before the grown one, so snapshot 1 may still hold 3 rows.
     std::fs::write(dir.path().join("modules.csv"), GROWN_CSV)?;
     wait_for_rows(&writer, modules, 5).await?;
-    wait_for_writer_snapshot(rustfs, &prefix, modules, 1).await?;
-    replicate_snapshots(rustfs, &prefix).await?;
-    wait_for_rows(&reader, modules, 5).await?;
+    let deadline = Instant::now() + Duration::from_mins(1);
+    loop {
+        replicate_snapshots(rustfs, &prefix).await?;
+        if rows(&reader, modules).await?.len() == 5 {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the reader should follow the writer to 5 rows"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     writer.shutdown().await;
     // Polls that find nothing newer are skipped fetches.
     wait_for_a_skipped_fetch(&snapshot_mode, Duration::from_secs(30)).await?;
