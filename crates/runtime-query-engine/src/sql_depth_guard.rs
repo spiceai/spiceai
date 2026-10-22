@@ -193,7 +193,8 @@ impl Visitor for DepthCollector {
 /// A subquery in `FROM` or in an expression is a [`Query`] of its own, which
 /// the statement visitor reaches and checks separately.
 fn check_named_expr_depths(query: &Query) -> DFResult<()> {
-    let check = |expr: &Expr| check_expr_depth(expr, MAX_UNPROTECTED_EXPR_DEPTH, too_deep_named_error);
+    let check =
+        |expr: &Expr| check_expr_depth(expr, MAX_UNPROTECTED_EXPR_DEPTH, too_deep_named_error);
     if let Some(OrderBy {
         kind: OrderByKind::Expressions(order_by),
         ..
