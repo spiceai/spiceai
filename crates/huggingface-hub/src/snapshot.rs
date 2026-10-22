@@ -278,18 +278,17 @@ impl Snapshot {
                 )
             };
             let file = self.files.get(path).ok_or_else(missing_file)?;
-            match self
+            if let Some(cached) = self
                 .cache
                 .cached_file(&self.repo, &self.commit, path, Some(file.size))
                 .await
             {
-                Some(cached) => located.push(cached),
-                None => {
-                    // A file only the cache knows of is one whose blob went missing.
-                    let entry = file.entry.clone().ok_or_else(missing_file)?;
-                    located.push(self.dir().join(relative));
-                    missing.push(entry);
-                }
+                located.push(cached);
+            } else {
+                // A file only the cache knows of is one whose blob went missing.
+                let entry = file.entry.clone().ok_or_else(missing_file)?;
+                located.push(self.dir().join(relative));
+                missing.push(entry);
             }
         }
 
@@ -328,7 +327,8 @@ impl Snapshot {
             .buffer_unordered(MAX_CONCURRENT_FILES)
             .try_collect::<Vec<_>>()
             .await;
-        if let Err((path, error)) = result {
+        if let Err(failure) = result {
+            let (path, error) = *failure;
             return Err(context.error(Some(&path), Cause::Fetch(error)));
         }
         if log {
@@ -350,7 +350,7 @@ impl Snapshot {
         &self,
         entry: TreeEntry,
         progress: Arc<Progress>,
-    ) -> Result<(), (String, FetchError)> {
+    ) -> Result<(), Box<(String, FetchError)>> {
         download::fetch_blob(
             &self.hub,
             &self.cache,
@@ -360,7 +360,7 @@ impl Snapshot {
             &progress,
         )
         .await
-        .map_err(|error| (entry.path.clone(), error))?;
+        .map_err(|error| Box::new((entry.path.clone(), error)))?;
         self.cache
             .link(
                 &self.repo,
@@ -371,13 +371,13 @@ impl Snapshot {
             .await
             .map(|_| ())
             .map_err(|source| {
-                (
+                Box::new((
                     entry.path.clone(),
                     FetchError::Write {
                         path: self.dir().join(&entry.path),
                         source,
                     },
-                )
+                ))
             })
     }
 }
@@ -561,12 +561,12 @@ pub fn progress_line(received: u64, total: u64, rate: u64) -> String {
     } else {
         format!("{rate_value:.0} {}/s", UNITS[rate_unit])
     };
-    let left = if rate == 0 {
-        String::new()
-    } else {
-        let seconds = total.saturating_sub(received) / rate;
-        format!(", about {} left", rough_duration(seconds))
-    };
+    let left = total
+        .saturating_sub(received)
+        .checked_div(rate)
+        .map_or_else(String::new, |seconds| {
+            format!(", about {} left", rough_duration(seconds))
+        });
     format!("{amounts} ({percent}%) at {speed}{left}")
 }
 

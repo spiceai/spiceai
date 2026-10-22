@@ -120,7 +120,11 @@ fn requester() -> Requester {
 }
 
 fn weights(len: usize) -> Bytes {
-    Bytes::from((0..len).map(|i| (i * 31 % 251) as u8).collect::<Vec<u8>>())
+    Bytes::from(
+        (0..len)
+            .map(|i| u8::try_from(i * 31 % 251).expect("a remainder of 251 fits in a byte"))
+            .collect::<Vec<u8>>(),
+    )
 }
 
 fn model_files() -> Vec<(&'static str, MockFile)> {
@@ -575,6 +579,64 @@ async fn a_hub_outage_with_a_cold_cache_fails_with_the_hub_error() {
         "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the Hugging Face Hub returned HTTP 503 after 5 attempt(s): The Hub is down. Spice retries the download; check the network connection. See: https://spiceai.org/docs/components/models/huggingface"
     );
     assert!(!error.is_configuration_error());
+}
+
+#[tokio::test]
+async fn a_renamed_repo_is_read_through_the_hubs_redirect() {
+    // The Hub redirects every request that names a repository's old name to its new one, so
+    // a Spicepod written before a rename keeps loading, as it does with `huggingface_hub`.
+    let fixture = Fixture::new().await;
+    let files = model_files();
+    let weights = files[2].1.clone();
+    fixture.mock.commit(MODEL, C1, files);
+    fixture.mock.branch(MODEL, "main", C1);
+    fixture.mock.rename("models/o/old", MODEL);
+
+    let snapshot = Snapshot::open(
+        fixture.settings(&[]).await,
+        requester(),
+        RepoId::new(RepoType::Model, "o", "old").expect("a valid repository"),
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the renamed repository opens: {e}"));
+    assert_eq!(snapshot.commit(), C1);
+    let paths = snapshot
+        .download(&["config.json", "model.safetensors"])
+        .await
+        .unwrap_or_else(|e| panic!("the renamed repository's files download: {e}"));
+    assert_eq!(
+        std::fs::read(&paths[1]).expect("the weights"),
+        weights.bytes.as_ref()
+    );
+    // The cache keeps the name the Spicepod gave, as `huggingface_hub` does.
+    assert_eq!(
+        paths[1],
+        fixture
+            .cache()
+            .join("models--o--old")
+            .join("snapshots")
+            .join(C1)
+            .join("model.safetensors")
+    );
+    // Every request went to the old name first and was redirected.
+    let seen: Vec<String> = fixture
+        .mock
+        .seen()
+        .into_iter()
+        .filter(|seen| !seen.cdn)
+        .map(|seen| seen.path)
+        .collect();
+    assert!(
+        seen.iter()
+            .any(|path| path.starts_with("/api/models/o/old/revision/main"))
+            && seen
+                .iter()
+                .any(|path| path.starts_with("/api/models/o/m/revision/main"))
+            && seen.iter().any(|path| path.starts_with("/o/old/resolve/"))
+            && seen.iter().any(|path| path.starts_with("/o/m/resolve/")),
+        "{seen:#?}"
+    );
 }
 
 #[tokio::test]

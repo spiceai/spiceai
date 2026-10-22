@@ -78,7 +78,7 @@ impl DownloadContext {
         DownloadError {
             context: Box::new(self.clone()),
             file: file.map(ToString::to_string),
-            cause,
+            cause: Box::new(cause),
         }
     }
 }
@@ -112,7 +112,7 @@ pub(crate) enum Cause {
 pub struct DownloadError {
     context: Box<DownloadContext>,
     file: Option<String>,
-    cause: Cause,
+    cause: Box<Cause>,
 }
 
 impl DownloadError {
@@ -132,7 +132,7 @@ impl DownloadError {
                 revision,
             )),
             file: None,
-            cause: Cause::Settings(source),
+            cause: Box::new(Cause::Settings(source)),
         }
     }
 
@@ -150,7 +150,7 @@ impl DownloadError {
         let invalid = || DownloadError {
             context: Box::new(DownloadContext::unresolved(requester, repo, revision)),
             file: None,
-            cause: Cause::InvalidRepo,
+            cause: Box::new(Cause::InvalidRepo),
         };
         let (owner, name) = repo.split_once('/').ok_or_else(invalid)?;
         RepoId::new(kind, owner, name).map_err(|_| invalid())
@@ -189,7 +189,7 @@ impl DownloadError {
     /// cache `hf download` can fill can clear while Spice runs.
     #[must_use]
     pub fn is_configuration_error(&self) -> bool {
-        match &self.cause {
+        match self.cause.as_ref() {
             Cause::Settings(_)
             | Cause::Unusable { .. }
             | Cause::InvalidPath
@@ -229,7 +229,7 @@ impl DownloadError {
         let context = self.context.as_ref();
         let token = context.token.as_ref();
         let no_token_fix = "set `hf_token`, set `HF_TOKEN`, or run `hf auth login`";
-        match &self.cause {
+        match self.cause.as_ref() {
             Cause::Hub(error)
             | Cause::Fetch(FetchError::Hub {
                 source: error,

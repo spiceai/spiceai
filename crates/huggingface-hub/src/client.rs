@@ -813,7 +813,8 @@ impl Hub {
     }
 
     /// Sends an API request and reads its whole body, returning the body and the response
-    /// headers.
+    /// headers. A redirect within the Hub's origin is followed: the Hub moves the API of a
+    /// renamed repository to its new name that way.
     ///
     /// A body that breaks off part way, by a reset connection or a read timeout, is requested
     /// again like a request that failed to connect, from the same budget of attempts: an API
@@ -827,7 +828,7 @@ impl Hub {
         url: Url,
         form: Option<String>,
     ) -> Result<(HeaderMap, Bytes)> {
-        let request = HubRequest {
+        let mut request = HubRequest {
             repo,
             revision,
             method,
@@ -836,8 +837,22 @@ impl Hub {
             form,
         };
         let mut attempts = Attempts::new();
+        let mut redirects = 0;
         loop {
             let mut response = self.send_with_retry(&request, &mut attempts).await?;
+            if response.status().is_redirection() {
+                ensure!(
+                    redirects < MAX_REDIRECTS,
+                    UnexpectedResponseSnafu {
+                        repo: repo.clone(),
+                        message: format!("a request redirected more than {MAX_REDIRECTS} times"),
+                    }
+                );
+                redirects += 1;
+                self.follow_redirect(&mut request, &response)?;
+                attempts = Attempts::new();
+                continue;
+            }
             let headers = std::mem::take(response.headers_mut());
             let source = match response.bytes().await {
                 Ok(body) => return Ok((headers, body)),
@@ -858,6 +873,52 @@ impl Hub {
             );
             attempts.wait(None).await;
         }
+    }
+
+    /// Points `request` at the location the redirect `response` names. Only a location on the
+    /// Hub's origin is followed: an API response anywhere else is not the Hub's.
+    fn follow_redirect(
+        &self,
+        request: &mut HubRequest<'_>,
+        response: &reqwest::Response,
+    ) -> Result<()> {
+        let repo = request.repo;
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|location| request.url.join(location).ok())
+            .context(UnexpectedResponseSnafu {
+                repo: repo.clone(),
+                message: "a request redirected without a location".to_string(),
+            })?;
+        ensure!(
+            self.is_endpoint_origin(&location),
+            UnexpectedResponseSnafu {
+                repo: repo.clone(),
+                message: format!(
+                    "a request redirected off the Hub, to {}, which was not followed",
+                    location.origin().ascii_serialization()
+                ),
+            }
+        );
+        tracing::debug!(
+            "Following the Hub's redirect of a request for Hugging Face {} '{repo}' to {}",
+            repo.kind(),
+            location.path()
+        );
+        // A 303, and a 301 or 302 after a POST, continue as a GET (RFC 9110, section 15.4); a
+        // 307 or 308 repeats the request as it was.
+        let status = response.status();
+        if status == StatusCode::SEE_OTHER
+            || (matches!(status, StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND)
+                && request.method == Method::POST)
+        {
+            request.method = Method::GET;
+            request.form = None;
+        }
+        request.url = location;
+        Ok(())
     }
 
     async fn request(

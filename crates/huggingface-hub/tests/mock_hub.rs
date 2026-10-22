@@ -127,6 +127,8 @@ struct MockState {
     cdn_base: String,
     /// CDN blobs by SHA-256.
     blobs: HashMap<String, Bytes>,
+    /// Renamed repositories: the old `<plural>/<owner>/<name>` and the new.
+    renamed: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -186,6 +188,15 @@ impl MockHub {
             .or_default()
             .branches
             .insert(branch.to_string(), commit.to_string());
+    }
+
+    /// Renames the repository `new` (`models/o/m`) from `old`, as the Hub does: a request that
+    /// names `old` is redirected to the same path under `new`.
+    pub fn rename(&self, old: &str, new: &str) {
+        self.0
+            .lock()
+            .renamed
+            .insert(old.to_string(), new.to_string());
     }
 
     pub fn gate(&self, repo: &str) {
@@ -282,6 +293,32 @@ fn hub_error(status: StatusCode, code: &str, message: &str) -> Response<Body> {
     )
 }
 
+/// Where the Hub redirects a request for a renamed repository: the same path, relative, under
+/// the new name, for the API (`/api/models/o/old/…`) and for files (`/o/old/resolve/…`).
+fn renamed_location(renamed: &HashMap<String, String>, path: &str, query: &str) -> Option<String> {
+    // A model's file URLs carry no `models/` prefix.
+    let in_files = |repo: &str| repo.strip_prefix("models/").unwrap_or(repo).to_string();
+    renamed.iter().find_map(|(old, new)| {
+        [
+            (format!("/api/{old}/"), format!("/api/{new}/")),
+            (
+                format!("/{}/", in_files(old)),
+                format!("/{}/", in_files(new)),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(from, to)| {
+            let rest = path.strip_prefix(&from)?;
+            let query = if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{query}")
+            };
+            Some(format!("{to}{rest}{query}"))
+        })
+    })
+}
+
 /// The byte range a `Range` header asks of a file of `size` bytes, inclusive.
 fn requested_range(range: Option<&str>, size: u64) -> Option<(u64, u64)> {
     let range = range?.strip_prefix("bytes=")?;
@@ -341,19 +378,17 @@ fn ranged(state: &mut MockState, bytes: &Bytes, range: Option<&str>) -> Response
         // reach the client first, so the break comes mid-body rather than before the response.
         let half = body.slice(..length / 2);
         let stream = futures::stream::unfold(Some(half), |half| async move {
-            match half {
-                Some(half) => Some((Ok::<Bytes, std::io::Error>(half), None)),
-                None => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    Some((
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionReset,
-                            "the mock reset the connection",
-                        )),
-                        None,
-                    ))
-                }
+            if let Some(half) = half {
+                return Some((Ok::<Bytes, std::io::Error>(half), None));
             }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Some((
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "the mock reset the connection",
+                )),
+                None,
+            ))
         });
         return response(status, &headers, Body::from_stream(stream));
     }
@@ -401,6 +436,13 @@ async fn hub_handler(State(mock): State<MockHub>, request: Request<Body>) -> Res
         return hub_error(StatusCode::SERVICE_UNAVAILABLE, "", "Try again later.");
     }
     let query = request.uri().query().unwrap_or_default().to_string();
+    if let Some(location) = renamed_location(&state.renamed, &path, &query) {
+        return response(
+            StatusCode::TEMPORARY_REDIRECT,
+            &[("location", location)],
+            Body::empty(),
+        );
+    }
     let range = request
         .headers()
         .get("range")

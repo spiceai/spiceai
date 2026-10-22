@@ -224,8 +224,7 @@ pub async fn fetch_blob(
     }
     let blobs = blob
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| cache.root().to_path_buf());
+        .map_or_else(|| cache.root().to_path_buf(), Path::to_path_buf);
     crate::cache::ensure_dir(&blobs)
         .await
         .map_err(FetchError::write(&blobs))?;
@@ -333,7 +332,7 @@ async fn download(
         Ok((written, hasher.finish()))
     });
 
-    let received = async {
+    let streamed = async {
         let Ok(existing) = start.await else {
             return Ok(());
         };
@@ -364,7 +363,7 @@ async fn download(
         path: incomplete.to_path_buf(),
         source: io::Error::other(error),
     })?;
-    received?;
+    streamed?;
     let (written, actual) = written.map_err(FetchError::write(incomplete))?;
     if written != size {
         // Too few bytes resume next time; too many cannot be right.

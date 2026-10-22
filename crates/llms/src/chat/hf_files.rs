@@ -90,44 +90,43 @@ static PICKLES: LazyLock<Option<Regex>> =
 pub async fn download(snapshot: &Snapshot, gguf: Option<&str>) -> Result<PathBuf, DownloadError> {
     let names: Vec<&str> = snapshot.files().map(|file| file.path.as_str()).collect();
     let mut paths = configs(&names);
-    match gguf {
-        Some(gguf) => paths.push(gguf.to_string()),
-        None => {
-            for alternatives in [
-                ["tokenizer.json", "tekken.json"],
-                ["config.json", "params.json"],
-            ] {
-                if !alternatives.iter().any(|name| names.contains(name)) {
-                    return Err(DownloadError::missing(
-                        snapshot,
-                        format!("'{}' or '{}'", alternatives[0], alternatives[1]),
-                    ));
-                }
+    if let Some(gguf) = gguf {
+        paths.push(gguf.to_string());
+    } else {
+        for alternatives in [
+            ["tokenizer.json", "tekken.json"],
+            ["config.json", "params.json"],
+        ] {
+            if !alternatives.iter().any(|name| names.contains(name)) {
+                return Err(DownloadError::missing(
+                    snapshot,
+                    format!("'{}' or '{}'", alternatives[0], alternatives[1]),
+                ));
             }
-            let weights = match weights(&names) {
-                Some(Weights::Index) => {
-                    let index = snapshot.fetch_quietly(&[SAFETENSOR_INDEX]).await?;
-                    let index = index.first().cloned().unwrap_or_default();
-                    let contents = tokio::fs::read_to_string(&index).await.map_err(|error| {
-                        DownloadError::unusable(
-                            snapshot,
-                            format!("'{SAFETENSOR_INDEX}' could not be read ({error})"),
-                        )
-                    })?;
-                    shards(&contents, |shard| names.contains(&shard)).map_err(|why| {
-                        DownloadError::unusable(snapshot, format!("'{SAFETENSOR_INDEX}' {why}"))
-                    })?
-                }
-                Some(Weights::Files(files)) => files,
-                None => {
-                    return Err(DownloadError::missing(
-                        snapshot,
-                        "weights the model can load ('model.safetensors', 'model-00001-of-0000N.safetensors', 'consolidated.safetensors' or sharded 'pytorch_model-00001-of-0000N.bin')",
-                    ));
-                }
-            };
-            paths.extend(weights);
         }
+        let weights = match weights(&names) {
+            Some(Weights::Index) => {
+                let index = snapshot.fetch_quietly(&[SAFETENSOR_INDEX]).await?;
+                let index = index.first().cloned().unwrap_or_default();
+                let contents = tokio::fs::read_to_string(&index).await.map_err(|error| {
+                    DownloadError::unusable(
+                        snapshot,
+                        format!("'{SAFETENSOR_INDEX}' could not be read ({error})"),
+                    )
+                })?;
+                shards(&contents, |shard| names.contains(&shard)).map_err(|why| {
+                    DownloadError::unusable(snapshot, format!("'{SAFETENSOR_INDEX}' {why}"))
+                })?
+            }
+            Some(Weights::Files(files)) => files,
+            None => {
+                return Err(DownloadError::missing(
+                    snapshot,
+                    "weights the model can load ('model.safetensors', 'model-00001-of-0000N.safetensors', 'consolidated.safetensors' or sharded 'pytorch_model-00001-of-0000N.bin')",
+                ));
+            }
+        };
+        paths.extend(weights);
     }
     paths.sort();
     paths.dedup();
