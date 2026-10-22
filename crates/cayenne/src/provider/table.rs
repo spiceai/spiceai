@@ -3617,6 +3617,7 @@ impl CayenneTableProviderBuilder {
     /// `detection`. A partition follows that table turning conflict detection off; see
     /// [`CayenneTableProviderOpenOptions::partitioned_table_conflict_detection`].
     #[must_use]
+    #[cfg(feature = "partition-table-provider")]
     pub(crate) fn with_partitioned_table_conflict_detection(
         mut self,
         detection: PkConflictDetection,
