@@ -350,7 +350,13 @@ async fn run_scans(ctx: &Arc<SessionContext>) {
         let (mut cpu, mut wall, mut out) = (Vec::new(), Vec::new(), String::new());
         for _ in 0..reps {
             let (c0, w0) = (cpu_seconds(), Instant::now());
-            let batches = ctx.sql(sql).await.expect("plan").collect().await.expect("scan");
+            let batches = ctx
+                .sql(sql)
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("scan");
             cpu.push((cpu_seconds() - c0) * 1e3);
             wall.push(w0.elapsed().as_secs_f64() * 1e3);
             out = arrow::util::pretty::pretty_format_batches(&batches)
@@ -366,7 +372,13 @@ async fn run_scans(ctx: &Arc<SessionContext>) {
         let n = cpu.len();
         println!(
             "scan n={n} cpu_ms med={:.1} min={:.1} max={:.1} wall_ms med={:.1} min={:.1} max={:.1} result={} sql={sql}",
-            cpu[n / 2], cpu[0], cpu[n - 1], wall[n / 2], wall[0], wall[n - 1], out.trim()
+            cpu[n / 2],
+            cpu[0],
+            cpu[n - 1],
+            wall[n / 2],
+            wall[0],
+            wall[n - 1],
+            out.trim()
         );
     }
 }
@@ -380,13 +392,19 @@ async fn run_appends(table: &Arc<CayenneTableProvider>, rows: usize, data: &std:
     let (cpu0, wall0) = (cpu_seconds(), Instant::now());
     for a in 0..appends {
         let start = rows + a * 2_048;
-        let exec = MemorySourceConfig::try_new_exec(&[batches_of(start..start + 2_048, 2_048)], schema(), None)
-            .expect("exec");
+        let exec = MemorySourceConfig::try_new_exec(
+            &[batches_of(start..start + 2_048, 2_048)],
+            schema(),
+            None,
+        )
+        .expect("exec");
         let plan = table
             .insert_into(&state.state(), exec, InsertOp::Append)
             .await
             .expect("append plan");
-        datafusion_physical_plan::collect(plan, state.task_ctx()).await.expect("append");
+        datafusion_physical_plan::collect(plan, state.task_ctx())
+            .await
+            .expect("append");
     }
     let inlined = table.checkpoint_inlined_data().await.expect("checkpoint");
     let (files1, bytes1) = (count_files(data), walk_size(data));
@@ -402,8 +420,16 @@ async fn run_appends(table: &Arc<CayenneTableProvider>, rows: usize, data: &std:
     let (cpu0, wall0) = (cpu_seconds(), Instant::now());
     let mut passes = 0;
     loop {
-        assert!(cayenne::drain_compaction_tasks(Duration::from_secs(120)).await, "compaction did not drain");
-        if passes >= 8 || !table.compact_current_snapshot_small_files().await.expect("compact") {
+        assert!(
+            cayenne::drain_compaction_tasks(Duration::from_secs(120)).await,
+            "compaction did not drain"
+        );
+        if passes >= 8
+            || !table
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("compact")
+        {
             break;
         }
         passes += 1;
