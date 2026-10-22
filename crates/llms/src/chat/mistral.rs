@@ -49,7 +49,6 @@ use mistralrs::{
     SamplingParams, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 
-use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use snafu::ResultExt;
 use std::{
@@ -444,16 +443,21 @@ impl MistralLlama {
         }
     }
 
-    pub async fn from_hf(
-        model_id: &str,
+    /// Loads a model from `dir`, a local copy of a Hugging Face model repository's files (the
+    /// cache's snapshot of it). mistral.rs reads it as a local model directory, so it never
+    /// downloads anything or reads a token: Spice downloaded the files.
+    ///
+    /// `gguf_filename` is a GGUF file's path in the directory; when set, the model is loaded
+    /// from it.
+    pub async fn from_snapshot(
+        dir: &Path,
         arch: Option<&str>,
-        hf_token_literal: Option<&SecretString>,
-        gguf_filename: Option<PathBuf>,
+        gguf_filename: Option<&str>,
         chat_template_literal: Option<&str>,
         ring_config_path: Option<tempfile::TempPath>,
         reasoning: ReasoningDefault<'_>,
     ) -> Result<Self> {
-        let model_parts: Vec<&str> = model_id.split(':').collect();
+        let model_id = dir.to_string_lossy().to_string();
         let chat_template = chat_template_literal.map(ToString::to_string);
 
         // Loading the GGUF directly (as if it is a quantized model, although it need not be quantized).
@@ -463,8 +467,8 @@ impl MistralLlama {
                     Ok(GGUFLoaderBuilder::new(
                         chat_template.clone(),
                         None,
-                        model_parts[0].to_string(),
-                        vec![gguf.to_string_lossy().to_string()],
+                        model_id.clone(),
+                        vec![gguf.to_string()],
                         GGUFSpecificConfig::default(),
                         false,
                         None,
@@ -495,7 +499,7 @@ impl MistralLlama {
                         MultimodalSpecificConfig::default(),
                         chat_template,
                         None,
-                        Some(model_parts[0].to_string()),
+                        Some(model_id.clone()),
                         None,
                     );
 
@@ -508,7 +512,7 @@ impl MistralLlama {
                         NormalSpecificConfig::default(),
                         chat_template,
                         None,
-                        Some(model_parts[0].to_string()),
+                        Some(model_id.clone()),
                         false,
                         None,
                     );
@@ -523,18 +527,15 @@ impl MistralLlama {
             };
 
         let device = Self::get_device();
-        let token_source = hf_token_literal.map_or(TokenSource::CacheToken, |secret| {
-            tracing::debug!("A HuggingFace token was specified in parameters. The specified token will be used instead of any system/environment defaults.");
-            TokenSource::Literal(secret.expose_secret().to_string())
-        });
-
         let paged_attn_config = Self::paged_attention_config(&device);
         let paged_attn_requested = paged_attn_config.is_some();
 
+        // A model id that names an existing directory is read from it, with no revision and
+        // no token: the loader lists and opens the directory's files.
         let pipeline = loader?
             .load_model_from_hf(
-                model_parts.get(1).map(|&x| x.to_string()),
-                token_source,
+                None,
+                TokenSource::None,
                 &ModelDType::Auto,
                 &device,
                 false,

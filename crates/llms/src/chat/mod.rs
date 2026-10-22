@@ -42,6 +42,8 @@ use async_openai::types::chat::{
 #[cfg(feature = "local_llm")]
 pub mod engine;
 #[cfg(feature = "local_llm")]
+pub mod hf_files;
+#[cfg(feature = "local_llm")]
 pub mod mistral;
 pub mod nsql;
 #[cfg(feature = "local_llm")]
@@ -350,15 +352,26 @@ pub fn message_to_mistral(
     }
 }
 
-/// Create a model to run locally, via files from Huggingface.
+/// The Hugging Face Hub settings a model names: its `hf_token` and `hf_endpoint`, which the
+/// environment's settings fill in (see [`huggingface_hub::settings`]).
+#[cfg(feature = "local_llm")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HubParams<'a> {
+    pub token: Option<&'a SecretString>,
+    pub endpoint: Option<&'a str>,
+}
+
+/// Create a model to run locally, from a Hugging Face model repository.
 ///
-/// `model_id` uniquely refers to a Huggingface model.
+/// `model_id` names the repository, `org/name`, with an optional `:revision`. Spice downloads
+/// the files the engine loads into the Hugging Face cache ([`hf_files`]), and the engine loads
+/// the cache's snapshot directory: it never downloads anything itself.
 /// `model_type` is the type of model, if needed to be explicit. Often this can
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
 /// `gguf_files` are the GGUF files within the huggingface model repo to load the model from,
-///    in the order the model lists them. A registered engine that serves them gets them all,
-///    downloaded; mistral.rs loads the first.
-/// `hf_token_literal` is a literal string of the Huggingface API token. If not provided, the token will be read from the HF token cache (i.e. `~/.cache/huggingface/token` or set via `HF_TOKEN_PATH`).
+///    in the order the model lists them: every shard, and any MTP draft head. A registered
+///    engine that serves them gets them all; mistral.rs loads the first.
+/// `hub` is the model's `hf_token` and `hf_endpoint`.
 /// `distributed` optionally runs the model tensor-parallel across multiple nodes.
 /// `reasoning` names the model and its `reasoning_effort` default for the load-time check.
 #[cfg(feature = "local_llm")]
@@ -366,15 +379,29 @@ pub async fn create_hf_model(
     model_id: &str,
     model_type: Option<&str>,
     gguf_files: &[PathBuf],
-    hf_token_literal: Option<&SecretString>,
+    hub: HubParams<'_>,
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
     reasoning: ReasoningDefault<'_>,
 ) -> Result<Arc<dyn Chat>> {
+    let gguf = gguf_files
+        .iter()
+        .map(|file| {
+            file.to_str().ok_or_else(|| Error::FailedToLoadModel {
+                source: format!("the GGUF path '{}' is not valid UTF-8", file.display()).into(),
+            })
+        })
+        .collect::<Result<Vec<&str>>>()?;
+    let dir = hf_files::download_model(model_id, &gguf, hub, reasoning.model_name)
+        .await
+        .map_err(|error| Error::FailedToDownloadModel {
+            configuration: error.is_configuration_error(),
+            source: Box::new(error),
+        })?;
     if distributed.is_none()
         && let Some(engine) = engine::engine_for(gguf_files)
     {
-        let weights = download_hf_files(model_id, gguf_files, hf_token_literal).await?;
+        let weights: Vec<PathBuf> = gguf_files.iter().map(|file| dir.join(file)).collect();
         let options = LocalModelOptions {
             chat_template_literal,
             reasoning,
@@ -395,71 +422,16 @@ pub async fn create_hf_model(
         unsafe { std::env::remove_var("RING_CONFIG") };
         None
     };
-    mistral::MistralLlama::from_hf(
-        model_id,
+    mistral::MistralLlama::from_snapshot(
+        &dir,
         model_type,
-        hf_token_literal,
-        gguf_files.first().cloned(),
+        gguf.first().copied(),
         chat_template_literal,
         ring_config,
         reasoning,
     )
     .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
-}
-
-/// The lock that serializes this process's downloads of one Hugging Face file.
-#[cfg(feature = "local_llm")]
-fn download_lock(file: &str) -> Arc<parking_lot::Mutex<()>> {
-    static LOCKS: std::sync::LazyLock<
-        parking_lot::Mutex<std::collections::HashMap<String, Arc<parking_lot::Mutex<()>>>>,
-    > = std::sync::LazyLock::new(Default::default);
-    Arc::clone(LOCKS.lock().entry(file.to_string()).or_default())
-}
-
-/// Downloads `files` of the Hugging Face model `model_id` (`<repo>` or `<repo>:<revision>`)
-/// into the Hugging Face cache and returns their local paths. It resolves the cache, the
-/// revision and the token the way the mistral.rs engine does for the same model, so either
-/// engine finds the other's downloads.
-#[cfg(feature = "local_llm")]
-pub async fn download_hf_files(
-    model_id: &str,
-    files: &[PathBuf],
-    hf_token_literal: Option<&SecretString>,
-) -> Result<Vec<PathBuf>> {
-    use secrecy::ExposeSecret;
-
-    let (repo, revision) = model_id.split_once(':').unwrap_or((model_id, "main"));
-    let token = hf_token_literal.map_or(mistralrs_core::TokenSource::CacheToken, |token| {
-        mistralrs_core::TokenSource::Literal(token.expose_secret().to_string())
-    });
-    let (repo, revision, files) = (repo.to_string(), revision.to_string(), files.to_vec());
-    tokio::task::spawn_blocking(move || {
-        files
-            .iter()
-            .map(|file| {
-                let file_name = file.to_string_lossy();
-                // The Hub client locks a file while it downloads it, and a second download of
-                // the same file fails on that lock instead of waiting. Two models listing one
-                // GGUF load at once, so they take turns, and the second finds it cached.
-                let lock = download_lock(&format!("{repo}@{revision}/{file_name}"));
-                let _turn = lock.lock();
-                mistralrs_core::get_model_file(&repo, &revision, &file_name, &token).map_err(|e| {
-                    Error::FailedToLoadModel {
-                        source: format!(
-                            "could not download '{}' from Hugging Face model '{repo}': {e}",
-                            file.display()
-                        )
-                        .into(),
-                    }
-                })
-            })
-            .collect()
-    })
-    .await
-    .map_err(|e| Error::FailedToLoadModel {
-        source: Box::new(e),
-    })?
 }
 
 /// Knobs pushed into the loader for a locally served model. Grouped so that adding one is

@@ -31,10 +31,15 @@ use crate::{FILE, MODEL, REVISION, request};
 /// The GGUF in the Hugging Face cache, downloaded the way `create_hf_model` downloads it,
 /// so it waits for, rather than races, another test's download of the same file.
 async fn local_gguf() -> PathBuf {
-    llms::chat::download_hf_files(&format!("{MODEL}:{REVISION}"), &[PathBuf::from(FILE)], None)
-        .await
-        .expect("the GGUF downloads")
-        .remove(0)
+    llms::chat::hf_files::download_model(
+        &format!("{MODEL}:{REVISION}"),
+        &[FILE],
+        llms::chat::HubParams::default(),
+        "qwen3-0.6b",
+    )
+    .await
+    .expect("the GGUF downloads")
+    .join(FILE)
 }
 
 /// Questions with one right answer, and that answer, which a reply must end with.

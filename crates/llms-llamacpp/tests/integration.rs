@@ -50,7 +50,7 @@ pub(crate) async fn qwen3() -> Arc<dyn Chat> {
         &format!("{MODEL}:{REVISION}"),
         None,
         &file,
-        None,
+        llms::chat::HubParams::default(),
         None,
         None,
         ReasoningDefault {

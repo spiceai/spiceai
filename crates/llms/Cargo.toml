@@ -32,6 +32,7 @@ google-genai = { path = "../google-genai" }
 governor.workspace = true
 
 hf-hub.workspace = true
+huggingface-hub = { path = "../huggingface-hub" }
 http.workspace = true
 insta = { workspace = true, features = ["filters"] }
 itertools.workspace = true
@@ -69,7 +70,6 @@ cudarc = { version = "0.19", optional = true, features = [
 either = "1.15.0"
 indexmap.workspace = true
 linkme.workspace = true
-parking_lot.workspace = true
 tempfile.workspace = true
 token_provider = { path = "../token_provider" }
 

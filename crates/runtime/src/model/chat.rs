@@ -434,7 +434,10 @@ async fn huggingface(
     };
 
     let model_type = params.model_type.as_deref();
-    let hf_token = params.hf_token.as_ref();
+    let hub = llms::chat::HubParams {
+        token: params.hf_token.as_ref(),
+        endpoint: params.hf_endpoint.as_deref(),
+    };
 
     // For GGUF models, we require user specify via `.files[].path`: the shards of a split
     // GGUF, and an MTP draft head, are each listed.
@@ -471,7 +474,7 @@ async fn huggingface(
         &id,
         model_type,
         &gguf_files,
-        hf_token,
+        hub,
         chat_template_literal,
         distributed,
         llms::chat::ReasoningDefault {
