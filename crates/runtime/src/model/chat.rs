@@ -69,20 +69,36 @@ use crate::{
 use runtime_parameters_typed::TypedParams;
 use runtime_secrets::Secrets;
 use runtime_tools::options::SpiceToolsOptions;
+use tools::SpiceModelTool;
 
 pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
 
-/// A loaded chat model, both as `/v1/chat/completions` serves it and as `/v1/decisions`
-/// uses it.
+/// A loaded chat model, as `/v1/chat/completions` serves it, as `/v1/decisions` uses it, and
+/// as `/v1/messages` runs Spice's tools for it.
 pub struct LoadedChatModel {
     /// The model with the runtime tools its Spicepod `tools` param enables.
     pub chat: Arc<dyn Chat>,
     /// The same model — same provider client, system prompt and parameter defaults — with
     /// no runtime tools.
     without_tools: Arc<dyn Chat>,
+    /// The runtime tools its Spicepod `tools` param enables, and the most rounds of calls to
+    /// them one request may run.
+    tools: Vec<Arc<dyn SpiceModelTool>>,
+    tool_recursion_limit: usize,
 }
 
 impl LoadedChatModel {
+    /// The same model with no runtime tools.
+    pub(crate) fn without_tools(&self) -> Arc<dyn Chat> {
+        Arc::clone(&self.without_tools)
+    }
+
+    /// The runtime tools the model's Spicepod `tools` param enables, and the most rounds of
+    /// calls to them one request may run.
+    pub(crate) fn tools(&self) -> (&[Arc<dyn SpiceModelTool>], usize) {
+        (&self.tools, self.tool_recursion_limit)
+    }
+
     /// The evaluator decisions use for this model, which the Spicepod names `name`.
     ///
     /// It calls the model without runtime tools: an evaluation's `state` is untrusted
@@ -138,7 +154,7 @@ pub async fn try_to_chat_model(
 
     let tool_embedding_model = extract_secret!(params, TOOL_EMBEDDING_MODEL_PARAM);
 
-    let tool_model = match spice_tool_opt {
+    let (tool_model, tools) = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => {
             let table_allowlist = create_table_allowlist(&component.datasets).map_err(|e| {
                 LlmError::ModelParameterFailed {
@@ -150,17 +166,20 @@ pub async fn try_to_chat_model(
             let tools = prepare_model_tools(Arc::clone(&rt), &opts, tools, tool_embedding_model)
                 .await
                 .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
-            Arc::new(ToolUsingChat::new(
+            let tool_model: Arc<dyn Chat> = Arc::new(ToolUsingChat::new(
                 Arc::clone(&model),
-                tools,
+                tools.clone(),
                 spice_recursion_limit,
-            ))
+            ));
+            (tool_model, tools)
         }
-        Some(_) | None => Arc::clone(&model),
+        Some(_) | None => (Arc::clone(&model), Vec::new()),
     };
     Ok(LoadedChatModel {
         chat: tool_model,
         without_tools: model,
+        tools,
+        tool_recursion_limit: spice_recursion_limit.unwrap_or(DEFAULT_SPICE_TOOL_RECURSION_LIMIT),
     })
 }
 
@@ -336,6 +355,15 @@ fn anthropic(
     model_id: Option<&str>,
     params: &AnthropicModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
+    Ok(Arc::new(anthropic_client(model_id, params)?) as Arc<dyn Chat>)
+}
+
+/// The Anthropic client of a `from: anthropic` model, which serves both its chat completions
+/// and, natively, the Messages API.
+pub(crate) fn anthropic_client(
+    model_id: Option<&str>,
+    params: &AnthropicModelParams,
+) -> Result<Anthropic, LlmError> {
     let api_base = params.endpoint.as_deref();
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
     let auth_token = params.auth_token.as_ref().map(ExposeSecret::expose_secret);
@@ -360,7 +388,7 @@ fn anthropic(
             source: format!("Invalid `anthropic_workspace_id`: {e}").into(),
         })?;
 
-    Ok(Arc::new(anthropic) as Arc<dyn Chat>)
+    Ok(anthropic)
 }
 
 async fn google(
