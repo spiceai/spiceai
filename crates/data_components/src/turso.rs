@@ -830,14 +830,24 @@ impl TursoTableProvider {
                                 TimeUnit::Nanosecond => millis.checked_mul(NANOS_PER_MILLI),
                             }
                         }
-                        TursoValue::Text(rfc3339_str) => {
-                            // RFC3339 TEXT format: Parse and convert to target unit.
+                        TursoValue::Text(text) => {
+                            // TEXT format: Parse and convert to target unit.
                             // Use unit-appropriate methods to avoid i64 nanosecond overflow
                             // for dates outside ~1677-2262.
-                            use chrono::DateTime;
+                            //
+                            // A stored timestamp is RFC3339. A computed one can also be the
+                            // `YYYY-MM-DD HH:MM:SS[.SSS]` text SQLite's `datetime()` answers
+                            // in UTC: the interval rewrite renders `ts - INTERVAL '1 hour'`
+                            // through it.
+                            use chrono::{DateTime, NaiveDateTime};
 
-                            // Parse RFC3339 string
-                            if let Ok(dt) = DateTime::parse_from_rfc3339(rfc3339_str) {
+                            let parsed = DateTime::parse_from_rfc3339(text)
+                                .map(|dt| dt.to_utc())
+                                .or_else(|_| {
+                                    NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+                                        .map(|naive| naive.and_utc())
+                                });
+                            if let Ok(dt) = parsed {
                                 match unit {
                                     TimeUnit::Second => Some(dt.timestamp()),
                                     TimeUnit::Millisecond => Some(dt.timestamp_millis()),
