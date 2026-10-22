@@ -124,7 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `a6b07b8b9625e552c502c3a7229fd4bb7725bd2e` | `spiceai-0.11.0-df-55` |
-| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `4450776632f7e92f5b8b1ac97f56fe3f72cf2618` | `spiceai` |
+| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `d99170d287d6a94c1b1ff0c1622904c8bff704f0` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
@@ -634,10 +634,12 @@ Upstream [EricLBuehler/mistral.rs](https://github.com/EricLBuehler/mistral.rs) a
 [huggingface/text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference).
 
 The `mistral.rs` fork's tree is upstream tag `v0.9.4` (`440093545`) plus the Spice
-patches. They landed on `spiceai` as the merge of spiceai/mistral.rs#47 (`ea48c06b`),
-and spiceai/mistral.rs#48, squash-merged as `44507766`, adds the DeepSeek-V4.1 decode fixes
-on top, so `git diff v0.9.4 44507766` is the whole fork delta. #47 built it in
-32 commits. The first replays the Spice patches from the `v0.9.0` line: `glm-dsa`
+patches. They landed on `spiceai` as the merge of spiceai/mistral.rs#47 (`ea48c06b`);
+spiceai/mistral.rs#48, squash-merged as `44507766`, adds the DeepSeek-V4.1 decode fixes
+on top, and spiceai/mistral.rs#49, squash-merged as `d99170d2`, the DeepSeek-V4.1 and
+GLM-5.3 decode speedups on top of that, so `git diff v0.9.4 d99170d2` is the whole fork
+delta. #47 built it in 32 commits. The first replays the Spice patches from the
+`v0.9.0` line: `glm-dsa`
 GGUF loading, the i-quant MoE fallback, ring tensor parallelism past two ranks,
 multi-node NCCL on the GGUF path, and the `spiceai/candle` pin. The rest add the GGUF
 graphs that serve Qwen3.8-Flash-Next (`qwen4exp`), DeepSeek-V4.1-Flash (`deepseek41`)
@@ -666,6 +668,7 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 | `mistral.rs`: chat templates render with Jinja loop controls (`minijinja` `loop_controls`) | A template that uses `{% break %}` or `{% continue %}` fails to render, so every chat request to that model returns HTTP 500; GLM-5.3-Flash's uses `break` seven times | request failure | **GAP** |
 | `mistral.rs`: a request that sets neither `enable_thinking` nor `reasoning_effort` leaves `enable_thinking` undefined in the chat template, so each template applies its own default | Every template is rendered with thinking on; DeepSeek-V4.1 then keeps its whole reply inside an unclosed `<think>` block and `content` comes back empty | silent (wrong text) | **GAP** |
 | `mistral.rs`: `deepseek41` decode computes what its prefill and the reference graph compute: one rope rotation per tensor on CUDA, window keys at their own positions, the compressor's rope base on compressed layers, the indexer's top-k, and the routed experts' SwiGLU clamp, with each SwiGLU limit read as one value or one per layer (spiceai/mistral.rs#48) | DeepSeek-V4.1-Flash degenerates after its first few tokens (`Count from 1 to 40` gives `1, 2, 2, 2 2 2…`), and drifts from the reference past 128 and 512 tokens | silent (wrong text) | **GAP** — guarded in the fork, not here: `decoding_a_token_matches_prefilling_through_it` and its `_on_cuda` twin, `a_compressed_layer_rotates_with_the_compressor_base`, `an_index_source_attends_to_only_the_compressed_rows_it_picked`, `the_picked_rows_restrict_the_compressed_keys_and_not_the_window`, `the_gather_path_clamps_swiglu_inputs_to_the_limit` and `the_swiglu_limits_load_as_one_value_or_one_per_layer` |
+| `mistral.rs`: `deepseek41` and `glm5-next` decode run fewer, larger kernels: the hyper-connection sinkhorn as one CUDA kernel, the hyper-connection and engram projections oriented once at load with the engram projection kept quantized, the attention heads folded into one matmul over the key they share (DeepSeek-V4.1's MQA, GLM-5.3's MLA latent), and GLM-5.3's KDA causal convolution on the device (spiceai/mistral.rs#49) | DeepSeek-V4.1-Flash decodes at about 5.3 tokens/s on the 3-node ring instead of 10.5, and GLM-5.3-Flash at 5.8 instead of 8.6 on one node | silent (perf) | **GAP** — a perf-only row; the fork guards that each fast path computes what it replaced, and only runs there: `hyper_coeff_takes_the_gguf_out_in_matrix_oriented_at_load`, `an_engram_layer_runs_through_its_quantized_projection`, `folding_the_heads_into_one_matmul_matches_broadcasting_the_keys`, `the_fused_sinkhorn_matches_the_tensor_ops_on_cuda` and `the_device_convolution_matches_the_host_loop` |
 | `mistral.rs`: GGUF `eot_token_id` and `eom_token_id` stop generation, as `eos_token_id` does | GLM-5.3-Flash's reply runs past `<|user|>` into an invented next turn until `max_tokens` | silent (wrong text) | **GAP** |
 | `mistral.rs`: a `distributed` build serves a single-node model, and a ring head keeps a second request queued while one runs | A model without `distributed_backend` never finishes loading in a `distributed` build, and a second request to a ring deadlocks every rank at the next all-reduce | load failure / hang | **GAP** |
 | `text-embeddings-inference`: Spice integration + candle re-pointing | Local embedding models fail to load | build | compile-guarded |
@@ -739,7 +742,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**35 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**36 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -827,6 +830,8 @@ without becoming a flaky timing test:
 
 13. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
+    `mistral.rs` `deepseek41` and `glm5-next` decode kernels (spiceai/mistral.rs#49), which
+    no suite here trends yet — their evidence is the DGX Spark decode A/B in that PR;
     `snowflake-rs` streaming batches (memory, not latency — but see the
     `snowflake-rs` note above: it is blocked with the rest of that fork);
     `async-openai` retry-after handling; `datafusion`'s `IoWaitHook` carry through
