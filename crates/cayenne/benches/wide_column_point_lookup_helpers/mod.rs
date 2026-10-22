@@ -38,6 +38,10 @@ limitations under the License.
 //! (Tokio workers, 8), `WCPL_LOOKUPS` (per client per phase, 1,000),
 //! `WCPL_CACHE_MB` (256), `WCPL_HOT_KEYS` (insertion-order key count, 80,000).
 //!
+//! `WCPL_EXTRA=1` adds the write and scan costs of the wide column: the load's CPU, full-column
+//! queries (`WCPL_SCAN_REPS`, 11) before and after `WCPL_APPENDS` (40) appends of 2,048 rows,
+//! and the CPU of those appends with the compaction they trigger.
+//!
 //! `cargo bench -p cayenne --bench wide_column_point_lookup` (macOS/Linux system allocator),
 //! `--bench wide_column_point_lookup_jemalloc`, or `--bench wide_column_point_lookup_snmalloc`
 //! (the allocator `spiced` ships with).
@@ -193,12 +197,18 @@ fn json_row(rng: &mut Rng, i: usize) -> String {
     s
 }
 
-fn batches(rows: usize) -> Vec<RecordBatch> {
-    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    (0..rows)
-        .step_by(8192)
+fn batches(range: std::ops::Range<usize>) -> Vec<RecordBatch> {
+    batches_of(range, 8192)
+}
+
+fn batches_of(range: std::ops::Range<usize>, size: usize) -> Vec<RecordBatch> {
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ range.start as u64);
+    let rows = range.end;
+    range
+        .clone()
+        .step_by(size)
         .map(|start| {
-            let end = (start + 8192).min(rows);
+            let end = (start + size).min(rows);
             let (queries, paths): (Vec<String>, Vec<String>) = (start..end).map(key).unzip();
             let content: Vec<String> = (start..end).map(|i| json_row(&mut rng, i)).collect();
             if int_key() {
@@ -329,6 +339,97 @@ async fn run_phase(label: &str, ctx: &Arc<SessionContext>, keys_per_client: Vec<
     println!("  allocations >=16KiB by size class:{hist}");
 }
 
+/// Full-column queries over `content`, each repeated `WCPL_SCAN_REPS` (11) times from one
+/// client: every 8,192-row block of `content` is read and decoded.
+async fn run_scans(ctx: &Arc<SessionContext>) {
+    let reps = env_usize("WCPL_SCAN_REPS", 11);
+    for sql in [
+        "SELECT sum(length(content)) FROM t",
+        "SELECT count(*) FROM t WHERE content LIKE '%SKU-00ab%'",
+    ] {
+        let (mut cpu, mut wall, mut out) = (Vec::new(), Vec::new(), String::new());
+        for _ in 0..reps {
+            let (c0, w0) = (cpu_seconds(), Instant::now());
+            let batches = ctx.sql(sql).await.expect("plan").collect().await.expect("scan");
+            cpu.push((cpu_seconds() - c0) * 1e3);
+            wall.push(w0.elapsed().as_secs_f64() * 1e3);
+            out = arrow::util::pretty::pretty_format_batches(&batches)
+                .expect("format")
+                .to_string()
+                .lines()
+                .nth(3)
+                .unwrap_or_default()
+                .to_string();
+        }
+        cpu.sort_by(f64::total_cmp);
+        wall.sort_by(f64::total_cmp);
+        let n = cpu.len();
+        println!(
+            "scan n={n} cpu_ms med={:.1} min={:.1} max={:.1} wall_ms med={:.1} min={:.1} max={:.1} result={} sql={sql}",
+            cpu[n / 2], cpu[0], cpu[n - 1], wall[n / 2], wall[0], wall[n - 1], out.trim()
+        );
+    }
+}
+
+/// Appends `WCPL_APPENDS` (40) batches of 2,048 new rows, checkpoints anything inlined, then
+/// compacts: the delta (light-level) and maintenance (full-tier) write paths of a wide table.
+async fn run_appends(table: &Arc<CayenneTableProvider>, rows: usize, data: &std::path::Path) {
+    let appends = env_usize("WCPL_APPENDS", 40);
+    let state = SessionContext::new();
+    let (files0, bytes0) = (count_files(data), walk_size(data));
+    let (cpu0, wall0) = (cpu_seconds(), Instant::now());
+    for a in 0..appends {
+        let start = rows + a * 2_048;
+        let exec = MemorySourceConfig::try_new_exec(&[batches_of(start..start + 2_048, 2_048)], schema(), None)
+            .expect("exec");
+        let plan = table
+            .insert_into(&state.state(), exec, InsertOp::Append)
+            .await
+            .expect("append plan");
+        datafusion_physical_plan::collect(plan, state.task_ctx()).await.expect("append");
+    }
+    let inlined = table.checkpoint_inlined_data().await.expect("checkpoint");
+    let (files1, bytes1) = (count_files(data), walk_size(data));
+    println!(
+        "appends n={appends}x2048 rows cpu_s={:.2} wall_s={:.2} checkpointed_inlined={inlined} files {files0}->{files1} bytes {:.1}->{:.1}MiB",
+        cpu_seconds() - cpu0,
+        wall0.elapsed().as_secs_f64(),
+        bytes0 as f64 / f64::from(1 << 20),
+        bytes1 as f64 / f64::from(1 << 20)
+    );
+    // Writes schedule background compaction passes; drain them, then run explicit passes
+    // until one declines, so the CPU below covers every compaction of the appended files.
+    let (cpu0, wall0) = (cpu_seconds(), Instant::now());
+    let mut passes = 0;
+    loop {
+        assert!(cayenne::drain_compaction_tasks(Duration::from_secs(120)).await, "compaction did not drain");
+        if passes >= 8 || !table.compact_current_snapshot_small_files().await.expect("compact") {
+            break;
+        }
+        passes += 1;
+    }
+    println!(
+        "compaction passes={passes} cpu_s={:.2} wall_s={:.2} files {files1}->{} bytes {:.1}MiB",
+        cpu_seconds() - cpu0,
+        wall0.elapsed().as_secs_f64(),
+        count_files(data),
+        walk_size(data) as f64 / f64::from(1 << 20)
+    );
+}
+
+fn count_files(dir: &std::path::Path) -> u64 {
+    let mut total = 0;
+    for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += count_files(&path);
+        } else if path.extension().is_some_and(|e| e == "vortex") {
+            total += 1;
+        }
+    }
+    total
+}
+
 /// Runs the bench; `allocator` names the global allocator the calling target installed.
 pub fn run(allocator: &str) {
     let rows = env_usize("WCPL_ROWS", 200_000);
@@ -392,8 +493,9 @@ pub fn run(allocator: &str) {
         );
 
         let load = SessionContext::new();
-        let exec = MemorySourceConfig::try_new_exec(&[batches(rows)], schema(), None)
+        let exec = MemorySourceConfig::try_new_exec(&[batches(0..rows)], schema(), None)
             .expect("exec");
+        let (load_cpu0, load_wall0) = (cpu_seconds(), Instant::now());
         let plan = table
             .insert_into(&load.state(), exec, InsertOp::Overwrite)
             .await
@@ -401,6 +503,11 @@ pub fn run(allocator: &str) {
         datafusion_physical_plan::collect(plan, load.task_ctx())
             .await
             .expect("insert");
+        println!(
+            "load (overwrite, full tier): cpu_s={:.2} wall_s={:.2}",
+            cpu_seconds() - load_cpu0,
+            load_wall0.elapsed().as_secs_f64()
+        );
 
         let ctx = Arc::new(SessionContext::new());
         ctx.register_table("t", Arc::clone(&table) as Arc<dyn TableProvider>)
@@ -463,6 +570,11 @@ pub fn run(allocator: &str) {
         run_phase("hot_in_order", &ctx, in_order).await;
         run_phase("hot_random", &ctx, shuffled).await;
         run_phase("whole_table_rand", &ctx, whole_table).await;
+        if std::env::var("WCPL_EXTRA").is_ok_and(|v| v == "1") {
+            run_scans(&ctx).await;
+            run_appends(&table, rows, &data).await;
+            run_scans(&ctx).await;
+        }
         if let Some(min) = std::env::var("WCPL_BT_MIN").ok().and_then(|v| v.parse().ok()) {
             BT_MIN.store(min, Ordering::Relaxed);
             BT_LEFT.store(6, Ordering::Relaxed);
