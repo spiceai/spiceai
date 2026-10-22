@@ -4552,8 +4552,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     /// `fill(i)` at offset `i`, built a block at a time so the whole is never held.
     fn gzip_json(len: usize, fill: fn(usize) -> u8) -> Vec<u8> {
         use std::io::Write;
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(br#"{"a":""#).expect("compress");
         let mut offset = 0;
         while offset < len - 8 {
@@ -4651,20 +4650,22 @@ uGgYIHbi/F+GaiUPzDyqe5p9
                 .await?
                 .collect()
                 .await?;
-            Ok::<_, datafusion::error::DataFusionError>(batches
-                .iter()
-                .flat_map(|batch| {
-                    let content = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<arrow::array::StringArray>()
-                        .expect("content is a string column");
-                    content
-                        .iter()
-                        .map(|value| value.unwrap_or_default().to_string())
-                        .collect::<Vec<_>>()
-                })
-                .collect())
+            Ok::<_, datafusion::error::DataFusionError>(
+                batches
+                    .iter()
+                    .flat_map(|batch| {
+                        let content = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringArray>()
+                            .expect("content is a string column");
+                        content
+                            .iter()
+                            .map(|value| value.unwrap_or_default().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect(),
+            )
         }
         .await;
         let made = requests.load(std::sync::atomic::Ordering::SeqCst) - before;
