@@ -64,7 +64,7 @@ use datafusion_datasource::source::DataSource;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore, ObjectStoreExt};
 use snafu::prelude::*;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SpiceJsonOptions {
     pub compression: CompressionTypeVariant,
     pub schema_infer_max_rec: Option<usize>,
@@ -146,7 +146,7 @@ impl Default for SpiceJsonOptions {
 }
 
 /// New line delimited JSON `FileFormat` implementation.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SpiceJsonFormat {
     options: SpiceJsonOptions,
 }

@@ -674,6 +674,18 @@ mod tests {
         HeaderProjectedCsvFormat::wrap(Arc::new(CsvFormat::default().with_has_header(true)))
     }
 
+    fn header_tsv_format() -> Arc<dyn FileFormat> {
+        HeaderProjectedCsvFormat::wrap(Arc::new(
+            CsvFormat::default()
+                .with_has_header(true)
+                .with_delimiter(b'\t'),
+        ))
+    }
+
+    fn write_tsv(path: &Path, header: &str, rows: &[&str]) {
+        write_csv(path, header, rows);
+    }
+
     #[tokio::test]
     async fn reordered_csv_columns_follow_header_names() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -698,6 +710,34 @@ mod tests {
             after,
             (Some(300), Some(30)),
             "values must follow the header names, not column position"
+        );
+    }
+
+    #[tokio::test]
+    async fn reordered_tsv_columns_follow_header_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_tsv(
+            &dir.path().join("base.tsv"),
+            "event_id\tuser_id\tregion\tamount_cents\tts",
+            &["1\t10\tus\t100\tt0", "2\t20\teu\t200\tt1"],
+        );
+        let table = listing_table_with_extension(dir.path(), header_tsv_format(), ".tsv");
+        assert_eq!(
+            query_sums(Arc::clone(&table))
+                .await
+                .expect("query before tsv reorder"),
+            (Some(300), Some(30))
+        );
+
+        write_tsv(
+            &dir.path().join("base.tsv"),
+            "event_id\tamount_cents\tregion\tuser_id\tts",
+            &["1\t100\tus\t10\tt0", "2\t200\teu\t20\tt1"],
+        );
+        assert_eq!(
+            query_sums(table).await.expect("query after tsv reorder"),
+            (Some(300), Some(30)),
+            "TSV is the same headered delimiter format as CSV"
         );
     }
 

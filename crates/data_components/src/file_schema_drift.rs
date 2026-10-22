@@ -25,9 +25,10 @@ limitations under the License.
 //! with no error and the dataset still `Ready`.
 //!
 //! [`FileSchemaDriftGuard`] checks each scan's files for the projected registered columns.
-//! Only formats that declare each file's full schema are checked (see
-//! [`FileSchemaDriftGuard::supports_format`]).
-//! A column that no scanned file carries is reported:
+//! Only formats whose per-file column list can be proven complete are checked
+//! (see [`FileSchemaDriftGuard::supports_format`]): a CSV/TSV header, or a
+//! JSON/NDJSON object-key scan that reads every record. A column that no
+//! scanned file carries is reported:
 //!
 //! - in a scan that feeds an acceleration refresh (the refresh session carries
 //!   [`AccelerationRefreshScan`]) that reads every file, the scan fails, so the refresh
@@ -46,10 +47,14 @@ use std::{
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use dataformat_json::SpiceJsonFormat;
 use datafusion::{
     catalog::{ScanArgs, ScanResult, Session},
     common::tree_node::{TreeNode, TreeNodeRecursion},
-    datasource::{TableProvider, file_format::FileFormat},
+    datasource::{
+        TableProvider,
+        file_format::{FileFormat, json::JsonFormat},
+    },
     error::{DataFusionError, Result as DFResult},
     execution::{config::SessionConfig, object_store::ObjectStoreUrl},
     physical_plan::ExecutionPlan,
@@ -121,15 +126,17 @@ pub struct FileSchemaDriftGuard {
 }
 
 impl FileSchemaDriftGuard {
-    /// Whether scans of `format` can be checked: the file declares its full column list
-    /// (a CSV/TSV header, via [`HeaderProjectedCsvFormat`]), so a column missing from that
-    /// list is absent from every record. Formats whose schema is inferred from a sample of
-    /// records (JSON) cannot prove a column absent, so they are not checked. Parquet and
-    /// ORC footers are the same kind of declaration; they are left to the pending
-    /// file-schema-drift change that lands that path.
+    /// Whether scans of `format` can be checked: the file's full column list can
+    /// be proven (a CSV/TSV header via [`HeaderProjectedCsvFormat`], or every
+    /// JSON/NDJSON record's object keys). A column missing from that list is
+    /// absent from every record. Parquet and ORC footers are the same kind of
+    /// declaration; they are left to the pending file-schema-drift change that
+    /// lands that path.
     #[must_use]
     pub fn supports_format(format: &dyn FileFormat) -> bool {
         format.downcast_ref::<HeaderProjectedCsvFormat>().is_some()
+            || format.downcast_ref::<JsonFormat>().is_some()
+            || format.downcast_ref::<SpiceJsonFormat>().is_some()
     }
 
     #[must_use]
@@ -319,12 +326,10 @@ impl FileSchemaDriftGuard {
         // The newest file alone first: it normally carries every column.
         let (newest, rest) = files.split_at(files.len().min(1));
         for chunk in std::iter::once(newest).chain(rest.chunks(SCHEMA_PROBE_CONCURRENCY)) {
+            let probe_format = schema_probe_format(&self.format);
             let probes: Vec<_> = chunk
                 .iter()
-                .map(|file| {
-                    self.format
-                        .infer_schema(state, store, std::slice::from_ref(file))
-                })
+                .map(|file| probe_format.infer_schema(state, store, std::slice::from_ref(file)))
                 .collect();
             for schema in futures::future::join_all(probes).await {
                 let schema = schema?;
@@ -381,6 +386,21 @@ fn scanned_files(plan: &Arc<dyn ExecutionPlan>) -> Option<(ObjectStoreUrl, Vec<O
     files.sort_by(|a, b| a.location.cmp(&b.location));
     files.dedup_by(|a, b| a.location == b.location);
     store_url.map(|url| (url, files))
+}
+
+/// JSON schema inference defaults to a record sample, which cannot prove a
+/// column absent (a sparse key can sit past the sample). The drift check reads
+/// every record so a rename is detected and a rare key is not.
+fn schema_probe_format(format: &Arc<dyn FileFormat>) -> Arc<dyn FileFormat> {
+    if let Some(json) = format.as_ref().downcast_ref::<JsonFormat>() {
+        let mut options = json.options().clone();
+        options.schema_infer_max_rec = Some(usize::MAX);
+        return Arc::new(JsonFormat::default().with_options(options));
+    }
+    if let Some(json) = format.as_ref().downcast_ref::<SpiceJsonFormat>() {
+        return Arc::new(json.clone().with_schema_infer_max_rec(usize::MAX));
+    }
+    Arc::clone(format)
 }
 
 fn fingerprint(columns: &[String], files: &[ObjectMeta]) -> u64 {
@@ -531,6 +551,34 @@ mod tests {
         std::fs::write(path, text).expect("write csv");
     }
 
+    fn write_ndjson(path: &Path, lines: &[&str]) {
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        std::fs::write(path, text).expect("write ndjson");
+    }
+
+    fn guarded_json_table(dir: &Path, columns: &[&str]) -> Guarded {
+        let schema = registered_schema(columns);
+        let format: Arc<dyn FileFormat> = Arc::new(JsonFormat::default());
+        let url = ListingTableUrl::parse(format!("file://{}/", dir.display())).expect("url");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(
+                ListingOptions::new(Arc::clone(&format)).with_file_extension(".json"),
+            )
+            .with_schema(Arc::clone(&schema));
+        let listing: Arc<dyn TableProvider> =
+            Arc::new(ListingTable::try_new(config).expect("listing table"));
+        let layer = Arc::new(FileSchemaDriftLayer::new(FileSchemaDriftGuard::new(
+            "base", schema, format,
+        )));
+        let table: Arc<dyn TableProvider> =
+            SpiceTable::over(Arc::clone(&layer) as Arc<dyn TableLayer>, listing);
+        Guarded { table, layer }
+    }
+
     fn registered_schema(columns: &[&str]) -> SchemaRef {
         Arc::new(Schema::new(
             columns
@@ -585,6 +633,24 @@ mod tests {
         let column = batches[0].column(0);
         let column = column.as_any().downcast_ref::<Int64Array>().expect("int64");
         (!column.is_null(0)).then(|| column.value(0))
+    }
+
+    fn two_values(batches: &[RecordBatch]) -> (Option<i64>, Option<i64>) {
+        let batch = &batches[0];
+        let first = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("column 0");
+        let second = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("column 1");
+        (
+            (!first.is_null(0)).then(|| first.value(0)),
+            (!second.is_null(0)).then(|| second.value(0)),
+        )
     }
 
     #[tokio::test]
@@ -698,20 +764,121 @@ mod tests {
             .expect("count(*) reads no column");
     }
 
+    #[tokio::test]
+    async fn json_reordered_object_keys_keep_values_with_their_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_ndjson(
+            &dir.path().join("base.json"),
+            &[
+                r#"{"id":1,"amount_cents":100,"user_id":10}"#,
+                r#"{"id":2,"amount_cents":200,"user_id":20}"#,
+            ],
+        );
+        let table = guarded_json_table(dir.path(), &["id", "amount_cents", "user_id"]);
+        let before = query(
+            &table,
+            false,
+            "SELECT sum(amount_cents), sum(user_id) FROM base",
+        )
+        .await
+        .expect("query before reorder");
+        assert_eq!(two_values(&before), (Some(300), Some(30)));
+
+        write_ndjson(
+            &dir.path().join("base.json"),
+            &[
+                r#"{"id":1,"user_id":10,"amount_cents":100}"#,
+                r#"{"id":2,"user_id":20,"amount_cents":200}"#,
+            ],
+        );
+        let after = query(
+            &table,
+            false,
+            "SELECT sum(amount_cents), sum(user_id) FROM base",
+        )
+        .await
+        .expect("query after key reorder");
+        assert_eq!(
+            two_values(&after),
+            (Some(300), Some(30)),
+            "JSON already binds by name; a key reorder must not swap values"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_refresh_scan_fails_when_a_registered_column_is_renamed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_ndjson(
+            &dir.path().join("base.json"),
+            &[r#"{"id":1,"amount_cents":2}"#],
+        );
+        let table = guarded_json_table(dir.path(), &["id", "amount_cents"]);
+        let before = query(&table, true, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("refresh scan before the rename");
+        assert_eq!(single_value(&before), Some(2));
+
+        write_ndjson(
+            &dir.path().join("base.json"),
+            &[r#"{"id":1,"amt":2}"#, r#"{"id":3,"amt":4}"#],
+        );
+        let err = query(&table, true, "SELECT * FROM base")
+            .await
+            .expect_err("a refresh scan must not overwrite accelerated JSON with NULLs");
+        let message = err.to_string();
+        assert!(message.contains("'amount_cents'"), "{message}");
+        assert!(message.contains("Dataset 'base'"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn json_federated_scan_warns_and_returns_null_when_a_registered_column_is_renamed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_ndjson(&dir.path().join("base.json"), &[r#"{"id":1,"amt":2}"#]);
+        let table = guarded_json_table(dir.path(), &["id", "amount_cents"]);
+        let batches = query(&table, false, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("a federated read still answers");
+        assert_eq!(single_value(&batches), None);
+        assert!(
+            table
+                .layer
+                .guard
+                .state
+                .lock()
+                .warned
+                .contains("amount_cents")
+        );
+    }
+
+    #[tokio::test]
+    async fn json_refresh_scan_finds_a_column_absent_from_the_first_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_ndjson(
+            &dir.path().join("base.json"),
+            &[r#"{"id":1}"#, r#"{"id":2}"#, r#"{"id":3,"amount_cents":2}"#],
+        );
+        let table = guarded_json_table(dir.path(), &["id", "amount_cents"]);
+        let batches = query(&table, true, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("a sparse JSON key later in the file is not drift");
+        assert_eq!(single_value(&batches), Some(2));
+    }
+
     #[test]
-    fn only_header_projected_csv_is_checked() {
+    fn declared_column_formats_are_checked() {
         assert!(FileSchemaDriftGuard::supports_format(
             HeaderProjectedCsvFormat::wrap(Arc::new(CsvFormat::default().with_has_header(true)))
                 .as_ref()
+        ));
+        assert!(FileSchemaDriftGuard::supports_format(&JsonFormat::default()));
+        assert!(FileSchemaDriftGuard::supports_format(
+            &dataformat_json::SpiceJsonFormat::default()
         ));
         assert!(!FileSchemaDriftGuard::supports_format(
             &CsvFormat::default().with_has_header(true)
         ));
         assert!(!FileSchemaDriftGuard::supports_format(
             &ParquetFormat::default()
-        ));
-        assert!(!FileSchemaDriftGuard::supports_format(
-            &JsonFormat::default()
         ));
     }
 
