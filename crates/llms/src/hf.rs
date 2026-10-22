@@ -17,7 +17,7 @@ limitations under the License.
 //! What every local model, embedding and reranker shares for reading the Hugging Face Hub:
 //! the Hub settings a component names, and opening a repository's snapshot with them.
 
-use huggingface_hub::{DownloadError, RepoType, Requester, Settings, Snapshot};
+use huggingface_hub::{DownloadError, ParamToken, RepoType, Requester, Settings, Snapshot};
 use secrecy::SecretString;
 
 /// The Hugging Face Hub settings a component names: its `hf_token` and `hf_endpoint`, which the
@@ -25,6 +25,9 @@ use secrecy::SecretString;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HubParams<'a> {
     pub token: Option<&'a SecretString>,
+    /// Whether the Spicepod sets `token`, rather than Spice loading it from a secret store. A
+    /// loaded token is never sent to an `hf_endpoint` the Spicepod sets (see [`ParamToken`]).
+    pub token_in_spicepod: bool,
     pub endpoint: Option<&'a str>,
 }
 
@@ -41,7 +44,14 @@ pub async fn open_model(
     hub: HubParams<'_>,
 ) -> Result<Snapshot, DownloadError> {
     let repo = DownloadError::parse_repo(&requester, RepoType::Model, model_id, revision)?;
-    let settings = Settings::resolve(hub.token.cloned(), hub.endpoint)
+    let token = hub.token.cloned().map(|secret| {
+        if hub.token_in_spicepod {
+            ParamToken::Spicepod(secret)
+        } else {
+            ParamToken::SecretStore(secret)
+        }
+    });
+    let settings = Settings::resolve(token, hub.endpoint)
         .await
         .map_err(|source| DownloadError::settings(&requester, &repo, revision, source))?;
     Snapshot::open(settings, requester, repo, revision).await

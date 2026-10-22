@@ -38,5 +38,5 @@ pub mod snapshot;
 pub use client::{Commit, EntryKind, Error, FileRead, Hub, HubConfig, Result, TreeEntry};
 pub use error::DownloadError;
 pub use location::{RepoId, RepoType};
-pub use settings::Settings;
+pub use settings::{ParamToken, Settings};
 pub use snapshot::{Requester, Snapshot};

@@ -436,6 +436,8 @@ async fn huggingface(
     let model_type = params.model_type.as_deref();
     let hub = llms::hf::HubParams {
         token: params.hf_token.as_ref(),
+        // A chat model's `hf_token` is never loaded from a secret store.
+        token_in_spicepod: true,
         endpoint: params.hf_endpoint.as_deref(),
     };
 
