@@ -508,7 +508,8 @@ jobs:
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
   # Rejected AWS keys fail every Bedrock test the same way, each after a 120-second readiness
-  # wait. This asks AWS once, before the build finishes, and names the cause.
+  # wait. This asks AWS once, before the build finishes, and names the cause. STS
+  # GetCallerIdentity needs no IAM permission, so only an invalid key pair fails it.
   check-bedrock-credentials:
     name: Check Bedrock credentials
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
@@ -527,12 +528,11 @@ jobs:
             echo "::error::AWS_BEDROCK_KEY or AWS_BEDROCK_SECRET is empty, so the Bedrock tests cannot authenticate. Set both repository secrets."
             exit 1
           fi
+          # Logged because --aws-sigv4 needs curl 7.75 or later.
           curl --version | head -n 1
           body=$(mktemp)
-          # GetCallerIdentity needs no IAM permission, so only an invalid key pair fails it. The
-          # key pair reaches curl on stdin, which keeps it out of the process list.
-          # `shell: bash` runs with -e, so a curl failure is captured here rather than ending
-          # the step before the fallback below.
+          # The key pair goes to curl on stdin, out of the process list. `|| curl_exit=$?` keeps
+          # `shell: bash`'s -e from ending the step before the fallback below.
           curl_exit=0
           status=$(printf 'user = "%s:%s"\n' "$AWS_BEDROCK_KEY" "$AWS_BEDROCK_SECRET" |
             curl --config - --silent --show-error --max-time 30 --retry 3 \
