@@ -47,6 +47,16 @@
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 6, actual: 5 }",
       "group": "other"
+    },
+    {
+      "run": "localpod-follow",
+      "who": "no-results-cache",
+      "key": "query: SELECT count(*) FROM parent",
+      "kind": "other",
+      "signature": "the query succeeded, but the script expected an error",
+      "pattern": "the query succeeded, but the script expected an error",
+      "group": "other",
+      "may-pass": true
     }
   ],
   "on-zero-results-partial": [

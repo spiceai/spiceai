@@ -44,6 +44,11 @@ steps:
   - source-exec:
       src: CREATE TABLE tenants (name text PRIMARY KEY); INSERT INTO tenants VALUES ('blue'), ('red');
   - start: { ready: false }
+  # The view never loads, so the start does not wait for readiness: wait
+  # here until the tenants table is registered.
+  - query: SELECT count(*) AS n FROM tenants
+    expect: { rows: [['2']] }
+    eventually: 30s
   # Headers from a subquery over another source, directly and in an
   # accelerated view.
   - query: >-

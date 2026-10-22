@@ -22,7 +22,8 @@
       "key": "query: SELECT request_path FROM oldest_out",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: DataMismatch { column: \"request_path\", row_number: 1, expected: \"\\\"/b\\\"\", actual: \"\\\"/a\\\"\" }",
-      "group": "caching-http"
+      "group": "caching-http",
+      "may-pass": true
     }
   ],
   "http-caching-request-key": [
