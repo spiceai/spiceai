@@ -39,11 +39,15 @@ pub use routes::get_api_doc;
 #[cfg(feature = "mcp")]
 mod mcp_transport;
 #[cfg(all(test, feature = "models"))]
+mod messages_tests;
+#[cfg(all(test, feature = "models"))]
 mod model_capability_tests;
 mod mtls;
 mod response_outcome;
 mod routes;
 mod server_timing;
+#[cfg(test)]
+mod write_access_tests;
 
 pub mod v1;
 

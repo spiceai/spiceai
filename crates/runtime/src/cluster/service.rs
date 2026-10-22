@@ -1950,11 +1950,12 @@ mod tests {
     }
 
     /// Serves `service` on a loopback port built like the internal cluster port and returns
-    /// its address. Plain TCP stands in for the transport: the port's gate reads only
-    /// whether the port runs cluster mTLS.
+    /// its address. Plain TCP stands in for the transport; the gate uses the node's
+    /// mTLS and insecure connection settings.
     async fn spawn_cluster_server(
         service: ClusterServiceImpl,
         mtls_enabled: bool,
+        allow_insecure_connections: bool,
     ) -> (std::net::SocketAddr, CancellationToken) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1966,7 +1967,7 @@ mod tests {
         let shutdown_signal = shutdown.clone();
 
         tokio::spawn(async move {
-            internal_cluster_server(mtls_enabled)
+            internal_cluster_server(mtls_enabled, allow_insecure_connections)
                 .add_service(ClusterServiceServer::new(service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                     shutdown_signal.cancelled().await;
@@ -1982,8 +1983,10 @@ mod tests {
     async fn serve_on_cluster_port(
         service: ClusterServiceImpl,
         mtls_enabled: bool,
+        allow_insecure_connections: bool,
     ) -> (Channel, CancellationToken) {
-        let (address, shutdown) = spawn_cluster_server(service, mtls_enabled).await;
+        let (address, shutdown) =
+            spawn_cluster_server(service, mtls_enabled, allow_insecure_connections).await;
         let channel = Channel::from_shared(format!("http://{address}"))
             .expect("test cluster service address should be a valid URI")
             .connect()
@@ -1993,11 +1996,11 @@ mod tests {
         (channel, shutdown)
     }
 
-    /// Serves `service` on a cluster port that runs cluster mTLS.
+    /// Serves `service` on a cluster port that explicitly allows insecure connections.
     async fn serve_test_service(
         service: ClusterServiceImpl,
     ) -> (ClusterServiceClient<Channel>, CancellationToken) {
-        let (channel, shutdown) = serve_on_cluster_port(service, true).await;
+        let (channel, shutdown) = serve_on_cluster_port(service, false, true).await;
         (ClusterServiceClient::new(channel), shutdown)
     }
 
@@ -2052,8 +2055,9 @@ mod tests {
             .await
             .expect("spicepod should load");
         let service = make_test_service_with(Some(Arc::new(app)), Secrets::default()).await;
+        let (mut client, shutdown) = serve_test_service(service).await;
 
-        let app_json = service
+        let app_json = client
             .get_app_definition(Request::new(GetAppDefinitionRequest {
                 executor_id: "executor-1".to_string(),
             }))
@@ -2072,6 +2076,7 @@ mod tests {
             serde_json::from_str(&app_json).expect("app definition should deserialize");
         assert_eq!(definition.datasets.len(), 1);
         assert_eq!(definition.datasets[0].name, "orders");
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -2161,13 +2166,13 @@ mod tests {
     }
 
     /// Every RPC on the internal cluster port, the Ballista scheduler's included, is
-    /// refused when the port does not run cluster mTLS.
+    /// refused without cluster mTLS or an explicit insecure opt-in.
     #[tokio::test]
-    async fn cluster_port_refuses_every_rpc_without_mtls() {
+    async fn cluster_port_refuses_every_rpc_without_mtls_or_insecure_opt_in() {
         let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
         let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
         let service = make_test_service_full(Some(app), secrets, None, &["trace-a"]).await;
-        let (channel, shutdown) = serve_on_cluster_port(service, false).await;
+        let (channel, shutdown) = serve_on_cluster_port(service, false, false).await;
         let mut client = ClusterServiceClient::new(channel.clone());
         let mut scheduler = SchedulerGrpcClient::new(channel);
 
@@ -2277,8 +2282,9 @@ mod tests {
             .build();
         let secrets = secrets_with(&[("API_KEY", "runtime-api-key")]);
         let service = make_test_service_with(Some(Arc::new(app)), secrets).await;
+        let (mut client, shutdown) = serve_test_service(service).await;
 
-        let err = service
+        let err = client
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: "API_KEY".to_string(),
@@ -2287,6 +2293,7 @@ mod tests {
             .expect_err("a key only runtime.auth references must not expand");
 
         assert_eq!(err.code(), tonic::Code::NotFound);
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -2492,7 +2499,7 @@ mod tests {
 
         let service = make_test_service().await;
         let registry = service.executor_registry();
-        let (scheduler, shutdown) = spawn_cluster_server(service, true).await;
+        let (scheduler, shutdown) = spawn_cluster_server(service, true, false).await;
         // The executor reaches the scheduler through this relay, so the test can cut the
         // connection as a killed process does, while its stream of messages stays open.
         let relay = TcpListener::bind("127.0.0.1:0")
@@ -2732,6 +2739,7 @@ mod tests {
     #[tokio::test]
     async fn get_task_history_refuses_other_sql() {
         let service = make_test_service_with_task_history(&["trace-a"]).await;
+        let (mut client, shutdown) = serve_test_service(service).await;
         let table = format!("\"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\"");
 
         for sql in [
@@ -2747,7 +2755,7 @@ mod tests {
             format!("DELETE FROM {table}"),
             format!("CREATE VIEW \"{SPICE_RUNTIME_SCHEMA}\".\"leaked\" AS SELECT * FROM {table}"),
         ] {
-            let Err(err) = service
+            let Err(err) = client
                 .get_task_history(Request::new(GetTaskHistoryRequest { sql: sql.clone() }))
                 .await
             else {
@@ -2755,6 +2763,7 @@ mod tests {
             };
             assert_eq!(err.code(), tonic::Code::InvalidArgument, "{sql}: {err:?}");
         }
+        shutdown.cancel();
     }
 
     #[test]
