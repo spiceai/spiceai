@@ -2979,6 +2979,7 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
+        replaced_delete_file_ids: Vec<String>,
     ) -> CatalogResult<()> {
         const MAX_PARAMS: usize = 32_000;
         const PARAMS_PER_DELETE_FILE: usize = 10;
@@ -3003,6 +3004,21 @@ impl MetadataCatalog for CayenneCatalog {
             }
         }
         let txn = self.begin_transaction().await?;
+        if !replaced_delete_file_ids.is_empty() {
+            txn.execute_many(
+                "DELETE FROM cayenne_delete_file WHERE table_id = ?1 AND delete_file_id = ?2",
+                replaced_delete_file_ids
+                    .into_iter()
+                    .map(|id| {
+                        vec![
+                            MetastoreValue::Text(table_id.to_string()),
+                            MetastoreValue::Text(id),
+                        ]
+                    })
+                    .collect(),
+            )
+            .await?;
+        }
         for chunk in delete_files.chunks(MAX_PARAMS / PARAMS_PER_DELETE_FILE) {
             let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
             txn.execute(ExecuteParams { sql: &sql, params }).await?;
@@ -8168,6 +8184,7 @@ mod tests {
                     sequence_number: 1,
                     created_at: String::new(),
                 }],
+                Vec::new(),
                 Vec::new(),
             )
             .await
