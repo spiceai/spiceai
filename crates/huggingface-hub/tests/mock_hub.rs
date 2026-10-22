@@ -365,6 +365,9 @@ fn entry_json(path: &str, file: &MockFile, gated: bool) -> serde_json::Value {
         let oid = if gated { "*".repeat(64) } else { file.sha256() };
         entry["lfs"] =
             serde_json::json!({"oid": oid, "size": file.bytes.len(), "pointerSize": 133});
+        // The Hub stores every LFS file of a new repository in Xet, and names its Xet hash
+        // (any id serves the mock, whose Xet storage refuses every read).
+        entry["xetHash"] = file.sha256().into();
     }
     entry
 }
@@ -601,6 +604,13 @@ async fn hub_handler(State(mock): State<MockHub>, request: Request<Body>) -> Res
                 serde_json::to_string(&entries).expect("JSON"),
             )
         }
+        // The mock serves no Xet storage: the read token is refused, as for a repository the
+        // account cannot read.
+        ["api", _, _, _, "xet-read-token", _] => hub_error(
+            StatusCode::FORBIDDEN,
+            "",
+            "Xet storage is not available on the mock Hub.",
+        ),
         ["api", plural, owner, name, "paths-info", commit, ..] => {
             let Some(repo) = state.repos.get(&format!("{plural}/{owner}/{name}")) else {
                 return hub_error(

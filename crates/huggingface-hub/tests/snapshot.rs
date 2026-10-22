@@ -897,6 +897,55 @@ async fn an_endpoint_that_does_not_describe_files_is_listed() {
 }
 
 #[tokio::test]
+async fn files_xet_cannot_serve_download_through_the_bridge() {
+    // Spice reads Xet only from the public Hub; here Xet is turned on for the mock, whose Xet
+    // storage refuses the read token, so every file of the load downloads through the bridge.
+    let fixture = Fixture::new().await;
+    let files = model_files();
+    fixture.mock.commit(MODEL, C1, files.clone());
+    fixture.mock.branch(MODEL, "main", C1);
+    let mut settings = fixture.settings(&[]).await;
+    assert_eq!(settings.xet, None, "the mock is not the public Hub");
+    settings.xet = Some(fixture.cache().join("xet"));
+    let snapshot = Snapshot::open(
+        settings,
+        requester(),
+        RepoId::new(RepoType::Model, "o", "m").expect("a valid repository"),
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the snapshot opens: {e}"));
+
+    let paths = snapshot
+        .download(&["config.json", "model.safetensors", "onnx/model.onnx"])
+        .await
+        .unwrap_or_else(|e| panic!("the files download through the bridge: {e}"));
+    for (path, (_, file)) in paths.iter().zip([&files[0], &files[2], &files[3]]) {
+        assert_eq!(
+            std::fs::read(path).expect("a downloaded file"),
+            file.bytes.as_ref()
+        );
+    }
+    // The revision, one description of both LFS files, which names their Xet hashes, and the
+    // refused read token. Each file then comes through the bridge: one request for
+    // `config.json`, and a `resolve` and its CDN redirect for each LFS file.
+    assert_eq!(
+        fixture.mock.api_paths(),
+        vec![
+            REVISION_DESCRIBED.to_string(),
+            format!("/api/models/o/m/paths-info/{C1}"),
+            format!("/api/models/o/m/xet-read-token/{C1}"),
+        ]
+    );
+    assert_eq!(
+        fixture.mock.downloads().len(),
+        5,
+        "{:?}",
+        fixture.mock.downloads()
+    );
+}
+
+#[tokio::test]
 async fn a_missing_revision_does_not_fall_back_to_the_cache() {
     let fixture = Fixture::new().await;
     fixture.mock.commit(MODEL, C1, model_files());

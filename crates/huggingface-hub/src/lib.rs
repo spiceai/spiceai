@@ -34,6 +34,7 @@ mod error;
 pub mod location;
 pub mod settings;
 pub mod snapshot;
+mod xet;
 
 pub use client::{Commit, EntryKind, Error, FileRead, Hub, HubConfig, Result, TreeEntry};
 pub use error::DownloadError;

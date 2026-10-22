@@ -66,6 +66,8 @@ const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 /// The longest a rate-limited request waits for the Hub's window to reset before failing.
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
+/// Paths one `paths-info` request describes.
+const PATHS_PER_REQUEST: usize = 1_000;
 /// Redirects followed for one file read (resolve → resolve-cache or CDN).
 const MAX_REDIRECTS: usize = 5;
 
@@ -364,6 +366,10 @@ pub struct TreeEntry {
     oid: String,
     #[serde(default)]
     lfs: Option<LfsInfo>,
+    /// The file's Xet hash, when the Hub stores it in Xet. The tree and `paths-info` endpoints
+    /// name it; the revision endpoint does not.
+    #[serde(default, rename = "xetHash")]
+    pub(crate) xet_hash: Option<String>,
 }
 
 impl TreeEntry {
@@ -427,6 +433,7 @@ impl Sibling {
             size: self.size?,
             oid: self.blob_id?,
             lfs: self.lfs.map(|lfs| LfsInfo { oid: lfs.sha256 }),
+            xet_hash: None,
         })
     }
 }
@@ -819,20 +826,48 @@ impl Hub {
         commit: &str,
         path: &str,
     ) -> Result<Option<TreeEntry>> {
-        let url = self.api_url(repo, &["paths-info"], commit, "");
-        let form = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("paths", path)
-            .append_pair("expand", "false")
-            .finish();
-        let (_, body) = self
-            .request_body(repo, Some(commit), Method::POST, url, Some(form))
-            .await?;
-        let entries: Vec<TreeEntry> =
-            serde_json::from_slice(&body).map_err(|e| Error::UnexpectedResponse {
-                repo: repo.clone(),
-                message: format!("the description of '{path}' could not be read ({e})"),
-            })?;
+        let entries = self.entries(repo, commit, &[path]).await?;
         Ok(entries.into_iter().find(|entry| entry.path == path))
+    }
+
+    /// Describes `paths` at `commit`, [`PATHS_PER_REQUEST`] to a request. A path that does
+    /// not exist is left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the repository or commit does not exist, access is denied, or the
+    /// Hub cannot be reached.
+    pub(crate) async fn entries(
+        &self,
+        repo: &RepoId,
+        commit: &str,
+        paths: &[&str],
+    ) -> Result<Vec<TreeEntry>> {
+        let mut entries = Vec::with_capacity(paths.len());
+        for batch in paths.chunks(PATHS_PER_REQUEST) {
+            let url = self.api_url(repo, &["paths-info"], commit, "");
+            // The serializer is not `Send`, so it ends before the request is awaited.
+            let form = {
+                let mut form = url::form_urlencoded::Serializer::new(String::new());
+                for path in batch {
+                    form.append_pair("paths", path);
+                }
+                form.append_pair("expand", "false").finish()
+            };
+            let (_, body) = self
+                .request_body(repo, Some(commit), Method::POST, url, Some(form))
+                .await?;
+            let described: Vec<TreeEntry> =
+                serde_json::from_slice(&body).map_err(|e| Error::UnexpectedResponse {
+                    repo: repo.clone(),
+                    message: format!(
+                        "the description of '{}' could not be read ({e})",
+                        batch.join("', '")
+                    ),
+                })?;
+            entries.extend(described);
+        }
+        Ok(entries)
     }
 
     /// Reads `range` of the file at `path` and `commit` (the whole file when `None`).
@@ -1038,6 +1073,16 @@ impl Hub {
 
     fn is_endpoint_origin(&self, url: &Url) -> bool {
         url.origin() == self.config.endpoint.origin()
+    }
+
+    /// The `Authorization` header requests to the Hub carry, when there is a token.
+    pub(crate) fn authorization(&self) -> Option<&HeaderValue> {
+        self.authorization.as_ref()
+    }
+
+    /// Where `hf-xet` asks for the read token of `repo`'s Xet files at `commit`.
+    pub(crate) fn xet_read_token_url(&self, repo: &RepoId, commit: &str) -> Url {
+        self.api_url(repo, &["xet-read-token"], commit, "")
     }
 
     /// Where the token every request carries came from, which an error about access names.

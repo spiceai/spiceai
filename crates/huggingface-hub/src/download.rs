@@ -40,6 +40,7 @@ use snafu::prelude::*;
 use crate::cache::{HubCache, is_valid_etag, set_mode};
 use crate::client::{self, Hub, TreeEntry};
 use crate::location::RepoId;
+use crate::xet::XetFiles;
 
 /// Chunks queued between the download and the thread writing it.
 const WRITE_QUEUE: usize = 16;
@@ -181,6 +182,7 @@ impl FileProgress<'_> {
 }
 
 /// One file to download into `incomplete`.
+#[derive(Clone, Copy)]
 struct Job<'a> {
     hub: &'a Arc<Hub>,
     repo: &'a RepoId,
@@ -188,22 +190,28 @@ struct Job<'a> {
     entry: &'a TreeEntry,
     checksum: &'a Checksum,
     incomplete: &'a Path,
+    /// The Xet files of the load, when this file is one of them.
+    xet: Option<&'a XetFiles>,
 }
 
 /// Downloads `entry` of `repo` at `commit` into the cache, unless its blob is already there,
 /// and returns the blob's path. Resumed bytes, already on disk, are added to `progress` too.
 ///
+/// A file among `xet`, the load's Xet files, is read through `hf-xet`, and through the Hub's
+/// LFS bridge from the first byte Xet did not deliver if Xet fails (see [`crate::xet`]).
+///
 /// # Errors
 ///
 /// Returns an error if the Hub refuses or fails the download, the cache cannot be written, or
 /// the downloaded bytes do not match the file's checksum.
-pub async fn fetch_blob(
+pub(crate) async fn fetch_blob(
     hub: &Arc<Hub>,
     cache: &HubCache,
     repo: &RepoId,
     commit: &str,
     entry: &TreeEntry,
     progress: &Progress,
+    xet: Option<&XetFiles>,
 ) -> Result<PathBuf, FetchError> {
     let checksum = Checksum::of(entry);
     let etag = checksum.etag().to_string();
@@ -245,15 +253,16 @@ pub async fn fetch_blob(
         entry,
         checksum: &checksum,
         incomplete: &incomplete,
+        xet: xet.filter(|xet| xet.contains(&entry.path)),
     };
     let mut file_progress = FileProgress {
         total: progress,
         counted: 0,
     };
-    match download(&job, &mut file_progress, true).await {
-        Ok(()) => {}
+    let retry = match download(&job, &mut file_progress, true).await {
+        Ok(()) => None,
         // A server that answered the resumed request with the whole file, or with other bytes
-        // than asked for: start over from the first byte.
+        // than asked for: start over from the first byte, through the bridge.
         Err(FetchError::Hub {
             source: client::Error::UnexpectedResponse { .. },
         }) if file_len(&incomplete).await > 0 => {
@@ -262,10 +271,25 @@ pub async fn fetch_blob(
                 entry.path,
                 repo.kind()
             );
-            file_progress.restart();
-            download(&job, &mut file_progress, false).await?;
+            Some(Job { xet: None, ..job })
+        }
+        // Bytes read through Xet that fail the Hub's checksum or size are read once more, from
+        // the first byte, through the bridge.
+        Err(error @ (FetchError::Checksum { .. } | FetchError::Size { .. }))
+            if job.xet.is_some() =>
+        {
+            tracing::warn!(
+                "Failed to download '{}' of Hugging Face {} '{repo}' through Xet, so it downloads again through the Hub's LFS bridge. Cause: {error}",
+                entry.path,
+                repo.kind()
+            );
+            Some(Job { xet: None, ..job })
         }
         Err(error) => return Err(error),
+    };
+    if let Some(job) = retry {
+        file_progress.restart();
+        download(&job, &mut file_progress, false).await?;
     }
     tokio::fs::rename(&incomplete, &blob)
         .await
@@ -288,6 +312,7 @@ async fn download(
         entry,
         checksum,
         incomplete,
+        xet,
     } = *job;
     let size = entry.size;
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(WRITE_QUEUE);
@@ -340,12 +365,16 @@ async fn download(
         if existing == size {
             return Ok(());
         }
-        let range = (existing > 0).then_some(GetRange::Offset(existing));
-        let read = hub
-            .read(repo, commit, &entry.path, range)
-            .await
-            .context(HubSnafu)?;
-        let mut stream = read.stream;
+        let xet_read = xet.and_then(|xet| xet.read(hub, repo, commit, entry, existing));
+        let mut stream = if let Some(stream) = xet_read {
+            stream
+        } else {
+            let range = (existing > 0).then_some(GetRange::Offset(existing));
+            hub.read(repo, commit, &entry.path, range)
+                .await
+                .context(HubSnafu)?
+                .stream
+        };
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context(HubSnafu)?;
             let len = chunk.len() as u64;

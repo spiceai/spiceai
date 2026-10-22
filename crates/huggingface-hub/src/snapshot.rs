@@ -41,6 +41,7 @@ use crate::download::{self, Checksum, FetchError, Progress};
 use crate::error::{Cause, DownloadContext, DownloadError};
 use crate::location::RepoId;
 use crate::settings::Settings;
+use crate::xet::XetFiles;
 
 /// Files of one repository downloaded at once, as `hf download` does.
 const MAX_CONCURRENT_FILES: usize = 8;
@@ -384,8 +385,14 @@ impl Snapshot {
             ))
         });
 
+        let xet = match self.settings.xet.as_deref() {
+            Some(cache_dir) => {
+                XetFiles::of(&self.hub, cache_dir, &self.repo, &self.commit, &missing).await
+            }
+            None => None,
+        };
         let result = futures::stream::iter(missing)
-            .map(|entry| self.fetch_file(entry, Arc::clone(&progress)))
+            .map(|entry| self.fetch_file(entry, Arc::clone(&progress), xet.as_ref()))
             .buffer_unordered(MAX_CONCURRENT_FILES)
             .try_collect::<Vec<_>>()
             .await;
@@ -412,6 +419,7 @@ impl Snapshot {
         &self,
         entry: TreeEntry,
         progress: Arc<Progress>,
+        xet: Option<&XetFiles>,
     ) -> Result<(), Box<(String, FetchError)>> {
         download::fetch_blob(
             &self.hub,
@@ -420,6 +428,7 @@ impl Snapshot {
             &self.commit,
             &entry,
             &progress,
+            xet,
         )
         .await
         .map_err(|error| Box::new((entry.path.clone(), error)))?;
@@ -638,8 +647,9 @@ fn files_and_size(count: usize, bytes: u64) -> String {
     format!("{count} {files} ({})", human_bytes(bytes))
 }
 
-/// Aborts a background task when dropped, so a load that is cancelled stops its reporting.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+/// Aborts a background task when dropped: the progress reporting of a load that is cancelled,
+/// or a Xet read whose bytes are no longer wanted.
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {

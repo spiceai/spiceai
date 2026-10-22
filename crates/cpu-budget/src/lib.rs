@@ -868,6 +868,10 @@ impl CpuBudget {
                 self.metastore_pool_connections(),
             ),
             ("embedding_pool_threads", self.embedding_pool_threads()),
+            (
+                "hf_xet_runtime_worker_threads",
+                self.hf_xet_runtime_worker_threads(),
+            ),
             ("duckdb_threads", self.duckdb_threads()),
             (
                 "cluster_executor_concurrent_tasks",
@@ -1455,6 +1459,15 @@ impl CpuBudget {
     #[must_use]
     pub const fn embedding_pool_threads(&self) -> usize {
         self.cores
+    }
+
+    /// Worker threads for the runtime that downloads Hugging Face files stored in Xet: a
+    /// quarter of the cores, at least two. A download waits on the network far more than it
+    /// computes, so a few threads keep many chunk fetches in flight.
+    #[must_use]
+    pub const fn hf_xet_runtime_worker_threads(&self) -> usize {
+        let threads = self.cores / 4;
+        if threads < 2 { 2 } else { threads }
     }
 
     /// `DuckDB`'s per-instance `threads` setting. `DuckDB` otherwise sizes its
@@ -2462,7 +2475,7 @@ mod tests {
 
     /// The claim in `configured_above_ceiling_warning` is that lowering changes
     /// no pool size — not that every pool equals the core budget, which is false
-    /// and was what the message said. Four of the sixteen derived quantities
+    /// and was what the message said. Five of the seventeen derived quantities
     /// diverge from `cores` at `cores = 3`, and a reword checked only against
     /// `derived_sizing()` being *unchanged* cannot see that, because unchanged
     /// and equal are different properties. This pins the divergence itself, so
@@ -2489,6 +2502,7 @@ mod tests {
                 ("interactive_query_worker_threads", 2),
                 ("max_concurrent_queries", 12),
                 ("cayenne_encode_permits", 1),
+                ("hf_xet_runtime_worker_threads", 2),
             ],
             "a pool that stops tracking `cores` belongs in this list, and any message \
              saying \"every pool at N cores\" is wrong while the list is non-empty"
@@ -3137,6 +3151,7 @@ mod tests {
             "cayenne_max_concurrent_file_scans",
             "metastore_pool_connections",
             "embedding_pool_threads",
+            "hf_xet_runtime_worker_threads",
             "duckdb_threads",
             "cluster_executor_concurrent_tasks",
         ] {

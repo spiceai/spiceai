@@ -218,12 +218,12 @@ pub struct Settings {
     pub token_scope: TokenScope,
     /// The root of the Hub's file cache: `models--<owner>--<name>/` and its siblings.
     pub cache_dir: PathBuf,
-    /// The root of `hf-xet`'s shard cache.
-    pub xet_cache_dir: PathBuf,
     /// Only the cache is read; the Hub is never contacted.
     pub offline: bool,
-    /// Every file is read through the Hub's `resolve` redirect, never the Xet protocol.
-    pub xet_disabled: bool,
+    /// Where reads of the Hub's Xet storage keep their shard cache (`HF_XET_CACHE`, else
+    /// `$HF_HOME/xet`) when Spice reads it: only from the public Hub, and never with
+    /// `HF_HUB_DISABLE_XET` set. `None` reads every file through the Hub's LFS bridge.
+    pub xet: Option<PathBuf>,
 }
 
 /// The process environment, or a stand-in a test controls without mutating process state.
@@ -282,10 +282,13 @@ impl Settings {
             .map(|cache| expand_home(&cache, env))
             .or_else(|| hf_home.as_ref().map(|home| home.join("hub")))
             .context(NoCacheDirectorySnafu)?;
-        let xet_cache_dir = var(HF_XET_CACHE)
-            .map(|cache| expand_home(&cache, env))
-            .or_else(|| hf_home.as_ref().map(|home| home.join("xet")))
-            .context(NoCacheDirectorySnafu)?;
+        let xet = (is_public_hub(&endpoint) && !is_true(var(HF_HUB_DISABLE_XET).as_deref()))
+            .then(|| {
+                var(HF_XET_CACHE)
+                    .map(|cache| expand_home(&cache, env))
+                    .or_else(|| hf_home.as_ref().map(|home| home.join("xet")))
+            })
+            .flatten();
 
         Ok(Self {
             endpoint,
@@ -293,10 +296,9 @@ impl Settings {
             token,
             token_scope,
             cache_dir,
-            xet_cache_dir,
             offline: is_true(var(HF_HUB_OFFLINE).as_deref())
                 || is_true(var(TRANSFORMERS_OFFLINE).as_deref()),
-            xet_disabled: is_true(var(HF_HUB_DISABLE_XET).as_deref()),
+            xet,
         })
     }
 }
@@ -352,7 +354,7 @@ impl Access {
 
         // A token the Spicepod does not set goes only to an endpoint set where it was: the
         // public Hub or `HF_ENDPOINT`, never a Spicepod's `hf_endpoint`.
-        let token_scope = if endpoint.origin() == default_endpoint.origin()
+        let token_scope = if is_public_hub(&endpoint)
             || env_endpoint
                 .as_ref()
                 .is_some_and(|env_endpoint| env_endpoint.origin() == endpoint.origin())
@@ -396,6 +398,11 @@ fn loaded_source(env: &impl Environment, secret: &SecretString) -> TokenSource {
     } else {
         TokenSource::Secret
     }
+}
+
+/// Whether `endpoint` is the public Hub.
+fn is_public_hub(endpoint: &Url) -> bool {
+    Url::parse(DEFAULT_ENDPOINT).is_ok_and(|hub| hub.origin() == endpoint.origin())
 }
 
 /// `HF_HOME`, else `$XDG_CACHE_HOME/huggingface`, else `~/.cache/huggingface`.
@@ -750,14 +757,22 @@ mod tests {
             cache(&[(HUGGINGFACE_HUB_CACHE, "/legacy"), (HF_HUB_CACHE, "/hub")]).await,
             PathBuf::from("/hub")
         );
-        let xet = resolve(&env(&[(HF_HOME, "/hf")]), None, None)
-            .await
-            .xet_cache_dir;
-        assert_eq!(xet, PathBuf::from("/hf/xet"));
+        let xet = resolve(&env(&[(HF_HOME, "/hf")]), None, None).await.xet;
+        assert_eq!(xet, Some(PathBuf::from("/hf/xet")));
         let xet = resolve(&env(&[(HF_HOME, "/hf"), (HF_XET_CACHE, "/x")]), None, None)
             .await
-            .xet_cache_dir;
-        assert_eq!(xet, PathBuf::from("/x"));
+            .xet;
+        assert_eq!(xet, Some(PathBuf::from("/x")));
+        // A mirror's files are read as it serves them, never from the Hub's Xet storage.
+        let mirror = "https://hf-mirror.example";
+        let xet = resolve(&env(&[(HF_HOME, "/hf")]), None, Some(mirror))
+            .await
+            .xet;
+        assert_eq!(xet, None);
+        let xet = resolve(&env(&[(HF_HOME, "/hf"), (HF_ENDPOINT, mirror)]), None, None)
+            .await
+            .xet;
+        assert_eq!(xet, None);
     }
 
     #[tokio::test]
@@ -775,10 +790,11 @@ mod tests {
                     .offline,
                 "{value}"
             );
-            assert!(
+            assert_eq!(
                 resolve(&env(&[(HF_HUB_DISABLE_XET, value)]), None, None)
                     .await
-                    .xet_disabled,
+                    .xet,
+                None,
                 "{value}"
             );
         }
@@ -787,6 +803,17 @@ mod tests {
                 !resolve(&env(&[(HF_HUB_OFFLINE, value)]), None, None)
                     .await
                     .offline,
+                "{value}"
+            );
+            assert_eq!(
+                resolve(
+                    &env(&[(HF_HOME, "/hf"), (HF_HUB_DISABLE_XET, value)]),
+                    None,
+                    None
+                )
+                .await
+                .xet,
+                Some(PathBuf::from("/hf/xet")),
                 "{value}"
             );
         }
