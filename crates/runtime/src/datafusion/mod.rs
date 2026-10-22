@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
+use crate::accelerated::partition_scope::{PartitionScope, scope_changes};
 use crate::accelerated::refresh::{self, RefreshOverrides};
 use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
@@ -95,6 +96,7 @@ use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
+use data_components::cdc::AccelerationContents;
 use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
@@ -4259,6 +4261,16 @@ impl DataFusion {
             .validate_time_format(&dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
+        // A change stream applies whatever its source sends, so on a cluster
+        // executor it is scoped to the partitions the executor serves, when its
+        // connector supports that.
+        let partition_scope = initial_partition_filters
+            .as_ref()
+            .filter(|_| {
+                refresh_mode == RefreshMode::Changes && source.supports_partitioned_changes()
+            })
+            .map(|filters| PartitionScope::new(filters.clone()));
+
         // Apply initial partition filters before the refresher starts to avoid a race
         // where the first refresh runs without partition filters. `Some(empty)`
         // (executor owns no partition of this table) is preserved so the refresh
@@ -4622,8 +4634,14 @@ impl DataFusion {
             // assume they may be hiding rows deleted at the source; this is how
             // it recognizes a load that starts from nothing instead. See
             // `AccelerationContents`.
-            let acceleration =
+            let mut acceleration =
                 probe_acceleration_contents(&accelerated_table_provider, &dataset.name).await;
+            // Kept rows of a scoped acceleration may belong to partitions this
+            // executor no longer serves, so the source rebuilds it instead of
+            // resuming on them.
+            if partition_scope.is_some() && acceleration == AccelerationContents::NonEmpty {
+                acceleration = AccelerationContents::Unknown;
+            }
 
             let changes_stream = source
                 .changes_stream(
@@ -4635,6 +4653,13 @@ impl DataFusion {
                 .await;
 
             if let Some(changes_stream) = changes_stream {
+                let changes_stream = match &partition_scope {
+                    Some(scope) => {
+                        accelerated_table_builder.partition_scope(Arc::clone(scope));
+                        scope_changes(changes_stream, Arc::clone(scope))
+                    }
+                    None => changes_stream,
+                };
                 accelerated_table_builder.changes_stream(changes_stream);
             }
         }
@@ -6084,6 +6109,16 @@ impl DataFusion {
             table.as_ref(),
             spice_table::LayerWalk::Read,
         ) {
+            if let Some(waiter) =
+                accelerated_table
+                    .trigger_reload()
+                    .await
+                    .context(UnableToTriggerRefreshSnafu {
+                        dataset_name: dataset_name.to_string(),
+                    })?
+            {
+                return Ok(Some(waiter));
+            }
             // Taken before the trigger, for both halves of the correlation: the
             // refresh it starts cannot finish unobserved between here and the
             // caller's wait (#13086), and a refresh already running when the
