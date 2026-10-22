@@ -1837,6 +1837,18 @@
       "group": "sqlite"
     }
   ],
+  "mysql-cdc-parity": [
+    {
+      "run": "mysql-cdc-parity",
+      "who": "turso-position",
+      "key": "start: {}",
+      "kind": "status",
+      "signature": "spiced not ready: a dataset is in Error: .*Database schema conflict|spiced not ready: a dataset is in Error: .*Failed to commit staged on-conflict metadata",
+      "pattern": "spiced not ready: a dataset is in Error: .*Database schema conflict|spiced not ready: a dataset is in Error: .*Failed to commit staged on-conflict metadata",
+      "group": "sqlite",
+      "may-pass": true
+    }
+  ],
   "mysql-literals": [
     {
       "run": "mysql-literals",

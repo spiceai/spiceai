@@ -219,6 +219,26 @@
       "pattern": "spiced not ready: a dataset is in Error",
       "group": "cdc-postgres",
       "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key",
+      "key": "restart: {}",
+      "kind": "other",
+      "signature": "spiced not ready: a dataset is in Error",
+      "pattern": "spiced not ready: a dataset is in Error",
+      "group": "cdc-postgres",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position",
+      "key": "restart: {}",
+      "kind": "other",
+      "signature": "spiced not ready: a dataset is in Error",
+      "pattern": "spiced not ready: a dataset is in Error",
+      "group": "cdc-postgres",
+      "may-pass": true
     }
   ],
   "postgres-cdc-unchanged-toast": [
