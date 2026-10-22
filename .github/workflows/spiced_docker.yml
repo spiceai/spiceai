@@ -3,14 +3,38 @@ name: spiced_docker
 on:
   release:
     types:
-      # 'published' fires when a release (including a pre-release / RC) is
-      # first published, so RC tags still get pushed to DockerHub / GHCR even
-      # though they aren't marked as "latest" on GitHub.
-      - published
       # 'edited' fires when an existing release is edited — we use this to
       # re-run the workflow when a release is flipped to 'latest' so the
       # :latest tag can be updated without re-publishing all images.
+      #
+      # 'published' is deliberately absent. Publishing a release candidate
+      # creates its tag in the same second, so the event arrives hours before
+      # build_and_release has attached the binaries the images are built
+      # from, and every download 404s. Release candidates are built by
+      # build_and_release instead, through workflow_call below, once its
+      # `publish` jobs have uploaded them.
       - edited
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Git tag to source binaries from (for example v1.4.0-rc.1)
+        required: true
+        type: string
+      publish:
+        description: Publish the Docker images to registries
+        required: false
+        type: boolean
+        default: false
+      tag_latest:
+        description: "Tag as 'latest': auto (only if the GitHub release is marked 'latest'), 'true', or 'false'"
+        required: false
+        type: string
+        default: auto
+      target:
+        description: "Build docker images for specific target(s): all, amd64, or arm64"
+        required: false
+        type: string
+        default: all
   workflow_dispatch:
     inputs:
       release_tag:
@@ -46,10 +70,8 @@ jobs:
   setup:
     # Run on:
     #   - workflow_dispatch (manual runs)
-    #   - release 'published' ONLY for stable releases (vX.Y.Z) or RC tags
-    #     (vX.Y.Z-rc.N / vX.Y.Z-rc-N). Other pre-releases (nightly, beta,
-    #     alpha, dev, etc.) are intentionally excluded so they never get
-    #     published to DockerHub / GHCR via this workflow.
+    #   - workflow_call from build_and_release, for release-candidate tags
+    #     (vX.Y.Z-rc.N), after the binaries are attached to the release
     #   - release 'edited' only when the release is flipped to 'latest', so the
     #     ':latest' tag can be moved without re-publishing on every edit.
     #
@@ -59,11 +81,6 @@ jobs:
     if: >-
       ${{
         github.event_name != 'release'
-        || (
-          github.event.action == 'published'
-          && !github.event.release.draft
-          && contains(github.event.release.tag_name, '-rc.')
-        )
         || (
           github.event.action == 'edited'
           && !github.event.release.draft
@@ -87,21 +104,34 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          # `inputs` holds the workflow_dispatch and the workflow_call inputs
+          # alike. A called workflow sees its caller's event, so anything that
+          # is neither 'release' nor 'workflow_dispatch' is the call.
+          INPUT_TARGET: ${{ inputs.target }}
+          INPUT_PUBLISH: ${{ inputs.publish && 'true' || 'false' }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_TAG_LATEST: ${{ inputs.tag_latest }}
+          RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
 
           event_name="${{ github.event_name }}"
-          if [ "$event_name" = "workflow_dispatch" ]; then
-            target_input="${{ github.event.inputs.target }}"
-            publish_flag="${{ github.event.inputs.publish || 'false' }}"
-            release_tag_input="${{ github.event.inputs.release_tag }}"
-            allow_cuda=true
-          else
+          if [ "$event_name" = "release" ]; then
             # For release events, CUDA is not built (nightly-only)
             target_input="all"
             publish_flag="true"
-            release_tag_input="${{ github.event.release.tag_name }}"
+            release_tag_input="${RELEASE_TAG_NAME}"
             allow_cuda=false
+          else
+            target_input="${INPUT_TARGET}"
+            publish_flag="${INPUT_PUBLISH}"
+            release_tag_input="${INPUT_RELEASE_TAG}"
+            # CUDA images are nightly-only: only a manual run builds them.
+            if [ "$event_name" = "workflow_dispatch" ]; then
+              allow_cuda=true
+            else
+              allow_cuda=false
+            fi
           fi
 
           target_input="${target_input:-all}"
@@ -171,11 +201,11 @@ jobs:
           # itself is marked as the repository's "latest" release. We no
           # longer infer this from the version string — RCs, stable releases
           # published out-of-order, etc. all respect GitHub's latest flag.
-          if [ "$event_name" = "workflow_dispatch" ]; then
-            tag_latest_input="${{ github.event.inputs.tag_latest }}"
-          else
+          if [ "$event_name" = "release" ]; then
             # For release events, use 'auto' detection
             tag_latest_input="auto"
+          else
+            tag_latest_input="${INPUT_TAG_LATEST:-auto}"
           fi
 
           if [ "$tag_latest_input" = "auto" ]; then
