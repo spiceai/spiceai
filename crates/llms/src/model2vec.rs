@@ -84,7 +84,7 @@ impl Model2Vec {
         component: &str,
         model: &str,
         hub: HubParams<'_>,
-        options: Model2VecOptions,
+        mut options: Model2VecOptions,
     ) -> Result<Self, super::embeddings::Error> {
         let (dir, name) = match local_model_path(model)? {
             Some(path) => {
@@ -109,6 +109,9 @@ impl Model2Vec {
                 (PathBuf::from(model), model.to_string())
             }
             None => {
+                // `model2vec-rs` joins the folder onto the snapshot directory, where a leading
+                // `/` would make it an absolute path.
+                options.subfolder = repo_folder(options.subfolder.as_deref());
                 let requester = Requester {
                     kind: "embedding model",
                     name: component.to_string(),
@@ -173,16 +176,24 @@ impl Model2Vec {
     }
 }
 
-/// The files `model2vec-rs` reads from a model in `subfolder` of a repository: its tokenizer
-/// and its weights, and its `config.json` when the repository has one; `has` says whether the
-/// repository holds a path. When the repository lacks a file, what it lacks.
-fn model2vec_files(
-    subfolder: Option<&str>,
-    has: impl Fn(&str) -> bool,
-) -> Result<Vec<String>, String> {
-    let prefix = subfolder
+/// `subfolder` as a folder of a repository, which has no leading or trailing `/`; `None` for
+/// the repository's root.
+fn repo_folder(subfolder: Option<&str>) -> Option<String> {
+    subfolder
         .map(|folder| folder.trim_matches('/'))
         .filter(|folder| !folder.is_empty())
+        .map(str::to_string)
+}
+
+/// The files `model2vec-rs` reads from a model in `folder` of a repository (see
+/// [`repo_folder`]): its tokenizer and its weights, and its `config.json` when the repository
+/// has one; `has` says whether the repository holds a path. When the repository lacks a file,
+/// what it lacks.
+fn model2vec_files(
+    folder: Option<&str>,
+    has: impl Fn(&str) -> bool,
+) -> Result<Vec<String>, String> {
+    let prefix = folder
         .map(|folder| format!("{folder}/"))
         .unwrap_or_default();
     let mut paths = Vec::new();
@@ -206,10 +217,10 @@ async fn download(
     requester: Requester,
     repo: &str,
     hub: HubParams<'_>,
-    subfolder: Option<&str>,
+    folder: Option<&str>,
 ) -> Result<PathBuf, DownloadError> {
     let snapshot = crate::hf::open_model(requester, repo, None, hub).await?;
-    let paths = model2vec_files(subfolder, |path| snapshot.file(path).is_some())
+    let paths = model2vec_files(folder, |path| snapshot.file(path).is_some())
         .map_err(|missing| DownloadError::missing(&snapshot, missing))?;
     let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
     snapshot.download(&paths).await?;
@@ -401,7 +412,9 @@ mod tests {
     use async_openai::types::embeddings::EmbeddingInput;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{home_dir, local_model_path, looks_like_local_model_path, model2vec_files};
+    use super::{
+        home_dir, local_model_path, looks_like_local_model_path, model2vec_files, repo_folder,
+    };
 
     /// Loads `model`, a local directory in these tests, as the embedding model `test`.
     async fn load(model: &str) -> Result<Model2Vec, Error> {
@@ -575,10 +588,14 @@ mod tests {
             ])
         );
         // A model in a subfolder, however the folder is written.
-        for subfolder in ["0_StaticEmbedding", "/0_StaticEmbedding/"] {
+        for subfolder in [
+            "0_StaticEmbedding",
+            "0_StaticEmbedding/",
+            "/0_StaticEmbedding/",
+        ] {
             assert_eq!(
                 model2vec_files(
-                    Some(subfolder),
+                    repo_folder(Some(subfolder)).as_deref(),
                     repo(&[
                         "tokenizer.json",
                         "0_StaticEmbedding/tokenizer.json",

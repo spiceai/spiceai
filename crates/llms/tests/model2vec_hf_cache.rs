@@ -108,26 +108,7 @@ async fn a_cached_model_is_read_from_the_directory_hf_hub_cache_names() {
         "this test sets the process-wide `HF_HUB_CACHE` and `HF_HUB_OFFLINE` environment variables",
     );
     let cache = tempfile::tempdir().expect("creates a cache directory");
-
-    // `huggingface_hub`'s on-disk layout: `refs/<revision>` holds the commit hash, and
-    // the files live under `snapshots/<commit hash>/`.
-    let repo_dir = cache
-        .path()
-        .join(format!("models--{}", REPO_ID.replace('/', "--")));
-    let commit = "0000000000000000000000000000000000000000";
-    let snapshot = repo_dir.join("snapshots").join(commit);
-    std::fs::create_dir_all(&snapshot).expect("creates the snapshot directory");
-    std::fs::create_dir_all(repo_dir.join("refs")).expect("creates the refs directory");
-    std::fs::write(repo_dir.join("refs").join("main"), commit).expect("writes the ref");
-    write_static_model(&snapshot);
-
-    // SAFETY: `require_process_per_test` above has established that this test
-    // runs in a process of its own, so no other thread is reading or writing the
-    // environment while this runs.
-    unsafe {
-        std::env::set_var("HF_HUB_CACHE", cache.path());
-        std::env::set_var("HF_HUB_OFFLINE", "1");
-    }
+    write_static_model(&offline_snapshot(cache.path()));
 
     Model2Vec::load(
         "test",
@@ -142,4 +123,66 @@ async fn a_cached_model_is_read_from_the_directory_hf_hub_cache_names() {
              variable re-downloads it on every start, and fails outright with no egress: {e}"
         )
     });
+}
+
+/// A model in a folder of its repository loads however `subfolder` writes the folder.
+///
+/// A sentence-transformers export keeps its static embedding in `0_StaticEmbedding/`.
+/// Spice downloads that folder's files, then hands `model2vec-rs` the snapshot directory
+/// and the subfolder, which it joins onto the directory. A leading `/` must not make that
+/// join an absolute path outside the snapshot, after the download found the files.
+///
+/// The repository's root holds no model, so a load succeeds only by reading the folder.
+#[tokio::test]
+async fn a_model_in_a_subfolder_loads_however_the_subfolder_is_written() {
+    crate::require_process_per_test(
+        "this test sets the process-wide `HF_HUB_CACHE` and `HF_HUB_OFFLINE` environment variables",
+    );
+    let cache = tempfile::tempdir().expect("creates a cache directory");
+    let folder = offline_snapshot(cache.path()).join("0_StaticEmbedding");
+    std::fs::create_dir_all(&folder).expect("creates the model's folder");
+    write_static_model(&folder);
+
+    for subfolder in [
+        "0_StaticEmbedding",
+        "0_StaticEmbedding/",
+        "/0_StaticEmbedding/",
+    ] {
+        Model2Vec::load(
+            "test",
+            REPO_ID,
+            HubParams::default(),
+            Model2VecOptions {
+                subfolder: Some(subfolder.to_string()),
+                ..Model2VecOptions::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the model in subfolder '{subfolder}' must load: {e}"));
+    }
+}
+
+/// Lays out an empty snapshot of [`REPO_ID`] at `main` in the Hugging Face cache `cache`,
+/// points `HF_HUB_CACHE` at it and sets `HF_HUB_OFFLINE`, and returns the snapshot directory.
+///
+/// Call it only after `require_process_per_test`, which establishes that no other thread
+/// reads or writes the environment.
+fn offline_snapshot(cache: &Path) -> std::path::PathBuf {
+    // `huggingface_hub`'s on-disk layout: `refs/<revision>` holds the commit hash, and
+    // the files live under `snapshots/<commit hash>/`.
+    let repo_dir = cache.join(format!("models--{}", REPO_ID.replace('/', "--")));
+    let commit = "0000000000000000000000000000000000000000";
+    let snapshot = repo_dir.join("snapshots").join(commit);
+    std::fs::create_dir_all(&snapshot).expect("creates the snapshot directory");
+    std::fs::create_dir_all(repo_dir.join("refs")).expect("creates the refs directory");
+    std::fs::write(repo_dir.join("refs").join("main"), commit).expect("writes the ref");
+
+    // SAFETY: the caller has established, through `require_process_per_test`, that this
+    // test runs in a process of its own, so no other thread is reading or writing the
+    // environment while this runs.
+    unsafe {
+        std::env::set_var("HF_HUB_CACHE", cache);
+        std::env::set_var("HF_HUB_OFFLINE", "1");
+    }
+    snapshot
 }
