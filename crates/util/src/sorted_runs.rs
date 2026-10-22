@@ -31,7 +31,7 @@ use std::sync::{Arc, LazyLock, Weak};
 use parking_lot::Mutex;
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 
-use datafusion::arrow::array::{Array, UInt32Array};
+use datafusion::arrow::array::{Array, AsArray, UInt32Array};
 use datafusion::arrow::compute::{concat_batches, lexsort_to_indices, take_record_batch};
 use datafusion::arrow::datatypes::{DataType, SchemaRef, i256};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -63,6 +63,11 @@ const MIN_CHUNK_BYTES: usize = 256 * 1024;
 /// (see `sort_partition_into_runs`). The sort's working memory is charged beside
 /// them (see `chunk_charge`).
 const CHUNK_COPIES: usize = 2;
+
+/// The most bytes one column with 32-bit offsets (`Utf8`, `Binary`, `List`, and
+/// types holding them) may carry in a chunk: a chunk is concatenated before it
+/// is sorted, and a concatenation past `i32::MAX` bytes overflows its offsets.
+const MAX_OFFSET_BYTES: usize = 0x7FFF_FFFF;
 
 /// How much of its memory pool one sort may plan to hold.
 ///
@@ -129,6 +134,9 @@ struct RunsConfig {
     max_fan_in: Option<usize>,
     /// The largest chunk sorted at once.
     max_chunk_bytes: Option<usize>,
+    /// The most bytes a column with 32-bit offsets carries in one chunk
+    /// (see [`MAX_OFFSET_BYTES`]).
+    max_offset_bytes: Option<usize>,
     /// How much of the pool the sort may plan to hold.
     budget: SortBudget,
 }
@@ -562,6 +570,45 @@ fn write_run(
     }))
 }
 
+/// What `array` adds to a concatenation's 32-bit offsets: a string or binary
+/// column's value bytes, the whole size of any other type that holds 32-bit
+/// offsets (an upper bound), and nothing for a type without them.
+fn offset_bytes(array: &dyn Array) -> usize {
+    let span = |offsets: &[i32]| match (offsets.first(), offsets.last()) {
+        (Some(first), Some(last)) => usize::try_from(last - first).unwrap_or(0),
+        _ => 0,
+    };
+    match array.data_type() {
+        DataType::Utf8 => span(array.as_string::<i32>().value_offsets()),
+        DataType::Binary => span(array.as_binary::<i32>().value_offsets()),
+        data_type if has_offsets_i32(data_type) => array.get_array_memory_size(),
+        _ => 0,
+    }
+}
+
+/// Whether `data_type` holds 32-bit offsets anywhere in it.
+fn has_offsets_i32(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8
+        | DataType::Binary
+        | DataType::List(_)
+        | DataType::ListView(_)
+        | DataType::Map(..) => true,
+        DataType::LargeList(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _) => has_offsets_i32(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| has_offsets_i32(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| has_offsets_i32(field.data_type())),
+        DataType::Dictionary(_, values) => has_offsets_i32(values),
+        DataType::RunEndEncoded(_, values) => has_offsets_i32(values.data_type()),
+        _ => false,
+    }
+}
+
 /// What sorting a chunk allocates per row for a key column of `data_type`,
 /// beside the chunk: its `(row index, sort value)` pair and the row-index
 /// vectors it partitions the rows into and emits, which overlap the pairs.
@@ -624,6 +671,7 @@ async fn sort_partition_into_runs(
     partition: usize,
     ordering: LexOrdering,
     chunk_bytes: usize,
+    max_offset_bytes: usize,
     run_batch_rows: usize,
     ctx: Arc<TaskContext>,
     spill_manager: SpillManager,
@@ -643,6 +691,10 @@ async fn sort_partition_into_runs(
     // What each buffered batch reserved (see `chunk_charge`), and their sum.
     let mut charges: Vec<usize> = Vec::new();
     let mut buffered_bytes = 0;
+    // What each buffered batch adds to each column's 32-bit offsets (see
+    // `offset_bytes`), and their sums per column.
+    let mut offsets: Vec<Vec<usize>> = Vec::new();
+    let mut offset_totals = vec![0_usize; schema.fields().len()];
     let mut pending: Option<PendingRun> = None;
     // What the chunk in the background holds: its batches and concatenation
     // while it is sorted, then the sorted chunk while it is written.
@@ -670,6 +722,11 @@ async fn sort_partition_into_runs(
             let batches: Vec<RecordBatch> = buffered.drain(..count).collect();
             let bytes: usize = charges.drain(..count).sum();
             buffered_bytes -= bytes;
+            for batch_offsets in offsets.drain(..count) {
+                for (total, added) in offset_totals.iter_mut().zip(batch_offsets) {
+                    *total -= added;
+                }
+            }
             let held = reservation.split(bytes.min(reservation.size()));
             let (schema, ordering, spill_manager, keys) = (
                 Arc::clone(&schema),
@@ -700,6 +757,22 @@ async fn sort_partition_into_runs(
             batch.num_rows(),
             scratch_per_row,
         );
+        // Sort what is buffered first when this batch would take a column past
+        // what a concatenation's 32-bit offsets address.
+        let batch_offsets: Vec<usize> = batch
+            .columns()
+            .iter()
+            .map(|column| offset_bytes(column.as_ref()))
+            .collect();
+        if !buffered.is_empty()
+            && offset_totals
+                .iter()
+                .zip(&batch_offsets)
+                .any(|(total, added)| total.saturating_add(*added) > max_offset_bytes)
+        {
+            gate.enter().await?;
+            spill_in_background!(buffered.len());
+        }
         // The pool may refuse a batch another consumer needs the room for: sort
         // what is buffered first, and hold the batch regardless (a sort must hold
         // at least one batch to make progress).
@@ -712,6 +785,10 @@ async fn sort_partition_into_runs(
         }
         buffered_bytes += bytes;
         charges.push(bytes);
+        for (total, added) in offset_totals.iter_mut().zip(&batch_offsets) {
+            *total += added;
+        }
+        offsets.push(batch_offsets);
         buffered.push(batch);
         // Read on beside the chunk in the background only while both fit the
         // partition's budget; otherwise wait for it to be written.
@@ -877,6 +954,7 @@ async fn sort_then_merge(
             partition,
             ordering.clone(),
             chunk_bytes,
+            config.max_offset_bytes.unwrap_or(MAX_OFFSET_BYTES),
             run_batch_rows,
             Arc::clone(&ctx),
             spill_manager.clone(),
@@ -1276,10 +1354,11 @@ mod tests {
     }
 
     async fn collect(plan: Arc<dyn ExecutionPlan>, ctx: Arc<TaskContext>) -> RecordBatch {
+        let schema = plan.schema();
         let batches = datafusion::physical_plan::collect(plan, ctx)
             .await
             .expect("plan runs");
-        concat_batches(&schema(), &batches).expect("concat")
+        concat_batches(&schema, &batches).expect("concat")
     }
 
     async fn assert_matches_one_sort(ctx: Arc<TaskContext>, rows_per_batch: usize, seed: u64) {
@@ -1346,6 +1425,101 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// Six batches of 1,000 rows, each with 8 KB of string payload, keyed by
+    /// seeded pseudo-random keys.
+    fn string_batches() -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let mut state = 17_u64;
+        (0..6)
+            .map(|batch| {
+                let keys: Vec<i64> = (0..1_000)
+                    .map(|_| {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        i64::try_from((state >> 33) % 499).expect("small")
+                    })
+                    .collect();
+                let payloads: Vec<String> = (0..1_000)
+                    .map(|row| format!("{batch:03}-{row:04}"))
+                    .collect();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(keys)),
+                        Arc::new(arrow::array::StringArray::from(payloads)),
+                    ],
+                )
+                .expect("batch")
+            })
+            .collect()
+    }
+
+    // A chunk is concatenated before it is sorted, so a column with 32-bit
+    // offsets must never carry more bytes into one chunk than they address; a
+    // sort with GiBs of strings in one partition otherwise fails with an Arrow
+    // offset overflow.
+    #[tokio::test]
+    async fn a_chunk_ends_before_its_string_bytes_pass_what_offsets_address() {
+        let data = string_batches();
+        let schema = data[0].schema();
+        let input: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[data], Arc::clone(&schema), None)
+                .expect("memory source");
+        // Payloads are unique, so the order is total and one sort fixes it.
+        let columns = ["key".to_string(), "payload".to_string()];
+        let ordering =
+            crate::stream_utils::build_lex_ordering(&schema, &columns).expect("ordering");
+        let ctx = Arc::new(TaskContext::default());
+        let spill_manager = SpillManager::new(
+            ctx.runtime_env(),
+            SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            Arc::clone(&schema),
+        );
+        // Room for two batches' payloads: memory never fills a chunk, so only
+        // the payload's bytes end one.
+        let runs = sort_partition_into_runs(
+            Arc::clone(&input),
+            0,
+            ordering.clone(),
+            usize::MAX / CHUNK_COPIES,
+            2 * 8_000,
+            8_192,
+            Arc::clone(&ctx),
+            spill_manager,
+            Arc::new(AdmissionGate::new(None, 0)),
+            Arc::new(KeyEncoder::new(&schema, &ordering).expect("encoder")),
+        )
+        .await
+        .expect("runs");
+        assert_eq!(runs.rows, 6_000);
+        assert_eq!(
+            runs.runs.iter().map(|run| run.rows).collect::<Vec<_>>(),
+            vec![2_000, 2_000]
+        );
+        assert_eq!(
+            runs.tail.as_ref().map(|tail| tail.sorted.rows()),
+            Some(2_000)
+        );
+
+        // The whole sort under that bound returns exactly what one sort does.
+        let config = RunsConfig {
+            max_offset_bytes: Some(2 * 8_000),
+            ..RunsConfig::default()
+        };
+        let actual = collect(
+            sort_in_runs_with(Arc::clone(&input), ordering, &ctx, config),
+            Arc::clone(&ctx),
+        )
+        .await;
+        let expected = collect(oracle(input, &columns), Arc::new(TaskContext::default())).await;
+        assert_eq!(actual.num_rows(), 6_000);
+        assert_eq!(actual, expected);
+    }
+
     #[tokio::test]
     async fn a_partition_larger_than_its_chunk_is_written_as_several_bounded_runs() {
         // One partition of 3 batches x 8k rows x 16 bytes (~128 KB each), with
@@ -1381,6 +1555,7 @@ mod tests {
             0,
             ordering,
             100_000,
+            MAX_OFFSET_BYTES,
             8_192,
             ctx,
             spill_manager,
@@ -1558,6 +1733,7 @@ mod tests {
             0,
             ordering.clone(),
             chunk,
+            MAX_OFFSET_BYTES,
             8_192,
             ctx,
             spill_manager,
@@ -1638,6 +1814,7 @@ mod tests {
             run_batch_rows: Some(1_000),
             max_fan_in: Some(3),
             max_chunk_bytes: None,
+            max_offset_bytes: None,
             budget: SortBudget::Shared,
         };
         let actual = collect(
