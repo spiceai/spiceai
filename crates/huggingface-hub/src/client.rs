@@ -14,17 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A client for the parts of the Hugging Face Hub a dataset read uses.
+//! A client for the parts of the Hugging Face Hub Spice reads, for model, dataset and space
+//! repositories alike (`{type}s` below is `models`, `datasets` or `spaces`).
 //!
-//! - `GET /api/datasets/{repo}/revision/{revision}` resolves a branch or tag to a commit;
-//! - `GET /api/datasets/{repo}/tree/{commit}/{path}` lists files, 1,000 per page;
-//! - `POST /api/datasets/{repo}/paths-info/{commit}` describes one path;
-//! - `GET /datasets/{repo}/resolve/{commit}/{path}` reads a file. For a large file it redirects
-//!   to a signed CDN URL that serves byte ranges; the redirect target is cached, so a file costs
-//!   one `resolve` request however many ranges a scan reads from it.
+//! - `GET /api/{type}s/{repo}/revision/{revision}` resolves a branch or tag to a commit;
+//! - `GET /api/{type}s/{repo}/tree/{commit}/{path}` lists files, 1,000 per page;
+//! - `POST /api/{type}s/{repo}/paths-info/{commit}` describes one path;
+//! - `GET /[{type}s/]{repo}/resolve/{commit}/{path}` reads a file (a model repository has no
+//!   prefix). For a large file it redirects to a signed CDN URL that serves byte ranges; the
+//!   redirect target is cached, so a file costs one `resolve` request however many ranges a
+//!   scan reads from it.
 //!
 //! Every read names a commit, never a branch, so everything one scan reads comes from the same
-//! snapshot of the dataset, and anything keyed by a commit can be cached without invalidation.
+//! snapshot of the repository, and anything keyed by a commit can be cached without
+//! invalidation.
 
 use std::fmt;
 use std::ops::Range;
@@ -47,12 +50,13 @@ use snafu::prelude::*;
 use tokio::runtime::Handle;
 use url::Url;
 
-use crate::location::RepoId;
+use crate::location::{RepoId, RepoType};
 
 /// The public Hugging Face Hub.
 pub const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
-const DOCS_URL: &str =
+const DATASET_DOCS_URL: &str =
     "https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md";
+const MODEL_DOCS_URL: &str = "https://spiceai.org/docs/components/models/huggingface";
 
 /// Attempts for one request, the first included.
 const MAX_ATTEMPTS: u32 = 5;
@@ -68,7 +72,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long a branch or tag resolves to the same commit without asking the Hub again. Bounds
-/// how stale a scan can be after the dataset changes, and coalesces the lookups of a burst of
+/// how stale a scan can be after the repository changes, and coalesces the lookups of a burst of
 /// scans into one.
 const REVISION_TTL: Duration = Duration::from_secs(10);
 /// How long a resolved CDN URL is reused. The Hub signs them for an hour; an expired one is
@@ -84,39 +88,51 @@ const MAX_CACHED_LISTING_ENTRIES: u64 = 500_000;
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
     #[snafu(display(
-        "Hugging Face dataset '{repo}' was not found{private_hint}. Check the owner and dataset name in `from`. See: {DOCS_URL}"
+        "Hugging Face {kind} '{repo}' was not found{private_hint}. Check the owner and {kind} name in `from`. See: {docs}",
+        kind = repo.kind(),
+        docs = docs_url(repo.kind())
     ))]
     RepoNotFound { repo: RepoId, private_hint: String },
 
     #[snafu(display(
-        "Revision '{revision}' does not exist in Hugging Face dataset '{repo}'. Use an existing branch, tag or commit after '@' in `from`, or remove '@{revision}' to read 'main'."
+        "Revision '{revision}' does not exist in Hugging Face {kind} '{repo}'. Use an existing branch, tag or commit after '{separator}' in `from`, or remove '{separator}{revision}' to read 'main'.",
+        kind = repo.kind(),
+        separator = revision_separator(repo.kind())
     ))]
     RevisionNotFound { repo: RepoId, revision: String },
 
-    #[snafu(display("'{path}' does not exist in Hugging Face dataset '{repo}'."))]
+    #[snafu(display("'{path}' does not exist in Hugging Face {kind} '{repo}'.", kind = repo.kind()))]
     EntryNotFound { repo: RepoId, path: String },
 
     #[snafu(display(
-        "Hugging Face dataset '{repo}' is gated{token_hint}: accept its access conditions at {dataset_url} with the account `hf_token` belongs to. See: {DOCS_URL}"
+        "Hugging Face {kind} '{repo}' is gated{token_hint}: accept its access conditions at {repo_url} with the account `hf_token` belongs to. See: {docs}",
+        kind = repo.kind(),
+        docs = docs_url(repo.kind())
     ))]
     Gated {
         repo: RepoId,
-        dataset_url: String,
+        repo_url: String,
         token_hint: String,
     },
 
     #[snafu(display(
-        "The Hugging Face Hub rejected `hf_token` for dataset '{repo}' (HTTP {status}). Check that the token is valid and grants read access to the dataset. See: {DOCS_URL}"
+        "The Hugging Face Hub rejected `hf_token` for {kind} '{repo}' (HTTP {status}). Check that the token is valid and grants read access to the {kind}. See: {docs}",
+        kind = repo.kind(),
+        docs = docs_url(repo.kind())
     ))]
     TokenRejected { repo: RepoId, status: u16 },
 
     #[snafu(display(
-        "The Hugging Face Hub kept rate-limiting requests for dataset '{repo}'{reset_hint}. Set `hf_token` (authenticated requests have higher limits) or accelerate the dataset so it is read once per refresh. See: {DOCS_URL}"
+        "The Hugging Face Hub kept rate-limiting requests for {kind} '{repo}'{reset_hint}. Set `hf_token` (authenticated requests have higher limits){advice}. See: {docs}",
+        kind = repo.kind(),
+        advice = rate_limit_advice(repo.kind()),
+        docs = docs_url(repo.kind())
     ))]
     RateLimited { repo: RepoId, reset_hint: String },
 
     #[snafu(display(
-        "The Hugging Face Hub returned HTTP {status} for dataset '{repo}' after {attempts} attempt(s){message}"
+        "The Hugging Face Hub returned HTTP {status} for {kind} '{repo}' after {attempts} attempt(s){message}",
+        kind = repo.kind()
     ))]
     Status {
         repo: RepoId,
@@ -126,7 +142,8 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to reach the Hugging Face Hub at {endpoint} for dataset '{repo}' after {attempts} attempt(s): {source}"
+        "Failed to reach the Hugging Face Hub at {endpoint} for {kind} '{repo}' after {attempts} attempt(s): {source}",
+        kind = repo.kind()
     ))]
     Request {
         repo: RepoId,
@@ -136,12 +153,14 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "The Hugging Face Hub returned an unexpected response for dataset '{repo}': {message}"
+        "The Hugging Face Hub returned an unexpected response for {kind} '{repo}': {message}",
+        kind = repo.kind()
     ))]
     UnexpectedResponse { repo: RepoId, message: String },
 
     #[snafu(display(
-        "A request for Hugging Face dataset '{repo}' stopped before it completed: {source}"
+        "A request for Hugging Face {kind} '{repo}' stopped before it completed: {source}",
+        kind = repo.kind()
     ))]
     TaskStopped {
         repo: RepoId,
@@ -159,13 +178,39 @@ pub enum Error {
     HttpClient { source: reqwest::Error },
 
     #[snafu(display(
-        "`hf_token` is not a valid Hugging Face access token: it contains characters an HTTP header cannot carry. See: {DOCS_URL}"
+        "`hf_token` is not a valid Hugging Face access token: it contains characters an HTTP header cannot carry. See: {DATASET_DOCS_URL}"
     ))]
     InvalidToken,
 }
 
+/// The page a message about a repository of `kind` links to.
+fn docs_url(kind: RepoType) -> &'static str {
+    match kind {
+        RepoType::Dataset => DATASET_DOCS_URL,
+        RepoType::Model | RepoType::Space => MODEL_DOCS_URL,
+    }
+}
+
+/// What separates a repository from its revision in a `from` reading a repository of `kind`:
+/// `hf://datasets/<owner>/<name>@<revision>`, `huggingface:huggingface.co/<owner>/<name>:<revision>`.
+fn revision_separator(kind: RepoType) -> char {
+    match kind {
+        RepoType::Model => ':',
+        RepoType::Dataset | RepoType::Space => '@',
+    }
+}
+
+/// The second way out of rate limiting, beside a token, for a repository of `kind`.
+fn rate_limit_advice(kind: RepoType) -> &'static str {
+    match kind {
+        RepoType::Dataset => " or accelerate the dataset so it is read once per refresh",
+        RepoType::Model | RepoType::Space => "",
+    }
+}
+
 impl Error {
-    /// Whether the error means the path does not exist, as opposed to the dataset or revision.
+    /// Whether the error means the path does not exist, as opposed to the repository or
+    /// revision.
     #[must_use]
     pub fn is_entry_not_found(&self) -> bool {
         matches!(self, Error::EntryNotFound { .. })
@@ -179,7 +224,7 @@ impl Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// A commit of a dataset repository.
+/// A commit of a repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub sha: String,
@@ -198,7 +243,7 @@ struct LfsInfo {
     oid: String,
 }
 
-/// A file or folder in a dataset repository, as the tree and paths-info endpoints describe it.
+/// A file or folder in a repository, as the tree and paths-info endpoints describe it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TreeEntry {
     #[serde(rename = "type")]
@@ -257,7 +302,7 @@ pub struct FileRead {
     pub stream: BoxStream<'static, Result<Bytes>>,
 }
 
-/// The configuration that identifies a Hub client: two datasets with the same identity share
+/// The configuration that identifies a Hub client: two components with the same identity share
 /// one client and its caches.
 #[derive(Clone)]
 pub struct HubConfig {
@@ -366,30 +411,31 @@ impl Hub {
         &self.config
     }
 
-    /// Forgets every branch and tag resolution, as if [`REVISION_TTL`] had passed.
-    #[cfg(test)]
-    pub(crate) fn forget_revisions(&self) {
+    /// Forgets every branch and tag resolution, as if [`REVISION_TTL`] had passed, so the next
+    /// lookup of each asks the Hub.
+    pub fn forget_revisions(&self) {
         self.revisions.invalidate_all();
     }
 
-    /// The dataset's page on the Hub.
+    /// The repository's page on the Hub.
     #[must_use]
-    pub fn dataset_url(&self, repo: &RepoId) -> String {
-        format!(
-            "{}/datasets/{repo}",
-            self.config.endpoint.as_str().trim_end_matches('/')
-        )
+    pub fn repo_url(&self, repo: &RepoId) -> String {
+        let endpoint = self.config.endpoint.as_str().trim_end_matches('/');
+        match repo.kind().url_prefix() {
+            Some(prefix) => format!("{endpoint}/{prefix}/{repo}"),
+            None => format!("{endpoint}/{repo}"),
+        }
     }
 
     /// Resolves `revision` (a branch, tag or commit) to a commit.
     ///
-    /// A branch or tag is resolved again once [`REVISION_TTL`] has passed, so a dataset change
+    /// A branch or tag is resolved again once [`REVISION_TTL`] has passed, so a repository change
     /// is seen within that time; concurrent lookups of the same revision share one request.
     ///
     /// # Errors
     ///
-    /// Returns an error if the dataset or revision does not exist, access is denied, or the Hub
-    /// cannot be reached.
+    /// Returns an error if the repository or revision does not exist, access is denied, or the
+    /// Hub cannot be reached.
     pub async fn commit(&self, repo: &RepoId, revision: &str) -> Result<Commit> {
         // A commit names an immutable snapshot: only its date is looked up, once.
         if is_commit_sha(revision) {
@@ -461,8 +507,8 @@ impl Hub {
     ///
     /// # Errors
     ///
-    /// Returns an error if the dataset or commit does not exist, access is denied, or the Hub
-    /// cannot be reached.
+    /// Returns an error if the repository or commit does not exist, access is denied, or the
+    /// Hub cannot be reached.
     pub async fn list(
         &self,
         repo: &RepoId,
@@ -527,8 +573,8 @@ impl Hub {
     ///
     /// # Errors
     ///
-    /// Returns an error if the dataset or commit does not exist, access is denied, or the Hub
-    /// cannot be reached.
+    /// Returns an error if the repository or commit does not exist, access is denied, or the
+    /// Hub cannot be reached.
     pub async fn entry(
         &self,
         repo: &RepoId,
@@ -642,13 +688,15 @@ impl Hub {
                 Ok(response) if response.status().is_success() => return Ok((response, e_tag)),
                 Ok(response) => {
                     tracing::debug!(
-                        "Re-resolving '{path}' of Hugging Face dataset '{repo}': its cached download URL returned HTTP {}",
+                        "Re-resolving '{path}' of Hugging Face {} '{repo}': its cached download URL returned HTTP {}",
+                        repo.kind(),
                         response.status()
                     );
                 }
                 Err(error) => {
                     tracing::debug!(
-                        "Re-resolving '{path}' of Hugging Face dataset '{repo}' after its cached download URL failed: {error}"
+                        "Re-resolving '{path}' of Hugging Face {} '{repo}' after its cached download URL failed: {error}",
+                        repo.kind()
                     );
                 }
             }
@@ -709,7 +757,7 @@ impl Hub {
         .fail()
     }
 
-    /// `{endpoint}/api/datasets/{repo}/{kind...}/{revision}/{path}`.
+    /// `{endpoint}/api/{type}s/{repo}/{kind...}/{revision}/{path}`.
     fn api_url(&self, repo: &RepoId, kind: &[&str], revision: &str, path: &str) -> Url {
         let mut url = self.config.endpoint.clone();
         {
@@ -719,7 +767,7 @@ impl Hub {
                 .unwrap_or_else(|()| unreachable!("an http(s) endpoint has path segments"));
             segments
                 .pop_if_empty()
-                .extend(["api", "datasets", repo.owner(), repo.name()])
+                .extend(["api", repo.kind().plural(), repo.owner(), repo.name()])
                 .extend(kind)
                 .push(revision);
             if !path.is_empty() {
@@ -729,16 +777,16 @@ impl Hub {
         url
     }
 
-    /// `{endpoint}/datasets/{repo}/resolve/{commit}/{path}`.
+    /// `{endpoint}/[{type}s/]{repo}/resolve/{commit}/{path}`.
     fn resolve_url(&self, repo: &RepoId, commit: &str, path: &str) -> Url {
         let mut url = self.config.endpoint.clone();
         {
             let mut segments = url
                 .path_segments_mut()
                 .unwrap_or_else(|()| unreachable!("an http(s) endpoint has path segments"));
+            segments.pop_if_empty().extend(repo.kind().url_prefix());
             segments
-                .pop_if_empty()
-                .extend(["datasets", repo.owner(), repo.name(), "resolve", commit])
+                .extend([repo.owner(), repo.name(), "resolve", commit])
                 .extend(path.split('/'));
         }
         url
@@ -788,7 +836,8 @@ impl Hub {
                 });
             }
             tracing::debug!(
-                "Retrying a request for Hugging Face dataset '{repo}' after its response broke off: {source} (attempt {} of {MAX_ATTEMPTS})",
+                "Retrying a request for Hugging Face {} '{repo}' after its response broke off: {source} (attempt {} of {MAX_ATTEMPTS})",
+                repo.kind(),
                 attempts.made
             );
             attempts.wait(None).await;
@@ -873,7 +922,8 @@ impl Hub {
                 Err(source) => {
                     if attempts.can_retry() && is_transient(&source) {
                         tracing::debug!(
-                            "Retrying a request for Hugging Face dataset '{repo}' after {source} (attempt {attempt} of {MAX_ATTEMPTS})"
+                            "Retrying a request for Hugging Face {} '{repo}' after {source} (attempt {attempt} of {MAX_ATTEMPTS})",
+                            repo.kind()
                         );
                         attempts.wait(None).await;
                         continue;
@@ -895,7 +945,8 @@ impl Hub {
                 let reset = rate_limit_reset(response.headers());
                 if attempts.can_retry() && reset.is_none_or(|reset| reset <= MAX_RATE_LIMIT_WAIT) {
                     tracing::debug!(
-                        "The Hugging Face Hub rate-limited a request for dataset '{repo}'; retrying in {:?} (attempt {attempt} of {MAX_ATTEMPTS})",
+                        "The Hugging Face Hub rate-limited a request for {} '{repo}'; retrying in {:?} (attempt {attempt} of {MAX_ATTEMPTS})",
+                        repo.kind(),
                         attempts.next_wait(reset)
                     );
                     attempts.wait(reset).await;
@@ -911,7 +962,8 @@ impl Hub {
             }
             if attempts.can_retry() && is_transient_status(status) {
                 tracing::debug!(
-                    "Retrying a request for Hugging Face dataset '{repo}' after HTTP {status} (attempt {attempt} of {MAX_ATTEMPTS})"
+                    "Retrying a request for Hugging Face {} '{repo}' after HTTP {status} (attempt {attempt} of {MAX_ATTEMPTS})",
+                    repo.kind()
                 );
                 attempts.wait(None).await;
                 continue;
@@ -939,7 +991,7 @@ impl Hub {
         match (status, code.as_deref()) {
             (_, Some("GatedRepo")) => Error::Gated {
                 repo: repo.clone(),
-                dataset_url: self.dataset_url(repo),
+                repo_url: self.repo_url(repo),
                 token_hint: if has_token {
                     String::new()
                 } else {
@@ -948,7 +1000,7 @@ impl Hub {
             },
             (_, Some("RepoNotFound")) => Error::RepoNotFound {
                 repo: repo.clone(),
-                private_hint: private_hint(has_token),
+                private_hint: private_hint(repo.kind(), has_token),
             },
             (_, Some("RevisionNotFound")) => Error::RevisionNotFound {
                 repo: repo.clone(),
@@ -958,11 +1010,11 @@ impl Hub {
                 repo: repo.clone(),
                 path: url_file_path(url),
             },
-            // Without a token the Hub answers 401 for a dataset that does not exist and for one
-            // that is private, so the two cannot be told apart.
+            // Without a token the Hub answers 401 for a repository that does not exist and for
+            // one that is private, so the two cannot be told apart.
             (StatusCode::UNAUTHORIZED, _) if !has_token && from_hub => Error::RepoNotFound {
                 repo: repo.clone(),
-                private_hint: private_hint(false),
+                private_hint: private_hint(repo.kind(), false),
             },
             (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, _) if from_hub => {
                 Error::TokenRejected {
@@ -1000,11 +1052,11 @@ impl Error {
             },
             Error::Gated {
                 repo,
-                dataset_url,
+                repo_url,
                 token_hint,
             } => Error::Gated {
                 repo: repo.clone(),
-                dataset_url: dataset_url.clone(),
+                repo_url: repo_url.clone(),
                 token_hint: token_hint.clone(),
             },
             Error::TokenRejected { repo, status } => Error::TokenRejected {
@@ -1043,11 +1095,11 @@ impl Error {
     }
 }
 
-fn private_hint(has_token: bool) -> String {
+fn private_hint(kind: RepoType, has_token: bool) -> String {
     if has_token {
         ", or the account `hf_token` belongs to cannot read it".to_string()
     } else {
-        " or it is private: a private dataset needs `hf_token`".to_string()
+        format!(" or it is private: a private {kind} needs `hf_token`")
     }
 }
 
@@ -1239,7 +1291,8 @@ impl Download {
                     }
                 );
                 tracing::debug!(
-                    "Resuming the download of '{path}' of Hugging Face dataset '{repo}' at byte {} after: {failure}",
+                    "Resuming the download of '{path}' of Hugging Face {} '{repo}' at byte {} after: {failure}",
+                    repo.kind(),
                     download.next
                 );
                 download.resumes_left -= 1;
@@ -1499,7 +1552,7 @@ mod tests {
                 .clone(),
         )
         .expect("a Hub client");
-        let repo = RepoId::new("o", "d").expect("a valid repository");
+        let repo = RepoId::dataset("o", "d").expect("a valid repository");
         assert_eq!(
             hub.api_url(
                 &repo,
@@ -1519,5 +1572,34 @@ mod tests {
             .as_str(),
             "https://huggingface.co/datasets/o/d/resolve/e6281661ce1c48d982bc483cf8a173c1bbeb5d31/plain_text/x.parquet"
         );
+
+        // A model repository sits at the root of the Hub; a space under `spaces/`.
+        let model = RepoId::new(RepoType::Model, "o", "m").expect("a valid repository");
+        assert_eq!(
+            hub.api_url(&model, &["revision"], "main", "").as_str(),
+            "https://huggingface.co/api/models/o/m/revision/main"
+        );
+        assert_eq!(
+            hub.resolve_url(
+                &model,
+                "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+                "config.json"
+            )
+            .as_str(),
+            "https://huggingface.co/o/m/resolve/e6281661ce1c48d982bc483cf8a173c1bbeb5d31/config.json"
+        );
+        assert_eq!(hub.repo_url(&model), "https://huggingface.co/o/m");
+        let space = RepoId::new(RepoType::Space, "o", "s").expect("a valid repository");
+        assert_eq!(
+            hub.resolve_url(
+                &space,
+                "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+                "a/b.txt"
+            )
+            .as_str(),
+            "https://huggingface.co/spaces/o/s/resolve/e6281661ce1c48d982bc483cf8a173c1bbeb5d31/a/b.txt"
+        );
+        assert_eq!(hub.repo_url(&space), "https://huggingface.co/spaces/o/s");
+        assert_eq!(hub.repo_url(&repo), "https://huggingface.co/datasets/o/d");
     }
 }

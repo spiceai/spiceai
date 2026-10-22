@@ -27,9 +27,11 @@ use object_store_spawn::DestinationGuard;
 use url::Url;
 
 /// Environment variable that, when set to a truthy value (`1`/`true`/`yes`/`on`),
-/// disables the SSRF guard on `http`/`https` URL tables, allowing them to target
-/// private, loopback, and link-local addresses. Off by default — intended only
-/// for operators who knowingly query an internal HTTP object store.
+/// disables the SSRF guard on `http`/`https` URL tables and on storage endpoints
+/// and `file://` locations supplied by an Iceberg REST catalog, allowing them to
+/// target private, loopback, and link-local addresses or the local filesystem.
+/// Off by default — intended only for operators who knowingly query an internal
+/// HTTP object store or a local Iceberg warehouse.
 pub const ALLOW_PRIVATE_HOSTS_ENV: &str = "SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS";
 
 /// Whether the SSRF guard is disabled via [`ALLOW_PRIVATE_HOSTS_ENV`].

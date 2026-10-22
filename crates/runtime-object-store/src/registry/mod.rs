@@ -540,10 +540,23 @@ impl SpiceObjectStoreRegistry {
             format!("http://{host_and_port}/")
         };
 
-        let mut client_options = ClientOptions::new().with_allow_http(true);
+        // `allow_http` is the operator's setting, carried in the URL fragment
+        // the way the S3 store reads it. The default is HTTPS-only, so reqwest
+        // refuses an `http://` target — including one a redirect `Location`
+        // names. The HTTP connector sets the fragment when the dataset URL
+        // itself is `http://`.
         let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
             .into_owned()
             .collect();
+        let mut client_options = ClientOptions::new();
+        if let Some(allow_http) = params.get("allow_http") {
+            let as_bool = allow_http.parse::<bool>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{allow_http} is not a valid boolean for allow_http"
+                ))
+            })?;
+            client_options = client_options.with_allow_http(as_bool);
+        }
         if let Some(timeout) = params.get("client_timeout") {
             client_options =
                 client_options.with_timeout(fundu::parse_duration(timeout).map_err(|_| {
@@ -899,7 +912,65 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
     }
 }
 
+/// True when the fragment sets `allow_http` to false, after the same form
+/// decoding the registry uses to build the store. A missing key is not a refusal.
+fn plaintext_is_forbidden(url: &Url) -> datafusion::error::Result<bool> {
+    let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+        .into_owned()
+        .collect();
+    let Some(value) = params.get("allow_http") else {
+        return Ok(false);
+    };
+    let allowed = value.parse::<bool>().map_err(|_| {
+        DataFusionError::Configuration(format!("{value} is not a valid boolean for `allow_http`"))
+    })?;
+    Ok(!allowed)
+}
+
 impl SpiceObjectStoreRegistry {
+    /// Keep a store this origin already has. Build a plaintext one only when
+    /// the origin has no fragment-built or externally registered store.
+    ///
+    /// A SQL `http://` URL asks for `allow_http=true` and nothing else.
+    /// Replacing a dataset store with that URL would drop credentials and
+    /// timeouts already configured for the origin. A bare HTTPS-only entry
+    /// cannot fetch the URL, so that entry is replaced. An explicit
+    /// `allow_http=false` is refused here, before a lookup: the listing table
+    /// passes the fragment through, and building that URL would replace the
+    /// configured store.
+    ///
+    /// # Errors
+    ///
+    /// Returns a plan error when the fragment sets `allow_http` to false, a
+    /// configuration error when that value is not a boolean, or the store
+    /// builder's error when this origin has no store yet and one cannot be
+    /// created.
+    pub fn ensure_plaintext_http_store(
+        &self,
+        url: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        if plaintext_is_forbidden(url)? {
+            let shown = ssrf::url_table_target(url).unwrap_or_else(|| url.clone());
+            let host = &shown[url::Position::BeforeHost..url::Position::AfterPort];
+            return Err(DataFusionError::Plan(format!(
+                "Failed to read '{}://{host}{}'. `allow_http` is false, so this plaintext address is not fetched.",
+                shown.scheme(),
+                shown.path(),
+            )));
+        }
+        let key = Self::url_key(url);
+        if let Some(config) = self.configs.get(&key)
+            && matches!(
+                config.value(),
+                StoreConfig::Fragment(_) | StoreConfig::External
+            )
+            && let Ok(store) = self.inner.get_store(url)
+        {
+            return Ok(store);
+        }
+        self.get_store(url)
+    }
+
     fn should_reuse_cached(&self, key: &str, wanted: &StoreConfig) -> bool {
         self.configs
             .get(key)
@@ -969,10 +1040,11 @@ impl SpiceObjectStoreRegistry {
 
 // This method uses unwrap_or_default, however it should never fail on the initialization. See
 // RuntimeEnv::default()
+/// A `DataFusion` runtime whose object-store registry is `registry`.
 #[must_use]
-pub fn default_runtime_env(io_runtime: Handle) -> Arc<RuntimeEnv> {
+pub fn runtime_env_with_registry(registry: Arc<SpiceObjectStoreRegistry>) -> Arc<RuntimeEnv> {
     match RuntimeEnvBuilder::default()
-        .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::new(io_runtime)))
+        .with_object_store_registry(registry)
         .build_arc()
     {
         Ok(runtime_env) => runtime_env,
@@ -980,6 +1052,11 @@ pub fn default_runtime_env(io_runtime: Handle) -> Arc<RuntimeEnv> {
             unreachable!("Tests ensure this should never fail: {e}");
         }
     }
+}
+
+#[must_use]
+pub fn default_runtime_env(io_runtime: Handle) -> Arc<RuntimeEnv> {
+    runtime_env_with_registry(Arc::new(SpiceObjectStoreRegistry::new(io_runtime)))
 }
 
 #[cfg(test)]
@@ -1049,7 +1126,10 @@ mod tests {
         );
         let with_token = |base: &Url| {
             let mut url = base.join("items.csv").expect("valid path");
-            url.set_fragment(Some(&format!("{}={token}", http_auth::FRAGMENT_KEY)));
+            url.set_fragment(Some(&format!(
+                "allow_http=true&{}={token}",
+                http_auth::FRAGMENT_KEY
+            )));
             url
         };
 
@@ -1072,12 +1152,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_store_without_allow_http_does_not_connect() {
+        use object_store::ObjectStoreExt;
+
+        let (origin, seen) = header_recording_server().await;
+        let url = origin.join("items.csv").expect("valid path");
+        let store = SpiceObjectStoreRegistry::new(Handle::current())
+            .get_store(&url)
+            .expect("the registry builds an HTTP store");
+        let err = store
+            .head(&object_store::path::Path::from("items.csv"))
+            .await
+            .expect_err("plaintext is refused without allow_http")
+            .to_string();
+        assert!(
+            seen.lock().expect("not poisoned").is_empty(),
+            "the store fetched {url} without allow_http: {err}"
+        );
+        assert!(
+            err.contains("builder error") || err.to_ascii_lowercase().contains("scheme"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_redirect_is_followed_only_when_allow_http_is_set() {
+        use axum::{Router, body::Body, extract::State, http::Request, response::Response};
+        use object_store::ObjectStoreExt;
+
+        async fn record(
+            State(seen): State<Arc<Mutex<Vec<String>>>>,
+            request: Request<Body>,
+        ) -> Response<Body> {
+            seen.lock()
+                .expect("the request log is not poisoned")
+                .push(request.uri().path().to_string());
+            Response::builder()
+                .status(404)
+                .body(Body::empty())
+                .expect("a 404 response builds")
+        }
+
+        let target_seen = Arc::new(Mutex::new(Vec::new()));
+        let target = Router::new()
+            .fallback(axum::routing::any(record))
+            .with_state(Arc::clone(&target_seen));
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the redirect target binds");
+        let target_addr = target_listener
+            .local_addr()
+            .expect("the redirect target has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(target_listener, target).await;
+        });
+
+        let origin_seen = Arc::new(Mutex::new(Vec::new()));
+        let location = format!("http://{target_addr}/secret");
+        let origin = Router::new()
+            .fallback(axum::routing::any(
+                move |State(seen): State<Arc<Mutex<Vec<String>>>>, request: Request<Body>| {
+                    let location = location.clone();
+                    async move {
+                        seen.lock()
+                            .expect("the request log is not poisoned")
+                            .push(request.uri().path().to_string());
+                        Response::builder()
+                            .status(302)
+                            .header("location", location)
+                            .body(Body::empty())
+                            .expect("a redirect response builds")
+                    }
+                },
+            ))
+            .with_state(Arc::clone(&origin_seen));
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the redirect origin binds");
+        let origin_addr = origin_listener
+            .local_addr()
+            .expect("the redirect origin has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(origin_listener, origin).await;
+        });
+
+        let mut blocked =
+            Url::parse(&format!("http://{origin_addr}/items.csv")).expect("valid URL");
+        let store = SpiceObjectStoreRegistry::new(Handle::current())
+            .get_store(&blocked)
+            .expect("the registry builds an HTTP store");
+        let blocked_err = store
+            .head(&object_store::path::Path::from("items.csv"))
+            .await
+            .expect_err("plaintext is refused")
+            .to_string();
+        assert!(
+            origin_seen.lock().expect("not poisoned").is_empty(),
+            "refused store still connected: {blocked_err}"
+        );
+        assert!(
+            target_seen.lock().expect("not poisoned").is_empty(),
+            "refused store followed the redirect: {blocked_err}"
+        );
+
+        blocked.set_fragment(Some("allow_http=true"));
+        let store = SpiceObjectStoreRegistry::new(Handle::current())
+            .get_store(&blocked)
+            .expect("allow_http builds an HTTP store");
+        let _ = store
+            .head(&object_store::path::Path::from("items.csv"))
+            .await
+            .expect_err("the redirect target answers 404");
+        assert_eq!(
+            origin_seen.lock().expect("not poisoned").as_slice(),
+            ["/items.csv"]
+        );
+        assert_eq!(
+            target_seen.lock().expect("not poisoned").as_slice(),
+            ["/secret"],
+            "allow_http follows an http redirect"
+        );
+    }
+
+    #[tokio::test]
     async fn http_store_errors_do_not_show_url_user_information() {
         let (origin, seen) = header_recording_server().await;
         let mut url = origin.join("items.csv").expect("valid path");
         url.set_username("url_user").expect("http URL takes a user");
         url.set_password(Some("url-pass"))
             .expect("http URL takes a password");
+        url.set_fragment(Some("allow_http=true"));
 
         let error = head_through_registry(&url).await;
 
@@ -1090,7 +1294,8 @@ mod tests {
     }
 
     /// A loopback origin that redirects every request to a loopback target serving a CSV body;
-    /// returns the origin URL and the number of requests the target received.
+    /// returns the origin URL, with `allow_http=true` set the way an `http` dataset or URL table
+    /// sets it, and the number of requests the target received.
     async fn redirect_to_loopback_target() -> (Url, Arc<std::sync::atomic::AtomicUsize>) {
         use axum::{Router, http::StatusCode, response::IntoResponse};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1125,7 +1330,7 @@ mod tests {
             )
             .await;
         (
-            Url::parse(&format!("http://{origin}/")).expect("valid URL"),
+            Url::parse(&format!("http://{origin}/#allow_http=true")).expect("valid URL"),
             target_hits,
         )
     }
@@ -1196,7 +1401,7 @@ mod tests {
             .expect_err("a loopback origin is refused")
             .to_string();
 
-        let origin = origin.as_str().trim_end_matches('/');
+        let origin = &origin[..url::Position::BeforePath];
         assert_eq!(
             error,
             format!(
