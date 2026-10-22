@@ -36,6 +36,12 @@ pub mod streaming_utils;
 pub mod typesafe;
 pub mod xai;
 
+// Engine crates register through `register_local_chat_engine!`, which names `linkme` through
+// this crate so they need no `linkme` dependency of their own.
+#[cfg(feature = "local_llm")]
+#[doc(hidden)]
+pub use linkme;
+
 pub enum HealthCheck {
     Required,
     Skip,

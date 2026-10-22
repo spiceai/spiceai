@@ -78,9 +78,13 @@ impl Model {
             .and_then(|layers| i32::try_from(layers).ok())
             .unwrap_or(-1);
         raw_params.load_mtp = params.load_mtp;
+        crate::log::clear_last_error();
         // SAFETY: `c_path` is a NUL-terminated path that outlives the call.
         let raw = unsafe { sys::llama_model_load_from_file(c_path.as_ptr(), raw_params) };
-        let raw = NonNull::new(raw).context(LoadModelSnafu { path: display })?;
+        let raw = NonNull::new(raw).with_context(|| LoadModelSnafu {
+            path: display,
+            reason: crate::log::last_error(),
+        })?;
         Ok(Self { raw })
     }
 
@@ -96,6 +100,14 @@ impl Model {
             raw,
             _model: PhantomData,
         }
+    }
+
+    /// How many multi-token-prediction (NextN) layers the model carries; a model with one
+    /// can draft for itself.
+    #[must_use]
+    pub fn n_layer_nextn(&self) -> i32 {
+        // SAFETY: reads the loaded model's hyperparameters.
+        unsafe { sys::llama_model_n_layer_nextn(self.raw.as_ptr()) }
     }
 
     /// The chat template the GGUF file carries, if any.
@@ -115,9 +127,12 @@ impl Model {
 
     /// Creates a context to decode with.
     pub fn new_context(&self, _backend: &Backend, params: &ContextParams) -> Result<Context<'_>> {
+        crate::log::clear_last_error();
         // SAFETY: the model outlives the context through the context's lifetime.
         let raw = unsafe { sys::llama_init_from_model(self.raw.as_ptr(), params.raw(None)) };
-        let raw = NonNull::new(raw).context(CreateContextSnafu)?;
+        let raw = NonNull::new(raw).with_context(|| CreateContextSnafu {
+            reason: crate::log::last_error(),
+        })?;
         Ok(Context::from_raw(raw))
     }
 }
@@ -137,6 +152,26 @@ pub struct Vocab<'m> {
 }
 
 impl Vocab<'_> {
+    pub(crate) fn as_ptr(&self) -> *const sys::llama_vocab {
+        self.raw
+    }
+
+    /// How many tokens the vocabulary holds; token ids run from 0 to one less.
+    #[must_use]
+    pub fn n_tokens(&self) -> i32 {
+        // SAFETY: the vocabulary lives as long as `'m`.
+        unsafe { sys::llama_vocab_n_tokens(self.raw) }
+    }
+
+    /// Every token that ends generation.
+    #[must_use]
+    pub fn eog_tokens(&self) -> Vec<Token> {
+        (0..self.n_tokens())
+            .map(Token)
+            .filter(|&token| self.is_eog(token))
+            .collect()
+    }
+
     #[must_use]
     pub fn bos(&self) -> Token {
         // SAFETY: the vocabulary lives as long as `'m`.

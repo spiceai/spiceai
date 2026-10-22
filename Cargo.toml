@@ -39,6 +39,7 @@ members = [
     "crates/hash-index",
     "crates/key-index",
     "crates/llama-cpp",
+    "crates/llms-llamacpp",
     "crates/llms",
     "crates/chat-api",
     "crates/embed-api",

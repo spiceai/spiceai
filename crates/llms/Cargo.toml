@@ -50,10 +50,9 @@ tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "dc73261eb0db949b6e114ae4fd355ac112296266", optional = true } # branch: spiceai (spiceai/mistral.rs#49 decode speedups and #50 exported chat-template renderer)
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "dc73261eb0db949b6e114ae4fd355ac112296266", package = "mistralrs-core", optional = true } # branch: spiceai (spiceai/mistral.rs#49 decode speedups and #50 exported chat-template renderer)
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "7cc0c27222c8bd68f858d1fc70300fce4145c3ea", optional = true } # branch: lukim/export-tool-call-parser (spiceai/mistral.rs#52, the exported tool-call parser, on #49 and #50)
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "7cc0c27222c8bd68f858d1fc70300fce4145c3ea", package = "mistralrs-core", optional = true } # branch: lukim/export-tool-call-parser (spiceai/mistral.rs#52, the exported tool-call parser, on #49 and #50)
 rand.workspace = true
-llama-cpp = { path = "../llama-cpp", optional = true }
 
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", features = [
     "candle",
@@ -68,6 +67,8 @@ cudarc = { version = "0.19", optional = true, features = [
 ] }
 either = "1.15.0"
 indexmap.workspace = true
+linkme.workspace = true
+parking_lot.workspace = true
 tempfile.workspace = true
 token_provider = { path = "../token_provider" }
 
@@ -95,7 +96,6 @@ path = "tests/integration.rs"
 
 [features]
 cuda = [
-    "llama-cpp?/cuda",
     "tei_backend/cuda",
     "tei_candle/cuda",
     "mistralrs-core/cuda",
@@ -130,11 +130,7 @@ local_embed = [
     "dep:model2vec-rs",
 ]
 local_llm = ["dep:mistralrs", "dep:mistralrs-core"]
-# Serves single-node GGUF models with llama.cpp instead of mistral.rs. Composes with `cuda`
-# or `metal`; ring (`distributed`) models stay on mistral.rs.
-llama_cpp = ["local_llm", "dep:llama-cpp"]
 metal = [
-    "llama-cpp?/metal",
     "tei_backend/metal",
     "tei_candle/metal",
     "mistralrs-core/metal",

@@ -17,26 +17,37 @@ limitations under the License.
 
 use std::ptr::NonNull;
 
-use crate::context::Context;
-use crate::{Token, sys};
+use std::ffi::CString;
+use std::marker::PhantomData;
 
-/// A llama.cpp sampler, or a chain of them applied in order.
+use snafu::ResultExt;
+
+use crate::context::Context;
+use crate::model::Vocab;
+use crate::{GrammarNulSnafu, GrammarSnafu, Result, Token, sys};
+
+/// A llama.cpp sampler, or a chain of them applied in order. A grammar sampler reads its
+/// model's vocabulary, so it lives no longer than `'v`.
 #[derive(Debug)]
-pub struct Sampler {
+pub struct Sampler<'v> {
     raw: NonNull<sys::llama_sampler>,
+    _vocab: PhantomData<&'v ()>,
 }
 
 // SAFETY: a sampler is used by one thread at a time (`sample` takes `&mut self`), and holds
 // nothing tied to the thread that made it.
-unsafe impl Send for Sampler {}
+unsafe impl Send for Sampler<'_> {}
 
-impl Sampler {
+impl<'v> Sampler<'v> {
     fn from_raw(raw: *mut sys::llama_sampler) -> Self {
         // llama.cpp's initializers only return null when out of memory.
         let raw = NonNull::new(raw).unwrap_or_else(|| {
             std::alloc::handle_alloc_error(std::alloc::Layout::new::<sys::llama_sampler>())
         });
-        Self { raw }
+        Self {
+            raw,
+            _vocab: PhantomData,
+        }
     }
 
     /// The most likely token.
@@ -67,9 +78,48 @@ impl Sampler {
         Self::from_raw(unsafe { sys::llama_sampler_init_top_p(p, min_keep) })
     }
 
+    /// Adds `bias` to the logit of each token, as `-inf` rules a token out.
+    #[must_use]
+    pub fn logit_bias(vocab: &Vocab<'_>, biases: &[(Token, f32)]) -> Self {
+        let biases: Vec<sys::llama_logit_bias> = biases
+            .iter()
+            .map(|&(token, bias)| sys::llama_logit_bias {
+                token: token.0,
+                bias,
+            })
+            .collect();
+        let n = i32::try_from(biases.len()).unwrap_or(i32::MAX);
+        // SAFETY: `biases` holds `n` entries for the call; llama.cpp copies them.
+        Self::from_raw(unsafe {
+            sys::llama_sampler_init_logit_bias(vocab.n_tokens(), n, biases.as_ptr())
+        })
+    }
+
+    /// Keeps only tokens that continue a text the GBNF `grammar` accepts from its `root`
+    /// rule. A sampler chain applies it before the sampler that picks the token.
+    pub fn grammar(vocab: &Vocab<'v>, grammar: &str) -> Result<Self> {
+        let c_grammar = CString::new(grammar).context(GrammarNulSnafu)?;
+        crate::log::clear_last_error();
+        // SAFETY: both strings are NUL-terminated and outlive the call; the vocabulary lives
+        // as long as the model, which outlives the request the sampler serves.
+        let raw = unsafe {
+            sys::llama_sampler_init_grammar(vocab.as_ptr(), c_grammar.as_ptr(), c"root".as_ptr())
+        };
+        let raw = NonNull::new(raw).ok_or_else(|| {
+            GrammarSnafu {
+                reason: crate::log::last_error(),
+            }
+            .build()
+        })?;
+        Ok(Self {
+            raw,
+            _vocab: PhantomData,
+        })
+    }
+
     /// Applies `samplers` in order; the last one picks the token.
     #[must_use]
-    pub fn chain(samplers: impl IntoIterator<Item = Sampler>) -> Self {
+    pub fn chain(samplers: impl IntoIterator<Item = Sampler<'v>>) -> Self {
         // SAFETY: allocates an empty chain from its default parameters.
         let chain = Self::from_raw(unsafe {
             sys::llama_sampler_chain_init(sys::llama_sampler_chain_default_params())
@@ -90,7 +140,7 @@ impl Sampler {
     }
 }
 
-impl Drop for Sampler {
+impl Drop for Sampler<'_> {
     fn drop(&mut self) {
         // SAFETY: the sampler was not handed to a chain, which would own it.
         unsafe { sys::llama_sampler_free(self.raw.as_ptr()) };

@@ -58,9 +58,12 @@ impl<'m> Mtp<'m> {
         params: &ContextParams,
         mtp: MtpParams,
     ) -> Result<Self> {
+        crate::log::clear_last_error();
         // SAFETY: the draft context reads `target`, which `Self` keeps alive longer.
         let draft = unsafe { sys::llama_init_from_model(head.as_ptr(), params.raw(Some(&target))) };
-        let draft = Context::from_raw(NonNull::new(draft).context(CreateContextSnafu)?);
+        let draft = Context::from_raw(NonNull::new(draft).with_context(|| CreateContextSnafu {
+            reason: crate::log::last_error(),
+        })?);
         // SAFETY: both contexts are live, and `draft` is the MTP context of `target`.
         let raw = unsafe {
             sys::spice_mtp_init(
@@ -71,7 +74,9 @@ impl<'m> Mtp<'m> {
                 mtp.p_min,
             )
         };
-        let raw = NonNull::new(raw).context(MtpInitSnafu)?;
+        let raw = NonNull::new(raw).with_context(|| MtpInitSnafu {
+            reason: crate::log::last_error(),
+        })?;
         Ok(Self {
             raw,
             draft,

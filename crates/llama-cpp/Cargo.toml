@@ -8,9 +8,11 @@ name = "llama-cpp"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+# One integration test binary: see docs/dev/integration_test_layout.md.
+autotests = false
 
 [dependencies]
-llama-cpp-src = { git = "https://github.com/spiceai/llama.cpp", rev = "c54c51f83591bee7695e9be8263217ab29e8aa55" } # tag: b11803-spiceai.1 (branch spiceai-b11803: upstream release b11803 plus the Cargo packaging)
+llama-cpp-src = { git = "https://github.com/spiceai/llama.cpp", rev = "9a24494dae66b8a172fe0bfbed7d454e1f7555b7" } # branch: lukim/b11803-abort-throws (spiceai/llama.cpp#2 on #1: upstream release b11803, the Cargo packaging, and failed checks that throw)
 snafu.workspace = true
 tracing.workspace = true
 
@@ -18,6 +20,13 @@ tracing.workspace = true
 bindgen = "0.72.1"
 cc = "1.2.63"
 cmake = "0.1.58"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [features]
 # The GPU backend llama.cpp is built with; without either, it runs on the CPU.

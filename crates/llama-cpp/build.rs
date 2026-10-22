@@ -143,13 +143,14 @@ fn index_libraries(dir: &Path, found: &mut BTreeMap<String, PathBuf>) {
     }
 }
 
-/// Compiles the C interface to llama.cpp's C++ speculative decoding. It goes on the link line
-/// before the libraries it calls.
+/// Compiles the C interfaces to llama.cpp's C++ speculative decoding and JSON-schema
+/// conversion. They go on the link line before the libraries they call.
 fn compile_shim(root: &Path) {
     cc::Build::new()
         .cpp(true)
         .std("c++17")
         .file("shim/spice_mtp.cpp")
+        .file("shim/spice_grammar.cpp")
         .include("shim")
         .include(root.join("include"))
         .include(root.join("common"))
@@ -157,7 +158,7 @@ fn compile_shim(root: &Path) {
         .include(root.join("vendor"))
         .cpp_link_stdlib(None)
         .warnings(false)
-        .compile("spice_mtp");
+        .compile("spice_llama_shim");
 }
 
 /// The system libraries llama.cpp's static libraries need, after them on the link line.
@@ -187,7 +188,11 @@ fn link_system(target_os: &str, cuda: bool, metal: bool) {
         }
     }
     match target_os {
-        "macos" | "ios" => println!("cargo:rustc-link-lib=dylib=c++"),
+        "macos" | "ios" => {
+            println!("cargo:rustc-link-lib=dylib=c++");
+            // ggml's CPU backend calls Accelerate's vDSP on Apple platforms.
+            println!("cargo:rustc-link-lib=framework=Accelerate");
+        }
         _ => {
             println!("cargo:rustc-link-lib=dylib=stdc++");
             println!("cargo:rustc-link-lib=dylib=m");
@@ -206,6 +211,8 @@ fn bindings(root: &Path) {
         .clang_arg(format!("-I{}", root.join("ggml/include").display()))
         .allowlist_function("llama_.*")
         .allowlist_function("spice_mtp_.*")
+        .allowlist_function("spice_json_schema_to_grammar")
+        .allowlist_function("spice_string_free")
         .allowlist_type("llama_.*")
         .allowlist_type("spice_mtp.*")
         .allowlist_type("ggml_log_level")

@@ -46,6 +46,7 @@ connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optiona
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
 accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres", optional = true }
 accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite", optional = true }
+llms-llamacpp = { path = "../../crates/llms-llamacpp", optional = true }
 accelerator-turso = { path = "../../crates/accelerators/accelerator-turso", optional = true }
 accelerator-duckdb = { path = "../../crates/accelerators/accelerator-duckdb", optional = true }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
@@ -160,8 +161,9 @@ azure-keyvault = ["runtime/azure-keyvault"]
 hashicorp_vault = ["runtime/hashicorp_vault"]
 clickhouse = ["connector-clickhouse"]
 cosmosdb = ["connector-cosmosdb", "runtime/cosmosdb"]
-cuda = ["runtime/cuda"]
-llama_cpp = ["runtime/llama_cpp"]
+cuda = ["runtime/cuda", "llms-llamacpp?/cuda"]
+# Serves single-node GGUF models with llama.cpp; ring models and safetensors stay on mistral.rs.
+llamacpp = ["dep:llms-llamacpp"]
 databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
@@ -216,9 +218,9 @@ imap = ["connector-imap", "runtime/imap"]
 kafka = ["dep:connector-kafka", "runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
-metal = ["runtime/metal"]
+metal = ["runtime/metal", "llms-llamacpp?/metal"]
 distributed = ["runtime/distributed"]
-models = ["runtime/models"]
+models = ["runtime/models", "llamacpp"]
 mongodb = ["connector-mongodb", "runtime/mongodb"]
 mssql = ["connector-mssql", "runtime/mssql"]
 # Opt-in Kerberos integrated auth (GSSAPI) for MSSQL on Unix; not in `default`.

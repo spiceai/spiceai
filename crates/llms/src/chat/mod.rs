@@ -39,8 +39,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestUserMessageContent, ReasoningEffort,
 };
 
-#[cfg(feature = "llama_cpp")]
-pub mod llama_cpp;
+#[cfg(feature = "local_llm")]
+pub mod engine;
 #[cfg(feature = "local_llm")]
 pub mod mistral;
 pub mod nsql;
@@ -355,7 +355,9 @@ pub fn message_to_mistral(
 /// `model_id` uniquely refers to a Huggingface model.
 /// `model_type` is the type of model, if needed to be explicit. Often this can
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
-/// `from_gguf` is a path to a GGUF file within the huggingface model repo. If provided, the model will be loaded from this GGUF. This is useful for loading quantized models.
+/// `gguf_files` are the GGUF files within the huggingface model repo to load the model from,
+///    in the order the model lists them. A registered engine that serves them gets them all,
+///    downloaded; mistral.rs loads the first.
 /// `hf_token_literal` is a literal string of the Huggingface API token. If not provided, the token will be read from the HF token cache (i.e. `~/.cache/huggingface/token` or set via `HF_TOKEN_PATH`).
 /// `distributed` optionally runs the model tensor-parallel across multiple nodes.
 /// `reasoning` names the model and its `reasoning_effort` default for the load-time check.
@@ -363,12 +365,23 @@ pub fn message_to_mistral(
 pub async fn create_hf_model(
     model_id: &str,
     model_type: Option<&str>,
-    from_gguf: Option<PathBuf>,
+    gguf_files: &[PathBuf],
     hf_token_literal: Option<&SecretString>,
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
     reasoning: ReasoningDefault<'_>,
 ) -> Result<Arc<dyn Chat>> {
+    if distributed.is_none()
+        && let Some(engine) = engine::engine_for(gguf_files)
+    {
+        let weights = download_hf_files(model_id, gguf_files, hf_token_literal).await?;
+        let options = LocalModelOptions {
+            chat_template_literal,
+            reasoning,
+            ..LocalModelOptions::default()
+        };
+        return (engine.load)(&weights, options).await;
+    }
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the
     // pipeline. The returned guard keeps the temp file alive for the model.
@@ -386,13 +399,67 @@ pub async fn create_hf_model(
         model_id,
         model_type,
         hf_token_literal,
-        from_gguf,
+        gguf_files.first().cloned(),
         chat_template_literal,
         ring_config,
         reasoning,
     )
     .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
+}
+
+/// The lock that serializes this process's downloads of one Hugging Face file.
+#[cfg(feature = "local_llm")]
+fn download_lock(file: &str) -> Arc<parking_lot::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashMap<String, Arc<parking_lot::Mutex<()>>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    Arc::clone(LOCKS.lock().entry(file.to_string()).or_default())
+}
+
+/// Downloads `files` of the Hugging Face model `model_id` (`<repo>` or `<repo>:<revision>`)
+/// into the Hugging Face cache and returns their local paths. It resolves the cache, the
+/// revision and the token the way the mistral.rs engine does for the same model, so either
+/// engine finds the other's downloads.
+#[cfg(feature = "local_llm")]
+pub async fn download_hf_files(
+    model_id: &str,
+    files: &[PathBuf],
+    hf_token_literal: Option<&SecretString>,
+) -> Result<Vec<PathBuf>> {
+    use secrecy::ExposeSecret;
+
+    let (repo, revision) = model_id.split_once(':').unwrap_or((model_id, "main"));
+    let token = hf_token_literal.map_or(mistralrs_core::TokenSource::CacheToken, |token| {
+        mistralrs_core::TokenSource::Literal(token.expose_secret().to_string())
+    });
+    let (repo, revision, files) = (repo.to_string(), revision.to_string(), files.to_vec());
+    tokio::task::spawn_blocking(move || {
+        files
+            .iter()
+            .map(|file| {
+                let file_name = file.to_string_lossy();
+                // The Hub client locks a file while it downloads it, and a second download of
+                // the same file fails on that lock instead of waiting. Two models listing one
+                // GGUF load at once, so they take turns, and the second finds it cached.
+                let lock = download_lock(&format!("{repo}@{revision}/{file_name}"));
+                let _turn = lock.lock();
+                mistralrs_core::get_model_file(&repo, &revision, &file_name, &token).map_err(|e| {
+                    Error::FailedToLoadModel {
+                        source: format!(
+                            "could not download '{}' from Hugging Face model '{repo}': {e}",
+                            file.display()
+                        )
+                        .into(),
+                    }
+                })
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| Error::FailedToLoadModel {
+        source: Box::new(e),
+    })?
 }
 
 /// Knobs pushed into the loader for a locally served model. Grouped so that adding one is
@@ -433,21 +500,13 @@ pub async fn create_local_model(
     distributed: Option<DistributedConfig>,
     options: LocalModelOptions<'_>,
 ) -> Result<Arc<dyn Chat>> {
-    // A single-node GGUF model is served by llama.cpp when it is linked in; a ring model
-    // stays on mistral.rs, whose tensor-parallel backend llama.cpp has no counterpart for.
-    #[cfg(feature = "llama_cpp")]
-    if distributed.is_none()
-        && !model_weights.is_empty()
-        && model_weights.iter().all(|w| {
-            Path::new(w)
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
-        })
-    {
+    // A single-node model goes to a registered engine that serves its weights; a ring model
+    // stays on mistral.rs, whose tensor-parallel backend no other engine has a counterpart for.
+    if distributed.is_none() {
         let weights = model_weights.iter().map(PathBuf::from).collect::<Vec<_>>();
-        return llama_cpp::LlamaCpp::from(&weights, options)
-            .await
-            .map(|x| Arc::new(x) as Arc<dyn Chat>);
+        if let Some(engine) = engine::engine_for(&weights) {
+            return (engine.load)(&weights, options).await;
+        }
     }
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the

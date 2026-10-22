@@ -60,8 +60,8 @@ mod sys {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("llama.cpp could not load the model '{path}'"))]
-    LoadModel { path: String },
+    #[snafu(display("llama.cpp could not load the model '{path}': {reason}"))]
+    LoadModel { path: String, reason: String },
 
     #[snafu(display("The model path '{path}' cannot be passed to llama.cpp: {source}"))]
     ModelPath {
@@ -69,8 +69,8 @@ pub enum Error {
         source: std::ffi::NulError,
     },
 
-    #[snafu(display("llama.cpp could not create a context for the model"))]
-    CreateContext,
+    #[snafu(display("llama.cpp could not create a context for the model: {reason}"))]
+    CreateContext { reason: String },
 
     #[snafu(display("llama.cpp could not decode the batch: {reason}"))]
     Decode { reason: String },
@@ -81,14 +81,51 @@ pub enum Error {
     #[snafu(display("The text is too long for llama.cpp to tokenize: {bytes} bytes"))]
     TextTooLong { bytes: usize },
 
-    #[snafu(display("llama.cpp could not start MTP drafting with this model and its draft head"))]
-    MtpInit,
+    #[snafu(display(
+        "llama.cpp could not start MTP drafting with this model and its draft head: {reason}"
+    ))]
+    MtpInit { reason: String },
 
     #[snafu(display("llama.cpp MTP drafting failed: {message}"))]
     Mtp { message: String },
+
+    #[snafu(display("llama.cpp could not use the grammar: {reason}"))]
+    Grammar { reason: String },
+
+    #[snafu(display("The grammar cannot be passed to llama.cpp: {source}"))]
+    GrammarNul { source: std::ffi::NulError },
+
+    #[snafu(display("llama.cpp could not turn the JSON schema into a grammar: {reason}"))]
+    JsonSchema { reason: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// The GBNF grammar, with start rule `root`, that accepts exactly the JSON documents
+/// `schema` (a JSON Schema, as JSON text) describes, converted by llama.cpp.
+pub fn json_schema_to_grammar(schema: &str) -> Result<String> {
+    let c_schema = std::ffi::CString::new(schema).map_err(|e| Error::JsonSchema {
+        reason: e.to_string(),
+    })?;
+    let mut error: *mut std::ffi::c_char = std::ptr::null_mut();
+    // SAFETY: `c_schema` is NUL-terminated for the call, and `error` takes an owned string.
+    let grammar = unsafe { sys::spice_json_schema_to_grammar(c_schema.as_ptr(), &raw mut error) };
+    // SAFETY: each pointer is null or a string the shim allocated, read once, then freed.
+    let take = |text: *mut std::ffi::c_char| -> Option<String> {
+        if text.is_null() {
+            return None;
+        }
+        let owned = unsafe { std::ffi::CStr::from_ptr(text) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { sys::spice_string_free(text) };
+        Some(owned)
+    };
+    let reason = take(error);
+    take(grammar).ok_or_else(|| Error::JsonSchema {
+        reason: reason.unwrap_or_else(|| "llama.cpp gave no reason".to_string()),
+    })
+}
 
 /// A token id in a model's vocabulary.
 #[repr(transparent)]

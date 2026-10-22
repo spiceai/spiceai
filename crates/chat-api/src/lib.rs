@@ -96,6 +96,11 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Architecture '{architecture}' in {file} is not supported by this Spice release. Upgrade Spice, or use a GGUF of a supported architecture: https://spiceai.org/docs/components/models#gguf-architectures"
+    ))]
+    UnsupportedArchitecture { architecture: String, file: String },
+
+    #[snafu(display(
         "The specified model identifier '{model}' is not valid for the source '{model_source}'. Verify the model exists, and try again."
     ))]
     ModelNotFound { model: String, model_source: String },
@@ -183,6 +188,7 @@ impl Error {
             | Self::LocalModelConfigNotFound { .. }
             | Self::LocalTokenizerNotFound { .. }
             | Self::UnsupportedModelType { .. }
+            | Self::UnsupportedArchitecture { .. }
             | Self::ModelNotProvided { .. }
             | Self::UnknownModelSource { .. }
             | Self::UnsupportedTaskForModel { .. }

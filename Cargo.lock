@@ -11925,13 +11925,14 @@ dependencies = [
  "cmake",
  "llama-cpp-src",
  "snafu",
+ "tempfile",
  "tracing",
 ]
 
 [[package]]
 name = "llama-cpp-src"
 version = "0.1.11803"
-source = "git+https://github.com/spiceai/llama.cpp?rev=c54c51f83591bee7695e9be8263217ab29e8aa55#c54c51f83591bee7695e9be8263217ab29e8aa55"
+source = "git+https://github.com/spiceai/llama.cpp?rev=9a24494dae66b8a172fe0bfbed7d454e1f7555b7#9a24494dae66b8a172fe0bfbed7d454e1f7555b7"
 
 [[package]]
 name = "llguidance"
@@ -11979,10 +11980,11 @@ dependencies = [
  "insta",
  "itertools 0.14.0",
  "jsonpath-rust",
- "llama-cpp",
+ "linkme",
  "mistralrs",
  "mistralrs-core",
  "model2vec-rs",
+ "parking_lot",
  "paste",
  "rand 0.10.1",
  "regex",
@@ -12012,6 +12014,25 @@ dependencies = [
  "tracing-subscriber",
  "util",
  "wiremock",
+]
+
+[[package]]
+name = "llms-llamacpp"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-openai",
+ "async-trait",
+ "either",
+ "futures",
+ "indexmap 2.14.0",
+ "llama-cpp",
+ "llms",
+ "mistralrs-core",
+ "rand 0.10.1",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -12682,7 +12703,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc73261eb0db949b6e114ae4fd355ac112296266#dc73261eb0db949b6e114ae4fd355ac112296266"
+source = "git+https://github.com/spiceai/mistral.rs?rev=7cc0c27222c8bd68f858d1fc70300fce4145c3ea#7cc0c27222c8bd68f858d1fc70300fce4145c3ea"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12709,7 +12730,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc73261eb0db949b6e114ae4fd355ac112296266#dc73261eb0db949b6e114ae4fd355ac112296266"
+source = "git+https://github.com/spiceai/mistral.rs?rev=7cc0c27222c8bd68f858d1fc70300fce4145c3ea#7cc0c27222c8bd68f858d1fc70300fce4145c3ea"
 dependencies = [
  "anyhow",
  "apodize",
@@ -12720,7 +12741,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-code-exec"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc73261eb0db949b6e114ae4fd355ac112296266#dc73261eb0db949b6e114ae4fd355ac112296266"
+source = "git+https://github.com/spiceai/mistral.rs?rev=7cc0c27222c8bd68f858d1fc70300fce4145c3ea#7cc0c27222c8bd68f858d1fc70300fce4145c3ea"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -12739,7 +12760,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc73261eb0db949b6e114ae4fd355ac112296266#dc73261eb0db949b6e114ae4fd355ac112296266"
+source = "git+https://github.com/spiceai/mistral.rs?rev=7cc0c27222c8bd68f858d1fc70300fce4145c3ea#7cc0c27222c8bd68f858d1fc70300fce4145c3ea"
 dependencies = [
  "ahash 0.8.12",
  "akin",
@@ -12845,7 +12866,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-flash-attn"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc73261eb0db949b6e114ae4fd355ac112296266#dc73261eb0db949b6e114ae4fd355ac112296266"
+source = "git+https://github.com/spiceai/mistral.rs?rev=7cc0c27222c8bd68f858d1fc70300fce4145c3ea#7cc0c27222c8bd68f858d1fc70300fce4145c3ea"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12856,7 +12877,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc73261eb0db949b6e114ae4fd355ac112296266#dc73261eb0db949b6e114ae4fd355ac112296266"
+source = "git+https://github.com/spiceai/mistral.rs?rev=7cc0c27222c8bd68f858d1fc70300fce4145c3ea#7cc0c27222c8bd68f858d1fc70300fce4145c3ea"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -12867,7 +12888,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc73261eb0db949b6e114ae4fd355ac112296266#dc73261eb0db949b6e114ae4fd355ac112296266"
+source = "git+https://github.com/spiceai/mistral.rs?rev=7cc0c27222c8bd68f858d1fc70300fce4145c3ea#7cc0c27222c8bd68f858d1fc70300fce4145c3ea"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12888,7 +12909,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-metal-compile"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc73261eb0db949b6e114ae4fd355ac112296266#dc73261eb0db949b6e114ae4fd355ac112296266"
+source = "git+https://github.com/spiceai/mistral.rs?rev=7cc0c27222c8bd68f858d1fc70300fce4145c3ea#7cc0c27222c8bd68f858d1fc70300fce4145c3ea"
 dependencies = [
  "candle-metal-kernels",
  "objc2-metal 0.3.2",
@@ -12897,7 +12918,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc73261eb0db949b6e114ae4fd355ac112296266#dc73261eb0db949b6e114ae4fd355ac112296266"
+source = "git+https://github.com/spiceai/mistral.rs?rev=7cc0c27222c8bd68f858d1fc70300fce4145c3ea#7cc0c27222c8bd68f858d1fc70300fce4145c3ea"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12915,7 +12936,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc73261eb0db949b6e114ae4fd355ac112296266#dc73261eb0db949b6e114ae4fd355ac112296266"
+source = "git+https://github.com/spiceai/mistral.rs?rev=7cc0c27222c8bd68f858d1fc70300fce4145c3ea#7cc0c27222c8bd68f858d1fc70300fce4145c3ea"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -12953,7 +12974,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-sandbox"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc73261eb0db949b6e114ae4fd355ac112296266#dc73261eb0db949b6e114ae4fd355ac112296266"
+source = "git+https://github.com/spiceai/mistral.rs?rev=7cc0c27222c8bd68f858d1fc70300fce4145c3ea#7cc0c27222c8bd68f858d1fc70300fce4145c3ea"
 dependencies = [
  "anyhow",
  "itoa",
@@ -12970,7 +12991,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc73261eb0db949b6e114ae4fd355ac112296266#dc73261eb0db949b6e114ae4fd355ac112296266"
+source = "git+https://github.com/spiceai/mistral.rs?rev=7cc0c27222c8bd68f858d1fc70300fce4145c3ea#7cc0c27222c8bd68f858d1fc70300fce4145c3ea"
 dependencies = [
  "candle-core",
  "image 0.25.10",
@@ -20526,6 +20547,7 @@ dependencies = [
  "iceberg",
  "iceberg-storage-opendal",
  "libc",
+ "llms-llamacpp",
  "mimalloc",
  "nix 0.30.1",
  "opentelemetry 0.32.0",

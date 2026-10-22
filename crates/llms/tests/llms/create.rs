@@ -132,7 +132,7 @@ pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError
     create_hf_model(
         model_id,
         None,
-        None,
+        &[],
         std::env::var("HF_TOKEN")
             .ok()
             .map(SecretString::from)
