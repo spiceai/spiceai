@@ -234,9 +234,8 @@ mod tests {
                 &HashMap::from([("aws_iam_role_source".to_string(), SOURCE.to_string())]),
             )
             .await;
-            let err = match result {
-                Err(err) => err,
-                Ok(_) => panic!("padded/mixed-case secret must fail validation"),
+            let Err(err) = result else {
+                panic!("padded/mixed-case secret must fail validation");
             };
             let message = err.to_string();
             assert!(
