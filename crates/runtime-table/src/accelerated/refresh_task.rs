@@ -802,6 +802,11 @@ impl RefreshTask {
     /// Returns an error if the source cannot be queried, the refresh SQL fails to
     /// plan or execute, or the resulting data cannot be written to the accelerator.
     pub async fn run(&self, refresh: Refresh) -> super::Result<RefreshOutcome> {
+        // Wait for a source not reached yet before taking a refresh slot: the wait lasts
+        // as long as the source is down, and an accelerated view's source is the tables
+        // it reads, whose own refreshes need a slot.
+        let _ = self.federated.try_wait_table_provider().await;
+
         // Limit parallel refreshes via a semaphore
         let _permit = self.semaphore.acquire().await;
 
@@ -1225,11 +1230,15 @@ impl RefreshTask {
             oneshot::channel::<RefreshStat>();
 
         let resource_monitor = self.resource_monitor.clone();
+        // A source that stops sending mid-stream fails the refresh instead of
+        // holding it, and every refresh queued behind it, for ever.
+        let source =
+            super::source_stall::with_stall_timeout(data_update.data, dataset_name.to_string());
         let observed_record_batch_stream = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             stream::unfold(
                 (
-                    data_update.data,
+                    source,
                     RefreshStat::default(),
                     dataset_name.to_string(),
                     self.dataset_metric_labels.clone(),
@@ -5263,6 +5272,71 @@ mod tests {
             probe_acceleration_contents(&empty_batches, &dataset_name).await,
             AccelerationContents::Empty
         );
+    }
+
+    /// A source that sends a batch and then goes silent, as a connection the network
+    /// stopped carrying does, fails the refresh once the stall timeout passes: retried,
+    /// and counted on the attempt. Without the timeout the write waits for ever and
+    /// nothing is counted.
+    #[tokio::test(start_paused = true)]
+    async fn a_source_silent_mid_refresh_fails_retriably() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("federated mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(federated_table));
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("source_stalled_refresh"),
+            federated,
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("batch should be created");
+        let sent = futures::stream::iter(vec![Ok(batch)]).chain(futures::stream::pending());
+        let update_stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), sent));
+        let update = StreamingDataUpdate::new(update_stream, UpdateType::Overwrite);
+
+        let timeout = super::super::source_stall::SOURCE_STALL_TIMEOUT;
+        let started = tokio::time::Instant::now();
+        let Err(error) = tokio::time::timeout(
+            timeout * 2,
+            task.write_streaming_data_update(None, update, None, None),
+        )
+        .await
+        .expect("a refresh whose source went silent must not wait for ever") else {
+            panic!("a source silent mid-refresh must fail the refresh");
+        };
+        assert!(
+            matches!(&error, RetryError::Transient { .. }),
+            "a stalled source is retried on a new connection: {error:?}"
+        );
+        let counted = attempt_refresh_error(&error).expect("counted on the attempt");
+        assert_eq!(
+            refresh_error_reason(counted),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+        assert!(
+            counted
+                .to_string()
+                .contains("The source of dataset 'source_stalled_refresh' stopped sending data"),
+            "{counted}"
+        );
+        assert_eq!(started.elapsed(), timeout, "fails at the stall timeout");
     }
 
     #[tokio::test]
