@@ -37,8 +37,7 @@ pub const METRIC_REFRESH_WORKER_PANICS: &str = "dataset_acceleration_refresh_wor
 /// A snapshot reader (`refresh_mode: snapshot`) reports why it could not advance:
 /// `snapshot_not_found` when none is published, `snapshot_older_than_loaded` when
 /// loading the published one would regress the dataset, and `snapshot_download_failed`
-/// when a newer one could not be downloaded or verified (a missing file only once a poll has
-/// waited for a region replica to receive it).
+/// when a newer one could not be loaded.
 pub const REFRESH_ERROR_REASON: &str = "reason";
 pub const REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED: &str = "object_generation_changed";
 pub const REFRESH_ERROR_REASON_PARQUET_DECODE: &str = "parquet_decode";

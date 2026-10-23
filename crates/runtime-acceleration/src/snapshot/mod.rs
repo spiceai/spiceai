@@ -138,12 +138,10 @@ const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const METADATA_FILE_NAME: &str = "metadata.json";
 const SNAPSHOT_CHECKSUM_ALGORITHM: &str = "SHA256";
 const NETWORK_RETRY_MAX: usize = 3;
-/// How long a poll keeps checking for the file of a newer published snapshot that is not at
-/// the location yet. A region replica of the location, as filled by S3 replication, can
-/// receive `metadata.json` before the snapshot file it names; 90 seconds is about three times
-/// the replication delay seen in testing.
+/// How long a poll waits for a newer snapshot's file, which can reach the location after
+/// `metadata.json`. About three times the replication delay seen in testing.
 const SNAPSHOT_ALLOWED_LATE_ARRIVAL_GRACE: Duration = Duration::from_secs(90);
-/// How often a poll checks again whether a late snapshot file has arrived.
+/// How often a poll checks whether a late snapshot file has arrived.
 const LATE_SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 const SNAPSHOTS_DOCS: &str = "https://spiceai.org/docs/features/data-acceleration/snapshots";
 
@@ -372,9 +370,7 @@ pub enum SnapshotPollOutcome {
     /// The published snapshot is older than the loaded one, as after the location was
     /// recreated and the writer's ids restarted. It is never loaded.
     OlderThanLoaded { published_id: u64, loaded_id: u64 },
-    /// A newer snapshot is published but could not be loaded: its file is still not at the
-    /// location after [`SNAPSHOT_ALLOWED_LATE_ARRIVAL_GRACE`], or it could not be read or
-    /// verified. Nothing changed locally; the next poll tries again.
+    /// A newer snapshot is published but could not be loaded. The next poll tries again.
     DownloadFailed {
         published_id: u64,
         loaded_id: u64,
@@ -1771,9 +1767,7 @@ impl SnapshotManager {
     /// schema **before** any bytes are downloaded or written to disk; if it returns false a
     /// schema mismatch is reported and the accelerator's primary file is left untouched.
     ///
-    /// A newer snapshot whose file is not at the location yet is checked for again every
-    /// [`LATE_SNAPSHOT_RETRY_INTERVAL`] for up to [`SNAPSHOT_ALLOWED_LATE_ARRIVAL_GRACE`]
-    /// before the poll reports it, since a replica can receive the metadata first.
+    /// A missing file of a newer snapshot is waited for a short time before the poll reports it.
     ///
     /// # Errors
     ///
@@ -1902,12 +1896,8 @@ impl SnapshotManager {
                 .map_err(RetryError::permanent)?,
         );
         let download = if let Some(loaded_id) = current_local_id {
-            // A reader that serves a snapshot keeps serving it when the published one cannot
-            // be loaded, and the next poll tries again, under every bootstrap behavior. A
-            // region replica of the location can receive the metadata before the file it
-            // names, so the poll first waits a while for that file. It waits for the snapshot
-            // it read and validated, so a writer that publishes faster than files replicate
-            // cannot keep the reader from loading any.
+            // Wait for the file of the snapshot this poll validated, not a newer one, so a
+            // writer that publishes faster than files arrive cannot starve the reader.
             if let Some(entry) = dataset_metadata.current_snapshot() {
                 let started = tokio::time::Instant::now();
                 while started.elapsed() < SNAPSHOT_ALLOWED_LATE_ARRIVAL_GRACE
@@ -5184,10 +5174,8 @@ mod tests {
         assert_eq!(info.snapshot_id, 7);
     }
 
-    /// A reader that serves snapshot 1 polls a published snapshot 2, under every bootstrap
-    /// behavior. A missing file is checked for again until the grace period ends, since a
-    /// replica can receive the metadata first: one that arrives meanwhile is loaded, one that
-    /// does not is reported as missing. A file that fails verification is reported at once.
+    /// A late file is loaded once it arrives, a missing one is reported after the grace
+    /// period, and a corrupt one is reported at once, under every bootstrap behavior.
     #[tokio::test(start_paused = true)]
     #[cfg(feature = "duckdb")]
     async fn poll_waits_for_a_late_snapshot_file_and_reports_one_it_cannot_load() {
@@ -5306,7 +5294,6 @@ mod tests {
                 );
 
                 let started = tokio::time::Instant::now();
-                // A poll that retried without end would never return here.
                 let poll = tokio::time::timeout(
                     Duration::from_mins(10),
                     manager.download_if_newer(Some(1), None, None),
@@ -5355,10 +5342,7 @@ mod tests {
         }
     }
 
-    /// A poll waiting for a late snapshot file keeps downloading the snapshot it read and
-    /// validated, even when the metadata names a newer one meanwhile whose file is late too:
-    /// a writer that publishes faster than files replicate cannot keep the reader from
-    /// loading any.
+    /// A poll waits for the snapshot it validated, even if a newer one is published meanwhile.
     #[tokio::test(start_paused = true)]
     #[cfg(feature = "duckdb")]
     async fn a_poll_waiting_for_a_late_file_loads_the_snapshot_it_read() {
@@ -5636,10 +5620,8 @@ mod tests {
         }
     }
 
-    /// Under `bootstrap_on_failure_behavior: retry`, a reader that serves a snapshot and polls
-    /// a broken one reports it rather than retrying inside the poll, and the next poll reads
-    /// the metadata again: a snapshot published to replace the broken one is validated and
-    /// downloaded.
+    /// Under `bootstrap_on_failure_behavior: retry`, a serving reader reports a broken snapshot,
+    /// and the next poll loads the one published to replace it.
     #[tokio::test]
     async fn download_if_newer_retry_picks_up_a_replacement_snapshot() {
         let store = Arc::new(InMemory::new());
@@ -11363,8 +11345,7 @@ mod tests {
 
     /// A reader that serves snapshot 1 skips a newer snapshot whose file is gone and
     /// loads the newest one whose file exists; it never falls back to the snapshot it
-    /// already serves or an older one, and reports the published one as missing once the
-    /// grace period for a late file ends.
+    /// already serves or an older one.
     #[tokio::test(start_paused = true)]
     async fn a_serving_reader_skips_a_newer_snapshot_whose_file_is_gone() {
         let schema = sample_schema();
