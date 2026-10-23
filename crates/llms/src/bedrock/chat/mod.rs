@@ -776,13 +776,6 @@ impl StreamState {
                     Some(Err(to_api_error("Invalid stream from Bedrock Converse API. Tool use delta received before starting packet".to_string())))
                 }
             }
-            // An `OpenAI` stream delta has no reasoning field, so reasoning text, signatures and
-            // redacted reasoning yield no chunk. The Anthropic provider drops thinking deltas the
-            // same way.
-            ConverseStreamOutputPacket::ContentBlockDelta(ContentBlockDeltaEvent {
-                delta: Some(ContentBlockDeltaType::ReasoningContent(_)),
-                ..
-            }) => None,
             ConverseStreamOutputPacket::MessageStop(MessageStopEvent { stop_reason, .. }) => {
                 match try_convert_finish_reason(&stop_reason) {
                     Ok(finish_reason) => Some(create_stream_response(
@@ -809,7 +802,14 @@ impl StreamState {
                 vec![],
                 Some(convert_usage(&usage)),
             )),
-            ConverseStreamOutputPacket::ContentBlockStop(_) => None,
+            // An `OpenAI` stream delta has no reasoning field, so reasoning text, signatures and
+            // redacted reasoning yield no chunk. The Anthropic provider drops thinking deltas the
+            // same way.
+            ConverseStreamOutputPacket::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: Some(ContentBlockDeltaType::ReasoningContent(_)),
+                ..
+            })
+            | ConverseStreamOutputPacket::ContentBlockStop(_) => None,
             unknown => Some(Err(to_api_error(format!(
                 "Unknown event from Bedrock stream: {unknown:?}"
             )))),
