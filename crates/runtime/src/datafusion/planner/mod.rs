@@ -371,6 +371,7 @@ async fn plan_distributed_dml(
                     .get_cached_table_metadata(&dml.table_name)
                     .is_some()
             })
+            && !is_partitioned_acceleration(session, &dml.table_name).await
         {
             return Err(DataFusionError::Plan(format!(
                 "Cannot write to {}: its rows are partitioned across executors, but this scheduler has not registered its acceleration. Run its CREATE TABLE IF NOT EXISTS ... WITH (acceleration ...) PARTITION BY statement again, then retry the write.",
@@ -410,7 +411,10 @@ fn is_cayenne_table(session: &SessionState, table_name: &TableReference) -> bool
     }
 }
 
-async fn is_distributed_insert_table(session: &SessionState, table_name: &TableReference) -> bool {
+pub(crate) async fn is_distributed_insert_table(
+    session: &SessionState,
+    table_name: &TableReference,
+) -> bool {
     // Distributed scheduler-mode INSERT rewriting applies to both:
     // 1. Cayenne catalog tables, which must be forwarded to executors, and
     // 2. dual-write accelerated tables (Iceberg federated catalog cache), which
@@ -419,22 +423,35 @@ async fn is_distributed_insert_table(session: &SessionState, table_name: &TableR
         return true;
     }
 
+    table_provider(session, table_name)
+        .await
+        .is_some_and(|table_provider| is_dual_write_table_provider(&table_provider))
+}
+
+/// Whether `table_name` is an acceleration whose partitions the executors hold.
+async fn is_partitioned_acceleration(session: &SessionState, table_name: &TableReference) -> bool {
+    table_provider(session, table_name)
+        .await
+        .is_some_and(|table_provider| {
+            spice_table::find_layer::<AcceleratedTable>(
+                table_provider.as_ref(),
+                spice_table::LayerWalk::Read,
+            )
+            .is_some_and(|accelerated| !accelerated.is_node_local())
+        })
+}
+
+async fn table_provider(
+    session: &SessionState,
+    table_name: &TableReference,
+) -> Option<Arc<dyn TableProvider>> {
     let catalog_name = table_name.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
     let schema_name = table_name.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
-
-    let Some(catalog) = session.catalog_list().catalog(catalog_name) else {
-        return false;
-    };
-
-    let Some(schema) = catalog.schema(schema_name) else {
-        return false;
-    };
-
-    let Ok(Some(table_provider)) = schema.table(table_name.table()).await else {
-        return false;
-    };
-
-    is_dual_write_table_provider(&table_provider)
+    let schema = session
+        .catalog_list()
+        .catalog(catalog_name)?
+        .schema(schema_name)?;
+    schema.table(table_name.table()).await.ok().flatten()
 }
 
 fn is_dual_write_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
