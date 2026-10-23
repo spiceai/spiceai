@@ -172,11 +172,28 @@ impl Container {
                     .await
                     .map(|created| created.id)
             },
-            || async {
-                docker
-                    .inspect_container(&spec.name, None)
-                    .await
-                    .map(|found| found.id.unwrap_or_default())
+            |holder| {
+                let docker = &docker;
+                async move {
+                    docker
+                        .inspect_container(&holder, None)
+                        .await
+                        .map(|found| found.id.unwrap_or(holder))
+                }
+            },
+            |holder| {
+                let docker = &docker;
+                async move {
+                    let _ = docker
+                        .remove_container(
+                            &holder,
+                            Some(RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
+                }
             },
         )
         .await
@@ -434,33 +451,37 @@ const CREATE_ATTEMPTS: u32 = 3;
 const CREATE_RETRY_PAUSE: Duration = Duration::from_secs(2);
 
 /// How many times to look up a container a timed-out attempt created before
-/// giving up on finding it (about a minute at [`CREATE_RETRY_PAUSE`]).
-const ADOPT_LOOKUPS: u32 = 30;
+/// removing it and creating again (about 20 s at [`CREATE_RETRY_PAUSE`]).
+const ADOPT_LOOKUPS: u32 = 10;
 
 /// Runs `create` until it succeeds, fails other than by Docker not answering
 /// in time, or has been tried `attempts` times, pausing `pause` before each
 /// retry. Once an attempt has timed out, a name conflict (409) means that
 /// attempt's container was created after all, with this name and
-/// configuration: `adopt` then looks it up, again after `pause` for as long
-/// as Docker does not know it yet, and its id is used. Each retry is reported
-/// in the script's output, naming `what`.
-async fn create_or_adopt<C, CF, A, AF>(
+/// configuration: `adopt` looks up the container the conflict names, again
+/// after `pause` while Docker does not know it yet, and its id is used. If it
+/// never turns up, `remove` frees the name and creating is tried again. Each
+/// retry is reported in the script's output, naming `what`.
+async fn create_or_adopt<C, CF, A, AF, R, RF>(
     attempts: u32,
     pause: Duration,
     what: &str,
     mut create: C,
     mut adopt: A,
+    mut remove: R,
 ) -> Result<String, bollard::errors::Error>
 where
     C: FnMut() -> CF,
     CF: std::future::Future<Output = Result<String, bollard::errors::Error>>,
-    A: FnMut() -> AF,
+    A: FnMut(String) -> AF,
     AF: std::future::Future<Output = Result<String, bollard::errors::Error>>,
+    R: FnMut(String) -> RF,
+    RF: std::future::Future<Output = ()>,
 {
     let mut tried = 1;
     let mut timed_out = false;
     loop {
-        match create().await {
+        let conflict = match create().await {
             Err(bollard::errors::Error::RequestTimeoutError) if tried < attempts => {
                 timed_out = true;
                 crate::runner::emit(&format!(
@@ -468,32 +489,61 @@ where
                 ));
                 tried += 1;
                 tokio::time::sleep(pause).await;
+                continue;
             }
             Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 409, ..
-            }) if timed_out => {
-                crate::runner::emit(&format!(
-                    "   a timed-out attempt had created {what}; using that container"
-                ));
-                // Docker claims the name before the container can be looked
-                // up, so a lookup right after the conflict can find nothing.
-                let mut looked = 1;
-                loop {
-                    match adopt().await {
-                        Err(bollard::errors::Error::DockerResponseServerError {
-                            status_code: 404,
-                            ..
-                        }) if looked < ADOPT_LOOKUPS => {
-                            looked += 1;
-                            tokio::time::sleep(pause).await;
-                        }
-                        found => return found,
-                    }
-                }
-            }
+                status_code: 409,
+                message,
+            }) if timed_out => message,
             other => return other,
+        };
+        // The conflict names the container holding the name; look it up by
+        // that id (by name it can stay unknown to Docker), retrying while
+        // Docker is still registering it.
+        let holder = conflict_holder(&conflict).unwrap_or_else(|| what.to_string());
+        let mut looked = 1;
+        let missing = loop {
+            match adopt(holder.clone()).await {
+                Ok(id) => {
+                    crate::runner::emit(&format!(
+                        "   a timed-out attempt had created {what}; using that container"
+                    ));
+                    return Ok(id);
+                }
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    message,
+                }) => {
+                    if looked >= ADOPT_LOOKUPS {
+                        break message;
+                    }
+                    looked += 1;
+                    tokio::time::sleep(pause).await;
+                }
+                Err(other) => return Err(other),
+            }
+        };
+        if tried >= attempts {
+            return Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                message: missing,
+            });
         }
+        crate::runner::emit(&format!(
+            "   Docker holds the name {what} for a container it cannot find; removing it and trying again ({tried} of {attempts} attempts made)"
+        ));
+        remove(holder).await;
+        tried += 1;
+        tokio::time::sleep(pause).await;
     }
+}
+
+/// The id of the container a 409 name conflict says holds the name:
+/// `… is already in use by container "<id>". …`.
+fn conflict_holder(message: &str) -> Option<String> {
+    let (_, rest) = message.split_once("in use by container \"")?;
+    let id = rest.split('"').next()?;
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_string())
 }
 
 /// A host port that is free now. Another process could take it before Docker
@@ -571,24 +621,46 @@ mod port_tests {
 
 #[cfg(test)]
 mod create_retry_tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     use bollard::errors::Error;
 
-    use super::create_or_adopt;
+    use super::{conflict_holder, create_or_adopt};
+
+    const HOLDER: &str = "7cd4ae6e9028774521e285a3aca8c021b11b04882a842cdd56dfffe3a3814318";
 
     fn conflict() -> Error {
         Error::DockerResponseServerError {
             status_code: 409,
-            message: "Conflict. The container name is already in use".into(),
+            // As Docker words it.
+            message: format!(
+                "Conflict. The container name \"/c\" is already in use by container \"{HOLDER}\". You have to remove (or rename) that container to be able to reuse that name."
+            ),
         }
     }
 
+    fn not_found() -> Error {
+        Error::DockerResponseServerError {
+            status_code: 404,
+            message: "No such container".into(),
+        }
+    }
+
+    #[test]
+    fn reads_the_holder_from_a_name_conflict() {
+        let Err(Error::DockerResponseServerError { message, .. }) = Err::<(), _>(conflict()) else {
+            unreachable!("built above");
+        };
+        assert_eq!(conflict_holder(&message).as_deref(), Some(HOLDER));
+        assert_eq!(conflict_holder("Conflict."), None);
+    }
+
     #[tokio::test]
-    async fn retries_a_timeout_and_adopts_the_container_it_created() {
+    async fn retries_a_timeout_and_adopts_or_replaces_the_container_it_created() {
         let no_pause = Duration::ZERO;
-        let never = || async { Err::<String, Error>(Error::RequestTimeoutError) };
+        let no_remove = |_: String| async {};
 
         // Two timeouts, then success: three attempts.
         let calls = AtomicU32::new(0);
@@ -602,7 +674,8 @@ mod create_retry_tests {
                     _ => Ok("new".to_string()),
                 }
             },
-            never,
+            |_| async { Err(not_found()) },
+            no_remove,
         )
         .await;
         assert_eq!(
@@ -610,9 +683,10 @@ mod create_retry_tests {
             (Some("new".into()), 3)
         );
 
-        // A timeout whose container then holds the name: that container is
-        // adopted.
+        // A timeout, then a conflict: the container the conflict names is
+        // looked up by its id (twice, as Docker registers it) and adopted.
         let calls = AtomicU32::new(0);
+        let looked_up = Mutex::new(Vec::new());
         let got = create_or_adopt(
             3,
             no_pause,
@@ -623,18 +697,25 @@ mod create_retry_tests {
                     _ => Err(conflict()),
                 }
             },
-            || async { Ok("adopted".to_string()) },
+            |holder| {
+                let mut seen = looked_up.lock().expect("lock");
+                seen.push(holder.clone());
+                let found = seen.len() > 1;
+                async move { if found { Ok(holder) } else { Err(not_found()) } }
+            },
+            no_remove,
         )
         .await;
+        assert_eq!(got.ok().as_deref(), Some(HOLDER));
         assert_eq!(
-            (got.ok(), calls.load(Ordering::SeqCst)),
-            (Some("adopted".into()), 2)
+            *looked_up.lock().expect("lock"),
+            vec![HOLDER.to_string(); 2]
         );
 
-        // Docker does not know that container yet: the lookup is repeated
-        // until it does.
+        // The holder never turns up: it is removed and creating is tried
+        // again, which succeeds.
         let calls = AtomicU32::new(0);
-        let lookups = AtomicU32::new(0);
+        let removed = Mutex::new(Vec::new());
         let got = create_or_adopt(
             3,
             no_pause,
@@ -642,24 +723,19 @@ mod create_retry_tests {
             || async {
                 match calls.fetch_add(1, Ordering::SeqCst) {
                     0 => Err(Error::RequestTimeoutError),
-                    _ => Err(conflict()),
+                    1 => Err(conflict()),
+                    _ => Ok("new".to_string()),
                 }
             },
-            || async {
-                match lookups.fetch_add(1, Ordering::SeqCst) {
-                    0 | 1 => Err(Error::DockerResponseServerError {
-                        status_code: 404,
-                        message: "No such container".into(),
-                    }),
-                    _ => Ok("adopted".to_string()),
-                }
+            |_| async { Err(not_found()) },
+            |holder| {
+                removed.lock().expect("lock").push(holder);
+                async {}
             },
         )
         .await;
-        assert_eq!(
-            (got.ok(), lookups.load(Ordering::SeqCst)),
-            (Some("adopted".into()), 3)
-        );
+        assert_eq!(got.ok().as_deref(), Some("new"));
+        assert_eq!(*removed.lock().expect("lock"), vec![HOLDER.to_string()]);
 
         // Timeouts every time: gives up after the allowed attempts.
         let calls = AtomicU32::new(0);
@@ -671,14 +747,14 @@ mod create_retry_tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Err(Error::RequestTimeoutError)
             },
-            never,
+            |_| async { Err(not_found()) },
+            no_remove,
         )
         .await;
         assert!(matches!(got, Err(Error::RequestTimeoutError)), "{got:?}");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
-        // A conflict with no timeout before it is returned at once, without
-        // adopting anything.
+        // A conflict with no timeout before it is returned at once.
         let calls = AtomicU32::new(0);
         let got = create_or_adopt(
             3,
@@ -688,7 +764,8 @@ mod create_retry_tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Err(conflict())
             },
-            || async { Ok("adopted".to_string()) },
+            |_| async { Ok("adopted".to_string()) },
+            no_remove,
         )
         .await;
         assert!(
