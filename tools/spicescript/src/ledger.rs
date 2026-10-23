@@ -40,6 +40,9 @@ use crate::{runner::Failure, script::Script};
 
 pub const FILE: &str = "expected-failures.json";
 const UNASSIGNED: &str = "unassigned";
+/// The key of a failure outside any step: starting a run's sources or
+/// instances.
+pub const SETUP: &str = "setup";
 
 /// One expected failure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,8 +233,20 @@ impl Ledger {
         }
         let none_failed = failures.is_empty();
         // Entries for runs and variants `--matrix` or `--variant` left out
-        // were not checked, so their passing says nothing.
-        let ran = |e: &Entry| !script.left_out.covers(&e.run, &e.who);
+        // were not checked, so their passing says nothing; nor were those of
+        // a run, or an instance, that failed to set up, whose setup failure
+        // is reported in their place.
+        let unset: Vec<(&str, &str)> = failures
+            .iter()
+            .filter(|f| f.key == SETUP)
+            .map(|f| (f.run.as_str(), f.who.as_str()))
+            .collect();
+        let ran = |e: &Entry| {
+            !script.left_out.covers(&e.run, &e.who)
+                && !unset
+                    .iter()
+                    .any(|(run, who)| *run == e.run && (who.is_empty() || *who == e.who))
+        };
         let checked = entries.iter().filter(|e| ran(e)).count();
         if none_failed && checked > 0 && entries.iter().filter(|e| ran(e)).all(|e| e.may_pass) {
             verdict.notes.push(format!(
@@ -684,6 +699,36 @@ mod tests {
             BTreeMap::from([(script.file_stem.clone(), entries)]),
         );
         Ledger { files }
+    }
+
+    #[test]
+    fn a_run_that_failed_to_set_up_reports_that_not_its_entries() {
+        let script = script_in("t");
+        let ledger = ledger(&script, vec![entry("a", false), entry("b", false)]);
+        let setup = |who: &str| Failure {
+            key: SETUP.into(),
+            what: SETUP.into(),
+            step: 0,
+            message: "Failed to start source 'ref' (postgres): Timeout error".into(),
+            ..failure(who)
+        };
+        let whole_run = ledger.judge(&script, &[setup("")]);
+        assert_eq!(
+            (whole_run.new.len(), whole_run.gone.len()),
+            (1, 0),
+            "{:?}",
+            whole_run.problems()
+        );
+        let one_instance = ledger.judge(&script, &[setup("a")]);
+        assert_eq!(
+            one_instance
+                .gone
+                .iter()
+                .map(|e| e.who.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"],
+            "the instance that did set up still owes its expected failure"
+        );
     }
 
     #[test]

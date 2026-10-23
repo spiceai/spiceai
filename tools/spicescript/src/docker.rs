@@ -452,7 +452,7 @@ async fn pull_if_missing(docker: &Docker, image: &str) -> Result<()> {
 /// in time. A daemon busy with many containers at once (several runs on one
 /// host) can take longer than the client's request timeout, and creating the
 /// container again usually succeeds.
-const CREATE_ATTEMPTS: u32 = 3;
+const CREATE_ATTEMPTS: u32 = 5;
 
 /// How long to wait before trying again after Docker did not answer in time,
 /// and between lookups of a container a timed-out attempt created.
