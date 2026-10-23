@@ -128,11 +128,11 @@ impl fmt::Display for ModelId {
 mod tests {
     use super::*;
 
-    fn model(provider: Provider, name: &str) -> Option<FoundationModel> {
-        Some(FoundationModel {
+    fn model(provider: Provider, name: &str) -> FoundationModel {
+        FoundationModel {
             provider,
             name: name.to_string(),
-        })
+        }
     }
 
     #[test]
@@ -141,40 +141,55 @@ mod tests {
         let cases = [
             (
                 "anthropic.claude-3-7-sonnet-20250219-v1:0",
-                model(Provider::Anthropic, "claude-3-7-sonnet-20250219-v1:0"),
+                Some(model(
+                    Provider::Anthropic,
+                    "claude-3-7-sonnet-20250219-v1:0",
+                )),
             ),
             (
                 "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-                model(Provider::Anthropic, "claude-sonnet-4-5-20250929-v1:0"),
+                Some(model(
+                    Provider::Anthropic,
+                    "claude-sonnet-4-5-20250929-v1:0",
+                )),
             ),
             (
                 "global.anthropic.claude-haiku-4-5-20251001-v1:0",
-                model(Provider::Anthropic, "claude-haiku-4-5-20251001-v1:0"),
+                Some(model(Provider::Anthropic, "claude-haiku-4-5-20251001-v1:0")),
             ),
             (
                 "us-gov.anthropic.claude-3-5-sonnet-20240620-v1:0",
-                model(Provider::Anthropic, "claude-3-5-sonnet-20240620-v1:0"),
+                Some(model(
+                    Provider::Anthropic,
+                    "claude-3-5-sonnet-20240620-v1:0",
+                )),
             ),
             (
                 "us.amazon.nova-2-lite-v1:0",
-                model(Provider::Amazon, "nova-2-lite-v1:0"),
+                Some(model(Provider::Amazon, "nova-2-lite-v1:0")),
             ),
             (
                 "openai.gpt-oss-120b-1:0",
-                model(Provider::OpenAi, "gpt-oss-120b-1:0"),
+                Some(model(Provider::OpenAi, "gpt-oss-120b-1:0")),
             ),
             (
                 "meta.llama3-1-8b-instruct-v1:0",
-                model(Provider::Other, "llama3-1-8b-instruct-v1:0"),
+                Some(model(Provider::Other, "llama3-1-8b-instruct-v1:0")),
             ),
-            ("us.deepseek.r1-v1:0", model(Provider::Other, "r1-v1:0")),
+            (
+                "us.deepseek.r1-v1:0",
+                Some(model(Provider::Other, "r1-v1:0")),
+            ),
             (
                 "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-                model(Provider::Anthropic, "claude-sonnet-4-5-20250929-v1:0"),
+                Some(model(
+                    Provider::Anthropic,
+                    "claude-sonnet-4-5-20250929-v1:0",
+                )),
             ),
             (
                 "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-6-v1",
-                model(Provider::Anthropic, "claude-opus-4-6-v1"),
+                Some(model(Provider::Anthropic, "claude-opus-4-6-v1")),
             ),
             (
                 "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3",

@@ -314,20 +314,20 @@ mod tests {
 
     fn fields(
         model_id: &str,
-        effort: ReasoningEffort,
+        effort: &ReasoningEffort,
         max_tokens: Option<u32>,
     ) -> Option<ReasoningRequest> {
         let model_id = ModelId::from(model_id);
         ReasoningControl::for_model(&model_id)
-            .request(&model_id, Some(&effort), max_tokens)
+            .request(&model_id, Some(effort), max_tokens)
             .expect("reasoning request should build")
     }
 
-    fn expected(value: Value, max_tokens: Option<u32>) -> Option<ReasoningRequest> {
-        Some(ReasoningRequest {
+    fn expected(value: Value, max_tokens: Option<u32>) -> ReasoningRequest {
+        ReasoningRequest {
             additional_model_request_fields: value_to_document(value),
             max_tokens,
-        })
+        }
     }
 
     #[test]
@@ -409,24 +409,24 @@ mod tests {
         assert_eq!(
             fields(
                 "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-                ReasoningEffort::High,
+                &ReasoningEffort::High,
                 None
             ),
-            expected(
+            Some(expected(
                 json!({"thinking": {"type": "enabled", "budget_tokens": 16384}}),
                 Some(16384 + CLAUDE_ANSWER_TOKENS)
-            )
+            ))
         );
         assert_eq!(
             fields(
                 "anthropic.claude-3-7-sonnet-20250219-v1:0",
-                ReasoningEffort::Minimal,
+                &ReasoningEffort::Minimal,
                 Some(8000)
             ),
-            expected(
+            Some(expected(
                 json!({"thinking": {"type": "enabled", "budget_tokens": 1024}}),
                 Some(8000)
-            )
+            ))
         );
     }
 
@@ -435,18 +435,18 @@ mod tests {
         let model = "anthropic.claude-opus-4-5-20251101-v1:0";
         let model_id = ModelId::from(model);
         assert_eq!(
-            fields(model, ReasoningEffort::High, Some(10000)),
-            expected(
+            fields(model, &ReasoningEffort::High, Some(10000)),
+            Some(expected(
                 json!({"thinking": {"type": "enabled", "budget_tokens": 5000}}),
                 Some(10000)
-            )
+            ))
         );
         assert_eq!(
-            fields(model, ReasoningEffort::Medium, Some(1500)),
-            expected(
+            fields(model, &ReasoningEffort::Medium, Some(1500)),
+            Some(expected(
                 json!({"thinking": {"type": "enabled", "budget_tokens": 1024}}),
                 Some(1500)
-            )
+            ))
         );
 
         let Err(OpenAIError::InvalidArgument(message)) = ReasoningControl::for_model(&model_id)
@@ -472,17 +472,17 @@ mod tests {
             (ReasoningEffort::Xhigh, "high"),
         ] {
             assert_eq!(
-                fields(model, effort.clone(), Some(2000)),
-                expected(
+                fields(model, &effort, Some(2000)),
+                Some(expected(
                     json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": level}}),
                     Some(2000)
-                ),
+                )),
                 "{effort:?}"
             );
         }
         assert_eq!(
-            fields(model, ReasoningEffort::None, None),
-            expected(json!({"thinking": {"type": "disabled"}}), None)
+            fields(model, &ReasoningEffort::None, None),
+            Some(expected(json!({"thinking": {"type": "disabled"}}), None))
         );
     }
 
@@ -490,14 +490,14 @@ mod tests {
     fn nova_sends_a_reasoning_config() {
         // Shape from the Amazon Nova 2 extended thinking page.
         assert_eq!(
-            fields("us.amazon.nova-2-lite-v1:0", ReasoningEffort::Medium, None),
-            expected(
+            fields("us.amazon.nova-2-lite-v1:0", &ReasoningEffort::Medium, None),
+            Some(expected(
                 json!({"reasoningConfig": {"type": "enabled", "maxReasoningEffort": "medium"}}),
                 None
-            )
+            ))
         );
         assert_eq!(
-            fields("us.amazon.nova-2-lite-v1:0", ReasoningEffort::None, None),
+            fields("us.amazon.nova-2-lite-v1:0", &ReasoningEffort::None, None),
             None
         );
     }
@@ -507,8 +507,8 @@ mod tests {
         // Converse passes chat-completions fields such as `reasoning_effort` through
         // `additionalModelRequestFields` (Bedrock OpenAI models page).
         assert_eq!(
-            fields("openai.gpt-oss-120b-1:0", ReasoningEffort::Low, Some(500)),
-            expected(json!({"reasoning_effort": "low"}), Some(500))
+            fields("openai.gpt-oss-120b-1:0", &ReasoningEffort::Low, Some(500)),
+            Some(expected(json!({"reasoning_effort": "low"}), Some(500)))
         );
     }
 
@@ -536,7 +536,7 @@ mod tests {
         assert_eq!(
             fields(
                 "anthropic.claude-3-5-sonnet-20240620-v1:0",
-                ReasoningEffort::High,
+                &ReasoningEffort::High,
                 None
             ),
             None
