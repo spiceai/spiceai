@@ -958,6 +958,167 @@ async fn file_connector_unknown_file_format_log_stays_ready() -> Result<(), anyh
         .await
 }
 
+/// Common real text extensions stay Ready. Structured-format typos remain
+/// configuration errors. `file_format: text` plus `file_extension: .tex`
+/// lists only `*.tex` files.
+#[tokio::test]
+async fn file_connector_text_extensions_ready_structured_typos_error() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::TempDir::new()?;
+            for ext in [
+                "tex", "org", "json5", "jsonc", "mdx", "css", "ts", "psv", "md",
+            ] {
+                std::fs::write(
+                    dir.path().join(format!("notes.{ext}")),
+                    format!("hello {ext}\n"),
+                )?;
+            }
+            let csv = dir.path().join("orders.csv");
+            write_orders_csv(&csv)?;
+
+            let docs = format!("file:{}/", dir.path().display());
+            let mut app = AppBuilder::new("file_format_text_extensions");
+            for format in ["tex", "org", "json5", "jsonc", "mdx", "css", "ts", "psv"] {
+                let mut dataset = Dataset::new(docs.clone(), format!("fmt_{format}"));
+                dataset.params = Some(Params {
+                    data: HashMap::from([(
+                        "file_format".to_string(),
+                        ParamValue::String(format.to_string()),
+                    )]),
+                });
+                app = app.with_dataset(dataset);
+            }
+
+            let mut text_tex = Dataset::new(docs, "text_tex");
+            text_tex.params = Some(Params {
+                data: HashMap::from([
+                    (
+                        "file_format".to_string(),
+                        ParamValue::String("text".to_string()),
+                    ),
+                    (
+                        "file_extension".to_string(),
+                        ParamValue::String(".tex".to_string()),
+                    ),
+                ]),
+            });
+            app = app.with_dataset(text_tex);
+
+            for (name, format) in [
+                ("typo_cvs", "cvs"),
+                ("typo_parqet", "parqet"),
+                ("typo_jsno", "jsno"),
+                ("typo_parquett", "parquett"),
+            ] {
+                let mut dataset = Dataset::new(format!("file:{}", csv.display()), name);
+                dataset.params = Some(Params {
+                    data: HashMap::from([(
+                        "file_format".to_string(),
+                        ParamValue::String(format.to_string()),
+                    )]),
+                });
+                app = app.with_dataset(dataset);
+            }
+
+            let app = app.build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            for format in ["tex", "org", "json5", "jsonc", "mdx", "css", "ts", "psv"] {
+                let name = format!("fmt_{format}");
+                let status = rt
+                    .status()
+                    .get_dataset_status(&datafusion::common::TableReference::bare(name.as_str()))
+                    .expect("dataset status");
+                assert_eq!(
+                    status.to_string(),
+                    "Ready",
+                    "file_format {format} must stay Ready, got {status:?}"
+                );
+            }
+
+            let text_status = rt
+                .status()
+                .get_dataset_status(&datafusion::common::TableReference::bare("text_tex"))
+                .expect("dataset status");
+            assert_eq!(
+                text_status.to_string(),
+                "Ready",
+                "file_format text plus file_extension .tex must stay Ready, got {text_status:?}"
+            );
+
+            let mut result = rt
+                .datafusion()
+                .query_builder("SELECT location FROM text_tex")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("text_tex query failed: {e}"))?;
+            let mut locations = Vec::new();
+            while let Some(batch) = result.data.next().await {
+                let batch = batch.map_err(|e| anyhow::anyhow!("text_tex batch error: {e}"))?;
+                for row in 0..batch.num_rows() {
+                    locations.push(
+                        arrow::util::display::array_value_to_string(batch.column(0), row)
+                            .expect("location renders"),
+                    );
+                }
+            }
+            assert_eq!(
+                locations.len(),
+                1,
+                "text_tex must list exactly one object: {locations:?}"
+            );
+            assert!(
+                locations[0].ends_with("notes.tex"),
+                "text_tex must pick up notes.tex, got {locations:?}"
+            );
+
+            for (name, format, hint) in [
+                ("typo_cvs", "cvs", "csv"),
+                ("typo_parqet", "parqet", "parquet"),
+                ("typo_jsno", "jsno", "json"),
+                ("typo_parquett", "parquett", "parquet"),
+            ] {
+                let status = rt
+                    .status()
+                    .get_dataset_status(&datafusion::common::TableReference::bare(name))
+                    .expect("dataset status");
+                assert!(
+                    status.is_error(),
+                    "{format} must not go Ready, got {status:?}"
+                );
+                let message = status
+                    .error_message()
+                    .expect("configuration error must be recorded");
+                assert!(
+                    message.contains(&format!("Unknown `file_format` '{format}'")),
+                    "status error_message must name {format}: {message}"
+                );
+                assert!(
+                    message.contains(&format!("Did you mean `{hint}`?")),
+                    "status error_message must suggest {hint}: {message}"
+                );
+            }
+
+            Ok(())
+        })
+        .await
+}
+
 /// A secret-derived bool param must not echo the resolved canary in the
 /// dataset status `error_message`.
 #[tokio::test]
