@@ -2612,7 +2612,10 @@ mod served_with_snapshots_enabled {
         .await;
         let observed = (count(&rt).await, dataset_status(&rt, "orders"));
         stop(rt, loader).await;
-        anyhow::ensure!(seeded, "seeding the acceleration and its snapshot, got {observed:?}");
+        anyhow::ensure!(
+            seeded,
+            "seeding the acceleration and its snapshot, got {observed:?}"
+        );
         Ok(())
     }
 
@@ -2651,7 +2654,10 @@ mod served_with_snapshots_enabled {
             "a source that cannot be reached sets Error, saying the dataset is still served ({:?})",
             dataset_status(&rt, "orders")
         );
-        assert!(rt.status().is_ready(), "a served dataset in Error stays ready");
+        assert!(
+            rt.status().is_ready(),
+            "a served dataset in Error stays ready"
+        );
 
         source.bring_up();
         let reached = wait_until_true(Duration::from_secs(30), || async {
