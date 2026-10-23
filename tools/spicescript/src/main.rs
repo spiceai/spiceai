@@ -30,6 +30,7 @@ mod compare;
 mod docker;
 mod generate;
 mod ledger;
+mod pki;
 mod reap;
 mod rqg;
 mod runner;
@@ -65,7 +66,7 @@ struct Cli {
     from: Option<PathBuf>,
 
     /// Run every instance as a cluster: a scheduler with one executor,
-    /// over node mTLS from the nearest `cluster-pki/` above the script.
+    /// over node mTLS with certificates generated for the run.
     #[arg(long)]
     cluster: bool,
 

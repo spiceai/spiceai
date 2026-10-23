@@ -120,6 +120,7 @@ pub struct VariantSpec {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[expect(clippy::struct_excessive_bools, reason = "independent script switches")]
 pub struct Defaults {
     #[serde(default)]
     pub expect: Option<Expect>,
@@ -142,6 +143,11 @@ pub struct Defaults {
     /// answer as over Flight.
     #[serde(default)]
     pub also_http: bool,
+    /// Also run every query through the asynchronous `/v1/queries` API (a
+    /// distributed job on a cluster) and require the same answer as over
+    /// Flight.
+    #[serde(default)]
+    pub also_async: bool,
     /// The variant every other variant's answers are compared with.
     #[serde(default)]
     pub compare_to: Option<String>,
@@ -165,7 +171,7 @@ pub struct Defaults {
     #[serde(default)]
     pub executor_args: Option<Vec<String>>,
     /// Always run as a cluster: a scheduler with this many executors, over
-    /// node mTLS from the nearest `cluster-pki/` above the script.
+    /// node mTLS with certificates generated for the run.
     #[serde(default)]
     pub cluster: Option<ClusterDefaults>,
     /// When the script runs as a cluster, the column each acceleration without
@@ -202,6 +208,11 @@ pub struct ClusterDefaults {
     /// Executors made ready but not started, for `add-executor` steps.
     #[serde(default)]
     pub spare: usize,
+    /// Runs each executor in a container of its own (Linux only), writing
+    /// shuffle output to its own `/tmp`, so executors read each other's
+    /// shuffle output over the network, as they do on separate hosts.
+    #[serde(default)]
+    pub containers: bool,
 }
 
 fn one() -> usize {
@@ -226,6 +237,7 @@ impl Default for Defaults {
             ready_timeout: None,
             query_timeout: None,
             also_http: false,
+            also_async: false,
             compare_to: None,
             api_key: None,
             tls: None,

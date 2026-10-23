@@ -22,4 +22,3 @@ target/debug/spicescript --jobs 8 --spiced trunk=target/release/spiced test/spic
 | `seed/` | Source fixtures loaded by `source-exec: { file }`. |
 | `slt/`, `slt-sqlite/` | sqllogictest files. |
 | `recordings/` | Run times per script (`durations.json`), in every directory with scripts, and the expected failures (`expected-failures.json`). |
-| `cluster-pki/` | A test-only CA and node certificates for `--cluster` runs (`generate.sh` makes them). |

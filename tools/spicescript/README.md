@@ -51,7 +51,7 @@ target/debug/spicescript --jobs 4 \
 # Start on a release and upgrade in place to the build under test at each `upgrade` step:
 target/debug/spicescript --from $HOME/.spice/bin/spiced \
   --spiced dev=target/release/spiced test/spicescript/postgres-upgrade.yaml
-# Every instance as a scheduler with one executor (node mTLS from cluster-pki/):
+# Every instance as a scheduler with one executor, over node mTLS:
 target/debug/spicescript --cluster test/spicescript/query-coverage.yaml
 # Known-failing scripts of one group, without waiting out every limit:
 target/debug/spicescript --max-wait 20s test/spicescript/known-failing/clickhouse
@@ -69,7 +69,7 @@ DuckDB CLI matching Spice's embedded DuckDB into `~/.cache/spicescript/`
 | `<SCRIPTS>…` | Script files, or directories of `*.yaml` scripts (not their subdirectories, except that `known-failing/` includes its group directories). |
 | `--spiced [NAME=]PATH` | A `spiced` to test; repeat it to run every script on several binaries, which must give identical answers. Default: `~/.spice/bin/spiced`. |
 | `--from PATH` | Start every instance on this binary; each `upgrade` step moves it to the binary under test, over the same data. |
-| `--cluster` | Run every instance as a scheduler plus one executor over node mTLS. Scripts that can't run distributed (memory-mode Cayenne, DuckDB or SQLite accelerations) are skipped. |
+| `--cluster` | Run every instance as a scheduler plus one executor over node mTLS, with a test CA and node certificates generated into the work directory's `cluster-pki-<runner pid>/`. Scripts that can't run distributed (memory-mode Cayenne, DuckDB or SQLite accelerations) are skipped. |
 | `--jobs N` | Run up to N `spiced` processes at once (default 1). Every instance of every matrix combination is a job of its own, taking a slot per process, executors included, and freeing it when it finishes. A combination that stops and starts a source its instances share, or whose variants work together (`run-variants: side-by-side`), runs its instances a step at a time as one job; a script with `defaults.exclusive` runs alone. Scripts ask for slots longest first, from recorded durations. Each script's output is printed when it finishes, with progress lines and the slowest scripts at the end. |
 | `--partition I/N` | Run only share I of N (1-based), for splitting a suite across CI jobs. Scripts go longest first, by recorded duration, to the share with the least work so far, so every job computes the same split and the shares take about as long. |
 | `--record-durations` | Write each script's run time to `recordings/durations.json` beside it. A script without a recorded duration is refused unless this is set, so a new script gets one when it's added. Record from a `--jobs 1` run. |
@@ -236,9 +236,9 @@ top-level `ORDER BY … LIMIT`, with ties at the cutoff allowed and floats withi
 Defaults (`defaults:`):
 - **Expectations and timing:** `expect`, `eventually`, `query-timeout` (default 120 s), `ready-timeout`.
 - **Comparing variants:** `compare-variants: false` turns off agreement between variants; `compare-to: <variant>` compares every variant with one.
-- **Protocols and auth:** `also-http: true` also asks every query over HTTP JSON and requires the same answer; `api-key`; `tls: { ca }`.
+- **Protocols and auth:** `also-http: true` also asks every query over HTTP JSON and requires the same answer; `also-async: true` also runs every query as a `/v1/queries` job (a distributed job on a cluster) and requires the same answer; `api-key`; `tls: { ca }`.
 - **Running spiced:** `spiced-args`, `executor-args`.
-- **Clusters:** `cluster: { executors, spare }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs.
+- **Clusters:** `cluster: { executors, spare, containers }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs. `containers: true` runs each executor in a container of its own on the host's network (Linux only; elsewhere the script is skipped), with the work and script directories mounted. Each executor writes shuffle output to its own `/tmp`, so a stage reads another executor's output over the network, as on separate hosts; a spicepod that sets `runtime.query.temp_directory` to a shared path undoes this, since an executor reads a peer's shuffle file from disk wherever its path exists.
 - **Scheduling:**
   - `exclusive: true` runs the script alone, its instances one after another;
   - `run-variants: side-by-side` runs variants that work together (a snapshot writer and its reader) a step at a time, as one job.
@@ -355,9 +355,10 @@ fails anywhere.
 | `runner/api.rs` | Refreshes, the `spice` CLI, HTTP steps, source queries. |
 | `runner/generators.rs` | TLP, random queries, sqllogictest. |
 | `runner/cluster.rs` | Scheduler and executors: arguments, readiness, spicepod changes. |
-| `spiced.rs` | One `spiced` process: start, readiness, stop, Flight and HTTP clients. |
+| `spiced.rs` | One `spiced` process, or container: start, readiness, stop, Flight and HTTP clients. |
 | `source/` | One module per source kind; `mod.rs` holds the `Source` trait. |
 | `docker.rs` | Containers on fixed host ports, so a restarted container keeps its address. |
+| `pki.rs` | The test CA and node certificates a cluster's node mTLS uses. |
 | `ledger.rs` | Expected failures: recording, signatures, judging a run against them. |
 | `compare.rs`, `template.rs` | Answer comparison glue, placeholders and merge patches. |
 | `generate.rs`, `tpch.rs` | Seeded generated tables, TPC-H loading. |
