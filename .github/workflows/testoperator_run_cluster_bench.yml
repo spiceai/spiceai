@@ -43,6 +43,25 @@ on:
         options:
           - 'v1-queries'  # Ballista distributed query (HTTP /v1/queries) — sets --distributed
           - 'flightsql'   # Distributed accelerations (Flight SQL gRPC)
+      compute:
+        description: |
+          Where the cluster runs. `scp` deploys a Spice Cloud app. `ec2` launches
+          a temporary scheduler and `executor_replicas` executor instances in the
+          sandbox account for each image in `ec2_images`, and terminates them
+          when that image's run ends.
+        required: false
+        default: 'scp'
+        type: choice
+        options:
+          - 'scp'
+          - 'ec2'
+      ec2_images:
+        description: |
+          `compute: ec2` only. Comma-separated `spiced` images to run in order on
+          identical clusters, e.g. `spiceai/spiceai:2.3.2,spiceai/spiceai:2.4.0-rc.3`.
+        required: false
+        default: ''
+        type: string
       executor_replicas:
         description: 'Number of spidapter executor replicas'
         required: true
@@ -166,6 +185,8 @@ permissions:
   contents: write
   packages: read
   pull-requests: write
+  # `compute: ec2` assumes the sandbox benchmark role over OIDC.
+  id-token: write
 
 # Centralized defaults so workflow_dispatch runs have one fallback chain.
 # Defaults exercise the public-S3 TPC-H Ballista distributed-query path
@@ -192,6 +213,9 @@ env:
   CB_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots || 'default' }}
   CB_READY_WAIT: ${{ github.event.inputs.ready_wait || '600' }}
   CB_RUNNER_TYPE: ${{ github.event.inputs.runner_type || 'spiceai-dev-runners' }}
+  CB_COMPUTE: ${{ github.event.inputs.compute || 'scp' }}
+  CB_EC2_IMAGES: ${{ github.event.inputs.ec2_images || '' }}
+  CB_EC2_REGION: us-west-2
 
 jobs:
   run-cluster-bench:
@@ -277,6 +301,7 @@ jobs:
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Management login (prod)
+        if: env.CB_COMPUTE == 'scp'
         uses: ./.github/actions/management-login
         with:
           token-url: https://spice.ai/api/oauth/token
@@ -285,6 +310,42 @@ jobs:
           # Exports SPICEAI_API_KEY for subsequent steps. Same prod creds
           # spicebench's run_spicebench.yml uses.
 
+      # Credentials must outlast every image's run and its teardown, so they
+      # match the job timeout rather than the 1-hour default.
+      - name: Authorize with the sandbox benchmark role
+        if: env.CB_COMPUTE == 'ec2'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::211125479522:role/spiceai-github-actions-ballista-bench
+          role-session-name: gha-ballista-bench-${{ github.run_id }}
+          role-duration-seconds: 36000
+          aws-region: ${{ env.CB_EC2_REGION }}
+
+      - name: Resolve the EC2 cluster inputs
+        if: env.CB_COMPUTE == 'ec2'
+        env:
+          SUBNET_ID: ${{ vars.BALLISTA_BENCH_SUBNET_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CB_EC2_IMAGES}" ]; then
+            echo "::error::compute: ec2 needs at least one image in ec2_images"
+            exit 1
+          fi
+          if [ -z "${SUBNET_ID}" ]; then
+            echo "::error::Repository variable BALLISTA_BENCH_SUBNET_ID is not set"
+            exit 1
+          fi
+          ami_id="$(aws ssm get-parameters --region "${CB_EC2_REGION}" \
+            --names /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+            --query 'Parameters[0].Value' --output text)"
+          echo "Ubuntu 24.04 AMI: ${ami_id}"
+          {
+            echo "SPIDAPTER_EC2_REGION=${CB_EC2_REGION}"
+            echo "SPIDAPTER_EC2_SUBNET_ID=${SUBNET_ID}"
+            echo "SPIDAPTER_EC2_AMI_ID=${ami_id}"
+            echo "SPIDAPTER_EC2_EXECUTOR_COUNT=${CB_EXECUTOR_REPLICAS}"
+          } >> "${GITHUB_ENV}"
+
       - name: Run the cluster benchmark - ${{ env.CB_SPICEPOD_PATH }}
         env:
           SPICEAI_API_KEY: ${{ env.SPICEAI_API_KEY }}
@@ -292,10 +353,10 @@ jobs:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
-          AWS_REGION: us-east-1
-          AWS_DEFAULT_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_ACCESS_KEY_ID || secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_SECRET_ACCESS_KEY || secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ env.CB_COMPUTE == 'ec2' && env.CB_EC2_REGION || 'us-east-1' }}
+          AWS_DEFAULT_REGION: ${{ env.CB_COMPUTE == 'ec2' && env.CB_EC2_REGION || 'us-east-1' }}
           # Select the nodegroup for the spidapter cluster app via tags.organization.
           # Defaults to the dedicated spicehq nodegroup; without it the app lands on
           # the shared default nodegroup.
@@ -392,23 +453,79 @@ jobs:
           export SPIDAPTER_CHANNEL="${ADAPTER_CHANNEL}"
           echo "SPIDAPTER_CHANNEL=${ADAPTER_CHANNEL}"
 
-          rm -rf .spice/data
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
-            -p "${SPICEPOD_PATH}" \
-            --query-set "${QUERY_SET}" \
-            --scale-factor "${SCALE_FACTOR}" \
-            --ready-wait "${READY_WAIT}" \
-            --disable-progress-bars \
-            --validate="${VALIDATE_RESULTS}" \
-            --metrics \
-            ${TRANSPORT_FLAG} \
-            ${SCENARIO_ARG} \
-            --system-adapter-stdio-cmd spidapter \
-            --system-adapter-stdio-args "stdio --verbose --scenario federated-direct --scenario-base-path tools/spidapter/scenarios" \
-            --system-adapter-param channel="${CHANNEL}" \
-            --system-adapter-param executor_replicas="${EXECUTOR_REPLICAS}" \
-            --system-adapter-param custom_image_tag="${CUSTOM_IMAGE_TAG}" \
-            --system-adapter-param query_transport="${QUERY_TRANSPORT}"
+          run_bench() {
+            local scenario="$1"
+            local image_label="$2"
+            rm -rf .spice/data
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
+              -p "${SPICEPOD_PATH}" \
+              --query-set "${QUERY_SET}" \
+              --scale-factor "${SCALE_FACTOR}" \
+              --ready-wait "${READY_WAIT}" \
+              --disable-progress-bars \
+              --validate="${VALIDATE_RESULTS}" \
+              --metrics \
+              ${TRANSPORT_FLAG} \
+              ${SCENARIO_ARG} \
+              --system-adapter-stdio-cmd spidapter \
+              --system-adapter-stdio-args "stdio --verbose --scenario ${scenario} --scenario-base-path tools/spidapter/scenarios" \
+              --system-adapter-param channel="${CHANNEL}" \
+              --system-adapter-param executor_replicas="${EXECUTOR_REPLICAS}" \
+              --system-adapter-param custom_image_tag="${image_label}" \
+              --system-adapter-param query_transport="${QUERY_TRANSPORT}"
+          }
+
+          if [ "${CB_COMPUTE}" = "ec2" ]; then
+            # A failing query on one release must not skip the releases after it.
+            failed_images=()
+            IFS=',' read -ra images <<< "${CB_EC2_IMAGES}"
+            for image in "${images[@]}"; do
+              image="$(echo "${image}" | xargs)"
+              echo "::group::Cluster benchmark on ${image}"
+              if ! SPIDAPTER_EC2_IMAGE="${image}" run_bench federated-direct-ec2 "${image}"; then
+                failed_images+=("${image}")
+              fi
+              echo "::endgroup::"
+            done
+            if [ "${#failed_images[@]}" -gt 0 ]; then
+              echo "::error::Failed on: ${failed_images[*]}"
+              exit 1
+            fi
+          else
+            run_bench federated-direct "${CUSTOM_IMAGE_TAG}"
+          fi
+
+      - name: Re-authorize for cleanup
+        if: always() && env.CB_COMPUTE == 'ec2'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::211125479522:role/spiceai-github-actions-ballista-bench
+          role-session-name: gha-ballista-bench-cleanup-${{ github.run_id }}
+          aws-region: ${{ env.CB_EC2_REGION }}
+
+      - name: Remove EC2 cluster resources left by this run
+        if: always() && env.CB_COMPUTE == 'ec2'
+        run: |
+          set -euo pipefail
+          filters=(
+            "Name=tag:spice:purpose,Values=ballista-bench"
+            "Name=tag:spice:github-run-id,Values=${GITHUB_RUN_ID}"
+          )
+          instance_ids="$(aws ec2 describe-instances --region "${CB_EC2_REGION}" \
+            --filters "${filters[@]}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)"
+          if [ -n "${instance_ids}" ]; then
+            echo "Terminating ${instance_ids}"
+            # shellcheck disable=SC2086
+            aws ec2 terminate-instances --region "${CB_EC2_REGION}" --instance-ids ${instance_ids} >/dev/null
+            # shellcheck disable=SC2086
+            aws ec2 wait instance-terminated --region "${CB_EC2_REGION}" --instance-ids ${instance_ids}
+          fi
+          for group_id in $(aws ec2 describe-security-groups --region "${CB_EC2_REGION}" \
+            --filters "${filters[@]}" --query 'SecurityGroups[].GroupId' --output text); do
+            echo "Deleting security group ${group_id}"
+            aws ec2 delete-security-group --region "${CB_EC2_REGION}" --group-id "${group_id}"
+          done
 
       - name: Install gh CLI
         if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
