@@ -392,15 +392,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// If any row fails validation or insertion, none become visible.
     async fn add_delete_files(&self, delete_files: Vec<DeleteFile>) -> CatalogResult<()>;
 
-    /// Atomically commit deletion-vector rows and an inline-data rewrite for
-    /// one logical delete. A failure leaves both catalog areas unchanged.
+    /// Atomically commit deletion-vector rows, an inline-data rewrite, and an
+    /// inline tombstone for one logical delete. A failure leaves every catalog
+    /// area unchanged. Returns the tombstone's `inlined_id` when one was written.
     async fn commit_delete_files_with_inlined_rewrite(
         &self,
         delete_files: Vec<DeleteFile>,
         table_id: &str,
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
-    ) -> CatalogResult<()>;
+        inline_tombstone: Option<InlinedDelete>,
+    ) -> CatalogResult<Option<String>>;
 
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>>;

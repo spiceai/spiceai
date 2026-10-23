@@ -3023,10 +3023,21 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
-    ) -> CatalogResult<()> {
+        inline_tombstone: Option<InlinedDelete>,
+    ) -> CatalogResult<Option<String>> {
         const MAX_PARAMS: usize = 32_000;
         const PARAMS_PER_DELETE_FILE: usize = 10;
 
+        if let Some(tombstone) = &inline_tombstone
+            && tombstone.table_id != table_id
+        {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Inline tombstone table_id '{}' does not match combined delete table_id '{table_id}'",
+                    tombstone.table_id
+                ),
+            });
+        }
         for delete_file in &delete_files {
             if delete_file.table_id != table_id {
                 return Err(CatalogError::InvalidOperationNoSource {
@@ -3081,7 +3092,34 @@ impl MetadataCatalog for CayenneCatalog {
             })
             .await?;
         }
-        txn.commit().await
+        let tombstone_id = if let Some(tombstone) = inline_tombstone {
+            let inlined_id = if tombstone.inlined_id.is_empty() {
+                uuid::Uuid::now_v7().to_string()
+            } else {
+                tombstone.inlined_id
+            };
+            txn.execute(ExecuteParams {
+                sql: r"
+                INSERT INTO cayenne_inlined_delete
+                    (inlined_id, table_id, delete_ipc, delete_count, sequence_number, published)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ",
+                params: vec![
+                    MetastoreValue::Text(inlined_id.clone()),
+                    MetastoreValue::Text(tombstone.table_id),
+                    MetastoreValue::Blob(tombstone.delete_ipc),
+                    MetastoreValue::Integer(tombstone.delete_count),
+                    MetastoreValue::Integer(tombstone.sequence_number),
+                    MetastoreValue::Integer(i64::from(tombstone.published)),
+                ],
+            })
+            .await?;
+            Some(inlined_id)
+        } else {
+            None
+        };
+        txn.commit().await?;
+        Ok(tombstone_id)
     }
 
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>> {
@@ -8208,9 +8246,26 @@ mod tests {
                     created_at: String::new(),
                 }],
                 Vec::new(),
+                Some(InlinedDelete {
+                    inlined_id: String::new(),
+                    table_id: table_id.clone(),
+                    delete_ipc: vec![4, 5, 6],
+                    delete_count: 1,
+                    sequence_number: 2,
+                    created_at: String::new(),
+                    published: true,
+                }),
             )
             .await
             .expect_err("missing inline rewrite target must abort the transaction");
+        assert!(
+            catalog
+                .get_inlined_deletes(&table_id)
+                .await
+                .expect("get inline tombstones after rollback")
+                .is_empty(),
+            "the inline tombstone must roll back with the failed inline rewrite"
+        );
         assert!(
             catalog
                 .get_table_delete_files(&table_id)
@@ -8226,6 +8281,89 @@ mod tests {
         assert_eq!(stored_inline.len(), 1);
         assert_eq!(stored_inline[0].inlined_id, existing_inline_id);
         assert_eq!(stored_inline[0].data_ipc, vec![1, 2, 3]);
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_combined_delete_commits_an_inline_tombstone_with_its_delete_files() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_combined_delete_tombstone_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "test_combined_delete_tombstone".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec!["id".to_string()],
+                on_conflict: None,
+                base_path: base_path.clone(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("Failed to create table");
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: table_id.clone(),
+            source_data_file_path: None,
+            path: "/tmp/combined_delete_tombstone.arrow".to_string(),
+            path_is_relative: false,
+            format: "arrow".to_string(),
+            delete_count: 1,
+            file_size_bytes: 64,
+            deletion_type: DeletionType::KeyBased,
+            sequence_number: 2,
+            reinsert_sequence: None,
+        };
+
+        let tombstone_id = catalog
+            .commit_delete_files_with_inlined_rewrite(
+                vec![delete_file],
+                &table_id,
+                Vec::new(),
+                Vec::new(),
+                Some(InlinedDelete {
+                    inlined_id: String::new(),
+                    table_id: table_id.clone(),
+                    delete_ipc: vec![4, 5, 6],
+                    delete_count: 1,
+                    sequence_number: 3,
+                    created_at: String::new(),
+                    published: true,
+                }),
+            )
+            .await
+            .expect("commit the delete with its inline tombstone")
+            .expect("the committed tombstone has an id");
+
+        assert_eq!(
+            catalog
+                .get_table_delete_files(&table_id)
+                .await
+                .expect("get delete files")
+                .len(),
+            1
+        );
+        let stored = catalog
+            .get_inlined_deletes(&table_id)
+            .await
+            .expect("get inline tombstones");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].inlined_id, tombstone_id);
+        assert_eq!(stored[0].delete_ipc, vec![4, 5, 6]);
+        assert_eq!(stored[0].sequence_number, 3);
+        assert!(stored[0].published);
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);

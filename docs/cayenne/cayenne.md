@@ -1060,7 +1060,7 @@ sequenceDiagram
     SINK->>EX: try extract concrete PK set from filter tree
     alt filter shape qualifies (IN / OR-of-AND / tuple-IN)
         EX-->>SINK: PK set (no data scan)
-        SINK->>L0: rewrite matching INLINE rows out of the inline corpus (InlineAwareDeletionSink, same txn as the DV)
+        SINK->>L0: tombstone the keys of matching INLINE rows (InlineAwareDeletionSink, inline tombstone in the same txn as the DV)
         SINK->>DV: write deletion vector for every extracted PK (upper bound, no scan)
         Note over SINK: user DELETE scans to an exact count, CDC fast path returns a sentinel 0
     else does not qualify
@@ -1068,7 +1068,7 @@ sequenceDiagram
     end
 ```
 
-A pure delete differs from an upsert in that it writes a tombstone with a `delete_seq` and **no** `insert_seq` — so merge-on-read hides the row permanently (until a later upsert re-inserts the key at a higher sequence). A pure delete writes its key tombstones straight into a deletion-vector file; `InlinedDelete` entries are the inline tombstones an upsert writes to hide the prior inline copy, applied and cleared by the next inline checkpoint.
+A pure delete differs from an upsert in that it writes a tombstone with a `delete_seq` and **no** `insert_seq` — so merge-on-read hides the row permanently (until a later upsert re-inserts the key at a higher sequence). A pure delete writes its key tombstones for file-backed rows straight into a deletion-vector file. On a table with a primary key it hides matched *inline* rows the way an upsert hides a prior inline copy: with an `InlinedDelete` entry naming their keys, committed in the same metastore transaction as the deletion vectors and applied and cleared by the next inline checkpoint. The rows stay in the inline corpus until then. The matched keys come from the cached inline view plus the entries committed above its published watermark (a pipelined write not yet visible, or a sealed mem-tier shadow), so a row that becomes visible later is still deleted. Because the tombstone is published as a removal delta with a generation-only bump, the inline cache is extended rather than rebuilt after the delete; rewriting the inline entries instead would force every later cache miss to rebuild the whole inline corpus. A table without a primary key has no key to tombstone, so this does not apply to it.
 
 Two callers share this extractor and the `InlineAwareDeletionSink`, differing only in whether they need a verified count. A **user-visible `DELETE`** runs through `delete_from` with an exact count (it must surface "rows affected"), so a qualifying `pk IN (…)` scans to count just the live rows removed. The **durable CDC apply loop** instead calls `delete_from_cdc_fast`, which builds the identical key-delete sink but *non-exact*: it persists deletion vectors straight from the extracted PK set with no scan and returns a sentinel `0` the caller discards — restoring the `O(deleted keys)` cost (a scan-to-count path had regressed durable CDC deletes to `O(table)` under `write_lock`). Shapes the fast path declines — position- or retention-based deletes — fall back to `delete_from` unchanged. (The memory-absorption path always kept the fast path; this restores it for `cdc_durability: file` key-delete tables.)
 

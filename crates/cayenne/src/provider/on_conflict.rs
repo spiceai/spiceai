@@ -370,6 +370,30 @@ pub(crate) struct ExtractedPrimaryKeys {
     pub(crate) row_keys: Vec<Box<[u8]>>,
 }
 
+/// An inline tombstone a keyed delete commits in the same catalog transaction as
+/// its deletion-vector files, then publishes to the inline cache.
+pub(crate) struct PreparedInlineDeleteTombstone {
+    /// The tombstone row; the catalog commit takes it.
+    pub(crate) tombstone: Option<crate::metadata::InlinedDelete>,
+    pub(crate) delete_sequence: i64,
+    pub(crate) int64_pk: Vec<i64>,
+    pub(crate) row_keys: Vec<Box<[u8]>>,
+    pub(crate) delete_count: i64,
+    pub(crate) ipc_bytes: usize,
+    /// Visible inline rows the tombstone hides, taken off the live row count.
+    pub(crate) live_rows: i64,
+}
+
+/// The inline rows a keyed delete matched.
+#[derive(Default)]
+pub(crate) struct InlinedDeleteMatches {
+    pub(crate) keys: ExtractedPrimaryKeys,
+    /// Every matched row, visible or held back above the published watermark.
+    pub(crate) matched_rows: u64,
+    /// The matched rows that were visible.
+    pub(crate) visible_rows: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct InlinedDataRewrite {
     pub(crate) updated_data: Vec<InlinedData>,
@@ -655,19 +679,39 @@ impl DeletionSink for InlineAwareDeletionSink {
             }
         };
 
-        let (inline_rewrite, inlined_deleted) = self
-            .table
-            .prepare_inlined_rows_matching_filters(&self.filters)
-            .await?;
+        // A keyed table hides matched inline rows with an inline tombstone, as an
+        // upsert does, instead of rewriting their entries: a rewrite forces every
+        // later inline-cache miss into a full rebuild of the corpus.
+        let (inline_rewrite, inlined_deleted, inline_tombstone_keys) =
+            if self.table.pk_deletion_strategy.is_position_based() {
+                let (rewrite, deleted) = self
+                    .table
+                    .prepare_inlined_rows_matching_filters(&self.filters)
+                    .await?;
+                (rewrite, deleted, None)
+            } else {
+                let matches = self.table.matching_inlined_keys(&self.filters).await?;
+                (Default::default(), matches.matched_rows, Some(matches))
+            };
         let mut prepared_file_delete = file_sink.prepare_delete().await?;
         let file_deleted = prepared_file_delete
             .as_ref()
             .map_or(0, super::delete::PreparedDeletionPublish::deleted_count);
+        let mut inline_tombstone = match inline_tombstone_keys {
+            Some(matches) => self.table.prepare_inline_delete_tombstone(matches).await?,
+            None => None,
+        };
 
-        if !inline_rewrite.is_empty() || prepared_file_delete.is_some() {
+        if !inline_rewrite.is_empty()
+            || prepared_file_delete.is_some()
+            || inline_tombstone.is_some()
+        {
             let delete_files = prepared_file_delete
                 .as_ref()
                 .map_or_else(Vec::new, |prepared| prepared.delete_files().to_vec());
+            // The deletion vectors, the inline rewrite, and the inline tombstone
+            // commit in one catalog transaction, so a crash never leaves the
+            // delete applied to the files but not to the inline rows, or the reverse.
             if let Err(error) = self
                 .table
                 .metadata_catalog()
@@ -676,6 +720,9 @@ impl DeletionSink for InlineAwareDeletionSink {
                     self.table.table_id(),
                     inline_rewrite.updated_data.clone(),
                     inline_rewrite.deleted_inlined_ids.clone(),
+                    inline_tombstone
+                        .as_mut()
+                        .and_then(|prepared| prepared.tombstone.take()),
                 )
                 .await
             {
@@ -689,6 +736,9 @@ impl DeletionSink for InlineAwareDeletionSink {
             }
             if !inline_rewrite.is_empty() {
                 self.table.publish_inlined_rewrite(&inline_rewrite);
+            }
+            if let Some(prepared) = inline_tombstone {
+                self.table.publish_inline_delete_tombstone(prepared);
             }
         }
 

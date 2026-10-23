@@ -395,7 +395,12 @@ async fn test_update_preserves_inline_append_path_impl(
     assert_eq!(names.value(0), "A");
     assert_eq!(names.value(1), "B-updated");
     assert_eq!(values.values(), &[10_i64, 200]);
-    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 2);
+    // The update hides the old inline row with a published inline tombstone and
+    // appends the new one, so the corpus holds three rows until a checkpoint.
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 3);
+    let tombstones = fixture.catalog.get_inlined_deletes(&table_id).await?;
+    assert_eq!(tombstones.len(), 1);
+    assert!(tombstones[0].published);
     assert!(
         fixture
             .catalog
@@ -403,6 +408,25 @@ async fn test_update_preserves_inline_append_path_impl(
             .await?
             .is_empty()
     );
+
+    // A checkpoint writes only the visible rows and reclaims the tombstone.
+    table.checkpoint_inlined_data().await?;
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 0);
+    assert_eq!(
+        fixture.catalog.get_inlined_deletes(&table_id).await?.len(),
+        0
+    );
+    let batches = ctx
+        .sql("SELECT id, name, value FROM upd_inline_writer ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+    let values = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("value col");
+    assert_eq!(values.values(), &[10_i64, 200]);
 
     Ok(())
 }

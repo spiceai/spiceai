@@ -54,10 +54,11 @@ use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
 use super::mutation_writer::AppendMutationWriter;
 use super::on_conflict::{
     BatchValidationResult, CheckpointCorpusKeys, DeletionSinkSource, ExtractedPrimaryKeys,
-    InlineAwareDeletionSink, InlinedDataRewrite, Int64DeletionDelta, OnConflictContext,
-    OnConflictDeletionUpdate, OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream,
-    PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
-    PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
+    InlineAwareDeletionSink, InlinedDataRewrite, InlinedDeleteMatches, Int64DeletionDelta,
+    OnConflictContext, OnConflictDeletionUpdate, OnConflictDeletions, OnConflictUpdate,
+    OnConflictValidationStream, PendingTombstoneDeltas, PkDeletionSnapshot,
+    PkKeysetInvalidatingDeletionSink, PreparedInlineDeleteTombstone, PreparedInsertStream,
+    PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
     RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyBatches,
     ShardedApplyResult, pk_deletion_snapshot_for_strategy,
@@ -18323,10 +18324,12 @@ impl CayenneTableProvider {
     /// unchanged, so the next miss may extend the cached view with the delta
     /// instead of rebuilding it. Also advances `scan_input_version` so
     /// [`ScanViewReuse::UntilInvalidated`] recaptures rather than serving a
-    /// [`ScanView`] whose inlined batches predate the append. Use
-    /// [`Self::bump_inlined_structural_epoch`] for any mutation that can change
-    /// an already-materialized entry (rewrite, removal, tombstone, checkpoint,
-    /// overwrite, recovery).
+    /// [`ScanView`] whose inlined batches predate the append. A published inline
+    /// tombstone takes this bump too: its removal is queued in
+    /// `pending_tombstone_deltas`, and the delta path applies it to the cached
+    /// entries. Use [`Self::bump_inlined_structural_epoch`] for any other
+    /// mutation that can change an already-materialized entry (rewrite, removal,
+    /// checkpoint, overwrite, recovery).
     fn bump_inlined_generation(&self) {
         self.inlined_generation.fetch_add(1, Ordering::Release);
         // A pure inline append is baked into the captured ScanView's inlined
@@ -18345,9 +18348,10 @@ impl CayenneTableProvider {
     /// that observes the new generation also observes the advanced structural
     /// epoch (and on a miss correctly chooses the full rebuild). Must be used by
     /// every mutation that can retroactively change an already-materialized
-    /// entry: an inline rewrite/removal, a newly published tombstone (whose
-    /// re-filter can hide rows in older cached entries), a checkpoint clear, an
-    /// overwrite that wipes the inline tables, and open-time orphan recovery.
+    /// entry: an inline rewrite/removal, a checkpoint clear, an overwrite that
+    /// wipes the inline tables, and open-time orphan recovery. A published inline
+    /// tombstone is not one of them: the delta path re-filters cached entries
+    /// against its queued removal (see [`Self::bump_inlined_generation`]).
     ///
     /// A mem-tier (RAM) append is deliberately EXEMPT even though it adds
     /// tombstones: those tombstones live in the tier snapshot, are never baked
@@ -32627,16 +32631,18 @@ impl CayenneTableProvider {
     /// - **append-only delta** — taken iff the currently-cached entry is a real
     ///   (non-sentinel) view whose `structural_epoch` still equals the live
     ///   `inlined_structural_epoch`. That equality proves every change since the
-    ///   cached view was built was a pure append (no rewrite, no removal, no
-    ///   newly published tombstone, no checkpoint/overwrite/recovery), so the
+    ///   cached view was built was a pure append or a published tombstone queued
+    ///   as a removal delta (no rewrite, no removal, no checkpoint/overwrite/
+    ///   recovery), so the
     ///   already-decoded+filtered entries remain valid and only the entries with
     ///   `sequence_number > materialized_through_sequence` need to be fetched,
     ///   decoded, filtered, and merged on top. This avoids the O(corpus) metastore read +
     ///   IPC re-decode + O(rows × tombstones) re-filter on every scan under
     ///   sustained CDC — the dominant inline read-tax.
     /// - **full rebuild** — the fallback for every other miss: the sentinel/first
-    ///   touch, or any structural-epoch mismatch (rewrite, tombstone publish,
-    ///   checkpoint clear, overwrite, retention/manual delete, recovery). This is
+    ///   touch, an over-cap tombstone-delta queue, or any structural-epoch
+    ///   mismatch (rewrite, checkpoint clear, overwrite, retention, a delete on a
+    ///   table without a primary key, recovery). This is
     ///   the original from-scratch path and is the safety net for anything that
     ///   cannot prove delta-consistency.
     ///
@@ -38725,6 +38731,205 @@ impl CayenneTableProvider {
             Some(matched) => Ok(arrow::compute::filter_record_batch(&batch, &matched)?),
             None => Ok(batch),
         }
+    }
+
+    /// Primary keys of the inline rows that `filters` match, and how many rows
+    /// matched: the visible rows of the cached inline view, plus the entries
+    /// committed above that view's watermark whose visibility is not yet
+    /// published (a pipelined write's tail, or a sealed mem-tier shadow), which
+    /// the delete must cover too. Also returns how many of the matched rows were
+    /// visible, which is what the delete takes off the live inline row count:
+    /// held-back rows join that count only when they publish. Empty on a
+    /// position-based table, whose inline rows have no key.
+    pub(crate) async fn matching_inlined_keys(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<InlinedDeleteMatches> {
+        if self.pk_deletion_strategy.is_position_based() || self.cached_inlined_row_count() == 0 {
+            return Ok(InlinedDeleteMatches::default());
+        }
+        self.cached_inlined_view().await.map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to read inlined data for delete on table {}: {e}",
+                self.table_metadata.table_name
+            ))
+        })?;
+        // One cache entry gives the view and the watermark it materialized
+        // through, so the held-back read below starts exactly where it stops.
+        let cache = self.inlined_cache.load_full();
+        let held_back = self
+            .catalog
+            .get_inlined_data_above_sequence(
+                &self.table_metadata.table_id,
+                cache.materialized_through_sequence,
+            )
+            .await
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to read inlined data for delete on table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
+
+        let coerced_filters = self.coerce_filters_for_inlined_delete(filters)?;
+        let physical_filters = self.build_physical_filters_for_inlined_delete(&coerced_filters)?;
+        let mut keys = ExtractedPrimaryKeys::default();
+        let mut matched_rows = 0_u64;
+        // The cached view already applies the inline tombstones, but not a
+        // file-side key delete published since it was built: scans apply those
+        // at use-site. Apply the live file-side snapshot here too, so a row a
+        // scan would not return is neither matched nor taken off the live count
+        // a second time — an undercount there would make scans skip live rows.
+        let no_inline_deletions = InlinedDeletionMaps::default();
+        for entry in cache.view.iter() {
+            for batch in &entry.batches {
+                let Some(visible) = self
+                    .filter_inlined_batch_for_deletions(
+                        batch.clone(),
+                        entry.envelope.sequence_number,
+                        &no_inline_deletions,
+                    )
+                    .map_err(|e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to apply inlined delete visibility for table {}: {e}",
+                            self.table_metadata.table_name
+                        ))
+                    })?
+                else {
+                    continue;
+                };
+                self.collect_matching_inlined_keys(
+                    visible,
+                    &physical_filters,
+                    &mut keys,
+                    &mut matched_rows,
+                )?;
+            }
+        }
+        let visible_rows = matched_rows;
+        if !held_back.is_empty() {
+            let deletions = self.load_inlined_deletion_maps().await.map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to read inlined delete metadata for delete on table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
+            for entry in held_back {
+                let batches = deserialize_ipc_to_batch(&entry.data_ipc)?;
+                let batches = self.adapt_inlined_batches_to_live_schema(batches)?;
+                for batch in batches {
+                    let Some(visible) = self
+                        .filter_inlined_batch_for_deletions(
+                            batch,
+                            entry.sequence_number,
+                            &deletions,
+                        )
+                        .map_err(|e| {
+                            datafusion_common::DataFusionError::Execution(format!(
+                                "Failed to apply inlined delete visibility for table {}: {e}",
+                                self.table_metadata.table_name
+                            ))
+                        })?
+                    else {
+                        continue;
+                    };
+                    self.collect_matching_inlined_keys(
+                        visible,
+                        &physical_filters,
+                        &mut keys,
+                        &mut matched_rows,
+                    )?;
+                }
+            }
+        }
+        Ok(InlinedDeleteMatches {
+            keys,
+            matched_rows,
+            visible_rows,
+        })
+    }
+
+    fn collect_matching_inlined_keys(
+        &self,
+        batch: RecordBatch,
+        physical_filters: &[Arc<dyn PhysicalExpr>],
+        keys: &mut ExtractedPrimaryKeys,
+        matched_rows: &mut u64,
+    ) -> datafusion_common::Result<()> {
+        let matched = self.apply_inlined_delete_filters(batch, physical_filters)?;
+        if matched.num_rows() == 0 {
+            return Ok(());
+        }
+        *matched_rows =
+            matched_rows.saturating_add(u64::try_from(matched.num_rows()).unwrap_or(u64::MAX));
+        let extracted = self.extract_primary_keys_from_batch(&matched)?;
+        keys.int64_pk.extend(extracted.int64_pk);
+        keys.row_keys.extend(extracted.row_keys);
+        Ok(())
+    }
+
+    /// Reserve a delete sequence and build a published inline tombstone hiding
+    /// every inline copy of `keys` committed before it. Writes nothing: the caller
+    /// commits the tombstone in the delete's catalog transaction, then calls
+    /// [`Self::publish_inline_delete_tombstone`]. `None` when there is nothing to
+    /// hide.
+    pub(crate) async fn prepare_inline_delete_tombstone(
+        &self,
+        matches: InlinedDeleteMatches,
+    ) -> datafusion_common::Result<Option<PreparedInlineDeleteTombstone>> {
+        let InlinedDeleteMatches {
+            keys, visible_rows, ..
+        } = matches;
+        if keys.int64_pk.is_empty() && keys.row_keys.is_empty() {
+            return Ok(None);
+        }
+        let delete_sequence = self.reserve_sequences_local(1).await.map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to reserve a delete sequence for table {}: {e}",
+                self.table_metadata.table_name
+            ))
+        })?;
+        let Some(tombstone) = self
+            .build_staged_inline_tombstone(&keys.int64_pk, &keys.row_keys, delete_sequence, true)
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to build an inline tombstone for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(PreparedInlineDeleteTombstone {
+            delete_count: tombstone.delete_count,
+            ipc_bytes: tombstone.delete_ipc.len(),
+            tombstone: Some(tombstone),
+            delete_sequence,
+            int64_pk: keys.int64_pk,
+            row_keys: keys.row_keys,
+            live_rows: i64::try_from(visible_rows).unwrap_or(i64::MAX),
+        }))
+    }
+
+    /// Publish a committed inline delete tombstone. Its removal is applied to the
+    /// cached inline view as a tombstone delta with a generation-only bump, so the
+    /// next miss extends the cached view instead of rebuilding the corpus. The
+    /// hidden rows leave the live inline row count, while the durable corpus
+    /// count keeps them: they stay in `cayenne_inlined_data` until a checkpoint.
+    pub(crate) fn publish_inline_delete_tombstone(&self, prepared: PreparedInlineDeleteTombstone) {
+        self.adjust_cached_inlined_row_count(prepared.live_rows.saturating_neg());
+        self.record_inline_tombstone_written(
+            prepared.delete_count,
+            prepared.ipc_bytes,
+            prepared.delete_sequence,
+            true,
+        );
+        self.pending_tombstone_deltas.lock().push(
+            prepared.delete_sequence,
+            prepared.int64_pk,
+            prepared.row_keys,
+        );
+        self.bump_inlined_generation();
     }
 
     fn extract_primary_keys_from_batch(
@@ -66277,6 +66482,233 @@ mod tests {
         let ids: Vec<i64> = (start_id..start_id + rows).collect();
         let values: Vec<i64> = ids.iter().map(|id| id * 10).collect();
         id_value_batch(schema, &ids, &values)
+    }
+
+    /// A keyed table in durable mode, whose small writes land in the inline corpus.
+    async fn create_durable_inline_keyed_table(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        create_cdc_upsert_table_with_vortex_config(
+            table_name,
+            runtime_env,
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::File,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await
+    }
+
+    async fn delete_where_id(ctx: &SessionContext, provider: &CayenneTableProvider, id: i64) {
+        let plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("id").eq(datafusion_expr::lit(id))],
+            )
+            .await
+            .expect("delete plan");
+        datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("delete executed");
+    }
+
+    /// A delete on a keyed table hides a matched inline row with an inline
+    /// tombstone instead of rewriting the inline corpus: the structural epoch is
+    /// unchanged, so the cached inline view is extended rather than rebuilt; the
+    /// row leaves the live inline count but stays in the durable corpus count.
+    #[tokio::test]
+    async fn a_keyed_delete_hides_an_inline_row_with_a_tombstone() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_durable_inline_keyed_table("keyed_delete_tombstone", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
+        )
+        .await;
+        provider
+            .read_inlined_batches()
+            .await
+            .expect("warm the inline cache");
+        let epoch_before = provider.inlined_structural_epoch();
+        let live_before = provider.cached_inlined_row_count();
+        let durable_before = provider.durable_inlined_row_count.load(Ordering::Relaxed);
+
+        delete_where_id(&ctx, &provider, 2).await;
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "keyed_delete_tombstone").await,
+            vec![(1, 10), (3, 30)]
+        );
+        assert_eq!(provider.inlined_structural_epoch(), epoch_before);
+        assert_eq!(provider.cached_inlined_row_count(), live_before - 1);
+        assert_eq!(
+            provider.durable_inlined_row_count.load(Ordering::Relaxed),
+            durable_before
+        );
+        let tombstones = catalog
+            .get_inlined_deletes(&provider.table_metadata.table_id)
+            .await
+            .expect("read inline tombstones");
+        assert_eq!(tombstones.len(), 1);
+        assert!(tombstones[0].published);
+    }
+
+    /// A key re-inserted after a tombstoned delete is visible: the tombstone hides
+    /// only inline copies committed before it.
+    #[tokio::test]
+    async fn a_key_reinserted_after_a_tombstoned_delete_is_visible() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_durable_inline_keyed_table("keyed_delete_reinsert", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20]),
+        )
+        .await;
+        delete_where_id(&ctx, &provider, 1).await;
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[11])).await;
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "keyed_delete_reinsert").await,
+            vec![(1, 11), (2, 20)]
+        );
+    }
+
+    /// A tombstoned delete is durable: reopening the table, which rebuilds the
+    /// inline view from the corpus and the catalog's tombstones, keeps it applied.
+    #[tokio::test]
+    async fn a_tombstoned_delete_survives_reopening_the_table() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_durable_inline_keyed_table("keyed_delete_reopen", Arc::clone(&runtime_env))
+                .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
+        )
+        .await;
+        delete_where_id(&ctx, &provider, 2).await;
+
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("keyed_delete_reopen")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "keyed_delete_reopen").await,
+            vec![(1, 10), (3, 30)]
+        );
+    }
+
+    /// Checkpointing the inline corpus after a tombstoned delete writes only the
+    /// surviving rows and reclaims the tombstone.
+    #[tokio::test]
+    async fn a_checkpoint_after_a_tombstoned_delete_keeps_it_applied() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_durable_inline_keyed_table("keyed_delete_checkpoint", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
+        )
+        .await;
+        delete_where_id(&ctx, &provider, 2).await;
+        {
+            let _write_guard = provider.write_lock.lock().await;
+            provider
+                .checkpoint_inlined_data()
+                .await
+                .expect("checkpoint the inline corpus");
+        }
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "keyed_delete_checkpoint").await,
+            vec![(1, 10), (3, 30)]
+        );
+        assert!(
+            catalog
+                .get_inlined_deletes(&provider.table_metadata.table_id)
+                .await
+                .expect("read inline tombstones")
+                .is_empty(),
+            "the checkpoint reclaims the tombstone"
+        );
+    }
+
+    /// Add an inline entry the way a pipelined write commits one before it
+    /// publishes: durable in the catalog, above the published watermark.
+    async fn add_held_back_inline_row(
+        provider: &CayenneTableProvider,
+        catalog: &Arc<dyn MetadataCatalog>,
+        id: i64,
+        value: i64,
+    ) {
+        let batch = id_value_batch(Arc::clone(&provider.table_metadata.schema), &[id], &[value]);
+        let sequence_number = provider
+            .reserve_sequences_local(1)
+            .await
+            .expect("reserve a sequence");
+        catalog
+            .add_inlined_data(InlinedData {
+                inlined_id: String::new(),
+                table_id: provider.table_metadata.table_id.clone(),
+                partition_key: None,
+                data_ipc: serialize_batches_to_ipc(&[batch]).expect("encode the row"),
+                record_count: 1,
+                sequence_number,
+                created_at: String::new(),
+            })
+            .await
+            .expect("commit the held-back row");
+    }
+
+    /// A delete covers inline rows committed above the published watermark, which
+    /// a reopen makes visible: the tombstone names their keys too. The control
+    /// table shows the same row does become visible on reopen without the delete.
+    #[tokio::test]
+    async fn a_tombstoned_delete_covers_a_committed_row_that_is_not_yet_visible() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+
+        let (control, control_catalog, _control_tmp) =
+            create_durable_inline_keyed_table("held_back_control", Arc::clone(&runtime_env)).await;
+        let schema = Arc::clone(&control.table_metadata.schema);
+        insert_batch(&control, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        add_held_back_inline_row(&control, &control_catalog, 5, 50).await;
+        drop(control);
+        let control = CayenneTableProviderBuilder::new(control_catalog, Arc::clone(&runtime_env))
+            .open("held_back_control")
+            .await
+            .expect("reopen the control table");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &control, "held_back_control").await,
+            vec![(1, 10), (5, 50)],
+            "precondition: reopening makes the held-back row visible"
+        );
+
+        let (provider, catalog, _tmp) =
+            create_durable_inline_keyed_table("held_back_delete", Arc::clone(&runtime_env)).await;
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        add_held_back_inline_row(&provider, &catalog, 5, 50).await;
+        delete_where_id(&ctx, &provider, 5).await;
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("held_back_delete")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "held_back_delete").await,
+            vec![(1, 10)]
+        );
     }
 
     /// Read back all `(id, value)` pairs, sorted by id, for assertion.

@@ -477,7 +477,7 @@ async fn test_pk_upsert_inline_mutation(
 async fn test_pk_delete_inline_mutation(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_table, ctx, table_id) = create_pk_upsert_table(&fixture, "inline_pk_delete").await?;
+    let (table, ctx, table_id) = create_pk_upsert_table(&fixture, "inline_pk_delete").await?;
 
     ctx.sql("INSERT INTO inline_pk_delete VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Cara')")
         .await?
@@ -503,14 +503,17 @@ async fn test_pk_delete_inline_mutation(
     assert_eq!(ids.values(), &[1_i64, 3]);
     assert_eq!(names.value(0), "Alice");
     assert_eq!(names.value(1), "Cara");
-    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 2);
+    // The delete hides the inline row with a published inline tombstone rather
+    // than rewriting the inline entry: the row stays in the corpus until the next
+    // checkpoint, and no deletion-vector file is written for it.
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 3);
     let inlined_data = fixture.catalog.get_inlined_data(&table_id).await?;
     assert_eq!(inlined_data.len(), 1);
-    assert_eq!(inlined_data[0].record_count, 2);
-    assert_eq!(
-        fixture.catalog.get_inlined_deletes(&table_id).await?.len(),
-        0
-    );
+    assert_eq!(inlined_data[0].record_count, 3);
+    let tombstones = fixture.catalog.get_inlined_deletes(&table_id).await?;
+    assert_eq!(tombstones.len(), 1);
+    assert!(tombstones[0].published);
+    assert_eq!(tombstones[0].delete_count, 1);
     assert!(
         fixture
             .catalog
@@ -518,6 +521,21 @@ async fn test_pk_delete_inline_mutation(
             .await?
             .is_empty()
     );
+
+    // A checkpoint writes only the surviving rows and reclaims the tombstone.
+    table.checkpoint_inlined_data().await?;
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 0);
+    assert_eq!(
+        fixture.catalog.get_inlined_deletes(&table_id).await?.len(),
+        0
+    );
+    let got = collect_sorted(&ctx, "SELECT id, name FROM inline_pk_delete ORDER BY id").await?;
+    let ids = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    assert_eq!(ids.values(), &[1_i64, 3]);
 
     Ok(())
 }
