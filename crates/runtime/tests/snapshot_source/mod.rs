@@ -1620,7 +1620,14 @@ async fn metrics_scenario(
     // Load a second snapshot, so a rollback to snapshot 0 is older than the loaded one.
     std::fs::write(dir.path().join("modules.csv"), GROWN_CSV)?;
     wait_for_rows(&writer, modules, 5).await?;
-    wait_for_writer_snapshot(rustfs, &prefix, modules, 1).await?;
+    // A full refresh publishes a snapshot after every refresh, so snapshots of the 3
+    // rows can follow snapshot 0 before the writer reads the grown file. The refresh
+    // loop publishes each snapshot before its next refresh starts, so the first one
+    // published after the writer serves 5 rows holds them.
+    let published = writer_snapshot_id(rustfs, &prefix, modules)
+        .await?
+        .context("the writer published snapshot 0")?;
+    wait_for_writer_snapshot(rustfs, &prefix, modules, published + 1).await?;
     replicate_snapshots(rustfs, &prefix).await?;
     wait_for_rows(&reader, modules, 5).await?;
     writer.shutdown().await;
