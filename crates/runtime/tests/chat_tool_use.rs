@@ -35,6 +35,8 @@ use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use serde_json::{Value, json};
 use spicepod::component::model::Model;
 
+mod tool_call_limit;
+
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const QUESTION: &str = "How many rows are there?";
 /// A question the mock's model answers after two `sql` calls rather than one.
@@ -203,6 +205,17 @@ async fn start_mock_anthropic() -> anyhow::Result<(String, Recorded)> {
 /// Starts a runtime serving model `claude` from the mock at `endpoint` with the `sql` tool, and
 /// returns its HTTP base URL once it reports ready.
 async fn start_runtime(endpoint: &str) -> anyhow::Result<String> {
+    let mut model = Model::new("anthropic:claude-sonnet-4-6", "claude");
+    model
+        .params
+        .insert("anthropic_api_key".to_string(), "test".into());
+    model.params.insert("endpoint".to_string(), endpoint.into());
+    model.params.insert("tools".to_string(), "sql".into());
+    start_runtime_with(model).await
+}
+
+/// Starts a runtime serving `model`, and returns its HTTP base URL once it reports ready.
+async fn start_runtime_with(model: Model) -> anyhow::Result<String> {
     // Both listeners are bound before either is dropped, so the two ports differ.
     let flight_listener = std::net::TcpListener::bind(SocketAddr::new(LOCALHOST, 0))?;
     let http_listener = std::net::TcpListener::bind(SocketAddr::new(LOCALHOST, 0))?;
@@ -211,12 +224,6 @@ async fn start_runtime(endpoint: &str) -> anyhow::Result<String> {
     drop(flight_listener);
     drop(http_listener);
 
-    let mut model = Model::new("anthropic:claude-sonnet-4-6", "claude");
-    model
-        .params
-        .insert("anthropic_api_key".to_string(), "test".into());
-    model.params.insert("endpoint".to_string(), endpoint.into());
-    model.params.insert("tools".to_string(), "sql".into());
     let app = AppBuilder::new("chat_tool_use").with_model(model).build();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
     Arc::clone(&rt).load_components().await;
