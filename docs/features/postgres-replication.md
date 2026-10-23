@@ -237,6 +237,9 @@ Every Spice replica must have its own replication slot. Spice handles this autom
 | ------------------------------- | --------------------------------------------------------------- |
 | `SPICE_INSTANCE_ID` env         | Preferred — set it explicitly per replica.                      |
 | `HOSTNAME` / `COMPUTERNAME` env | Fallback — works on k8s where each pod has a distinct hostname. |
+| The host name                   | Last fallback, when none of the variables above is set.         |
+
+An empty variable counts as unset. When an instance's identity changes, for example when `SPICE_INSTANCE_ID` is set on an instance that had none, its default slot name changes too: Spice creates a new slot, and the old slot keeps retaining WAL on the source until it is dropped. Find slots no replica consumes with `SELECT slot_name, active FROM pg_replication_slots WHERE slot_name LIKE 'spice_%'`, then drop a confirmed-abandoned one with `SELECT pg_drop_replication_slot('<slot name>')`.
 
 ### Example: Kubernetes StatefulSet
 

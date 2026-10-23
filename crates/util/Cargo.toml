@@ -15,6 +15,7 @@ chrono.workspace = true
 cpu-budget = { path = "../cpu-budget", optional = true }
 ctrlc = "3.5"
 futures.workspace = true
+gethostname.workspace = true
 http-body = { version = "1.0.1", optional = true }
 humantime.workspace = true
 pin-project = { workspace = true, optional = true }
@@ -25,6 +26,7 @@ tokio = { workspace = true, features = ["sync", "time"] }
 tokio-util = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber.workspace = true
+uuid = { workspace = true, features = ["v7"] }
 arrow.workspace = true
 arrow-schema.workspace = true
 datafusion = { workspace = true, optional = true }

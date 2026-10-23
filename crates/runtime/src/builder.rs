@@ -808,6 +808,12 @@ impl RuntimeBuilder {
         .with_caching(caching)
         .with_results_cache_warmup_enabled(results_cache_warmup_enabled)
         .with_results_cache_warmer(results_cache_warmer)
+        .with_runtime_state_location(
+            spicepod_rt
+                .state
+                .as_ref()
+                .map(|state| state.location.clone()),
+        )
         .with_metrics(metrics)
         .with_resource_monitor(resource_monitor.clone())
         .with_url_tables(url_tables_enabled)

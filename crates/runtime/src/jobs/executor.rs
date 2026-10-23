@@ -32,8 +32,33 @@ use crate::http::v1::queries::SubmitQueryRequest;
 use crate::jobs::state::JobErrorCode;
 
 use super::Result;
+use super::error::Error;
 use super::state::{JobState, JobStatus};
 use super::store::JobStore;
+
+/// How a job comes to be driven by this scheduler.
+enum Start {
+    /// It was submitted here: start it.
+    Submitted,
+    /// It was taken over from a scheduler that stopped: this is the state the
+    /// takeover wrote.
+    TakenOver(Box<JobState>),
+}
+
+/// Logs how a job's background task ended. A driver that another scheduler
+/// took the job from stops at its next write; that is not a failure.
+fn report_job_end(job_id: &str, result: Result<()>, what: &str) {
+    match result {
+        Ok(()) => {}
+        Err(Error::JobTakenOver { .. }) => {
+            tracing::debug!(
+                job_id,
+                "Stopped driving the job: another scheduler took it over"
+            );
+        }
+        Err(e) => tracing::error!(job_id = %job_id, error = %e, "{what}"),
+    }
+}
 
 /// Tracks an active job's cancellation token and query handle (once submitted).
 struct ActiveJobInfo {
@@ -117,7 +142,7 @@ impl JobExecutor {
                     &job_id_clone,
                     &active_jobs,
                     cancel_token,
-                    false,
+                    Start::Submitted,
                 )
                 .await;
 
@@ -127,9 +152,7 @@ impl JobExecutor {
                     active.remove(&job_id_clone);
                 }
 
-                if let Err(e) = result {
-                    tracing::error!(job_id = %job_id_clone, error = %e, "Job execution failed");
-                }
+                report_job_end(&job_id_clone, result, "Job execution failed");
             }
             .instrument(tracing::info_span!("job_execution", job_id = %job_id)),
         );
@@ -140,6 +163,12 @@ impl JobExecutor {
     /// Re-drives an existing job whose owning scheduler was lost, resuming its
     /// distributed execution on this scheduler. No-op if this scheduler is
     /// already driving the job locally.
+    ///
+    /// `job` is the state in which the recovery sweep found the job orphaned.
+    /// The takeover, or the failure of a principal's job, lands only while the
+    /// job is still in that state, so of the schedulers that recover the same
+    /// job only one acts on it, and the driver it was taken from is refused at
+    /// its next write.
     ///
     /// Resuming re-plans the job's SQL on this scheduler, and planning is where a
     /// principal's table access and masking apply. The job records only its
@@ -153,19 +182,24 @@ impl JobExecutor {
                 job_id,
                 "Async query job '{job_id}' was running on a scheduler that stopped, and it cannot be resumed under the identity that submitted it, so it is marked failed; resubmit the query."
             );
-            if let Err(e) = self
+            match self
                 .job_store
-                .fail_job(
-                    job_id,
+                .fail_orphaned_job(
+                    job,
                     JobErrorCode::SchedulerUnavailable,
                     "The scheduler running this query stopped before it finished, and the query cannot be resumed under the identity that submitted it. Resubmit the query.",
                 )
                 .await
             {
-                tracing::warn!(
+                Ok(Some(_)) => {}
+                Ok(None) => tracing::debug!(
+                    job_id,
+                    "Not recovering the job: another scheduler took it over first, or it finished"
+                ),
+                Err(e) => tracing::warn!(
                     job_id,
                     "Failed to mark async query job '{job_id}' failed after its scheduler stopped: {e}"
-                );
+                ),
             }
             return;
         }
@@ -185,6 +219,25 @@ impl JobExecutor {
             );
         }
 
+        let taken = match self.job_store.take_over_job(job).await {
+            Ok(Some(taken)) => Some(taken),
+            Ok(None) => {
+                tracing::debug!(
+                    job_id,
+                    "Not recovering the job: another scheduler took it over first, or it finished"
+                );
+                None
+            }
+            Err(e) => {
+                report_job_end(job_id, Err(e), "Job recovery failed");
+                None
+            }
+        };
+        let Some(taken) = taken else {
+            self.active_jobs.write().await.remove(job_id);
+            return;
+        };
+
         let job_store = Arc::clone(&self.job_store);
         let df = Arc::clone(&self.df);
         let active_jobs = Arc::clone(&self.active_jobs);
@@ -198,7 +251,7 @@ impl JobExecutor {
                     &job_id_owned,
                     &active_jobs,
                     cancel_token,
-                    true,
+                    Start::TakenOver(Box::new(taken)),
                 )
                 .await;
 
@@ -207,9 +260,7 @@ impl JobExecutor {
                     active.remove(&job_id_owned);
                 }
 
-                if let Err(e) = result {
-                    tracing::error!(job_id = %job_id_owned, error = %e, "Job recovery failed");
-                }
+                report_job_end(&job_id_owned, result, "Job recovery failed");
             }
             .instrument(tracing::info_span!("job_recovery", job_id = %job_id)),
         );
@@ -295,6 +346,17 @@ impl JobExecutor {
             });
         }
 
+        // A driver the job was taken over from can leave chunks past the ones
+        // the result lists; only listed chunks hold the job's results.
+        if let Some(result) = &state.result
+            && !result.chunk_indices.contains(&chunk_index)
+        {
+            return Err(super::error::Error::ChunkNotFound {
+                job_id: job_id.to_string(),
+                chunk_index,
+            });
+        }
+
         self.job_store.read_chunk(job_id, chunk_index).await
     }
 
@@ -309,7 +371,13 @@ impl JobExecutor {
         Ok(jobs)
     }
 
-    /// Deletes jobs whose results have expired, with their result chunks.
+    /// The query engine jobs run on.
+    pub(crate) fn datafusion(&self) -> &Arc<DataFusion> {
+        &self.df
+    }
+
+    /// Deletes, with their result chunks, the jobs whose results expired and the
+    /// jobs that failed or were cancelled at least the result TTL ago.
     ///
     /// Returns how many were deleted.
     pub async fn cleanup_expired_jobs(&self) -> Result<usize> {
@@ -333,17 +401,23 @@ impl JobExecutor {
         job_id: &str,
         active_jobs: &RwLock<std::collections::HashMap<String, ActiveJobInfo>>,
         cancel: CancellationToken,
-        resume: bool,
+        start: Start,
     ) -> Result<()> {
-        // Get job and mark as running. During recovery another scheduler may have
-        // already claimed this job; treat that race as a no-op.
-        let state = match job_store.set_job_running(job_id).await {
-            Ok(state) => state,
-            Err(super::error::Error::ConcurrentModification { .. }) if resume => return Ok(()),
-            // Cancelled (or otherwise finished) before this task started it.
-            Err(super::error::Error::JobAlreadyFinished { .. }) => return Ok(()),
-            Err(e) => return Err(e),
+        let resume = matches!(start, Start::TakenOver(_));
+        let state = match start {
+            Start::Submitted => match job_store.set_job_running(job_id).await {
+                Ok(state) => state,
+                // Cancelled (or otherwise finished) before this task started it.
+                Err(Error::JobAlreadyFinished { .. }) => return Ok(()),
+                Err(e) => return Err(e),
+            },
+            Start::TakenOver(state) => *state,
         };
+        // Every write this task makes for the job is refused once another
+        // scheduler takes the job over.
+        let driver = state.driver().ok_or_else(|| Error::JobTakenOver {
+            job_id: job_id.to_string(),
+        })?;
 
         // Check for early cancellation
         if cancel.is_cancelled() {
@@ -364,7 +438,12 @@ impl JobExecutor {
                 }
                 Err(e) => {
                     job_store
-                        .fail_job(job_id, JobErrorCode::ParameterBindingFailed, e.to_string())
+                        .fail_job(
+                            job_id,
+                            &driver,
+                            JobErrorCode::ParameterBindingFailed,
+                            e.to_string(),
+                        )
                         .await?;
                     return Ok(());
                 }
@@ -383,7 +462,7 @@ impl JobExecutor {
             Err(e) => {
                 let error_code = Self::query_error_to_code(&e);
                 job_store
-                    .fail_job(job_id, error_code, e.to_string())
+                    .fail_job(job_id, &driver, error_code, e.to_string())
                     .await?;
                 return Ok(());
             }
@@ -428,7 +507,7 @@ impl JobExecutor {
                 if let Err(e) = query_handle.cancel().await {
                     tracing::error!("Failed to cancel the timed-out query '{job_id}': {e}");
                 }
-                job_store.fail_job(job_id, JobErrorCode::Timeout, "Job execution timed out".to_string()).await?;
+                job_store.fail_job(job_id, &driver, JobErrorCode::Timeout, "Job execution timed out".to_string()).await?;
                 Ok(())
             }
             result_stream = query_handle.into_stream() => {
@@ -437,27 +516,28 @@ impl JobExecutor {
                     Ok(stream) => stream,
                     Err(e) => {
                         let (error_code, error_msg) = Self::handle_error_to_code_and_msg(&e);
-                        job_store.fail_job(job_id, error_code, error_msg).await?;
+                        job_store.fail_job(job_id, &driver, error_code, error_msg).await?;
                         return Ok(());
                     }
                 };
 
                 // Write result chunks as batches arrive from the stream
                 let job_result = match job_store
-                    .write_result_chunks_from_stream(job_id, result_stream)
+                    .write_result_chunks_from_stream(job_id, &driver, result_stream)
                     .await
                 {
                     Ok(result) => result,
+                    Err(e @ Error::JobTakenOver { .. }) => return Err(e),
                     Err(e) => {
                         job_store
-                            .fail_job(job_id, JobErrorCode::FetchingResultsFailed, e.to_string())
+                            .fail_job(job_id, &driver, JobErrorCode::FetchingResultsFailed, e.to_string())
                             .await?;
                         return Ok(());
                     }
                 };
 
                 // Mark job as succeeded
-                job_store.complete_job(job_id, job_result).await?;
+                job_store.complete_job(job_id, &driver, job_result).await?;
 
                 Ok(())
             }
@@ -611,6 +691,326 @@ mod tests {
             !message.contains("identity that submitted it"),
             "a public job is re-driven, not refused: {message}"
         );
+    }
+
+    /// A stream of one batch per entry of `batches`, each in an `id` column.
+    fn int_batches(batches: Vec<Vec<i32>>) -> datafusion::execution::SendableRecordBatchStream {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batches: Vec<_> = batches
+            .into_iter()
+            .map(|values| {
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int32Array::from(values))],
+                )
+                .expect("a batch"))
+            })
+            .collect();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ))
+    }
+
+    /// A former driver leaves two chunks; the driver that took the job over
+    /// receives the same rows in one batch and completes the job with one
+    /// chunk. The second chunk is not a result.
+    #[tokio::test]
+    async fn get_chunk_refuses_an_index_the_result_does_not_list() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let former = JobStore::new(Arc::clone(&store), "test", "node-a").with_chunk_size(2);
+        let successor =
+            Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b").with_chunk_size(2));
+        let job_id = seed_job(&former, PUBLIC_JOB_OWNER).await;
+        let started = former.set_job_running(&job_id).await.expect("to start");
+        let left = former
+            .write_result_chunks_from_stream(
+                &job_id,
+                &started.driver().expect("a driver"),
+                int_batches(vec![vec![9, 9], vec![9, 9]]),
+            )
+            .await
+            .expect("the former driver writes while it drives");
+        assert_eq!(left.chunk_indices, vec![0, 1]);
+
+        let taken = successor
+            .take_over_job(&started)
+            .await
+            .expect("to take over")
+            .expect("the job is still driven as observed");
+        let driver = taken.driver().expect("a driver");
+        let result = successor
+            .write_result_chunks_from_stream(&job_id, &driver, int_batches(vec![vec![1, 2, 3, 4]]))
+            .await
+            .expect("the driver writes results");
+        assert_eq!(result.chunk_indices, vec![0]);
+        successor
+            .complete_job(&job_id, &driver, result)
+            .await
+            .expect("the driver completes the job");
+
+        let executor = executor(successor);
+        executor
+            .get_chunk(&job_id, 0, PUBLIC_JOB_OWNER)
+            .await
+            .expect("the listed chunk");
+        let err = executor
+            .get_chunk(&job_id, 1, PUBLIC_JOB_OWNER)
+            .await
+            .expect_err("chunk 1 is not in the result");
+        assert!(
+            matches!(err, Error::ChunkNotFound { chunk_index: 1, .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Object store that fails the first write marking an async-query job
+    /// failed.
+    #[derive(Debug)]
+    struct FailFirstFailedWrite {
+        inner: Arc<dyn object_store::ObjectStore>,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for FailFirstFailedWrite {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailFirstFailedWrite")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FailFirstFailedWrite {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let marks_failed = payload
+                .iter()
+                .any(|chunk| chunk.windows(8).any(|w| w == b"\"FAILED\""));
+            if marks_failed && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "test",
+                    source: "the write did not land".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A principal's orphaned job whose failure write does not land stays
+    /// orphaned, so the next recovery sweep fails it.
+    #[tokio::test]
+    async fn resume_fails_a_principals_job_on_a_later_sweep_after_a_failed_write() {
+        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let lost = JobStore::new(Arc::clone(&inner), "test", "node-lost");
+        let job_id = seed_job(&lost, OWNER).await;
+        let running = lost
+            .set_job_running(&job_id)
+            .await
+            .expect("the lost scheduler had started the job");
+        let flaky: Arc<dyn object_store::ObjectStore> = Arc::new(FailFirstFailedWrite {
+            inner: Arc::clone(&inner),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let recoverer = Arc::new(JobStore::new(flaky, "test", "node-b"));
+        let executor = executor(Arc::clone(&recoverer));
+
+        executor.resume(&running).await;
+        let orphaned = recoverer.get_job(&job_id).await.expect("job exists");
+        assert_eq!(orphaned.status, JobStatus::Running);
+        assert_eq!(
+            orphaned.scheduler_node.as_deref(),
+            Some("node-lost"),
+            "the job is still orphaned for the next sweep"
+        );
+
+        executor.resume(&orphaned).await;
+        let state = recoverer.get_job(&job_id).await.expect("job exists");
+        assert_eq!(state.status, JobStatus::Failed);
+    }
+
+    /// How a takeover write that landed reports back.
+    #[derive(Debug, Clone, Copy)]
+    enum LostResponse {
+        /// The response never arrived.
+        Error,
+        /// The write was sent again after it landed, and its condition failed.
+        Conflict,
+    }
+
+    /// Object store whose first write marking an async-query job running lands
+    /// and then reports `lost`.
+    #[derive(Debug)]
+    struct LoseFirstRunningWrite {
+        inner: Arc<dyn object_store::ObjectStore>,
+        lost: LostResponse,
+        reported: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for LoseFirstRunningWrite {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "LoseFirstRunningWrite")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for LoseFirstRunningWrite {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let marks_running = payload
+                .iter()
+                .any(|chunk| chunk.windows(9).any(|w| w == b"\"RUNNING\""));
+            let written = self.inner.put_opts(location, payload, opts).await?;
+            if marks_running
+                && !self
+                    .reported
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(match self.lost {
+                    LostResponse::Error => object_store::Error::Generic {
+                        store: "test",
+                        source: "the response did not arrive".into(),
+                    },
+                    LostResponse::Conflict => object_store::Error::Precondition {
+                        path: location.to_string(),
+                        source: "the object changed".into(),
+                    },
+                });
+            }
+            Ok(written)
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A takeover write that lands but reports an error: the recoverer reads
+    /// the job back, finds it holds the job, and drives it.
+    #[tokio::test]
+    async fn resume_drives_a_job_whose_takeover_landed_but_reported_an_error() {
+        for lost in [LostResponse::Error, LostResponse::Conflict] {
+            let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+            let lost_scheduler = JobStore::new(Arc::clone(&inner), "test", "node-lost");
+            let job_id = seed_job(&lost_scheduler, PUBLIC_JOB_OWNER).await;
+            let running = lost_scheduler
+                .set_job_running(&job_id)
+                .await
+                .expect("the lost scheduler had started the job");
+            let store: Arc<dyn object_store::ObjectStore> = Arc::new(LoseFirstRunningWrite {
+                inner: Arc::clone(&inner),
+                lost,
+                reported: std::sync::atomic::AtomicBool::new(false),
+            });
+            let recoverer = Arc::new(JobStore::new(store, "test", "node-b"));
+            let executor = executor(Arc::clone(&recoverer));
+
+            executor.resume(&running).await;
+
+            assert!(
+                executor.active_jobs.read().await.contains_key(&job_id),
+                "{lost:?}: the recoverer drives the job it took over"
+            );
+            let state = wait_until_finished(&recoverer, &job_id).await;
+            assert_eq!(state.scheduler_node.as_deref(), Some("node-b"), "{lost:?}");
+            assert_eq!(state.generation, Some(2), "{lost:?}");
+        }
     }
 
     #[tokio::test]

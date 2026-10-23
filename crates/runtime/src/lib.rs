@@ -1479,6 +1479,7 @@ impl Runtime {
     /// [`Runtime::init_cache_metrics`].
     pub fn init_component_metrics(&self) {
         runtime_metrics::publish_component_counters_at_zero();
+        runtime_state_location::metrics::init();
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -2230,10 +2231,19 @@ impl Runtime {
         // milliseconds. Waited on alongside the connection drain, under the same
         // timeout: a source that cannot finish in it costs a rebuild on the next
         // start, never a hung shutdown.
-        let (unfinished_sources, _) = tokio::join!(
+        //
+        // Snapshot writer leases are resigned alongside, so a replacement instance
+        // need not wait for them to lapse.
+        let (unfinished_sources, _, leases_released) = tokio::join!(
             data_components::cdc::drain_shutdown(shutdown_timeout),
             join_all(shutdown_futures),
+            tokio::time::timeout(shutdown_timeout, self.df.resign_snapshot_writer_leases()),
         );
+        if leases_released.is_err() {
+            tracing::warn!(
+                "Shutdown waited {shutdown_timeout:?} to release snapshot writer leases and gave up; another instance takes over those datasets' snapshots only after the leases lapse"
+            );
+        }
         if unfinished_sources > 0 {
             tracing::warn!(
                 "Shutdown waited {shutdown_timeout:?} for {unfinished_sources} change-data-capture source(s) to record how far their accelerations were advanced, and gave up; each dataset on those sources will be rebuilt from its source on the next start rather than resumed"

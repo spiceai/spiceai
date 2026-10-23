@@ -267,6 +267,7 @@ impl ExecutorOutboundBroadcaster {
                 statistics,
                 column_names,
             })),
+            process_id: String::new(),
         };
 
         let targets: Vec<(String, mpsc::Sender<ExecutorControlMessage>)> = {
@@ -311,6 +312,7 @@ fn partitions_loaded_message(
                 items: partition_expr_bytes,
             }),
         })),
+        process_id: String::new(),
     }
 }
 

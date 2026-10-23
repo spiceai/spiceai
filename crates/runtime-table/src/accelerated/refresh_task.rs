@@ -65,8 +65,8 @@ use datafusion_table_providers::util::retriable_error::{
 };
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
-use runtime_acceleration::SnapshotPoll;
 use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
+use runtime_acceleration::{SnapshotPoll, SnapshotPollOutcome};
 use runtime_component::dataset::TimeFormat;
 use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_datafusion::analyzer_rule::AnalyzerRulesBuilder;
@@ -997,7 +997,9 @@ impl RefreshTask {
                 // For snapshot mode, poll the snapshot store for a newer snapshot
                 // and reload the accelerator from it. The federated source is
                 // never queried for refreshes in this mode.
-                return self.refresh_from_snapshot(refresh).await;
+                return self
+                    .refresh_from_snapshot(refresh, &dataset_metrics_label_sets)
+                    .await;
             }
         };
 
@@ -1202,11 +1204,15 @@ impl RefreshTask {
             oneshot::channel::<RefreshStat>();
 
         let resource_monitor = self.resource_monitor.clone();
+        // A source that stops sending mid-stream fails the refresh instead of
+        // holding it, and every refresh queued behind it, for ever.
+        let source =
+            super::source_stall::with_stall_timeout(data_update.data, dataset_name.to_string());
         let observed_record_batch_stream = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             stream::unfold(
                 (
-                    data_update.data,
+                    source,
                     RefreshStat::default(),
                     dataset_name.to_string(),
                     self.dataset_metric_labels.clone(),
@@ -2022,6 +2028,7 @@ impl RefreshTask {
     async fn refresh_from_snapshot(
         &self,
         refresh: &Refresh,
+        dataset_metrics_label_sets: &[Vec<KeyValue>],
     ) -> Result<RefreshOutcome, RetryError<super::Error>> {
         let _ = refresh; // refresh sql / window are intentionally unused for snapshot mode
 
@@ -2106,34 +2113,11 @@ impl RefreshTask {
 
         let (info, metadata_e_tag) = match download_result {
             Ok(SnapshotPoll {
-                download: Some(info),
+                outcome: SnapshotPollOutcome::Downloaded(info),
                 metadata_e_tag,
             }) => (info, metadata_e_tag),
-            Ok(SnapshotPoll { download: None, .. }) if current_local_id.is_none() => {
-                // No snapshot has ever been loaded and none is available at the configured location.
-                tracing::warn!(
-                    dataset = %self.dataset_name,
-                    snapshot_location = %state.manager.snapshot_location(),
-                    "refresh_mode: snapshot - no snapshot found at the configured location. Ensure the snapshot location is correct and that a snapshot has been created."
-                );
-                self.set_refresh_status(
-                    None,
-                    status::ComponentStatus::error_with_message(
-                        "no snapshot available".to_string(),
-                    ),
-                )
-                .await;
-                return Err(RetryError::transient(
-                    super::Error::FailedToRefreshDataset {
-                        source: datafusion::error::DataFusionError::Internal(
-                            "refresh_mode: snapshot - no snapshot found at the configured location"
-                                .to_string(),
-                        ),
-                    },
-                ));
-            }
             Ok(SnapshotPoll {
-                download: None,
+                outcome: SnapshotPollOutcome::UpToDate,
                 metadata_e_tag,
             }) => {
                 state.record_metadata_e_tag(metadata_e_tag);
@@ -2142,10 +2126,52 @@ impl RefreshTask {
                     current_snapshot_id = ?current_local_id,
                     "refresh_mode: snapshot - no newer snapshot available; skipping reload"
                 );
-                let dataset_metrics_label_sets =
-                    self.get_dataset_label_sets(&RefreshMode::Snapshot).await;
                 return Ok(self
-                    .finish_up_to_date(refresh, &dataset_metrics_label_sets)
+                    .finish_up_to_date(refresh, dataset_metrics_label_sets)
+                    .await);
+            }
+            Ok(SnapshotPoll {
+                outcome: SnapshotPollOutcome::NotPublished,
+                ..
+            }) => {
+                let error = super::Error::SnapshotNotPublished {
+                    location: state.manager.snapshot_location().to_string(),
+                };
+                let Some(loaded_id) = current_local_id else {
+                    // Nothing is loaded yet: fail the refresh so the retry loop counts
+                    // and retries it.
+                    tracing::warn!(
+                        "Dataset '{}' has no snapshot to load, so it cannot be queried until one is published. Cause: {error}",
+                        self.dataset_name
+                    );
+                    self.set_refresh_status(
+                        None,
+                        status::ComponentStatus::error_with_message(
+                            "no snapshot available".to_string(),
+                        ),
+                    )
+                    .await;
+                    return Err(RetryError::transient(error));
+                };
+                return Ok(self
+                    .keep_serving_loaded_snapshot(&error, loaded_id, dataset_metrics_label_sets)
+                    .await);
+            }
+            Ok(SnapshotPoll {
+                outcome:
+                    SnapshotPollOutcome::OlderThanLoaded {
+                        published_id,
+                        loaded_id,
+                    },
+                ..
+            }) => {
+                let error = super::Error::SnapshotOlderThanLoaded {
+                    location: state.manager.snapshot_location().to_string(),
+                    published_id,
+                    loaded_id,
+                };
+                return Ok(self
+                    .keep_serving_loaded_snapshot(&error, loaded_id, dataset_metrics_label_sets)
                     .await);
             }
             Err(e) => {
@@ -2352,6 +2378,28 @@ impl RefreshTask {
         self.set_refresh_status(None, status::ComponentStatus::Ready)
             .await;
         Ok(RefreshOutcome::Refreshed)
+    }
+
+    /// Counts and logs a poll that could not advance to the published snapshot. The
+    /// dataset keeps serving snapshot `loaded_id`, so it stays `Ready` and the refresh
+    /// reports it up to date.
+    async fn keep_serving_loaded_snapshot(
+        &self,
+        error: &super::Error,
+        loaded_id: u64,
+        dataset_metrics_label_sets: &[Vec<KeyValue>],
+    ) -> RefreshOutcome {
+        emit_refresh_errors(
+            dataset_metrics_label_sets.to_vec(),
+            refresh_error_reason(error),
+        );
+        tracing::warn!(
+            "Dataset '{}' cannot refresh from its snapshot location, so it keeps serving snapshot {loaded_id}. Cause: {error}",
+            self.dataset_name
+        );
+        self.set_refresh_status(None, status::ComponentStatus::Ready)
+            .await;
+        RefreshOutcome::UpToDate
     }
 
     async fn trace_load_completed(
@@ -3157,6 +3205,9 @@ impl RefreshTask {
                     RefreshMode::Full => label_set.push(KeyValue::new("mode", "full".to_string())),
                     RefreshMode::Append => {
                         label_set.push(KeyValue::new("mode", "append".to_string()));
+                    }
+                    RefreshMode::Snapshot => {
+                        label_set.push(KeyValue::new("mode", "snapshot".to_string()));
                     }
                     _ => (),
                 }
@@ -3964,16 +4015,25 @@ fn terminal_generation_change_refresh_error<T>(
 
 /// `dataset_acceleration_refresh_errors{reason=...}` for the error that ended a refresh.
 ///
-/// Generation-change is checked first so a 412 wrapped in a Parquet fetch
-/// error is still filterable, not classified as decoder corruption.
+/// A snapshot poll's own errors name their reason. Otherwise generation-change is
+/// checked first so a 412 wrapped in a Parquet fetch error is still filterable, not
+/// classified as decoder corruption.
 #[must_use]
 pub fn refresh_error_reason(error: &super::Error) -> &'static str {
-    if error_chain_matches(error, looks_like_generation_change) {
-        metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
-    } else if error_chain_matches(error, looks_like_parquet_decode) {
-        metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
-    } else {
-        metrics::REFRESH_ERROR_REASON_OTHER
+    match error {
+        super::Error::SnapshotNotPublished { .. } => {
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_NOT_FOUND
+        }
+        super::Error::SnapshotOlderThanLoaded { .. } => {
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_OLDER_THAN_LOADED
+        }
+        _ if error_chain_matches(error, looks_like_generation_change) => {
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+        }
+        _ if error_chain_matches(error, looks_like_parquet_decode) => {
+            metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        }
+        _ => metrics::REFRESH_ERROR_REASON_OTHER,
     }
 }
 
@@ -4796,6 +4856,76 @@ mod tests {
         );
     }
 
+    /// A snapshot poll that cannot advance names its reason on
+    /// `dataset_acceleration_refresh_errors`.
+    #[test]
+    fn snapshot_refresh_errors_name_their_reason() {
+        let not_published = super::super::Error::SnapshotNotPublished {
+            location: "s3://bucket/snapshots/".to_string(),
+        };
+        assert_eq!(
+            refresh_error_reason(&not_published),
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_NOT_FOUND
+        );
+        assert_eq!(
+            not_published.to_string(),
+            "No snapshot of the dataset is published at 's3://bucket/snapshots/'. Ensure the location is correct and that a dataset with `acceleration.snapshots` enabled has published one. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+        );
+
+        let older = super::super::Error::SnapshotOlderThanLoaded {
+            location: "s3://bucket/snapshots/".to_string(),
+            published_id: 0,
+            loaded_id: 3,
+        };
+        assert_eq!(
+            refresh_error_reason(&older),
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_OLDER_THAN_LOADED
+        );
+        assert_eq!(
+            older.to_string(),
+            "The snapshot published at 's3://bucket/snapshots/' (id 0) is older than the loaded snapshot (id 3), so it was not loaded. Publish a newer snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+        );
+    }
+
+    /// Snapshot refreshes carry `mode="snapshot"`, as source refreshes carry `mode="full"`.
+    #[tokio::test]
+    async fn snapshot_refresh_metrics_carry_the_snapshot_mode() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("snapshot_mode_labels"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        assert_eq!(
+            task.get_dataset_label_sets(&RefreshMode::Snapshot).await,
+            vec![vec![
+                KeyValue::new("dataset", "snapshot_mode_labels"),
+                KeyValue::new("mode", "snapshot"),
+            ]]
+        );
+        assert_eq!(
+            task.get_dataset_label_sets(&RefreshMode::Full).await,
+            vec![vec![
+                KeyValue::new("dataset", "snapshot_mode_labels"),
+                KeyValue::new("mode", "full"),
+            ]]
+        );
+    }
+
     /// The periodic caching refresh fetches under the same process-wide `SessionState` as the
     /// query path; a copy built per task would rebuild the default registry for every dataset.
     #[tokio::test]
@@ -5062,6 +5192,71 @@ mod tests {
             probe_acceleration_contents(&empty_batches, &dataset_name).await,
             AccelerationContents::Empty
         );
+    }
+
+    /// A source that sends a batch and then goes silent, as a connection the network
+    /// stopped carrying does, fails the refresh once the stall timeout passes: retried,
+    /// and counted on the attempt. Without the timeout the write waits for ever and
+    /// nothing is counted.
+    #[tokio::test(start_paused = true)]
+    async fn a_source_silent_mid_refresh_fails_retriably() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("federated mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(federated_table));
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("source_stalled_refresh"),
+            federated,
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("batch should be created");
+        let sent = futures::stream::iter(vec![Ok(batch)]).chain(futures::stream::pending());
+        let update_stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), sent));
+        let update = StreamingDataUpdate::new(update_stream, UpdateType::Overwrite);
+
+        let timeout = super::super::source_stall::SOURCE_STALL_TIMEOUT;
+        let started = tokio::time::Instant::now();
+        let Err(error) = tokio::time::timeout(
+            timeout * 2,
+            task.write_streaming_data_update(None, update, None, None),
+        )
+        .await
+        .expect("a refresh whose source went silent must not wait for ever") else {
+            panic!("a source silent mid-refresh must fail the refresh");
+        };
+        assert!(
+            matches!(&error, RetryError::Transient { .. }),
+            "a stalled source is retried on a new connection: {error:?}"
+        );
+        let counted = attempt_refresh_error(&error).expect("counted on the attempt");
+        assert_eq!(
+            refresh_error_reason(counted),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+        assert!(
+            counted
+                .to_string()
+                .contains("The source of dataset 'source_stalled_refresh' stopped sending data"),
+            "{counted}"
+        );
+        assert_eq!(started.elapsed(), timeout, "fails at the stall timeout");
     }
 
     #[tokio::test]

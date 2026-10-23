@@ -20,10 +20,18 @@ limitations under the License.
 //! scheduler in the cluster can read a job's status and, if the owning
 //! scheduler is lost, take ownership and resume driving it to completion.
 //!
-//! Ownership is keyed by the owning scheduler's per-process `instance_id`. A
-//! monotonic `epoch` is bumped on every ownership transfer and acts as a
-//! fencing token: a scheduler that is presumed dead but later resurfaces will
-//! observe a higher epoch and decline to continue.
+//! Ownership follows [`object_store_occ::lease`]: the owner is an id the
+//! owning scheduler takes when it starts, so no two scheduler runs share it,
+//! and `epoch` is the generation it owns the job under. Every ownership
+//! transfer takes the next generation, and every save checks both the owner and
+//! the generation the saver acquired the job under, so a scheduler that is
+//! presumed dead but later resurfaces, or a save begun under an earlier
+//! generation, is refused.
+//!
+//! Every write is conditional. Metadata writes are bound to the version they
+//! were computed from. A graph write lands only over the graph its owner last
+//! wrote or loaded; when another scheduler wrote the graph since, the write is
+//! retried only while the writer still owns the job at the same epoch.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -35,7 +43,11 @@ use datafusion::prelude::SessionConfig;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectStore, ObjectStoreExt, UpdateVersion};
+use object_store_occ::{
+    Attempt, Change, ConflictRetry, Expected, InsertResult, ModifyError, RetryOnConflictError,
+    UpdateResult, conditional_put, retry_on_conflict,
+};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::error::TrySendError;
@@ -107,6 +119,8 @@ impl JobMetadata {
 struct LocalJob {
     status: JobStatus,
     subscriber: Option<JobStatusSubscriber>,
+    /// The generation (`epoch`) this scheduler owns the job under.
+    generation: u64,
 }
 
 impl LocalJob {
@@ -139,6 +153,10 @@ pub struct SharedJobState<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
     queued_jobs: DashMap<String, (String, u64)>,
     /// Locally driven jobs, retained for fast status reads and subscriber delivery.
     local_jobs: DashMap<String, LocalJob>,
+    /// The version of each locally driven job's graph that this scheduler last
+    /// wrote or loaded, and the generation it held the job under: the
+    /// condition of its next graph write under that generation.
+    graph_versions: DashMap<String, (u64, UpdateVersion)>,
 }
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SharedJobState<T, U> {
@@ -155,7 +173,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SharedJobState<T,
         let meta = object_store_occ::ObjectState::new(Arc::clone(&store))
             .with_prefix(format!("{base}/scheduler/meta/"));
         Self {
-            owner_instance_id: Uuid::new_v4(),
+            owner_instance_id: Uuid::now_v7(),
             scheduler: scheduler.into(),
             store,
             graph_prefix: format!("{base}/scheduler/graph"),
@@ -166,6 +184,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SharedJobState<T,
             event_sender: ClusterEventSender::new(100),
             queued_jobs: DashMap::new(),
             local_jobs: DashMap::new(),
+            graph_versions: DashMap::new(),
         }
     }
 
@@ -173,27 +192,176 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SharedJobState<T,
         Path::from(format!("{}/{job_id}", self.graph_prefix))
     }
 
-    async fn put_graph(&self, job_id: &str, graph: &ExecutionGraphBox) -> Result<()> {
-        let bytes = execution_graph_to_bytes(graph.as_ref(), &self.codec)?;
-        self.store
-            .put(&self.graph_path(job_id), bytes.into())
-            .await
-            .map_err(|e| BallistaError::Internal(format!("failed to persist job graph: {e}")))?;
-        Ok(())
+    /// Writes `bytes` as the job's graph if the graph is in the `expected`
+    /// state. Returns the version written, or `None` when another writer
+    /// changed the graph first.
+    async fn write_graph(
+        &self,
+        job_id: &str,
+        bytes: &[u8],
+        expected: &Expected,
+    ) -> Result<Option<UpdateVersion>> {
+        match conditional_put(
+            self.store.as_ref(),
+            &self.graph_path(job_id),
+            bytes.to_vec().into(),
+            expected,
+        )
+        .await
+        {
+            Ok(result) => Ok(Some(UpdateVersion::from(result))),
+            Err(err) if err.is_conflict() => Ok(None),
+            Err(e) => Err(BallistaError::Internal(format!(
+                "failed to persist job graph: {e}"
+            ))),
+        }
     }
 
-    async fn load_graph(&self, job_id: &str, meta: &JobMetadata) -> Result<ExecutionGraphBox> {
+    /// The version of the job's graph as stored now, as a write condition.
+    async fn stored_graph_version(&self, job_id: &str) -> Result<Expected> {
+        match self.store.head(&self.graph_path(job_id)).await {
+            Ok(meta) => Expected::at_version(UpdateVersion {
+                e_tag: meta.e_tag,
+                version: meta.version,
+            })
+            .ok_or_else(|| {
+                BallistaError::Internal(format!(
+                    "the object store reported no version for the graph of job {job_id}, so it cannot be written conditionally"
+                ))
+            }),
+            Err(object_store::Error::NotFound { .. }) => Ok(Expected::Absent),
+            Err(e) => Err(BallistaError::Internal(format!(
+                "failed to read job graph: {e}"
+            ))),
+        }
+    }
+
+    /// The job's graph as stored now, as a write condition, or `None` when the
+    /// job has a new owner.
+    ///
+    /// The graph is read before the metadata: a new owner records its claim
+    /// before it saves a graph, so a graph it saved is never seen without its
+    /// claim.
+    async fn owned_graph_version(&self, job_id: &str, epoch: u64) -> Result<Option<Expected>> {
+        let stored = self.stored_graph_version(job_id).await?;
+        let owned = self
+            .meta
+            .get(job_id)
+            .await
+            .map_err(|e| BallistaError::Internal(format!("failed to read job meta: {e}")))?
+            .is_some_and(|meta| {
+                meta.owner_instance_id == Some(self.owner_instance_id) && meta.epoch == epoch
+            });
+        Ok(owned.then_some(stored))
+    }
+
+    /// Persists the graph of a job this scheduler owns at `epoch`.
+    ///
+    /// The write is conditional on the graph this scheduler last wrote or
+    /// loaded under `epoch`. Without one, or after another writer changed the graph, it is
+    /// conditional on the graph as stored now and made only while this
+    /// scheduler still owns the job at `epoch`. Returns `false` when the job
+    /// has a new owner, which keeps its own graph.
+    async fn put_graph(&self, job_id: &str, graph: &ExecutionGraphBox, epoch: u64) -> Result<bool> {
+        let bytes = execution_graph_to_bytes(graph.as_ref(), &self.codec)?;
+        let written = retry_on_conflict(&ConflictRetry::default(), || async {
+            let recorded = self
+                .graph_versions
+                .get(job_id)
+                .filter(|recorded| recorded.0 == epoch)
+                .map(|recorded| recorded.1.clone());
+            let expected = match recorded.and_then(Expected::at_version) {
+                Some(expected) => expected,
+                None => match self.owned_graph_version(job_id, epoch).await? {
+                    Some(expected) => expected,
+                    None => return Ok(Attempt::Done(false)),
+                },
+            };
+            if let Some(version) = self.write_graph(job_id, &bytes, &expected).await? {
+                self.graph_versions
+                    .insert(job_id.to_string(), (epoch, version));
+                return Ok(Attempt::Done(true));
+            }
+            self.graph_versions
+                .remove_if(job_id, |_, recorded| recorded.0 == epoch);
+            Ok(Attempt::Conflict)
+        })
+        .await;
+        match written {
+            Ok(written) => Ok(written),
+            Err(RetryOnConflictError::ConflictsExhausted { attempts }) => {
+                Err(BallistaError::Internal(format!(
+                    "failed to persist the graph of job {job_id}: another writer changed it before each of {attempts} attempts"
+                )))
+            }
+            Err(RetryOnConflictError::Failed(e)) => Err(e),
+        }
+    }
+
+    /// Reads the job's graph and the version it was stored at.
+    async fn load_graph(
+        &self,
+        job_id: &str,
+        meta: &JobMetadata,
+    ) -> Result<(ExecutionGraphBox, UpdateVersion)> {
         let result = self
             .store
             .get(&self.graph_path(job_id))
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to read job graph: {e}")))?;
+        let version = UpdateVersion {
+            e_tag: result.meta.e_tag.clone(),
+            version: result.meta.version.clone(),
+        };
         let bytes = result
             .bytes()
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to read job graph: {e}")))?;
         let ctx = self.session_context(&meta.session_id)?;
-        execution_graph_from_bytes(&bytes, &self.codec, ctx.as_ref())
+        Ok((
+            execution_graph_from_bytes(&bytes, &self.codec, ctx.as_ref())?,
+            version,
+        ))
+    }
+
+    /// Deletes the metadata of a submission whose graph could not be written,
+    /// unless another scheduler has claimed the job since.
+    async fn roll_back_submission(&self, job_id: &str) {
+        match self.meta.get(job_id).await {
+            Ok(Some(meta))
+                if meta.owner_instance_id == Some(self.owner_instance_id) && meta.epoch == 0 =>
+            {
+                if let Err(cleanup) = self.meta.delete(job_id).await {
+                    tracing::warn!(
+                        "failed to roll back job meta for {job_id} after graph write failed: {cleanup}"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(cleanup) => {
+                tracing::warn!(
+                    "failed to roll back job meta for {job_id} after graph write failed: {cleanup}"
+                );
+            }
+        }
+    }
+
+    /// Stops driving a job locally.
+    fn forget_local(&self, job_id: &str) -> Option<LocalJob> {
+        self.graph_versions.remove(job_id);
+        self.local_jobs.remove(job_id).map(|(_, local)| local)
+    }
+
+    /// Stops driving a job locally if this scheduler still holds it under
+    /// `generation`; a later generation it acquired since keeps running.
+    fn forget_generation(&self, job_id: &str, generation: u64) {
+        if self
+            .local_jobs
+            .remove_if(job_id, |_, local| local.generation == generation)
+            .is_some()
+        {
+            self.graph_versions.remove(job_id);
+        }
     }
 
     fn session_context(&self, session_id: &str) -> Result<Arc<SessionContext>> {
@@ -262,30 +430,43 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
             queued_at,
         );
         meta.session_id = graph.session_id().to_string();
-        if let object_store_occ::WriteResult::Conflict { .. } = self
+        let inserted = self
             .meta
-            .insert_or_update(job_id.as_str(), &meta)
+            .insert(job_id.as_str(), &meta)
             .await
-            .map_err(|e| BallistaError::Internal(format!("failed to persist job meta: {e}")))?
-        {
+            .map_err(|e| BallistaError::Internal(format!("failed to persist job meta: {e}")))?;
+        if inserted == InsertResult::AlreadyExists {
             return Err(BallistaError::Internal(format!(
                 "failed to submit job {job_id}, meta already owned"
             )));
         }
-        // With the claim in place, persist the graph. If that fails, best-effort
-        // roll back the metadata so other schedulers never observe meta pointing
-        // at a missing graph.
-        if let Err(e) = self.put_graph(job_id.as_str(), graph).await {
-            if let Err(cleanup) = self.meta.delete(job_id.as_str()).await {
-                tracing::warn!(
-                    "failed to roll back job meta for {job_id} after graph write failed: {cleanup}"
-                );
+        // With the claim in place, persist the graph, over any graph a removed
+        // job with this id left behind. If that fails, best-effort roll back the
+        // metadata so other schedulers never observe meta pointing at a missing
+        // graph.
+        match self.put_graph(job_id.as_str(), graph, 0).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // The metadata is the claim of the scheduler that took the job
+                // over, so it stays.
+                return Err(BallistaError::Internal(format!(
+                    "failed to submit job {job_id}, another scheduler took it over"
+                )));
             }
-            return Err(e);
+            Err(e) => {
+                self.roll_back_submission(job_id.as_str()).await;
+                return Err(e);
+            }
         }
 
-        self.local_jobs
-            .insert(job_id.to_string(), LocalJob { status, subscriber });
+        self.local_jobs.insert(
+            job_id.to_string(),
+            LocalJob {
+                status,
+                subscriber,
+                generation: 0,
+            },
+        );
         self.event_sender.send(&JobStateEvent::JobAcquired {
             job_id,
             owner: self.scheduler.clone(),
@@ -326,75 +507,86 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
         else {
             return Ok(None);
         };
-        Ok(Some(self.load_graph(job_id.as_str(), &meta).await?))
+        Ok(Some(self.load_graph(job_id.as_str(), &meta).await?.0))
     }
 
     async fn save_job(&self, job_id: &JobId, graph: &ExecutionGraphBox) -> Result<()> {
         let status = graph.status().clone();
-
-        let current = self
-            .meta
+        let Some(generation) = self
+            .local_jobs
             .get(job_id.as_str())
-            .await
-            .map_err(|e| BallistaError::Internal(format!("failed to read job meta: {e}")))?;
-        // A scheduler that has lost ownership must not touch shared state. Drop
-        // the local entry so reads fall through to the new owner's status.
-        if let Some(m) = &current
-            && m.owner_instance_id != Some(self.owner_instance_id)
-        {
-            tracing::warn!(
-                "job {job_id} owned by another scheduler (epoch {}); yielding",
-                m.epoch
-            );
-            self.local_jobs.remove(job_id.as_str());
+            .map(|local| local.generation)
+        else {
+            tracing::debug!("job {job_id} is not driven by this scheduler; not saving it");
             return Ok(());
-        }
-        let (epoch, queued_at, session_id) = current
-            .as_ref()
-            .map(|m| (m.epoch, m.queued_at, m.session_id.clone()))
-            .unwrap_or((0, 0, graph.session_id().to_string()));
+        };
 
-        let mut meta = Self::metadata(
-            job_id.as_str(),
-            &status,
-            Some(self.owner_instance_id),
-            epoch,
-            queued_at,
-        );
-        meta.session_id = session_id;
-        // Compare-and-set the ownership metadata before persisting the graph, so a
-        // scheduler racing a takeover cannot clobber the shared graph blob.
-        match self
+        // Compare-and-set the ownership metadata before persisting the graph. A
+        // scheduler that has lost ownership, or that acquired the job again since
+        // this save began, must not touch shared state under the generation it
+        // no longer holds: it drops that local entry so reads fall through to
+        // the current owner's status.
+        let owned = self
             .meta
-            .update(job_id.as_str(), &meta)
-            .await
-            .map_err(|e| BallistaError::Internal(format!("failed to persist job meta: {e}")))?
-        {
-            object_store_occ::UpdateResult::Ok => {}
-            object_store_occ::UpdateResult::Conflict { current } => {
+            .modify(
+                job_id.as_str(),
+                &ConflictRetry::default(),
+                |current| -> Result<Change<JobMetadata, std::result::Result<u64, u64>>> {
+                    let Some(current) = current else {
+                        return Err(BallistaError::Internal(format!(
+                            "job {job_id} metadata no longer exists; cannot persist state"
+                        )));
+                    };
+                    if current.owner_instance_id != Some(self.owner_instance_id)
+                        || current.epoch != generation
+                    {
+                        return Ok(Change::Keep(Err(current.epoch)));
+                    }
+                    let mut meta = Self::metadata(
+                        job_id.as_str(),
+                        &status,
+                        Some(self.owner_instance_id),
+                        current.epoch,
+                        current.queued_at,
+                    );
+                    meta.session_id = current.session_id;
+                    Ok(Change::Write(meta, Ok(current.epoch)))
+                },
+            )
+            .await;
+        let epoch = match owned {
+            Ok(Ok(epoch)) => epoch,
+            Ok(Err(owner_epoch)) => {
                 tracing::warn!(
-                    "job {job_id} ownership changed under us (epoch {} -> {}); yielding",
-                    epoch,
-                    current.epoch
+                    "job {job_id} owned by another scheduler (epoch {owner_epoch}); yielding"
                 );
-                self.local_jobs.remove(job_id.as_str());
+                self.forget_generation(job_id.as_str(), generation);
                 return Ok(());
             }
-            object_store_occ::UpdateResult::NotFound => {
-                self.local_jobs.remove(job_id.as_str());
+            Err(ModifyError::Rejected(e)) => {
+                self.forget_generation(job_id.as_str(), generation);
+                return Err(e);
+            }
+            Err(e) => {
                 return Err(BallistaError::Internal(format!(
-                    "job {job_id} metadata no longer exists; cannot persist state"
+                    "failed to persist job meta: {e}"
                 )));
             }
+        };
+        if !self.put_graph(job_id.as_str(), graph, epoch).await? {
+            tracing::warn!(
+                "job {job_id} was taken over by another scheduler while its graph was being saved; yielding"
+            );
+            self.forget_generation(job_id.as_str(), generation);
+            return Ok(());
         }
-        self.put_graph(job_id.as_str(), graph).await?;
 
         let terminal = matches!(
             status.status,
             Some(Status::Successful(_) | Status::Failed(_))
         );
         if terminal {
-            if let Some((_, local)) = self.local_jobs.remove(job_id.as_str()) {
+            if let Some(local) = self.forget_local(job_id.as_str()) {
                 local.notify(status.clone());
             }
         } else if let Some(mut local) = self.local_jobs.get_mut(job_id.as_str()) {
@@ -410,9 +602,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
     }
 
     async fn try_acquire_job(&self, job_id: &JobId) -> Result<Option<ExecutionGraphBox>> {
-        let Some(meta) = self
+        let Some((meta, version)) = self
             .meta
-            .get(job_id.as_str())
+            .get_with_version(job_id.as_str())
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to read job meta: {e}")))?
         else {
@@ -432,26 +624,30 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
 
         let mut claimed = meta.clone();
         claimed.owner_instance_id = Some(self.owner_instance_id);
-        claimed.epoch = meta.epoch + 1;
+        claimed.epoch = object_store_occ::lease::next_generation(meta.epoch);
         claimed.updated_at = now_ms();
-        // Another scheduler won the claim (Conflict), or the job's metadata was
-        // removed under us (NotFound) — either way we don't own it.
+        // The claim lands only over the metadata it was decided on. Another
+        // scheduler won the claim (Conflict), or the job's metadata was removed
+        // under us (NotFound) — either way we don't own it.
         if !matches!(
             self.meta
-                .update(job_id.as_str(), &claimed)
+                .update_with_version(job_id.as_str(), &claimed, version)
                 .await
                 .map_err(|e| BallistaError::Internal(format!("failed to acquire job: {e}")))?,
-            object_store_occ::UpdateResult::Ok
+            UpdateResult::Ok
         ) {
             return Ok(None);
         }
 
-        let graph = self.load_graph(job_id.as_str(), &claimed).await?;
+        let (graph, graph_version) = self.load_graph(job_id.as_str(), &claimed).await?;
+        self.graph_versions
+            .insert(job_id.to_string(), (claimed.epoch, graph_version));
         self.local_jobs.insert(
             job_id.to_string(),
             LocalJob {
                 status: graph.status().clone(),
                 subscriber: None,
+                generation: claimed.epoch,
             },
         );
         self.event_sender.send(&JobStateEvent::JobAcquired {
@@ -466,7 +662,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
     }
 
     async fn remove_job(&self, job_id: &JobId) -> Result<()> {
-        self.local_jobs.remove(job_id.as_str());
+        self.forget_local(job_id.as_str());
         self.queued_jobs.remove(job_id.as_str());
         // Delete metadata first, and only delete the graph if that succeeds.
         // `ObjectState::delete` treats NotFound as success, so an error here is a
@@ -538,8 +734,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
             queued_at,
         );
         meta.session_id = String::new();
-        if let Err(e) = self.meta.insert_or_update(job_id.as_str(), &meta).await {
-            tracing::warn!("failed to persist failed status for unscheduled job {job_id}: {e}");
+        match self.meta.insert(job_id.as_str(), &meta).await {
+            Ok(InsertResult::Ok) => {}
+            Ok(InsertResult::AlreadyExists) => {
+                tracing::warn!(
+                    "job {job_id} already has persisted state; not overwriting it with the failed status of the unscheduled job"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("failed to persist failed status for unscheduled job {job_id}: {e}");
+            }
         }
         Ok(())
     }
@@ -586,7 +790,10 @@ mod tests {
     /// the metadata/ownership paths and never `load_graph`), so trivial stubs are
     /// sufficient.
     fn test_state() -> TestState {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        test_state_on(Arc::new(InMemory::new()))
+    }
+
+    fn test_state_on(store: Arc<dyn ObjectStore>) -> TestState {
         let config_producer: ConfigProducer = Arc::new(SessionConfig::new);
         let session_builder: SessionBuilder = Arc::new(|_cfg| Ok(SessionContext::new().state()));
         SharedJobState::new(
@@ -658,7 +865,7 @@ mod tests {
         );
         state
             .meta
-            .insert_or_update("self", &self_owned)
+            .insert("self", &self_owned)
             .await
             .expect("persist self-owned meta");
         assert!(
@@ -681,7 +888,7 @@ mod tests {
         corrupt.status = vec![0xff, 0xff, 0xff, 0xff];
         state
             .meta
-            .insert_or_update("corrupt", &corrupt)
+            .insert("corrupt", &corrupt)
             .await
             .expect("persist corrupt meta");
         assert!(
@@ -703,11 +910,7 @@ mod tests {
             state.owner_instance_id,
             0,
         );
-        state
-            .meta
-            .insert_or_update("j1", &meta)
-            .await
-            .expect("persist meta");
+        state.meta.insert("j1", &meta).await.expect("persist meta");
         // The graph blob is deleted by path and never decoded, so dummy bytes are fine.
         state
             .store
@@ -856,7 +1059,8 @@ mod tests {
             .await
             .expect("persist the graph");
 
-        let graph = state.load_graph("j", &meta).await.expect("load the graph");
+        let (graph, version) = state.load_graph("j", &meta).await.expect("load the graph");
+        state.graph_versions.insert("j".to_string(), (0, version));
         let Some(ExecutionStage::Successful(map_stage)) = graph.stages().get(&1) else {
             panic!("the loaded graph lost its successful stage");
         };
@@ -878,10 +1082,13 @@ mod tests {
              is refunded the wrong amount"
         );
 
-        state
-            .put_graph("j", &graph)
-            .await
-            .expect("save the graph again");
+        assert!(
+            state
+                .put_graph("j", &graph, 0)
+                .await
+                .expect("save the graph again"),
+            "nothing else wrote the graph"
+        );
         let saved = state
             .store
             .get(&state.graph_path("j"))
@@ -899,6 +1106,480 @@ mod tests {
         assert_eq!(
             task.vcores_consumed, 2,
             "a saved graph has to carry `vcores_consumed`"
+        );
+    }
+
+    type Race = tokio::sync::Mutex<Option<futures::future::BoxFuture<'static, ()>>>;
+
+    /// Runs `before_write` once, right before the next graph write reaches the
+    /// store, `before_head` once, right before the next read of the graph's
+    /// version, `before_meta_read` once, right before the next metadata read,
+    /// and `after_meta_write` once, right after the next metadata write lands.
+    struct GraphRace {
+        inner: Arc<dyn ObjectStore>,
+        before_write: Race,
+        before_head: Race,
+        before_meta_read: Race,
+        after_meta_write: Race,
+    }
+
+    impl GraphRace {
+        fn on(inner: &Arc<dyn ObjectStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::clone(inner),
+                before_write: tokio::sync::Mutex::new(None),
+                before_head: tokio::sync::Mutex::new(None),
+                before_meta_read: tokio::sync::Mutex::new(None),
+                after_meta_write: tokio::sync::Mutex::new(None),
+            })
+        }
+
+        async fn run(race: &Race, location: &Path) {
+            if location.as_ref().contains("scheduler/graph/") {
+                let race = race.lock().await.take();
+                if let Some(race) = race {
+                    race.await;
+                }
+            }
+        }
+    }
+
+    impl std::fmt::Display for GraphRace {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GraphRace")
+        }
+    }
+
+    impl std::fmt::Debug for GraphRace {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GraphRace")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for GraphRace {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            Self::run(&self.before_write, location).await;
+            let written = self.inner.put_opts(location, payload, opts).await;
+            if location.as_ref().contains("scheduler/meta/") {
+                let race = self.after_meta_write.lock().await.take();
+                if let Some(race) = race {
+                    race.await;
+                }
+            }
+            written
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if options.head {
+                Self::run(&self.before_head, location).await;
+            } else if location.as_ref().contains("scheduler/meta/") {
+                let race = self.before_meta_read.lock().await.take();
+                if let Some(race) = race {
+                    race.await;
+                }
+            }
+            self.inner.get_opts(location, options).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A running job's graph, told apart from others by its session id.
+    fn running_graph(state: &TestState, session_id: &str) -> ExecutionGraphBox {
+        use ballista_core::serde::protobuf::ExecutionGraph;
+
+        let mut graph =
+            ExecutionGraph::decode(graph_with_a_multi_partition_task(&state.codec).as_slice())
+                .expect("decode the graph");
+        graph.session_id = session_id.to_string();
+        let ctx = state.session_context(session_id).expect("session context");
+        execution_graph_from_bytes(&graph.encode_to_vec(), &state.codec, ctx.as_ref())
+            .expect("build the graph")
+    }
+
+    /// The session id of the graph stored for `job_id`.
+    async fn stored_graph_session(
+        store: &Arc<dyn ObjectStore>,
+        state: &TestState,
+        job_id: &str,
+    ) -> String {
+        use ballista_core::serde::protobuf::ExecutionGraph;
+
+        let bytes = store
+            .get(&state.graph_path(job_id))
+            .await
+            .expect("read the stored graph")
+            .bytes()
+            .await
+            .expect("read the stored graph's bytes");
+        ExecutionGraph::decode(bytes.as_ref())
+            .expect("decode the stored graph")
+            .session_id
+    }
+
+    /// A scheduler that loses a job while its graph write is in flight does not
+    /// replace the graph the scheduler that took the job over has saved since.
+    #[tokio::test]
+    async fn a_superseded_owner_does_not_replace_the_new_owners_graph() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let racing = GraphRace::on(&inner);
+        let old_owner = test_state_on(Arc::clone(&racing) as Arc<dyn ObjectStore>);
+        let new_owner = Arc::new(test_state_on(Arc::clone(&inner)));
+        let job = JobId::new("j");
+
+        old_owner.accept_job(&job, "test", 0).expect("accept");
+        old_owner
+            .submit_job(job.clone(), &running_graph(&old_owner, "old-first"), None)
+            .await
+            .expect("submit");
+
+        *racing.before_write.lock().await = Some(take_over_and_save(&new_owner, &job));
+
+        old_owner
+            .save_job(&job, &running_graph(&old_owner, "old-second"))
+            .await
+            .expect("a superseded owner yields");
+
+        assert!(
+            racing.before_write.lock().await.is_none(),
+            "the takeover must have run"
+        );
+        assert_eq!(
+            stored_graph_session(&inner, &old_owner, "j").await,
+            "new",
+            "the new owner's graph must be kept"
+        );
+        assert!(
+            old_owner.local_jobs.get("j").is_none(),
+            "the superseded owner stops driving the job"
+        );
+    }
+
+    /// A scheduler whose graph write meets a graph another writer changed, and
+    /// that loses the job before it retries, does not replace the graph the new
+    /// owner saved in between.
+    #[tokio::test]
+    async fn a_superseded_owner_does_not_retry_over_the_new_owners_graph() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let racing = GraphRace::on(&inner);
+        let old_owner = test_state_on(Arc::clone(&racing) as Arc<dyn ObjectStore>);
+        let new_owner = Arc::new(test_state_on(Arc::clone(&inner)));
+        let job = JobId::new("j");
+
+        old_owner.accept_job(&job, "test", 0).expect("accept");
+        old_owner
+            .submit_job(job.clone(), &running_graph(&old_owner, "old-first"), None)
+            .await
+            .expect("submit");
+        write_stray_graph(&inner, &old_owner, "j", "stray").await;
+
+        *racing.before_head.lock().await = Some(take_over_and_save(&new_owner, &job));
+
+        old_owner
+            .save_job(&job, &running_graph(&old_owner, "old-second"))
+            .await
+            .expect("a superseded owner yields");
+
+        assert!(
+            racing.before_head.lock().await.is_none(),
+            "the takeover must have run"
+        );
+        assert_eq!(
+            stored_graph_session(&inner, &old_owner, "j").await,
+            "new",
+            "the new owner's graph must be kept"
+        );
+        assert!(
+            old_owner.local_jobs.get("j").is_none(),
+            "the superseded owner stops driving the job"
+        );
+    }
+
+    /// `new_owner` takes `job` over and saves a graph with session id `new`.
+    fn take_over_and_save(
+        new_owner: &Arc<TestState>,
+        job: &JobId,
+    ) -> futures::future::BoxFuture<'static, ()> {
+        let (new_owner, job) = (Arc::clone(new_owner), job.clone());
+        Box::pin(async move {
+            new_owner
+                .try_acquire_job(&job)
+                .await
+                .expect("acquire")
+                .expect("the new owner takes the job over");
+            let graph = running_graph(&new_owner, "new");
+            new_owner
+                .save_job(&job, &graph)
+                .await
+                .expect("the new owner saves");
+        })
+    }
+
+    /// Writes a graph for `job_id` straight to the store, outside any
+    /// scheduler's bookkeeping.
+    async fn write_stray_graph(
+        store: &Arc<dyn ObjectStore>,
+        state: &TestState,
+        job_id: &str,
+        session_id: &str,
+    ) {
+        let bytes =
+            execution_graph_to_bytes(running_graph(state, session_id).as_ref(), &state.codec)
+                .expect("encode");
+        store
+            .put(&state.graph_path(job_id), bytes.into())
+            .await
+            .expect("write the stray graph");
+    }
+
+    /// A removal whose graph delete failed leaves the graph behind.
+    #[tokio::test]
+    async fn a_submission_writes_over_a_graph_a_removed_job_left_behind() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_state_on(Arc::clone(&store));
+        let job = JobId::new("j");
+        write_stray_graph(&store, &state, "j", "orphan").await;
+
+        state.accept_job(&job, "test", 0).expect("accept");
+        state
+            .submit_job(job.clone(), &running_graph(&state, "fresh"), None)
+            .await
+            .expect("submit");
+
+        assert_eq!(stored_graph_session(&store, &state, "j").await, "fresh");
+        assert!(state.local_jobs.get("j").is_some());
+    }
+
+    /// A scheduler that takes a job over before its submitter writes the graph
+    /// keeps the job: the submitter neither replaces the graph nor removes the
+    /// new owner's metadata.
+    #[tokio::test]
+    async fn a_submission_keeps_the_claim_of_a_scheduler_that_took_the_job_over() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let racing = GraphRace::on(&inner);
+        let submitter = test_state_on(Arc::clone(&racing) as Arc<dyn ObjectStore>);
+        let new_owner = Arc::new(test_state_on(Arc::clone(&inner)));
+        let job = JobId::new("j");
+        write_stray_graph(&inner, &submitter, "j", "orphan").await;
+
+        *racing.before_write.lock().await = Some(take_over_and_save(&new_owner, &job));
+
+        submitter.accept_job(&job, "test", 0).expect("accept");
+        let outcome = submitter
+            .submit_job(job.clone(), &running_graph(&submitter, "submitted"), None)
+            .await;
+
+        assert!(outcome.is_err(), "the submitter does not own the job");
+        let meta = new_owner
+            .meta
+            .get("j")
+            .await
+            .expect("read meta")
+            .expect("the new owner's metadata must remain");
+        assert_eq!(meta.owner_instance_id, Some(new_owner.owner_instance_id));
+        assert_eq!(stored_graph_session(&inner, &submitter, "j").await, "new");
+        assert!(submitter.local_jobs.get("j").is_none());
+    }
+
+    /// The new owner's first graph write lands even when the scheduler it took the
+    /// job from wrote the graph after the takeover.
+    #[tokio::test]
+    async fn the_new_owner_writes_over_a_graph_the_old_owner_wrote_late() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let old_owner = Arc::new(test_state_on(Arc::clone(&inner)));
+        let racing = GraphRace::on(&inner);
+        let new_owner = test_state_on(Arc::clone(&racing) as Arc<dyn ObjectStore>);
+        let job = JobId::new("j");
+
+        old_owner.accept_job(&job, "test", 0).expect("accept");
+        old_owner
+            .submit_job(job.clone(), &running_graph(&old_owner, "old-first"), None)
+            .await
+            .expect("submit");
+        new_owner
+            .try_acquire_job(&job)
+            .await
+            .expect("acquire")
+            .expect("the new owner takes the job over");
+
+        // The old owner's graph write lands between the takeover and the new
+        // owner's first save.
+        let (late, store) = (Arc::clone(&old_owner), Arc::clone(&inner));
+        *racing.before_write.lock().await = Some(Box::pin(async move {
+            write_stray_graph(&store, &late, "j", "old-late").await;
+        }));
+
+        new_owner
+            .save_job(&job, &running_graph(&new_owner, "new"))
+            .await
+            .expect("the new owner saves");
+
+        assert_eq!(stored_graph_session(&inner, &new_owner, "j").await, "new");
+        assert!(
+            new_owner.local_jobs.get("j").is_some(),
+            "the new owner keeps driving the job"
+        );
+    }
+
+    /// A save begun under one generation that reaches the metadata after
+    /// another scheduler took the job over and this scheduler took it back is
+    /// refused: the generation it was made under is no longer held, even
+    /// though the owner is this scheduler again.
+    #[tokio::test]
+    async fn a_save_from_an_earlier_generation_is_refused_after_the_job_is_taken_back() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let racing = GraphRace::on(&inner);
+        let owner = Arc::new(test_state_on(Arc::clone(&racing) as Arc<dyn ObjectStore>));
+        let other = Arc::new(test_state_on(Arc::clone(&inner)));
+        let job = JobId::new("j");
+
+        owner.accept_job(&job, "test", 0).expect("accept");
+        owner
+            .submit_job(job.clone(), &running_graph(&owner, "first"), None)
+            .await
+            .expect("submit");
+
+        let (taker, retaker, job_id) = (Arc::clone(&other), Arc::clone(&owner), job.clone());
+        *racing.before_meta_read.lock().await = Some(Box::pin(async move {
+            taker
+                .try_acquire_job(&job_id)
+                .await
+                .expect("acquire")
+                .expect("another scheduler takes the job over");
+            retaker
+                .try_acquire_job(&job_id)
+                .await
+                .expect("acquire")
+                .expect("the first owner takes the job back");
+            retaker
+                .save_job(&job_id, &running_graph(&retaker, "current"))
+                .await
+                .expect("the current generation saves");
+        }));
+
+        owner
+            .save_job(&job, &running_graph(&owner, "stale"))
+            .await
+            .expect("a stale save yields");
+
+        assert!(
+            racing.before_meta_read.lock().await.is_none(),
+            "the takeovers must have run"
+        );
+        let meta = owner
+            .meta
+            .get("j")
+            .await
+            .expect("read meta")
+            .expect("the job's metadata");
+        assert_eq!(meta.owner_instance_id, Some(owner.owner_instance_id));
+        assert_eq!(meta.epoch, 2);
+        assert_eq!(
+            stored_graph_session(&inner, &owner, "j").await,
+            "current",
+            "the stale save must not replace the current generation's graph"
+        );
+        assert_eq!(
+            owner.local_jobs.get("j").map(|local| local.generation),
+            Some(2),
+            "the current generation keeps driving the job"
+        );
+    }
+
+    /// A save whose metadata write lands before another scheduler takes the
+    /// job over and this scheduler takes it back does not write its graph on
+    /// the version the later generation recorded.
+    #[tokio::test]
+    async fn a_save_paused_after_its_metadata_write_does_not_replace_a_later_generations_graph() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let racing = GraphRace::on(&inner);
+        let owner = Arc::new(test_state_on(Arc::clone(&racing) as Arc<dyn ObjectStore>));
+        let other = Arc::new(test_state_on(Arc::clone(&inner)));
+        let job = JobId::new("j");
+
+        owner.accept_job(&job, "test", 0).expect("accept");
+        owner
+            .submit_job(job.clone(), &running_graph(&owner, "first"), None)
+            .await
+            .expect("submit");
+
+        let (taker, retaker, job_id) = (Arc::clone(&other), Arc::clone(&owner), job.clone());
+        *racing.after_meta_write.lock().await = Some(Box::pin(async move {
+            taker
+                .try_acquire_job(&job_id)
+                .await
+                .expect("acquire")
+                .expect("another scheduler takes the job over");
+            retaker
+                .try_acquire_job(&job_id)
+                .await
+                .expect("acquire")
+                .expect("the first owner takes the job back");
+            retaker
+                .save_job(&job_id, &running_graph(&retaker, "current"))
+                .await
+                .expect("the current generation saves");
+        }));
+
+        owner
+            .save_job(&job, &running_graph(&owner, "stale"))
+            .await
+            .expect("a stale save yields");
+
+        assert!(
+            racing.after_meta_write.lock().await.is_none(),
+            "the takeovers must have run"
+        );
+        assert_eq!(
+            stored_graph_session(&inner, &owner, "j").await,
+            "current",
+            "the stale save must not replace the current generation's graph"
+        );
+        assert_eq!(
+            owner.local_jobs.get("j").map(|local| local.generation),
+            Some(2),
+            "the current generation keeps driving the job"
         );
     }
 }
