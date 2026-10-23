@@ -50,7 +50,7 @@ use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
 use data_accelerator_api::{
     AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, keep_first,
-    upsert_dedup,
+    pk_write_guard, upsert_dedup,
 };
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_checkpoint_api::CheckpointError;
@@ -638,6 +638,18 @@ impl DataAccelerator for SqliteAccelerator {
             &cmd.options,
             cmd.constraints.clone(),
         );
+        // Validate NULL primary keys and in-batch duplicates before SQLite
+        // sees the stream. SQLite's sink otherwise reports a failed write as
+        // `Query is not read-only` (#14757), and a non-INTEGER PRIMARY KEY
+        // accepts NULL. `keep_first` sits above this so `on_conflict: drop`
+        // still keeps the first copy rather than failing the repeat.
+        let write_provider = pk_write_guard::wrap_with_pk_write_guard_if_needed(
+            write_provider,
+            cmd.schema.as_arrow(),
+            &cmd.constraints,
+            pk_write_guard::GuardStrategy::CollectThenInsert,
+            None,
+        );
         // The per-batch uniqueness check refuses a key repeated within one
         // write before `ON CONFLICT DO NOTHING` can drop it, so `drop` keeps
         // the first copy here.
@@ -1076,6 +1088,162 @@ mod tests {
         assert_eq!(
             id_v_rows(&table).await,
             vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
+    }
+
+    fn nullable_id_v_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, true),
+            arrow::datatypes::Field::new("v", DataType::Utf8, false),
+        ]))
+    }
+
+    fn nullable_id_v_batch(rows: &[(Option<i64>, &str)]) -> RecordBatch {
+        RecordBatch::try_new(
+            nullable_id_v_schema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("nullable batch should be created")
+    }
+
+    async fn upsert_id_v_table(
+        name: &str,
+        schema: Arc<Schema>,
+    ) -> Arc<dyn datafusion::datasource::TableProvider> {
+        let external_table = CreateExternalTable {
+            schema: ToDFSchema::to_dfschema_ref(schema).expect("df schema"),
+            name: TableReference::bare(name),
+            locations: vec![],
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: [("on_conflict".to_string(), "upsert:id".to_string())]
+                .into_iter()
+                .collect(),
+            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        SqliteAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("table should be created")
+    }
+
+    async fn write_should_fail(
+        table: &Arc<dyn datafusion::datasource::TableProvider>,
+        exec: MockExec,
+    ) -> datafusion::error::DataFusionError {
+        let ctx = SessionContext::new();
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion should be planned");
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect_err("the write must fail")
+    }
+
+    /// Regression: a NULL primary key must be rejected, matching `DuckDB` and Cayenne.
+    #[tokio::test]
+    async fn insert_rejects_a_null_primary_key() {
+        let table = upsert_id_v_table("null_pk", nullable_id_v_schema()).await;
+        let error = write_should_fail(
+            &table,
+            MockExec::new(
+                vec![Ok(nullable_id_v_batch(&[(None, "nullpk")]))],
+                nullable_id_v_schema(),
+            ),
+        )
+        .await;
+        let message = error.to_string();
+        assert!(
+            message.contains("Primary key") && message.contains("null"),
+            "NULL primary key must be rejected as a null key, got: {message}"
+        );
+        assert!(
+            !message.contains("Query is not read-only"),
+            "NULL primary key must not be mis-reported as read-only, got: {message}"
+        );
+
+        let rows = {
+            let ctx = SessionContext::new();
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should be planned");
+            collect(scan, ctx.task_ctx()).await.expect("scan")
+        };
+        let null_ids = rows.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert_eq!(
+            null_ids, 0,
+            "a rejected NULL primary key must not insert a row"
+        );
+    }
+
+    /// Regression: an in-batch duplicate key must surface the uniqueness
+    /// constraint, not `Query is not read-only` (#14757).
+    #[tokio::test]
+    async fn insert_reports_uniqueness_for_an_in_batch_duplicate_key() {
+        let table = upsert_id_v_table("dup_key", id_v_schema()).await;
+        let error = write_should_fail(
+            &table,
+            MockExec::new(
+                vec![Ok(id_v_batch(&[(5001, "a"), (5001, "b")]))],
+                id_v_schema(),
+            ),
+        )
+        .await;
+        let message = error.to_string();
+        assert!(
+            message.contains("uniqueness")
+                || message.contains("UNIQUE")
+                || message.contains("constraint"),
+            "in-batch duplicate key must name the uniqueness constraint, got: {message}"
+        );
+        assert!(
+            !message.contains("Query is not read-only"),
+            "in-batch duplicate key must not be mis-reported as read-only, got: {message}"
+        );
+    }
+
+    /// Regression for #14757: a failed input stream must report the stream
+    /// error, not `Query is not read-only`.
+    #[tokio::test]
+    async fn insert_reports_the_input_stream_error() {
+        let table = upsert_id_v_table("stream_err", id_v_schema()).await;
+        let error = write_should_fail(
+            &table,
+            MockExec::new(
+                vec![
+                    Ok(id_v_batch(&[(1, "ok")])),
+                    Err(datafusion::error::DataFusionError::Execution(
+                        "Arrow error: Parser error: Error while parsing value 'not-a-number' as type 'Int64'".to_string(),
+                    )),
+                ],
+                id_v_schema(),
+            ),
+        )
+        .await;
+        let message = error.to_string();
+        assert!(
+            message.contains("not-a-number") || message.contains("Parser error"),
+            "the stream's parse error must be reported, got: {message}"
+        );
+        assert!(
+            !message.contains("Query is not read-only"),
+            "a failed input stream must not be mis-reported as read-only, got: {message}"
         );
     }
 
