@@ -1849,6 +1849,13 @@ impl AcceleratedTable {
         matches!(self.write_mode, WriteMode::AcceleratorOnly)
     }
 
+    /// Whether writes go to the federated source, from which the refresh
+    /// propagates them to the accelerator.
+    #[must_use]
+    pub fn is_write_through(&self) -> bool {
+        matches!(self.write_mode, WriteMode::WriteThrough)
+    }
+
     /// Why `operation` is refused on this node, if it is: on a scheduler, a table whose
     /// writes go only to the accelerator. Executors hold the acceleration and serve every
     /// read; the scheduler's own accelerator is never loaded or read, so the write would
