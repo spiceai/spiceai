@@ -281,6 +281,10 @@ impl SpiceJsonFormat {
     /// Values are not type-merged: an unregistered key that is a number in one
     /// record and an object in another is still one key.
     ///
+    /// When `flatten_json` is set, a null-valued key that is the parent path of
+    /// a name in `registered` is skipped so `{"user": null}` does not look like
+    /// a rename of `user.name`.
+    ///
     /// The count is `0` for an empty array, an empty pointer target, or blank
     /// JSONL. An empty object (`{}` / `[{}]`) is one record with no keys.
     ///
@@ -294,6 +298,7 @@ impl SpiceJsonFormat {
         _state: &dyn Session,
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
+        registered: &BTreeSet<String>,
     ) -> Result<JsonKeyProbe> {
         let mut keys = BTreeSet::new();
         let mut records_to_read = self
@@ -328,7 +333,7 @@ impl SpiceJsonFormat {
                     raw_buf
                 }
             };
-            self.collect_keys_from_raw_buf(&raw_buf, &mut take_while, &mut keys)?;
+            self.collect_keys_from_raw_buf(&raw_buf, &mut take_while, registered, &mut keys)?;
             if records_to_read == 0 {
                 break;
             }
@@ -341,6 +346,7 @@ impl SpiceJsonFormat {
         &self,
         raw_buf: &[u8],
         take_while: &mut dyn FnMut() -> bool,
+        registered: &BTreeSet<String>,
         keys: &mut BTreeSet<String>,
     ) -> Result<()> {
         let is_soda = self.options.format == Format::Soda
@@ -381,6 +387,7 @@ impl SpiceJsonFormat {
             self.options.format,
             take_while,
             self.options.flatten_json.as_deref(),
+            registered,
             keys,
         )
     }
@@ -823,13 +830,42 @@ fn infer_json_schema_for_format(
 fn collect_record_keys(
     value: &serde_json::Value,
     flatten_separator: Option<&str>,
+    registered: &BTreeSet<String>,
     keys: &mut BTreeSet<String>,
 ) {
     let flattened = flatten_separator.map(|sep| flatten_json_obj(value, sep));
     let object = flattened.as_ref().unwrap_or(value).as_object();
     if let Some(object) = object {
-        keys.extend(object.keys().cloned());
+        for (key, val) in object {
+            if is_null_parent_of_registered(key, val, flatten_separator, registered) {
+                continue;
+            }
+            keys.insert(key.clone());
+        }
     }
+}
+
+/// `{"user": null}` flattens to key `user`. A registered `user.name` then
+/// looks missing while `user` looks new, which the drift guard reads as a
+/// rename. Skip that null parent so the missing child is a sparse nullable.
+fn is_null_parent_of_registered(
+    key: &str,
+    value: &serde_json::Value,
+    flatten_separator: Option<&str>,
+    registered: &BTreeSet<String>,
+) -> bool {
+    let Some(separator) = flatten_separator else {
+        return false;
+    };
+    if !value.is_null() {
+        return false;
+    }
+    registered.iter().any(|name| {
+        name.starts_with(key)
+            && name
+                .get(key.len()..)
+                .is_some_and(|rest| rest.starts_with(separator))
+    })
 }
 
 /// Collect top-level object keys from `buf` using the same array / object /
@@ -840,6 +876,7 @@ fn collect_json_keys_for_format(
     format: Format,
     take_while: &mut dyn FnMut() -> bool,
     flatten_separator: Option<&str>,
+    registered: &BTreeSet<String>,
     keys: &mut BTreeSet<String>,
 ) -> Result<()> {
     let buf = buf.strip_prefix(&UTF8_BOM).unwrap_or(buf);
@@ -848,7 +885,7 @@ fn collect_json_keys_for_format(
         let value: serde_json::Value =
             serde_json::from_slice(buf).map_err(|e| DataFusionError::External(Box::new(e)))?;
         take_while();
-        collect_record_keys(&value, flatten_separator, keys);
+        collect_record_keys(&value, flatten_separator, registered, keys);
         return Ok(());
     }
 
@@ -870,7 +907,7 @@ fn collect_json_keys_for_format(
         let mut adapter = ArrayToNdjson::try_new(reader)?;
         let iter = ValueIter::new(&mut adapter, None);
         for value in iter.take_while(|_| take_while()) {
-            collect_record_keys(&value?, flatten_separator, keys);
+            collect_record_keys(&value?, flatten_separator, registered, keys);
         }
         return Ok(());
     }
@@ -880,14 +917,14 @@ fn collect_json_keys_for_format(
         && value.is_object()
     {
         take_while();
-        collect_record_keys(&value, flatten_separator, keys);
+        collect_record_keys(&value, flatten_separator, registered, keys);
         return Ok(());
     }
 
     let mut reader = BufReader::new(std::io::Cursor::new(buf));
     let iter = ValueIter::new(&mut reader, None);
     for value in iter.take_while(|_| take_while()) {
-        collect_record_keys(&value?, flatten_separator, keys);
+        collect_record_keys(&value?, flatten_separator, registered, keys);
     }
     Ok(())
 }
@@ -1056,8 +1093,15 @@ mod tests {
             true
         };
         let mut keys = BTreeSet::new();
-        collect_json_keys_for_format(buf.as_bytes(), Format::Jsonl, &mut take, None, &mut keys)
-            .expect("key collection does not merge types");
+        collect_json_keys_for_format(
+            buf.as_bytes(),
+            Format::Jsonl,
+            &mut take,
+            None,
+            &BTreeSet::new(),
+            &mut keys,
+        )
+        .expect("key collection does not merge types");
         assert_eq!(n, 2);
         assert_eq!(
             keys,
@@ -1073,8 +1117,15 @@ mod tests {
             true
         };
         let mut keys = BTreeSet::new();
-        collect_json_keys_for_format(b"[]", Format::Array, &mut take, None, &mut keys)
-            .expect("empty array");
+        collect_json_keys_for_format(
+            b"[]",
+            Format::Array,
+            &mut take,
+            None,
+            &BTreeSet::new(),
+            &mut keys,
+        )
+        .expect("empty array");
         assert_eq!(n, 0);
         assert!(keys.is_empty());
     }
@@ -1087,10 +1138,87 @@ mod tests {
             true
         };
         let mut keys = BTreeSet::new();
-        collect_json_keys_for_format(b"[{}]", Format::Array, &mut take, None, &mut keys)
-            .expect("empty object is one record");
+        collect_json_keys_for_format(
+            b"[{}]",
+            Format::Array,
+            &mut take,
+            None,
+            &BTreeSet::new(),
+            &mut keys,
+        )
+        .expect("empty object is one record");
         assert_eq!(n, 1);
         assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn collect_json_keys_skips_a_null_flatten_parent_of_a_registered_column() {
+        let registered = BTreeSet::from(["user.name".to_string()]);
+        let mut n = 0;
+        let mut take = || {
+            n += 1;
+            true
+        };
+        let mut keys = BTreeSet::new();
+        collect_json_keys_for_format(
+            br#"{"id":1,"user":null}"#,
+            Format::Jsonl,
+            &mut take,
+            Some("."),
+            &registered,
+            &mut keys,
+        )
+        .expect("null parent of a registered child");
+        assert_eq!(n, 1);
+        assert_eq!(
+            keys,
+            BTreeSet::from(["id".to_string()]),
+            "null parent of user.name must not appear as an extra key"
+        );
+    }
+
+    #[test]
+    fn collect_json_keys_keeps_a_null_flatten_key_that_is_not_a_registered_parent() {
+        let registered = BTreeSet::from(["id".to_string()]);
+        let mut n = 0;
+        let mut take = || {
+            n += 1;
+            true
+        };
+        let mut keys = BTreeSet::new();
+        collect_json_keys_for_format(
+            br#"{"id":1,"user":null}"#,
+            Format::Jsonl,
+            &mut take,
+            Some("."),
+            &registered,
+            &mut keys,
+        )
+        .expect("unrelated null key");
+        assert_eq!(n, 1);
+        assert_eq!(keys, BTreeSet::from(["id".to_string(), "user".to_string()]));
+    }
+
+    #[test]
+    fn collect_json_keys_keeps_a_non_null_flatten_parent() {
+        let registered = BTreeSet::from(["user.name".to_string()]);
+        let mut n = 0;
+        let mut take = || {
+            n += 1;
+            true
+        };
+        let mut keys = BTreeSet::new();
+        collect_json_keys_for_format(
+            br#"{"user":"alice"}"#,
+            Format::Jsonl,
+            &mut take,
+            Some("."),
+            &registered,
+            &mut keys,
+        )
+        .expect("scalar parent");
+        assert_eq!(n, 1);
+        assert_eq!(keys, BTreeSet::from(["user".to_string()]));
     }
 
     #[test]

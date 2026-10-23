@@ -8,6 +8,7 @@ A CSV file dataset with `has_header` true binds columns by header name. Reorderi
 - `csv-rename` renames `amount_cents` to `amt`. Federated reads return `NULL` for `amount_cents` and one `WARN`. An Arrow refresh fails; status is `Error`; accelerated sums stay `300`/`30`.
 - `csv-restore` puts the original header back. Federated sums return; a refresh succeeds; status is `Ready`.
 - `csv-cluster-name-binding` a headered CSV scan serializes as a header-projection node, not a positional `CsvScan`. After the plan is decoded, a reordered header still returns `sum(amount_cents)=300`, `sum(user_id)=30`. Compression (`file_compression_type`) is carried on the node so a gzip/bzip2 scan still decompresses on the executor.
+- `csv-generation-pin` the header `get_range` and the inner `CsvOpener` `get` are pinned to the listed `ETag` and/or version when `ObjectMeta` has either. Replacing the object with reordered columns between those reads fails with a precondition error instead of swapping same-typed values. Stores that list neither stay two unpinned reads. Proof is `replacing_the_object_between_header_and_data_reads_fails_the_scan`.
 
 ## How to get to it (user POV)
 
@@ -30,6 +31,7 @@ Preconditions:
 - **Restore.** Rewrite the baseline header and rows. Query `csv_fed` (`300`/`30`). Refresh `csv_acc` until `Ready`. Query `csv_acc` (`300`/`30`).
 - **Proof.** Keep `sql-*-csv_*.json`, `datasets-*.json`, `refresh-*-csv_acc.*`, and the matching `WARN` / error lines from `spiced.log`.
 - **Cluster name-binding.** The HTTP helper is a single `spiced` and does not start a scheduler/executor. `header_projected_csv_codec_round_trip_keeps_name_binding` and `header_projected_csv_codec_round_trip_keeps_gzip_name_binding` encode a scan of a reordered-header CSV (plain and gzip) through `SpicePhysicalCodec` and execute the decoded plan; sums stay `300`/`30`, the source stays `HeaderProjectedCsvSource`, and gzip keeps `FileCompressionType::GZIP`.
+- **Generation pin.** The HTTP helper does not replace an object between the header read and the data read. `replacing_the_object_between_header_and_data_reads_fails_the_scan` does that on an in-memory store with ETags and requires a precondition error, not swapped `30`/`300`.
 
 ## Gotchas
 

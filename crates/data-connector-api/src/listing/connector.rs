@@ -3518,6 +3518,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_listing_table_allows_json_flatten_null_parent_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"user":{"name":"a"},"amount_cents":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"user":{"name":"b"},"amount_cents":200,"ts":"t1"}"#,
+            ],
+        );
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "json".to_string());
+        params.insert("flatten_json".to_string(), "true".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("flattened json format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+        assert!(
+            file_format
+                .as_ref()
+                .downcast_ref::<SpiceJsonFormat>()
+                .is_some_and(|json| json.options().flatten_json.as_deref() == Some(".")),
+            "listing must enable flatten_json so user.name is a registered column"
+        );
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"user":null,"amount_cents":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"user":null,"amount_cents":200,"ts":"t1"}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "a flattened null parent is NULL for user.name on a federated read"
+        );
+        assert_eq!(
+            csv_listing_sums(provider, true).await,
+            (Some(300), Some(30)),
+            "user becoming null in every record must not fail refresh"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_file_format_and_extension_tsv_from_params() {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "tsv".to_string());

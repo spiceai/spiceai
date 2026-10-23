@@ -102,7 +102,7 @@ The mapped journeys are in `features/`. Drive them with:
   --label "$LABEL"
 ```
 
-`$LABEL` is `trunk` or `branch`. The helper writes, then queries, for baseline → reorder → rename → restore → empty-JSON on CSV, JSONL, `file_format: json` (array), and `json_pointer`, federated and Arrow-accelerated. Federated reads see the file immediately. Accelerated reads see it only after refresh. Emptying the JSON sources (`[]` / `{"data":[]}` / blank JSONL) must clear the JSON accelerations; CSV stays populated. An unregistered JSON key that changes type after registration is not in this HTTP drive; prove it with `create_listing_table_allows_json_unregistered_field_type_change_on_refresh`.
+`$LABEL` is `trunk` or `branch`. The helper writes, then queries, for baseline → reorder → rename → restore → empty-JSON on CSV, JSONL, `file_format: json` (array), and `json_pointer`, federated and Arrow-accelerated. Federated reads see the file immediately. Accelerated reads see it only after refresh. Emptying the JSON sources (`[]` / `{"data":[]}` / blank JSONL) must clear the JSON accelerations; CSV stays populated. An unregistered JSON key that changes type after registration is not in this HTTP drive; prove it with `create_listing_table_allows_json_unregistered_field_type_change_on_refresh`. A flattened object that becomes null is not in this HTTP drive; prove it with `json_refresh_allows_a_flattened_object_that_becomes_null` and `create_listing_table_allows_json_flatten_null_parent_refresh`. A mid-scan CSV replacement is not in this HTTP drive; prove it with `replacing_the_object_between_header_and_data_reads_fails_the_scan`.
 
 ## Evidence
 
@@ -150,4 +150,4 @@ Sends `TERM` (then `KILL` if needed) only to the pid in `$WORK_DIR/spiced.pid` w
 
 ## Feature map
 
-See `features/README.md`. Seeded journeys: CSV, JSONL, `file_format: json`, and `json_pointer` reorder / rename / restore. Both federated and Arrow-accelerated. An unregistered JSON key that changes type after registration is proven by `create_listing_table_allows_json_unregistered_field_type_change_on_refresh`.
+See `features/README.md`. Seeded journeys: CSV, JSONL, `file_format: json`, and `json_pointer` reorder / rename / restore. Both federated and Arrow-accelerated. An unregistered JSON key that changes type after registration is proven by `create_listing_table_allows_json_unregistered_field_type_change_on_refresh`. A flattened object that becomes null (`user` → `null` with registered `user.name`) is proven by `json_refresh_allows_a_flattened_object_that_becomes_null` and `create_listing_table_allows_json_flatten_null_parent_refresh`. A mid-scan CSV object replacement is proven by `replacing_the_object_between_header_and_data_reads_fails_the_scan`.

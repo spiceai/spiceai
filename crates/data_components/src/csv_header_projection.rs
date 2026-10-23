@@ -51,8 +51,13 @@ use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource_csv::source::{CsvOpener, CsvSource};
+use futures::stream::BoxStream;
 use futures::{StreamExt, stream};
-use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+use object_store::path::Path as ObjectStorePath;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+};
 
 /// Initial object prefix read when parsing the header. The probe grows from
 /// byte 0 until a quote-aware header record is available, or the whole object
@@ -371,6 +376,11 @@ impl FileOpener for HeaderMappedOpener {
         }
 
         Ok(Box::pin(async move {
+            // CsvOpener reads with GetOptions::default() and cannot take an
+            // if_match/version without a fork. Pinning the store injects the
+            // listed generation on both this header get_range and that opener
+            // get. Stores that list neither an ETag nor a version stay unwrapped.
+            let store = pin_store_to_listed_generation(store, &partitioned_file.object_meta);
             let header =
                 read_csv_header(&store, &partitioned_file.object_meta, &options, compression)
                     .await?;
@@ -391,6 +401,110 @@ impl FileOpener for HeaderMappedOpener {
                 .map(move |batch| batch.and_then(|b| project_record_batch(&b, &target)))
                 .boxed())
         }))
+    }
+}
+
+/// Wraps `store` so every `get_opts` for `meta.location` sends the listed
+/// `ETag` as `If-Match` and/or the listed version. A replacement mid-scan
+/// then fails the second read instead of binding another file's columns.
+///
+/// Smaller than forking `CsvOpener` (it has no pin hook) and smaller than
+/// reading the whole object once to parse the header from the data stream
+/// (that would pull compressed objects into memory and change the streaming
+/// opener). Stores without a generation are returned unchanged.
+#[must_use]
+fn pin_store_to_listed_generation(
+    store: Arc<dyn ObjectStore>,
+    meta: &ObjectMeta,
+) -> Arc<dyn ObjectStore> {
+    if meta.e_tag.is_none() && meta.version.is_none() {
+        return store;
+    }
+    Arc::new(GenerationPinnedStore {
+        inner: store,
+        location: meta.location.clone(),
+        if_match: meta.e_tag.clone(),
+        version: meta.version.clone(),
+    })
+}
+
+#[derive(Debug)]
+struct GenerationPinnedStore {
+    inner: Arc<dyn ObjectStore>,
+    location: ObjectStorePath,
+    if_match: Option<String>,
+    version: Option<String>,
+}
+
+impl std::fmt::Display for GenerationPinnedStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GenerationPinnedStore")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for GenerationPinnedStore {
+    fn list(
+        &self,
+        prefix: Option<&ObjectStorePath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn put_opts(
+        &self,
+        location: &ObjectStorePath,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjectStorePath,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectStorePath,
+        mut options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        if location == &self.location {
+            if options.if_match.is_none() {
+                options.if_match.clone_from(&self.if_match);
+            }
+            if options.version.is_none() {
+                options.version.clone_from(&self.version);
+            }
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<ObjectStorePath>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectStorePath>> {
+        self.inner.delete_stream(locations)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectStorePath>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &ObjectStorePath,
+        to: &ObjectStorePath,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -653,9 +767,18 @@ mod tests {
     use datafusion::datasource::listing::{
         ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
     };
-    use datafusion::prelude::SessionContext;
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult,
+    };
     use std::fmt::Write;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn header_probe_len() -> usize {
         usize::try_from(HEADER_PROBE_BYTES).expect("header probe fits usize")
@@ -1177,5 +1300,147 @@ mod tests {
             .await
             .expect("query after growing past leading blank records");
         assert_eq!(sums, (Some(300), Some(30)));
+    }
+
+    /// Serves the original object until the first ranged body `GET`, then
+    /// replaces it. Listing `HEAD`/`list` must not count: those are not the
+    /// header read. The header probe is `get_range`; `CsvOpener` is an
+    /// unranged `get_opts`.
+    #[derive(Debug)]
+    struct ReplaceAfterFirstRangeRead {
+        inner: InMemory,
+        replacement: bytes::Bytes,
+        replaced: AtomicBool,
+    }
+
+    impl ReplaceAfterFirstRangeRead {
+        fn new(replacement: &str) -> Self {
+            Self {
+                inner: InMemory::new(),
+                replacement: bytes::Bytes::copy_from_slice(replacement.as_bytes()),
+                replaced: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl std::fmt::Display for ReplaceAfterFirstRangeRead {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ReplaceAfterFirstRangeRead")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ReplaceAfterFirstRangeRead {
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let is_range_body = !options.head && options.range.is_some();
+            let result = self.inner.get_opts(location, options).await?;
+            if is_range_body && !self.replaced.swap(true, Ordering::SeqCst) {
+                self.inner
+                    .put(location, self.replacement.clone().into())
+                    .await?;
+            }
+            Ok(result)
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn replacing_the_object_between_header_and_data_reads_fails_the_scan() {
+        const ORIGINAL: &str =
+            "event_id,user_id,region,amount_cents,ts\n1,10,us,100,t0\n2,20,eu,200,t1\n";
+        const REORDERED: &str =
+            "event_id,amount_cents,region,user_id,ts\n1,100,us,10,t0\n2,200,eu,20,t1\n";
+
+        let store = Arc::new(ReplaceAfterFirstRangeRead::new(REORDERED));
+        let location = ObjectPath::from("base.csv");
+        store
+            .put(&location, ORIGINAL.as_bytes().to_vec().into())
+            .await
+            .expect("store the original csv");
+        let listed = store.head(&location).await.expect("head original");
+        assert!(
+            listed.e_tag.is_some(),
+            "InMemory must report an ETag so the scan has something to pin"
+        );
+
+        let ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_collect_statistics(false));
+        let url = ObjectStoreUrl::parse("memory://csv-pin").expect("store url");
+        ctx.runtime_env()
+            .register_object_store(url.as_ref(), Arc::clone(&store) as Arc<dyn ObjectStore>);
+        let table_url = ListingTableUrl::parse("memory://csv-pin/base.csv").expect("listing url");
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(ListingOptions::new(header_format()).with_file_extension(".csv"))
+            .with_schema(registered_schema());
+        ctx.register_table(
+            "base",
+            Arc::new(ListingTable::try_new(config).expect("listing table")),
+        )
+        .expect("register");
+
+        let message = ctx
+            .sql("SELECT sum(amount_cents), sum(user_id) FROM base")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err(
+                "replacing the object between the header read and the data read must not bind the new header",
+            )
+            .to_string();
+        assert!(
+            message.to_ascii_lowercase().contains("precondition"),
+            "expected a generation precondition, not swapped columns: {message}"
+        );
     }
 }

@@ -411,7 +411,7 @@ impl FileSchemaDriftGuard {
         for chunk in std::iter::once(newest).chain(rest.chunks(SCHEMA_PROBE_CONCURRENCY)) {
             let probes: Vec<_> = chunk
                 .iter()
-                .map(|file| probe_json_file(&self.format, state, store, file))
+                .map(|file| probe_json_file(&self.format, state, store, file, &registered))
                 .collect();
             for probe in futures::future::join_all(probes).await {
                 let probe = probe?;
@@ -519,13 +519,14 @@ async fn probe_json_file(
     state: &dyn Session,
     store: &Arc<dyn object_store::ObjectStore>,
     file: &ObjectMeta,
+    registered: &BTreeSet<String>,
 ) -> DFResult<JsonKeyProbe> {
     let files = std::slice::from_ref(file);
     if let Some(json) = format.as_ref().downcast_ref::<SpiceJsonFormat>() {
         return json
             .clone()
             .with_schema_infer_max_rec(usize::MAX)
-            .probe_keys(state, store, files)
+            .probe_keys(state, store, files, registered)
             .await;
     }
     if let Some(json) = format.as_ref().downcast_ref::<JsonFormat>() {
@@ -536,7 +537,7 @@ async fn probe_json_file(
             .with_format(Format::Jsonl)
             .with_schema_infer_max_rec(usize::MAX)
             .with_file_compression_type(compression)
-            .probe_keys(state, store, files)
+            .probe_keys(state, store, files, registered)
             .await;
     }
     Err(DataFusionError::Internal(
@@ -1257,6 +1258,60 @@ mod tests {
             .await
             .expect("an unregistered key that changes type must not fail refresh");
         assert_eq!(single_value(&refreshed), Some(3));
+    }
+
+    #[tokio::test]
+    async fn json_refresh_allows_a_flattened_object_that_becomes_null() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_ndjson(
+            &dir.path().join("base.json"),
+            &[
+                r#"{"id":1,"user":{"name":2}}"#,
+                r#"{"id":3,"user":{"name":4}}"#,
+            ],
+        );
+        let table = guarded_spice_json_table(
+            dir.path(),
+            &["id", "user.name"],
+            SpiceJsonFormat::default()
+                .with_format(Format::Jsonl)
+                .with_flatten_json(".".to_string()),
+        );
+        let before = query(
+            &table,
+            true,
+            r#"SELECT sum(id), sum("user.name") FROM base"#,
+        )
+        .await
+        .expect("refresh before user becomes null");
+        assert_eq!(two_values(&before), (Some(4), Some(6)));
+
+        write_ndjson(
+            &dir.path().join("base.json"),
+            &[r#"{"id":1,"user":null}"#, r#"{"id":3,"user":null}"#],
+        );
+
+        let federated = query(
+            &table,
+            false,
+            r#"SELECT sum(id), sum("user.name") FROM base"#,
+        )
+        .await
+        .expect("federated flattened null parent");
+        assert_eq!(two_values(&federated), (Some(4), None));
+
+        let refreshed = query(
+            &table,
+            true,
+            r#"SELECT sum(id), sum("user.name") FROM base"#,
+        )
+        .await
+        .expect("a flattened object that becomes null is not a rename");
+        assert_eq!(
+            two_values(&refreshed),
+            (Some(4), None),
+            "refresh loads NULL for user.name instead of failing"
+        );
     }
 
     #[tokio::test]

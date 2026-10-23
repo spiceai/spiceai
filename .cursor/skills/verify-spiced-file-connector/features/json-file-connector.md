@@ -13,6 +13,7 @@ A JSON/NDJSON file dataset binds object keys by name. Reordering keys keeps valu
 - `json-array` is `file_format: json` over `data/events.json` (a JSON array). Same reorder / rename / restore / empty as JSONL.
 - `json-pointer` is `file_format: json` plus `json_pointer: /data` over `data/events_pointer.json` (`{"data":[...]}`). Same reorder / rename / restore / empty as JSONL.
 - `json-unregistered-type-change` adds an unregistered key after registration and changes its type (`extra: 1` then `extra: {}`). Federated sums stay `300`/`30`. An Arrow refresh succeeds (`Ready`). The normal scan ignores unregistered fields; the drift probe must not type-merge them.
+- `json-flatten-null-parent` with `flatten_json: true` rewrites a nested `user` object to `null` in every record. Federated `user.name` is `NULL`. An Arrow refresh succeeds (`Ready`) instead of treating the flattened key `user` as a rename of `user.name`. Proof is `json_refresh_allows_a_flattened_object_that_becomes_null` and `create_listing_table_allows_json_flatten_null_parent_refresh`. The HTTP helper does not rewrite that fixture.
 
 ## How to get to it (user POV)
 
@@ -44,3 +45,4 @@ Preconditions:
 - After `json_acc` is `Error`, `/v1/ready` may be `503`. Federated queries still run.
 - A sparse `amount_cents` that appears only after the first records is not a rename. Do not treat that file as the rename fixture.
 - An unregistered key that changes type after registration (`extra: 1` then `extra: {}`) is not a rename. The listing test `create_listing_table_allows_json_unregistered_field_type_change_on_refresh` is the proof; the HTTP helper does not rewrite that fixture.
+- A flattened object that becomes null (`{"user": {"name": ...}}` → `{"user": null}`) is not a rename. The drift probe skips that null parent of `user.name`; the reconstructed nested struct is nullable so the scan loads `NULL` for the child. The HTTP helper does not rewrite that fixture.
