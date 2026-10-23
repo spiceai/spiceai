@@ -370,11 +370,9 @@ pub(crate) struct ExtractedPrimaryKeys {
     pub(crate) row_keys: Vec<Box<[u8]>>,
 }
 
-/// An inline tombstone a keyed delete commits in the same catalog transaction as
-/// its deletion-vector files, then publishes to the inline cache.
+/// What publishing a keyed delete's inline tombstone needs once its row has been
+/// committed in the delete's catalog transaction.
 pub(crate) struct PreparedInlineDeleteTombstone {
-    /// The tombstone row; the catalog commit takes it.
-    pub(crate) tombstone: Option<crate::metadata::InlinedDelete>,
     pub(crate) delete_sequence: i64,
     pub(crate) int64_pk: Vec<i64>,
     pub(crate) row_keys: Vec<Box<[u8]>>,
@@ -390,7 +388,8 @@ pub(crate) struct InlinedDeleteMatches {
     pub(crate) keys: ExtractedPrimaryKeys,
     /// Every matched row, visible or held back above the published watermark.
     pub(crate) matched_rows: u64,
-    /// The matched rows that were visible.
+    /// The matched rows that were visible. Only these leave the live inline row
+    /// count: a held-back row joins it when it publishes.
     pub(crate) visible_rows: u64,
 }
 
@@ -697,9 +696,13 @@ impl DeletionSink for InlineAwareDeletionSink {
         let file_deleted = prepared_file_delete
             .as_ref()
             .map_or(0, super::delete::PreparedDeletionPublish::deleted_count);
-        let mut inline_tombstone = match inline_tombstone_keys {
-            Some(matches) => self.table.prepare_inline_delete_tombstone(matches).await?,
-            None => None,
+        let (tombstone_row, inline_tombstone) = match inline_tombstone_keys {
+            Some(matches) => self
+                .table
+                .prepare_inline_delete_tombstone(matches)
+                .await?
+                .unzip(),
+            None => (None, None),
         };
 
         if !inline_rewrite.is_empty()
@@ -720,9 +723,7 @@ impl DeletionSink for InlineAwareDeletionSink {
                     self.table.table_id(),
                     inline_rewrite.updated_data.clone(),
                     inline_rewrite.deleted_inlined_ids.clone(),
-                    inline_tombstone
-                        .as_mut()
-                        .and_then(|prepared| prepared.tombstone.take()),
+                    tombstone_row,
                 )
                 .await
             {

@@ -3024,7 +3024,7 @@ impl MetadataCatalog for CayenneCatalog {
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
         inline_tombstone: Option<InlinedDelete>,
-    ) -> CatalogResult<Option<String>> {
+    ) -> CatalogResult<()> {
         const MAX_PARAMS: usize = 32_000;
         const PARAMS_PER_DELETE_FILE: usize = 10;
 
@@ -3092,34 +3092,10 @@ impl MetadataCatalog for CayenneCatalog {
             })
             .await?;
         }
-        let tombstone_id = if let Some(tombstone) = inline_tombstone {
-            let inlined_id = if tombstone.inlined_id.is_empty() {
-                uuid::Uuid::now_v7().to_string()
-            } else {
-                tombstone.inlined_id
-            };
-            txn.execute(ExecuteParams {
-                sql: r"
-                INSERT INTO cayenne_inlined_delete
-                    (inlined_id, table_id, delete_ipc, delete_count, sequence_number, published)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ",
-                params: vec![
-                    MetastoreValue::Text(inlined_id.clone()),
-                    MetastoreValue::Text(tombstone.table_id),
-                    MetastoreValue::Blob(tombstone.delete_ipc),
-                    MetastoreValue::Integer(tombstone.delete_count),
-                    MetastoreValue::Integer(tombstone.sequence_number),
-                    MetastoreValue::Integer(i64::from(tombstone.published)),
-                ],
-            })
-            .await?;
-            Some(inlined_id)
-        } else {
-            None
-        };
-        txn.commit().await?;
-        Ok(tombstone_id)
+        if let Some(tombstone) = inline_tombstone {
+            txn.execute(inlined_delete_insert(tombstone).1).await?;
+        }
+        txn.commit().await
     }
 
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>> {
@@ -4924,28 +4900,8 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String> {
-        let inlined_id = if delete.inlined_id.is_empty() {
-            uuid::Uuid::now_v7().to_string()
-        } else {
-            delete.inlined_id
-        };
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: r"
-                INSERT INTO cayenne_inlined_delete
-                    (inlined_id, table_id, delete_ipc, delete_count, sequence_number, published)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ",
-                params: vec![
-                    MetastoreValue::Text(inlined_id.clone()),
-                    MetastoreValue::Text(delete.table_id),
-                    MetastoreValue::Blob(delete.delete_ipc),
-                    MetastoreValue::Integer(delete.delete_count),
-                    MetastoreValue::Integer(delete.sequence_number),
-                    MetastoreValue::Integer(i64::from(delete.published)),
-                ],
-            })
-            .await?;
+        let (inlined_id, insert) = inlined_delete_insert(delete);
+        self.metastore.execute_helper(insert).await?;
         Ok(inlined_id)
     }
 
@@ -5400,29 +5356,13 @@ impl MetadataCatalog for CayenneCatalog {
             }
 
             // Append the inline tombstone INSERT as the LAST statement before
-            // commit — same SQL/params as `add_inlined_delete`, with the id
+            // commit — the statement `add_inlined_delete` runs, with the id
             // pre-generated above so retries are idempotent. Preserves the
             // pre-fold ordering (the tombstone was written immediately after
             // `commit_on_conflict_deletions` returned) while making the two
             // writes one atomic, single-writer-acquisition transaction.
             if let Some(tombstone) = &tombstone_with_id
-                && let Err(e) = tx
-                    .execute(ExecuteParams {
-                        sql: r"
-                        INSERT INTO cayenne_inlined_delete
-                            (inlined_id, table_id, delete_ipc, delete_count, sequence_number, published)
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                        ",
-                        params: vec![
-                            MetastoreValue::Text(tombstone.inlined_id.clone()),
-                            MetastoreValue::Text(tombstone.table_id.clone()),
-                            MetastoreValue::Blob(tombstone.delete_ipc.clone()),
-                            MetastoreValue::Integer(tombstone.delete_count),
-                            MetastoreValue::Integer(tombstone.sequence_number),
-                            MetastoreValue::Integer(i64::from(tombstone.published)),
-                        ],
-                    })
-                    .await
+                && let Err(e) = tx.execute(inlined_delete_insert(tombstone.clone()).1).await
             {
                 if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
                     drop(tx);
@@ -5982,6 +5922,38 @@ const COLD_TIER_FILE_UPSERT_SQL: &str = "INSERT INTO cayenne_cold_tier_file \
      file_size_bytes = excluded.file_size_bytes, min_sequence = excluded.min_sequence, \
      max_sequence = excluded.max_sequence, statistics_blob = excluded.statistics_blob, \
      pk_bloom_blob = excluded.pk_bloom_blob";
+
+/// The one statement that appends a row to `cayenne_inlined_delete`. Shared by
+/// every inline-tombstone write path so the column list and parameter order
+/// cannot drift between them; see [`inlined_delete_insert`].
+const INLINED_DELETE_INSERT_SQL: &str = "INSERT INTO cayenne_inlined_delete \
+     (inlined_id, table_id, delete_ipc, delete_count, sequence_number, published) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+
+/// Bind one `cayenne_inlined_delete` row, minting a `UUIDv7` identity when the
+/// row carries none, and return that identity alongside the statement.
+fn inlined_delete_insert(delete: InlinedDelete) -> (String, ExecuteParams<'static>) {
+    let inlined_id = if delete.inlined_id.is_empty() {
+        uuid::Uuid::now_v7().to_string()
+    } else {
+        delete.inlined_id
+    };
+    let params = vec![
+        MetastoreValue::Text(inlined_id.clone()),
+        MetastoreValue::Text(delete.table_id),
+        MetastoreValue::Blob(delete.delete_ipc),
+        MetastoreValue::Integer(delete.delete_count),
+        MetastoreValue::Integer(delete.sequence_number),
+        MetastoreValue::Integer(i64::from(delete.published)),
+    ];
+    (
+        inlined_id,
+        ExecuteParams {
+            sql: INLINED_DELETE_INSERT_SQL,
+            params,
+        },
+    )
+}
 
 /// The one statement that appends a row to `cayenne_inlined_data`. Shared by
 /// every inline write path so the column list and parameter order cannot drift
@@ -8290,29 +8262,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_combined_delete_commits_an_inline_tombstone_with_its_delete_files() {
-        let (_table_root, base_path) = test_table_root();
-        let test_db = format!(
-            "sqlite://./.test_combined_delete_tombstone_{}.db",
-            uuid::Uuid::now_v7()
-        );
-        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
-        catalog.init().await.expect("Failed to initialize catalog");
-        let table_id = catalog
-            .create_table(CreateTableOptions {
-                table_name: "test_combined_delete_tombstone".to_string(),
-                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-                    "id",
-                    arrow_schema::DataType::Int64,
-                    false,
-                )])),
-                primary_key: vec!["id".to_string()],
-                on_conflict: None,
-                base_path: base_path.clone(),
-                partition_column: None,
-                vortex_config: crate::metadata::VortexConfig::default(),
-            })
-            .await
-            .expect("Failed to create table");
+        let (catalog, table_id, _base_path, _db_dir, _table_root) =
+            catalog_with_table("combined_delete_tombstone").await;
         let delete_file = DeleteFile {
             delete_file_id: String::new(),
             table_id: table_id.clone(),
@@ -8327,7 +8278,7 @@ mod tests {
             reinsert_sequence: None,
         };
 
-        let tombstone_id = catalog
+        catalog
             .commit_delete_files_with_inlined_rewrite(
                 vec![delete_file],
                 &table_id,
@@ -8344,8 +8295,7 @@ mod tests {
                 }),
             )
             .await
-            .expect("commit the delete with its inline tombstone")
-            .expect("the committed tombstone has an id");
+            .expect("commit the delete with its inline tombstone");
 
         assert_eq!(
             catalog
@@ -8360,15 +8310,11 @@ mod tests {
             .await
             .expect("get inline tombstones");
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].inlined_id, tombstone_id);
+        assert!(!stored[0].inlined_id.is_empty());
         assert_eq!(stored[0].delete_ipc, vec![4, 5, 6]);
+        assert_eq!(stored[0].delete_count, 1);
         assert_eq!(stored[0].sequence_number, 3);
         assert!(stored[0].published);
-
-        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(format!("{db_path}-shm"));
-        let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
     #[tokio::test]

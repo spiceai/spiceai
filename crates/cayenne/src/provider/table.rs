@@ -18342,12 +18342,13 @@ impl CayenneTableProvider {
     /// unchanged, so the next miss may extend the cached view with the delta
     /// instead of rebuilding it. Also advances `scan_input_version` so
     /// [`ScanViewReuse::UntilInvalidated`] recaptures rather than serving a
-    /// [`ScanView`] whose inlined batches predate the append. A published inline
-    /// tombstone takes this bump too: its removal is queued in
-    /// `pending_tombstone_deltas`, and the delta path applies it to the cached
-    /// entries. Use [`Self::bump_inlined_structural_epoch`] for any other
+    /// [`ScanView`] whose inlined batches predate the append. An inline tombstone
+    /// published through `pending_tombstone_deltas` (a keyed delete, a staged
+    /// upsert) takes this bump too: the delta path applies its removal to the
+    /// cached entries. Use [`Self::bump_inlined_structural_epoch`] for any other
     /// mutation that can change an already-materialized entry (rewrite, removal,
-    /// checkpoint, overwrite, recovery).
+    /// checkpoint, overwrite, recovery, or a synchronous on-conflict publish that
+    /// does not queue its removal).
     fn bump_inlined_generation(&self) {
         self.inlined_generation.fetch_add(1, Ordering::Release);
         // A pure inline append is baked into the captured ScanView's inlined
@@ -18367,9 +18368,10 @@ impl CayenneTableProvider {
     /// epoch (and on a miss correctly chooses the full rebuild). Must be used by
     /// every mutation that can retroactively change an already-materialized
     /// entry: an inline rewrite/removal, a checkpoint clear, an overwrite that
-    /// wipes the inline tables, and open-time orphan recovery. A published inline
-    /// tombstone is not one of them: the delta path re-filters cached entries
-    /// against its queued removal (see [`Self::bump_inlined_generation`]).
+    /// wipes the inline tables, and open-time orphan recovery. An inline tombstone
+    /// whose removal is queued in `pending_tombstone_deltas` is not one of them:
+    /// the delta path re-filters cached entries against it (see
+    /// [`Self::bump_inlined_generation`]).
     ///
     /// A mem-tier (RAM) append is deliberately EXEMPT even though it adds
     /// tombstones: those tombstones live in the tier snapshot, are never baked
@@ -31164,8 +31166,8 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Fire (and consume) the test-only post-snapshot-LIST hook, if one is
-    /// installed. See [`Self::test_post_snapshot_list_hook`].
+    /// Fire (and consume) the test-only delete-publish hook, if one is installed.
+    /// See [`Self::test_delete_publish_hook`].
     #[cfg(test)]
     async fn run_test_delete_publish_hook(&self) {
         let hook = self.test_delete_publish_hook.lock().take();
@@ -31174,6 +31176,8 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Fire (and consume) the test-only inline-delete-match hook, if one is
+    /// installed. See [`Self::test_inline_delete_match_hook`].
     #[cfg(test)]
     async fn run_test_inline_delete_match_hook(&self) {
         let hook = self.test_inline_delete_match_hook.lock().take();
@@ -31182,6 +31186,8 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Fire (and consume) the test-only post-snapshot-LIST hook, if one is
+    /// installed. See [`Self::test_post_snapshot_list_hook`].
     #[cfg(test)]
     async fn run_test_post_snapshot_list_hook(&self) {
         let hook = self.test_post_snapshot_list_hook.lock().take();
@@ -32689,7 +32695,7 @@ impl CayenneTableProvider {
     /// last `ArcSwap::store` wins. If a writer bumps the generation between the
     /// caller's load and this store, the stored entry simply misses next read and
     /// is recomputed — no data is lost or corrupted.
-    async fn populate_inlined_cache(&self, generation: u64) -> Result<()> {
+    async fn populate_inlined_cache(&self, generation: u64) -> Result<Arc<InlinedCache>> {
         // cycle-5 TASK 1: if the pending tombstone-delta queue has outgrown its
         // cap, take the bounded over-cap path (full rebuild + queue release). The
         // common per-batch single-tombstone case stays well under the cap and
@@ -32728,8 +32734,22 @@ impl CayenneTableProvider {
         // the ordered queue's back) — O(new deltas), not O(queue). The queue is
         // bounded by `rebuild_inlined_cache_over_cap` and fully cleared at
         // checkpoint/overwrite/recovery.
-        self.inlined_cache.store(Arc::new(new_cache));
-        Ok(())
+        let new_cache = Arc::new(new_cache);
+        self.inlined_cache.store(Arc::clone(&new_cache));
+        Ok(new_cache)
+    }
+
+    /// The inline cache entry for the live generation: the stored entry on a hit,
+    /// otherwise the entry this call populates. It is never reloaded after the
+    /// populate, so an older entry a concurrent miss stores meanwhile is not
+    /// returned in its place.
+    async fn current_inlined_cache(&self) -> Result<Arc<InlinedCache>> {
+        let generation = self.inlined_generation.load(Ordering::Acquire);
+        let cached = self.inlined_cache.load_full();
+        if cached.generation == generation {
+            return Ok(cached);
+        }
+        self.populate_inlined_cache(generation).await
     }
 
     /// Over-cap fallback for [`Self::populate_inlined_cache`] (cycle-5 TASK 1):
@@ -32749,7 +32769,7 @@ impl CayenneTableProvider {
     /// at/below the seq captured BEFORE the corpus read (deltas pushed afterward
     /// have higher seqs and are retained), and the corpus read reflects every
     /// tombstone, so the released queue cannot drop a still-needed removal.
-    async fn rebuild_inlined_cache_over_cap(&self) -> Result<()> {
+    async fn rebuild_inlined_cache_over_cap(&self) -> Result<Arc<InlinedCache>> {
         // Capture the queue seq to drain through BEFORE the corpus read so a
         // tombstone published during the rebuild (higher seq) is retained.
         let drain_through = self.pending_tombstone_deltas.lock().seq;
@@ -32771,8 +32791,9 @@ impl CayenneTableProvider {
             .lock()
             .drain_through(drain_through);
 
-        self.inlined_cache.store(Arc::new(new_cache));
-        Ok(())
+        let new_cache = Arc::new(new_cache);
+        self.inlined_cache.store(Arc::clone(&new_cache));
+        Ok(new_cache)
     }
 
     /// Full rebuild: read the entire `cayenne_inlined_data` corpus, decode each
@@ -38767,14 +38788,11 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Primary keys of the inline rows that `filters` match, and how many rows
-    /// matched: the visible rows of the cached inline view, plus the entries
-    /// committed above that view's watermark whose visibility is not yet
-    /// published (a pipelined write's tail, or a sealed mem-tier shadow), which
-    /// the delete must cover too. Also returns how many of the matched rows were
-    /// visible, which is what the delete takes off the live inline row count:
-    /// held-back rows join that count only when they publish. Empty on a
-    /// position-based table, whose inline rows have no key.
+    /// Primary keys of the inline rows that `filters` match: the visible rows of
+    /// the live generation's cached inline view, plus the entries committed above
+    /// that view's watermark whose visibility is not yet published (a pipelined
+    /// write's tail, or a sealed mem-tier shadow), which the delete must cover too.
+    /// Empty on a position-based table, whose inline rows have no key.
     pub(crate) async fn matching_inlined_keys(
         &self,
         filters: &[Expr],
@@ -38784,28 +38802,14 @@ impl CayenneTableProvider {
         if self.pk_deletion_strategy.is_position_based() {
             return Ok(InlinedDeleteMatches::default());
         }
-        // One cache entry gives the view and the watermark it materialized
-        // through, so the held-back read below starts exactly where it stops. It
-        // must be the entry for the live generation: a scan that read the corpus
-        // before an earlier delete can store its older entry after this warm, and
-        // matching against it would take that delete's hidden rows off the live
-        // count a second time. `write_lock` keeps inline writers from advancing
-        // the generation, so the loop ends once the stale entry is replaced.
-        let cache = loop {
-            let generation = self.inlined_generation.load(Ordering::Acquire);
-            self.cached_inlined_view().await.map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to read inlined data for delete on table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?;
-            #[cfg(test)]
-            self.run_test_inline_delete_match_hook().await;
-            let cache = self.inlined_cache.load_full();
-            if cache.generation == generation {
-                break cache;
-            }
-        };
+        // One entry gives the view and the watermark it materialized through, so
+        // the held-back read below starts exactly where the view stops.
+        let cache = self
+            .current_inlined_cache()
+            .await
+            .map_err(|e| self.inline_delete_error("read inlined data", e))?;
+        #[cfg(test)]
+        self.run_test_inline_delete_match_hook().await;
         let held_back = self
             .catalog
             .get_inlined_data_above_sequence(
@@ -38813,22 +38817,15 @@ impl CayenneTableProvider {
                 cache.materialized_through_sequence,
             )
             .await
-            .map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to read inlined data for delete on table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?;
+            .map_err(|e| self.inline_delete_error("read inlined data", e))?;
 
         let coerced_filters = self.coerce_filters_for_inlined_delete(filters)?;
         let physical_filters = self.build_physical_filters_for_inlined_delete(&coerced_filters)?;
-        let mut keys = ExtractedPrimaryKeys::default();
-        let mut matched_rows = 0_u64;
-        // The cached view already applies the inline tombstones, but not a
-        // file-side key delete published since it was built: scans apply those
-        // at use-site. Apply the live file-side snapshot here too, so a row a
-        // scan would not return is neither matched nor taken off the live count
-        // a second time — an undercount there would make scans skip live rows.
+        let mut matches = InlinedDeleteMatches::default();
+        // The cached view applies the inline tombstones but not a file-side key
+        // delete published since it was built (scans apply those at use-site), so
+        // filter visibility again: a row a scan would not return must not be
+        // matched, or it would leave the live count a second time.
         let no_inline_deletions = InlinedDeletionMaps::default();
         for entry in cache.view.iter() {
             for batch in &entry.batches {
@@ -38838,153 +38835,136 @@ impl CayenneTableProvider {
                         entry.envelope.sequence_number,
                         &no_inline_deletions,
                     )
-                    .map_err(|e| {
-                        datafusion_common::DataFusionError::Execution(format!(
-                            "Failed to apply inlined delete visibility for table {}: {e}",
-                            self.table_metadata.table_name
-                        ))
-                    })?
+                    .map_err(|e| self.inline_delete_error("apply inlined delete visibility", e))?
                 else {
                     continue;
                 };
-                self.collect_matching_inlined_keys(
-                    visible,
-                    &physical_filters,
-                    &mut keys,
-                    &mut matched_rows,
-                )?;
+                self.collect_matching_inlined_keys(visible, &physical_filters, &mut matches)?;
             }
         }
-        let visible_rows = matched_rows;
+        matches.visible_rows = matches.matched_rows;
         if !held_back.is_empty() {
-            let deletions = self.load_inlined_deletion_maps().await.map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to read inlined delete metadata for delete on table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?;
+            let deletions = self
+                .load_inlined_deletion_maps()
+                .await
+                .map_err(|e| self.inline_delete_error("read inlined delete metadata", e))?;
             for entry in held_back {
-                let batches = deserialize_ipc_to_batch(&entry.data_ipc)?;
-                let batches = self.adapt_inlined_batches_to_live_schema(batches)?;
-                for batch in batches {
-                    let Some(visible) = self
-                        .filter_inlined_batch_for_deletions(
-                            batch,
-                            entry.sequence_number,
-                            &deletions,
-                        )
-                        .map_err(|e| {
-                            datafusion_common::DataFusionError::Execution(format!(
-                                "Failed to apply inlined delete visibility for table {}: {e}",
-                                self.table_metadata.table_name
-                            ))
-                        })?
-                    else {
-                        continue;
-                    };
-                    self.collect_matching_inlined_keys(
-                        visible,
-                        &physical_filters,
-                        &mut keys,
-                        &mut matched_rows,
-                    )?;
+                let entry = self
+                    .decode_and_filter_inlined_entry(entry, &deletions)
+                    .map_err(|e| self.inline_delete_error("decode inlined data", e))?;
+                for batch in entry.batches {
+                    self.collect_matching_inlined_keys(batch, &physical_filters, &mut matches)?;
                 }
             }
         }
-        Ok(InlinedDeleteMatches {
-            keys,
-            matched_rows,
-            visible_rows,
-        })
+        Ok(matches)
+    }
+
+    fn inline_delete_error(
+        &self,
+        action: &str,
+        error: impl std::fmt::Display,
+    ) -> datafusion_common::DataFusionError {
+        datafusion_common::DataFusionError::Execution(format!(
+            "Failed to {action} for delete on table {}: {error}",
+            self.table_metadata.table_name
+        ))
     }
 
     fn collect_matching_inlined_keys(
         &self,
         batch: RecordBatch,
         physical_filters: &[Arc<dyn PhysicalExpr>],
-        keys: &mut ExtractedPrimaryKeys,
-        matched_rows: &mut u64,
+        matches: &mut InlinedDeleteMatches,
     ) -> datafusion_common::Result<()> {
         let matched = self.apply_inlined_delete_filters(batch, physical_filters)?;
         if matched.num_rows() == 0 {
             return Ok(());
         }
-        *matched_rows =
-            matched_rows.saturating_add(u64::try_from(matched.num_rows()).unwrap_or(u64::MAX));
+        matches.matched_rows = matches
+            .matched_rows
+            .saturating_add(u64::try_from(matched.num_rows()).unwrap_or(u64::MAX));
         let extracted = self.extract_primary_keys_from_batch(&matched)?;
-        keys.int64_pk.extend(extracted.int64_pk);
-        keys.row_keys.extend(extracted.row_keys);
+        matches.keys.int64_pk.extend(extracted.int64_pk);
+        matches.keys.row_keys.extend(extracted.row_keys);
         Ok(())
     }
 
     /// Reserve a delete sequence and build a published inline tombstone hiding
-    /// every inline copy of `keys` committed before it. Writes nothing: the caller
-    /// commits the tombstone in the delete's catalog transaction, then calls
-    /// [`Self::publish_inline_delete_tombstone`]. `None` when there is nothing to
-    /// hide.
+    /// every inline copy of the matched keys committed before it. Writes nothing:
+    /// the caller commits the returned row in the delete's catalog transaction and
+    /// then passes the publish half to [`Self::publish_committed_delete`]. `None`
+    /// when there is nothing to hide.
     pub(crate) async fn prepare_inline_delete_tombstone(
         &self,
         matches: InlinedDeleteMatches,
-    ) -> datafusion_common::Result<Option<PreparedInlineDeleteTombstone>> {
+    ) -> datafusion_common::Result<Option<(InlinedDelete, PreparedInlineDeleteTombstone)>> {
         let InlinedDeleteMatches {
             keys, visible_rows, ..
         } = matches;
         if keys.int64_pk.is_empty() && keys.row_keys.is_empty() {
             return Ok(None);
         }
-        let delete_sequence = self.reserve_sequences_local(1).await.map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to reserve a delete sequence for table {}: {e}",
-                self.table_metadata.table_name
-            ))
-        })?;
+        let delete_sequence = self
+            .reserve_sequences_local(1)
+            .await
+            .map_err(|e| self.inline_delete_error("reserve a delete sequence", e))?;
         let Some(tombstone) = self
             .build_staged_inline_tombstone(&keys.int64_pk, &keys.row_keys, delete_sequence, true)
-            .map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to build an inline tombstone for table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?
+            .map_err(|e| self.inline_delete_error("build an inline tombstone", e))?
         else {
             return Ok(None);
         };
-        Ok(Some(PreparedInlineDeleteTombstone {
-            delete_count: tombstone.delete_count,
-            ipc_bytes: tombstone.delete_ipc.len(),
-            tombstone: Some(tombstone),
+        let publish = PreparedInlineDeleteTombstone {
             delete_sequence,
             int64_pk: keys.int64_pk,
             row_keys: keys.row_keys,
+            delete_count: tombstone.delete_count,
+            ipc_bytes: tombstone.delete_ipc.len(),
             live_rows: i64::try_from(visible_rows).unwrap_or(i64::MAX),
-        }))
+        };
+        Ok(Some((tombstone, publish)))
     }
 
     /// Publish a committed delete: its file-side deletions, its inline rewrite,
-    /// and its inline tombstone, all under one hold. Scans capture the inline
-    /// view and the deletion view under the listing fence and
-    /// `scan_state_lock`, so no scan sees the delete applied to the files but not
-    /// to the inline rows, or the reverse. The locks are taken in the order the
-    /// inline insert publish takes them.
+    /// and its inline tombstone. When the delete has an inline half, all of it is
+    /// published under one hold: scans capture the inline view and the deletion
+    /// view under the listing fence and `scan_state_lock`, so none sees the delete
+    /// applied to the files but not to the inline rows, or the reverse. The locks
+    /// are taken in the order the inline insert publish takes them.
     pub(crate) async fn publish_committed_delete(
         &self,
         prepared_file_delete: Option<super::delete::PreparedDeletionPublish>,
         inline_rewrite: &InlinedDataRewrite,
         inline_tombstone: Option<PreparedInlineDeleteTombstone>,
     ) -> Result<()> {
-        let _visibility = self.visibility_lock_arc().lock_owned().await;
-        let _fence = self.lock_listing_fence_write_owned().await;
-        let _view_guard = self.scan_state_lock.write().await;
-        if let Some(prepared) = prepared_file_delete {
-            prepared.publish()?;
+        if inline_rewrite.is_empty() && inline_tombstone.is_none() {
+            if let Some(prepared) = prepared_file_delete {
+                prepared.publish()?;
+            }
+            return Ok(());
         }
-        #[cfg(test)]
-        self.run_test_delete_publish_hook().await;
-        if !inline_rewrite.is_empty() {
-            self.publish_inlined_rewrite(inline_rewrite);
+        let tombstone_written = inline_tombstone
+            .as_ref()
+            .map(|t| (t.delete_count, t.ipc_bytes, t.delete_sequence));
+        {
+            let _visibility = self.visibility_lock_arc().lock_owned().await;
+            let _fence = self.lock_listing_fence_write_owned().await;
+            let _view_guard = self.scan_state_lock.write().await;
+            if let Some(prepared) = prepared_file_delete {
+                prepared.publish()?;
+            }
+            #[cfg(test)]
+            self.run_test_delete_publish_hook().await;
+            if !inline_rewrite.is_empty() {
+                self.publish_inlined_rewrite(inline_rewrite);
+            }
+            if let Some(prepared) = inline_tombstone {
+                self.publish_inline_delete_tombstone(prepared);
+            }
         }
-        if let Some(prepared) = inline_tombstone {
-            self.publish_inline_delete_tombstone(prepared);
+        if let Some((delete_count, ipc_bytes, delete_sequence)) = tombstone_written {
+            self.record_inline_tombstone_written(delete_count, ipc_bytes, delete_sequence, true);
         }
         Ok(())
     }
@@ -38994,14 +38974,8 @@ impl CayenneTableProvider {
     /// next miss extends the cached view instead of rebuilding the corpus. The
     /// hidden rows leave the live inline row count, while the durable corpus
     /// count keeps them: they stay in `cayenne_inlined_data` until a checkpoint.
-    pub(crate) fn publish_inline_delete_tombstone(&self, prepared: PreparedInlineDeleteTombstone) {
+    fn publish_inline_delete_tombstone(&self, prepared: PreparedInlineDeleteTombstone) {
         self.adjust_cached_inlined_row_count(prepared.live_rows.saturating_neg());
-        self.record_inline_tombstone_written(
-            prepared.delete_count,
-            prepared.ipc_bytes,
-            prepared.delete_sequence,
-            true,
-        );
         self.pending_tombstone_deltas.lock().push(
             prepared.delete_sequence,
             prepared.int64_pk,
@@ -66749,44 +66723,69 @@ mod tests {
             .expect("commit the held-back row");
     }
 
-    /// A delete covers inline rows committed above the published watermark, which
-    /// a reopen makes visible: the tombstone names their keys too. The control
-    /// table shows the same row does become visible on reopen without the delete.
-    #[tokio::test]
-    async fn a_tombstoned_delete_covers_a_committed_row_that_is_not_yet_visible() {
+    /// Delete a row committed above the published watermark, alongside the
+    /// `visible` inline rows, and check that reopening, which makes held-back rows
+    /// visible, does not bring it back. A control table without the delete shows
+    /// that reopening does make the row visible.
+    async fn assert_a_delete_covers_a_held_back_row(table_prefix: &str, visible: &[(i64, i64)]) {
         let ctx = SessionContext::new();
         let runtime_env = ctx.runtime_env();
+        let (ids, values): (Vec<i64>, Vec<i64>) = visible.iter().copied().unzip();
+        let control_name = format!("{table_prefix}_control");
+        let delete_name = format!("{table_prefix}_delete");
 
         let (control, control_catalog, _control_tmp) =
-            create_durable_inline_keyed_table("held_back_control", Arc::clone(&runtime_env)).await;
+            create_durable_inline_keyed_table(&control_name, Arc::clone(&runtime_env)).await;
         let schema = Arc::clone(&control.table_metadata.schema);
-        insert_batch(&control, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        if !ids.is_empty() {
+            insert_batch(&control, id_value_batch(Arc::clone(&schema), &ids, &values)).await;
+        }
         add_held_back_inline_row(&control, &control_catalog, 5, 50).await;
         drop(control);
         let control = CayenneTableProviderBuilder::new(control_catalog, Arc::clone(&runtime_env))
-            .open("held_back_control")
+            .open(&control_name)
             .await
             .expect("reopen the control table");
+        let mut with_held_back = visible.to_vec();
+        with_held_back.push((5, 50));
         assert_eq!(
-            collect_id_value_pairs(&ctx, &control, "held_back_control").await,
-            vec![(1, 10), (5, 50)],
+            collect_id_value_pairs(&ctx, &control, &control_name).await,
+            with_held_back,
             "precondition: reopening makes the held-back row visible"
         );
 
         let (provider, catalog, _tmp) =
-            create_durable_inline_keyed_table("held_back_delete", Arc::clone(&runtime_env)).await;
-        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+            create_durable_inline_keyed_table(&delete_name, Arc::clone(&runtime_env)).await;
+        if !ids.is_empty() {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &ids, &values),
+            )
+            .await;
+        }
         add_held_back_inline_row(&provider, &catalog, 5, 50).await;
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            i64::try_from(visible.len()).expect("small row count"),
+            "precondition: the held-back row is not in the live count"
+        );
         delete_where_id(&ctx, &provider, 5).await;
         drop(provider);
         let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .open("held_back_delete")
+            .open(&delete_name)
             .await
             .expect("reopen");
         assert_eq!(
-            collect_id_value_pairs(&ctx, &reopened, "held_back_delete").await,
-            vec![(1, 10)]
+            collect_id_value_pairs(&ctx, &reopened, &delete_name).await,
+            visible.to_vec()
         );
+    }
+
+    /// A delete covers an inline row committed above the published watermark,
+    /// which reopening makes visible: the tombstone names its key too.
+    #[tokio::test]
+    async fn a_tombstoned_delete_covers_a_committed_row_that_is_not_yet_visible() {
+        assert_a_delete_covers_a_held_back_row("held_back", &[(1, 10)]).await;
     }
 
     /// A delete that matches against a stale inline cache, stored by a scan that
@@ -66799,7 +66798,11 @@ mod tests {
         let (provider, _catalog, _tmp) =
             create_durable_inline_keyed_table("stale_cache_delete", ctx.runtime_env()).await;
         let schema = Arc::clone(&provider.table_metadata.schema);
-        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])).await;
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20]),
+        )
+        .await;
         provider
             .read_inlined_batches()
             .await
@@ -66830,49 +66833,10 @@ mod tests {
     }
 
     /// A delete covers a committed-but-unpublished inline row even when no inline
-    /// row is visible yet. The control table shows the row becomes visible on
-    /// reopen without the delete.
+    /// row is visible yet, so the live inline count is zero.
     #[tokio::test]
     async fn a_delete_covers_a_held_back_row_when_no_inline_row_is_visible() {
-        let ctx = SessionContext::new();
-        let runtime_env = ctx.runtime_env();
-
-        let (control, control_catalog, _control_tmp) = create_durable_inline_keyed_table(
-            "held_back_only_control",
-            Arc::clone(&runtime_env),
-        )
-        .await;
-        add_held_back_inline_row(&control, &control_catalog, 5, 50).await;
-        drop(control);
-        let control = CayenneTableProviderBuilder::new(control_catalog, Arc::clone(&runtime_env))
-            .open("held_back_only_control")
-            .await
-            .expect("reopen the control table");
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &control, "held_back_only_control").await,
-            vec![(5, 50)],
-            "precondition: reopening makes the held-back row visible"
-        );
-
-        let (provider, catalog, _tmp) =
-            create_durable_inline_keyed_table("held_back_only_delete", Arc::clone(&runtime_env))
-                .await;
-        add_held_back_inline_row(&provider, &catalog, 5, 50).await;
-        assert_eq!(
-            provider.cached_inlined_row_count(),
-            0,
-            "precondition: no inline row is visible"
-        );
-        delete_where_id(&ctx, &provider, 5).await;
-        drop(provider);
-        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .open("held_back_only_delete")
-            .await
-            .expect("reopen");
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &reopened, "held_back_only_delete").await,
-            Vec::<(i64, i64)>::new()
-        );
+        assert_a_delete_covers_a_held_back_row("held_back_only", &[]).await;
     }
 
     /// A scan concurrent with a delete that covers a file-backed row and an inline
