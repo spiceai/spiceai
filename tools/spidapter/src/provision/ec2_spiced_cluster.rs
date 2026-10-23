@@ -85,23 +85,48 @@ impl Ec2Cluster {
             wait_for_instance_state(&ec2, &self.instance_ids, "terminated").await?;
             self.instance_ids.clear();
         }
-        if let Some(group_id) = self.security_group_id.take() {
-            ec2.delete_security_group()
-                .group_id(&group_id)
-                .send()
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to delete security group {group_id}: {e:#?}")
-                })?;
-            eprintln!("[stdio] ec2 backend: deleted security group {group_id}");
+        if let Some(group_id) = self.security_group_id.clone() {
+            delete_security_group(&ec2, &group_id).await?;
+            self.security_group_id = None;
         }
         Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.instance_ids.clear();
+        self.security_group_id = None;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.instance_ids.is_empty() && self.security_group_id.is_none()
+    }
+}
+
+/// A terminated instance's network interface can hold the group for a short
+/// while after the instance reports `terminated`.
+async fn delete_security_group(ec2: &Ec2Client, group_id: &str) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(5);
+    loop {
+        match ec2.delete_security_group().group_id(group_id).send().await {
+            Ok(_) => {
+                eprintln!("[stdio] ec2 backend: deleted security group {group_id}");
+                return Ok(());
+            }
+            Err(e)
+                if e.as_service_error().and_then(|se| se.meta().code())
+                    == Some("DependencyViolation")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            Err(e) => anyhow::bail!("Failed to delete security group {group_id}: {e:#?}"),
+        }
     }
 }
 
 impl Drop for Ec2Cluster {
     fn drop(&mut self) {
-        if self.instance_ids.is_empty() && self.security_group_id.is_none() {
+        if self.is_empty() {
             return;
         }
         let mut owned = Ec2Cluster {
@@ -114,12 +139,21 @@ impl Drop for Ec2Cluster {
                 .enable_all()
                 .build()
             else {
-                eprintln!("[stdio] ec2 backend: failed to build tokio runtime for cleanup");
+                eprintln!(
+                    "[stdio] ec2 backend: failed to build tokio runtime for cleanup, left {:?} and {:?}",
+                    owned.instance_ids, owned.security_group_id
+                );
+                owned.disarm();
                 return;
             };
             if let Err(e) = rt.block_on(owned.terminate()) {
-                eprintln!("[stdio] ec2 backend: cleanup failed: {e}");
+                eprintln!(
+                    "[stdio] ec2 backend: cleanup failed, left {:?} and {:?}: {e}",
+                    owned.instance_ids, owned.security_group_id
+                );
             }
+            // One attempt only: dropping `owned` must not start another.
+            owned.disarm();
         })
         .join()
         .ok();
@@ -166,8 +200,9 @@ pub(crate) async fn provision_ec2_spiced_cluster(
         instance_ids: Vec::new(),
         security_group_id: None,
     };
-    let group_id = create_security_group(&ec2, config, &tags, &runner_ip).await?;
+    let group_id = create_security_group(&ec2, config, &tags).await?;
     cluster.security_group_id = Some(group_id.clone());
+    authorize_ingress(&ec2, &group_id, &runner_ip).await?;
 
     eprintln!(
         "[stdio] ec2 backend: launching scheduler ({}) and {} executor(s) ({}) with {}",
@@ -193,6 +228,11 @@ pub(crate) async fn provision_ec2_spiced_cluster(
         .await?
         .pop()
         .ok_or_else(|| anyhow::anyhow!("Scheduler instance has no addresses"))?;
+    let http_url = format!("http://{}:{HTTP_PORT}", scheduler.public_ip);
+    let ready_wait = ready_wait.max(MIN_READY_WAIT);
+    // An executor that cannot reach the scheduler when it starts exits, so
+    // executors launch only once the scheduler serves.
+    wait_for_http_ok(&format!("{http_url}/health"), ready_wait).await?;
 
     let executor_ids = launch_nodes(
         &ec2,
@@ -214,9 +254,6 @@ pub(crate) async fn provision_ec2_spiced_cluster(
     cluster.instance_ids.extend(executor_ids.iter().cloned());
     wait_for_instance_state(&ec2, &executor_ids, "running").await?;
 
-    let http_url = format!("http://{}:{HTTP_PORT}", scheduler.public_ip);
-    let ready_wait = ready_wait.max(MIN_READY_WAIT);
-    wait_for_http_ok(&format!("{http_url}/health"), ready_wait).await?;
     let metrics_url = format!("http://{}:{METRICS_PORT}/metrics", scheduler.public_ip);
     wait_for_executors(&metrics_url, config.executor_count, ready_wait).await?;
     wait_for_http_ok(&format!("{http_url}/v1/ready"), ready_wait).await?;
@@ -305,7 +342,6 @@ async fn create_security_group(
     ec2: &Ec2Client,
     config: &Ec2ClusterConfig,
     tags: &RunTags,
-    runner_ip: &str,
 ) -> anyhow::Result<String> {
     let subnets = ec2
         .describe_subnets()
@@ -333,7 +369,10 @@ async fn create_security_group(
         .group_id()
         .ok_or_else(|| anyhow::anyhow!("CreateSecurityGroup returned no group ID"))?
         .to_string();
+    Ok(group_id)
+}
 
+async fn authorize_ingress(ec2: &Ec2Client, group_id: &str, runner_ip: &str) -> anyhow::Result<()> {
     let runner_cidr = IpRange::builder()
         .cidr_ip(format!("{runner_ip}/32"))
         .build();
@@ -347,10 +386,10 @@ async fn create_security_group(
     };
     let within_cluster = IpPermission::builder()
         .ip_protocol("-1")
-        .user_id_group_pairs(UserIdGroupPair::builder().group_id(&group_id).build())
+        .user_id_group_pairs(UserIdGroupPair::builder().group_id(group_id).build())
         .build();
     ec2.authorize_security_group_ingress()
-        .group_id(&group_id)
+        .group_id(group_id)
         .ip_permissions(from_runner(HTTP_PORT))
         .ip_permissions(from_runner(FLIGHT_PORT))
         .ip_permissions(from_runner(METRICS_PORT))
@@ -359,7 +398,7 @@ async fn create_security_group(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to authorize ingress on {group_id}: {e:#?}"))?;
     eprintln!("[stdio] ec2 backend: security group {group_id} admits {runner_ip}");
-    Ok(group_id)
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -724,4 +763,32 @@ systemd-run --unit spiced-console sh -c 'docker logs -f spiced > /dev/console 2>
         );
     }
     Ok(script)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_makes_one_cleanup_attempt_when_cleanup_fails() {
+        // SAFETY: test-only, single-threaded test runner
+        unsafe {
+            std::env::set_var("AWS_ENDPOINT_URL_EC2", "http://127.0.0.1:9");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+            std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(Ec2Cluster {
+                region: "us-west-2".to_string(),
+                instance_ids: vec!["i-00000000000000000".to_string()],
+                security_group_id: Some("sg-00000000000000000".to_string()),
+            });
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("dropping a cluster whose cleanup fails returns");
+    }
 }

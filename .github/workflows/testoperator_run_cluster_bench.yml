@@ -517,26 +517,41 @@ jobs:
       - name: Remove EC2 cluster resources left by this run
         if: always() && env.CB_COMPUTE == 'ec2'
         run: |
-          set -euo pipefail
+          set -uo pipefail
           filters=(
             "Name=tag:spice:purpose,Values=ballista-bench"
             "Name=tag:spice:github-run-id,Values=${GITHUB_RUN_ID}"
           )
+          failed=0
           instance_ids="$(aws ec2 describe-instances --region "${CB_EC2_REGION}" \
-            --filters "${filters[@]}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-            --query 'Reservations[].Instances[].InstanceId' --output text)"
+            --filters "${filters[@]}" "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)" || failed=1
           if [ -n "${instance_ids}" ]; then
             echo "Terminating ${instance_ids}"
             # shellcheck disable=SC2086
-            aws ec2 terminate-instances --region "${CB_EC2_REGION}" --instance-ids ${instance_ids} >/dev/null
+            aws ec2 terminate-instances --region "${CB_EC2_REGION}" --instance-ids ${instance_ids} >/dev/null || failed=1
             # shellcheck disable=SC2086
-            aws ec2 wait instance-terminated --region "${CB_EC2_REGION}" --instance-ids ${instance_ids}
+            aws ec2 wait instance-terminated --region "${CB_EC2_REGION}" --instance-ids ${instance_ids} || failed=1
           fi
-          for group_id in $(aws ec2 describe-security-groups --region "${CB_EC2_REGION}" \
-            --filters "${filters[@]}" --query 'SecurityGroups[].GroupId' --output text); do
+          group_ids="$(aws ec2 describe-security-groups --region "${CB_EC2_REGION}" \
+            --filters "${filters[@]}" --query 'SecurityGroups[].GroupId' --output text)" || failed=1
+          for group_id in ${group_ids}; do
             echo "Deleting security group ${group_id}"
-            aws ec2 delete-security-group --region "${CB_EC2_REGION}" --group-id "${group_id}"
+            deleted=0
+            # A terminated instance's network interface can hold the group for a short while.
+            for _ in $(seq 1 30); do
+              if aws ec2 delete-security-group --region "${CB_EC2_REGION}" --group-id "${group_id}"; then
+                deleted=1
+                break
+              fi
+              sleep 10
+            done
+            if [ "${deleted}" -eq 0 ]; then
+              echo "::error::Could not delete security group ${group_id}"
+              failed=1
+            fi
           done
+          exit "${failed}"
 
       - name: Install gh CLI
         if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
