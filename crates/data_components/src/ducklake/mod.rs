@@ -21,6 +21,7 @@ limitations under the License.
 //! with the `ducklake` extension.
 
 use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
@@ -37,8 +38,9 @@ static EXTENSION_INSTALL: Mutex<()> = Mutex::new(());
 /// extension into an empty extension directory therefore delete each other's
 /// files: one `INSTALL` fails with `Could not remove file`, or a `LOAD` finds the
 /// file it was about to open already gone. A lock held across both statements,
-/// in this process and through an advisory lock on a file every process on the
-/// host shares, keeps one caller's install and load from overlapping another's.
+/// in this process and through an advisory lock on a file in the extension
+/// directory, which every process installing into it shares, keeps one caller's
+/// install and load from overlapping another's.
 ///
 /// # Errors
 ///
@@ -48,24 +50,49 @@ pub fn install_and_load_extension(
     extension: &'static str,
 ) -> Result<(), duckdb::Error> {
     let _guard = EXTENSION_INSTALL.lock();
-    let _host_lock = lock_extension_installs_on_host();
+    let _directory_lock = extension_directory(conn).and_then(|dir| lock_extension_directory(&dir));
     conn.execute(&format!("INSTALL {extension}"), [])?;
     conn.execute(&format!("LOAD {extension}"), [])?;
     Ok(())
 }
 
-/// Takes the host-wide install lock, released when the returned file is dropped.
+/// The directory `INSTALL` writes into, resolved as `DuckDB` resolves it: the
+/// `extension_directory` setting, else `.duckdb/extensions` under the
+/// `home_directory` setting or the user's home directory.
+fn extension_directory(conn: &duckdb::Connection) -> Option<PathBuf> {
+    let setting = |name: &str| -> Option<String> {
+        conn.query_row("SELECT current_setting(?)", [name], |row| row.get(0))
+            .ok()
+    };
+    let home = || match setting("home_directory") {
+        Some(home) if !home.is_empty() => Some(PathBuf::from(home)),
+        _ => util::home_dir::home_dir(),
+    };
+    match setting("extension_directory") {
+        Some(dir) if dir == "~" => home(),
+        Some(dir) if !dir.is_empty() => match dir.strip_prefix("~/") {
+            Some(rest) => home().map(|home| home.join(rest)),
+            None => Some(PathBuf::from(dir)),
+        },
+        _ => home().map(|home| home.join(".duckdb").join("extensions")),
+    }
+}
+
+/// Takes the install lock for `dir`, released when the returned file is dropped.
 ///
-/// Returns `None` when the lock file cannot be opened or locked, for example in a
-/// read-only temporary directory; installs are then serialized only within this
+/// Returns `None` when the lock file cannot be created or locked, for example in
+/// a read-only extension directory; installs are then serialized only within this
 /// process.
-fn lock_extension_installs_on_host() -> Option<File> {
-    let path = std::env::temp_dir().join("spice-duckdb-extension-install.lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
+fn lock_extension_directory(dir: &Path) -> Option<File> {
+    let path = dir.join("spice-install.lock");
+    let file = std::fs::create_dir_all(dir)
+        .and_then(|()| {
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+        })
         .or_else(|_| File::open(&path));
     match file.and_then(|file| file.lock().map(|()| file)) {
         Ok(file) => Some(file),
