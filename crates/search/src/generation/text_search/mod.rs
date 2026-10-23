@@ -407,20 +407,7 @@ impl FullTextSearchFieldIndex {
         filters: &[Box<dyn Query>],
         limit: usize,
     ) -> Result<Vec<(Score, DocAddress)>> {
-        // Prefer Tantivy's full QueryParser so operators (AND/OR/NOT), phrases
-        // ("exact match"), field-scoped queries (title:foo) and boosts (term^2)
-        // are honored. Fall back to a bag-of-words OR clause for inputs the
-        // parser rejects (e.g. unbalanced quotes, lone special characters in
-        // conversational queries).
-        let parser = self.query_parser();
-        let text_query = match parser.parse_query(literal) {
-            Ok(parsed) => parsed,
-            Err(_) => parser
-                .build_query_from_user_input_ast(parse_query_literal(literal))
-                .context(InvalidTextSearchQuerySnafu {
-                    query: literal.to_string(),
-                })?,
-        };
+        let text_query = parse_user_query(&self.query_parser(), literal)?;
 
         // `Must`-combine each pushed-down SQL filter with the full-text clause so the top-K is
         // computed over the filtered document set (the filter is applied inside the index, not
@@ -486,6 +473,41 @@ impl FullTextSearchFieldIndex {
 
         Ok(decoder)
     }
+}
+
+/// Parse a user-provided full-text query.
+///
+/// Prefer Tantivy's full `QueryParser` so operators (AND/OR/NOT), phrases ("exact match"),
+/// field-scoped queries (title:foo) and boosts (term^2) are honored. Fall back to a bag-of-words
+/// OR clause for inputs the parser rejects (e.g. unbalanced quotes, lone special characters in
+/// conversational queries) or would panic on (see [`has_fieldless_exists`]).
+fn parse_user_query(parser: &QueryParser, literal: &str) -> Result<Box<dyn Query>> {
+    let parsed = if has_fieldless_exists(literal) {
+        None
+    } else {
+        parser.parse_query(literal).ok()
+    };
+    match parsed {
+        Some(parsed) => Ok(parsed),
+        None => parser
+            .build_query_from_user_input_ast(parse_query_literal(literal))
+            .context(InvalidTextSearchQuerySnafu {
+                query: literal.to_string(),
+            }),
+    }
+}
+
+/// Whether `q` has a `*` directly followed by a character Tantivy's grammar reads as ending a word
+/// (other than `)`), e.g. `a *(b)` or `*"x"`.
+///
+/// `QueryParser::parse_query` (tantivy-query-grammar 0.26) reads such a `*` as an exists query with
+/// no field and panics with "Exist query without a field isn't allowed" instead of returning an
+/// error (<https://github.com/quickwit-oss/tantivy/issues/3031>). The check also matches a `*`
+/// inside a word (`a*(`), which the grammar parses; those queries take the bag-of-words fallback.
+fn has_fieldless_exists(q: &str) -> bool {
+    q.as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b'*' && b"^`:{}\"'[]\\(".contains(&w[1]))
 }
 
 // Parse a user-provided query to interpret it without terms (e.g. `IN ['foo', 'bar']`) or clauses (foo AND bar).
@@ -654,7 +676,57 @@ pub fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::generation::text_search::parse_query_literal;
+    use crate::generation::text_search::{
+        has_fieldless_exists, parse_query_literal, parse_user_query,
+    };
+    use tantivy::{
+        Index,
+        query::QueryParser,
+        schema::{Schema, TEXT},
+    };
+
+    fn text_parser() -> QueryParser {
+        let mut builder = Schema::builder();
+        let text = builder.add_text_field("text", TEXT);
+        QueryParser::for_index(&Index::create_in_ram(builder.build()), vec![text])
+    }
+
+    /// A bare `*` before a word-ending character panicked inside Tantivy's parser
+    /// (quickwit-oss/tantivy#3031), failing the whole search request.
+    #[test]
+    fn test_bare_star_before_word_end_falls_back_instead_of_panicking() {
+        let parser = text_parser();
+        for prefix in ["", "a ", "(", "+", "-", "NOT ", "a AND ", "a\t"] {
+            for end in ['^', '`', ':', '{', '}', '"', '\'', '[', ']', '\\', '('] {
+                let q = format!("{prefix}*{end}b");
+                assert!(has_fieldless_exists(&q), "{q:?}");
+                parse_user_query(&parser, &q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
+            }
+        }
+    }
+
+    /// Queries the grammar handles keep the full parser, operators and all.
+    #[test]
+    fn test_parseable_queries_keep_the_full_parser() {
+        let parser = text_parser();
+        for q in [
+            "a *",
+            "*",
+            "(a *)",
+            "a * b",
+            "foo*",
+            "a*b",
+            "a *~",
+            "a *+",
+            "text:sea^20 whale^70",
+            "\"exact phrase\" AND -other",
+        ] {
+            assert!(!has_fieldless_exists(q), "{q:?}");
+            let full = parser.parse_query(q).expect(q);
+            let ours = parse_user_query(&parser, q).expect(q);
+            assert_eq!(format!("{full:?}"), format!("{ours:?}"), "{q:?}");
+        }
+    }
 
     #[test]
     fn test_parse_query_literal() {
