@@ -1563,22 +1563,28 @@ pub trait ListingTableConnector: DataConnector {
         }
     }
 
+    /// Build an [`ObjectStoreTextTable`]. `extension` is the listing suffix
+    /// (`file_extension` or the path suffix). `parser_key` is the document
+    /// parser registry key — typically the lowercased `file_format` — and is
+    /// distinct from the listing suffix so `file_format: pdf` plus
+    /// `file_extension: .bin` still extracts PDF text.
     async fn create_text_table(
         &self,
         dataset: &DatasetSpec,
         url: &Url,
         extension: &str,
+        parser_key: Option<&str>,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>
     where
         Self: Display,
     {
-        let content_formatter =
-            document_parse::get_parser_factory(extension)
-                .await
-                .map(|factory| {
-                    // TODO: add opts.
-                    factory.default()
-                });
+        let lookup = parser_key.unwrap_or(extension);
+        let content_formatter = document_parse::get_parser_factory(lookup)
+            .await
+            .map(|factory| {
+                // TODO: add opts.
+                factory.default()
+            });
 
         let metadata_columns = dataset.listing_table_metadata_columns(
             get_url_prefix(url),
@@ -1982,7 +1988,9 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         match file_format_opt {
             None => {
                 // Assume its unstructured text data. Use a [`ObjectStoreTextTable`].
-                self.create_text_table(dataset, &url, &extension).await
+                let parser_key = listing_document_parser_key(self.get_params());
+                self.create_text_table(dataset, &url, &extension, parser_key.as_deref())
+                    .await
             }
             Some(file_format) => {
                 // Structured tabular data, use a [`ListingTable`].
@@ -2170,6 +2178,17 @@ fn resolve_file_compression_type(
     }
 
     Ok(detected_compression.unwrap_or(FileCompressionType::UNCOMPRESSED))
+}
+
+/// Document parser registry key for a listing dataset. Distinct from the
+/// listing suffix: `file_format: pdf` plus `file_extension: .bin` must still
+/// look up the PDF parser.
+fn listing_document_parser_key(params: &Parameters) -> Option<String> {
+    params
+        .get("file_format")
+        .expose()
+        .ok()
+        .map(str::to_ascii_lowercase)
 }
 
 fn listing_extension(
@@ -3285,6 +3304,105 @@ mod tests {
             .expect("pdf is a valid document format");
         assert!(file_format.is_none());
         assert_eq!(extension, ".pdf");
+    }
+
+    /// A minimal, well-formed single-page PDF whose content stream draws the
+    /// text "Spice Hello". Same fixture as `document_parse::pdf` tests.
+    const SAMPLE_PDF: &[u8] = include_bytes!("../../../document_parse/tests/fixtures/hello.pdf");
+
+    async fn create_document_text_table(
+        connector: &TestConnector,
+        dataset: &DatasetSpec,
+        expected_extension: &str,
+    ) -> Arc<dyn TableProvider> {
+        document_parse::register_all().await;
+        let url = connector
+            .get_object_store_url(dataset, None)
+            .expect("dataset url");
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(dataset)
+            .await
+            .expect("document file_format must stay on the text-table path");
+        assert!(
+            file_format.is_none(),
+            "document formats must keep the text-table path"
+        );
+        assert_eq!(extension, expected_extension);
+        let parser_key = listing_document_parser_key(connector.get_params());
+        connector
+            .create_text_table(dataset, &url, &extension, parser_key.as_deref())
+            .await
+            .expect("create text table")
+    }
+
+    async fn scan_text_table_content(table: Arc<dyn TableProvider>) -> String {
+        let ctx = SessionContext::new();
+        ctx.register_table("docs", table)
+            .expect("register text table");
+        let batches = ctx
+            .sql("SELECT content FROM docs")
+            .await
+            .expect("plan content scan")
+            .collect()
+            .await
+            .expect("collect content");
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1, "expected one document row, got {batches:?}");
+        let col = batches[0]
+            .column_by_name("content")
+            .expect("content column");
+        let values = col
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content is utf8");
+        values.value(0).to_string()
+    }
+
+    #[tokio::test]
+    async fn test_document_file_format_pdf_with_bin_extension_extracts_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("hello.bin"), SAMPLE_PDF).expect("write pdf as bin");
+
+        let (connector, dataset) = setup_connector(
+            format!("file://{}/", dir.path().display()),
+            HashMap::from([
+                ("file_format".to_string(), "pdf".to_string()),
+                ("file_extension".to_string(), ".bin".to_string()),
+            ]),
+        );
+
+        let table = create_document_text_table(&connector, &dataset, ".bin").await;
+        let content = scan_text_table_content(table).await;
+        assert!(
+            content.contains("Spice"),
+            "pdf + .bin must extract text, got: {content:?}"
+        );
+        assert!(
+            !content.contains("%PDF"),
+            "pdf + .bin must not UTF-8-decode raw PDF bytes, got: {content:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_document_file_format_pdf_uppercase_path_is_parsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.PDF"), SAMPLE_PDF).expect("write uppercase PDF");
+
+        let (connector, dataset) = setup_connector(
+            format!("file://{}/a.PDF", dir.path().display()),
+            HashMap::from([("file_format".to_string(), "pdf".to_string())]),
+        );
+
+        let table = create_document_text_table(&connector, &dataset, ".PDF").await;
+        let content = scan_text_table_content(table).await;
+        assert!(
+            content.contains("Spice"),
+            "uppercase .PDF path must be parsed, got: {content:?}"
+        );
+        assert!(
+            !content.contains("%PDF"),
+            "uppercase .PDF path must not UTF-8-decode raw PDF bytes, got: {content:?}"
+        );
     }
 
     #[tokio::test]
