@@ -130,6 +130,9 @@ const STREAM_BUFFER: usize = 64;
 /// The most choices one request may ask for, as `OpenAI`'s `n` allows.
 const MAX_CHOICES: u8 = 128;
 
+/// How long the decode thread waits before it retries a send to a client whose buffer is full.
+const SEND_RETRY: Duration = Duration::from_millis(1);
+
 /// How long dropping a model waits for its decode thread to stop and free it.
 const UNLOAD_WAIT: Duration = Duration::from_secs(30);
 
@@ -397,11 +400,17 @@ impl LlamaCpp {
         // A required call is forced with a grammar where the template's format allows one,
         // and otherwise only held to by refusing to end until the model makes one.
         let obliged = obliged_tools(tool_choice.as_ref(), &tools);
+        // Under `tool_choice: none` a call is only ever content, so the grammar offers none.
+        let callable: &[Tool] = if matches!(tool_choice, Some(ToolChoice::None)) {
+            &[]
+        } else {
+            &tools
+        };
         let grammar = content_grammar(
             &self.model_name,
             &self.template,
             req.response_format.as_ref(),
-            &tools,
+            callable,
             &obliged,
         )?;
         // Each choice reads its own reply, so each has its own reader.
@@ -814,11 +823,26 @@ fn serve(
             Ok(outcome) => Event::Done(outcome),
             Err(message) => Event::Failed(message),
         };
-        // A stopping thread does not wait for a client that has stopped reading.
-        if stopping.load(Ordering::Relaxed) {
-            let _ = events.try_send(event);
-        } else {
-            let _ = events.blocking_send(event);
+        send_unless_stopping(&events, &stopping, event);
+    }
+}
+
+/// Sends `event` to its client, waiting while the client's buffer is full, and returns whether
+/// the client took it. A stopping thread does not wait for a client that has stopped reading:
+/// it gives up as soon as it sees `stopping`, which a blocked send would never notice.
+fn send_unless_stopping(events: &mpsc::Sender<Event>, stopping: &AtomicBool, event: Event) -> bool {
+    let mut event = event;
+    loop {
+        match events.try_send(event) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(back)) => {
+                if stopping.load(Ordering::Relaxed) {
+                    return false;
+                }
+                event = back;
+                std::thread::sleep(SEND_RETRY);
+            }
         }
     }
 }
@@ -1079,11 +1103,7 @@ impl Output {
 
     /// Whether the client is still there to take `event`.
     fn send(&self, event: Event) -> bool {
-        if self.stopping.load(Ordering::Relaxed) {
-            self.events.try_send(event).is_ok()
-        } else {
-            self.events.blocking_send(event).is_ok()
-        }
+        send_unless_stopping(&self.events, &self.stopping, event)
     }
 
     /// Splits `text` into reasoning and content and sends them; content goes through the

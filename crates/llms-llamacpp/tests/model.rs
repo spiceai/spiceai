@@ -446,3 +446,83 @@ async fn n_of_zero_is_refused() {
         "invalid args: `n` must be between 1 and 128, the number of choices to generate."
     );
 }
+
+/// Under `tool_choice: none` the model may not call a tool, so a `json_schema` reply is held to
+/// its schema alone, even when the prompt asks for what a tool would answer.
+#[tokio::test]
+async fn under_tool_choice_none_a_json_schema_reply_keeps_its_schema() {
+    let model = qwen3().await;
+    let reply = model
+        .chat_request(request(json!({
+            "model": "qwen3",
+            "messages": [{ "role": "user", "content": "What is the weather in Paris right now?" }],
+            "tools": weather_tools(),
+            "tool_choice": "none",
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+            "temperature": 0,
+            "reasoning_effort": "none",
+            "max_tokens": 64,
+        })))
+        .await
+        .expect("a reply");
+    let message = &reply.choices[0].message;
+    assert_eq!(message.tool_calls, None);
+    let content = message.content.clone().expect("content");
+    let value: Value = serde_json::from_str(&content)
+        .unwrap_or_else(|e| panic!("the reply is not JSON ({e}): {content}"));
+    let keys: Vec<&String> = value.as_object().expect("an object").keys().collect();
+    assert_eq!(keys, ["city"], "{content}");
+    assert!(value["city"].is_string(), "{content}");
+}
+
+/// A model dropped while a client holds a stream it has stopped reading frees promptly: the
+/// decode thread, waiting for room in that client's full buffer, sees the model stopping.
+#[tokio::test]
+async fn a_model_dropped_under_a_stalled_stream_stops_promptly() {
+    let model = qwen3().await;
+    let mut stream = model
+        .chat_stream(request(json!({
+            "model": "qwen3",
+            "messages": [{ "role": "user", "content": "Write a very long story about the sea." }],
+            "temperature": 0,
+            "reasoning_effort": "none",
+            "max_tokens": 4000,
+            "stream": true,
+        })))
+        .await
+        .expect("a stream");
+    stream
+        .next()
+        .await
+        .expect("a first chunk")
+        .expect("a chunk");
+    // The stream's buffer holds 64 tokens, which Qwen3-0.6B decodes in well under a second;
+    // the count drained below shows the buffer was full when the model was dropped.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let started = std::time::Instant::now();
+    drop(model);
+    let stopped = started.elapsed();
+    let mut buffered = 0;
+    while let Some(Ok(_)) = stream.next().await {
+        buffered += 1;
+    }
+    assert!(
+        buffered >= 64,
+        "the buffer held {buffered} chunks, so it was not full"
+    );
+    assert!(
+        stopped < std::time::Duration::from_secs(5),
+        "dropping the model took {stopped:?}"
+    );
+}
