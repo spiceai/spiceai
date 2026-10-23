@@ -194,7 +194,7 @@ async fn run_inner(
     // A layout run's answers are checked by `--validate` against the unaccelerated
     // oracle, and its plans legitimately differ from the default layout's (index
     // lookups, sorts), so it records no result or explain-plan snapshots.
-    let benchmark_test = if args.layout.is_some() {
+    let benchmark_test = if args.layout.is_some() || !args.snapshots {
         benchmark_test
     } else {
         benchmark_test
