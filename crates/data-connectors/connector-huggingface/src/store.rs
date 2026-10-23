@@ -167,6 +167,29 @@ fn object_meta(
     })
 }
 
+/// The file at `path`, or [`object_store::Error::NotFound`] when it is missing or a folder.
+async fn file_entry(
+    hub: &Hub,
+    repo: &RepoId,
+    commit: &str,
+    path: &str,
+    location: &Path,
+) -> object_store::Result<TreeEntry> {
+    hub.entry(repo, commit, path)
+        .await
+        .map_err(|e| store_error(location, e))?
+        .filter(|entry| entry.kind == EntryKind::File)
+        .ok_or_else(|| {
+            store_error(
+                location,
+                hub::Error::EntryNotFound {
+                    repo: repo.clone(),
+                    path: path.to_string(),
+                },
+            )
+        })
+}
+
 /// Maps a Hub error to the `object_store` error a reader acts on: a missing path is
 /// [`object_store::Error::NotFound`], so a listing falls back from a file to a folder.
 fn store_error(location: &Path, error: hub::Error) -> object_store::Error {
@@ -247,20 +270,7 @@ impl ObjectStore for HuggingFaceStore {
         let empty_range =
             matches!(&options.range, Some(GetRange::Bounded(range)) if range.is_empty());
         if options.head || empty_range {
-            let entry = hub
-                .entry(&repo, commit, path)
-                .await
-                .map_err(|e| store_error(location, e))?
-                .filter(|entry| entry.kind == EntryKind::File)
-                .ok_or_else(|| {
-                    store_error(
-                        location,
-                        hub::Error::EntryNotFound {
-                            repo: repo.clone(),
-                            path: path.to_string(),
-                        },
-                    )
-                })?;
+            let entry = file_entry(hub, &repo, commit, path, location).await?;
             let meta = object_meta(&repo, commit, last_modified, &entry)?;
             options.check_preconditions(&meta)?;
             let start = match &options.range {
@@ -279,12 +289,27 @@ impl ObjectStore for HuggingFaceStore {
             .read(&repo, commit, path, options.range.clone())
             .await
             .map_err(|e| store_error(location, e))?;
-        let meta = ObjectMeta {
-            location: location.clone(),
-            last_modified,
-            size: read.size,
-            e_tag: read.e_tag,
-            version: Some(commit.to_string()),
+        // `list` advertises `TreeEntry::content_id` (the git oid, or the LFS
+        // SHA-256). The download `ETag` is Hub `x-linked-etag`, a different
+        // identifier. If-Match of a listed generation is checked against the
+        // listing, which is the generation `list` returned.
+        let meta = if options.if_match.is_some() || options.if_none_match.is_some() {
+            let entry = file_entry(hub, &repo, commit, path, location).await?;
+            ObjectMeta {
+                location: location.clone(),
+                last_modified,
+                size: read.size,
+                e_tag: Some(entry.content_id().to_string()),
+                version: Some(commit.to_string()),
+            }
+        } else {
+            ObjectMeta {
+                location: location.clone(),
+                last_modified,
+                size: read.size,
+                e_tag: read.e_tag,
+                version: Some(commit.to_string()),
+            }
         };
         options.check_preconditions(&meta)?;
         let stream_location = location.clone();
