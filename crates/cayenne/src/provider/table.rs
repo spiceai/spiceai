@@ -464,6 +464,19 @@ const MAX_PK_SELECTIVE_RANGE_SPAN: i64 = 32;
 /// `MoR` exceeds the bound and falls through to the post-decode deletion filter.
 const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 2048;
 
+/// Whether a scan pushes the keys its tombstones hide into its scan filters as
+/// `pk NOT IN (...)` (see `vortex_key_delete_pushdown_filter`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TombstonePushdown {
+    /// Push them, so listing and Vortex skip the files and chunks they cover.
+    Apply,
+    /// Leave every hidden row to the deletion filters. A rewrite reads every
+    /// file anyway, and its filters' `rows_deleted` counts are the yield its
+    /// reclaim records (see [`super::deletion_yield`]): a file pruned from the
+    /// scan would remove rows that no filter counts.
+    Skip,
+}
+
 /// Result of a Cayenne CDC append write.
 ///
 /// A write can be fully complete when this value is returned, or it can have a
@@ -3845,6 +3858,17 @@ pub(crate) fn upsert_on_primary_key(
 /// grew (q20's correlated rescans paid it per outer group).
 pub(crate) type InlinedDeletionMaps = crate::provider::mem_tier::InMemTombstones;
 
+/// What [`super::delete::detect_deletion_type_and_read`] reads from a table's
+/// deletion-vector files: deleted positions per data file, deleted keys with their
+/// delete sequence, re-inserted keys with theirs, and the key vectors whose file is
+/// missing.
+type DeletionVectorRead = (
+    HashMap<String, RoaringBitmap>,
+    HashMap<Box<[u8]>, i64>,
+    HashMap<Box<[u8]>, i64>,
+    Vec<super::delete::MissingKeyDeletionVector>,
+);
+
 /// The error a synchronous retention drain gets when the pass is waiting on a recent
 /// write to become durable ([`RetentionPass::DeferredUntilCheckpoint`]).
 ///
@@ -4642,6 +4666,30 @@ fn deletion_bytes_over_ceiling(
     )]
     let over = resident_bytes as f64 > *limit as f64 * DELETION_INDEX_MEMORY_CEILING_FRACTION;
     over
+}
+
+/// Rows the key deletion filters anywhere in `plan` removed, once it has run:
+/// what a reclaim's tombstones actually hid (see [`super::deletion_yield`]).
+///
+/// Read from the filters themselves, not from every node: a wrapper such as
+/// `CayenneAccelerationExec` reports its child's metrics as its own, so a sum
+/// over every node would count a wrapped filter's rows twice.
+fn rows_deleted_by(plan: &Arc<dyn ExecutionPlan>) -> u64 {
+    let is_deletion_filter = plan.downcast_ref::<KeyBasedDeletionFilterExec>().is_some()
+        || plan.downcast_ref::<Int64PkDeletionFilterExec>().is_some();
+    let own = if is_deletion_filter {
+        plan.metrics()
+            .and_then(|metrics| metrics.sum_by_name("rows_deleted"))
+            .map_or(0, |value| {
+                u64::try_from(value.as_usize()).unwrap_or(u64::MAX)
+            })
+    } else {
+        0
+    };
+    plan.children()
+        .into_iter()
+        .map(rows_deleted_by)
+        .fold(own, u64::saturating_add)
 }
 
 /// Classify a protected snapshot's on-disk byte size into an LSM-style size
@@ -6699,7 +6747,49 @@ impl CayenneTableProvider {
 
     /// Atomically commit a snapshot rewrite to the catalog, clearing exactly the
     /// state the rewrite materialized (see [`RewriteScope`]).
+    ///
+    /// A scope that clears every delete-file row also removes those rows' files
+    /// once the commit succeeds: no row names them afterwards, and nothing else
+    /// would. Such a rewrite excludes writers, so the rows read before the commit
+    /// are the rows it clears.
     pub(crate) async fn commit_snapshot_rewrite(
+        &self,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+        scope: &RewriteScope,
+    ) -> CatalogResult<()> {
+        let cleared_delete_files = match scope {
+            RewriteScope::All | RewriteScope::AllTombstonesFoldedSnapshots { .. } => {
+                self.catalog
+                    .get_table_delete_files(&self.table_metadata.table_id)
+                    .await
+                    .unwrap_or_else(|error| {
+                        // The commit does not depend on this read; without it the
+                        // cleared rows' files stay on disk.
+                        tracing::debug!(
+                            target: "cayenne::compaction",
+                            table = self.table_metadata.table_name.as_str(),
+                            %error,
+                            "Could not list the deletion vectors a snapshot rewrite clears; their files stay on disk"
+                        );
+                        Vec::new()
+                    })
+            }
+            RewriteScope::Fenced { .. } => Vec::new(),
+        };
+        let committed = self
+            .commit_snapshot_rewrite_catalog(replaced_snapshot_id, new_snapshot_id, scope)
+            .await;
+        if committed.is_ok() {
+            super::delete::remove_dropped_deletion_vector_files(
+                cleared_delete_files,
+                Arc::clone(&self.file_deletion_fence),
+            );
+        }
+        committed
+    }
+
+    async fn commit_snapshot_rewrite_catalog(
         &self,
         replaced_snapshot_id: &str,
         new_snapshot_id: &str,
@@ -21014,7 +21104,7 @@ impl CayenneTableProvider {
         // can run while it sorts, and the snapshot current at commit time would
         // then be the overwrite's.
         let replaced_snapshot_id = self.get_current_snapshot_id();
-        let (sorted_stream, _) = self.visible_file_stream_for_rewrite(&ctx, &order).await?;
+        let (sorted_stream, _, _) = self.visible_file_stream_for_rewrite(&ctx, &order).await?;
 
         // Write sorted data to a new snapshot directory. Because SortExec lazily
         // reads input files via DataSourceExec, writing to a separate directory
@@ -21328,7 +21418,10 @@ impl CayenneTableProvider {
         // to bake more often, a trade priced against the incremental bake's write
         // amplification, and this path is a full rewrite instead. See
         // `CayenneContext::configured_deletion_index_trigger`.
-        let trigger_len = self.context.configured_deletion_index_trigger();
+        // Scaled by the rows the last reclaim found the tombstones hiding: a full
+        // rewrite that removes none of the table's rows is the costliest way to
+        // learn that its tombstones hid nothing.
+        let trigger_len = self.context.effective_reclaim_deletion_index_trigger();
         let over_memory_ceiling = self.deletion_index_over_memory_ceiling();
         if deletion_index_len < trigger_len && !over_memory_ceiling {
             return ReclaimDecision::NotDue;
@@ -25531,11 +25624,12 @@ impl CayenneTableProvider {
         // is the ordered one: executing it executes the scan, so the rewrite
         // pins its inputs exactly where the fenced scan does.
 
-        let (stream, scope, generation_before, snapshot_id_before): (
+        let (stream, scope, generation_before, snapshot_id_before, rewrite_plan): (
             SendableRecordBatchStream,
             RewriteScope,
             u64,
             String,
+            Arc<dyn ExecutionPlan>,
         ) = if uses_position_deletes {
             let snapshot_id_before = self.get_current_snapshot_id();
             // Drain the RAM tier and the inline memtable FIRST, for the same
@@ -25550,7 +25644,7 @@ impl CayenneTableProvider {
                 self.checkpoint_inlined_data().await?;
             }
             let folded_before = self.protected_snapshot_ids();
-            let (stream, generation_before) =
+            let (stream, generation_before, rewrite_plan) =
                 self.visible_file_stream_for_rewrite(&ctx, &order).await?;
             if folded_before != self.protected_snapshot_ids() {
                 tracing::debug!(
@@ -25573,6 +25667,7 @@ impl CayenneTableProvider {
                 },
                 generation_before,
                 snapshot_id_before,
+                rewrite_plan,
             )
         } else {
             let (scan_view, scope, generation_before, snapshot_id_before) = {
@@ -25664,11 +25759,20 @@ impl CayenneTableProvider {
                     hook().await;
                 }
             }
-            let stream = self
+            let (stream, rewrite_plan) = self
                 .rewrite_stream_from_view(&ctx, &order, scan_view)
                 .await?;
-            (stream, scope, generation_before, snapshot_id_before)
+            (
+                stream,
+                scope,
+                generation_before,
+                snapshot_id_before,
+                rewrite_plan,
+            )
         };
+
+        // Read before the clear below retires the rewritten files' position deletes.
+        let rewrite_position_deletes = self.holds_position_deletes();
 
         // The whole-table reclaim of an `auto` table on position deletes sizes what
         // it captured, the current snapshot and every protected snapshot it folds,
@@ -26085,6 +26189,9 @@ impl CayenneTableProvider {
 
             self.listing_table.store(new_listing_table);
             self.update_current_snapshot_id(&new_snapshot_id);
+            // As for the bake: a tombstone recorded meanwhile only shrinks the
+            // difference, which overstates the yield.
+            let held_before_clear = self.pk_deletion_snapshot().delete_len();
             match &scope {
                 // This rewrite always captures a folded set, so `All` is
                 // unreachable here; treat it as the conservative wholesale clear
@@ -26118,6 +26225,9 @@ impl CayenneTableProvider {
                     );
                 }
             }
+            let reclaimed =
+                held_before_clear.saturating_sub(self.pk_deletion_snapshot().delete_len());
+            self.record_reclaim_yield(&rewrite_plan, rewrite_position_deletes, reclaimed);
 
             // [sound output_ordering attestation] This rewrite consolidated the
             // entire snapshot into a single globally-sorted, non-overlapping run
@@ -26254,29 +26364,30 @@ impl CayenneTableProvider {
         ctx: &SessionContext,
         order: &RewriteOrder,
         scan_view: Arc<ScanView>,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<(SendableRecordBatchStream, Arc<dyn ExecutionPlan>)> {
         let state = ctx.state();
         let plan = self
-            .plan_scan_from_view(&state, None, &[], None, scan_view)
+            .plan_scan_from_view(&state, None, &[], None, scan_view, TombstonePushdown::Skip)
             .await?;
         let task_ctx = ctx.task_ctx();
         let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
-        Ok(datafusion_physical_plan::execute_stream(ordered, task_ctx)?)
+        let stream = datafusion_physical_plan::execute_stream(Arc::clone(&ordered), task_ctx)?;
+        Ok((stream, ordered))
     }
 
     async fn visible_file_stream_for_rewrite(
         &self,
         ctx: &SessionContext,
         order: &RewriteOrder,
-    ) -> Result<(SendableRecordBatchStream, u64)> {
+    ) -> Result<(SendableRecordBatchStream, u64, Arc<dyn ExecutionPlan>)> {
         let (plan, generation_before) = self.rewrite_scan_plan(ctx).await?;
         let task_ctx = ctx.task_ctx();
         let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
         // Executing the ordered plan executes the scan beneath it (each
         // operator executes its input when it is executed), so the stream
         // pins the same scan inputs, at the same point, as the scan alone did.
-        let stream = datafusion_physical_plan::execute_stream(ordered, task_ctx)?;
-        Ok((stream, generation_before))
+        let stream = datafusion_physical_plan::execute_stream(Arc::clone(&ordered), task_ctx)?;
+        Ok((stream, generation_before, ordered))
     }
 
     /// The scan plan [`Self::visible_file_stream_for_rewrite`] reads, and the
@@ -26288,7 +26399,14 @@ impl CayenneTableProvider {
     ) -> Result<(Arc<dyn ExecutionPlan>, u64)> {
         let (scan_view, generation_before) = self.rewrite_scan_view(ctx).await?;
         let plan = self
-            .plan_scan_from_view(&ctx.state(), None, &[], None, scan_view)
+            .plan_scan_from_view(
+                &ctx.state(),
+                None,
+                &[],
+                None,
+                scan_view,
+                TombstonePushdown::Skip,
+            )
             .await?;
         Ok((plan, generation_before))
     }
@@ -28899,6 +29017,9 @@ impl CayenneTableProvider {
         } else {
             UnionExec::try_new(plans)?
         };
+        // Kept to read its deletion filters' counts once the stream is drained.
+        let bake_plan = Arc::clone(&merged_plan);
+        let bake_position_deletes = self.holds_position_deletes();
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
@@ -29108,6 +29229,9 @@ impl CayenneTableProvider {
             // the prefix cutoff may still hide one (the output applies deletions
             // above the fence).
             let off_fence_cutoff = prune_cutoff.min(fence_max_delete_seq);
+            // A writer recording a tombstone meanwhile only shrinks the difference,
+            // which overstates the yield: the error is toward baking as before.
+            let held_before_prune = self.pk_deletion_snapshot().delete_len();
             // Boxed: the bake is one of the crate's largest futures (see
             // `snapshot_bytes_for_merge_budget`), and the prune's state need not grow it.
             Box::pin(self.prune_deletion_index_after_bake(
@@ -29117,6 +29241,9 @@ impl CayenneTableProvider {
                 &old_ids,
             ))
             .await?;
+            let reclaimed =
+                held_before_prune.saturating_sub(self.pk_deletion_snapshot().delete_len());
+            self.record_reclaim_yield(&bake_plan, bake_position_deletes, reclaimed);
         }
 
         if clean_prefix_holds {
@@ -30336,9 +30463,14 @@ impl CayenneTableProvider {
                 self.clear_cached_pk_keyset();
             }
             if self.pk_deletion_strategy.is_position_based() {
+                // The sink published each file's whole deletion vector under the
+                // write lock. Reloading the cache now, without it, could overwrite a
+                // vector a later delete published, and the delete after that would
+                // build its vector from the stale bitmap and replace the newer row.
                 self.clear_scan_file_statistics_cache();
+            } else {
+                self.refresh_deletion_cache().await?;
             }
-            self.refresh_deletion_cache().await?;
         }
 
         Ok(RetentionPass::Deleted(deleted_count))
@@ -30650,6 +30782,32 @@ impl CayenneTableProvider {
             cutoff,
             folded_protected = folded_protected_ids.len(),
             "Pruned deletion caches after sequence-fenced full rewrite"
+        );
+    }
+
+    /// Whether a scan of this table may remove rows by position delete. A
+    /// reclaim whose scan did cannot measure its yield: the position vectors
+    /// drop those rows inside the file scan, before any key filter counts them,
+    /// while the tombstones that twin them are still taken out of the index.
+    fn holds_position_deletes(&self) -> bool {
+        !self.pk_deletion_strategy.position_cache().load().is_empty()
+    }
+
+    /// Record a reclaim's yield (see [`super::deletion_yield`]), unless its scan
+    /// ran with position deletes it could not count, in which case the yield
+    /// measured before it stands.
+    fn record_reclaim_yield(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        position_deletes_applied: bool,
+        tombstones_reclaimed: usize,
+    ) {
+        if position_deletes_applied {
+            return;
+        }
+        self.context.record_deletion_index_yield(
+            rows_deleted_by(plan),
+            u64::try_from(tombstones_reclaimed).unwrap_or(u64::MAX),
         );
     }
 
@@ -38529,9 +38687,9 @@ impl CayenneTableProvider {
     /// callers — the file-based retention delete (gated by
     /// `file_based_deletes_preferred`, which requires a `time_retention_filter_builder`,
     /// i.e. `has_retention_delete_filters()`, which BLOCKS inline upserts in
-    /// `mutation_writer::write_all_append`) and the position-based delete (whose tables
-    /// don't support upserts) — cannot coexist with a staged inline-conflict tombstone
-    /// on the same table.
+    /// `mutation_writer::write_all_append`) and the `MERGE` key-probe delete of a table
+    /// with no primary key (whose tables don't support upserts) — cannot coexist with a
+    /// staged inline-conflict tombstone on the same table.
     ///
     /// That argument does NOT extend to the third caller, the background retention pass
     /// (`apply_retention_filters`): the pipelined CDC path inlines without consulting
@@ -38561,14 +38719,21 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Rewrite the inline corpus without the rows `filters` delete: the entries
+    /// that keep rows are replaced by their survivors and the ones that keep none
+    /// are removed. Returns that rewrite, which the caller commits together with
+    /// the delete's file-side deletion vectors, and how many rows it deletes.
+    ///
+    /// A table with a primary key deletes every inline version of each key a
+    /// matched row holds, so the key's superseded copies go with it. A table with
+    /// none deletes exactly the rows the predicate is true for: there is no key
+    /// to widen the match to, and no row positions an inline row could be
+    /// tombstoned by.
     pub(crate) async fn prepare_inlined_rows_matching_filters(
         &self,
         filters: &[Expr],
     ) -> datafusion_common::Result<(InlinedDataRewrite, u64)> {
-        if self.pk_deletion_strategy.is_position_based() {
-            return Ok((InlinedDataRewrite::default(), 0));
-        }
-
+        let position_based = self.pk_deletion_strategy.is_position_based();
         let inlined_data = self
             .catalog
             .get_inlined_data(&self.table_metadata.table_id)
@@ -38583,12 +38748,17 @@ impl CayenneTableProvider {
             return Ok((InlinedDataRewrite::default(), 0));
         }
 
-        let legacy_inlined_deletions = self.load_inlined_deletion_maps().await.map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to read inlined delete metadata for delete on table {}: {e}",
-                self.table_metadata.table_name
-            ))
-        })?;
+        // Inline tombstones are keyed by primary key, so a table with none has none.
+        let legacy_inlined_deletions = if position_based {
+            InlinedDeletionMaps::default()
+        } else {
+            self.load_inlined_deletion_maps().await.map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to read inlined delete metadata for delete on table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?
+        };
 
         let coerced_filters = self.coerce_filters_for_inlined_delete(filters)?;
         let physical_filters = self.build_physical_filters_for_inlined_delete(&coerced_filters)?;
@@ -38623,6 +38793,17 @@ impl CayenneTableProvider {
                 else {
                     continue;
                 };
+
+                if position_based {
+                    let (kept, removed_rows) =
+                        self.remove_inlined_rows_matching(visible_batch, &physical_filters)?;
+                    entry_matched_rows += removed_rows;
+                    if let Some(batch) = kept {
+                        remaining_rows += batch.num_rows();
+                        rewritten_batches.push(batch);
+                    }
+                    continue;
+                }
 
                 let filtered_batch =
                     self.apply_inlined_delete_filters(visible_batch.clone(), &physical_filters)?;
@@ -38727,6 +38908,35 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Split `batch` into the rows a delete by `physical_filters` keeps and the
+    /// number it removes: a row is removed only where every filter is true, so a
+    /// NULL result keeps it, as SQL `DELETE` does. No filters remove every row.
+    /// The kept rows are `None` when none remain.
+    fn remove_inlined_rows_matching(
+        &self,
+        batch: RecordBatch,
+        physical_filters: &[Arc<dyn PhysicalExpr>],
+    ) -> datafusion_common::Result<(Option<RecordBatch>, usize)> {
+        let rows = batch.num_rows();
+        let Some(matched) = self.delete_match_mask(&batch, physical_filters)? else {
+            return Ok((None, rows));
+        };
+        let removed = matched.true_count();
+        if removed == 0 {
+            return Ok((Some(batch), 0));
+        }
+        if removed == rows {
+            return Ok((None, rows));
+        }
+        // `matched` holds no NULLs (`delete_match_mask` folds them to false), so
+        // its negation is exactly the rows the delete keeps.
+        let kept = arrow::compute::not(&matched)?;
+        Ok((
+            Some(arrow::compute::filter_record_batch(&batch, &kept)?),
+            removed,
+        ))
+    }
+
     fn extract_primary_keys_from_batch(
         &self,
         batch: &RecordBatch,
@@ -38805,6 +39015,62 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Read the files of `delete_files`, delete-file rows just read from the catalog.
+    ///
+    /// On a table with no primary key, the file of a position deletion vector is
+    /// removed once the commit that replaced or cleared its row lands, which another
+    /// provider of the same table can do between this load's catalog read and its
+    /// file reads. When a read fails and the table's rows are no longer the ones it
+    /// read, it reads again against the rows the catalog holds now: a replacing
+    /// vector holds every position of the one it replaced. A read that fails
+    /// against rows that are still current returns its error.
+    async fn read_deletion_vectors_of_current_rows(
+        catalog: &dyn MetadataCatalog,
+        table_id: &str,
+        mut delete_files: Vec<crate::metadata::DeleteFile>,
+    ) -> CatalogResult<DeletionVectorRead> {
+        const MAX_READS: usize = 8;
+        let mut reads = 1;
+        loop {
+            let read_rows: HashSet<String> = delete_files
+                .iter()
+                .map(|file| file.delete_file_id.clone())
+                .collect();
+            let result = task::spawn_blocking(move || {
+                super::delete::detect_deletion_type_and_read(delete_files)
+            })
+            .await
+            .map_err(|err| CatalogError::InvalidOperation {
+                message: "Deletion vector reader task panicked or was cancelled.".to_string(),
+                source: Box::new(err),
+            })?;
+            let error = match result {
+                Ok(read) => return Ok(read),
+                Err(error) => error,
+            };
+            let current = catalog
+                .get_table_delete_files(table_id)
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to load deletion vectors from catalog.".to_string(),
+                    source: Box::new(e),
+                })?;
+            let rows_moved = current
+                .iter()
+                .map(|file| file.delete_file_id.as_str())
+                .collect::<HashSet<_>>()
+                != read_rows.iter().map(String::as_str).collect();
+            if !rows_moved || reads >= MAX_READS {
+                return Err(CatalogError::InvalidOperation {
+                    message: "Failed to read deletion vectors.".to_string(),
+                    source: Box::new(error),
+                });
+            }
+            reads += 1;
+            delete_files = current;
+        }
+    }
+
     /// Load both position-based and key-based deletion vectors from the catalog.
     ///
     /// This method queries the catalog for delete files and loads them into memory,
@@ -38823,8 +39089,6 @@ impl CayenneTableProvider {
         strategy: PkDeletionStrategy,
         cold_tier_enabled: bool,
     ) -> CatalogResult<PkDeletionStrategyWithCache> {
-        use super::delete::detect_deletion_type_and_read;
-
         // Query catalog for delete files
         let delete_files = catalog
             .get_table_delete_files(table_id)
@@ -38910,24 +39174,12 @@ impl CayenneTableProvider {
             });
         }
 
-        // Read deletion vector files in a blocking task, detecting type from schema
-        // Returns (HashMap<String, RoaringBitmap>, HashMap<Box<[u8]>, i64>,
-        // HashMap<Box<[u8]>, i64>) where:
+        // Read deletion vector files in a blocking task, detecting type from schema:
         // - per_file_row_ids: file path -> bitmap of deleted row positions
         // - deleted_row_keys: PK bytes -> max delete sequence
         let (per_file_row_ids, deleted_row_keys, derived_reinserted, missing_key_dvs) =
-            task::spawn_blocking(move || detect_deletion_type_and_read(delete_files))
-                .await
-                .map_err(|err| CatalogError::InvalidOperation {
-                    message: "Deletion vector reader task panicked or was cancelled.".to_string(),
-                    source: Box::new(err),
-                })
-                .and_then(|result| {
-                    result.map_err(|err| CatalogError::InvalidOperation {
-                        message: "Failed to read deletion vectors.".to_string(),
-                        source: Box::new(err),
-                    })
-                })?;
+            Self::read_deletion_vectors_of_current_rows(catalog.as_ref(), table_id, delete_files)
+                .await?;
 
         // Self-heal any key-based DV whose `.arrow` file is missing. The file-first
         // orphaned-DV sweep unlinks the file before removing its catalog row, so a
@@ -42252,6 +42504,7 @@ impl CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
         scan_view: Arc<ScanView>,
+        tombstone_pushdown: TombstonePushdown,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let warm_files = scan_view.raw.warm_files.clone();
         let mem_tier_any_rows = scan_view.raw.mem_tier_shards.iter().any(|s| !s.is_empty());
@@ -42373,7 +42626,10 @@ impl CayenneTableProvider {
         let effective_filters = rewritten_scan_filters(filters, retention_keep_filter.as_ref());
         let mut scan_filters_owned = effective_filters.unwrap_or_else(|| filters.to_vec());
         let mem_tier_pruning_filters = scan_filters_owned.clone();
-        if let Some(tombstone_filter) = self.vortex_key_delete_pushdown_filter(&deletion_snapshot) {
+        if tombstone_pushdown == TombstonePushdown::Apply
+            && let Some(tombstone_filter) =
+                self.vortex_key_delete_pushdown_filter(&deletion_snapshot)
+        {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
                 "Injected sparse key-delete tombstone exclusion into Vortex scan filters"
@@ -42812,8 +43068,15 @@ impl TableProvider for CayenneTableProvider {
                 hook().await;
             }
         }
-        self.plan_scan_from_view(state, projection, filters, limit, scan_view)
-            .await
+        self.plan_scan_from_view(
+            state,
+            projection,
+            filters,
+            limit,
+            scan_view,
+            TombstonePushdown::Apply,
+        )
+        .await
     }
 
     // Filter-pushdown exactness contract (read before changing the arms below):
@@ -42998,27 +43261,23 @@ impl TableProvider for CayenneTableProvider {
             return self.delete_using_files(&filters);
         }
 
-        if self.pk_deletion_strategy.is_position_based() {
-            // Position-based deletion vectors target file-local row positions,
-            // so no-PK inline rows must still be materialized before deletion.
-            {
-                let _guard = self.write_lock.lock().await;
-                self.checkpoint_inlined_data_if_present_for_delete().await?;
-            }
-
-            return self.delete_using_deletion_vectors(&filters).await;
-        }
-
-        // Key-based deletion-vector path. The sink scans main, the protected
-        // snapshots and the cold tier — every durable tier — and never the
-        // in-memory CDC tier, and its liveness probe reads the durable deletion
-        // index alone. A predicate that matches only a RAM-resident row would
-        // leave it alive, and one that matches the durable version an
-        // un-checkpointed upsert has superseded would tombstone the KEY and take
-        // the live RAM replacement with it — the shape #13574 closed for protected
-        // snapshots, one tier over. Materialize the tier, exactly as the two
-        // branches above materialize inline rows; once durable, the rows are
-        // subject to the sink's own tier-aware liveness rule.
+        // Deletion-vector path, for key and position deletes alike. Inline rows
+        // the predicate matches are removed from the inline corpus in the same
+        // catalog commit as the file-side vectors
+        // (`prepare_inlined_rows_matching_filters`), so a delete never has to turn
+        // the corpus into a Vortex file first. On a table with no primary key that
+        // flush would write one small file per delete, which every later scan and
+        // position delete then reads.
+        //
+        // The sink scans main, the protected snapshots and the cold tier — every
+        // durable tier — and never the in-memory CDC tier, and a key delete's
+        // liveness probe reads the durable deletion index alone. A predicate that
+        // matches only a RAM-resident row would leave it alive, and one that
+        // matches the durable version an un-checkpointed upsert has superseded
+        // would tombstone the KEY and take the live RAM replacement with it — the
+        // shape #13574 closed for protected snapshots, one tier over. Materialize
+        // the tier, as the file-based branch above materializes inline rows; once
+        // durable, the rows are subject to the sink's own tier-aware liveness rule.
         //
         // The checkpoint and the scan-source capture belong in the hold the DELETE
         // itself runs under, so both are deferred to
@@ -43250,28 +43509,6 @@ impl CayenneTableProvider {
         })
     }
 
-    /// Main deletion-vector path via [`CayenneDeletionSink`].
-    async fn delete_using_deletion_vectors(
-        &self,
-        filters: &[Expr],
-    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        let sink: Arc<dyn DeletionSink> = Arc::new(
-            self.build_deletion_vector_sink(
-                filters,
-                Some(Arc::clone(&self.write_lock)),
-                DeletionRequestSource::User,
-            )
-            .await?,
-        );
-        Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
-            Arc::new(PkKeysetInvalidatingDeletionSink {
-                table: self.clone_for_write(),
-                inner: sink,
-                filters: filters.to_vec(),
-            }),
-        ))))
-    }
-
     /// Build a `ListingTable` per distinct live cold-file directory (storage-
     /// cascade bottom tier), so a key-based DELETE scan finds cold-resident keys
     /// and records their tombstones. Empty when the cold tier is disabled/empty.
@@ -43427,6 +43664,7 @@ impl CayenneTableProvider {
         .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
         .with_scan_input_version(Arc::clone(&self.scan_input_version))
         .with_capture_locks(capture_locks)
+        .with_file_deletion_fence(Arc::clone(&self.file_deletion_fence))
         .with_exact_count(source.requires_exact_count());
 
         Ok(sink)
@@ -43535,7 +43773,8 @@ impl CayenneTableProvider {
             Arc::clone(&self.seq_allocator),
         )
         .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
-        .with_scan_input_version(Arc::clone(&self.scan_input_version));
+        .with_scan_input_version(Arc::clone(&self.scan_input_version))
+        .with_file_deletion_fence(Arc::clone(&self.file_deletion_fence));
 
         let deleted = sink
             .delete_by_key_hash_probe(&ctx, &all_tables, matched_keys, key_columns)
@@ -43799,7 +44038,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                 CompactionKind::Bake,
                 CompactionOutcome::DeclinedNotKeyMode,
             );
-        } else if deletion_index_len < self.context.bake_deletion_index_trigger()
+        } else if deletion_index_len < self.context.effective_bake_deletion_index_trigger()
             && !over_mem_ceiling
         {
             // The trigger's INPUT is exported as `cayenne_deletion_index_len` on
@@ -43813,7 +44052,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
             );
         }
         if key_mode
-            && (deletion_index_len >= self.context.bake_deletion_index_trigger()
+            && (deletion_index_len >= self.context.effective_bake_deletion_index_trigger()
                 || over_mem_ceiling)
         {
             maintenance_metrics::track_trigger(
@@ -43968,9 +44207,9 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                     .unwrap_or(0),
                 // Read through the same accessor the bake gate reads, not the
                 // controller's own value, so an experiment that pins the trigger
-                // reports the value actually in force.
+                // reports the value actually in force, yield backoff included.
                 bake_deletion_index_trigger: u64::try_from(
-                    self.context.bake_deletion_index_trigger(),
+                    self.context.effective_bake_deletion_index_trigger(),
                 )
                 .unwrap_or(0),
                 target_file_size_mb: u64::try_from(
@@ -62240,6 +62479,320 @@ mod tests {
         );
     }
 
+    /// A bake whose tombstones name keys that were never stored — what an upsert
+    /// leaves behind when its existence filter answers "maybe" for a fresh key —
+    /// removes no rows, so the table waits for the most tombstones the backoff
+    /// allows before it bakes again.
+    #[tokio::test]
+    async fn a_bake_whose_tombstones_hide_no_rows_backs_its_trigger_off() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_futile_yield",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+        let configured = provider.context.bake_deletion_index_trigger();
+        assert_eq!(
+            provider.context.effective_bake_deletion_index_trigger(),
+            configured
+        );
+
+        install_int64_deletes(&provider, &[(1_000, 15), (1_001, 15), (1_002, 15)]);
+        assert!(
+            provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("bake should not error"),
+            "the older prefix {{0,1}} must bake"
+        );
+        assert_eq!(
+            provider.context.effective_bake_deletion_index_trigger(),
+            configured * usize::try_from(super::super::deletion_yield::MAX_BACKOFF).expect("small"),
+        );
+    }
+
+    /// A bake whose tombstone hides a stored row measures full yield and keeps
+    /// the configured trigger.
+    #[tokio::test]
+    async fn a_bake_whose_tombstones_hide_rows_keeps_its_trigger() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) =
+            build_seq_prefix_fixture("bake_full_yield", ctx.runtime_env(), &[10, 20, 30, 40, 50])
+                .await;
+        let configured = provider.context.bake_deletion_index_trigger();
+        install_int64_deletes(&provider, &[(0, 15)]);
+        assert!(
+            provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("bake should not error"),
+            "the older prefix {{0,1}} must bake"
+        );
+        assert_eq!(
+            provider.context.effective_bake_deletion_index_trigger(),
+            configured
+        );
+    }
+
+    /// A bake whose tombstones hide a row for half of them measures half yield
+    /// and doubles its trigger: each removed row is counted once, however the
+    /// plan wraps the deletion filter that removed it.
+    #[tokio::test]
+    async fn a_bake_counts_each_removed_row_once() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) =
+            build_seq_prefix_fixture("bake_half_yield", ctx.runtime_env(), &[10, 20, 30, 40, 50])
+                .await;
+        let configured = provider.context.bake_deletion_index_trigger();
+        install_int64_deletes(&provider, &[(0, 15), (1_000, 15)]);
+        assert!(
+            provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("bake should not error"),
+            "the older prefix {{0,1}} must bake"
+        );
+        assert_eq!(
+            provider.context.effective_bake_deletion_index_trigger(),
+            2 * configured
+        );
+    }
+
+    /// A reclaim on an `auto` table still on position deletes, whose tombstones
+    /// twin the position deletes of real upserts, removes a row per tombstone even
+    /// though the scan's position vectors remove those rows before any key filter
+    /// sees them, so it keeps the configured trigger.
+    #[tokio::test]
+    async fn a_whole_table_reclaim_of_real_upserts_keeps_its_trigger() {
+        let ctx = SessionContext::new();
+        let config = VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Auto,
+            bake_deletion_index_trigger: 2,
+            compaction_background_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "reclaim_real_upserts",
+            ctx.runtime_env(),
+            config,
+        )
+        .await;
+        assert!(
+            provider.should_capture_positions(),
+            "precondition: a small auto-mode table records position deletes"
+        );
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
+        )
+        .await;
+        // Record the rows' file positions, so the upserts below conflict with
+        // located rows and write a position delete beside each key tombstone.
+        provider
+            .run_position_capture()
+            .await
+            .expect("position capture should not error");
+        insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[11, 21, 31])).await;
+        assert!(
+            provider.deletion_index_reclaim_trigger().is_some(),
+            "precondition: the upserts' tombstones are over the trigger of two"
+        );
+        provider.forget_auto_reclaim_pace();
+        assert!(
+            provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("the reclaim should not error"),
+            "the reclaim must run"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "reclaim_real_upserts").await,
+            vec![(1, 11), (2, 21), (3, 31)],
+        );
+        assert_eq!(
+            provider.context.effective_reclaim_deletion_index_trigger(),
+            2
+        );
+    }
+
+    /// A whole-table reclaim whose tombstones hide a row for half of them doubles
+    /// its trigger, counting each row once whatever wraps its deletion filter.
+    #[tokio::test]
+    async fn a_whole_table_reclaim_counts_each_removed_row_once() {
+        let ctx = SessionContext::new();
+        let config = VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Position,
+            bake_deletion_index_trigger: 2,
+            compaction_background_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "reclaim_half_yield",
+            ctx.runtime_env(),
+            config,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
+        install_int64_deletes(&provider, &[(1, i64::MAX - 1), (1_000, i64::MAX - 1)]);
+        assert!(
+            provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("the reclaim should not error"),
+            "the reclaim must run"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "reclaim_half_yield").await,
+            vec![(2, 20), (3, 30)],
+        );
+        assert_eq!(
+            provider.context.effective_reclaim_deletion_index_trigger(),
+            4
+        );
+    }
+
+    /// A whole-table reclaim counts the rows of a file whose every row its
+    /// tombstones hide: the rewrite reads that file through its deletion filters
+    /// rather than pruning it from the scan, so a reclaim that removes a row per
+    /// tombstone keeps the configured trigger.
+    #[tokio::test]
+    async fn a_whole_table_reclaim_counts_the_rows_of_files_its_tombstones_hide_whole() {
+        let ctx = SessionContext::new();
+        let config = VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Position,
+            bake_deletion_index_trigger: 2,
+            compaction_background_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "reclaim_whole_file_yield",
+            ctx.runtime_env(),
+            config,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+        insert_batch(&provider, id_value_batch(schema, &[3, 4], &[30, 40])).await;
+        install_int64_deletes(&provider, &[(1, i64::MAX - 1), (2, i64::MAX - 1)]);
+        assert!(
+            provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("the reclaim should not error"),
+            "the reclaim must run"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "reclaim_whole_file_yield").await,
+            vec![(3, 30), (4, 40)],
+        );
+        assert_eq!(
+            provider.context.effective_reclaim_deletion_index_trigger(),
+            2
+        );
+    }
+
+    /// A reclaim whose scan ran with position deletes cannot count the rows they
+    /// removed, so it records no yield and the trigger it had stands.
+    #[tokio::test]
+    async fn a_reclaim_over_position_deletes_keeps_the_yield_it_had() {
+        use super::super::deletion_strategy::PositionDeletionVector;
+
+        let ctx = SessionContext::new();
+        let config = VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Position,
+            bake_deletion_index_trigger: 2,
+            compaction_background_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "reclaim_position_deletes",
+            ctx.runtime_env(),
+            config,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
+        provider
+            .pk_deletion_strategy
+            .position_cache()
+            .store(Arc::new(HashMap::from([(
+                "/elsewhere/file.vortex".to_string(),
+                Arc::new(PositionDeletionVector::new(
+                    roaring::RoaringBitmap::from_iter([0u32]),
+                )),
+            )])));
+        install_int64_deletes(&provider, &[(1_000, 10), (1_001, 11), (1_002, 12)]);
+        assert!(
+            provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("the reclaim should not error"),
+            "the reclaim must run"
+        );
+        assert_eq!(
+            provider.context.effective_reclaim_deletion_index_trigger(),
+            2
+        );
+    }
+
+    /// The whole-table reclaim of a position-mode table measures its yield the same
+    /// way, and a reclaim that removed no rows moves its own trigger.
+    #[tokio::test]
+    async fn a_whole_table_reclaim_that_removes_no_rows_backs_its_trigger_off() {
+        let ctx = SessionContext::new();
+        let config = VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Position,
+            bake_deletion_index_trigger: 2,
+            compaction_background_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "reclaim_futile_yield",
+            ctx.runtime_env(),
+            config,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
+
+        install_int64_deletes(&provider, &[(1_000, 10), (1_001, 11), (1_002, 12)]);
+        assert!(
+            provider.deletion_index_reclaim_trigger().is_some(),
+            "precondition: three tombstones are over the trigger of two"
+        );
+        assert!(
+            provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("the reclaim should not error"),
+            "the reclaim must run"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "reclaim_futile_yield").await,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "tombstones for keys never stored hide no rows"
+        );
+        assert_eq!(
+            provider.context.effective_reclaim_deletion_index_trigger(),
+            2 * usize::try_from(super::super::deletion_yield::MAX_BACKOFF).expect("small"),
+        );
+        install_int64_deletes(&provider, &[(2_000, 20), (2_001, 21), (2_002, 22)]);
+        assert_eq!(
+            provider.deletion_index_reclaim_trigger(),
+            None,
+            "the index size that forced the last reclaim no longer forces one"
+        );
+    }
+
     /// STAGE-2 DELIVERABLE TEST (1). After a bake, a tombstone with
     /// `delete_seq <= T` is GONE from the index AND the deleted row stays deleted
     /// on scan. Five snapshots (ids 0..5) pinned at seqs 10,20,30,40,50; K = 3 is
@@ -78244,6 +78797,82 @@ mod tests {
         );
     }
 
+    /// A deletion-vector load that read a position vector's row just before a
+    /// delete replaced that vector, and removed its file, reads the replacing row
+    /// instead of failing on the missing file. Another provider of the same table —
+    /// an open, or a catalog refresh — can land in exactly that window.
+    #[tokio::test]
+    async fn deletion_vector_load_reads_the_row_that_replaced_a_removed_vector() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_position_based_table("replaced_vector_load", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
+        )
+        .await;
+        {
+            let _write = provider.write_lock.lock().await;
+            provider
+                .checkpoint_inlined_data()
+                .await
+                .expect("checkpoint inline rows");
+        }
+        let delete = |id: i64| {
+            let provider = provider.clone_for_write();
+            let ctx = ctx.clone();
+            async move {
+                let plan = provider
+                    .delete_from(&ctx.state(), vec![col("id").eq(datafusion_expr::lit(id))])
+                    .await
+                    .expect("delete plan");
+                collect(plan, ctx.task_ctx())
+                    .await
+                    .expect("delete executed");
+            }
+        };
+        let table_id = provider.table_id().to_string();
+
+        delete(1).await;
+        let read_before_replacement = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("delete-file rows");
+        assert_eq!(
+            read_before_replacement.len(),
+            1,
+            "one vector after one delete"
+        );
+        let replaced_path = std::path::PathBuf::from(&read_before_replacement[0].path);
+
+        delete(2).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while replaced_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the replaced vector's file {} was never removed",
+                replaced_path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (positions, _, _, _) = CayenneTableProvider::read_deletion_vectors_of_current_rows(
+            catalog.as_ref(),
+            &table_id,
+            read_before_replacement,
+        )
+        .await
+        .expect("the load reads the replacing vector");
+        assert_eq!(
+            positions.len(),
+            1,
+            "one data file holds deletes: {positions:?}"
+        );
+        let deleted = positions.values().next().expect("the data file's bitmap");
+        assert_eq!(deleted.len(), 2, "both deletes are in the replacing vector");
+    }
+
     /// When position deletes are pending and the cached aggregate stats are not
     /// available, `statistics()` must not fall back to raw `ListingTable` footer
     /// stats. Those stats do not account for the Vortex access-plan deletion
@@ -78261,6 +78890,15 @@ mod tests {
             id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
         )
         .await;
+        // Move the rows into a file: a delete of inline rows rewrites the corpus
+        // and leaves no position bitmap.
+        {
+            let _write = provider.write_lock.lock().await;
+            provider
+                .checkpoint_inlined_data()
+                .await
+                .expect("checkpoint inline rows");
+        }
         provider
             .flush_pending_maintenance()
             .await

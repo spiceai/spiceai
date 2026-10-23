@@ -1391,6 +1391,10 @@ impl DataConnector for Postgres {
         true
     }
 
+    fn supports_partitioned_changes(&self) -> bool {
+        true
+    }
+
     async fn changes_stream(
         &self,
         context: &dyn ConnectorContext,

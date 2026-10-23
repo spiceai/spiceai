@@ -155,6 +155,8 @@ pub async fn try_to_embedding(
         }),
         #[cfg(feature = "models")]
         EmbeddingPrefix::HuggingFace => {
+            // Parsing loads an `hf_token` the Spicepod does not set from the secret stores.
+            let token_in_spicepod = params.contains_key("hf_token");
             let typed = embedding_params::huggingface::HuggingFaceEmbeddingParams::try_from_params(
                 &component_name,
                 params,
@@ -162,7 +164,14 @@ pub async fn try_to_embedding(
             )
             .await
             .map_err(params_err)?;
-            huggingface(&component.name, model_id, &typed, embeddings_cache.clone()).await
+            huggingface(
+                &component.name,
+                model_id,
+                &typed,
+                token_in_spicepod,
+                embeddings_cache.clone(),
+            )
+            .await
         }
         #[cfg(not(feature = "models"))]
         EmbeddingPrefix::HuggingFace => Err(EmbedError::UnknownModelSource {
@@ -410,9 +419,14 @@ async fn huggingface(
     name: &String,
     model_id: Option<String>,
     params: &embedding_params::huggingface::HuggingFaceEmbeddingParams,
+    token_in_spicepod: bool,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
-    let hf_token = params.hf_token.as_ref().map(ExposeSecret::expose_secret);
+    let hub = llms::hf::HubParams {
+        token: params.hf_token.as_ref(),
+        token_in_spicepod,
+        endpoint: params.hf_endpoint.as_deref(),
+    };
     let pooling = params.pooling.map(embedding_params::Pooling::as_str);
     let truncation = params.truncate.unwrap_or_default().direction();
     if let Some(id) = model_id {
@@ -424,9 +438,10 @@ async fn huggingface(
         let (repo_id, revision) = spicepod::component::model::split_hf_model_id(&id);
         Ok(Arc::new(
             TeiEmbed::from_hf(
+                name,
                 repo_id,
                 revision,
-                hf_token,
+                hub,
                 pooling,
                 params.max_seq_length,
                 truncation,
