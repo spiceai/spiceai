@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,33 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::path::PathBuf;
+//! Environment-variable secret store.
+//!
+//! # Precedence
+//!
+//! Keys are tried as `SPICE_{key}`, `{key}`, `SPICE_{KEY}`, then `{KEY}`.
+//!
+//! * **Default store** (no `file_path`): the process environment wins, then
+//!   `.env.local`, then `.env`. That is the dotenv convention: a variable
+//!   already in the environment is not overwritten by a file.
+//! * **`file_path` store**: only that file is loaded. Its values win over the
+//!   process environment. Project `.env` / `.env.local` are not read.
+//!
+//! When several secret stores are configured, the store defined last in the
+//! spicepod wins for `${ secrets:KEY }` (the registry is searched last-to-first).
+//!
+//! # Process environment
+//!
+//! The default (no `file_path`) store also exports its file-loaded values
+//! into the process environment without overwriting existing variables, so
+//! libraries that read `std::env` directly (the AWS SDK default credential
+//! chain) keep working. A `file_path` store never exports. The bootstrap
+//! store used to expand other stores' `params:` also does not export, so a
+//! spicepod that only declares a `file_path` store does not inherit project
+//! `.env` files through the process environment.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use runtime_parameters_derive::TypedParams;
@@ -51,6 +77,7 @@ pub struct EnvConfig {
 
 pub struct EnvSecretStoreBuilder {
     path: Option<PathBuf>,
+    export_to_process_env: bool,
 }
 
 impl Default for EnvSecretStoreBuilder {
@@ -62,7 +89,10 @@ impl Default for EnvSecretStoreBuilder {
 impl EnvSecretStoreBuilder {
     #[must_use]
     pub fn new() -> Self {
-        Self { path: None }
+        Self {
+            path: None,
+            export_to_process_env: false,
+        }
     }
 
     #[must_use]
@@ -71,59 +101,104 @@ impl EnvSecretStoreBuilder {
         self
     }
 
+    /// Export file-loaded values into the process environment without
+    /// overwriting variables that are already set. Used only for the
+    /// registered default env store (no `file_path`).
+    #[must_use]
+    pub fn export_to_process_env(mut self) -> Self {
+        self.export_to_process_env = true;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> EnvSecretStore {
-        let env = EnvSecretStore { path: self.path };
-        env.load();
-        env
+        let values = load_values(self.path.as_deref());
+        if self.export_to_process_env {
+            export_without_overwrite(&values);
+        }
+        EnvSecretStore {
+            path: self.path,
+            values,
+        }
     }
 }
 
+/// An env secret store with a private key/value map.
+///
+/// See the module docs for precedence and process-environment rules.
 pub struct EnvSecretStore {
     path: Option<PathBuf>,
+    values: HashMap<String, String>,
 }
 
 impl EnvSecretStore {
-    fn load(&self) {
-        if let Some(path) = &self.path
-            && load_from_iter(path, dotenv::from_path_iter(path))
-        {
-            return;
-        }
-        // `.env.local` is loaded before `.env` so that its values take priority:
-        // `load_iter` preserves existing `std::env` vars and does not overwrite
-        // them, so the first file loaded wins.
-        let _ = dotenv::from_filename_iter(".env.local").map(|iter| load_iter(iter, ".env.local"));
-        let _ = dotenv::from_filename_iter(".env").map(|iter| load_iter(iter, ".env"));
+    fn key_variants(key: &str) -> [String; 4] {
+        let uppercase_key = key.to_uppercase();
+        [
+            format!("{ENV_SECRET_PREFIX}{key}"),
+            key.to_string(),
+            format!("{ENV_SECRET_PREFIX}{uppercase_key}"),
+            uppercase_key,
+        ]
+    }
+
+    fn lookup_map(&self, variants: &[String]) -> Option<SecretString> {
+        variants.iter().find_map(|variant| {
+            self.values
+                .get(variant)
+                .map(|value| SecretString::from(value.clone()))
+        })
     }
 }
 
-/// Iterates parsed entries from a [`dotenv`] iterator, setting each valid
-/// key-value pair into the environment. Variables already present in the
-/// environment are preserved, so earlier-loaded files take priority over later
-/// ones. Malformed lines are logged with their line number and content so users
+/// Load this store's private map.
+///
+/// A `file_path` store reads only that file. The default store reads
+/// `.env.local` then `.env` (first key wins).
+fn load_values(path: Option<&Path>) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    if let Some(path) = path {
+        load_path_into_map(path, &mut values);
+        return values;
+    }
+    // `.env.local` is loaded before `.env` so that its values take priority:
+    // `collect_iter` does not overwrite keys already present.
+    load_filename_into_map(".env.local", &mut values);
+    load_filename_into_map(".env", &mut values);
+    values
+}
+
+fn load_path_into_map(path: &Path, values: &mut HashMap<String, String>) {
+    match dotenv::from_path_iter(path) {
+        Ok(iter) => collect_iter(iter, &path.display().to_string(), values),
+        Err(err) => {
+            tracing::debug!("Error opening path {}: {err}", path.display());
+        }
+    }
+}
+
+fn load_filename_into_map(filename: &str, values: &mut HashMap<String, String>) {
+    match dotenv::from_filename_iter(filename) {
+        Ok(iter) => collect_iter(iter, filename, values),
+        Err(err) => {
+            tracing::debug!("{filename}: {err}");
+        }
+    }
+}
+
+/// Iterates parsed entries from a [`dotenv`] iterator into `values`.
+/// Keys already present are preserved, so earlier-loaded files win.
+/// Malformed lines are logged with their line number and content so users
 /// can fix them. I/O-level errors (e.g. missing file) are reported at debug
 /// level because the file is optional.
-///
-/// # Safety
-///
-/// `std::env::set_var` is unsafe in the 2024 edition because mutating the
-/// environment while another thread reads it is undefined behavior. The store
-/// is constructed during runtime startup, before request-serving workloads
-/// run, which keeps the writes confined to initialization; do not call this
-/// from steady-state code paths.
-fn load_iter<I>(iter: I, label: &str)
+fn collect_iter<I>(iter: I, label: &str, values: &mut HashMap<String, String>)
 where
     I: Iterator<Item = Result<(String, String), dotenv::Error>>,
 {
     for item in iter {
         match item {
             Ok((key, val)) => {
-                if std::env::var_os(&key).is_none() {
-                    unsafe {
-                        std::env::set_var(key, val);
-                    }
-                }
+                values.entry(key).or_insert(val);
             }
             Err(dotenv::Error::LineParse(line_num, content)) => {
                 tracing::warn!(
@@ -137,47 +212,45 @@ where
     }
 }
 
-/// Load entries from a `from_path_iter` / `from_filename_iter` result.
+/// # Safety
 ///
-/// Returns `true` when the file was opened and iterated (even if some lines were
-/// malformed). Returns `false` when the file could not be opened, so the caller
-/// can fall back to the default `.env` / `.env.local` search.
-fn load_from_iter<I, E>(path: &std::path::Path, result: Result<I, E>) -> bool
-where
-    I: Iterator<Item = Result<(String, String), dotenv::Error>>,
-    E: std::fmt::Display,
-{
-    match result {
-        Ok(iter) => {
-            load_iter(iter, &path.display().to_string());
-            true
-        }
-        Err(err) => {
-            tracing::debug!("Error opening path {}: {err}", path.display());
-            false
+/// `std::env::set_var` is unsafe in the 2024 edition because mutating the
+/// environment while another thread reads it is undefined behavior. The store
+/// is constructed during runtime startup, before request-serving workloads
+/// run, which keeps the writes confined to initialization; do not call this
+/// from steady-state code paths.
+fn export_without_overwrite(values: &HashMap<String, String>) {
+    for (key, val) in values {
+        if std::env::var_os(key).is_none() {
+            unsafe {
+                std::env::set_var(key, val);
+            }
         }
     }
 }
 
-#[async_trait]
-impl SecretStore for EnvSecretStore {
-    /// The key for `std::env::var` is case-sensitive. Calling `std::env::var("my_key")` is distinct from `std::env::var("MY_KEY")`.
-    ///
-    /// However, the convention is to use uppercase for environment variables - so to make the experience
-    /// consistent across secret stores that don't have this convention we will search for both original and uppercased keys.
-    async fn get_secret(&self, key: &str) -> crate::AnyErrorResult<Option<SecretString>> {
-        let uppercase_key = key.to_uppercase();
+/// Iterates parsed entries from a [`dotenv`] iterator, setting each valid
+/// key-value pair into the environment. Variables already present in the
+/// environment are preserved, so earlier-loaded files take priority over later
+/// ones. Malformed lines are logged with their line number and content so users
+/// can fix them. I/O-level errors (e.g. missing file) are reported at debug
+/// level because the file is optional.
+///
+/// # Safety
+///
+/// See [`export_without_overwrite`].
+#[cfg(test)]
+fn load_iter<I>(iter: I, label: &str)
+where
+    I: Iterator<Item = Result<(String, String), dotenv::Error>>,
+{
+    let mut values = HashMap::new();
+    collect_iter(iter, label, &mut values);
+    export_without_overwrite(&values);
+}
 
-        [
-            // First try looking for original prefixed `SPICE_my_key`
-            format!("{ENV_SECRET_PREFIX}{key}"),
-            // Then try looking for original `my_key`
-            key.to_string(),
-            // Then try looking for prefixed `SPICE_MY_KEY` in uppercase
-            format!("{ENV_SECRET_PREFIX}{uppercase_key}"),
-            // Then try looking for `MY_KEY` in uppercase
-            uppercase_key,
-        ]
+fn lookup_process_env(variants: &[String]) -> crate::AnyErrorResult<Option<SecretString>> {
+    variants
         .iter()
         .find_map(|variant| match std::env::var(variant) {
             Ok(value) => Some(Ok(SecretString::from(value))),
@@ -187,19 +260,70 @@ impl SecretStore for EnvSecretStore {
             )),
         })
         .transpose()
+}
+
+#[async_trait]
+impl SecretStore for EnvSecretStore {
+    /// The key for `std::env::var` is case-sensitive. Calling `std::env::var("my_key")` is distinct from `std::env::var("MY_KEY")`.
+    ///
+    /// However, the convention is to use uppercase for environment variables - so to make the experience
+    /// consistent across secret stores that don't have this convention we will search for both original and uppercased keys.
+    async fn get_secret(&self, key: &str) -> crate::AnyErrorResult<Option<SecretString>> {
+        let variants = Self::key_variants(key);
+        if self.path.is_some() {
+            if let Some(value) = self.lookup_map(&variants) {
+                return Ok(Some(value));
+            }
+            return lookup_process_env(&variants);
+        }
+        if let Some(value) = lookup_process_env(&variants)? {
+            return Ok(Some(value));
+        }
+        Ok(self.lookup_map(&variants))
     }
 }
 
+/// Serializes tests that mutate the process environment or the process cwd.
+///
+/// Tokio mutex so async tests can hold the guard across `.await` without
+/// tripping `await_holding_lock`. Shared with `runtime-secrets` lib tests.
+#[cfg(test)]
+pub(crate) static ENV_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::io::Write;
-    use std::sync::{Mutex, PoisonError};
 
-    /// Serializes the tests that mutate the process environment: under plain
-    /// `cargo test` all tests share one process, and concurrent `set_var` /
-    /// env reads are undefined behavior in the 2024 edition. (`cargo nextest`
-    /// runs each test in its own process and needs no serialization.)
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    use secrecy::ExposeSecret;
+
+    const C1_KEY: &str = "C1_PREC_KEY";
+
+    fn write_env_file(path: &Path, contents: &str) {
+        let mut file = std::fs::File::create(path).expect("Failed to create test .env file");
+        file.write_all(contents.as_bytes())
+            .expect("Failed to write test .env file");
+    }
+
+    /// Restores the process cwd when dropped so a failing assertion cannot
+    /// leave later tests in a temp directory.
+    struct CwdGuard {
+        prev: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(path: &Path) -> Self {
+            let prev = std::env::current_dir().expect("cwd");
+            std::env::set_current_dir(path).expect("chdir");
+            Self { prev }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
 
     /// Values containing `$` characters must be preserved literally.
     ///
@@ -223,10 +347,7 @@ TEST_PATCH_CURLY_BRACES=value_${NOT_A_VAR}_here
 TEST_PATCH_MULTIPLE_DOLLARS=$$double$$dollars$$
 ";
 
-        let mut file = std::fs::File::create(&env_file).expect("Failed to create test .env file");
-        file.write_all(env_content.as_bytes())
-            .expect("Failed to write test .env file");
-        drop(file);
+        write_env_file(&env_file, env_content);
 
         let entries: std::collections::HashMap<String, String> = dotenv::from_path_iter(&env_file)
             .expect("Failed to open .env file")
@@ -254,9 +375,9 @@ TEST_PATCH_MULTIPLE_DOLLARS=$$double$$dollars$$
     /// Valid entries that appear after a malformed line must still be loaded.
     /// Before the switch to `from_path_iter`, loading stopped at the first
     /// parse error and discarded all subsequent lines.
-    #[test]
-    fn test_malformed_line_does_not_block_valid_entries() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(PoisonError::into_inner);
+    #[tokio::test]
+    async fn test_malformed_line_does_not_block_valid_entries() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
         let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
         let env_file = temp_dir.path().join(".env.malformed");
 
@@ -264,10 +385,7 @@ TEST_PATCH_MULTIPLE_DOLLARS=$$double$$dollars$$
 THIS LINE HAS NO EQUALS SIGN
 MALFORMED_VALID_SECOND=second_value
 ";
-        let mut file = std::fs::File::create(&env_file).expect("Failed to create test .env file");
-        file.write_all(env_content.as_bytes())
-            .expect("Failed to write test .env file");
-        drop(file);
+        write_env_file(&env_file, env_content);
 
         let iter = dotenv::from_path_iter(&env_file).expect("Failed to open .env file");
         super::load_iter(iter, ".env.malformed");
@@ -293,16 +411,16 @@ MALFORMED_VALID_SECOND=second_value
     /// Variables already present in the environment must not be overwritten by
     /// a `.env` file: real environment variables take priority, and `.env.local`
     /// (loaded first) takes priority over `.env`.
-    #[test]
-    fn test_load_iter_preserves_existing_vars() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(PoisonError::into_inner);
+    #[tokio::test]
+    async fn test_load_iter_preserves_existing_vars() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
         let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
         let env_file = temp_dir.path().join(".env.preserve");
 
-        let mut file = std::fs::File::create(&env_file).expect("Failed to create test .env file");
-        file.write_all(b"PRESERVE_EXISTING=from_file\nPRESERVE_NEW=from_file\n")
-            .expect("Failed to write test .env file");
-        drop(file);
+        write_env_file(
+            &env_file,
+            "PRESERVE_EXISTING=from_file\nPRESERVE_NEW=from_file\n",
+        );
 
         // SAFETY: unique variable names, mutated only by this test.
         unsafe {
@@ -328,5 +446,176 @@ MALFORMED_VALID_SECOND=second_value
             std::env::remove_var("PRESERVE_EXISTING");
             std::env::remove_var("PRESERVE_NEW");
         }
+    }
+
+    #[tokio::test]
+    async fn file_path_store_returns_file_value_not_process_or_dotenv() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let custom = temp_dir.path().join("custom.env");
+        let dotenv_local = temp_dir.path().join(".env.local");
+        write_env_file(&custom, &format!("{C1_KEY}=from_custom\n"));
+        write_env_file(&dotenv_local, &format!("{C1_KEY}=from_dotenv_local\n"));
+
+        unsafe {
+            std::env::set_var(C1_KEY, "from_process");
+        }
+
+        let store = EnvSecretStoreBuilder::new().with_path(custom).build();
+        let value = store
+            .get_secret(C1_KEY)
+            .await
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(
+            value.expose_secret(),
+            "from_custom",
+            "a file_path store must return its file value, not the process env or .env.local"
+        );
+
+        unsafe {
+            std::env::remove_var(C1_KEY);
+        }
+    }
+
+    #[tokio::test]
+    async fn file_path_store_does_not_export_to_process_env() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let custom = temp_dir.path().join("custom.env");
+        write_env_file(&custom, "C1_NO_EXPORT_KEY=from_custom\n");
+
+        unsafe {
+            std::env::remove_var("C1_NO_EXPORT_KEY");
+        }
+
+        let _store = EnvSecretStoreBuilder::new().with_path(custom).build();
+        assert!(
+            std::env::var_os("C1_NO_EXPORT_KEY").is_none(),
+            "a file_path store must not export into the process environment"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_store_without_export_does_not_pollute_process_env() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let _cwd = CwdGuard::enter(temp_dir.path());
+        write_env_file(
+            &temp_dir.path().join(".env.local"),
+            "C1_BOOTSTRAP_KEY=from_dotenv_local\n",
+        );
+
+        unsafe {
+            std::env::remove_var("C1_BOOTSTRAP_KEY");
+        }
+
+        let store = EnvSecretStoreBuilder::new().build();
+        let value = store
+            .get_secret("C1_BOOTSTRAP_KEY")
+            .await
+            .expect("lookup")
+            .expect("present in the store map");
+        assert_eq!(value.expose_secret(), "from_dotenv_local");
+        assert!(
+            std::env::var_os("C1_BOOTSTRAP_KEY").is_none(),
+            "bootstrap / non-exporting default store must not write .env files into process env"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_store_prefers_process_env_over_dotenv() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let _cwd = CwdGuard::enter(temp_dir.path());
+        write_env_file(
+            &temp_dir.path().join(".env.local"),
+            &format!("{C1_KEY}=from_dotenv_local\n"),
+        );
+
+        unsafe {
+            std::env::set_var(C1_KEY, "from_process");
+        }
+
+        let store = EnvSecretStoreBuilder::new().build();
+        let value = store
+            .get_secret(C1_KEY)
+            .await
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(
+            value.expose_secret(),
+            "from_process",
+            "the default env store must let the process environment beat .env files"
+        );
+
+        unsafe {
+            std::env::remove_var(C1_KEY);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_store_prefers_dotenv_local_over_dotenv() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let _cwd = CwdGuard::enter(temp_dir.path());
+        write_env_file(
+            &temp_dir.path().join(".env.local"),
+            &format!("{C1_KEY}=from_dotenv_local\n"),
+        );
+        write_env_file(
+            &temp_dir.path().join(".env"),
+            &format!("{C1_KEY}=from_dotenv\n"),
+        );
+
+        unsafe {
+            std::env::remove_var(C1_KEY);
+        }
+
+        let store = EnvSecretStoreBuilder::new().build();
+        let value = store
+            .get_secret(C1_KEY)
+            .await
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(
+            value.expose_secret(),
+            "from_dotenv_local",
+            ".env.local must beat .env when the process environment does not define the key"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_path_store_does_not_load_project_dotenv_files() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let _cwd = CwdGuard::enter(temp_dir.path());
+        write_env_file(
+            &temp_dir.path().join(".env.local"),
+            "C1_ONLY_DOTENV=from_dotenv_local\n",
+        );
+        let custom = temp_dir.path().join("custom.env");
+        write_env_file(&custom, "C1_ONLY_CUSTOM=from_custom\n");
+
+        unsafe {
+            std::env::remove_var("C1_ONLY_DOTENV");
+            std::env::remove_var("C1_ONLY_CUSTOM");
+        }
+
+        let store = EnvSecretStoreBuilder::new().with_path(custom).build();
+        assert!(
+            store
+                .get_secret("C1_ONLY_DOTENV")
+                .await
+                .expect("lookup")
+                .is_none(),
+            "a file_path store must not read project .env / .env.local"
+        );
+        let custom_value = store
+            .get_secret("C1_ONLY_CUSTOM")
+            .await
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(custom_value.expose_secret(), "from_custom");
     }
 }
