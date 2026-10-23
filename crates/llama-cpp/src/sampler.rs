@@ -95,6 +95,17 @@ impl<'v> Sampler<'v> {
         })
     }
 
+    /// `OpenAI`'s frequency and presence penalties over the last `window` tokens the sampler
+    /// has accepted: each token's logit loses `frequency` for every time it was accepted, and
+    /// `presence` once if it was accepted at all.
+    #[must_use]
+    pub fn penalties(vocab: &Vocab<'_>, window: i32, frequency: f32, presence: f32) -> Self {
+        // SAFETY: plain values; a repeat penalty of 1.0 leaves llama.cpp's own penalty off.
+        Self::from_raw(unsafe {
+            sys::llama_sampler_init_penalties(vocab.n_tokens(), window, 1.0, frequency, presence)
+        })
+    }
+
     /// Keeps only tokens that continue a text the GBNF `grammar` accepts from its `root`
     /// rule. A sampler chain applies it before the sampler that picks the token.
     pub fn grammar(vocab: &Vocab<'v>, grammar: &str) -> Result<Self> {
@@ -168,6 +179,17 @@ impl<'v> Sampler<'v> {
             .iter()
             .map(|d| Token(d.id))
             .collect()
+    }
+
+    /// Tells the sampler at `index` in this chain that `token` was picked, as picking it
+    /// through the chain would. Nothing happens when the chain has no sampler there.
+    pub fn accept_at(&mut self, index: i32, token: Token) {
+        // SAFETY: the chain owns the sampler it returns, which lives as long as the chain.
+        let sampler = unsafe { sys::llama_sampler_chain_get(self.raw.as_ptr(), index) };
+        if !sampler.is_null() {
+            // SAFETY: as above.
+            unsafe { sys::llama_sampler_accept(sampler, token.0) };
+        }
     }
 
     /// Picks the token for output row `index` of the last decoded batch.

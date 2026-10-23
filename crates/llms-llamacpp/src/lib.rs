@@ -170,6 +170,9 @@ struct Loaded {
 struct Sampling {
     temperature: Option<f32>,
     top_p: Option<f32>,
+    /// `OpenAI`'s frequency and presence penalties, over every token the reply generates.
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
     seed: u32,
     /// The GBNF grammar the content must match: `response_format`'s, or a required tool
     /// call's.
@@ -452,6 +455,8 @@ impl LlamaCpp {
                 sampling: Sampling {
                     temperature: req.temperature,
                     top_p: req.top_p,
+                    frequency_penalty: req.frequency_penalty,
+                    presence_penalty: req.presence_penalty,
                     seed: rand::random(),
                     grammar: grammar.clone(),
                     ban_eog,
@@ -1302,20 +1307,39 @@ impl ToolSplit {
 
 /// Picks each token with the request's sampler. A `response_format` grammar constrains the
 /// content only, so it takes over when a reasoning block ends; while a required tool call is
-/// outstanding, end-of-generation tokens are ruled out.
+/// outstanding, end-of-generation tokens are ruled out. Frequency and presence penalties
+/// count every token the reply generates, reasoning included, as the mistral.rs engine does.
 struct Picker<'v> {
     free: Sampler<'v>,
     constrained: Option<Sampler<'v>>,
+    /// Whether each chain starts with the penalties, which then also hear of the tokens the
+    /// other chain picks.
+    penalized: bool,
 }
 
 impl<'v> Picker<'v> {
+    /// `window` is how many generated tokens the penalties remember: the context's length
+    /// covers a whole reply.
     fn new(
         vocab: Vocab<'v>,
         sampling: &Sampling,
         eog: &[Token],
+        window: u32,
     ) -> std::result::Result<Self, String> {
+        let frequency = sampling.frequency_penalty.unwrap_or(0.0);
+        let presence = sampling.presence_penalty.unwrap_or(0.0);
+        if !frequency.is_finite() || !presence.is_finite() {
+            return Err(format!(
+                "`frequency_penalty` and `presence_penalty` must be finite numbers, got {frequency} and {presence}"
+            ));
+        }
+        let penalized = frequency != 0.0 || presence != 0.0;
+        let window = i32::try_from(window).unwrap_or(i32::MAX);
         let chain = |grammar: Option<&str>| -> std::result::Result<Sampler<'v>, String> {
             let mut samplers = Vec::new();
+            if penalized {
+                samplers.push(Sampler::penalties(&vocab, window, frequency, presence));
+            }
             if sampling.ban_eog {
                 let ruled_out: Vec<_> = eog.iter().map(|&t| (t, f32::NEG_INFINITY)).collect();
                 samplers.push(Sampler::logit_bias(&vocab, &ruled_out));
@@ -1333,14 +1357,23 @@ impl<'v> Picker<'v> {
                 .as_deref()
                 .map(|g| chain(Some(g)))
                 .transpose()?,
+            penalized,
         })
     }
 
     fn sample(&mut self, context: &Context<'_>, index: i32, in_content: bool) -> Token {
-        match &mut self.constrained {
-            Some(constrained) if in_content => constrained.sample(context, index),
-            _ => self.free.sample(context, index),
+        let (used, other) = match &mut self.constrained {
+            Some(constrained) if in_content => (constrained, Some(&mut self.free)),
+            constrained => (&mut self.free, constrained.as_mut()),
+        };
+        let token = used.sample(context, index);
+        // The penalties lead each chain; the chain that did not pick still counts the token.
+        if self.penalized
+            && let Some(other) = other
+        {
+            other.accept_at(0, token);
         }
+        token
     }
 }
 
@@ -1368,7 +1401,7 @@ fn generate(
 ) -> std::result::Result<Outcome, String> {
     let (prompt, sampling, mut out) = Output::new(job);
     let vocab = model.vocab();
-    let mut picker = Picker::new(vocab, &sampling, eog)?;
+    let mut picker = Picker::new(vocab, &sampling, eog, context.n_ctx())?;
     let (tokens, mut batch) = read_prompt(model, context, &prompt, &out.stopping)?;
     let n_ctx = usize::try_from(context.n_ctx()).unwrap_or(usize::MAX);
     let mut pos = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
@@ -1398,7 +1431,7 @@ fn generate_mtp(
 ) -> std::result::Result<Outcome, String> {
     let (prompt, sampling, mut out) = Output::new(job);
     let vocab = model.vocab();
-    let mut picker = Picker::new(vocab, &sampling, eog)?;
+    let mut picker = Picker::new(vocab, &sampling, eog, spec.target().n_ctx())?;
     spec.draft_mut().clear();
     // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
     // hidden state at each prompt position before `begin`.

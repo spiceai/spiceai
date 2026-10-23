@@ -526,3 +526,40 @@ async fn a_model_dropped_under_a_stalled_stream_stops_promptly() {
         "dropping the model took {stopped:?}"
     );
 }
+
+/// `frequency_penalty` and `presence_penalty` reach the sampler: at temperature 0, a reply
+/// asked to repeat a word repeats it less under either penalty than without one.
+#[tokio::test]
+async fn frequency_and_presence_penalties_reduce_repetition() {
+    let model = qwen3().await;
+    let repeats = |penalty: Value| {
+        let model = std::sync::Arc::clone(&model);
+        async move {
+            let mut body = json!({
+                "model": "qwen3",
+                "messages": [{ "role": "user", "content": "Write the word yes thirty times, separated by spaces, and nothing else." }],
+                "temperature": 0,
+                "reasoning_effort": "none",
+                "max_tokens": 64,
+            });
+            if let (Some(body), Some(penalty)) = (body.as_object_mut(), penalty.as_object()) {
+                body.extend(penalty.clone());
+            }
+            let reply = model.chat_request(request(body)).await.expect("a reply");
+            let content = reply.choices[0].message.content.clone().expect("content");
+            (content.to_lowercase().matches("yes").count(), content)
+        }
+    };
+    let (plain, plain_text) = repeats(json!({})).await;
+    let (frequency, frequency_text) = repeats(json!({ "frequency_penalty": 2.0 })).await;
+    let (presence, presence_text) = repeats(json!({ "presence_penalty": 2.0 })).await;
+    assert!(plain >= 5, "without a penalty: {plain_text}");
+    assert!(
+        frequency < plain,
+        "frequency_penalty: {frequency} vs {plain}: {frequency_text} | {plain_text}"
+    );
+    assert!(
+        presence < plain,
+        "presence_penalty: {presence} vs {plain}: {presence_text} | {plain_text}"
+    );
+}
