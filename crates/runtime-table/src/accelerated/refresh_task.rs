@@ -17,6 +17,7 @@ limitations under the License.
 use self::append_cursor::AppendCursorStore;
 use super::refresh::Refresh;
 use super::refresh::get_timestamp;
+use super::refresh_completion::RefreshRequestId;
 use super::sink::AccelerationSink;
 use super::synchronized_table::SynchronizedTable;
 use crate::accelerated::caching::CacheRefreshHelper;
@@ -277,6 +278,8 @@ pub struct RefreshTaskBuilder {
     /// Per-dataset `cdc_*` parameter overrides drawn from
     /// `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    /// Requests to reload a change stream's served partitions.
+    reload_requests: Option<tokio::sync::mpsc::Receiver<RefreshRequestId>>,
     /// The cache keys a write is pending for, shared with the caching scan and
     /// its batched writer. `RefreshMode::Caching`'s periodic stale-row refresh
     /// replaces the entries it refreshes, so it has to claim each key for the
@@ -321,6 +324,7 @@ impl RefreshTaskBuilder {
             engine_type_rewrites: &[],
             snapshot_refresh_state: None,
             cdc_param_overrides: None,
+            reload_requests: None,
             in_flight_revalidations: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -473,6 +477,17 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Provide the requests that reload a change stream's served partitions;
+    /// see [`crate::accelerated::AcceleratedTable::trigger_reload`].
+    #[must_use]
+    pub fn with_reload_requests(
+        mut self,
+        reload_requests: Option<tokio::sync::mpsc::Receiver<RefreshRequestId>>,
+    ) -> RefreshTaskBuilder {
+        self.reload_requests = reload_requests;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> RefreshTask {
         let semaphore = self
@@ -540,6 +555,7 @@ impl RefreshTaskBuilder {
             change_sink: tokio::sync::OnceCell::new_with(self.change_sink),
             cache_write_sender: self.cache_write_sender,
             cdc_param_overrides: self.cdc_param_overrides,
+            reload_requests: parking_lot::Mutex::new(self.reload_requests),
             in_flight_revalidations: self.in_flight_revalidations,
             append_cursor_store: self.append_cursor_store,
             last_append_fallback: parking_lot::Mutex::new(None),
@@ -629,6 +645,10 @@ pub struct RefreshTask {
     cache_write_sender: Option<super::caching::CacheWriteSender>,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    /// Requests to reload a change stream's served partitions, taken by the
+    /// change stream when it starts.
+    pub(crate) reload_requests:
+        parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<RefreshRequestId>>>,
     in_flight_revalidations: super::caching::InFlightRevalidations,
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<AppendCursorStore>,
@@ -2703,6 +2723,9 @@ impl RefreshTask {
         state
             .config_mut()
             .set_extension(RequestContext::current(AsyncMarker::new().await));
+        // A file dataset whose source files lost a registered column fails this scan
+        // instead of loading NULLs over the accelerated data.
+        data_components::file_schema_drift::mark_acceleration_refresh(state.config_mut());
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             tracing::error!("Unable to register JSON functions: {e}");
@@ -3278,7 +3301,10 @@ impl RefreshTask {
     fn is_view_acceleration(&self) -> bool {
         match &*self.federated {
             FederatedTable::Immediate(provider) => provider.table_type() == TableType::View,
-            FederatedTable::Deferred(_) => false,
+            // A view served from its existing acceleration has no plan to ask yet.
+            FederatedTable::Deferred(_) => {
+                self.federated_source.as_deref() == Some(super::VIEW_FEDERATED_SOURCE)
+            }
         }
     }
 
@@ -4984,6 +5010,54 @@ mod tests {
         )
         .await;
         assert_eq!(refresh.state().config().target_partitions(), cores);
+    }
+
+    /// File datasets fail a refresh scan, rather than loading NULLs, when their source
+    /// files lost a registered column; they tell a refresh scan apart by this marker.
+    #[tokio::test]
+    async fn refresh_session_is_marked_as_acceleration_refresh() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let refresh = RefreshTask::create_refresh_df_context(
+            source,
+            &TableReference::bare("drift_marked_refresh"),
+            &accelerator,
+            false,
+            Handle::current(),
+        )
+        .await;
+        assert!(data_components::file_schema_drift::is_acceleration_refresh(
+            &refresh.state()
+        ));
+        assert!(
+            !data_components::file_schema_drift::is_acceleration_refresh(
+                &SessionContext::new().state()
+            ),
+            "an ordinary query session must not be treated as a refresh"
+        );
+    }
+
+    /// The missing-column refresh error is permanent: retrying cannot bring the column back,
+    /// and the refresh must not write NULLs over the loaded data.
+    #[test]
+    fn missing_column_refresh_error_is_permanent() {
+        let err = retry_from_df_error(DataFusionError::Plan(
+            "Dataset 'base': registered column 'amount_cents' missing from every source file scanned".to_string(),
+        ));
+        assert!(
+            matches!(
+                err,
+                RetryError::Permanent(super::super::Error::FailedToRefreshDataset { .. })
+            ),
+            "{err:?}"
+        );
     }
 
     #[derive(Debug)]

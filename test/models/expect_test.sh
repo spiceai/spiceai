@@ -270,6 +270,12 @@ stall_after=${SPICE_FAKE_STALL_AFTER_TURN:-0}
 # consumes the stream with a greedy catch-all eats the first piece and then
 # waits forever for a prompt that has already gone by.
 split_prompt=${SPICE_FAKE_SPLIT_PROMPT:-0}
+# Fails this turn the way both REPLs report a failed request: a red `Error`
+# line, then straight back to the prompt.
+error_turn=${SPICE_FAKE_ERROR_TURN:-0}
+# Answers with text that mentions an error without being one: a model talking
+# about an error, or a search result whose content contains the word.
+mention_error=${SPICE_FAKE_ANSWER_MENTIONS_ERROR:-0}
 
 write_prompt() {
   if [ "$split_prompt" -ne 0 ]; then
@@ -322,6 +328,16 @@ while IFS= read -r line; do
     # stand-in that outlives its pty does not sit on the runner.
     sleep 30
     exit 45
+  fi
+
+  if [ "$error_turn" -ne 0 ] && [ "$turn" -eq "$error_turn" ]; then
+    printf '\033[31mError\033[0m Failed to send the request: connection refused\r\n'
+    write_prompt
+    continue
+  fi
+
+  if [ "$mention_error" -ne 0 ]; then
+    printf 'An ERROR line in a log, or an Error: message, is not a failed request.\r\n'
   fi
 
   if [ "$mode" = 'search' ]; then
@@ -407,6 +423,39 @@ script_case 'chat_01.exp when the REPL exits while idle' chat_01.exp \
 assert_status 1
 assert_reports 'Checking the chat REPL is still running'
 assert_reports 'exited with status 44'
+
+# ---------------------------------------------------------------------------
+# A request the REPL reports as failed
+# ---------------------------------------------------------------------------
+#
+# Both REPLs print a failed request as a red `Error` line and return to the
+# prompt. The prompt alone cannot tell that turn from an answer, so each script
+# has to recognise the line itself; it used to wait for " ERROR ", which the CLI
+# never prints, and passed every turn that failed.
+
+for script in chat_01.exp chat_01_simple.exp search_01.exp; do
+  script_case "$script when the REPL reports a failed request" "$script" \
+    SPICE_FAKE_ERROR_TURN=1
+  assert_status 1
+  assert_reports 'the REPL reported a failed request'
+  assert_reports 'connection refused'
+  assert_silent_about 'returned expected'
+  assert_silent_about 'Model confirmed access'
+
+  # The word on its own is not the marker: an answer about an error, or a search
+  # result that contains one, is still an answer.
+  script_case "$script when an answer mentions an error" "$script" \
+    SPICE_FAKE_ANSWER_MENTIONS_ERROR=1
+  assert_status 0
+  assert_silent_about 'the REPL reported a failed request'
+  assert_silent_about 'Error detected'
+done
+
+# A failed request on a later turn is caught there, not only on the first.
+script_case 'chat_01.exp when the REPL reports a failed request on the second turn' chat_01.exp \
+  SPICE_FAKE_ERROR_TURN=2
+assert_status 1
+assert_reports 'Waiting for the issue count: the REPL reported a failed request'
 
 # ---------------------------------------------------------------------------
 # What the wait on a REPL response is bounded by

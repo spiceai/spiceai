@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
+use crate::accelerated::partition_scope::{PartitionScope, scope_changes};
 use crate::accelerated::refresh::{self, RefreshOverrides};
 use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
@@ -35,7 +36,7 @@ use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{
     Acceleration, Engine, Mode, RefreshMode, ZeroResultsAction,
 };
-use crate::component::dataset::{Dataset, OnSchemaChange, ReadyState};
+use crate::component::dataset::{Dataset, DatasetSpec, OnSchemaChange, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::spice_sys::dataset_checkpointer;
@@ -95,6 +96,7 @@ use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
+use data_components::cdc::AccelerationContents;
 use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
@@ -744,21 +746,38 @@ async fn read_refresh_batch(
     .await
 }
 
+/// The plan a rebuilt view acceleration reloads through.
+#[derive(Clone, Copy)]
+enum ViewPlan<'a> {
+    /// Built before the acceleration was created.
+    Built(&'a Arc<dyn TableProvider>),
+    /// Built once the tables the view reads are ready, while the view is served from its
+    /// existing acceleration.
+    Deferred(&'a crate::view::ViewRefreshSource),
+}
+
 /// Whether a rebuilt view acceleration could reload: a row of the view's query can be read
-/// through `view_table` within [`REBUILD_SOURCE_WAIT`]. Planning the view reads none of the
-/// sources its query reads, so only a read shows that they answer.
+/// through its plan within [`REBUILD_SOURCE_WAIT`], building the plan first if it is not
+/// built yet. Planning the view reads none of the sources its query reads, so only a read
+/// shows that they answer. A redefined view is not rebuilt here: it is registered again
+/// from its definition.
 async fn view_readable_for_rebuild(
     ctx: &SessionContext,
     view_name: &TableReference,
-    view_table: &Arc<dyn TableProvider>,
+    view_plan: ViewPlan<'_>,
 ) -> bool {
-    match tokio::time::timeout(
-        REBUILD_SOURCE_WAIT,
-        read_one_row(ctx, Arc::clone(view_table)),
-    )
-    .await
-    {
-        Ok(Ok(())) => true,
+    let read = async {
+        let view_table = match view_plan {
+            ViewPlan::Built(view_table) => Arc::clone(view_table),
+            ViewPlan::Deferred(source) => match source.plan_on_served_schema().await? {
+                Some(view_table) => view_table,
+                None => return Ok(false),
+            },
+        };
+        read_one_row(ctx, view_table).await.map(|()| true)
+    };
+    match tokio::time::timeout(REBUILD_SOURCE_WAIT, read).await {
+        Ok(Ok(readable)) => readable,
         Ok(Err(error)) => {
             let error = error.to_string();
             let cause = util::single_line(&error);
@@ -4259,6 +4278,16 @@ impl DataFusion {
             .validate_time_format(&dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
+        // A change stream applies whatever its source sends, so on a cluster
+        // executor it is scoped to the partitions the executor serves, when its
+        // connector supports that.
+        let partition_scope = initial_partition_filters
+            .as_ref()
+            .filter(|_| {
+                refresh_mode == RefreshMode::Changes && source.supports_partitioned_changes()
+            })
+            .map(|filters| PartitionScope::new(filters.clone()));
+
         // Apply initial partition filters before the refresher starts to avoid a race
         // where the first refresh runs without partition filters. `Some(empty)`
         // (executor owns no partition of this table) is preserved so the refresh
@@ -4622,8 +4651,14 @@ impl DataFusion {
             // assume they may be hiding rows deleted at the source; this is how
             // it recognizes a load that starts from nothing instead. See
             // `AccelerationContents`.
-            let acceleration =
+            let mut acceleration =
                 probe_acceleration_contents(&accelerated_table_provider, &dataset.name).await;
+            // Kept rows of a scoped acceleration may belong to partitions this
+            // executor no longer serves, so the source rebuilds it instead of
+            // resuming on them.
+            if partition_scope.is_some() && acceleration == AccelerationContents::NonEmpty {
+                acceleration = AccelerationContents::Unknown;
+            }
 
             let changes_stream = source
                 .changes_stream(
@@ -4635,6 +4670,13 @@ impl DataFusion {
                 .await;
 
             if let Some(changes_stream) = changes_stream {
+                let changes_stream = match &partition_scope {
+                    Some(scope) => {
+                        accelerated_table_builder.partition_scope(Arc::clone(scope));
+                        scope_changes(changes_stream, Arc::clone(scope))
+                    }
+                    None => changes_stream,
+                };
                 accelerated_table_builder.changes_stream(changes_stream);
             }
         }
@@ -5166,13 +5208,13 @@ impl DataFusion {
     /// (`acceleration_source::rebuilds_on_settings_change`), so the rebuild loses no row a
     /// reload does not bring back. The reload runs the view's query, which reads sources
     /// that can fail, so the acceleration is dropped only once a row of the query can be
-    /// read through `view_table` ([`view_readable_for_rebuild`]). Until then, the engine
+    /// read through `view_plan` ([`view_readable_for_rebuild`]). Until then, the engine
     /// keeps the settings the acceleration was built with
     /// ([`SettingsRebuild::HeldUntilSourceReadable`]) and the view keeps serving it.
     async fn create_view_accelerator_table(
         &self,
         view: &View,
-        view_table: &Arc<dyn TableProvider>,
+        view_plan: ViewPlan<'_>,
         schema: SchemaRef,
         acceleration_settings: &Acceleration,
         secrets: Arc<TokioRwLock<Secrets>>,
@@ -5182,7 +5224,7 @@ impl DataFusion {
             .await
         {
             Err(dataaccelerator::Error::RebuildRequired { source: cause }) => {
-                if view_readable_for_rebuild(&self.ctx, &view.name, view_table).await {
+                if view_readable_for_rebuild(&self.ctx, &view.name, view_plan).await {
                     self.rebuild_acceleration(view, acceleration_settings, &cause.to_string())
                         .await?;
                     return self
@@ -6084,6 +6126,16 @@ impl DataFusion {
             table.as_ref(),
             spice_table::LayerWalk::Read,
         ) {
+            if let Some(waiter) =
+                accelerated_table
+                    .trigger_reload()
+                    .await
+                    .context(UnableToTriggerRefreshSnafu {
+                        dataset_name: dataset_name.to_string(),
+                    })?
+            {
+                return Ok(Some(waiter));
+            }
             // Taken before the trigger, for both halves of the correlation: the
             // refresh it starts cannot finish unobserved between here and the
             // caller's wait (#13086), and a refresh already running when the
@@ -6387,6 +6439,7 @@ impl DataFusion {
         self: &Arc<Self>,
         view: Arc<View>,
         secrets: Arc<TokioRwLock<Secrets>>,
+        start: crate::view::ViewStart,
     ) -> Result<JoinHandle<Option<ViewRegistration>>> {
         tracing::info!("Initializing view {}", &view.name);
         if self.ctx.table_exist(view.name.clone()).unwrap_or(false) {
@@ -6415,6 +6468,31 @@ impl DataFusion {
         tracing::debug!("Creating view {table} with dependent tables {dependent_table_names:?}");
 
         let register_task: JoinHandle<Option<ViewRegistration>> = spawn(async move {
+            if start == crate::view::ViewStart::ExistingAcceleration
+                && let Some(checkpoint_schema) = view.existing_acceleration_schema().await
+            {
+                return match df_ref
+                    .create_accelerated_view_from_existing(
+                        &view,
+                        statements[0].clone(),
+                        dependent_table_names,
+                        checkpoint_schema,
+                        secrets,
+                    )
+                    .await
+                {
+                    Ok(registration) => registration,
+                    Err(e) => {
+                        tracing::error!("Failed to create view {table}: {e}");
+                        status.update_view(
+                            &table,
+                            status::ComponentStatus::error_with_message(e.to_string()),
+                        );
+                        None
+                    }
+                };
+            }
+
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
             // the tables are created. To handle this, wait until all tables are created.
@@ -6527,6 +6605,82 @@ impl DataFusion {
         view_table: Arc<dyn TableProvider>,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<Option<ViewRegistration>> {
+        let view_table =
+            table_provider_with_spicepod_metadata(view_table, &view.metadata, &view.columns);
+        let schema = view_table.schema();
+        self.register_accelerated_view(
+            view,
+            FederatedTable::new_unchecked(Arc::clone(&view_table)),
+            schema,
+            ViewPlan::Built(&view_table),
+            secrets,
+        )
+        .await
+    }
+
+    /// Registers an accelerated view against its existing acceleration, checkpointed
+    /// with `checkpoint_schema`, without waiting for the tables it reads (`reads`):
+    /// queries are served from the acceleration, and the view's plan is built in the
+    /// background once those tables are ready, when its refreshes resume. This is how
+    /// an accelerated dataset is served before its source answers. Settings that need a
+    /// rebuild wait for those tables within [`REBUILD_SOURCE_WAIT`], as a dataset waits for
+    /// its source ([`view_readable_for_rebuild`]). A plan that no longer matches the
+    /// acceleration registers the view again from its definition
+    /// (see [`crate::view::ViewRefreshSource`]).
+    async fn create_accelerated_view_from_existing(
+        self: &Arc<Self>,
+        view: &Arc<View>,
+        statement: datafusion::sql::parser::Statement,
+        reads: Vec<TableReference>,
+        checkpoint_schema: SchemaRef,
+        secrets: Arc<TokioRwLock<Secrets>>,
+    ) -> Result<Option<ViewRegistration>> {
+        let mut spec = DatasetSpec::new(String::new(), view.name.clone());
+        spec.metadata.clone_from(&view.metadata);
+        spec.columns.clone_from(&view.columns);
+        let served_schema =
+            runtime_table::accelerated::checkpoint_primary_key::without_acceleration_primary_key(
+                Arc::clone(&checkpoint_schema),
+            );
+        let source = crate::view::ViewRefreshSource::new_arc(
+            Arc::clone(&self.ctx),
+            statement,
+            Arc::clone(view),
+            reads,
+            self.runtime_status(),
+            served_schema,
+        );
+        let federated = FederatedTable::new_deferred(
+            Arc::new(spec),
+            Arc::clone(&source) as Arc<dyn runtime_table::refresh_source::RefreshSource>,
+            checkpoint_schema,
+            self.runtime_status().shutdown_token(),
+        );
+        let schema = federated.schema();
+        let registration = self
+            .register_accelerated_view(
+                view,
+                federated,
+                schema,
+                ViewPlan::Deferred(&source),
+                secrets,
+            )
+            .await?;
+        source.mark_registered();
+        Ok(registration)
+    }
+
+    /// Registers `view` accelerated, refreshed from `federated` and serving `schema`. A
+    /// settings change that rebuilds the acceleration drops it only once `view_plan` can
+    /// be read.
+    async fn register_accelerated_view(
+        self: &Arc<Self>,
+        view: &View,
+        federated: FederatedTable,
+        schema: SchemaRef,
+        view_plan: ViewPlan<'_>,
+        secrets: Arc<TokioRwLock<Secrets>>,
+    ) -> Result<Option<ViewRegistration>> {
         let table = &view.name;
 
         let acceleration =
@@ -6536,10 +6690,6 @@ impl DataFusion {
                     name: table.to_string(),
                 })?;
 
-        let view_table =
-            table_provider_with_spicepod_metadata(view_table, &view.metadata, &view.columns);
-        let schema = view_table.schema();
-
         // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
         validate_distributed_engine(
             &self.cluster_config,
@@ -6548,7 +6698,7 @@ impl DataFusion {
         )?;
 
         let accelerated_table_provider = self
-            .create_view_accelerator_table(view, &view_table, schema, acceleration, secrets)
+            .create_view_accelerator_table(view, view_plan, schema, acceleration, secrets)
             .await
             .map_err(|e| Error::UnableToCreateView {
                 reason: match e {
@@ -6588,8 +6738,8 @@ impl DataFusion {
         let mut builder = AcceleratedTable::builder(
             self.runtime_status(),
             table.clone(),
-            Arc::new(FederatedTable::new_unchecked(view_table)),
-            "view".to_string(),
+            Arc::new(federated),
+            runtime_table::accelerated::VIEW_FEDERATED_SOURCE.to_string(),
             accelerated_table_provider,
             refresh,
             self.io_runtime.clone(),
@@ -7353,7 +7503,7 @@ impl Drop for DataFusion {
     }
 }
 
-async fn wait_until_dependent_tables_are_ready(
+pub(crate) async fn wait_until_dependent_tables_are_ready(
     table: &TableReference,
     dependent_tables: &[TableReference],
     runtime_status: &Arc<status::RuntimeStatus>,
@@ -7421,16 +7571,20 @@ async fn build_snapshot_creation_config(
         return Ok(None);
     }
 
-    // A partitioned Cayenne dataset must not publish snapshots: its exported
-    // metastore slice omits the partition child tables, so the uploaded archive
-    // could not be restored, yet `create_snapshot` would still make it the
-    // store's `current-snapshot-id`. Same gate as `snapshot_before_recreate`.
-    if acceleration_settings.engine == Engine::Cayenne
-        && !acceleration_settings.partition_by.is_empty()
-    {
+    // The same rule `snapshot_before_recreate` applies, read from the one place
+    // that states it — rationale on `archive_would_be_unrestorable`. A copy per
+    // publish path is how the periodic path came to publish an archive the
+    // pre-recreation path already refused.
+    if engine_to_acceleration_engine(acceleration_settings.engine).is_some_and(|engine| {
+        data_accelerator_api::snapshots::archive_would_be_unrestorable(
+            &engine,
+            snapshot_engine_override.as_ref(),
+        )
+    }) {
         tracing::warn!(
             dataset = %dataset.name,
-            "Snapshot creation is disabled for this dataset: snapshots of a partitioned Cayenne acceleration are not yet supported, and an archive without the partitions' metadata could not be restored"
+            "Dataset '{}' will not publish snapshots: its Cayenne metastore catalog is unavailable, so an archive of it would carry no metastore slice and could not be restored. Check that this dataset's `cayenne_metadata_dir` and data directory are readable.",
+            dataset.name
         );
         return Ok(None);
     }
@@ -8464,6 +8618,60 @@ mod tests {
             .await;
 
             assert!(result.expect("config should exist").is_none());
+        }
+
+        /// A Cayenne dataset must not publish a snapshot the default engine
+        /// wrote: that archive carries the raw `cayenne.db` and no per-dataset
+        /// metastore slice, and publishing it makes an unrestorable archive the
+        /// store's `current-snapshot-id`. `snapshot_engine_for_source` returns
+        /// `None` on a catalog or data-directory failure, so the absent
+        /// override is the observable form of that failure here.
+        ///
+        /// Partitioned and unpartitioned alike: `snapshot_before_recreate`
+        /// draws no such distinction, and the slice is what makes either one
+        /// restorable.
+        #[tokio::test]
+        async fn cayenne_does_not_publish_without_its_snapshot_engine() {
+            for partition_by in [
+                vec![],
+                vec![spicepod::partitioning::PartitionedBy {
+                    name: "part_col".to_string(),
+                    expression: "part_col".to_string(),
+                }],
+            ] {
+                let dataset = create_test_dataset(None).await;
+                let acceleration = Acceleration {
+                    partition_by,
+                    ..create_acceleration_with_trigger(
+                        Some("file:///tmp".to_string()),
+                        Engine::Cayenne,
+                        Some(SnapshotsTrigger::RefreshComplete),
+                        None,
+                        &dataset.runtime().secrets(),
+                    )
+                };
+                let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+                let result = build_snapshot_creation_config(
+                    &dataset,
+                    &acceleration,
+                    RefreshMode::Full,
+                    AccelerationLayout::cayenne(
+                        temp_dir.path().join("metadata"),
+                        temp_dir.path().join("data"),
+                    ),
+                    None,
+                )
+                .await;
+
+                assert!(
+                    result
+                        .expect("an absent snapshot engine is not an error")
+                        .is_none(),
+                    "Cayenne must not publish through the default engine (partition_by={:?})",
+                    acceleration.partition_by
+                );
+            }
         }
 
         #[tokio::test]
