@@ -3213,6 +3213,133 @@ mod tests {
         assert!(message.contains("Dataset 'test'"), "{message}");
     }
 
+    const EVENTS_JSON_BASELINE: &[&str] = &[
+        r#"{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0"}"#,
+        r#"{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1"}"#,
+    ];
+    const EVENTS_JSON_RENAMED: &[&str] = &[
+        r#"{"event_id":1,"user_id":10,"region":"us","amt":100,"ts":"t0"}"#,
+        r#"{"event_id":2,"user_id":20,"region":"eu","amt":200,"ts":"t1"}"#,
+    ];
+
+    fn write_events_json_array(path: &std::path::Path, objects: &[&str]) {
+        std::fs::write(path, format!("[{}]", objects.join(","))).expect("write json array");
+    }
+
+    fn write_events_json_pointer(path: &std::path::Path, objects: &[&str]) {
+        std::fs::write(path, format!(r#"{{"data":[{}]}}"#, objects.join(",")))
+            .expect("write json pointer");
+    }
+
+    async fn assert_listing_json_rename_fails_refresh(
+        label: &str,
+        from: String,
+        params: HashMap<String, String>,
+        file_path: &std::path::Path,
+        write: fn(&std::path::Path, &[&str]),
+    ) {
+        write(file_path, EVENTS_JSON_BASELINE);
+        let (connector, dataset) = setup_connector(from.clone(), params);
+        let url = Url::parse(&from).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: format: {e}"))
+        else {
+            panic!("{label}: expected a JSON file format");
+        };
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: listing table: {e}"));
+
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), true).await,
+            (Some(300), Some(30)),
+            "{label}: last good accelerated read before rename"
+        );
+
+        write(file_path, EVENTS_JSON_RENAMED);
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "{label}: a renamed JSON column is NULL on a federated read"
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new();
+        data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let message = ctx
+            .sql("SELECT * FROM events")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a refresh scan must not overwrite accelerated JSON with NULLs")
+            .to_string();
+        assert!(message.contains("'amount_cents'"), "{label}: {message}");
+        assert!(message.contains("Dataset 'test'"), "{label}: {message}");
+        let file_name = file_path.file_name().expect("file name").to_string_lossy();
+        assert!(
+            message.contains(&format!(
+                "'{}/{}'",
+                file_path.parent().expect("parent").display(),
+                file_name
+            )) || message.contains(&format!("'{file_name}'")),
+            "{label}: example file path: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_json_array_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "json".to_string());
+        assert_listing_json_rename_fails_refresh(
+            "file_format json",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_array,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_auto_json_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        assert_listing_json_rename_fails_refresh(
+            "auto-detected json",
+            format!("file://{}", path.display()),
+            HashMap::new(),
+            &path,
+            write_events_json_array,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_json_pointer_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        params.insert("json_pointer".to_string(), "/data".to_string());
+        assert_listing_json_rename_fails_refresh(
+            "jsonl json_pointer",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_pointer,
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn test_get_file_format_and_extension_tsv_from_params() {
         let mut params = HashMap::new();

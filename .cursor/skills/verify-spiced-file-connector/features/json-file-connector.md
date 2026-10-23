@@ -2,17 +2,21 @@
 
 A JSON/NDJSON file dataset binds object keys by name. Reordering keys keeps values with their names. Renaming a registered key returns `NULL` on a federated read (one `WARN`) and fails an acceleration refresh so the last loaded data is kept. Schema inference samples records; the drift check reads every record so a sparse key later in the file is not treated as a rename.
 
+`file_format: json` (array/object) and `json_pointer` use a non-repartitioned scan wrapper. The drift guard must still see those files; a rename on those paths is the same contract as JSONL.
+
 ## Sub-features
 
 - `json-reorder` rewrites the same objects with keys in a different order and keeps `sum(amount_cents)=300`, `sum(user_id)=30`.
 - `json-rename` renames `amount_cents` to `amt`. Federated reads return `NULL` for `amount_cents` and one `WARN`. An Arrow refresh fails; status is `Error`; accelerated sums stay `300`/`30`.
 - `json-restore` puts the original key back. Federated sums return; a refresh succeeds; status is `Ready`.
+- `json-array` is `file_format: json` over `data/events.json` (a JSON array). Same reorder / rename / restore as JSONL.
+- `json-pointer` is `file_format: json` plus `json_pointer: /data` over `data/events_pointer.json` (`{"data":[...]}`). Same reorder / rename / restore as JSONL.
 
 ## How to get to it (user POV)
 
-- Configure a file-connector dataset `from: file:data/events.jsonl` with `file_format: jsonl`.
+- Configure a file-connector dataset `from: file:data/events.jsonl` with `file_format: jsonl`, or `from: file:data/events.json` with `file_format: json`, or `from: file:data/events_pointer.json` with `file_format: json` and `json_pointer: /data`.
 - Query it with `POST /v1/sql`.
-- For the accelerated copy, call `POST /v1/datasets/json_acc/acceleration/refresh` after the file changes.
+- For the accelerated copy, call `POST /v1/datasets/<name>/acceleration/refresh` after the file changes.
 - Inspect status with `GET /v1/datasets?status=true`.
 
 ## Driving it with verify-file-connector.sh
@@ -20,14 +24,14 @@ A JSON/NDJSON file dataset binds object keys by name. Reordering keys keeps valu
 Preconditions:
 
 - `spiced` is healthy at `http://127.0.0.1:18090` (`GET /v1/ready` is `200` / `ready`).
-- `doctor` lists `json_fed` and `json_acc`.
-- `data/events.jsonl` is the baseline (keys `event_id`, `user_id`, `region`, `amount_cents`, `ts`; sums `300`/`30`).
+- `doctor` lists `json_fed`, `json_acc`, `json_array_fed`, `json_array_acc`, `json_ptr_fed`, and `json_ptr_acc`.
+- `data/events.jsonl`, `data/events.json`, and `data/events_pointer.json` are the baseline (keys `event_id`, `user_id`, `region`, `amount_cents`, `ts`; sums `300`/`30`).
 
-- **Baseline sums.** `POST /v1/sql` `SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM json_fed` and the same for `json_acc`. Both return `300`/`30`. Both datasets are `Ready`.
-- **Reorder keys.** Rewrite each line with `amount_cents` before `user_id`. Query `json_fed`. Refresh `json_acc`, then query it. Both stay `300`/`30`. Status stays `Ready`.
-- **Rename the amount key.** Rewrite each line with `amt` instead of `amount_cents`. Query `json_fed`: `amount_cents` is `null`, `user_id` is `30`. The log has one `WARN` naming `'amount_cents'` and dataset `'json_fed'`. Refresh `json_acc`: the refresh ends in `Error` with a message naming `'amount_cents'`. Query `json_acc`: sums are still `300`/`30`.
-- **Restore.** Rewrite the baseline objects. Query `json_fed` (`300`/`30`). Refresh `json_acc` until `Ready`. Query `json_acc` (`300`/`30`).
-- **Proof.** Keep `sql-*-json_*.json`, `datasets-*.json`, `refresh-*-json_acc.*`, and the matching `WARN` / error lines from `spiced.log`.
+- **Baseline sums.** `POST /v1/sql` `SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM <dataset>` for each JSON dataset. All return `300`/`30`. All are `Ready`.
+- **Reorder keys.** Rewrite each source with `amount_cents` before `user_id`. Query the federated datasets. Refresh the accelerated datasets, then query them. All stay `300`/`30`. Status stays `Ready`.
+- **Rename the amount key.** Rewrite each source with `amt` instead of `amount_cents`. Query each federated dataset: `amount_cents` is `null`, `user_id` is `30`. The log has one `WARN` per federated dataset naming `'amount_cents'`. Refresh each accelerated dataset: the refresh ends in `Error` with a message naming `'amount_cents'`. Query each accelerated dataset: sums are still `300`/`30`.
+- **Restore.** Rewrite the baseline objects. Query federated (`300`/`30`). Refresh accelerated until `Ready`. Query accelerated (`300`/`30`).
+- **Proof.** Keep `sql-*-json_*.json`, `datasets-*.json`, `refresh-*-json_*acc.*`, and the matching `WARN` / error lines from `spiced.log`. The WARN example path starts with `/`.
 
 ## Gotchas
 

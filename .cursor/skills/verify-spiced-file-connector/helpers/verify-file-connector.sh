@@ -92,6 +92,63 @@ write_events_jsonl() {
   printf '%s\n' "$@" >"$path"
 }
 
+write_events_json_array() {
+  local path="$1"
+  shift
+  {
+    echo '['
+    local i=0
+    local n=$#
+    for row in "$@"; do
+      i=$((i + 1))
+      if (( i < n )); then
+        printf '  %s,\n' "$row"
+      else
+        printf '  %s\n' "$row"
+      fi
+    done
+    echo ']'
+  } >"$path"
+}
+
+write_events_json_pointer() {
+  local path="$1"
+  shift
+  {
+    echo '{"data":['
+    local i=0
+    local n=$#
+    for row in "$@"; do
+      i=$((i + 1))
+      if (( i < n )); then
+        printf '  %s,\n' "$row"
+      else
+        printf '  %s\n' "$row"
+      fi
+    done
+    echo ']}'
+  } >"$path"
+}
+
+JSON_BASELINE_1='{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0"}'
+JSON_BASELINE_2='{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1"}'
+JSON_REORDER_1='{"event_id":1,"amount_cents":100,"region":"us","user_id":10,"ts":"t0"}'
+JSON_REORDER_2='{"event_id":2,"amount_cents":200,"region":"eu","user_id":20,"ts":"t1"}'
+JSON_RENAME_1='{"event_id":1,"user_id":10,"region":"us","amt":100,"ts":"t0"}'
+JSON_RENAME_2='{"event_id":2,"user_id":20,"region":"eu","amt":200,"ts":"t1"}'
+
+ALL_DATASETS=(csv_fed csv_acc json_fed json_acc json_array_fed json_array_acc json_ptr_fed json_ptr_acc)
+FED_DATASETS=(csv_fed json_fed json_array_fed json_ptr_fed)
+ACC_DATASETS=(csv_acc json_acc json_array_acc json_ptr_acc)
+
+write_all_json_shapes() {
+  local one="$1"
+  local two="$2"
+  write_events_jsonl "${WORK}/data/events.jsonl" "$one" "$two"
+  write_events_json_array "${WORK}/data/events.json" "$one" "$two"
+  write_events_json_pointer "${WORK}/data/events_pointer.json" "$one" "$two"
+}
+
 seed_files() {
   local data="${WORK}/data"
   mkdir -p "$data"
@@ -99,9 +156,7 @@ seed_files() {
     "event_id,user_id,region,amount_cents,ts" \
     "1,10,us,100,t0" \
     "2,20,eu,200,t1"
-  write_events_jsonl "${data}/events.jsonl" \
-    '{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0"}' \
-    '{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1"}'
+  write_all_json_shapes "$JSON_BASELINE_1" "$JSON_BASELINE_2"
 }
 
 seed_spicepod() {
@@ -133,6 +188,32 @@ datasets:
     name: json_acc
     params:
       file_format: jsonl
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: full
+  - from: file:${data}/events.json
+    name: json_array_fed
+    params:
+      file_format: json
+  - from: file:${data}/events.json
+    name: json_array_acc
+    params:
+      file_format: json
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: full
+  - from: file:${data}/events_pointer.json
+    name: json_ptr_fed
+    params:
+      file_format: json
+      json_pointer: /data
+  - from: file:${data}/events_pointer.json
+    name: json_ptr_acc
+    params:
+      file_format: json
+      json_pointer: /data
     acceleration:
       enabled: true
       engine: arrow
@@ -235,7 +316,7 @@ cmd_doctor() {
   datasets="$(curl -sS --max-time 10 "http://${HTTP_ADDR}/v1/datasets?status=true")"
   python3 - "$datasets" <<'PY'
 import json, sys
-needed = {"csv_fed", "csv_acc", "json_fed", "json_acc"}
+needed = {"csv_fed", "csv_acc", "json_fed", "json_acc", "json_array_fed", "json_array_acc", "json_ptr_fed", "json_ptr_acc"}
 data = json.loads(sys.argv[1])
 names = {d.get("name") for d in data}
 missing = needed - names
@@ -352,7 +433,7 @@ summarize_datasets() {
 import json, sys
 data = json.loads(open(sys.argv[1], encoding="utf-8").read())
 parts = []
-for name in ("csv_fed", "csv_acc", "json_fed", "json_acc"):
+for name in ("csv_fed", "csv_acc", "json_fed", "json_acc", "json_array_fed", "json_array_acc", "json_ptr_fed", "json_ptr_acc"):
     row = next((d for d in data if d.get("name") == name), None)
     if row is None:
         parts.append(f"{name}=absent")
@@ -409,11 +490,14 @@ cmd_drive() {
   seed_files
   cp "${WORK}/data/events.csv" "${ev}/events.baseline.csv"
   cp "${WORK}/data/events.jsonl" "${ev}/events.baseline.jsonl"
+  cp "${WORK}/data/events.json" "${ev}/events.baseline.json"
+  cp "${WORK}/data/events_pointer.json" "${ev}/events.baseline.pointer.json"
 
   ready_capture "${ev}/ready-baseline.txt"
   datasets_status "${ev}/datasets-baseline.json"
   echo "baseline datasets: $(summarize_datasets "${ev}/datasets-baseline.json")" | tee -a "${ev}/summary.txt"
-  for ds in csv_fed csv_acc json_fed json_acc; do
+  local ds
+  for ds in "${ALL_DATASETS[@]}"; do
     query_dataset baseline "$ds" "$ev"
   done
 
@@ -421,20 +505,24 @@ cmd_drive() {
     "event_id,amount_cents,region,user_id,ts" \
     "1,100,us,10,t0" \
     "2,200,eu,20,t1"
-  write_events_jsonl "${WORK}/data/events.jsonl" \
-    '{"event_id":1,"amount_cents":100,"region":"us","user_id":10,"ts":"t0"}' \
-    '{"event_id":2,"amount_cents":200,"region":"eu","user_id":20,"ts":"t1"}'
+  write_all_json_shapes "$JSON_REORDER_1" "$JSON_REORDER_2"
   cp "${WORK}/data/events.csv" "${ev}/events.reordered.csv"
   cp "${WORK}/data/events.jsonl" "${ev}/events.reordered.jsonl"
+  cp "${WORK}/data/events.json" "${ev}/events.reordered.json"
+  cp "${WORK}/data/events_pointer.json" "${ev}/events.reordered.pointer.json"
 
-  query_dataset reorder-fed csv_fed "$ev"
-  query_dataset reorder-fed json_fed "$ev"
-  refresh_dataset csv_acc "${ev}/refresh-reorder-csv_acc"
-  refresh_dataset json_acc "${ev}/refresh-reorder-json_acc"
-  wait_refresh_settled csv_acc
-  wait_refresh_settled json_acc
-  query_dataset reorder-acc csv_acc "$ev"
-  query_dataset reorder-acc json_acc "$ev"
+  for ds in "${FED_DATASETS[@]}"; do
+    query_dataset reorder-fed "$ds" "$ev"
+  done
+  for ds in "${ACC_DATASETS[@]}"; do
+    refresh_dataset "$ds" "${ev}/refresh-reorder-${ds}"
+  done
+  for ds in "${ACC_DATASETS[@]}"; do
+    wait_refresh_settled "$ds"
+  done
+  for ds in "${ACC_DATASETS[@]}"; do
+    query_dataset reorder-acc "$ds" "$ev"
+  done
   datasets_status "${ev}/datasets-reorder.json"
   ready_capture "${ev}/ready-reorder.txt"
   echo "reorder datasets: $(summarize_datasets "${ev}/datasets-reorder.json")" | tee -a "${ev}/summary.txt"
@@ -445,21 +533,25 @@ cmd_drive() {
     "event_id,user_id,region,amt,ts" \
     "1,10,us,100,t0" \
     "2,20,eu,200,t1"
-  write_events_jsonl "${WORK}/data/events.jsonl" \
-    '{"event_id":1,"user_id":10,"region":"us","amt":100,"ts":"t0"}' \
-    '{"event_id":2,"user_id":20,"region":"eu","amt":200,"ts":"t1"}'
+  write_all_json_shapes "$JSON_RENAME_1" "$JSON_RENAME_2"
   cp "${WORK}/data/events.csv" "${ev}/events.renamed.csv"
   cp "${WORK}/data/events.jsonl" "${ev}/events.renamed.jsonl"
+  cp "${WORK}/data/events.json" "${ev}/events.renamed.json"
+  cp "${WORK}/data/events_pointer.json" "${ev}/events.renamed.pointer.json"
 
-  query_dataset rename-fed csv_fed "$ev"
-  query_dataset rename-fed json_fed "$ev"
+  for ds in "${FED_DATASETS[@]}"; do
+    query_dataset rename-fed "$ds" "$ev"
+  done
   capture_log_slice "$(logfile)" "$log_at" "${ev}/log-rename-fed.txt"
-  refresh_dataset csv_acc "${ev}/refresh-rename-csv_acc"
-  refresh_dataset json_acc "${ev}/refresh-rename-json_acc"
-  wait_refresh_settled csv_acc
-  wait_refresh_settled json_acc
-  query_dataset rename-acc csv_acc "$ev"
-  query_dataset rename-acc json_acc "$ev"
+  for ds in "${ACC_DATASETS[@]}"; do
+    refresh_dataset "$ds" "${ev}/refresh-rename-${ds}"
+  done
+  for ds in "${ACC_DATASETS[@]}"; do
+    wait_refresh_settled "$ds"
+  done
+  for ds in "${ACC_DATASETS[@]}"; do
+    query_dataset rename-acc "$ds" "$ev"
+  done
   datasets_status "${ev}/datasets-rename.json"
   ready_capture "${ev}/ready-rename.txt"
   capture_log_slice "$(logfile)" "$log_at" "${ev}/log-rename.txt"
@@ -469,20 +561,24 @@ cmd_drive() {
     "event_id,user_id,region,amount_cents,ts" \
     "1,10,us,100,t0" \
     "2,20,eu,200,t1"
-  write_events_jsonl "${WORK}/data/events.jsonl" \
-    '{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0"}' \
-    '{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1"}'
+  write_all_json_shapes "$JSON_BASELINE_1" "$JSON_BASELINE_2"
   cp "${WORK}/data/events.csv" "${ev}/events.restored.csv"
   cp "${WORK}/data/events.jsonl" "${ev}/events.restored.jsonl"
+  cp "${WORK}/data/events.json" "${ev}/events.restored.json"
+  cp "${WORK}/data/events_pointer.json" "${ev}/events.restored.pointer.json"
 
-  query_dataset restore-fed csv_fed "$ev"
-  query_dataset restore-fed json_fed "$ev"
-  refresh_dataset csv_acc "${ev}/refresh-restore-csv_acc"
-  refresh_dataset json_acc "${ev}/refresh-restore-json_acc"
-  wait_refresh_settled csv_acc
-  wait_refresh_settled json_acc
-  query_dataset restore-acc csv_acc "$ev"
-  query_dataset restore-acc json_acc "$ev"
+  for ds in "${FED_DATASETS[@]}"; do
+    query_dataset restore-fed "$ds" "$ev"
+  done
+  for ds in "${ACC_DATASETS[@]}"; do
+    refresh_dataset "$ds" "${ev}/refresh-restore-${ds}"
+  done
+  for ds in "${ACC_DATASETS[@]}"; do
+    wait_refresh_settled "$ds"
+  done
+  for ds in "${ACC_DATASETS[@]}"; do
+    query_dataset restore-acc "$ds" "$ev"
+  done
   datasets_status "${ev}/datasets-restore.json"
   ready_capture "${ev}/ready-restore.txt"
   echo "restore datasets: $(summarize_datasets "${ev}/datasets-restore.json")" | tee -a "${ev}/summary.txt"
@@ -538,7 +634,13 @@ def datasets(label, step):
     import json
     data = json.loads(p.read_text(encoding="utf-8"))
     parts = []
-    for name in ("csv_fed", "csv_acc", "json_fed", "json_acc"):
+    names = (
+        "csv_fed", "csv_acc",
+        "json_fed", "json_acc",
+        "json_array_fed", "json_array_acc",
+        "json_ptr_fed", "json_ptr_acc",
+    )
+    for name in names:
         row = next((d for d in data if d.get("name") == name), None)
         if not row:
             parts.append(f"{name}=absent")
@@ -567,7 +669,13 @@ lines = [
     "## Baseline",
     "",
 ]
-for ds in ("csv_fed", "csv_acc", "json_fed", "json_acc"):
+DATASETS = (
+    "csv_fed", "csv_acc",
+    "json_fed", "json_acc",
+    "json_array_fed", "json_array_acc",
+    "json_ptr_fed", "json_ptr_acc",
+)
+for ds in DATASETS:
     lines.append(f"- `{ds}` trunk `{sums('trunk', 'baseline', ds)}` / branch `{sums('branch', 'baseline', ds)}`")
 lines += [
     "",
@@ -582,6 +690,10 @@ for step, ds in (
     ("reorder-acc", "csv_acc"),
     ("reorder-fed", "json_fed"),
     ("reorder-acc", "json_acc"),
+    ("reorder-fed", "json_array_fed"),
+    ("reorder-acc", "json_array_acc"),
+    ("reorder-fed", "json_ptr_fed"),
+    ("reorder-acc", "json_ptr_acc"),
 ):
     lines.append(f"- `{ds}` {step} trunk `{sums('trunk', step, ds)}` / branch `{sums('branch', step, ds)}`")
 lines += [
@@ -597,6 +709,10 @@ for step, ds in (
     ("rename-acc", "csv_acc"),
     ("rename-fed", "json_fed"),
     ("rename-acc", "json_acc"),
+    ("rename-fed", "json_array_fed"),
+    ("rename-acc", "json_array_acc"),
+    ("rename-fed", "json_ptr_fed"),
+    ("rename-acc", "json_ptr_acc"),
 ):
     lines.append(f"- `{ds}` {step} trunk `{sums('trunk', step, ds)}` / branch `{sums('branch', step, ds)}`")
 lines += [
@@ -626,6 +742,10 @@ for step, ds in (
     ("restore-acc", "csv_acc"),
     ("restore-fed", "json_fed"),
     ("restore-acc", "json_acc"),
+    ("restore-fed", "json_array_fed"),
+    ("restore-acc", "json_array_acc"),
+    ("restore-fed", "json_ptr_fed"),
+    ("restore-acc", "json_ptr_acc"),
 ):
     lines.append(f"- `{ds}` {step} trunk `{sums('trunk', step, ds)}` / branch `{sums('branch', step, ds)}`")
 lines += [

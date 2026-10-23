@@ -537,14 +537,24 @@ impl Decoder for SpiceJsonDecoder {
 ///
 /// Note: A single partition is applied to the entire file group. To read files in parallel,
 /// organize files into multiple `file_groups`.
+///
+/// The inner config is public so scan-time file discovery (schema-drift checks)
+/// can see the same files a plain [`FileScanConfig`] scan would list. Array,
+/// object, auto, JSON, SODA, and `json_pointer` scans all wrap here.
 #[derive(Debug)]
-struct NonRepartitionedFileScanConfig {
+pub struct NonRepartitionedFileScanConfig {
     inner: FileScanConfig,
 }
 
 impl NonRepartitionedFileScanConfig {
     fn new(inner: FileScanConfig) -> Self {
         Self { inner }
+    }
+
+    /// The file groups and object-store URL this wrapper scans.
+    #[must_use]
+    pub fn file_scan_config(&self) -> &FileScanConfig {
+        &self.inner
     }
 }
 

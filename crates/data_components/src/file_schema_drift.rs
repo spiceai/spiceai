@@ -47,7 +47,7 @@ use std::{
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use dataformat_json::SpiceJsonFormat;
+use dataformat_json::{NonRepartitionedFileScanConfig, SpiceJsonFormat};
 use datafusion::{
     catalog::{ScanArgs, ScanResult, Session},
     common::tree_node::{TreeNode, TreeNodeRecursion},
@@ -207,7 +207,7 @@ impl FileSchemaDriftGuard {
                 }
             };
             match self
-                .find_drift(state, &store, columns.clone(), &files)
+                .find_drift(state, &store, &store_url, columns.clone(), &files)
                 .await
             {
                 Ok(drift) => {
@@ -319,6 +319,7 @@ impl FileSchemaDriftGuard {
         &self,
         state: &dyn Session,
         store: &Arc<dyn object_store::ObjectStore>,
+        store_url: &ObjectStoreUrl,
         columns: Vec<String>,
         files: &[ObjectMeta],
     ) -> DFResult<Option<Drift>> {
@@ -352,10 +353,24 @@ impl FileSchemaDriftGuard {
             missing,
             example_file: files
                 .first()
-                .map(|f| f.location.to_string())
+                .map(|f| display_source_file(store_url, &f.location))
                 .unwrap_or_default(),
         }))
     }
+}
+
+/// The [`FileScanConfig`] a [`DataSourceExec`] scans, including JSON's
+/// [`NonRepartitionedFileScanConfig`] wrapper. CSV/TSV header projection keeps a
+/// plain [`FileScanConfig`]; no other file format in this path wraps the config.
+fn file_scan_config(
+    source: &dyn datafusion_datasource::source::DataSource,
+) -> Option<&FileScanConfig> {
+    if let Some(config) = source.downcast_ref::<FileScanConfig>() {
+        return Some(config);
+    }
+    source
+        .downcast_ref::<NonRepartitionedFileScanConfig>()
+        .map(NonRepartitionedFileScanConfig::file_scan_config)
 }
 
 /// The object store and files of every file scan in `plan`, or `None` when `plan` scans no
@@ -366,7 +381,7 @@ fn scanned_files(plan: &Arc<dyn ExecutionPlan>) -> Option<(ObjectStoreUrl, Vec<O
     let mut mixed_stores = false;
     let _ = plan.apply(|node| {
         if let Some(exec) = node.downcast_ref::<DataSourceExec>()
-            && let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>()
+            && let Some(config) = file_scan_config(exec.data_source().as_ref())
         {
             match &store_url {
                 None => store_url = Some(config.object_store_url.clone()),
@@ -401,6 +416,20 @@ fn schema_probe_format(format: &Arc<dyn FileFormat>) -> Arc<dyn FileFormat> {
         return Arc::new(json.clone().with_schema_infer_max_rec(usize::MAX));
     }
     Arc::clone(format)
+}
+
+/// Local file object-store paths drop the leading `/`. Restore it so the
+/// message names a path the user can open (`/tmp/...`, not `tmp/...`).
+fn display_source_file(store_url: &ObjectStoreUrl, location: &object_store::path::Path) -> String {
+    let path = location.to_string();
+    let file_store = store_url.as_str().starts_with("file:");
+    // A Windows drive path (`C:/...`) is already absolute.
+    let windows_drive = path.chars().nth(1) == Some(':');
+    if file_store && !path.starts_with('/') && !windows_drive {
+        format!("/{path}")
+    } else {
+        path
+    }
 }
 
 fn fingerprint(columns: &[String], files: &[ObjectMeta]) -> u64 {
@@ -532,6 +561,7 @@ mod tests {
     use crate::csv_header_projection::HeaderProjectedCsvFormat;
     use arrow::array::{Array, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use dataformat_json::{Format, SpiceJsonFormat};
     use datafusion::datasource::file_format::csv::CsvFormat;
     use datafusion::datasource::file_format::json::JsonFormat;
     use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -558,6 +588,34 @@ mod tests {
             text.push('\n');
         }
         std::fs::write(path, text).expect("write ndjson");
+    }
+
+    fn write_json_array(path: &Path, objects: &[&str]) {
+        std::fs::write(path, format!("[{}]", objects.join(","))).expect("write json array");
+    }
+
+    fn write_json_pointer_doc(path: &Path, objects: &[&str]) {
+        std::fs::write(path, format!(r#"{{"data":[{}]}}"#, objects.join(",")))
+            .expect("write json pointer document");
+    }
+
+    fn guarded_spice_json_table(dir: &Path, columns: &[&str], format: SpiceJsonFormat) -> Guarded {
+        let schema = registered_schema(columns);
+        let format: Arc<dyn FileFormat> = Arc::new(format);
+        let url = ListingTableUrl::parse(format!("file://{}/", dir.display())).expect("url");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(
+                ListingOptions::new(Arc::clone(&format)).with_file_extension(".json"),
+            )
+            .with_schema(Arc::clone(&schema));
+        let listing: Arc<dyn TableProvider> =
+            Arc::new(ListingTable::try_new(config).expect("listing table"));
+        let layer = Arc::new(FileSchemaDriftLayer::new(FileSchemaDriftGuard::new(
+            "base", schema, format,
+        )));
+        let table: Arc<dyn TableProvider> =
+            SpiceTable::over(Arc::clone(&layer) as Arc<dyn TableLayer>, listing);
+        Guarded { table, layer }
     }
 
     fn guarded_json_table(dir: &Path, columns: &[&str]) -> Guarded {
@@ -672,7 +730,10 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("'amount_cents'"), "{message}");
         assert!(message.contains("Dataset 'base'"), "{message}");
-        assert!(message.contains("base.csv"), "{message}");
+        assert!(
+            message.contains(&format!("'{}/base.csv'", dir.path().display())),
+            "the example file must be an absolute path: {message}"
+        );
         assert!(!message.contains("'id'"), "{message}");
     }
 
@@ -894,6 +955,137 @@ mod tests {
         assert!(guard.scan_selects_all_files(&[col("id").gt(lit(1))], None));
         assert!(!guard.scan_selects_all_files(&[col("p").eq(lit(1))], None));
         assert!(!guard.scan_selects_all_files(&[], Some(10)));
+    }
+
+    const JSON_BASELINE: &[&str] = &[r#"{"id":1,"amount_cents":2}"#];
+    const JSON_RENAMED: &[&str] = &[r#"{"id":1,"amt":2}"#, r#"{"id":3,"amt":4}"#];
+
+    async fn spice_json_rename_case(
+        label: &str,
+        format: SpiceJsonFormat,
+        writer: fn(&Path, &[&str]),
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        writer(&dir.path().join("base.json"), JSON_BASELINE);
+        let table = guarded_spice_json_table(dir.path(), &["id", "amount_cents"], format);
+
+        let before = query(&table, true, "SELECT sum(amount_cents) FROM base")
+            .await
+            .unwrap_or_else(|e| panic!("{label}: refresh scan before the rename: {e}"));
+        assert_eq!(single_value(&before), Some(2), "{label} last good sum");
+
+        writer(&dir.path().join("base.json"), JSON_RENAMED);
+
+        let federated = query(&table, false, "SELECT sum(amount_cents), sum(id) FROM base")
+            .await
+            .unwrap_or_else(|e| panic!("{label}: federated read after rename: {e}"));
+        assert_eq!(
+            two_values(&federated),
+            (None, Some(4)),
+            "{label}: federated rename returns NULL for the missing column"
+        );
+        assert!(
+            table
+                .layer
+                .guard
+                .state
+                .lock()
+                .warned
+                .contains("amount_cents"),
+            "{label}: federated rename must WARN"
+        );
+
+        let err = query(&table, true, "SELECT * FROM base")
+            .await
+            .expect_err("a refresh scan must not overwrite accelerated JSON with NULLs");
+        let message = err.to_string();
+        assert!(message.contains("'amount_cents'"), "{label}: {message}");
+        assert!(message.contains("Dataset 'base'"), "{label}: {message}");
+        assert!(
+            message.contains(&format!("'{}/base.json'", dir.path().display())),
+            "{label}: example file must be an absolute path: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_array_refresh_scan_fails_when_a_registered_column_is_renamed() {
+        spice_json_rename_case(
+            "file_format json",
+            SpiceJsonFormat::default().with_format(Format::Json),
+            write_json_array,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auto_json_refresh_scan_fails_when_a_registered_column_is_renamed() {
+        spice_json_rename_case(
+            "auto-detected json",
+            SpiceJsonFormat::default().with_format(Format::Auto),
+            write_json_array,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn json_pointer_refresh_scan_fails_when_a_registered_column_is_renamed() {
+        spice_json_rename_case(
+            "json_pointer",
+            SpiceJsonFormat::default()
+                .with_format(Format::Auto)
+                .with_json_pointer("/data".to_string()),
+            write_json_pointer_doc,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scanned_files_sees_a_wrapped_json_array_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_json_array(&dir.path().join("base.json"), JSON_BASELINE);
+        let table = guarded_spice_json_table(
+            dir.path(),
+            &["id", "amount_cents"],
+            SpiceJsonFormat::default().with_format(Format::Json),
+        );
+        let ctx = context(false);
+        ctx.register_table("base", Arc::clone(&table.table))
+            .expect("register");
+        let plan = ctx
+            .sql("SELECT * FROM base")
+            .await
+            .expect("sql")
+            .create_physical_plan()
+            .await
+            .expect("plan");
+        let (store_url, files) =
+            scanned_files(&plan).expect("a wrapped JSON scan must still list its files");
+        assert!(
+            store_url.as_str().starts_with("file:"),
+            "{}",
+            store_url.as_str()
+        );
+        assert!(
+            files
+                .iter()
+                .any(|f| f.location.to_string().ends_with("base.json")),
+            "{files:?}"
+        );
+    }
+
+    #[test]
+    fn file_store_example_path_keeps_the_leading_slash() {
+        let url = ObjectStoreUrl::parse("file:///").expect("file store");
+        let path = object_store::path::Path::from("tmp/spice-verify/data/events.csv");
+        assert_eq!(
+            display_source_file(&url, &path),
+            "/tmp/spice-verify/data/events.csv"
+        );
+        let s3 = ObjectStoreUrl::parse("s3://bucket").expect("s3 store");
+        assert_eq!(
+            display_source_file(&s3, &path),
+            "tmp/spice-verify/data/events.csv"
+        );
     }
 
     #[test]

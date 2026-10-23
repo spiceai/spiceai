@@ -13,8 +13,8 @@ This directory is the maintained source for verifying user-visible file-connecto
 ## Driving conventions
 
 - HTTP SQL is the harness: `POST /v1/sql` with aliased `sum(amount_cents)` and `sum(user_id)`.
-- Federated datasets (`csv_fed`, `json_fed`) see file rewrites on the next query.
-- Arrow-accelerated datasets (`csv_acc`, `json_acc`) see file rewrites only after `POST /v1/datasets/<name>/acceleration/refresh` completes.
+- Federated datasets (`csv_fed`, `json_fed`, `json_array_fed`, `json_ptr_fed`) see file rewrites on the next query.
+- Arrow-accelerated datasets (`csv_acc`, `json_acc`, `json_array_acc`, `json_ptr_acc`) see file rewrites only after `POST /v1/datasets/<name>/acceleration/refresh` completes.
 - Capture `/v1/datasets?status=true` and the `spiced` log at every step.
 - Restore the baseline files at the end of a mutating journey. Keep proof artifacts.
 
@@ -28,4 +28,4 @@ This directory is the maintained source for verifying user-visible file-connecto
 ## Features
 
 - [CSV file connector](./csv-file-connector.md) covers header reorder, column rename, and restore on federated and Arrow-accelerated CSV.
-- [JSON file connector](./json-file-connector.md) covers object-key reorder, column rename, and restore on federated and Arrow-accelerated JSON/NDJSON.
+- [JSON file connector](./json-file-connector.md) covers object-key reorder, column rename, and restore on federated and Arrow-accelerated JSONL, `file_format: json` (array), and `json_pointer`.

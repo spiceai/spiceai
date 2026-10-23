@@ -75,7 +75,7 @@ Doctor requires all of:
 
 - `$WORK_DIR/spiced.pid` names a live process whose `/proc/<pid>/exe` is the launched `spiced`
 - `GET /v1/ready` is reachable (200 `ready` on a clean launch; after an expected Error the helper reports the 503 and still requires HTTP)
-- `GET /v1/datasets?status=true` lists `csv_fed`, `csv_acc`, `json_fed`, `json_acc`
+- `GET /v1/datasets?status=true` lists `csv_fed`, `csv_acc`, `json_fed`, `json_acc`, `json_array_fed`, `json_array_acc`, `json_ptr_fed`, `json_ptr_acc`
 
 Do not drive an instance that doctor did not start.
 
@@ -99,7 +99,7 @@ The mapped journeys are in `features/`. Drive them with:
   --label "$LABEL"
 ```
 
-`$LABEL` is `trunk` or `branch`. The helper writes, then queries, for baseline → reorder → rename → restore on both CSV and JSON, federated and Arrow-accelerated. Federated reads see the file immediately. Accelerated reads see it only after refresh.
+`$LABEL` is `trunk` or `branch`. The helper writes, then queries, for baseline → reorder → rename → restore on CSV, JSONL, `file_format: json` (array), and `json_pointer`, federated and Arrow-accelerated. Federated reads see the file immediately. Accelerated reads see it only after refresh.
 
 ## Evidence
 
@@ -145,4 +145,4 @@ Sends `TERM` (then `KILL` if needed) only to the pid in `$WORK_DIR/spiced.pid`. 
 
 ## Feature map
 
-See `features/README.md`. Seeded journeys: CSV reorder / rename / restore, JSON reorder / rename / restore. Both federated and Arrow-accelerated.
+See `features/README.md`. Seeded journeys: CSV, JSONL, `file_format: json`, and `json_pointer` reorder / rename / restore. Both federated and Arrow-accelerated.
