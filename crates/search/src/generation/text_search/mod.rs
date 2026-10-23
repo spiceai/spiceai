@@ -504,19 +504,20 @@ fn parse_user_query(parser: &QueryParser, literal: &str) -> Result<Box<dyn Query
 /// (<https://github.com/quickwit-oss/tantivy/issues/3031>). Outside a quoted phrase and a range or
 /// set's brackets, that is:
 /// - a `*` that starts a term (at the start, or after whitespace, `(`, `+` or `-`) and is followed
-///   by a character that ends a word, other than `)`: `a *(b)`, `*"x"`;
+///   by a character that ends a word but does not end a match-all `*`: `a *(b)`, `*"x"`,
+///   `*\u{a0}` (see [`ends_fieldless_star`]);
 /// - a `+` or `-` followed by whitespace and then `*`: `- *`, `a + *`.
 ///
 /// The check is conservative: a few queries the grammar does parse also match (`+ *x`), and those
 /// take the bag-of-words fallback.
 fn has_fieldless_exists(q: &str) -> bool {
-    let b = q.as_bytes();
+    let chars: Vec<char> = q.chars().collect();
     let mut quote = None;
     let mut bracket_depth = 0usize;
     let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if c == b'\\' {
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
             i += 2;
             continue;
         }
@@ -524,26 +525,24 @@ fn has_fieldless_exists(q: &str) -> bool {
             if c == open {
                 quote = None;
             }
-        } else if c == b'"' || c == b'\'' {
+        } else if c == '"' || c == '\'' {
             quote = Some(c);
-        } else if c == b'[' || c == b'{' {
+        } else if c == '[' || c == '{' {
             bracket_depth += 1;
-        } else if c == b']' || c == b'}' {
+        } else if c == ']' || c == '}' {
             bracket_depth = bracket_depth.saturating_sub(1);
         } else if bracket_depth == 0 {
-            if c == b'*' {
+            if c == '*' {
                 let starts_term = i == 0
-                    || matches!(b[i - 1], b'(' | b'+' | b'-')
-                    || b[i - 1].is_ascii_whitespace();
-                if starts_term && b.get(i + 1).is_some_and(|n| b"^`:{}\"'[]\\(".contains(n)) {
+                    || matches!(chars[i - 1], '(' | '+' | '-')
+                    || chars[i - 1].is_whitespace();
+                if starts_term && chars.get(i + 1).copied().is_some_and(ends_fieldless_star) {
                     return true;
                 }
-            } else if c == b'+' || c == b'-' {
-                let star = b[i + 1..]
-                    .iter()
-                    .position(|n| !n.is_ascii_whitespace())
-                    .map(|n| i + 1 + n);
-                if star.is_some_and(|j| j > i + 1 && b[j] == b'*') {
+            } else if c == '+' || c == '-' {
+                let rest = &chars[i + 1..];
+                let spaces = rest.iter().take_while(|n| n.is_whitespace()).count();
+                if spaces > 0 && rest.get(spaces) == Some(&'*') {
                     return true;
                 }
             }
@@ -551,6 +550,18 @@ fn has_fieldless_exists(q: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// Whether `c`, right after a term-starting `*`, makes Tantivy's grammar read the `*` as a
+/// fieldless exists query. The exists rule accepts any `char::is_whitespace` or a character that
+/// must be escaped in a word; the match-all rule, tried first, takes only ASCII space, tab, CR, LF
+/// and `)`. Whatever only the exists rule accepts reaches the panic.
+fn ends_fieldless_star(c: char) -> bool {
+    (c.is_whitespace() && !matches!(c, ' ' | '\t' | '\r' | '\n'))
+        || matches!(
+            c,
+            '^' | '`' | ':' | '{' | '}' | '"' | '\'' | '[' | ']' | '\\' | '('
+        )
 }
 
 // Parse a user-provided query to interpret it without terms (e.g. `IN ['foo', 'bar']`) or clauses (foo AND bar).
@@ -747,7 +758,10 @@ pub(crate) mod tests {
             "-  * b".to_string(),
         ];
         for prefix in ["", "a ", "(", "+", "-", "NOT ", "a AND ", "a\t", "\"x\" "] {
-            for end in ['^', '`', ':', '{', '}', '"', '\'', '[', ']', '\\', '('] {
+            for end in [
+                '^', '`', ':', '{', '}', '"', '\'', '[', ']', '\\', '(', '\u{a0}', '\u{b}',
+                '\u{c}', '\u{3000}',
+            ] {
                 queries.push(format!("{prefix}*{end}b"));
             }
         }
