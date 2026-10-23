@@ -853,9 +853,53 @@ impl Chat for BedrockConverse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::types::chat::{
-        ChatChoiceStream, ChatCompletionRequestUserMessageArgs, FinishReason,
-    };
+    use async_openai::types::chat::ChatCompletionRequestUserMessageArgs;
+
+    #[test]
+    fn prompt_cache_point_is_added_to_last_message() {
+        let messages = vec![
+            ChatCompletionRequestUserMessageArgs::default()
+                .content("Reusable context")
+                .build()
+                .expect("user message should build")
+                .into(),
+        ];
+        let mut system = vec![];
+        let mut messages = BedrockConverse::convert_non_system_messages(messages)
+            .expect("bedrock messages should convert");
+
+        BedrockConverse::add_prompt_cache_point(&mut system, &mut messages)
+            .expect("cache point should build");
+
+        assert!(matches!(
+            messages
+                .last()
+                .and_then(|message| message.content.last()),
+            Some(ContentBlock::CachePoint(cache_point))
+                if cache_point.r#type == CachePointType::Default
+        ));
+    }
+
+    #[test]
+    fn prompt_cache_point_is_added_to_system_when_messages_are_empty() {
+        let mut system = vec![];
+        let mut messages = vec![];
+
+        BedrockConverse::add_prompt_cache_point(&mut system, &mut messages)
+            .expect("cache point should build");
+
+        assert!(matches!(
+            system.last(),
+            Some(SystemContentBlock::CachePoint(cache_point))
+                if cache_point.r#type == CachePointType::Default
+        ));
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use async_openai::types::chat::{ChatChoiceStream, FinishReason};
     use aws_sdk_bedrockruntime::types::{
         ContentBlockStopEvent, ReasoningContentBlockDelta, StopReason,
     };
@@ -951,45 +995,5 @@ mod tests {
             choices.last().and_then(|choice| choice.finish_reason),
             Some(FinishReason::Stop)
         );
-    }
-
-    #[test]
-    fn prompt_cache_point_is_added_to_last_message() {
-        let messages = vec![
-            ChatCompletionRequestUserMessageArgs::default()
-                .content("Reusable context")
-                .build()
-                .expect("user message should build")
-                .into(),
-        ];
-        let mut system = vec![];
-        let mut messages = BedrockConverse::convert_non_system_messages(messages)
-            .expect("bedrock messages should convert");
-
-        BedrockConverse::add_prompt_cache_point(&mut system, &mut messages)
-            .expect("cache point should build");
-
-        assert!(matches!(
-            messages
-                .last()
-                .and_then(|message| message.content.last()),
-            Some(ContentBlock::CachePoint(cache_point))
-                if cache_point.r#type == CachePointType::Default
-        ));
-    }
-
-    #[test]
-    fn prompt_cache_point_is_added_to_system_when_messages_are_empty() {
-        let mut system = vec![];
-        let mut messages = vec![];
-
-        BedrockConverse::add_prompt_cache_point(&mut system, &mut messages)
-            .expect("cache point should build");
-
-        assert!(matches!(
-            system.last(),
-            Some(SystemContentBlock::CachePoint(cache_point))
-                if cache_point.r#type == CachePointType::Default
-        ));
     }
 }
