@@ -1236,19 +1236,43 @@ pub trait ListingTableConnector: DataConnector {
             }
             (Some(format), _) => {
                 match classify_unknown_file_format(format) {
-                    UnknownFileFormatAction::RejectStructuredTypo => {
-                        Err(crate::DataConnectorError::InvalidConfiguration {
-                            dataconnector: format!("{self}"),
-                            message: unknown_file_format_message(dataset, params, format),
-                            connector_component: ConnectorComponent::from(dataset),
-                            source: "Unknown file format".into(),
-                        })
+                    UnknownFileFormatAction::ConfirmStructuredTypo { suggested } => {
+                        if listing_confirms_structured_typo(self, dataset, format, &suggested).await
+                        {
+                            Err(crate::DataConnectorError::InvalidConfiguration {
+                                dataconnector: format!("{self}"),
+                                message: unknown_file_format_message(dataset, params, format),
+                                connector_component: ConnectorComponent::from(dataset),
+                                source: "Unknown file format".into(),
+                            })
+                        } else {
+                            // No listing evidence (or listing unavailable):
+                            // keep trunk's text-table fallthrough.
+                            tracing::warn!(
+                                "{}",
+                                unknown_file_format_fallback_warning(
+                                    dataset,
+                                    params,
+                                    format,
+                                    Some(suggested.as_str()),
+                                )
+                            );
+                            Ok((
+                                None,
+                                listing_extension(
+                                    configured_extension.as_ref(),
+                                    path_extension.as_ref(),
+                                    &format!(".{format}"),
+                                    file_compression_type,
+                                ),
+                            ))
+                        }
                     }
                     UnknownFileFormatAction::LoadAsText { hint } => {
                         // Trunk treated unknown formats such as `log`, `xml`,
                         // and `yaml` as a plain-text table. Keep that
-                        // fallthrough unless the value is a typo of a
-                        // structured format the listing connector parses.
+                        // fallthrough unless listing evidence confirms a
+                        // structured-format typo (the arm above).
                         tracing::warn!(
                             "{}",
                             unknown_file_format_fallback_warning(
@@ -2227,7 +2251,9 @@ const DOCUMENT_FILE_FORMATS: &[&str] = &[
 
 /// Common real text and source extensions that `closest_match` can treat as
 /// typos of a structured or document format (`org`→`orc`, `css`→`csv`,
-/// `tex`→`tsv`/`text`). They stay on the text-table path.
+/// `tex`→`tsv`/`text`). Fast path: load as text and skip the `Did you mean`
+/// hint. The list is not exhaustive — unlisted near-misses still load as
+/// text unless listing evidence confirms a typo.
 const TEXT_TABLE_FILE_EXTENSIONS: &[&str] = &[
     "css", "doc", "htmlx", "json5", "jsonc", "mdx", "mkd", "org", "ppt", "psv", "qmd", "rmd", "rs",
     "srt", "tex", "ts", "tsx", "xhtml", "xls",
@@ -2262,10 +2288,12 @@ fn valid_listing_file_formats() -> Vec<&'static str> {
 /// format nor a document format.
 #[derive(Debug, PartialEq, Eq)]
 enum UnknownFileFormatAction {
-    /// Near-miss of a format the listing connector parses natively.
-    RejectStructuredTypo,
-    /// Trunk-compatible text-table fallthrough. `hint` is a document-format
-    /// near-miss to mention in the WARN, if any.
+    /// Near-miss of a format the listing connector parses natively. Hard-error
+    /// only after listing evidence confirms it is a typo.
+    ConfirmStructuredTypo { suggested: String },
+    /// Trunk-compatible text-table fallthrough. `hint` is a suggested format
+    /// to mention in the WARN, if any (document near-miss, or a structured
+    /// near-miss that listing has not confirmed).
     LoadAsText { hint: Option<String> },
 }
 
@@ -2273,12 +2301,83 @@ fn classify_unknown_file_format(format: &str) -> UnknownFileFormatAction {
     if is_text_table_file_extension(format) {
         return UnknownFileFormatAction::LoadAsText { hint: None };
     }
-    if closest_file_format(format, &structured_file_formats()).is_some() {
-        return UnknownFileFormatAction::RejectStructuredTypo;
+    if let Some(suggested) = closest_file_format(format, &structured_file_formats()) {
+        return UnknownFileFormatAction::ConfirmStructuredTypo { suggested };
     }
     UnknownFileFormatAction::LoadAsText {
         hint: closest_file_format(format, &valid_listing_file_formats()),
     }
+}
+
+/// Whether a listed object's format suffix matches `format` (`csv` matches
+/// `orders.csv` and `orders.csv.gz`).
+fn object_matches_file_format(location: &str, format: &str) -> bool {
+    if detect_file_extension_from_path(location)
+        .and_then(|ext| ext.format_extension)
+        .is_some_and(|fmt| fmt.eq_ignore_ascii_case(format))
+    {
+        return true;
+    }
+    location.rsplit(['/', '\\']).next().is_some_and(|name| {
+        name.to_ascii_lowercase()
+            .ends_with(&format!(".{}", format.to_ascii_lowercase()))
+    })
+}
+
+/// True only when a complete listing confirms a typo: no object uses
+/// `claimed` as its format suffix, and at least one uses `suggested`.
+/// Listing failure, an incomplete scan, or any `claimed` object is not
+/// evidence — the caller must WARN and load as text.
+async fn listing_confirms_structured_typo<T>(
+    connector: &T,
+    dataset: &DatasetSpec,
+    claimed: &str,
+    suggested: &str,
+) -> bool
+where
+    T: ListingTableConnector + Display + ?Sized,
+{
+    let Ok(url) = connector.get_object_store_url(dataset, None) else {
+        return false;
+    };
+    let Ok(store) = connector.get_object_store(dataset) else {
+        return false;
+    };
+    let Ok(table_path) = ListingTableUrl::parse(url) else {
+        return false;
+    };
+    let ctx = connector.get_session_context();
+    let state = ctx.state();
+    let Ok(mut file_stream) = table_path.list_all_files(&state, &store, "").await else {
+        return false;
+    };
+
+    let mut saw_claimed = false;
+    let mut saw_suggested = false;
+    let mut scanned = 0usize;
+
+    loop {
+        match file_stream.try_next().await {
+            Ok(Some(file)) => {
+                scanned += 1;
+                if scanned > SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT {
+                    return false;
+                }
+                let location = file.location.as_ref();
+                if object_matches_file_format(location, claimed) {
+                    saw_claimed = true;
+                    break;
+                }
+                if object_matches_file_format(location, suggested) {
+                    saw_suggested = true;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return false,
+        }
+    }
+
+    !saw_claimed && saw_suggested
 }
 
 /// Closest valid format for a typo.
@@ -2332,7 +2431,7 @@ fn unknown_file_format_message(dataset: &DatasetSpec, params: &Parameters, forma
 }
 
 /// Warning when an unknown `file_format` falls through to the plain-text
-/// table (trunk-compatible). `hint` is a document-format near-miss.
+/// table (trunk-compatible). `hint` is a suggested format when one exists.
 fn unknown_file_format_fallback_warning(
     dataset: &DatasetSpec,
     params: &Parameters,
@@ -3017,17 +3116,38 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_unknown_file_format_cvs_is_rejected_with_suggestion() {
+    fn setup_listed_connector(
+        filenames: &[&str],
+        format: &str,
+    ) -> (TestConnector, DatasetSpec, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in filenames {
+            std::fs::write(dir.path().join(name), "hello").expect("write listed object");
+        }
         let (connector, dataset) = setup_connector(
-            "test:test/".to_string(),
-            HashMap::from([("file_format".to_string(), "cvs".to_string())]),
+            format!("file://{}/", dir.path().display()),
+            HashMap::from([("file_format".to_string(), format.to_string())]),
         );
+        (connector, dataset, dir)
+    }
+
+    async fn assert_text_table_format(connector: &TestConnector, dataset: &DatasetSpec, ext: &str) {
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(dataset)
+            .await
+            .unwrap_or_else(|err| panic!("{ext} must keep the text-table path: {err}"));
+        assert!(file_format.is_none(), "{ext} must use the text-table path");
+        assert_eq!(extension, format!(".{ext}"));
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_cvs_over_csv_is_rejected_with_suggestion() {
+        let (connector, dataset, _dir) = setup_listed_connector(&["orders.csv"], "cvs");
 
         let err = connector
             .get_file_format_and_extension(&dataset)
             .await
-            .expect_err("unknown file_format must fail dataset setup");
+            .expect_err("cvs over .csv files must fail dataset setup");
         let message = err.to_string();
         assert!(
             message.contains("Unknown `file_format` 'cvs'"),
@@ -3050,16 +3170,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unknown_file_format_parqet_is_rejected_with_suggestion() {
-        let (connector, dataset) = setup_connector(
-            "test:test/".to_string(),
-            HashMap::from([("file_format".to_string(), "parqet".to_string())]),
-        );
+    async fn test_unknown_file_format_parqet_over_parquet_is_rejected_with_suggestion() {
+        let (connector, dataset, _dir) = setup_listed_connector(&["data.parquet"], "parqet");
 
         let err = connector
             .get_file_format_and_extension(&dataset)
             .await
-            .expect_err("unknown file_format must fail dataset setup");
+            .expect_err("parqet over .parquet files must fail dataset setup");
         let message = err.to_string();
         assert!(
             message.contains("Unknown `file_format` 'parqet'"),
@@ -3072,16 +3189,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unknown_file_format_jsno_is_rejected_with_suggestion() {
-        let (connector, dataset) = setup_connector(
-            "test:test/".to_string(),
-            HashMap::from([("file_format".to_string(), "jsno".to_string())]),
-        );
+    async fn test_unknown_file_format_jsno_over_json_is_rejected_with_suggestion() {
+        let (connector, dataset, _dir) = setup_listed_connector(&["data.json"], "jsno");
 
         let err = connector
             .get_file_format_and_extension(&dataset)
             .await
-            .expect_err("jsno is a structured typo and must fail dataset setup");
+            .expect_err("jsno over .json files must fail dataset setup");
         let message = err.to_string();
         assert!(
             message.contains("Unknown `file_format` 'jsno'"),
@@ -3094,16 +3208,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unknown_file_format_parquett_is_rejected_with_suggestion() {
-        let (connector, dataset) = setup_connector(
-            "test:test/".to_string(),
-            HashMap::from([("file_format".to_string(), "parquett".to_string())]),
-        );
+    async fn test_unknown_file_format_parquett_over_parquet_is_rejected_with_suggestion() {
+        let (connector, dataset, _dir) = setup_listed_connector(&["data.parquet"], "parquett");
 
         let err = connector
             .get_file_format_and_extension(&dataset)
             .await
-            .expect_err("parquett is a structured typo and must fail dataset setup");
+            .expect_err("parquett over .parquet files must fail dataset setup");
         let message = err.to_string();
         assert!(
             message.contains("Unknown `file_format` 'parquett'"),
@@ -3113,6 +3224,79 @@ mod tests {
             message.contains("Did you mean `parquet`?"),
             "error must suggest parquet: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_real_text_near_misses_load_over_matching_files() {
+        for format in ["cs", "csx", "rc", "jsonld"] {
+            let (connector, dataset, _dir) =
+                setup_listed_connector(&[format!("notes.{format}").as_str()], format);
+            assert_text_table_format(&connector, &dataset, format).await;
+            let warning = unknown_file_format_fallback_warning(
+                &dataset,
+                connector.get_params(),
+                format,
+                closest_file_format(format, &structured_file_formats()).as_deref(),
+            );
+            assert!(
+                warning.contains("Did you mean"),
+                "{format} is an unlisted near-miss and must WARN with a hint: {warning}"
+            );
+            assert!(
+                warning.contains("plain-text table"),
+                "{format} must stay on the text fallthrough: {warning}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_cvs_over_only_cvs_files_loads_as_text() {
+        let (connector, dataset, _dir) = setup_listed_connector(&["notes.cvs"], "cvs");
+        assert_text_table_format(&connector, &dataset, "cvs").await;
+        let warning = unknown_file_format_fallback_warning(
+            &dataset,
+            connector.get_params(),
+            "cvs",
+            Some("csv"),
+        );
+        assert!(
+            warning.contains("Did you mean `csv`?"),
+            "unconfirmed cvs must WARN with the hint: {warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_cvs_over_mixed_claimed_and_suggested_loads_as_text() {
+        let (connector, dataset, _dir) =
+            setup_listed_connector(&["notes.cvs", "orders.csv"], "cvs");
+        assert_text_table_format(&connector, &dataset, "cvs").await;
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_cvs_over_csv_gz_is_rejected_with_suggestion() {
+        let (connector, dataset, _dir) = setup_listed_connector(&["orders.csv.gz"], "cvs");
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("cvs over .csv.gz must fail dataset setup");
+        let message = err.to_string();
+        assert!(
+            message.contains("Unknown `file_format` 'cvs'"),
+            "error must name the invalid format: {message}"
+        );
+        assert!(
+            message.contains("Did you mean `csv`?"),
+            "error must suggest csv: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_cvs_without_listing_degrades_to_text() {
+        let (connector, dataset) = setup_connector(
+            "test:test/".to_string(),
+            HashMap::from([("file_format".to_string(), "cvs".to_string())]),
+        );
+        assert_text_table_format(&connector, &dataset, "cvs").await;
     }
 
     #[tokio::test]
@@ -3191,14 +3375,37 @@ mod tests {
     }
 
     #[test]
-    fn classify_unknown_file_format_structured_typos_are_rejected() {
-        for format in ["cvs", "parqet", "jsno", "parquett"] {
+    fn classify_unknown_file_format_structured_near_misses_need_listing() {
+        for (format, suggested) in [
+            ("cvs", "csv"),
+            ("parqet", "parquet"),
+            ("jsno", "json"),
+            ("parquett", "parquet"),
+            ("cs", "csv"),
+            ("csx", "csv"),
+            ("rc", "orc"),
+            ("jsonld", "jsonl"),
+        ] {
             assert_eq!(
                 classify_unknown_file_format(format),
-                UnknownFileFormatAction::RejectStructuredTypo,
-                "{format} is a structured typo"
+                UnknownFileFormatAction::ConfirmStructuredTypo {
+                    suggested: suggested.to_string()
+                },
+                "{format} is a structured near-miss; listing decides"
             );
         }
+    }
+
+    #[test]
+    fn object_matches_file_format_suffix_and_gzip() {
+        assert!(object_matches_file_format("orders.csv", "csv"));
+        assert!(object_matches_file_format("orders.CSV", "csv"));
+        assert!(object_matches_file_format("/data/orders.csv.gz", "csv"));
+        assert!(object_matches_file_format("notes.jsonld", "jsonld"));
+        assert!(!object_matches_file_format("notes.jsonld", "jsonl"));
+        assert!(!object_matches_file_format("notes.cs", "csv"));
+        assert!(!object_matches_file_format("orders.csv", "cs"));
+        assert!(!object_matches_file_format("notes.cvs", "csv"));
     }
 
     #[test]
@@ -3409,6 +3616,52 @@ mod tests {
     async fn test_unknown_file_format_from_secret_does_not_echo_value() {
         const CANARY: &str = "cvs";
         const REFERENCE: &str = "${ env:FILE_FMT }";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("orders.csv"), "hello").expect("write csv");
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([(
+                    "file_format".to_string(),
+                    CANARY.to_string(),
+                )]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_format".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new(
+            format!("file://{}/", dir.path().display()),
+            TableReference::bare("test"),
+        );
+
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("listing-confirmed secret-derived file_format must fail");
+        let message = err.to_string();
+        assert!(
+            !message.contains(CANARY),
+            "unknown file_format errors must not echo a resolved secret: {message}"
+        );
+        assert!(
+            message.contains(REFERENCE),
+            "unknown file_format errors must name the secret reference: {message}"
+        );
+        assert!(
+            !message.contains("Did you mean"),
+            "do not suggest a correction from a secret-derived value: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_from_secret_without_listing_does_not_echo_value() {
+        const CANARY: &str = "cvs";
+        const REFERENCE: &str = "${ env:FILE_FMT }";
         let connector = TestConnector {
             params: Parameters::new(
                 to_secret_map(HashMap::from([(
@@ -3427,22 +3680,20 @@ mod tests {
         };
         let dataset = DatasetSpec::new("test:test/".to_string(), TableReference::bare("test"));
 
-        let err = connector
-            .get_file_format_and_extension(&dataset)
-            .await
-            .expect_err("near-miss secret-derived file_format must fail");
-        let message = err.to_string();
+        assert_text_table_format(&connector, &dataset, CANARY).await;
+        let warning =
+            unknown_file_format_fallback_warning(&dataset, &connector.params, CANARY, Some("csv"));
         assert!(
-            !message.contains(CANARY),
-            "unknown file_format errors must not echo a resolved secret: {message}"
+            !warning.contains(CANARY),
+            "unconfirmed secret-derived fallthrough must not echo a resolved secret: {warning}"
         );
         assert!(
-            message.contains(REFERENCE),
-            "unknown file_format errors must name the secret reference: {message}"
+            warning.contains(REFERENCE),
+            "unconfirmed secret-derived fallthrough must name the secret reference: {warning}"
         );
         assert!(
-            !message.contains("Did you mean"),
-            "do not suggest a correction from a secret-derived value: {message}"
+            !warning.contains("Did you mean"),
+            "do not suggest a correction from a secret-derived value: {warning}"
         );
     }
 

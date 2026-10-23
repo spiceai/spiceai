@@ -1,31 +1,27 @@
-# Unknown `file_format`: structured typo error, otherwise text-table fallthrough
+# Unknown `file_format`: listing-confirmed typo error, otherwise text-table fallthrough
 
 ## Intent
 
-A near-miss typo of a structured listing format (`cvs`→`csv`, `parqet`/`parquett`→`parquet`, `jsno`→`json`) must fail dataset setup. It must not become a 1-row document table (`location`, `content`) or a Ready dataset that then fails at query time.
+A near-miss of a structured listing format is a configuration error only when the listing confirms a typo: no object under the dataset path ends in `.{claimed}`, and at least one object ends in the suggested format's suffix (`cvs` over `.csv` files, `parqet` over `.parquet` files). That must fail dataset setup. It must not become a 1-row document table (`location`, `content`) or a Ready dataset that then fails at query time.
 
-Common real text and source extensions (`tex`, `org`, `json5`, `jsonc`, `mdx`, `css`, `ts`, `psv`, and the rest of the allowlist) keep trunk's plain-text table path: the dataset goes Ready. Other unknown formats (`log`, `xml`, `yaml`) do the same, with a WARN. A document-format near-miss (`mardown`) also stays Ready; the WARN includes `Did you mean`.
+No allowlist is complete. Real text and source extensions near a structured format (`cs`, `csx`, `rc`, `jsonld`, and the rest of Codex r4) keep trunk's plain-text table path when matching files exist. `cvs` over a folder that only has `.cvs` files does the same. Other unknown formats (`log`, `xml`, `yaml`) stay Ready, with a WARN. A document-format near-miss (`mardown`) also stays Ready; the WARN includes `Did you mean`. When listing is unavailable, degrade to WARN and load as text. Never hard-error without listing evidence.
+
+The allowlist (`tex`, `org`, `json5`, `jsonc`, `mdx`, `css`, `ts`, `psv`, …) is a fast path that skips the `Did you mean` hint.
 
 `file_format: text` plus `file_extension: .tex` lists `*.tex` files. Document and text formats honor `file_extension`.
 
 ## Launch
 
-A spicepod with a small CSV (a few rows is enough; do not generate 200k rows), a directory of one-line text files (`notes.tex`, `notes.org`, `notes.json5`, `notes.jsonc`, `notes.mdx`, `notes.css`, `notes.ts`, `notes.psv`), and:
+A spicepod with a small CSV, a dummy `.parquet` file (suffix evidence only; the format check runs before parse), a directory of one-line text files (`notes.tex`, `notes.org`, `notes.json5`, `notes.jsonc`, `notes.mdx`, `notes.css`, `notes.ts`, `notes.psv`, `notes.cs`, `notes.csx`, `notes.rc`, `notes.jsonld`), a folder that contains only `notes.cvs`, and:
 
 ```yaml
 datasets:
   - from: file:$CSV
     name: typo_cvs
     params: { file_format: cvs }
-  - from: file:$CSV
+  - from: file:$PARQUET
     name: typo_parqet
     params: { file_format: parqet }
-  - from: file:$CSV
-    name: typo_jsno
-    params: { file_format: jsno }
-  - from: file:$CSV
-    name: typo_parquett
-    params: { file_format: parquett }
   - from: file:$CSV
     name: fmt_log
     params: { file_format: log }
@@ -54,6 +50,21 @@ datasets:
     name: fmt_psv
     params: { file_format: psv }
   - from: file:$DOCS
+    name: fmt_cs
+    params: { file_format: cs }
+  - from: file:$DOCS
+    name: fmt_csx
+    params: { file_format: csx }
+  - from: file:$DOCS
+    name: fmt_rc
+    params: { file_format: rc }
+  - from: file:$DOCS
+    name: fmt_jsonld
+    params: { file_format: jsonld }
+  - from: file:$CVS_ONLY
+    name: fmt_cvs_only
+    params: { file_format: cvs }
+  - from: file:$DOCS
     name: text_tex
     params: { file_format: text, file_extension: .tex }
 ```
@@ -66,14 +77,16 @@ datasets:
 
 `GET /v1/datasets?status=true`.
 
-- `typo_cvs`, `typo_parqet`, `typo_jsno`, and `typo_parquett` must be `Error`. The `error_message` must name the invalid format, list valid formats, and include a `Did you mean` hint (`csv` / `parquet` / `json` / `parquet`).
+- `typo_cvs` and `typo_parqet` must be `Error`. The `error_message` must name the invalid format, list valid formats, and include a `Did you mean` hint (`csv` / `parquet`).
+- `fmt_cs`, `fmt_csx`, `fmt_rc`, and `fmt_jsonld` must be `Ready` over matching files.
+- `fmt_cvs_only` must be `Ready` over a folder that contains only `.cvs` files.
 - `fmt_log` must be `Ready`. The `spiced` log must contain a WARN that names `file_format` `'log'` and says the dataset is loaded as a plain-text table.
 - `fmt_tex`, `fmt_org`, `fmt_json5`, `fmt_jsonc`, `fmt_mdx`, `fmt_css`, `fmt_ts`, and `fmt_psv` must be `Ready`.
 - `text_tex` must be `Ready`. A query over it must return the `notes.tex` object and must not return `notes.org` / `notes.mdx` / the other extensions.
 
 ## Evidence
 
-Paste the typo `error_message` text (no file contents), the Ready statuses, the `fmt_log` WARN line, and the `text_tex` query rows (locations only). On trunk the typo datasets are also `Ready`.
+Paste the typo `error_message` text (no file contents), the Ready statuses (including `fmt_cs` / `fmt_csx` / `fmt_rc` / `fmt_jsonld` / `fmt_cvs_only`), the `fmt_log` WARN line, and the `text_tex` query rows (locations only). On trunk the typo datasets are also `Ready`.
 
 ## Cleanup
 

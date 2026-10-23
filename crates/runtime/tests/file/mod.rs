@@ -958,9 +958,10 @@ async fn file_connector_unknown_file_format_log_stays_ready() -> Result<(), anyh
         .await
 }
 
-/// Common real text extensions stay Ready. Structured-format typos remain
-/// configuration errors. `file_format: text` plus `file_extension: .tex`
-/// lists only `*.tex` files.
+/// Common real text extensions stay Ready. A structured-format near-miss is
+/// a configuration error only when listing confirms it (no `.{claimed}`
+/// objects, and at least one suggested-format object). `file_format: text`
+/// plus `file_extension: .tex` lists only `*.tex` files.
 #[tokio::test]
 async fn file_connector_text_extensions_ready_structured_typos_error() -> Result<(), anyhow::Error>
 {
@@ -970,7 +971,8 @@ async fn file_connector_text_extensions_ready_structured_typos_error() -> Result
         .scope(async {
             let dir = tempfile::TempDir::new()?;
             for ext in [
-                "tex", "org", "json5", "jsonc", "mdx", "css", "ts", "psv", "md",
+                "tex", "org", "json5", "jsonc", "mdx", "css", "ts", "psv", "md", "cs", "csx", "rc",
+                "jsonld",
             ] {
                 std::fs::write(
                     dir.path().join(format!("notes.{ext}")),
@@ -979,10 +981,18 @@ async fn file_connector_text_extensions_ready_structured_typos_error() -> Result
             }
             let csv = dir.path().join("orders.csv");
             write_orders_csv(&csv)?;
+            std::fs::write(dir.path().join("data.parquet"), b"PAR1")?;
+            std::fs::write(dir.path().join("data.json"), "{\"id\":1}\n")?;
+
+            let cvs_only_dir = tempfile::TempDir::new()?;
+            std::fs::write(cvs_only_dir.path().join("notes.cvs"), "hello cvs\n")?;
 
             let docs = format!("file:{}/", dir.path().display());
             let mut app = AppBuilder::new("file_format_text_extensions");
-            for format in ["tex", "org", "json5", "jsonc", "mdx", "css", "ts", "psv"] {
+            for format in [
+                "tex", "org", "json5", "jsonc", "mdx", "css", "ts", "psv", "cs", "csx", "rc",
+                "jsonld",
+            ] {
                 let mut dataset = Dataset::new(docs.clone(), format!("fmt_{format}"));
                 dataset.params = Some(Params {
                     data: HashMap::from([(
@@ -993,7 +1003,7 @@ async fn file_connector_text_extensions_ready_structured_typos_error() -> Result
                 app = app.with_dataset(dataset);
             }
 
-            let mut text_tex = Dataset::new(docs, "text_tex");
+            let mut text_tex = Dataset::new(docs.clone(), "text_tex");
             text_tex.params = Some(Params {
                 data: HashMap::from([
                     (
@@ -1008,13 +1018,37 @@ async fn file_connector_text_extensions_ready_structured_typos_error() -> Result
             });
             app = app.with_dataset(text_tex);
 
-            for (name, format) in [
-                ("typo_cvs", "cvs"),
-                ("typo_parqet", "parqet"),
-                ("typo_jsno", "jsno"),
-                ("typo_parquett", "parquett"),
+            let mut cvs_only = Dataset::new(
+                format!("file:{}/", cvs_only_dir.path().display()),
+                "fmt_cvs_only",
+            );
+            cvs_only.params = Some(Params {
+                data: HashMap::from([(
+                    "file_format".to_string(),
+                    ParamValue::String("cvs".to_string()),
+                )]),
+            });
+            app = app.with_dataset(cvs_only);
+
+            for (name, format, file) in [
+                ("typo_cvs", "cvs", csv.display().to_string()),
+                (
+                    "typo_parqet",
+                    "parqet",
+                    dir.path().join("data.parquet").display().to_string(),
+                ),
+                (
+                    "typo_jsno",
+                    "jsno",
+                    dir.path().join("data.json").display().to_string(),
+                ),
+                (
+                    "typo_parquett",
+                    "parquett",
+                    dir.path().join("data.parquet").display().to_string(),
+                ),
             ] {
-                let mut dataset = Dataset::new(format!("file:{}", csv.display()), name);
+                let mut dataset = Dataset::new(format!("file:{file}"), name);
                 dataset.params = Some(Params {
                     data: HashMap::from([(
                         "file_format".to_string(),
@@ -1037,7 +1071,10 @@ async fn file_connector_text_extensions_ready_structured_typos_error() -> Result
                 () = cloned_rt.load_components() => {}
             }
 
-            for format in ["tex", "org", "json5", "jsonc", "mdx", "css", "ts", "psv"] {
+            for format in [
+                "tex", "org", "json5", "jsonc", "mdx", "css", "ts", "psv", "cs", "csx", "rc",
+                "jsonld",
+            ] {
                 let name = format!("fmt_{format}");
                 let status = rt
                     .status()
@@ -1049,6 +1086,16 @@ async fn file_connector_text_extensions_ready_structured_typos_error() -> Result
                     "file_format {format} must stay Ready, got {status:?}"
                 );
             }
+
+            let cvs_only_status = rt
+                .status()
+                .get_dataset_status(&datafusion::common::TableReference::bare("fmt_cvs_only"))
+                .expect("dataset status");
+            assert_eq!(
+                cvs_only_status.to_string(),
+                "Ready",
+                "file_format cvs over only .cvs files must stay Ready, got {cvs_only_status:?}"
+            );
 
             let text_status = rt
                 .status()
