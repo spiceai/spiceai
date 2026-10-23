@@ -35,6 +35,7 @@ datasets:
 1. `grep CANARYPGPW7731` the `spiced` log — must be empty after the fix.
 2. `GET /v1/datasets?status=true` — `error_message` must not contain `CANARYPGPW7731`, and must contain `csv_has_header` and `${ env:PG_PW }` (spacing may match the spicepod).
 3. For a partial interpolation (`client_timeout: 1e${ env:SECRET }` with `SECRET=1234`), the error must be the generic `invalid value for \`client_timeout\` from ${ env:SECRET }` form. It must not contain `1234`, `1e1234`, or `Exponent`.
+4. For an omitted `s3_auth` that autoloads `SPICE_S3_AUTH=CANARYPGPW7731`, the error must name `${ secrets:s3_auth }` and must not contain `CANARYPGPW7731`.
 
 ## Evidence
 

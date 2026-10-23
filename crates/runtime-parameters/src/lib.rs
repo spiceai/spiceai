@@ -211,8 +211,10 @@ impl Parameters {
     ///
     /// Pass `Some(map)` when the caller tracked secret-reference templates
     /// (an empty map means every supplied value is a literal and is safe to
-    /// show). Pass `None` when provenance is unknown — `Found` clauses then
-    /// never interpolate the raw value.
+    /// show). Successfully autoloaded `.secret()` params are recorded on that
+    /// map as `${ secrets:<lookup key> }`. Pass `None` when provenance is
+    /// unknown — `Found` clauses then never interpolate the raw value,
+    /// including autoloaded secrets.
     ///
     /// # Errors
     ///
@@ -257,6 +259,12 @@ impl Parameters {
         // `Secrets::snapshot`.
         let secrets = Secrets::snapshot(&secrets).await;
 
+        // Remap supplied origins before autoload so a successfully
+        // autoloaded secret can be recorded on the same map validation
+        // consults. `None` stays conservative.
+        let mut secret_sources = secret_sources
+            .map(|sources| remap_secret_sources(all_params, prefix, component_name, sources));
+
         // Try to autoload secrets that might be missing from params.
         for secret_key in all_params.iter().filter(|p| p.secret) {
             let secret_key_with_prefix = if secret_key.name.starts_with(prefix) {
@@ -278,11 +286,14 @@ impl Parameters {
                 );
                 // Insert without the prefix into the params
                 params.push((secret_key.name.to_string(), secret));
+                if let Some(sources) = secret_sources.as_mut() {
+                    sources.insert(
+                        secret_key.name.to_string(),
+                        format!("${{ secrets:{secret_key_with_prefix} }}"),
+                    );
+                }
             }
         }
-
-        let secret_sources = secret_sources
-            .map(|sources| remap_secret_sources(all_params, prefix, component_name, sources));
 
         // If `ParameterSpec` requires the value to one of a set list, verify it is.
         for parameter in all_params {
@@ -1096,6 +1107,103 @@ mod test {
         );
         assert!(
             message.contains("Found a value from ${ env:PG_PW }."),
+            "unexpected found-clause: {message}"
+        );
+    }
+
+    struct MapStore(HashMap<String, String>);
+
+    #[async_trait::async_trait]
+    impl runtime_secrets::SecretStore for MapStore {
+        async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+            Ok(self
+                .0
+                .get(key)
+                .map(|value| SecretString::from(value.clone())))
+        }
+    }
+
+    fn secrets_with_map(entries: &[(&str, &str)]) -> Arc<RwLock<Secrets>> {
+        let mut secrets = Secrets::new();
+        secrets.register_store(
+            "fake",
+            Arc::new(MapStore(
+                entries
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            )),
+        );
+        Arc::new(RwLock::new(secrets))
+    }
+
+    /// Autoload fills a missing `.secret()` + `.one_of()` param. An empty
+    /// template map used to send that value through `found_clause`'s raw-value
+    /// branch. Record the autoload as `${ secrets:<lookup key> }` so the
+    /// canary never appears.
+    #[tokio::test]
+    async fn test_one_of_autoloaded_secret_masks_canary_and_names_the_lookup() {
+        static SPECS: &[ParameterSpec] = &[ParameterSpec::component("auth")
+            .one_of(&["iam_role", "key"])
+            .secret()];
+        const CANARY: &str = "CANARYPGPW7731";
+        const REFERENCE: &str = "${ secrets:test_auth }";
+        let err = Parameters::try_new_with_secret_sources(
+            "S3 state location",
+            vec![],
+            "test",
+            secrets_with_map(&[("test_auth", CANARY)]),
+            SPECS,
+            Diagnostics::Report,
+            Some(HashMap::new()),
+        )
+        .await
+        .expect_err("an autoloaded one_of reject must fail validation");
+
+        let message = err.to_string();
+        assert!(
+            !message.contains(CANARY),
+            "autoloaded secrets must not echo through Found: {message}"
+        );
+        assert!(
+            message.contains("'test_auth' parameter must be one of: iam_role, key."),
+            "the error must name the parameter: {message}"
+        );
+        assert!(
+            message.contains(REFERENCE),
+            "the error must name the autoload lookup: {message}"
+        );
+        assert!(
+            message.contains("Found a value from ${ secrets:test_auth }."),
+            "unexpected found-clause: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_of_autoloaded_secret_none_provenance_stays_conservative() {
+        static SPECS: &[ParameterSpec] = &[ParameterSpec::component("auth")
+            .one_of(&["iam_role", "key"])
+            .secret()];
+        const CANARY: &str = "CANARYPGPW7731";
+        let err = Parameters::try_new_with_secret_sources(
+            "S3 state location",
+            vec![],
+            "test",
+            secrets_with_map(&[("test_auth", CANARY)]),
+            SPECS,
+            Diagnostics::Report,
+            None,
+        )
+        .await
+        .expect_err("an autoloaded one_of reject must fail validation");
+
+        let message = err.to_string();
+        assert!(
+            !message.contains(CANARY),
+            "None provenance must stay conservative for autoload: {message}"
+        );
+        assert!(
+            message.contains("Found an invalid value."),
             "unexpected found-clause: {message}"
         );
     }
