@@ -29,8 +29,8 @@ use aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder;
 use object_store::ObjectStore;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use runtime_object_store::{build_azure_object_store, build_gcs_object_store};
-use runtime_parameters::{ParameterSpec, Parameters};
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_parameters::{Diagnostics, ParameterSpec, Parameters};
+use runtime_secrets::{Secrets, get_params_with_secrets, secret_sources_from_templates};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use spicepod::component::runtime::{SCHEDULER_STATE_FOLDER, StateLocation, StateSource};
@@ -450,12 +450,15 @@ pub async fn build_s3_parameters<S: BuildHasher>(
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
             let secret_params = get_params_with_secrets(Arc::clone(&secrets), &params).await;
-            Parameters::try_new(
+            let secret_sources = secret_sources_from_templates(&params);
+            Parameters::try_new_with_secret_sources(
                 usage,
                 secret_params.into_iter().collect(),
                 "s3",
                 secrets,
                 s3_parameters,
+                Diagnostics::Report,
+                Some(secret_sources),
             )
             .await
             .map_err(|source| Error::S3ParameterValidation { usage, source })
@@ -482,12 +485,15 @@ async fn build_gcs_parameters(
         return Ok(HashMap::new());
     };
     let secret_params = get_params_with_secrets(Arc::clone(&secrets), params).await;
-    let params = Parameters::try_new(
+    let secret_sources = secret_sources_from_templates(params);
+    let params = Parameters::try_new_with_secret_sources(
         usage,
         secret_params.into_iter().collect(),
         "gcs",
         secrets,
         &GCS_PARAMETERS,
+        Diagnostics::Report,
+        Some(secret_sources),
     )
     .await
     .map_err(|source| Error::GcsParameterValidation { usage, source })?;

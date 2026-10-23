@@ -139,13 +139,11 @@ pub fn parse_param<T: FromStr>(user_key: &str, value: &SecretString) -> Result<T
 where
     T::Err: Display,
 {
-    value
-        .expose_secret()
-        .parse()
-        .map_err(|e: T::Err| ParamsError::InvalidValue {
-            user_key: user_key.to_string(),
-            reason: e.to_string(),
-        })
+    let raw = value.expose_secret();
+    raw.parse().map_err(|e: T::Err| ParamsError::InvalidValue {
+        user_key: user_key.to_string(),
+        reason: redact_value_in_reason(&e.to_string(), raw),
+    })
 }
 
 /// [`parse_param`] with a custom parser (`#[param(parse_with = ...)]`).
@@ -158,10 +156,20 @@ pub fn parse_param_with<T, E: Display>(
     value: &SecretString,
     parser: impl FnOnce(&str) -> std::result::Result<T, E>,
 ) -> Result<T> {
-    parser(value.expose_secret()).map_err(|e| ParamsError::InvalidValue {
+    let raw = value.expose_secret();
+    parser(raw).map_err(|e| ParamsError::InvalidValue {
         user_key: user_key.to_string(),
-        reason: e.to_string(),
+        reason: redact_value_in_reason(&e.to_string(), raw),
     })
+}
+
+/// Defense in depth: if a `FromStr` / custom parser echoes the input, replace
+/// that text so a secret-derived value cannot leak through typed-param errors.
+fn redact_value_in_reason(reason: &str, value: &str) -> String {
+    if value.is_empty() || !reason.contains(value) {
+        return reason.to_string();
+    }
+    reason.replace(value, "an invalid value")
 }
 
 /// Looks up an absent `#[param(autoload_secret)]` parameter in the configured
@@ -359,4 +367,54 @@ pub fn deny_leftover_keys<S: std::hash::BuildHasher>(
         user_key: user_key.clone(),
         supported,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `FromStr` that echoes the input so we can prove the redact path
+    /// strips a canary that would otherwise appear in the error.
+    #[derive(Debug)]
+    struct EchoingParser;
+
+    impl std::str::FromStr for EchoingParser {
+        type Err = String;
+
+        fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+            Err(format!("cannot parse {s}"))
+        }
+    }
+
+    #[test]
+    fn redact_value_in_reason_replaces_canary() {
+        const CANARY: &str = "CANARYPGPW7731";
+        let redacted = redact_value_in_reason(&format!("invalid bool: {CANARY}"), CANARY);
+        assert!(
+            !redacted.contains(CANARY),
+            "redacted reason still contains the canary: {redacted}"
+        );
+        assert_eq!(redacted, "invalid bool: an invalid value");
+    }
+
+    #[test]
+    fn parse_param_does_not_echo_canary_when_fromstr_repeats_input() {
+        const CANARY: &str = "CANARYPGPW7731";
+        let err =
+            parse_param::<EchoingParser>("csv_has_header", &SecretString::from(CANARY.to_string()))
+                .expect_err("echoing parser always fails");
+        let message = err.to_string();
+        assert!(
+            !message.contains(CANARY),
+            "typed-param errors must not echo a resolved secret: {message}"
+        );
+        assert!(
+            message.contains("csv_has_header"),
+            "typed-param errors must name the parameter: {message}"
+        );
+        assert!(
+            message.contains("an invalid value"),
+            "typed-param errors must mask the echoed input: {message}"
+        );
+    }
 }
