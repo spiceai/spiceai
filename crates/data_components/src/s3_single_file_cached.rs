@@ -189,7 +189,10 @@ impl S3SingleFileCached {
     /// Returns `true` if the file is unchanged and can be skipped.
     async fn is_file_unchanged(&self) -> DataFusionResult<bool> {
         let Some(current_metadata) = self.fetch_current_metadata().await? else {
-            return Ok(false); // Can't determine, assume changed
+            // Can't determine, assume changed. The refresh that follows can replace the
+            // accelerated rows and still fail, so no version counts as loaded.
+            self.reset_skip_state().await;
+            return Ok(false);
         };
 
         let cached_metadata = {
@@ -491,12 +494,17 @@ mod tests {
     }
 
     #[derive(Debug)]
+    /// Answers each HEAD with the next response; `None` fails that HEAD.
     struct HeadOnlyObjectStore {
-        responses: Mutex<VecDeque<object_store::ObjectMeta>>,
+        responses: Mutex<VecDeque<Option<object_store::ObjectMeta>>>,
     }
 
     impl HeadOnlyObjectStore {
         fn new(responses: Vec<object_store::ObjectMeta>) -> Self {
+            Self::with_failures(responses.into_iter().map(Some).collect())
+        }
+
+        fn with_failures(responses: Vec<Option<object_store::ObjectMeta>>) -> Self {
             Self {
                 responses: Mutex::new(responses.into()),
             }
@@ -553,6 +561,7 @@ mod tests {
             let mut guard = self.responses.lock().await;
             let meta = guard
                 .pop_front()
+                .flatten()
                 .ok_or_else(|| not_implemented("get_opts"))?;
             Ok(object_store::GetResult {
                 payload: object_store::GetResultPayload::Stream(Box::pin(futures::stream::empty())),
@@ -654,6 +663,32 @@ mod tests {
                 .await
                 .expect("after a successful refresh"),
             "a file loaded by a successful refresh is skipped"
+        );
+    }
+
+    /// When the file's version cannot be read, the refresh that follows can replace the
+    /// accelerated rows and then fail, so the version loaded before no longer counts as loaded.
+    #[tokio::test]
+    async fn a_failed_version_check_forgets_the_version_loaded_before() {
+        let meta = make_meta("file", 128, 10, Some("etag"), Some("v1"));
+        let store = Arc::new(HeadOnlyObjectStore::with_failures(vec![
+            None,
+            Some(meta.clone()),
+        ])) as Arc<dyn ObjectStore>;
+        let cached_table = build_cached_table(store, Some(meta));
+
+        assert!(
+            !cached_table
+                .should_skip_refresh()
+                .await
+                .expect("failed version check")
+        );
+        assert!(
+            !cached_table
+                .should_skip_refresh()
+                .await
+                .expect("unchanged file after a failed version check"),
+            "the version loaded before a refresh that could not check the file is read again"
         );
     }
 
