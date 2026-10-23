@@ -17,7 +17,7 @@
 
 //! [`SpiceJsonFormat`]: Line delimited JSON [`FileFormat`] abstractions
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt::{self, Debug};
 use std::io::{BufReader, Read};
 use std::str::FromStr;
@@ -26,7 +26,8 @@ use std::sync::Arc;
 use crate::source::SpiceJsonSource;
 use crate::{
     ArrayToNdjson, ArrayToNdjsonPush, JsonPointerReader, ReadResult, SodaReader,
-    body_opens_a_json_array, extract_flattened_from_nested, is_soda_response, unnest_struct_schema,
+    body_opens_a_json_array, extract_flattened_from_nested, flatten_json_obj, is_soda_response,
+    unnest_struct_schema,
 };
 
 use arrow::array::RecordBatch;
@@ -276,6 +277,114 @@ impl SpiceJsonFormat {
         })
     }
 
+    /// Collect top-level object keys and a record count from `objects`.
+    /// Values are not type-merged: an unregistered key that is a number in one
+    /// record and an object in another is still one key.
+    ///
+    /// The count is `0` for an empty array, an empty pointer target, or blank
+    /// JSONL. An empty object (`{}` / `[{}]`) is one record with no keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reading a file, decompressing it, extracting a JSON
+    /// pointer, or parsing a record. Type conflicts between records are not
+    /// an error.
+    pub async fn probe_keys(
+        &self,
+        _state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        objects: &[ObjectMeta],
+    ) -> Result<JsonKeyProbe> {
+        let mut keys = BTreeSet::new();
+        let mut records_to_read = self
+            .options
+            .schema_infer_max_rec
+            .unwrap_or(DEFAULT_SCHEMA_INFER_MAX_RECORD);
+        let mut record_count = 0;
+        let file_compression_type = FileCompressionType::from(self.options.compression);
+        for object in objects {
+            let mut take_while = || {
+                let should_take = records_to_read > 0;
+                if should_take {
+                    records_to_read -= 1;
+                    record_count += 1;
+                }
+                should_take
+            };
+
+            let r = store.as_ref().get(&object.location).await?;
+            let raw_buf = match r.payload {
+                GetResultPayload::File(file, _) => {
+                    let mut decoder = file_compression_type.convert_read(file)?;
+                    let mut raw_buf = Vec::new();
+                    decoder.read_to_end(&mut raw_buf)?;
+                    raw_buf
+                }
+                GetResultPayload::Stream(_) => {
+                    let data = r.bytes().await?;
+                    let mut decoder = file_compression_type.convert_read(data.reader())?;
+                    let mut raw_buf = Vec::new();
+                    decoder.read_to_end(&mut raw_buf)?;
+                    raw_buf
+                }
+            };
+            self.collect_keys_from_raw_buf(&raw_buf, &mut take_while, &mut keys)?;
+            if records_to_read == 0 {
+                break;
+            }
+        }
+
+        Ok(JsonKeyProbe { keys, record_count })
+    }
+
+    fn collect_keys_from_raw_buf(
+        &self,
+        raw_buf: &[u8],
+        take_while: &mut dyn FnMut() -> bool,
+        keys: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let is_soda = self.options.format == Format::Soda
+            || (self.options.format == Format::Auto && is_soda_response(raw_buf));
+
+        if is_soda && self.options.json_pointer.is_some() {
+            return Err(DataFusionError::Configuration(
+                "'json_pointer' cannot be used with SODA format data. \
+                 SODA responses contain their own schema in 'meta.view.columns' \
+                 and data is extracted automatically. \
+                 Remove 'json_pointer' or set 'file_format: json' to treat the file as regular JSON."
+                    .to_string(),
+            ));
+        }
+
+        if is_soda {
+            let soda = SodaReader::from_vec(raw_buf, self.options.soda_metadata)?;
+            let schema = if let Some(separator) = &self.options.flatten_json {
+                unnest_struct_schema(soda.schema(), separator)
+            } else {
+                soda.schema().clone()
+            };
+            keys.extend(schema.fields().iter().map(|f| f.name().clone()));
+            return Ok(());
+        }
+
+        let extracted = if let Some(path) = &self.options.json_pointer {
+            let reader = JsonPointerReader::from_vec(raw_buf, path)?;
+            let mut out = Vec::new();
+            std::io::BufReader::new(reader).read_to_end(&mut out)?;
+            Some(out)
+        } else {
+            None
+        };
+        let buf = extracted.as_deref().unwrap_or(raw_buf);
+        collect_json_keys_for_format(
+            buf,
+            self.options.format,
+            take_while,
+            self.options.flatten_json.as_deref(),
+            keys,
+        )
+    }
+
     fn schema_from_raw_buf(
         &self,
         raw_buf: &[u8],
@@ -330,6 +439,21 @@ pub struct JsonSchemaProbe {
     /// Records `take_while` accepted while inferring. `0` means the files
     /// contained no JSON values (`[]`, `{"data":[]}` after a pointer, blank
     /// JSONL). An empty object is one record with no keys.
+    pub record_count: usize,
+}
+
+/// Top-level object keys from a JSON source plus how many records were inspected.
+///
+/// Unlike [`JsonSchemaProbe`], this does not merge value types. It is the
+/// probe the file schema-drift guard uses so an unregistered key that
+/// changes type across records cannot fail a refresh.
+#[derive(Debug, Clone)]
+pub struct JsonKeyProbe {
+    /// Top-level keys (flattened when `flatten_json` is set) seen in any record.
+    pub keys: BTreeSet<String>,
+    /// Records `take_while` accepted. `0` means the files contained no JSON
+    /// values (`[]`, `{"data":[]}` after a pointer, blank JSONL). An empty
+    /// object is one record with no keys.
     pub record_count: usize,
 }
 
@@ -696,6 +820,78 @@ fn infer_json_schema_for_format(
     }
 }
 
+fn collect_record_keys(
+    value: &serde_json::Value,
+    flatten_separator: Option<&str>,
+    keys: &mut BTreeSet<String>,
+) {
+    let flattened = flatten_separator.map(|sep| flatten_json_obj(value, sep));
+    let object = flattened.as_ref().unwrap_or(value).as_object();
+    if let Some(object) = object {
+        keys.extend(object.keys().cloned());
+    }
+}
+
+/// Collect top-level object keys from `buf` using the same array / object /
+/// JSONL extraction as [`infer_json_schema_for_format`], without merging
+/// value types.
+fn collect_json_keys_for_format(
+    buf: &[u8],
+    format: Format,
+    take_while: &mut dyn FnMut() -> bool,
+    flatten_separator: Option<&str>,
+    keys: &mut BTreeSet<String>,
+) -> Result<()> {
+    let buf = buf.strip_prefix(&UTF8_BOM).unwrap_or(buf);
+
+    if format == Format::Object {
+        let value: serde_json::Value =
+            serde_json::from_slice(buf).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        take_while();
+        collect_record_keys(&value, flatten_separator, keys);
+        return Ok(());
+    }
+
+    let mut reader = BufReader::new(std::io::Cursor::new(buf));
+
+    let is_array = match format {
+        Format::Array => true,
+        Format::Jsonl | Format::Object => false,
+        Format::Soda => {
+            return Err(DataFusionError::Internal(
+                "Format::Soda should be handled before calling collect_json_keys_for_format"
+                    .to_string(),
+            ));
+        }
+        Format::Auto | Format::Json => body_opens_a_json_array(&mut reader)?,
+    };
+
+    if is_array {
+        let mut adapter = ArrayToNdjson::try_new(reader)?;
+        let iter = ValueIter::new(&mut adapter, None);
+        for value in iter.take_while(|_| take_while()) {
+            collect_record_keys(&value?, flatten_separator, keys);
+        }
+        return Ok(());
+    }
+
+    if matches!(format, Format::Auto | Format::Json)
+        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(buf)
+        && value.is_object()
+    {
+        take_while();
+        collect_record_keys(&value, flatten_separator, keys);
+        return Ok(());
+    }
+
+    let mut reader = BufReader::new(std::io::Cursor::new(buf));
+    let iter = ValueIter::new(&mut reader, None);
+    for value in iter.take_while(|_| take_while()) {
+        collect_record_keys(&value?, flatten_separator, keys);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,6 +1021,76 @@ mod tests {
             .expect("blank JSONL is a valid schema");
         assert_eq!(schema.fields().len(), 0);
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn infer_json_schema_fails_when_an_unregistered_key_changes_type() {
+        let buf = concat!(
+            r#"{"id":1,"extra":1}"#,
+            "\n",
+            r#"{"id":2,"extra":{}}"#,
+            "\n"
+        );
+        let mut take = || true;
+        let err = infer_json_schema_for_format(buf.as_bytes(), Format::Jsonl, &mut take)
+            .expect_err("arrow-json type merge fails when extra changes type");
+        let message = err.to_string();
+        assert!(
+            message.contains("Expected scalar or scalar array JSON type")
+                || message.contains("Expected object json type"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn collect_json_keys_ignores_value_types() {
+        let buf = concat!(
+            r#"{"id":1,"extra":1}"#,
+            "\n",
+            r#"{"id":2,"extra":{}}"#,
+            "\n"
+        );
+        let mut n = 0;
+        let mut take = || {
+            n += 1;
+            true
+        };
+        let mut keys = BTreeSet::new();
+        collect_json_keys_for_format(buf.as_bytes(), Format::Jsonl, &mut take, None, &mut keys)
+            .expect("key collection does not merge types");
+        assert_eq!(n, 2);
+        assert_eq!(
+            keys,
+            BTreeSet::from(["id".to_string(), "extra".to_string()])
+        );
+    }
+
+    #[test]
+    fn collect_json_keys_empty_array_is_zero_records() {
+        let mut n = 0;
+        let mut take = || {
+            n += 1;
+            true
+        };
+        let mut keys = BTreeSet::new();
+        collect_json_keys_for_format(b"[]", Format::Array, &mut take, None, &mut keys)
+            .expect("empty array");
+        assert_eq!(n, 0);
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn collect_json_keys_empty_object_array_is_one_record() {
+        let mut n = 0;
+        let mut take = || {
+            n += 1;
+            true
+        };
+        let mut keys = BTreeSet::new();
+        collect_json_keys_for_format(b"[{}]", Format::Array, &mut take, None, &mut keys)
+            .expect("empty object is one record");
+        assert_eq!(n, 1);
+        assert!(keys.is_empty());
     }
 
     #[test]

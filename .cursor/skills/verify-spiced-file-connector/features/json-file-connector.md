@@ -1,6 +1,6 @@
 # JSON file connector
 
-A JSON/NDJSON file dataset binds object keys by name. Reordering keys keeps values with their names. Renaming a registered key returns `NULL` on a federated read (one `WARN`) and fails an acceleration refresh so the last loaded data is kept. Schema inference samples records; the drift check reads every record so a sparse key later in the file is not treated as a rename.
+A JSON/NDJSON file dataset binds object keys by name. Reordering keys keeps values with their names. Renaming a registered key returns `NULL` on a federated read (one `WARN`) and fails an acceleration refresh so the last loaded data is kept. The drift check reads every record for key presence (not type inference) so a sparse key later in the file is not treated as a rename, and an unregistered key that changes type cannot fail the refresh.
 
 `file_format: json` (array/object) and `json_pointer` use a non-repartitioned scan wrapper. The drift guard must still see those files; a rename on those paths is the same contract as JSONL.
 
@@ -12,6 +12,7 @@ A JSON/NDJSON file dataset binds object keys by name. Reordering keys keeps valu
 - `json-empty` rewrites each source to zero records (`[]`, `{"data":[]}`, blank JSONL). Federated sums are `null`/`null`. An Arrow refresh succeeds and clears the acceleration (`Ready`, `null`/`null`). This is not a rename: no records means no missing-column list.
 - `json-array` is `file_format: json` over `data/events.json` (a JSON array). Same reorder / rename / restore / empty as JSONL.
 - `json-pointer` is `file_format: json` plus `json_pointer: /data` over `data/events_pointer.json` (`{"data":[...]}`). Same reorder / rename / restore / empty as JSONL.
+- `json-unregistered-type-change` adds an unregistered key after registration and changes its type (`extra: 1` then `extra: {}`). Federated sums stay `300`/`30`. An Arrow refresh succeeds (`Ready`). The normal scan ignores unregistered fields; the drift probe must not type-merge them.
 
 ## How to get to it (user POV)
 
@@ -42,3 +43,4 @@ Preconditions:
 - `POST .../refresh` returns before the refresh finishes. Poll status.
 - After `json_acc` is `Error`, `/v1/ready` may be `503`. Federated queries still run.
 - A sparse `amount_cents` that appears only after the first records is not a rename. Do not treat that file as the rename fixture.
+- An unregistered key that changes type after registration (`extra: 1` then `extra: {}`) is not a rename. The listing test `create_listing_table_allows_json_unregistered_field_type_change_on_refresh` is the proof; the HTTP helper does not rewrite that fixture.

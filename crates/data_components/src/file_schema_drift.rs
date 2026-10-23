@@ -27,7 +27,8 @@ limitations under the License.
 //! [`FileSchemaDriftGuard`] checks each scan's files for the projected registered columns.
 //! Only formats whose per-file column list can be proven complete are checked
 //! (see [`FileSchemaDriftGuard::supports_format`]): Parquet and ORC footers, a
-//! CSV/TSV header, or a JSON/NDJSON object-key scan that reads every record.
+//! CSV/TSV header, or a JSON/NDJSON object-key scan that reads every record
+//! for key presence (not type inference).
 //! A column that no scanned file carries is reported:
 //!
 //! - in a scan that feeds an acceleration refresh (the refresh session carries
@@ -53,7 +54,7 @@ use std::{
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use dataformat_json::{Format, JsonSchemaProbe, NonRepartitionedFileScanConfig, SpiceJsonFormat};
+use dataformat_json::{Format, JsonKeyProbe, NonRepartitionedFileScanConfig, SpiceJsonFormat};
 use datafusion::{
     catalog::{ScanArgs, ScanResult, Session},
     common::tree_node::{TreeNode, TreeNodeRecursion},
@@ -332,9 +333,10 @@ impl FileSchemaDriftGuard {
     /// whose types differ across files never have to merge), until every column in `columns`
     /// is found. Returns the columns no file carries.
     ///
-    /// JSON probes also count records and collect unregistered keys. Zero
-    /// records is not drift. A missing key fails a refresh only when the probe
-    /// also saw a key that was never registered (the rename signal).
+    /// JSON probes also count records and collect unregistered keys (presence
+    /// only; value types are not merged). Zero records is not drift. A missing
+    /// key fails a refresh only when the probe also saw a key that was never
+    /// registered (the rename signal).
     ///
     /// # Errors
     ///
@@ -414,10 +416,10 @@ impl FileSchemaDriftGuard {
             for probe in futures::future::join_all(probes).await {
                 let probe = probe?;
                 records = records.saturating_add(probe.record_count);
-                remaining.retain(|name| probe.schema.field_with_name(name).is_err());
-                for field in probe.schema.fields() {
-                    if !registered.contains(field.name()) {
-                        extras.insert(field.name().clone());
+                remaining.retain(|name| !probe.keys.contains(name));
+                for key in &probe.keys {
+                    if !registered.contains(key) {
+                        extras.insert(key.clone());
                     }
                 }
             }
@@ -507,21 +509,23 @@ fn scanned_files(plan: &Arc<dyn ExecutionPlan>) -> Option<(ObjectStoreUrl, Vec<O
     store_url.map(|url| (url, files))
 }
 
-/// Object-key probe for one JSON file: schema plus how many records were seen.
-/// `JsonFormat` (JSONL without a pointer) is probed as `SpiceJsonFormat`
-/// JSONL so the record count uses the same reader as array/pointer scans.
+/// Object-key probe for one JSON file: top-level keys plus how many records
+/// were seen. Values are not type-merged, so an unregistered key that
+/// changes type across records cannot fail the refresh. `JsonFormat`
+/// (JSONL without a pointer) is probed as `SpiceJsonFormat` JSONL so the
+/// record count uses the same reader as array/pointer scans.
 async fn probe_json_file(
     format: &Arc<dyn FileFormat>,
     state: &dyn Session,
     store: &Arc<dyn object_store::ObjectStore>,
     file: &ObjectMeta,
-) -> DFResult<JsonSchemaProbe> {
+) -> DFResult<JsonKeyProbe> {
     let files = std::slice::from_ref(file);
     if let Some(json) = format.as_ref().downcast_ref::<SpiceJsonFormat>() {
         return json
             .clone()
             .with_schema_infer_max_rec(usize::MAX)
-            .probe_schema(state, store, files)
+            .probe_keys(state, store, files)
             .await;
     }
     if let Some(json) = format.as_ref().downcast_ref::<JsonFormat>() {
@@ -532,11 +536,11 @@ async fn probe_json_file(
             .with_format(Format::Jsonl)
             .with_schema_infer_max_rec(usize::MAX)
             .with_file_compression_type(compression)
-            .probe_schema(state, store, files)
+            .probe_keys(state, store, files)
             .await;
     }
     Err(DataFusionError::Internal(
-        "JSON schema probe invoked for a non-JSON format".to_string(),
+        "JSON key probe invoked for a non-JSON format".to_string(),
     ))
 }
 
@@ -1232,6 +1236,27 @@ mod tests {
             (None, Some(4)),
             "refresh loads NULL for the omitted key instead of failing"
         );
+    }
+
+    #[tokio::test]
+    async fn json_refresh_allows_an_unregistered_key_that_changes_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_ndjson(&dir.path().join("base.json"), &[r#"{"id":1}"#]);
+        let table = guarded_json_table(dir.path(), &["id"]);
+        let before = query(&table, true, "SELECT sum(id) FROM base")
+            .await
+            .expect("refresh before unregistered extra");
+        assert_eq!(single_value(&before), Some(1));
+
+        write_ndjson(
+            &dir.path().join("base.json"),
+            &[r#"{"id":1,"extra":1}"#, r#"{"id":2,"extra":{}}"#],
+        );
+
+        let refreshed = query(&table, true, "SELECT sum(id) FROM base")
+            .await
+            .expect("an unregistered key that changes type must not fail refresh");
+        assert_eq!(single_value(&refreshed), Some(3));
     }
 
     #[tokio::test]

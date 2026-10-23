@@ -3477,6 +3477,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_listing_table_allows_json_unregistered_field_type_change_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        write_events_ndjson(&path, EVENTS_JSON_BASELINE);
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("jsonl format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0","extra":1}"#,
+                r#"{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1","extra":{}}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "unregistered extra is ignored on a federated read"
+        );
+        assert_eq!(
+            csv_listing_sums(provider, true).await,
+            (Some(300), Some(30)),
+            "an unregistered field that changes type must not fail refresh"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_file_format_and_extension_tsv_from_params() {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "tsv".to_string());
