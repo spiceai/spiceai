@@ -27,7 +27,8 @@ use spicepod::{
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    run_query_and_check_results_with_plan_checks, utils::test_request_context,
+    run_query_and_check_results_with_plan_checks,
+    utils::{require_process_per_test, test_request_context},
 };
 
 /// Lay out a hive-partitioned Parquet dataset on disk with three partitions
@@ -1179,7 +1180,9 @@ async fn file_connector_secret_param_validation_does_not_echo_canary() -> Result
             const KEY: &str = "SEC1_CANARY_PG_PW";
             const REFERENCE: &str = "${ env:SEC1_CANARY_PG_PW }";
 
-            // SAFETY: unique test key; nextest runs this test in its own process.
+            require_process_per_test("the test sets an environment variable");
+            // SAFETY: the test runs in a process of its own, before the runtime
+            // starts any thread that reads the environment.
             unsafe {
                 std::env::set_var(KEY, CANARY);
             }
