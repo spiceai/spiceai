@@ -52,6 +52,9 @@ defaults:
   cluster-partition-by: { region: r_regionkey, nation: n_nationkey, supplier: s_suppkey, customer: c_custkey, part: p_partkey, partsupp: ps_partkey, orders: o_orderkey, lineitem: l_orderkey }
   expect: { oracle: ref }
   compare-variants: false
+  # Q20 federated to PostgreSQL takes 26-134 s at this scale (here and on CI
+  # runners), far longer than PostgreSQL alone; the answer is still checked.
+  query-timeout: 300s
 
 steps:
   - dbgen: { scale: 0.01, into: [backend, ref] }
