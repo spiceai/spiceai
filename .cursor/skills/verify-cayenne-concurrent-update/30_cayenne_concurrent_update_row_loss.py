@@ -4,7 +4,8 @@
 HTTP 200 is not success. `UPDATE … WHERE id = 50` can affect 0 or 1 rows.
 A parse failure or any other count cannot be ignored: then an unchanged
 table satisfies `amount == start + count1` and the harness exits 0
-without any UPDATE being acknowledged.
+without any UPDATE being acknowledged. An HTTP 409 is a retryable conflict:
+that UPDATE did not apply and is not counted as an increment.
 
 Usage:
   30_cayenne_concurrent_update_row_loss.py THREADS UPDATES
@@ -100,12 +101,18 @@ def run(threads: int, n: int, post: Callable[[str], _Resp]) -> int:
     bodies: list[str] = []
     count1 = 0
     count0 = 0
+    conflicts = 0
     errors = 0
     bad_replies = 0
     ok = True
     for r in res:
         codes[r.status_code] = codes.get(r.status_code, 0) + 1
         bodies.append(r.text.strip())
+        if r.status_code == 409:
+            # A retryable conflict: the UPDATE did not apply, so it is not
+            # counted toward the expected increment.
+            conflicts += 1
+            continue
         if r.status_code != 200:
             errors += 1
             continue
@@ -127,7 +134,10 @@ def run(threads: int, n: int, post: Callable[[str], _Resp]) -> int:
         "bodies sample:",
         set(bodies[:50]),
     )
-    print(f"count1={count1} count0={count0} non200={errors} bad_replies={bad_replies}")
+    print(
+        f"count1={count1} count0={count0} conflicts={conflicts} "
+        f"errors={errors} bad_replies={bad_replies}"
+    )
 
     after_row = post("SELECT id,amount FROM o_cayenne WHERE id=50")
     after_count = post("SELECT count(*) c FROM o_cayenne")
@@ -163,11 +173,11 @@ def run(threads: int, n: int, post: Callable[[str], _Resp]) -> int:
         ok = False
     else:
         print("OK count(*)=1000")
-    if count0 and errors == 0:
+    if count0:
         print(f"FAIL: {count0} silent count=0 responses with no error")
         ok = False
     if errors:
-        print(f"FAIL: {errors} non-200 responses")
+        print(f"FAIL: {errors} responses that were neither 200 nor a 409 conflict")
         ok = False
     if bad_replies:
         print(
@@ -178,12 +188,14 @@ def run(threads: int, n: int, post: Callable[[str], _Resp]) -> int:
     return 0 if ok else 2
 
 
-def _stub_post(update_body: str, after_amount: float) -> Callable[[str], _Resp]:
+def _stub_post(
+    update_body: str, after_amount: float, update_status: int = 200
+) -> Callable[[str], _Resp]:
     selects = {"n": 0}
 
     def post(sql: str) -> _Resp:
         if sql.startswith("UPDATE"):
-            return _Resp(200, update_body)
+            return _Resp(update_status, update_body)
         if "count(*)" in sql:
             return _Resp(200, '[{"c":1000}]')
         selects["n"] += 1
@@ -239,24 +251,27 @@ def replay_malformed() -> int:
         else:
             print(f"OK {body!r} -> {got}")
 
-    harness_cases: list[tuple[str, str, float, int]] = [
-        ("200 []", "[]", 28.13, 2),
-        ("200 not-json", "not-json", 28.13, 2),
-        ("200 {}", "{}", 28.13, 2),
-        ("200 [{}]", "[{}]", 28.13, 2),
-        ('200 [{"count":-1}]', '[{"count":-1}]', 28.13, 2),
-        ('200 [{"count":2}]', '[{"count":2}]', 28.13, 2),
-        ("valid count=1 + increment", '[{"count":1}]', 29.13, 0),
-        ("count=0 silent", '[{"count":0}]', 28.13, 2),
-        ("count=1 without increment", '[{"count":1}]', 28.13, 2),
+    harness_cases: list[tuple[str, int, str, float, int]] = [
+        ("200 []", 200, "[]", 28.13, 2),
+        ("200 not-json", 200, "not-json", 28.13, 2),
+        ("200 {}", 200, "{}", 28.13, 2),
+        ("200 [{}]", 200, "[{}]", 28.13, 2),
+        ('200 [{"count":-1}]', 200, '[{"count":-1}]', 28.13, 2),
+        ('200 [{"count":2}]', 200, '[{"count":2}]', 28.13, 2),
+        ("valid count=1 + increment", 200, '[{"count":1}]', 29.13, 0),
+        ("count=0 silent", 200, '[{"count":0}]', 28.13, 2),
+        ("count=1 without increment", 200, '[{"count":1}]', 28.13, 2),
+        ("409 conflict, row unchanged", 409, '{"error":"conflict"}', 28.13, 0),
+        ("409 conflict counted as an increment", 409, '{"error":"conflict"}', 29.13, 2),
+        ("500 error", 500, '{"error":"boom"}', 28.13, 2),
     ]
     harness_ok = True
     print()
     print("== stub-transport harness ==")
-    for name, body, after_amount, expected_rc in harness_cases:
+    for name, status, body, after_amount, expected_rc in harness_cases:
         print("=" * 72)
-        print(f"CASE {name!r} body={body!r}")
-        rc = run(1, 1, _stub_post(body, after_amount))
+        print(f"CASE {name!r} status={status} body={body!r}")
+        rc = run(1, 1, _stub_post(body, after_amount, status))
         print(f"exit={rc} expected={expected_rc}")
         if rc != expected_rc:
             print(f"FAIL: {name} exited {rc}, expected {expected_rc}")

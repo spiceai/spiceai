@@ -43466,18 +43466,24 @@ impl TableProvider for CayenneTableProvider {
             combined_filter,
             session_state.clone(),
         )?;
-        // Autocommit: do not freeze the physical scan here. Shared `UpdateExec`
-        // materializes a plan-time capture and only takes `write_lock` for the
-        // later delete + insert, so a concurrent same-key writer can tombstone
-        // the live replacement and insert nothing. `CayenneUpdateExec` rebuilds
-        // the scan after it holds `write_lock` — the #13828 pattern for UPDATE.
-        Ok(Arc::new(super::update_exec::CayenneUpdateExec::new(
+        // Autocommit: do not freeze the physical scan here. A scan captured at
+        // plan time and read outside `write_lock` lets a concurrent same-key
+        // writer's version be tombstoned with nothing inserted in its place. The
+        // serializer plans and reads the rows inside `write_lock` — the #13828
+        // pattern for UPDATE.
+        let update = data_components::update::UpdateExec::serialized(
             plan,
-            self.clone_for_write(),
+            Arc::new(super::update_serializer::CayenneUpdateSerializer::new(
+                self.clone_for_write(),
+            )),
+            Arc::new(self.clone_for_write()),
             session_state,
             filters,
-            check.map(|check| Arc::new(check) as Arc<dyn data_components::update::UpdateValidator>),
-        )))
+        );
+        Ok(Arc::new(match check {
+            Some(check) => update.with_validator(Arc::new(check)),
+            None => update,
+        }))
     }
 }
 
@@ -69850,6 +69856,193 @@ mod tests {
             vec![(7, 10 + UPDATES)],
             "every successful same-key increment must apply and the row must remain"
         );
+    }
+
+    /// Autocommit `UPDATE` holds `write_lock` across delete + insert. On an
+    /// unkeyed table that already holds rows, the insert takes the streaming
+    /// publish path (`stream_publish_interval_ms` is on by default), which must
+    /// not acquire that non-reentrant lock a second time.
+    #[tokio::test]
+    async fn an_unkeyed_update_with_streaming_publish_completes() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_inlining_table("update_unkeyed_streaming_publish", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
+        assert!(
+            provider.context.stream_publish_interval().is_some()
+                && matches!(provider.key_resolver(), Ok(None))
+                && !provider.holds_no_rows().await,
+            "precondition: the insert leg must take the streaming publish path"
+        );
+
+        let plan = provider
+            .update(
+                &ctx.state(),
+                vec![(
+                    "value".to_string(),
+                    datafusion_expr::col("value") + datafusion_expr::lit(1_i64),
+                )],
+                vec![datafusion_expr::col("id").eq(datafusion_expr::lit(2_i64))],
+            )
+            .await
+            .expect("update plan");
+        let batches = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            datafusion::physical_plan::collect(plan, ctx.task_ctx()),
+        )
+        .await
+        .expect("an unkeyed UPDATE must not wait on the write_lock it already holds")
+        .expect("update executed");
+        let count = batches
+            .first()
+            .and_then(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt64Array>()
+            })
+            .and_then(|counts| counts.values().first().copied())
+            .expect("update count");
+        assert_eq!(count, 1, "the UPDATE matches exactly one row");
+
+        let mut rows = scan_id_values(&provider).await;
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(1, 10), (2, 21), (3, 30)]);
+    }
+
+    /// The time-retention delete arm (`delete_using_files`) takes `write_lock`
+    /// again after its inner delete, to apply the delete to the mem-tier. An
+    /// autocommit `UPDATE` whose filter has the retention shape reaches it while
+    /// it holds that lock.
+    #[tokio::test]
+    async fn an_update_through_the_retention_delete_arm_completes() {
+        use arrow::array::{Int64Array, TimestampNanosecondArray};
+        use arrow_schema::TimeUnit;
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = temp_dir.path().join("metadata");
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!(
+                "sqlite://{}/cayenne.db",
+                metadata_dir
+                    .to_str()
+                    .expect("metadata path should be UTF-8")
+            ))
+            .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let retention_builder =
+            crate::TimeRetentionFilterBuilder::try_new("event_time", u64::MAX, &schema)
+                .expect("retention builder");
+        let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_time_retention_filter_builder(retention_builder)
+            .create(CreateTableOptions {
+                table_name: "update_retention_delete_arm".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    // The insert leg takes the plain append path, so only the
+                    // delete arm can take the lock a second time.
+                    stream_publish_interval_ms: 0,
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("retention table created");
+        for (times, values) in [([1_i64, 1], [10_i64, 20]), ([3, 3], [30, 40])] {
+            insert_batch(
+                &provider,
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(TimestampNanosecondArray::from(times.to_vec())),
+                        Arc::new(Int64Array::from(values.to_vec())),
+                    ],
+                )
+                .expect("batch"),
+            )
+            .await;
+        }
+
+        let filter = vec![datafusion_expr::col("event_time").lt(datafusion_expr::lit(
+            ScalarValue::TimestampNanosecond(Some(2), None),
+        ))];
+        assert!(
+            provider.file_based_deletes_preferred(&filter),
+            "precondition: the delete leg must take the retention arm"
+        );
+        let plan = provider
+            .update(
+                &ctx.state(),
+                vec![(
+                    "value".to_string(),
+                    datafusion_expr::col("value") + datafusion_expr::lit(1_i64),
+                )],
+                filter,
+            )
+            .await
+            .expect("update plan");
+        let batches = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            datafusion::physical_plan::collect(plan, ctx.task_ctx()),
+        )
+        .await
+        .expect("an UPDATE through the retention arm must not wait on the write_lock it holds")
+        .expect("update executed");
+        let count = batches
+            .first()
+            .and_then(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt64Array>()
+            })
+            .and_then(|counts| counts.values().first().copied())
+            .expect("update count");
+        assert_eq!(count, 2, "the UPDATE matches the two rows before t=2");
+
+        let mut rows: Vec<(i64, i64)> = read_all(&ctx, &provider, "update_retention_delete_arm")
+            .await
+            .iter()
+            .flat_map(|batch| {
+                let times = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .expect("event_time column");
+                let values = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("value column");
+                times
+                    .values()
+                    .iter()
+                    .copied()
+                    .zip(values.values().iter().copied())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(1, 11), (1, 21), (3, 30), (3, 40)]);
     }
 
     /// `delete_from_cdc_fast` used to prebuild the sink outside `write_lock` and

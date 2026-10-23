@@ -529,7 +529,11 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
         // rows are ONLY in the mem-tier the inner count is 0, and the cached scan
         // statistics still need invalidating once this changes the visible count.
         {
-            let _guard = self.table.write_lock.lock().await;
+            let _guard = if super::write_lock_held::is_held() {
+                None
+            } else {
+                Some(self.table.write_lock.lock().await)
+            };
             deleted = deleted.saturating_add(
                 apply_mem_tier_delete(&self.table, &self.filters)
                     .await

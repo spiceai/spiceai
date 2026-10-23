@@ -43,7 +43,8 @@ where
 /// `OwnedMutexGuard` only so a spawned commit can outlive the caller.
 ///
 /// Use only when [`is_held`] is true. Exclusive access is the outer
-/// `write_lock` hold, not this guard.
+/// `write_lock` hold, not this guard; that hold is owned by a task that waits
+/// for the write, and so for any commit the write hands this guard to.
 pub(crate) fn dummy_owned_guard() -> tokio::sync::OwnedMutexGuard<()> {
     let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let Ok(guard) = lock.try_lock_owned() else {

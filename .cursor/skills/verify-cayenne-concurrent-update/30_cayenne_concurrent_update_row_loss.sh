@@ -28,6 +28,12 @@ if [ -z "$SPICED" ]; then
     exit 1
   fi
 fi
+# The launch below runs from a temp dir, so pin a relative SPICED now.
+case "$SPICED" in
+  /*) ;;
+  */*) SPICED="$(cd "$(dirname "$SPICED")" && pwd)/$(basename "$SPICED")" ;;
+  *) SPICED=$(command -v "$SPICED") || { echo "spiced not found: $SPICED" >&2; exit 1; } ;;
+esac
 
 DATA_SRC=$SKILL_DIR/data/orders.parquet
 if [ ! -f "$DATA_SRC" ]; then

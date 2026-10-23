@@ -347,14 +347,16 @@ impl DataSink for CayenneDataSink {
             // other append would supersede a stored copy whatever its version.
             Err(versioned_append_refused(self.table.table_name()))
         } else if let Some(interval) = self.context.stream_publish_interval()
+            && !super::write_lock_held::is_held()
             && self.table.key_resolver()?.is_none()
             && !self.is_unkeyed_load_into_empty_table().await
         {
             // A keyed conflict-policy write is one statement: validation must
             // finish before any part is visible. An unkeyed load into an empty
             // table is written as one append too (see
-            // `is_unkeyed_load_into_empty_table`). Other streams may publish in
-            // segments to bound latency.
+            // `is_unkeyed_load_into_empty_table`), and so is an UPDATE's insert,
+            // which already holds the write lock each segment would take. Other
+            // streams may publish in segments to bound latency.
             // Append path with bounded publish latency: cut the input stream
             // into age/size-bounded segments and run a complete
             // prepare→stage→publish write per segment, so rows on a long-lived
@@ -367,9 +369,10 @@ impl DataSink for CayenneDataSink {
             // Append path: `write_all_append` uses the existing-staging helpers
             // that assume the caller already holds the write lock.
             let write_guard = if super::write_lock_held::is_held() {
-                // Exclusive access is the outer `write_lock` hold. The dummy
-                // only satisfies `PreparedResolvedAppend`, which needs an owned
-                // guard to outlive a spawned commit.
+                // Exclusive access is the outer `write_lock` hold, whose task
+                // waits for this write's commit. The dummy only satisfies
+                // `PreparedResolvedAppend`, which needs an owned guard to
+                // outlive a spawned commit.
                 super::write_lock_held::dummy_owned_guard()
             } else {
                 self.table.write_lock_arc().lock_owned().await
