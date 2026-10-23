@@ -91,6 +91,29 @@ process_matches_identity() {
   [[ -n "$start" && "$start" == "$want_start" ]]
 }
 
+# True when `$WORK` still owns a live process: pidfile + identity match
+# pid, `/proc/<pid>/exe`, and starttime. A dead or recycled PID is not tracked.
+work_tracks_live_spiced() {
+  local pf identf
+  pf="$(pidfile)"
+  identf="$(identityfile)"
+  [[ -f "$pf" && -f "$identf" ]] || return 1
+  local pid want_pid want_exe want_start
+  pid="$(cat "$pf")"
+  IFS=$'\t' read -r want_pid want_exe want_start <"$identf"
+  [[ -n "$pid" && "$pid" == "$want_pid" ]] || return 1
+  process_matches_identity "$pid" "$want_exe" "$want_start"
+}
+
+# Refuse a second launch before truncating the log or replacing ownership
+# records. Stale/dead/recycled PID files may relaunch.
+refuse_if_already_running() {
+  work_tracks_live_spiced || return 0
+  local pid
+  pid="$(cat "$(pidfile)")"
+  die "work directory already tracks live pid ${pid}; refusing to launch a second instance"
+}
+
 # Resolve `--work` after creating it. `cmd_launch` then cds to `$WORK`; a
 # relative path such as `work` would make `logfile` expand to `work/spiced.log`
 # inside that directory (`work/work/spiced.log`).
@@ -319,6 +342,7 @@ cmd_launch() {
   require_cmd curl
   require_work
   SPICED="$(resolve_spiced "$SPICED")"
+  refuse_if_already_running
   [[ -f "${WORK}/spicepod.yaml" ]] || seed_spicepod
   HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:$(free_port)}"
   FLIGHT_ADDR="${FLIGHT_ADDR:-127.0.0.1:$(free_port)}"
@@ -951,18 +975,38 @@ run_one_side() {
   local ev="$3"
   local work
   work="$(mktemp -d "/tmp/spice-file-connector-${label}.XXXXXX")"
-  HTTP_ADDR="127.0.0.1:$(free_port)"
-  FLIGHT_ADDR="127.0.0.1:$(free_port)"
-  METRICS_ADDR="127.0.0.1:$(free_port)"
-  WORK="$work"
-  SPICED="$binary"
-  cmd_seed
-  cmd_launch
-  cmd_doctor
-  EVIDENCE="$ev"
-  LABEL="$label"
-  cmd_drive
-  cmd_cleanup
+  (
+    HTTP_ADDR="127.0.0.1:$(free_port)"
+    FLIGHT_ADDR="127.0.0.1:$(free_port)"
+    METRICS_ADDR="127.0.0.1:$(free_port)"
+    WORK="$work"
+    SPICED="$binary"
+    EVIDENCE="$ev"
+    LABEL="$label"
+    verify_status=0
+    cleanup_on_exit() {
+      local trap_status=$?
+      local status="$verify_status"
+      if (( status == 0 && trap_status != 0 )); then
+        status="$trap_status"
+      fi
+      local cleanup_status=0
+      # Nested subshell so `die` in cleanup cannot overwrite a verify failure.
+      ( cmd_cleanup ) || cleanup_status=$?
+      if (( status != 0 )); then
+        exit "$status"
+      fi
+      if (( cleanup_status != 0 )); then
+        echo "error: cleanup failed after successful ${label} verification (status ${cleanup_status})" >&2
+        exit "$cleanup_status"
+      fi
+    }
+    trap cleanup_on_exit EXIT
+    cmd_seed
+    cmd_launch
+    cmd_doctor
+    cmd_drive
+  )
 }
 
 cmd_compare() {
@@ -977,16 +1021,18 @@ cmd_compare() {
   write_compare_report "$EVIDENCE"
 }
 
-cmd="${1:-}"
-shift || true
-parse_args "$@"
-case "$cmd" in
-  seed) cmd_seed ;;
-  launch) cmd_launch ;;
-  doctor) cmd_doctor ;;
-  drive) cmd_drive ;;
-  cleanup) cmd_cleanup ;;
-  compare) cmd_compare ;;
-  ""|-h|--help) usage ;;
-  *) usage; die "unknown command: $cmd" ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  cmd="${1:-}"
+  shift || true
+  parse_args "$@"
+  case "$cmd" in
+    seed) cmd_seed ;;
+    launch) cmd_launch ;;
+    doctor) cmd_doctor ;;
+    drive) cmd_drive ;;
+    cleanup) cmd_cleanup ;;
+    compare) cmd_compare ;;
+    ""|-h|--help) usage ;;
+    *) usage; die "unknown command: $cmd" ;;
+  esac
+fi

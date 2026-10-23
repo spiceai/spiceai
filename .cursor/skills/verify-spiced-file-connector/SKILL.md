@@ -45,6 +45,8 @@ Start only this instance, with logs and a pidfile under `$WORK_DIR`:
 
 `--spiced` and `--work` may be relative to the caller's directory. The helper canonicalizes both to absolute paths before changing to `$WORK_DIR` (so `logfile` / `pidfile` do not become `$WORK_DIR/$WORK_DIR/...`), and writes the binary path to `$WORK_DIR/spiced.binary`.
 
+A second `launch` on the same `--work` is refused when that directory still tracks a live process (`spiced.pid` plus `spiced.identity` still match pid, executable, and starttime). The existing log, pidfile, and identity stay in place so `cleanup` can still stop the first instance. A dead or recycled PID may relaunch.
+
 Exact process command the helper runs (cwd is `$WORK_DIR`, so `file:` paths resolve; `$SPICED` is already absolute):
 
 ```bash
@@ -131,6 +133,8 @@ Trunk vs branch in one shot (builds are the caller's job):
   --branch-spiced /path/to/spiced-branch \
   --evidence /opt/cursor/artifacts/verify-file-connector
 ```
+
+Each side runs in a subshell. An `EXIT` trap installed before launch always runs `cleanup` for that side, so a readiness, doctor, or refresh failure still stops the runtime. The original failure status is preserved. If verification succeeds and cleanup fails, the helper reports the cleanup failure and exits with that status.
 
 ## Cleanup
 
