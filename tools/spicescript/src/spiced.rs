@@ -32,6 +32,10 @@ use crate::docker::free_port;
 
 const ERROR_GRACE: Duration = Duration::from_secs(20);
 
+/// How long to wait, once `/v1/ready` has answered 200, for datasets still
+/// reported as loading.
+const SETTLE_AFTER_READY: Duration = Duration::from_secs(30);
+
 pub struct Spiced {
     pub binary: PathBuf,
     pub dir: PathBuf,
@@ -293,6 +297,7 @@ impl Spiced {
             if let Ok(r) = self.http_client.get(&url).send().await
                 && r.status().is_success()
             {
+                self.wait_loaded_after_ready().await;
                 return self.wait_flight(deadline, timeout).await;
             }
             // A dataset can report `Error` while it retries a transient
@@ -400,6 +405,28 @@ impl Spiced {
     pub async fn ready(&self) -> bool {
         let url = format!("{}://127.0.0.1:{}/v1/ready", self.scheme(), self.http);
         matches!(self.http_client.get(url).send().await, Ok(r) if r.status().is_success())
+    }
+
+    /// On loaded CI runners, a query sent right after `/v1/ready` answered
+    /// 200 has found its table missing (the dataset was registered moments
+    /// later). So once ready, wait up to [`SETTLE_AFTER_READY`] for any
+    /// dataset still initializing, and say so in the script's output: that
+    /// line is the evidence of readiness reported early.
+    async fn wait_loaded_after_ready(&self) {
+        let loading = still_loading(&self.dataset_status().await.unwrap_or_default());
+        if loading.is_empty() {
+            return;
+        }
+        crate::runner::emit(&format!(
+            "   /v1/ready answered 200 while datasets were still loading: {}; waiting up to {SETTLE_AFTER_READY:?} for them",
+            loading.join(", ")
+        ));
+        let deadline = tokio::time::Instant::now() + SETTLE_AFTER_READY;
+        while tokio::time::Instant::now() < deadline
+            && !still_loading(&self.dataset_status().await.unwrap_or_default()).is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     async fn dataset_status(&self) -> Result<String> {
@@ -736,5 +763,42 @@ impl Spiced {
             bail!("refresh of '{dataset}' returned {status}: {body}");
         }
         Ok(())
+    }
+}
+
+/// The datasets `/v1/datasets?status=true` (its body, `text`) reports as not
+/// loaded yet: `Initializing` or `NotLoaded`.
+fn still_loading(text: &str) -> Vec<String> {
+    let Ok(serde_json::Value::Array(list)) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter(|d| {
+            matches!(
+                d.get("status").and_then(serde_json::Value::as_str),
+                Some("Initializing" | "NotLoaded")
+            )
+        })
+        .filter_map(|d| d.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(test)]
+mod still_loading_tests {
+    use super::still_loading;
+
+    #[test]
+    fn names_the_datasets_not_loaded_yet() {
+        let text = r#"[
+            {"name": "a", "status": "Ready"},
+            {"name": "b", "status": "Initializing"},
+            {"name": "c", "status": "Error", "error_message": "x"},
+            {"name": "d", "status": "NotLoaded"},
+            {"name": "e", "status": "Refreshing"}
+        ]"#;
+        assert_eq!(still_loading(text), ["b", "d"]);
+        assert!(still_loading("[]").is_empty());
+        assert!(still_loading("not json").is_empty());
     }
 }
