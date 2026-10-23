@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Concurrent same-key autocommit UPDATE against a running or freshly launched
 # spiced. Success: id=50 present, count(*)=1000, amount = start + (# of
-# count=1 responses), no silent count=0, and every HTTP 200 UPDATE body is
+# count=1 responses), no silent count=0, HTTP 409 is a retryable conflict
+# (not an increment and not a failure), and every HTTP 200 UPDATE body is
 # a 0 or 1 affected-row count (malformed replies fail the harness).
 #
 # Usage: 30_cayenne_concurrent_update_row_loss.sh [threads] [updates]

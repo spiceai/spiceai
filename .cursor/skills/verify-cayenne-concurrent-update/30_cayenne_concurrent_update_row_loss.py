@@ -9,6 +9,7 @@ without any UPDATE being acknowledged.
 Usage:
   30_cayenne_concurrent_update_row_loss.py THREADS UPDATES
   30_cayenne_concurrent_update_row_loss.py --replay-malformed
+  30_cayenne_concurrent_update_row_loss.py --replay-conflict
 """
 
 from __future__ import annotations
@@ -101,11 +102,17 @@ def run(threads: int, n: int, post: Callable[[str], _Resp]) -> int:
     count1 = 0
     count0 = 0
     errors = 0
+    conflicts = 0
     bad_replies = 0
     ok = True
     for r in res:
         codes[r.status_code] = codes.get(r.status_code, 0) + 1
         bodies.append(r.text.strip())
+        # A retryable write conflict is not an increment and not a harness
+        # failure (SKILL.md: HTTP 200, or a 409 with a retryable conflict).
+        if r.status_code == 409:
+            conflicts += 1
+            continue
         if r.status_code != 200:
             errors += 1
             continue
@@ -127,7 +134,10 @@ def run(threads: int, n: int, post: Callable[[str], _Resp]) -> int:
         "bodies sample:",
         set(bodies[:50]),
     )
-    print(f"count1={count1} count0={count0} non200={errors} bad_replies={bad_replies}")
+    print(
+        f"count1={count1} count0={count0} non200={errors} "
+        f"conflicts={conflicts} bad_replies={bad_replies}"
+    )
 
     after_row = post("SELECT id,amount FROM o_cayenne WHERE id=50")
     after_count = post("SELECT count(*) c FROM o_cayenne")
@@ -178,12 +188,16 @@ def run(threads: int, n: int, post: Callable[[str], _Resp]) -> int:
     return 0 if ok else 2
 
 
-def _stub_post(update_body: str, after_amount: float) -> Callable[[str], _Resp]:
+def _stub_post(
+    update_body: str,
+    after_amount: float,
+    update_status: int = 200,
+) -> Callable[[str], _Resp]:
     selects = {"n": 0}
 
     def post(sql: str) -> _Resp:
         if sql.startswith("UPDATE"):
-            return _Resp(200, update_body)
+            return _Resp(update_status, update_body)
         if "count(*)" in sql:
             return _Resp(200, '[{"c":1000}]')
         selects["n"] += 1
@@ -269,13 +283,49 @@ def replay_malformed() -> int:
     return 0 if parser_ok and harness_ok else 2
 
 
+def replay_conflict() -> int:
+    """Stub-transport replay of HTTP 409 vs unexpected failures."""
+    sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+    print(f"sha={sha}")
+    print("command: 30_cayenne_concurrent_update_row_loss.py --replay-conflict")
+
+    cases: list[tuple[str, int, str, float, int]] = [
+        ("409 conflict, row kept", 409, '{"error":"write conflict"}', 28.13, 0),
+        ("500 unexpected", 500, "internal error", 28.13, 2),
+        ("403 unexpected", 403, "forbidden", 28.13, 2),
+        ("200 count=0 silent", 200, '[{"count":0}]', 28.13, 2),
+        ("valid count=1 + increment", 200, '[{"count":1}]', 29.13, 0),
+    ]
+    ok = True
+    print()
+    print("== stub-transport conflict harness ==")
+    for name, status, body, after_amount, expected_rc in cases:
+        print("=" * 72)
+        print(f"CASE {name!r} status={status} body={body!r}")
+        rc = run(1, 1, _stub_post(body, after_amount, update_status=status))
+        print(f"exit={rc} expected={expected_rc}")
+        if rc != expected_rc:
+            print(f"FAIL: {name} exited {rc}, expected {expected_rc}")
+            ok = False
+        print()
+
+    print("SUMMARY")
+    print(f"  conflict harness: {'ok' if ok else 'FAIL'}")
+    return 0 if ok else 2
+
+
 def main(argv: list[str]) -> int:
     if argv == ["--replay-malformed"]:
         return replay_malformed()
+    if argv == ["--replay-conflict"]:
+        return replay_conflict()
     if len(argv) != 2:
         print(
             "usage: 30_cayenne_concurrent_update_row_loss.py THREADS UPDATES\n"
-            "       30_cayenne_concurrent_update_row_loss.py --replay-malformed",
+            "       30_cayenne_concurrent_update_row_loss.py --replay-malformed\n"
+            "       30_cayenne_concurrent_update_row_loss.py --replay-conflict",
             file=sys.stderr,
         )
         return 2

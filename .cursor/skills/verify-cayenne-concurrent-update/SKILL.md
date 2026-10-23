@@ -36,11 +36,14 @@ MODE=memory .cursor/skills/verify-cayenne-concurrent-update/30_cayenne_concurren
 
 The script starts its own `spiced` on `8393/50393/9393`, loads 1000 parquet rows into `o_cayenne`, runs the updates, prints before/after, checks the success criteria, and tears down. It generates `data/orders.parquet` next to the script via `00_setup_data.py` on first run.
 
-Reply parsing lives in `30_cayenne_concurrent_update_row_loss.py`. Replay malformed HTTP 200 bodies against a stub transport (no `spiced`):
+Reply parsing lives in `30_cayenne_concurrent_update_row_loss.py`. Replay against a stub transport (no `spiced`):
 
 ```bash
 python3 .cursor/skills/verify-cayenne-concurrent-update/30_cayenne_concurrent_update_row_loss.py --replay-malformed
+python3 .cursor/skills/verify-cayenne-concurrent-update/30_cayenne_concurrent_update_row_loss.py --replay-conflict
 ```
+
+`--replay-conflict` accepts HTTP 409 as a retryable write conflict (not an increment, not a failure) and still fails HTTP 500 and silent `count: 0`.
 
 `spiced` must be the binary under test (`make install-dev` or `cargo build -p spiced`). Set `SPICED=` to pin a binary. Record the commit SHA with every run.
 
