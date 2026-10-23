@@ -121,4 +121,4 @@ steps:
     when: { engine: cayenne }
   # A refresh in flight when SIGTERM arrives can log this as an ERROR,
   # though the shutdown is clean and no data is affected.
-  - assert-log: { clean: true, allow: ['ERROR runtime_table::accelerated::refresh_task: Failed to provide stats on the amount of data written into data_(full|drop) *$'] }
+  - assert-log: { clean: true, allow: ['ERROR runtime_table::accelerated::refresh_task: Failed to provide stats on the amount of data written into data_(full|drop|upsert) *$'] }
