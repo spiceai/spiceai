@@ -501,55 +501,32 @@ fn parse_user_query(parser: &QueryParser, literal: &str) -> Result<Box<dyn Query
 ///
 /// `QueryParser::parse_query` (tantivy-query-grammar 0.26) panics on such a `*` with "Exist query
 /// without a field isn't allowed" instead of returning an error
-/// (<https://github.com/quickwit-oss/tantivy/issues/3031>). Outside a quoted phrase and a range or
-/// set's brackets, that is:
+/// (<https://github.com/quickwit-oss/tantivy/issues/3031>). That is:
 /// - a `*` that starts a term (at the start, or after whitespace, `(`, `+` or `-`) and is followed
 ///   by a character that ends a word but does not end a match-all `*`: `a *(b)`, `*"x"`,
 ///   `*\u{a0}` (see [`ends_fieldless_star`]);
 /// - a `+` or `-` followed by whitespace and then `*`: `- *`, `a + *`.
 ///
-/// The check is conservative: a few queries the grammar does parse also match (`+ *x`), and those
-/// take the bag-of-words fallback.
+/// The check ignores quotes, ranges and regexes on purpose: the grammar ends a phrase, range or
+/// regex in ways a scanner tracking them can misjudge (`/'/ *(` and `text:[a' TO z] *(` both
+/// panic), and a misjudged context would hide the `*`. It is conservative instead: a few queries
+/// the grammar does parse also match (`+ *x`, `text:[a TO *]`), and those take the bag-of-words
+/// fallback.
 fn has_fieldless_exists(q: &str) -> bool {
     let chars: Vec<char> = q.chars().collect();
-    let mut quote = None;
-    let mut bracket_depth = 0usize;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\\' {
-            i += 2;
-            continue;
+    chars.iter().enumerate().any(|(i, &c)| match c {
+        '*' => {
+            let starts_term =
+                i == 0 || matches!(chars[i - 1], '(' | '+' | '-') || chars[i - 1].is_whitespace();
+            starts_term && chars.get(i + 1).copied().is_some_and(ends_fieldless_star)
         }
-        if let Some(open) = quote {
-            if c == open {
-                quote = None;
-            }
-        } else if c == '"' || c == '\'' {
-            quote = Some(c);
-        } else if c == '[' || c == '{' {
-            bracket_depth += 1;
-        } else if c == ']' || c == '}' {
-            bracket_depth = bracket_depth.saturating_sub(1);
-        } else if bracket_depth == 0 {
-            if c == '*' {
-                let starts_term = i == 0
-                    || matches!(chars[i - 1], '(' | '+' | '-')
-                    || chars[i - 1].is_whitespace();
-                if starts_term && chars.get(i + 1).copied().is_some_and(ends_fieldless_star) {
-                    return true;
-                }
-            } else if c == '+' || c == '-' {
-                let rest = &chars[i + 1..];
-                let spaces = rest.iter().take_while(|n| n.is_whitespace()).count();
-                if spaces > 0 && rest.get(spaces) == Some(&'*') {
-                    return true;
-                }
-            }
+        '+' | '-' => {
+            let rest = &chars[i + 1..];
+            let spaces = rest.iter().take_while(|n| n.is_whitespace()).count();
+            spaces > 0 && rest.get(spaces) == Some(&'*')
         }
-        i += 1;
-    }
-    false
+        _ => false,
+    })
 }
 
 /// Whether `c`, right after a term-starting `*`, makes Tantivy's grammar read the `*` as a
@@ -754,6 +731,9 @@ pub(crate) mod tests {
             "- *".to_string(),
             "+ *".to_string(),
             "a - *".to_string(),
+            "/'/ *(".to_string(),
+            "text:[a' TO z] *(".to_string(),
+            "\"it's\" *(".to_string(),
             "(+ *)".to_string(),
             "-  * b".to_string(),
         ];
@@ -776,7 +756,7 @@ pub(crate) mod tests {
     #[test]
     fn test_short_queries_never_panic() {
         let parser = text_parser();
-        let alphabet: Vec<char> = "a* ()\"[]:^'{}\\+-\u{a0}".chars().collect();
+        let alphabet: Vec<char> = "a* ()\"[]:^'{}\\+-/\u{a0}".chars().collect();
         let mut digits = Vec::new();
         loop {
             let q: String = digits.iter().map(|&d| alphabet[d]).collect();
@@ -788,7 +768,7 @@ pub(crate) mod tests {
                     if digits.len() == 4 {
                         return;
                     }
-                    digits.iter_mut().for_each(|d| *d = 0);
+                    digits.fill(0);
                     digits.push(0);
                     break;
                 }
@@ -819,8 +799,7 @@ pub(crate) mod tests {
             "\"exact phrase\" AND -other",
             "\"foo*\" AND bar",
             "'it*' AND bar",
-            "text:[alpha TO *]",
-            "text:{alpha TO *}",
+            "text:[alpha TO beta]",
             "a -*",
         ] {
             assert!(!has_fieldless_exists(q), "{q:?}");
