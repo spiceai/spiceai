@@ -78,9 +78,11 @@ runs:
                   /etc/apt/sources.list.d/ubuntu.sources.bak
           # Ubuntu's default deb822 file has separate archive and security
           # stanzas. Replace only the archive URIs line and leave the
-          # security stanza untouched.
+          # security stanza untouched. The archive line is either Ubuntu's
+          # own single URI or, on a runner an earlier version of this action
+          # already configured, the space-separated mirror list it wrote.
           sudo sed -i -E \
-            -e "s|^URIs:[[:space:]]*https?://archive\.ubuntu\.com/ubuntu/?$|URIs: ${MIRROR_URI}|" \
+            -e "/^URIs:.*https?:\/\/archive\.ubuntu\.com\/ubuntu\/?([[:space:]]|$)/s|^URIs:.*$|URIs: ${MIRROR_URI}|" \
             /etc/apt/sources.list.d/ubuntu.sources
           # If the substitution had no effect, surface diagnostics but do not
           # fail the action.
@@ -93,10 +95,12 @@ runs:
         if [ -f /etc/apt/sources.list ]; then
           sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
           # Point every archive.ubuntu.com / us.archive.ubuntu.com entry
-          # (http or https) at the same mirror list.
+          # (http or https) at the same mirror list, as well as the primary
+          # mirror an earlier version of this action wrote there.
           sudo sed -i -E \
             -e "s|https?://archive\.ubuntu\.com/ubuntu/?|${MIRROR_URI}|g" \
             -e "s|https?://us\.archive\.ubuntu\.com/ubuntu/?|${MIRROR_URI}|g" \
+            -e "s|https?://mirror\.pit\.teraswitch\.com/ubuntu/?|${MIRROR_URI}|g" \
             /etc/apt/sources.list
         fi
 
