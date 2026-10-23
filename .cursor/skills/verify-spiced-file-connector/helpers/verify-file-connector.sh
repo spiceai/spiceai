@@ -359,10 +359,11 @@ wait_ready() {
       fi
     fi
     local code body
-    code="$(curl -sS -o "${WORK}/ready.body" -w '%{http_code}' --max-time 2 "$url" || echo 000)"
+    local curl_rc=0
+    code="$(curl -sS -o "${WORK}/ready.body" -w '%{http_code}' --max-time 2 "$url")" || curl_rc=$?
     body="$(tr -d '\r' <"${WORK}/ready.body" 2>/dev/null || true)"
-    last="${code} ${body}"
-    if [[ "$code" == "200" && "$body" == "ready" ]]; then
+    last="${code:-000} ${body}"
+    if (( curl_rc == 0 )) && [[ "$code" == "200" && "$body" == "ready" ]]; then
       echo "ready: ${url} -> 200 ready"
       return 0
     fi
@@ -425,10 +426,17 @@ cmd_doctor() {
       die "pid $pid exe is ${exe}, expected ${want} (launch identity ${want_exe})"
   fi
   local code body
-  code="$(curl -sS -o "${WORK}/ready.body" -w '%{http_code}' --max-time 5 "http://${HTTP_ADDR}/v1/ready" || echo 000)"
+  local curl_rc=0
+  : >"${WORK}/ready.body"
+  # `%{http_code}` is already `000` on a transport failure. `|| echo 000`
+  # concatenates to `000000`, which is not `000` and would accept doctor.
+  code="$(curl -sS -o "${WORK}/ready.body" -w '%{http_code}' --max-time 5 "http://${HTTP_ADDR}/v1/ready")" || curl_rc=$?
   body="$(tr -d '\r' <"${WORK}/ready.body" 2>/dev/null || true)"
-  echo "doctor pid=${pid} exe=${exe} ready=${code} ${body}"
-  [[ "$code" != "000" ]] || die "/v1/ready is unreachable at ${HTTP_ADDR}"
+  echo "doctor pid=${pid} exe=${exe} ready=${code:-000} ${body}"
+  if (( curl_rc != 0 )); then
+    die "/v1/ready transport failed (curl=${curl_rc} http=${code:-000}) at ${HTTP_ADDR}"
+  fi
+  [[ -n "${code}" && "${code}" != "000" ]] || die "/v1/ready is unreachable at ${HTTP_ADDR}"
   local datasets
   datasets="$(curl -sS --max-time 10 "http://${HTTP_ADDR}/v1/datasets?status=true")"
   python3 - "$datasets" <<'PY'
@@ -522,9 +530,14 @@ datasets_status() {
 ready_capture() {
   local out="$1"
   local code body
-  code="$(curl -sS -o "${WORK}/ready.body" -w '%{http_code}' --max-time 5 "http://${HTTP_ADDR}/v1/ready" || echo 000)"
+  local curl_rc=0
+  : >"${WORK}/ready.body"
+  code="$(curl -sS -o "${WORK}/ready.body" -w '%{http_code}' --max-time 5 "http://${HTTP_ADDR}/v1/ready")" || curl_rc=$?
   body="$(tr -d '\r' <"${WORK}/ready.body" 2>/dev/null || true)"
-  printf '%s %s\n' "$code" "$body" >"$out"
+  if (( curl_rc != 0 )); then
+    code="${code:-000}"
+  fi
+  printf '%s %s\n' "${code:-000}" "$body" >"$out"
 }
 
 refresh_dataset() {

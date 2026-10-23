@@ -77,7 +77,7 @@ Doctor requires all of:
 
 - `$WORK_DIR/spiced.identity` still names the pid in `$WORK_DIR/spiced.pid` (pid, `/proc/<pid>/exe`, `/proc/<pid>/stat` starttime). A missing identity, a reused PID, or a starttime/exe mismatch is refused even when `--spiced` is omitted
 - when `--spiced` is supplied, that path must be the same executable the identity recorded
-- `GET /v1/ready` is reachable (200 `ready` on a clean launch; after an expected Error the helper reports the 503 and still requires HTTP)
+- `GET /v1/ready` is reachable (200 `ready` on a clean launch; after an expected Error the helper reports the 503 and still requires HTTP). A transport failure is refused.
 - `GET /v1/datasets?status=true` lists `csv_fed`, `csv_acc`, `json_fed`, `json_acc`, `json_array_fed`, `json_array_acc`, `json_ptr_fed`, `json_ptr_acc`
 
 Do not drive an instance that doctor did not start.
