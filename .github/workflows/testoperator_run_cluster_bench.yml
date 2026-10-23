@@ -310,6 +310,17 @@ jobs:
           # Exports SPICEAI_API_KEY for subsequent steps. Same prod creds
           # spicebench's run_spicebench.yml uses.
 
+      - name: Install AWS CLI
+        if: env.CB_COMPUTE == 'ec2'
+        run: |
+          if ! command -v aws &> /dev/null; then
+            curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            sudo /tmp/aws/install
+            rm -rf /tmp/awscliv2.zip /tmp/aws
+          fi
+          aws --version
+
       # Credentials must outlast every image's run and its teardown, so they
       # match the job timeout rather than the 1-hour default.
       - name: Authorize with the sandbox benchmark role
