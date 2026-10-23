@@ -354,7 +354,7 @@ impl HuggingFace {
                     store: Arc::clone(&self.store),
                     dataset: dataset.clone(),
                     location: location.clone(),
-                    extension: extension.clone(),
+                    extension: extension.to_string(),
                     options: csv.options().clone(),
                     columns: column_names(template.file_schema()),
                 };

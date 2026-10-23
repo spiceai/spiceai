@@ -21,6 +21,7 @@ use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLa
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
+use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -96,6 +97,93 @@ const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
 /// reads every matching object. A narrower inference-only prefix would
 /// publish an incomplete schema for that full scan.
 const ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT: usize = 10_000;
+
+/// Where [`ListingSuffix`] was resolved from. Display and secret-masking
+/// follow this origin rather than comparing the suffix string to a parameter:
+/// a secret `file_format: csv` still lists as the hardcoded `.csv`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListingSuffixOrigin {
+    /// Configured `file_extension`.
+    FileExtension,
+    /// Fallback `.{file_format}` for document and unknown formats.
+    FileFormat,
+    /// Path suffix or a structured format's hardcoded default (for example `.csv`).
+    Default,
+}
+
+/// The listing suffix [`ListingTableConnector::get_file_format_and_extension`]
+/// resolved, plus the parameter that produced it when one did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingSuffix {
+    value: String,
+    origin: ListingSuffixOrigin,
+}
+
+impl ListingSuffix {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    /// How this suffix should appear in a user-facing error or warning.
+    #[must_use]
+    fn display(&self, params: &Parameters) -> String {
+        match self.origin {
+            ListingSuffixOrigin::FileExtension => {
+                params.display_value("file_extension", &self.value)
+            }
+            ListingSuffixOrigin::FileFormat => params.display_value("file_format", &self.value),
+            ListingSuffixOrigin::Default => self.value.clone(),
+        }
+    }
+
+    #[must_use]
+    fn secret_source<'a>(&self, params: &'a Parameters) -> Option<&'a str> {
+        match self.origin {
+            ListingSuffixOrigin::FileExtension => params.secret_source("file_extension"),
+            ListingSuffixOrigin::FileFormat => params.secret_source("file_format"),
+            ListingSuffixOrigin::Default => None,
+        }
+    }
+}
+
+impl Deref for ListingSuffix {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.value
+    }
+}
+
+impl AsRef<str> for ListingSuffix {
+    fn as_ref(&self) -> &str {
+        &self.value
+    }
+}
+
+impl Display for ListingSuffix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.value)
+    }
+}
+
+impl PartialEq<str> for ListingSuffix {
+    fn eq(&self, other: &str) -> bool {
+        self.value == other
+    }
+}
+
+impl PartialEq<&str> for ListingSuffix {
+    fn eq(&self, other: &&str) -> bool {
+        self.value == *other
+    }
+}
+
+impl PartialEq<String> for ListingSuffix {
+    fn eq(&self, other: &String) -> bool {
+        self.value == *other
+    }
+}
 
 /// The listing options and file schema a dataset's listing table is built from, as
 /// [`ListingTableConnector::listing_table_template`] resolves them.
@@ -935,16 +1023,17 @@ pub trait ListingTableConnector: DataConnector {
         let store = self.get_object_store(dataset)?;
         let (_, extension) = self.get_file_format_and_extension(dataset).await?;
 
-        let table = ObjectStoreMetadataTable::try_new(store, &store_url, Some(extension.clone()))
-            .map_err(|source| {
-            invalid_file_extension_error(
-                format!("{self}"),
-                dataset,
-                self.get_params(),
-                &extension,
-                source,
-            )
-        })?;
+        let table =
+            ObjectStoreMetadataTable::try_new(store, &store_url, Some(extension.to_string()))
+                .map_err(|source| {
+                    invalid_file_extension_error(
+                        format!("{self}"),
+                        dataset,
+                        self.get_params(),
+                        &extension,
+                        source,
+                    )
+                })?;
         Ok(table as Arc<dyn TableProvider>)
     }
 
@@ -961,11 +1050,11 @@ pub trait ListingTableConnector: DataConnector {
     /// For tabular formats, file options can also be specified in the [`Dataset`]'s `param`s.
     ///
     /// For unstructured text formats, the [`Dataset`]'s `file_format` param key must be set. `Ok`
-    /// responses, are always of the format `Ok((None, String))`. The data must be UTF8 compatible.
+    /// responses are always of the format `Ok((None, ListingSuffix))`. The data must be UTF8 compatible.
     async fn get_file_format_and_extension(
         &self,
         dataset: &DatasetSpec,
-    ) -> DataConnectorResult<(Option<Arc<dyn FileFormat>>, String)>
+    ) -> DataConnectorResult<(Option<Arc<dyn FileFormat>>, ListingSuffix)>
     where
         Self: Display,
     {
@@ -996,7 +1085,7 @@ pub trait ListingTableConnector: DataConnector {
 
         // Annotate before `?` so rustc unifies each arm as `Arc<dyn FileFormat>`
         // instead of pinning the match to the first (`CsvFormat`) arm.
-        let result: DataConnectorResult<(Option<Arc<dyn FileFormat>>, String)> =
+        let result: DataConnectorResult<(Option<Arc<dyn FileFormat>>, ListingSuffix)> =
             match (file_format_param.as_deref(), inferred_file_extension) {
             (Some("csv"), _) | (None, Some("csv")) => Ok((
                 Some(self.delimiter_separated_format(
@@ -1227,7 +1316,7 @@ pub trait ListingTableConnector: DataConnector {
             (Some(format), _) if is_document_file_format(format) => {
                 Ok((
                     None,
-                    listing_extension(
+                    file_format_listing_extension(
                         configured_extension.as_ref(),
                         path_extension.as_ref(),
                         &format!(".{format}"),
@@ -1260,7 +1349,7 @@ pub trait ListingTableConnector: DataConnector {
                             );
                             Ok((
                                 None,
-                                listing_extension(
+                                file_format_listing_extension(
                                     configured_extension.as_ref(),
                                     path_extension.as_ref(),
                                     &format!(".{format}"),
@@ -1285,7 +1374,7 @@ pub trait ListingTableConnector: DataConnector {
                         );
                         Ok((
                             None,
-                            listing_extension(
+                            file_format_listing_extension(
                                 configured_extension.as_ref(),
                                 path_extension.as_ref(),
                                 &format!(".{format}"),
@@ -1306,10 +1395,13 @@ pub trait ListingTableConnector: DataConnector {
         };
 
         if format_selected_listing {
-            let (file_format, default_extension) = result?;
+            let (file_format, suffix) = result?;
             Ok((
                 file_format,
-                format_selected_listing_extension(&default_extension),
+                ListingSuffix {
+                    value: format_selected_listing_extension(suffix.as_str()),
+                    origin: suffix.origin,
+                },
             ))
         } else {
             result
@@ -1597,13 +1689,13 @@ pub trait ListingTableConnector: DataConnector {
         &self,
         dataset: &DatasetSpec,
         url: &Url,
-        extension: &str,
+        extension: &ListingSuffix,
         parser_key: Option<&str>,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>
     where
         Self: Display,
     {
-        let lookup = parser_key.unwrap_or(extension);
+        let lookup = parser_key.unwrap_or(extension.as_str());
         let content_formatter = document_parse::get_parser_factory(lookup)
             .await
             .map(|factory| {
@@ -1726,6 +1818,12 @@ pub trait ListingTableConnector: DataConnector {
         let object_store = self.get_object_store(dataset)?;
 
         let ctx: SessionContext = self.get_session_context();
+        let params = self.get_params();
+        let displayed_extension = if params.secret_source("file_extension").is_some() {
+            params.display_value("file_extension", extension)
+        } else {
+            extension.to_string()
+        };
 
         let (schema_infer_url, schema_infer_meta) =
             if table_path.is_collection() && listing_extension_is_orc(extension) {
@@ -1736,6 +1834,7 @@ pub trait ListingTableConnector: DataConnector {
                     format!("{self}"),
                     dataset,
                     extension,
+                    &displayed_extension,
                     table_path.clone(),
                     &ctx,
                     &object_store,
@@ -1757,6 +1856,7 @@ pub trait ListingTableConnector: DataConnector {
                     format!("{self}"),
                     dataset,
                     extension,
+                    &displayed_extension,
                     schema_infer_url.clone(),
                     &ctx,
                     &object_store,
@@ -1773,6 +1873,7 @@ pub trait ListingTableConnector: DataConnector {
                     format!("{self}"),
                     dataset,
                     extension,
+                    &displayed_extension,
                     table_path.clone(),
                     &ctx,
                     &object_store,
@@ -2206,20 +2307,21 @@ fn resolve_file_compression_type(
     Ok(detected_compression.unwrap_or(FileCompressionType::UNCOMPRESSED))
 }
 
-/// Configuration error for an unusable listing `file_extension`.
+/// Configuration error for an unusable listing suffix.
 ///
-/// Secret-derived values are shown as their `${ store:key }` reference, and
-/// the regex compiler error is replaced so the resolved pattern cannot leak
+/// Masking follows [`ListingSuffix`] origin: a secret `file_format` that
+/// became `.{format}` is shown as its `${ store:key }` reference, and the
+/// regex compiler error is replaced so the resolved pattern cannot leak
 /// through [`std::error::Error::source`].
 fn invalid_file_extension_error(
     dataconnector: String,
     dataset: &DatasetSpec,
     params: &Parameters,
-    extension: &str,
+    suffix: &ListingSuffix,
     source: Box<dyn std::error::Error + Send + Sync>,
 ) -> crate::DataConnectorError {
-    let displayed = params.display_value("file_extension", extension);
-    let source = if params.secret_source("file_extension").is_some() {
+    let displayed = suffix.display(params);
+    let source = if suffix.secret_source(params).is_some() {
         "invalid regex".into()
     } else {
         source
@@ -2251,18 +2353,58 @@ fn listing_extension(
     path_extension: Option<&ParsedFileExtension>,
     default_extension: &str,
     file_compression_type: FileCompressionType,
-) -> String {
+) -> ListingSuffix {
+    listing_suffix(
+        configured_extension,
+        path_extension,
+        default_extension,
+        file_compression_type,
+        ListingSuffixOrigin::Default,
+    )
+}
+
+fn file_format_listing_extension(
+    configured_extension: Option<&ParsedFileExtension>,
+    path_extension: Option<&ParsedFileExtension>,
+    default_extension: &str,
+    file_compression_type: FileCompressionType,
+) -> ListingSuffix {
+    listing_suffix(
+        configured_extension,
+        path_extension,
+        default_extension,
+        file_compression_type,
+        ListingSuffixOrigin::FileFormat,
+    )
+}
+
+fn listing_suffix(
+    configured_extension: Option<&ParsedFileExtension>,
+    path_extension: Option<&ParsedFileExtension>,
+    default_extension: &str,
+    file_compression_type: FileCompressionType,
+    fallback_origin: ListingSuffixOrigin,
+) -> ListingSuffix {
     if let Some(extension) = configured_extension {
-        return extension.file_extension.clone();
+        return ListingSuffix {
+            value: extension.file_extension.clone(),
+            origin: ListingSuffixOrigin::FileExtension,
+        };
     }
 
     if let Some(extension) = path_extension
         && extension.format_extension.as_deref() == Some(default_extension.trim_start_matches('.'))
     {
-        return extension.file_extension.clone();
+        return ListingSuffix {
+            value: extension.file_extension.clone(),
+            origin: ListingSuffixOrigin::Default,
+        };
     }
 
-    format!("{}{}", default_extension, file_compression_type.get_ext())
+    ListingSuffix {
+        value: format!("{}{}", default_extension, file_compression_type.get_ext()),
+        origin: fallback_origin,
+    }
 }
 
 fn default_jsonl_extension(
@@ -2500,6 +2642,7 @@ async fn get_last_modified(
     dataconnector: String,
     dataset: &DatasetSpec,
     extension: &str,
+    displayed_extension: &str,
     table_path: ListingTableUrl,
     ctx: &SessionContext,
     object_store: &Arc<dyn ObjectStore>,
@@ -2572,7 +2715,7 @@ async fn get_last_modified(
             dataconnector: dataconnector.clone(),
             connector_component: ConnectorComponent::from(dataset),
             message: format!(
-                "Spice could not find any files matching the extension '{extension}' at the specified path."
+                "Spice could not find any files matching the extension '{displayed_extension}' at the specified path."
             ),
         });
     }
@@ -2589,7 +2732,7 @@ async fn get_last_modified(
             dataconnector: dataconnector.clone(),
             connector_component: ConnectorComponent::from(dataset),
             message: format!(
-                "Failed to find any files matching the extension '{extension}'. Is your `file_format` parameter correct? Spice found the following file extensions: {display_extensions}. For details, visit: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+                "Failed to find any files matching the extension '{displayed_extension}'. Is your `file_format` parameter correct? Spice found the following file extensions: {display_extensions}. For details, visit: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
             ),
         })
     }
@@ -2599,6 +2742,7 @@ async fn verify_schema_source_path(
     dataconnector: String,
     dataset: &DatasetSpec,
     extension: &str,
+    displayed_extension: &str,
     schema_source_path: ListingTableUrl,
     ctx: &SessionContext,
     object_store: &Arc<dyn ObjectStore>,
@@ -2641,7 +2785,7 @@ async fn verify_schema_source_path(
             // We've reached the limit of files to scan, but have not found any with the expected extension.
             // We do warning, not an error, as the dataset might have a large number of files.
             tracing::warn!(
-                "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}` after scanning {SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT} files. Ensure the `schema_source_path` is correct."
+                "Failed to find any files matching the extension '{displayed_extension}' at the specified path `{schema_source_path}` after scanning {SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT} files. Ensure the `schema_source_path` is correct."
             );
             return Ok(None);
         }
@@ -2651,7 +2795,7 @@ async fn verify_schema_source_path(
         dataconnector: dataconnector.clone(),
         connector_component: ConnectorComponent::from(dataset),
         message: format!(
-            "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}`. Verify that `schema_source_path` is correct and try again."
+            "Failed to find any files matching the extension '{displayed_extension}' at the specified path `{schema_source_path}`. Verify that `schema_source_path` is correct and try again."
         ),
     })
 }
@@ -3947,14 +4091,23 @@ mod tests {
     fn assert_invalid_file_extension_hides_secret(err: &DataConnectorError) {
         const CANARY: &str = "CANARYPGPW7731";
         const REFERENCE: &str = "${ env:SECRET }";
+        assert_error_hides_canary(err, CANARY, REFERENCE);
+    }
+
+    fn assert_error_hides_canary(err: &DataConnectorError, canary: &str, reference: &str) {
         let chain = error_chain_text(err);
+        let debug = format!("{err:?}");
         assert!(
-            chain.contains(REFERENCE),
-            "invalid file_extension errors must name the secret reference: {chain}"
+            chain.contains(reference),
+            "error must name the secret reference: {chain}"
         );
         assert!(
-            !chain.contains(CANARY),
-            "invalid file_extension errors must not echo a resolved secret: {chain}"
+            !chain.contains(canary),
+            "error Display/source must not echo a resolved secret: {chain}"
+        );
+        assert!(
+            !debug.contains(canary),
+            "error Debug must not echo a resolved secret: {debug}"
         );
     }
 
@@ -3983,6 +4136,91 @@ mod tests {
             .await
             .expect_err("invalid secret-derived file_extension must fail metadata setup");
         assert_invalid_file_extension_hides_secret(&err);
+    }
+
+    #[tokio::test]
+    async fn test_secret_file_format_text_fallthrough_does_not_echo_value() {
+        const CANARY: &str = "secret123[";
+        const REFERENCE: &str = "${ env:SECRET }";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "hello").expect("write listed object");
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([(
+                    "file_format".to_string(),
+                    CANARY.to_string(),
+                )]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_format".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new(
+            format!("file://{}/", dir.path().display()),
+            TableReference::bare("test"),
+        );
+        let url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("directory url");
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("secret-derived unknown file_format must fall through to text");
+        assert!(
+            file_format.is_none(),
+            "unknown file_format must use the text-table path"
+        );
+        let err = connector
+            .create_text_table(&dataset, &url, &extension, None)
+            .await
+            .expect_err("invalid secret-derived file_format suffix must fail text table setup");
+        assert_error_hides_canary(&err, "secret123", REFERENCE);
+    }
+
+    #[tokio::test]
+    async fn test_secret_file_extension_missing_files_does_not_echo_value() {
+        const CANARY: &str = ".CANARYPGPW7731[";
+        const REFERENCE: &str = "${ env:SECRET }";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "hello").expect("write non-matching object");
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([
+                    ("file_format".to_string(), "csv".to_string()),
+                    ("file_extension".to_string(), CANARY.to_string()),
+                ]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_extension".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new(
+            format!("file://{}/", dir.path().display()),
+            TableReference::bare("test"),
+        );
+        let url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("directory url");
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv plus file_extension must resolve");
+        let file_format = file_format.expect("csv must use the listing-table path");
+        let err = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect_err("secret-derived file_extension with no matching files must fail");
+        assert_error_hides_canary(&err, "CANARYPGPW7731", REFERENCE);
     }
 
     #[tokio::test]
@@ -4430,6 +4668,7 @@ mod tests {
         let last_modified = get_last_modified(
             "TestConnector".to_string(),
             &dataset,
+            ".orc",
             ".orc",
             table_path,
             &ctx,
@@ -4912,6 +5151,7 @@ mod tests {
         let last_modified = get_last_modified(
             "TestListingConnector".to_string(),
             &dataset,
+            ".parquet",
             ".parquet",
             table_path,
             &ctx,
@@ -5424,6 +5664,7 @@ mod tests {
             "TestListingConnector".to_string(),
             &dataset,
             "*.orc",
+            "*.orc",
             table_path,
             &ctx,
             &test_store,
@@ -5450,6 +5691,7 @@ mod tests {
         let err = get_last_modified(
             "TestListingConnector".to_string(),
             &dataset,
+            "*.orc",
             "*.orc",
             table_path,
             &ctx,
@@ -5494,6 +5736,7 @@ mod tests {
         let err = get_last_modified(
             "TestListingConnector".to_string(),
             &dataset,
+            ".parquet",
             ".parquet",
             table_path,
             &ctx,
@@ -5544,6 +5787,7 @@ mod tests {
         let last_modified = get_last_modified(
             "TestListingConnector".to_string(),
             &dataset,
+            ".csv.gz",
             ".csv.gz",
             table_path,
             &ctx,
@@ -6410,6 +6654,7 @@ mod tests {
             "TestListingConnector".to_string(),
             &dataset,
             ".csv",
+            ".csv",
             table_path,
             &ctx,
             &test_store,
@@ -6456,6 +6701,7 @@ mod tests {
             "TestListingConnector".to_string(),
             &dataset,
             ".parquet",
+            ".parquet",
             table_path,
             &ctx,
             &test_store,
@@ -6492,6 +6738,7 @@ mod tests {
             "TestListingConnector".to_string(),
             &dataset,
             ".parquet",
+            ".parquet",
             schema_source_path,
             &ctx,
             &test_store,
@@ -6519,6 +6766,7 @@ mod tests {
             "TestListingConnector".to_string(),
             &dataset,
             ".csv.gz",
+            ".csv.gz",
             schema_source_path,
             &ctx,
             &test_store,
@@ -6545,6 +6793,7 @@ mod tests {
         let result = verify_schema_source_path(
             "TestListingConnector".to_string(),
             &dataset,
+            ".parquet",
             ".parquet",
             schema_source_path.clone(),
             &ctx,
@@ -6581,6 +6830,7 @@ mod tests {
         let result = verify_schema_source_path(
             "TestListingConnector".to_string(),
             &dataset,
+            ".parquet",
             ".parquet",
             schema_source_path,
             &ctx,

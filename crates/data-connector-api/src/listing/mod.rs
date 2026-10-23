@@ -22,8 +22,9 @@ use runtime_parameters::{ParameterSpec, Parameters};
 mod connector;
 mod infer;
 pub use connector::{
-    ListingTableConnector, ListingTableTemplate, ObjectVersionType, build_table_parquet_options,
-    file_matches_extension, object_store_timeout_message,
+    ListingSuffix, ListingSuffixOrigin, ListingTableConnector, ListingTableTemplate,
+    ObjectVersionType, build_table_parquet_options, file_matches_extension,
+    object_store_timeout_message,
 };
 
 /// All [`super::DataConnectorFactory`] that create [`ListingTableConnector`]s should have at least these parameters returned from the associated [`super::DataConnectorFactory::parameters`].
