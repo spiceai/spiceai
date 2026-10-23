@@ -4737,6 +4737,16 @@ mod tests {
             .expect("write metadata");
     }
 
+    /// The object path of an entry's file in the in-memory store.
+    fn entry_path(entry: &SnapshotEntry) -> ObjectPath {
+        ObjectPath::from(
+            entry
+                .snapshot
+                .strip_prefix("memory://")
+                .expect("an in-memory snapshot URI"),
+        )
+    }
+
     fn snapshot_uri(location: &ObjectPath) -> String {
         let base = Path::from(SNAPSHOT_BASE_PATH);
         let relative = location.prefix_match(&base).map_or_else(
@@ -5177,121 +5187,76 @@ mod tests {
     /// A late file is loaded once it arrives, a missing one is reported after the grace
     /// period, and a corrupt one is reported at once, under every bootstrap behavior.
     #[tokio::test(start_paused = true)]
-    #[cfg(feature = "duckdb")]
     async fn poll_waits_for_a_late_snapshot_file_and_reports_one_it_cannot_load() {
         let schema = sample_schema();
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
-        let base = Path::from(SNAPSHOT_BASE_PATH);
-        let instant = |day| {
-            Utc.with_ymd_and_hms(2025, 1, day, 0, 0, 0)
-                .single()
-                .expect("valid time")
-        };
-        let loaded_location = layout.build_location(&base, instant(1));
-        let published_location = layout.build_location(&base, instant(2));
-        let metadata_path = base.join(METADATA_FILE_NAME);
-        let contents = Bytes::from_static(b"published-snapshot");
-        let entry = |snapshot_id, location: &ObjectPath, day, checksum: &str| SnapshotEntry {
-            snapshot_id,
-            timestamp_ms: instant(day).timestamp_millis(),
-            snapshot: snapshot_uri(location),
-            snapshot_checksum: checksum.to_string(),
-            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-            snapshot_size: contents.len() as u64,
-            snapshot_engine: None,
-            snapshot_row_count: None,
-            snapshot_last_updated_at_ms: None,
-        };
-        let valid_checksum = compute_sha256_hex(contents.as_ref());
-        let missing = SnapshotPollOutcome::DownloadFailed {
-            published_id: 2,
-            loaded_id: 1,
-            cause: SnapshotDownloadError::SnapshotFileMissing {
-                dataset: DATASET_NAME.to_string(),
-                snapshot_id: 2,
-                location: snapshot_uri(&published_location),
-            }
-            .to_string(),
-        };
-        let corrupt = SnapshotPollOutcome::DownloadFailed {
-            published_id: 2,
-            loaded_id: 1,
-            cause: SnapshotDownloadError::ChecksumMismatch {
-                path: published_location.to_string(),
-                expected: "0000".to_string(),
-                actual: valid_checksum.clone(),
-            }
-            .to_string(),
-        };
-
-        // (case, recorded checksum, when the file arrives, expected outcome, expected wait)
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        // (case, when the file arrives, whether it fails verification, expected wait)
         let cases = [
             (
                 "never arrives",
-                valid_checksum.as_str(),
                 None,
-                Some(missing),
+                false,
                 SNAPSHOT_ALLOWED_LATE_ARRIVAL_GRACE
                     ..=SNAPSHOT_ALLOWED_LATE_ARRIVAL_GRACE + LATE_SNAPSHOT_RETRY_INTERVAL,
             ),
             (
                 "arrives after 30 seconds",
-                valid_checksum.as_str(),
                 Some(Duration::from_secs(30)),
-                None,
+                false,
                 Duration::from_secs(30)..=Duration::from_secs(30) + LATE_SNAPSHOT_RETRY_INTERVAL,
             ),
             (
                 "fails verification",
-                "0000",
                 Some(Duration::ZERO),
-                Some(corrupt),
+                true,
                 Duration::ZERO..=Duration::ZERO,
             ),
         ];
-        for (case, checksum, arrives_after, expected, expected_wait) in cases {
-            let metadata = metadata_with(
-                &schema,
-                vec![
-                    entry(1, &loaded_location, 1, &valid_checksum),
-                    entry(2, &published_location, 2, checksum),
-                ],
-                2,
-            );
+        for (case, arrives_after, corrupt, expected_wait) in cases {
             for behavior in [
                 BootstrapOnFailureBehavior::Warn,
                 BootstrapOnFailureBehavior::Retry,
                 BootstrapOnFailureBehavior::Fallback,
             ] {
                 let store = Arc::new(InMemory::new());
-                write_metadata(&store, &metadata_path, &metadata).await;
-                if arrives_after == Some(Duration::ZERO) {
-                    store
-                        .put(&published_location, contents.clone().into())
-                        .await
-                        .expect("write snapshot");
+                let loaded = put_cayenne_snapshot_entry(&store, 1, 1, b"loaded").await;
+                let mut published = put_cayenne_snapshot_entry(&store, 2, 2, b"published").await;
+                let path = entry_path(&published);
+                let contents = store
+                    .get(&path)
+                    .await
+                    .expect("read snapshot")
+                    .bytes()
+                    .await
+                    .expect("read snapshot bytes");
+                let actual_checksum = published.snapshot_checksum.clone();
+                if corrupt {
+                    published.snapshot_checksum = "0".repeat(64);
                 }
+                if arrives_after != Some(Duration::ZERO) {
+                    store.delete(&path).await.expect("delete snapshot");
+                }
+                write_metadata(
+                    &store,
+                    &metadata_path,
+                    &metadata_with(&schema, vec![loaded, published.clone()], 2),
+                )
+                .await;
                 let arrival = arrives_after.filter(|after| !after.is_zero()).map(|after| {
                     let store = Arc::clone(&store);
-                    let location = published_location.clone();
+                    let path = path.clone();
                     let contents = contents.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(after).await;
                         store
-                            .put(&location, contents.into())
+                            .put(&path, contents.into())
                             .await
                             .expect("write snapshot");
                     })
                 });
-                let temp_dir = TempDir::new().expect("create temp dir");
-                let local_path = temp_dir.path().join("snapshot.db");
-                let manager = build_manager(
-                    Arc::clone(&store),
-                    local_path.clone(),
-                    behavior,
-                    &schema,
-                    false,
-                );
+                let root = TempDir::new().expect("create temp dir");
+                let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+                manager.bootstrap_failure_behavior = behavior;
 
                 let started = tokio::time::Instant::now();
                 let poll = tokio::time::timeout(
@@ -5310,33 +5275,46 @@ mod tests {
                     expected_wait.contains(&waited),
                     "{behavior:?}, {case}: waited {waited:?}, expected {expected_wait:?}"
                 );
-                match &expected {
-                    Some(expected) => {
-                        assert_eq!(&poll.outcome, expected, "{behavior:?}, {case}");
-                        assert_eq!(
-                            poll.metadata_e_tag, None,
-                            "{behavior:?}, {case}: the next poll reads the metadata again"
-                        );
-                        assert!(
-                            !local_path.exists(),
-                            "{behavior:?}, {case}: nothing is written locally"
-                        );
-                    }
-                    None => {
-                        assert_eq!(
-                            poll.download().map(|info| info.snapshot_id),
-                            Some(2),
-                            "{behavior:?}, {case}"
-                        );
-                        let downloaded = fs::read(&local_path)
-                            .await
-                            .expect("read downloaded snapshot");
-                        assert_eq!(
-                            downloaded.as_slice(),
-                            contents.as_ref(),
-                            "{behavior:?}, {case}"
-                        );
-                    }
+                let restored = root.path().join("data").join("part-2.vortex");
+                if arrives_after.is_some() && !corrupt {
+                    assert_eq!(
+                        poll.download().map(|info| info.snapshot_id),
+                        Some(2),
+                        "{behavior:?}, {case}"
+                    );
+                    let data = fs::read(&restored).await.expect("read restored data file");
+                    assert_eq!(data.as_slice(), b"published", "{behavior:?}, {case}");
+                } else {
+                    let cause = if corrupt {
+                        SnapshotDownloadError::ChecksumMismatch {
+                            path: path.to_string(),
+                            expected: "0".repeat(64),
+                            actual: actual_checksum,
+                        }
+                    } else {
+                        SnapshotDownloadError::SnapshotFileMissing {
+                            dataset: DATASET_NAME.to_string(),
+                            snapshot_id: 2,
+                            location: published.snapshot.clone(),
+                        }
+                    };
+                    assert_eq!(
+                        poll.outcome,
+                        SnapshotPollOutcome::DownloadFailed {
+                            published_id: 2,
+                            loaded_id: 1,
+                            cause: cause.to_string(),
+                        },
+                        "{behavior:?}, {case}"
+                    );
+                    assert_eq!(
+                        poll.metadata_e_tag, None,
+                        "{behavior:?}, {case}: the next poll reads the metadata again"
+                    );
+                    assert!(
+                        !restored.exists(),
+                        "{behavior:?}, {case}: nothing is restored"
+                    );
                 }
             }
         }
@@ -5344,52 +5322,39 @@ mod tests {
 
     /// A poll waits for the snapshot it validated, even if a newer one is published meanwhile.
     #[tokio::test(start_paused = true)]
-    #[cfg(feature = "duckdb")]
     async fn a_poll_waiting_for_a_late_file_loads_the_snapshot_it_read() {
         let schema = sample_schema();
-        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
-        let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.clone().join(METADATA_FILE_NAME);
-        let contents = Bytes::from_static(b"published-snapshot");
-        let checksum = compute_sha256_hex(contents.as_ref());
-        // Each snapshot's file name is built once: it carries a random suffix.
-        let locations: Vec<ObjectPath> = (1..=3)
-            .map(|day| {
-                layout.build_location(
-                    &base,
-                    Utc.with_ymd_and_hms(2025, 1, day, 0, 0, 0)
-                        .single()
-                        .expect("valid time"),
-                )
-            })
-            .collect();
-        let location = |snapshot_id: u64| {
-            locations[usize::try_from(snapshot_id - 1).expect("small id")].clone()
-        };
-        let entry = |snapshot_id: u64| SnapshotEntry {
-            snapshot_id,
-            timestamp_ms: 0,
-            snapshot: snapshot_uri(&location(snapshot_id)),
-            snapshot_checksum: checksum.clone(),
-            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-            snapshot_size: contents.len() as u64,
-            snapshot_engine: None,
-            snapshot_row_count: None,
-            snapshot_last_updated_at_ms: None,
-        };
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let store = Arc::new(InMemory::new());
+        let loaded = put_cayenne_snapshot_entry(&store, 1, 1, b"loaded").await;
+        let published = put_cayenne_snapshot_entry(&store, 2, 2, b"published").await;
+        let newer = put_cayenne_snapshot_entry(&store, 3, 3, b"newer").await;
+        let published_path = entry_path(&published);
+        let contents = store
+            .get(&published_path)
+            .await
+            .expect("read snapshot")
+            .bytes()
+            .await
+            .expect("read snapshot bytes");
+        store
+            .delete(&published_path)
+            .await
+            .expect("delete snapshot");
+        store
+            .delete(&entry_path(&newer))
+            .await
+            .expect("delete snapshot");
         write_metadata(
             &store,
             &metadata_path,
-            &metadata_with(&schema, vec![entry(1), entry(2)], 2),
+            &metadata_with(&schema, vec![loaded.clone(), published.clone()], 2),
         )
         .await;
-        let newer_metadata = metadata_with(&schema, vec![entry(1), entry(2), entry(3)], 3);
+        let newer_metadata = metadata_with(&schema, vec![loaded, published, newer], 3);
         let replication = {
             let store = Arc::clone(&store);
             let metadata_path = metadata_path.clone();
-            let file = location(2);
-            let contents = contents.clone();
             tokio::spawn(async move {
                 // Snapshot 3 is published before snapshot 2's file arrives, and its own file
                 // never does.
@@ -5397,20 +5362,13 @@ mod tests {
                 write_metadata(&store, &metadata_path, &newer_metadata).await;
                 tokio::time::sleep(Duration::from_secs(25)).await;
                 store
-                    .put(&file, contents.into())
+                    .put(&published_path, contents.into())
                     .await
                     .expect("write snapshot");
             })
         };
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let local_path = temp_dir.path().join("snapshot.db");
-        let manager = build_manager(
-            Arc::clone(&store),
-            local_path,
-            BootstrapOnFailureBehavior::Warn,
-            &schema,
-            false,
-        );
+        let root = TempDir::new().expect("create temp dir");
+        let manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
 
         let poll = manager
             .download_if_newer(Some(1), None, None)
@@ -5424,6 +5382,10 @@ mod tests {
             "{:?}",
             poll.outcome
         );
+        let data = fs::read(root.path().join("data").join("part-2.vortex"))
+            .await
+            .expect("read restored data file");
+        assert_eq!(data.as_slice(), b"published");
     }
 
     /// A Cayenne manager over `root/metadata` and `root/data`, the directories a Cayenne
