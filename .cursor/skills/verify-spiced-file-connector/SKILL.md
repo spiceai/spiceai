@@ -123,6 +123,7 @@ Standards:
 - Drive the shipped binary over HTTP. A unit test is not evidence.
 - A SQL transport failure, a non-2xx `/v1/sql` response, a body that is not JSON, or a row missing `amount_cents` / `user_id` fails `drive` / `compare`. Valid SQL `NULL` sums (`null,null`) stay accepted. Response artifacts are still written.
 - A refresh transport failure or a non-2xx `POST /v1/datasets/<name>/acceleration/refresh` fails `drive` / `compare` before polling. Status and body artifacts are still written.
+- A doctor `/v1/ready` transport failure is refused. HTTP 503 after an expected refresh Error is still HTTP and is accepted.
 - Capture the action (file rewrite, refresh POST) and the resulting sums/status/log, not only the last query.
 - Re-run from a clean work dir. The helper is deterministic: same files, same SQL, same endpoints.
 - Compare `trunk` vs `branch` with the same helper so the numbers are from the same recipe.

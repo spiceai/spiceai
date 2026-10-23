@@ -7,7 +7,7 @@ This directory is the maintained source for verifying user-visible file-connecto
 - Build `spiced` with `CC=cc CXX=g++ cargo build -p spiced --no-default-features`.
 - Seed an isolated work directory with `helpers/verify-file-connector.sh seed`.
 - Launch that work directory's spicepod and wait for `GET /v1/ready` → `200` / `ready`.
-- Run `helpers/verify-file-connector.sh doctor` and require the pid, binary, four datasets, and a reachable `/v1/ready`.
+- Run `helpers/verify-file-connector.sh doctor` and require the pid, binary, four datasets, and a reachable `/v1/ready`. A transport failure is refused (`000` / curl error). HTTP 503 after an expected refresh Error is still HTTP and is accepted.
 - Never drive an instance this run did not start.
 
 ## Driving conventions
