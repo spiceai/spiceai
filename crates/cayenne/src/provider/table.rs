@@ -2463,6 +2463,9 @@ pub struct CayenneTableProvider {
     /// the capture that follows a promotion pays no metastore read. Shared across
     /// writer clones of the same table.
     cold_manifest: Arc<ArcSwap<Option<ColdManifestForSnapshot>>>,
+    /// Parsed per-file PK blooms of the cold manifest, probed by point lookups to
+    /// skip cold files. Shared across writer clones like the manifest.
+    cold_pk_blooms: Arc<super::cold_pk_prune::ColdPkBloomCache>,
     /// Test-only seam fired just before a pass publishes, so a test can commit a
     /// snapshot replacement (overwrite/promotion) inside the exact window the
     /// pass's overwrite guard defends: between the catalog CAS commit and the
@@ -10488,6 +10491,7 @@ impl CayenneTableProvider {
             // a snapshot.
             current_sorted_snapshot: Arc::new(ArcSwap::from_pointee(None)),
             cold_manifest: Arc::new(ArcSwap::from_pointee(None)),
+            cold_pk_blooms: Arc::default(),
             mem_checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             mem_tier_publish_locks: (0..mem_tier_shards)
                 .map(|_| tokio::sync::Mutex::new(()))
@@ -12887,6 +12891,7 @@ impl CayenneTableProvider {
             // Shared so a writer clone's promotion publishes the manifest every
             // clone's scans resolve against.
             cold_manifest: Arc::clone(&self.cold_manifest),
+            cold_pk_blooms: Arc::clone(&self.cold_pk_blooms),
             mem_checkpoint_lock: Arc::clone(&self.mem_checkpoint_lock),
             // Shared across clones so EVERY writer serializes on the one publish
             // lock (the seq-ordering invariant requires a single lock per table).
@@ -39955,6 +39960,21 @@ impl CayenneTableProvider {
             super::file_pruning::build_listing_pruning_predicate(&scan_schema, filters)?
         };
 
+        // Candidate primary keys the filters pin, to probe each file's bloom. A
+        // promotion's private session reads its classified files whole.
+        let pk_probe = if promotion_files.is_some() {
+            None
+        } else {
+            super::cold_pk_prune::PkProbe::from_filters(
+                filters,
+                &self.table_schema(),
+                &self.pk_column_indices,
+            )
+        };
+        if pk_probe.is_some() {
+            self.cold_pk_blooms.trim(&cold_files);
+        }
+
         let table_name = self.table_metadata.table_name.clone();
         let mut object_store_url: Option<ListingTableUrl> = None;
         let mut kept: Vec<PartitionedFile> = Vec::with_capacity(cold_files.len());
@@ -39993,6 +40013,16 @@ impl CayenneTableProvider {
                     table = %table_name,
                     file = %file.file_url,
                     "Pruned cold-tier file at listing time via persisted footer statistics"
+                );
+                continue;
+            }
+            if let Some(probe) = &pk_probe
+                && !probe.may_match(&self.cold_pk_blooms, file)
+            {
+                tracing::debug!(
+                    table = %table_name,
+                    file = %file.file_url,
+                    "Pruned cold-tier file at listing time via its primary-key bloom filter"
                 );
                 continue;
             }
@@ -41882,7 +41912,7 @@ fn reconcile_lookup_index(
 /// planner rewrites an `IN` list of consecutive integers into one, which would
 /// otherwise pin nothing. On any other column type a range holds values no
 /// enumeration lists, so it pins nothing.
-fn bare_column_values_for(
+pub(super) fn bare_column_values_for(
     expr: &Expr,
     name: &str,
     column_type: Option<DataType>,
