@@ -139,10 +139,10 @@ pub(super) fn can_cache_footer_after_open(footer: &Footer, file_size: u64) -> bo
             let Some(segment) = footer.segment_map().get(index) else {
                 return false;
             };
-            if !segment
+            if segment
                 .offset
                 .checked_add(u64::from(segment.length))
-                .is_some_and(|end| end <= file_size)
+                .is_none_or(|end| end > file_size)
             {
                 return false;
             }
