@@ -62,6 +62,9 @@ use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
 
 use crate::Runtime;
+use crate::opentelemetry_store::{
+    MAX_STORE_BATCH_ROWS, OTLP_METRICS_PARAM, StoreExport, is_otlp_metrics_store_param,
+};
 use runtime_query_engine::query_engine::{QueryEngine, UpdateType};
 use util::tracers::OnceTracer;
 use util::warn_once;
@@ -76,6 +79,7 @@ pub enum Error {
     #[snafu(display(
         "Failed to ingest OpenTelemetry metric {metric}: metric type {data_type} is not supported. \
         Supported metric types are Gauge, Sum and Histogram; its data points were rejected. \
+        A metrics store dataset (`otlp_metrics: all`) stores every metric type. \
         See: https://spiceai.org/docs/features/observability"
     ))]
     UnsupportedMetricDataType {
@@ -154,6 +158,9 @@ pub struct Service {
     /// and metrics with new dimensions are rejected as before.
     runtime: Option<Weak<Runtime>>,
     once_tracer: OnceTracer,
+    /// Metrics store tables to use instead of the `otlp_metrics: all` datasets of the
+    /// runtime's app. Only tests set this, since they drive the service without a runtime.
+    store_tables_override: Option<Vec<TableReference>>,
 }
 
 /// Names of columns present in `incoming` but absent from `existing` (by name). New metric
@@ -174,9 +181,16 @@ impl MetricsService for Service {
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> std::result::Result<Response<ExportMetricsServiceResponse>, Status> {
+        crate::http::v1::ensure_otlp_grpc_write_access().await?;
         let mut rejected_data_points = 0;
         let mut total_data_points = 0;
-        let resource_metrics = request.into_inner().resource_metrics;
+        let request = request.into_inner();
+        // Write the whole export to every metrics store table first (#15060). When that
+        // succeeds every data point is stored, so a metric without its own dataset is not
+        // rejected, and its per-metric dataset, if any, still receives it below.
+        let store_outcome = self.write_to_metrics_store(&request).await;
+        let stored_in_metrics_store = store_outcome == StoreOutcome::Stored;
+        let resource_metrics = request.resource_metrics;
         tracing::debug!(
             "OpenTelemetry export: received {} resource metric group(s)",
             resource_metrics.len()
@@ -206,6 +220,24 @@ impl MetricsService for Service {
                         metric_data_type_name(&data),
                         data_points_count
                     );
+                    if stored_in_metrics_store {
+                        // Stored already; a per-metric dataset is optional in this mode, but
+                        // when one exists a failed write to it still rejects those points.
+                        if self
+                            .datafusion
+                            .is_writable(&TableReference::bare(metric.name.clone()))
+                        {
+                            rejected_data_points += self
+                                .ingest_metric(
+                                    &metric.name,
+                                    &data,
+                                    resource_attrs,
+                                    data_points_count,
+                                )
+                                .await;
+                        }
+                        continue;
+                    }
                     rejected_data_points += self
                         .ingest_metric(&metric.name, &data, resource_attrs, data_points_count)
                         .await;
@@ -216,6 +248,15 @@ impl MetricsService for Service {
         // An export carrying no data points at all (e.g. only metrics with no data) rejected
         // nothing, so it succeeds; only an export that had data points and lost all of them is
         // a failed export.
+        if store_outcome == StoreOutcome::Failed {
+            // The store failed to write, which is not the client's fault. Fail the export
+            // even if per-metric datasets took some points, so exporters retry and the store
+            // is not left missing data. A retry may write those per-metric points again;
+            // a duplicate is preferable to a silent gap in the all-metrics store.
+            return Err(Status::unavailable(
+                "Failed to write to the OpenTelemetry metrics store; retry the export",
+            ));
+        }
         if total_data_points > 0 && rejected_data_points >= total_data_points {
             return Err(Status::invalid_argument("All data points were rejected"));
         }
@@ -232,6 +273,17 @@ impl MetricsService for Service {
             partial_success,
         }))
     }
+}
+
+/// Outcome of writing an export to the metrics store tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreOutcome {
+    /// No writable metrics store table, or nothing to write.
+    NotConfigured,
+    /// Every table stored every data point.
+    Stored,
+    /// A table failed to store a batch.
+    Failed,
 }
 
 /// Outcome of one attempt to build and write a metric's batch.
@@ -254,6 +306,102 @@ enum MetricWriteOutcome {
 const MAX_METRIC_WRITE_ATTEMPTS: usize = 5;
 
 impl Service {
+    /// Tables that hold every metric of an export: writable datasets with the
+    /// `otlp_metrics: all` param.
+    async fn metrics_store_tables(&self) -> Vec<TableReference> {
+        let candidates = if let Some(tables) = &self.store_tables_override {
+            tables.clone()
+        } else {
+            let Some(runtime) = self.runtime.as_ref().and_then(Weak::upgrade) else {
+                return Vec::new();
+            };
+            let app = runtime.app();
+            let app = app.read().await;
+            let Some(app) = app.as_ref() else {
+                return Vec::new();
+            };
+            app.datasets
+                .iter()
+                .filter(|dataset| {
+                    dataset
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.data.get(OTLP_METRICS_PARAM))
+                        .is_some_and(|value| is_otlp_metrics_store_param(&value.as_string()))
+                })
+                .map(|dataset| TableReference::from(dataset.name.as_str()))
+                .collect()
+        };
+        candidates
+            .into_iter()
+            .filter(|table| {
+                let writable = self.datafusion.is_writable(table);
+                if !writable {
+                    warn_once!(
+                        self.once_tracer,
+                        "OpenTelemetry metrics store dataset {} is not writable. Set `access: read_write` on it to store metrics.",
+                        table
+                    );
+                }
+                writable
+            })
+            .collect()
+    }
+
+    /// Writes every data point of the export to each metrics store table, in batches of
+    /// bounded size.
+    async fn write_to_metrics_store(&self, request: &ExportMetricsServiceRequest) -> StoreOutcome {
+        let tables = self.metrics_store_tables().await;
+        if tables.is_empty() {
+            return StoreOutcome::NotConfigured;
+        }
+        let export = StoreExport::new(request);
+        if export.rows() == 0 {
+            return StoreOutcome::NotConfigured;
+        }
+        let mut failed = false;
+        for batch in export.batches(MAX_STORE_BATCH_ROWS) {
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(e) => {
+                    tracing::error!("Failed to build an OpenTelemetry metrics store batch: {e}");
+                    return StoreOutcome::Failed;
+                }
+            };
+            for table in &tables {
+                if let Err(e) = self
+                    .datafusion
+                    .write_data(
+                        table,
+                        batch.schema(),
+                        vec![batch.clone()],
+                        UpdateType::Append,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to write OpenTelemetry metrics to metrics store dataset '{table}': {e}. \
+                        This export falls back to per-metric datasets, so metrics without a writable \
+                        per-metric dataset are rejected and the exporter is asked to retry. \
+                        Check that '{table}' is loaded and writable (`access: read_write`)."
+                    );
+                    failed = true;
+                }
+            }
+            if failed {
+                // A retried export rewrites the batches already stored; the
+                // `(time_unix_nano, series_hash)` primary key deduplicates them.
+                return StoreOutcome::Failed;
+            }
+        }
+        tracing::debug!(
+            "OpenTelemetry export: wrote {} data point(s) to {} metrics store table(s)",
+            export.rows(),
+            tables.len()
+        );
+        StoreOutcome::Stored
+    }
+
     /// Ingests one metric of an export, returning how many of its data points were rejected.
     ///
     /// A write rejected by the schema check is retried, because another export adding a
@@ -1469,6 +1617,7 @@ pub fn build_metrics_service(
         datafusion,
         runtime,
         once_tracer: OnceTracer::new(),
+        store_tables_override: None,
     }
 }
 
@@ -1487,6 +1636,7 @@ pub fn create_metrics_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::spicepod::component::runtime::ApiKey;
     use arrow::array::Array;
     use arrow::array::AsArray;
     use arrow::array::Float64Array;
@@ -1511,9 +1661,11 @@ mod tests {
     use opentelemetry_proto::tonic::metrics::v1::SummaryDataPoint;
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use parking_lot::Mutex;
+    use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
     use runtime_query_engine::query_engine::Error as QueryEngineError;
     use runtime_query_engine::query_engine::QueryRequest;
     use runtime_query_engine::query_engine::Result as QueryEngineResult;
+    use runtime_request_context::{Protocol, RequestContext, RequestContextBuilder};
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
@@ -2939,6 +3091,12 @@ mod tests {
         failing_writes: u64,
         failure_mode: WriteFailureMode,
         batches_written: Mutex<Vec<RecordBatch>>,
+        /// Tables a write was accepted for, in order.
+        tables_written: Mutex<Vec<String>>,
+        /// Tables that accept writes. `None`: every table does.
+        writable_tables: Option<Vec<String>>,
+        /// Writable tables whose every write fails.
+        failing_tables: Vec<String>,
     }
 
     // `QueryEngine` requires `Debug`, and `SessionContext` does not implement it.
@@ -2971,7 +3129,26 @@ mod tests {
                 failing_writes,
                 failure_mode,
                 batches_written: Mutex::new(Vec::new()),
+                tables_written: Mutex::new(Vec::new()),
+                writable_tables: None,
+                failing_tables: Vec::new(),
             }
+        }
+
+        /// Only `tables` accept writes.
+        fn writable_only(mut self, tables: &[&str]) -> Self {
+            self.writable_tables = Some(tables.iter().map(ToString::to_string).collect());
+            self
+        }
+
+        /// Every write to `tables` fails.
+        fn failing_on(mut self, tables: &[&str]) -> Self {
+            self.failing_tables = tables.iter().map(ToString::to_string).collect();
+            self
+        }
+
+        fn tables_written(&self) -> Vec<String> {
+            self.tables_written.lock().clone()
         }
 
         fn rows_written(&self) -> u64 {
@@ -3029,8 +3206,10 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn is_writable(&self, _table_ref: &TableReference) -> bool {
-            true
+        fn is_writable(&self, table_ref: &TableReference) -> bool {
+            self.writable_tables
+                .as_ref()
+                .is_none_or(|tables| tables.iter().any(|t| *t == table_ref.to_string()))
         }
 
         fn is_path_catalog_writable(&self, _table_ref: &TableReference) -> bool {
@@ -3059,7 +3238,12 @@ mod tests {
             _update_type: UpdateType,
         ) -> QueryEngineResult<()> {
             let call = self.write_calls.fetch_add(1, Ordering::SeqCst);
-            if call < self.failing_writes {
+            if call < self.failing_writes
+                || self
+                    .failing_tables
+                    .iter()
+                    .any(|t| *t == table_ref.to_string())
+            {
                 return Err(match self.failure_mode {
                     WriteFailureMode::SchemaMismatch => schema_mismatch_write_error(table_ref),
                     WriteFailureMode::Generic => QueryEngineError::WriteData {
@@ -3069,6 +3253,7 @@ mod tests {
                 });
             }
             self.batches_written.lock().extend(data);
+            self.tables_written.lock().push(table_ref.to_string());
             Ok(())
         }
     }
@@ -3153,6 +3338,141 @@ mod tests {
         );
     }
 
+    fn store_service(engine: &Arc<FakeQueryEngine>, tables: &[&str]) -> Service {
+        let mut service = build_metrics_service(Arc::clone(engine) as Arc<dyn QueryEngine>, None);
+        service.store_tables_override =
+            Some(tables.iter().map(|t| TableReference::from(*t)).collect());
+        service
+    }
+
+    /// With a metrics store dataset, every metric of an export is stored in it, including
+    /// metric types and names that have no per-metric dataset, and nothing is rejected.
+    #[tokio::test]
+    async fn metrics_store_accepts_every_metric_without_per_metric_datasets() {
+        let engine = Arc::new(FakeQueryEngine::unregistered().writable_only(&["otel_metrics"]));
+        let service = store_service(&engine, &["otel_metrics"]);
+
+        let request = otlp_request(vec![
+            otlp_metric("http.server.request.duration", Some(gauge(1.0))),
+            otlp_metric("gc_pause_seconds", Some(summary(3))),
+        ]);
+        let response = service
+            .export(Request::new(request))
+            .await
+            .expect("the store accepts every metric")
+            .into_inner();
+
+        assert!(response.partial_success.is_none(), "nothing is rejected");
+        assert_eq!(engine.tables_written(), vec!["otel_metrics".to_string()]);
+        assert_eq!(engine.rows_written(), 4);
+        assert_eq!(
+            engine.batches_written()[0].schema(),
+            *crate::opentelemetry_store::METRICS_STORE_SCHEMA
+        );
+    }
+
+    /// A per-metric dataset keeps receiving its metric when a metrics store also exists.
+    #[tokio::test]
+    async fn per_metric_datasets_keep_working_next_to_the_metrics_store() {
+        let engine = Arc::new(
+            FakeQueryEngine::unregistered().writable_only(&["otel_metrics", "svc_requests"]),
+        );
+        let service = store_service(&engine, &["otel_metrics"]);
+
+        let request = otlp_request(vec![
+            otlp_metric("svc_requests", Some(gauge(1.0))),
+            otlp_metric("other", Some(gauge(2.0))),
+        ]);
+        service
+            .export(Request::new(request))
+            .await
+            .expect("export succeeds");
+
+        assert_eq!(
+            engine.tables_written(),
+            vec!["otel_metrics".to_string(), "svc_requests".to_string()]
+        );
+    }
+
+    /// A failed write to a per-metric dataset is still rejected when the metrics store took the
+    /// export, so the exporter learns that dataset missed those points.
+    #[tokio::test]
+    async fn failed_per_metric_write_is_rejected_next_to_the_metrics_store() {
+        let engine = Arc::new(
+            FakeQueryEngine::unregistered()
+                .writable_only(&["otel_metrics", "svc_requests"])
+                .failing_on(&["svc_requests"]),
+        );
+        let service = store_service(&engine, &["otel_metrics"]);
+
+        let request = otlp_request(vec![
+            otlp_metric("svc_requests", Some(gauge(1.0))),
+            otlp_metric("other", Some(gauge(2.0))),
+        ]);
+        let response = service
+            .export(Request::new(request))
+            .await
+            .expect("the store took every point")
+            .into_inner();
+
+        assert_eq!(engine.tables_written(), vec!["otel_metrics".to_string()]);
+        assert_eq!(
+            response
+                .partial_success
+                .expect("the per-metric dataset missed its point")
+                .rejected_data_points,
+            1
+        );
+    }
+
+    /// A store dataset that is not writable is ignored, so per-metric routing decides.
+    #[tokio::test]
+    async fn unwritable_metrics_store_falls_back_to_per_metric_routing() {
+        let engine = Arc::new(FakeQueryEngine::unregistered().writable_only(&["svc_requests"]));
+        let service = store_service(&engine, &["otel_metrics"]);
+
+        let request = otlp_request(vec![
+            otlp_metric("svc_requests", Some(gauge(1.0))),
+            otlp_metric("gc_pause_seconds", Some(summary(2))),
+        ]);
+        let response = service
+            .export(Request::new(request))
+            .await
+            .expect("export succeeds")
+            .into_inner();
+
+        assert_eq!(engine.tables_written(), vec!["svc_requests".to_string()]);
+        assert_eq!(
+            response
+                .partial_success
+                .expect("summary points rejected")
+                .rejected_data_points,
+            2
+        );
+    }
+
+    /// A failed store write falls back to per-metric routing and its rejection accounting.
+    #[tokio::test]
+    async fn failed_metrics_store_write_falls_back_to_per_metric_routing() {
+        let engine = Arc::new(FakeQueryEngine::evolving(
+            Vec::new(),
+            1,
+            WriteFailureMode::Generic,
+        ));
+        let service = store_service(&engine, &["otel_metrics"]);
+
+        let request = otlp_request(vec![otlp_metric("gc_pause_seconds", Some(summary(2)))]);
+        let status = service
+            .export(Request::new(request))
+            .await
+            .expect_err("nothing was stored anywhere");
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unavailable,
+            "a store write failure is retryable, not an invalid export"
+        );
+    }
+
     /// An export whose data points were all rejected is a failed export, including when every
     /// metric in it has an unsupported type.
     #[tokio::test]
@@ -3198,6 +3518,56 @@ mod tests {
         );
         assert_eq!(engine.rows_written(), 0);
     }
+
+    fn context_with_api_key(key: ApiKey) -> Arc<RequestContext> {
+        let context = Arc::new(RequestContextBuilder::new(Protocol::Flight).build());
+        context
+            .set_auth_principal(Arc::new(key) as AuthPrincipalRef)
+            .expect("auth principal should be set");
+        context
+    }
+
+    /// A read-only API key must not persist an OTLP metrics export. The metrics store table is
+    /// writable, so a missing principal check would store the row and return success.
+    #[tokio::test]
+    async fn otlp_grpc_read_only_api_key_is_denied_and_writes_nothing() {
+        let engine = Arc::new(FakeQueryEngine::unregistered().writable_only(&["otel_metrics"]));
+        let service = store_service(&engine, &["otel_metrics"]);
+        let request = otlp_request(vec![otlp_metric("checkout_requests", Some(gauge(1.0)))]);
+
+        let status = context_with_api_key(ApiKey::ReadOnly {
+            key: "read-only".to_string(),
+        })
+        .scope(service.export(Request::new(request)))
+        .await
+        .expect_err("a read-only API key must not export metrics");
+
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(status.message(), "API key does not allow write access");
+        assert_eq!(engine.rows_written(), 0);
+        assert!(engine.tables_written().is_empty());
+    }
+
+    /// A read-write API key still stores the export.
+    #[tokio::test]
+    async fn otlp_grpc_read_write_api_key_exports_metrics() {
+        let engine = Arc::new(FakeQueryEngine::unregistered().writable_only(&["otel_metrics"]));
+        let service = store_service(&engine, &["otel_metrics"]);
+        let request = otlp_request(vec![otlp_metric("svc_requests", Some(gauge(1.0)))]);
+
+        let response = context_with_api_key(ApiKey::ReadWrite {
+            key: "read-write".to_string(),
+        })
+        .scope(service.export(Request::new(request)))
+        .await
+        .expect("a read-write API key exports metrics")
+        .into_inner();
+
+        assert!(response.partial_success.is_none());
+        assert_eq!(engine.tables_written(), vec!["otel_metrics".to_string()]);
+        assert_eq!(engine.rows_written(), 1);
+    }
+
     /// Resource attributes identify the process that produced a measurement, so they must land
     /// as dimension columns on every data point of the export rather than being dropped.
     #[test]

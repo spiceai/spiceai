@@ -88,6 +88,15 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// Downloading the model's files failed. The source names the file, the repository, the
+    /// cause and the fix, so it is the whole message.
+    #[snafu(display("{source}"))]
+    FailedToDownloadModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        /// Whether only a Spicepod change clears it (see [`Error::is_configuration_error`]).
+        configuration: bool,
+    },
+
     #[snafu(display(
         "Unsupported value for `model_type` parameter. {source}  Verify the `model_type` parameter, and try again"
     ))]
@@ -172,6 +181,42 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl Error {
+    /// Whether the error is a mistake in the model's Spicepod configuration, which only a
+    /// change to the Spicepod can clear. A refusal from the provider is not one: a missing
+    /// model, a bad key or an exhausted quota can be fixed on the provider's side.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        match self {
+            Self::LocalModelNotFound { .. }
+            | Self::LocalModelConfigNotFound { .. }
+            | Self::LocalTokenizerNotFound { .. }
+            | Self::UnsupportedModelType { .. }
+            | Self::ModelNotProvided { .. }
+            | Self::UnknownModelSource { .. }
+            | Self::UnsupportedTaskForModel { .. }
+            | Self::EvaluateOnlyModel { .. }
+            | Self::InvalidParamValueError { .. }
+            | Self::MissingParamError { .. }
+            | Self::ModelMissingWeights { .. }
+            | Self::UnsafePickleWeight { .. }
+            | Self::ModelParameterFailed { .. }
+            | Self::ResponsesNotSupported { .. } => true,
+            Self::FailedToDownloadModel { configuration, .. } => *configuration,
+            // A loader can wrap a configuration error, such as rejected pickle weights.
+            Self::FailedToLoadModel { source } => source
+                .downcast_ref::<Self>()
+                .is_some_and(Self::is_configuration_error),
+            Self::HealthCheckError { .. }
+            | Self::FailedToRunModel { .. }
+            | Self::ModelNotFound { .. }
+            | Self::FailedToLoadTokenizer { .. }
+            | Self::ModelFileMissing { .. }
+            | Self::ToolNotFound { .. } => false,
+        }
+    }
+}
+
 /// The kind of failure a provider's [`ApiError`] reports.
 ///
 /// Providers put the kind in either field: `OpenAI` sends `type: invalid_request_error`
@@ -186,6 +231,8 @@ pub enum ApiErrorKind {
     Authentication,
     /// The credentials were accepted but may not do what was asked.
     PermissionDenied,
+    /// The requested resource, for example a model or a stored response, does not exist.
+    NotFound,
     /// The provider is throttling requests.
     RateLimited,
     /// The account has no quota left.
@@ -204,6 +251,7 @@ impl ApiErrorKind {
             "invalid_request_error" => Some(Self::InvalidRequest),
             "invalid_api_key" | "authentication_error" => Some(Self::Authentication),
             "permission_error" => Some(Self::PermissionDenied),
+            "not_found_error" => Some(Self::NotFound),
             "rate_limit_exceeded" | "rate_limit_error" => Some(Self::RateLimited),
             "insufficient_quota" => Some(Self::InsufficientQuota),
             _ => None,

@@ -43,40 +43,12 @@ limitations under the License.
 
 use std::path::{Component, Path, PathBuf};
 
-/// Returns true if the path is a local filesystem path (not a remote object store).
-///
-/// Local paths include:
-/// - Absolute paths: `/data/cayenne`
-/// - Relative paths: `./data`
-/// - file:// URIs: `file:///data/cayenne`
-///
-/// Remote paths (S3, etc.) return false.
-#[must_use]
-pub fn is_local_path(path: &str) -> bool {
-    !path.contains("://") || path.starts_with("file://")
-}
+use util::spice_paths::{absolute_dir as absolute_fs_dir, is_local_path};
 
 /// Strip a `file:`/`file://` scheme (including an optional authority such as
-/// `localhost`) so on-disk storage detection receives a real filesystem path.
-///
-/// A configured Cayenne directory may be spelled as such a URI, and feeding
-/// `file:///x` or `file://localhost/x` into `Path::new` would make `Auto` storage
-/// detection misclassify it as `Unknown`. Returns a borrowed slice (no owned path), so
-/// callers can pass the result directly as `&str`.
-#[must_use]
-pub fn fs_probe_path(path: &str) -> &str {
-    if let Some(rest) = path.strip_prefix("file://") {
-        // `rest` is either `/abs/path` (empty authority, e.g. `file:///x`) or
-        // `authority/abs/path` (e.g. `localhost/abs/path`); the filesystem path
-        // begins at the first '/'.
-        match rest.find('/') {
-            Some(slash) => &rest[slash..],
-            None => rest,
-        }
-    } else {
-        path.strip_prefix("file:").unwrap_or(path)
-    }
-}
+/// `localhost`) so on-disk storage detection receives a real filesystem path;
+/// shared with the Spicepod validation in `app` through `util`.
+pub use util::spice_paths::fs_probe_path;
 
 /// How a configured directory string becomes the filesystem path it names.
 ///
@@ -104,15 +76,10 @@ pub enum PathSpelling {
 /// fails. A path this cannot place is a path whose overlap with the metastore is
 /// unknown, and every caller must refuse rather than assume.
 fn absolute_dir(path: &str, spelling: PathSpelling) -> std::io::Result<PathBuf> {
-    let raw = Path::new(match spelling {
+    absolute_fs_dir(match spelling {
         PathSpelling::Uri => fs_probe_path(path),
         PathSpelling::Verbatim => path,
-    });
-    if raw.is_absolute() {
-        Ok(raw.to_path_buf())
-    } else {
-        Ok(std::env::current_dir()?.join(raw))
-    }
+    })
 }
 
 /// Make a configured Cayenne *data* directory absolute, or `Ok(None)` when it is an
@@ -320,7 +287,7 @@ async fn compare_against(
 
 #[cfg(test)]
 mod tests {
-    use super::{absolute_data_dir, fs_probe_path, is_local_path, overlapping_metastore_dir};
+    use super::{absolute_data_dir, overlapping_metastore_dir};
 
     /// The shape both configuration surfaces exist to refuse: the metastore sits
     /// beneath the directory a recursive delete would walk.
@@ -443,46 +410,5 @@ mod tests {
             absolute_data_dir("s3://bucket/orders/").expect("an object store is not a failure"),
             None,
         );
-    }
-
-    #[test]
-    fn fs_probe_path_strips_every_file_scheme_spelling() {
-        assert_eq!(
-            fs_probe_path("file:///data/cayenne/metadata"),
-            "/data/cayenne/metadata"
-        );
-        assert_eq!(fs_probe_path("file:/data/cayenne"), "/data/cayenne");
-        // An explicit authority (e.g. localhost) is dropped down to the path.
-        assert_eq!(
-            fs_probe_path("file://localhost/data/cayenne"),
-            "/data/cayenne"
-        );
-        // Plain paths pass through unchanged.
-        assert_eq!(
-            fs_probe_path("/data/cayenne/metadata"),
-            "/data/cayenne/metadata"
-        );
-        assert_eq!(fs_probe_path("relative/metadata"), "relative/metadata");
-    }
-
-    #[test]
-    fn is_local_path_admits_local_spellings_and_refuses_object_stores() {
-        // Local absolute paths.
-        assert!(is_local_path("/data/cayenne"));
-        assert!(is_local_path("/var/spice/data"));
-
-        // Local relative paths.
-        assert!(is_local_path("./data"));
-        assert!(is_local_path("data/cayenne"));
-
-        // file:// URIs are local.
-        assert!(is_local_path("file:///data/cayenne"));
-        assert!(is_local_path("file://localhost/data"));
-
-        // Object stores are not — including a bucket whose name contains a dash run.
-        assert!(!is_local_path("s3://bucket/prefix"));
-        assert!(!is_local_path("s3://bucket-usw2-az1-x-s3/prefix"));
-        assert!(!is_local_path("gs://bucket/prefix"));
-        assert!(!is_local_path("az://container/blob"));
     }
 }

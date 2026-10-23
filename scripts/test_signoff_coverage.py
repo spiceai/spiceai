@@ -36,7 +36,7 @@ class SignoffCoverageTest(unittest.TestCase):
         self.run_ok("git", "init", "-q", "-b", "trunk")
         self.run_ok("git", "config", "user.name", "signoff test")
         self.run_ok("git", "config", "user.email", "signoff@example.invalid")
-        self.write(".gitignore", "target/\nstatus\nrefresh\nprobe.sh\n")
+        self.write(".gitignore", "target/\nstatus\ndescription\nrefresh\nprobe.sh\n")
         self.write("crates/probe/src/expected.snap", "expected\n")
         self.write("crates/probe/src/lib.rs", '''#[test]
 fn snapshot_matches() {
@@ -81,7 +81,7 @@ verify-cli:
         commit = self.run_ok(*args, stdin="fixture\n")
         self.run_ok("git", "update-ref", "HEAD", commit)
 
-    def signoff(self, env=None):
+    def signoff(self, env=None, command="cmd_signoff", args=()):
         # Keep the check runner and Make recipes intact. Replace only GitHub
         # transport and the pushed-branch precondition; nothing leaves this fixture.
         script = '''source "$1"
@@ -89,11 +89,12 @@ VCS=git
 require_tools() { :; }
 ensure_clean_and_pushed() { :; }
 repo_slug() { echo audit/fixture; }
-post_commit_status() { printf '%s\\n' "$3" > status; }
+post_commit_status() { printf '%s\\n' "$3" > status; printf '%s\\n' "$4" > description; }
 refresh_attestation_check() { printf '%s\\n' "$*" > refresh; }
-cmd_signoff
+"$2" "${@:3}"
 '''
-        return self.run_command("bash", "-c", script, "test", str(SUBJECT), env=env)
+        return self.run_command("bash", "-c", script, "test", str(SUBJECT), command, *args,
+                                env=env)
 
     def assert_rejected(self, result):
         self.assertEqual(result.returncode, 1, result.stdout)
@@ -255,6 +256,7 @@ inherits = "dev"
         self.write(".config/nextest.toml", "[profile.default]\nretries = 0\n")
         self.write("version.txt", "0.1.0\n")
         self.write("scripts/verify_cli_build.py", (REPO / "scripts/verify_cli_build.py").read_text())
+        self.write("scripts/nextest_build_targets.py", (REPO / "scripts/nextest_build_targets.py").read_text())
         self.run_ok("cargo", "generate-lockfile", "--offline")
         self.commit()
         for controls in (
@@ -276,6 +278,33 @@ inherits = "dev"
         self.assertEqual((self.root / "status").read_text().strip(), "success")
         self.assertIn("no Rust changes (lint/test skipped)", result.stdout)
         self.assertFalse((self.root / "target").exists())
+
+    def test_verify_reports_failure_without_a_status(self):
+        self.write("crates/probe/src/lib.rs", "#[test] fn wrong_rows() { assert_eq!(2, 1); }\n")
+        self.commit()
+        self.write("status", "success\n")
+        result = self.signoff(command="cmd_verify")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("wrong_rows ... FAILED", result.stdout)
+        self.assertIn("(no status posted)", result.stdout)
+        # The earlier status is untouched, and the Attestation check is not re-run.
+        self.assertEqual((self.root / "status").read_text().strip(), "success")
+        self.assertFalse((self.root / "refresh").exists())
+
+    def test_verify_passes_an_unpushed_head_without_a_status(self):
+        self.write("crates/probe/src/lib.rs", "#[test] fn right_rows() { assert_eq!(1, 1); }\n")
+        self.commit()
+        result = self.signoff(command="cmd_verify")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("lint+test passed", result.stdout)
+        self.assertFalse((self.root / "status").exists())
+
+    def test_note_replaces_the_unverified_suffix(self):
+        result = self.signoff(args=("-f", "--no-verify", "--note", "verified in batch abc"))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual((self.root / "status").read_text().strip(), "success")
+        self.assertEqual((self.root / "description").read_text().strip(),
+                         "Signed off by audit — verified in batch abc")
 
     def test_gate_features_match(self):
         result = subprocess.run(

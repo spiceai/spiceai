@@ -85,6 +85,28 @@ impl DuckDbBlobCheckpointStore {
         Ok(())
     }
 
+    fn delete_blocking(
+        pool: &Arc<DuckDbConnectionPool>,
+        dataset_name: &str,
+        table: &str,
+    ) -> Result<(), BoxedError> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut db_conn = Arc::clone(pool).connect_sync()?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)?
+            .get_underlying_conn_mut();
+
+        // The table may not exist yet: a dataset that never checkpointed has nothing
+        // to discard, and that is not an error.
+        duckdb_conn.execute(&Self::create_table_sql(table), [])?;
+        let delete = format!("DELETE FROM {table} WHERE dataset_name = ?");
+        duckdb_conn.execute(&delete, [dataset_name])?;
+        Ok(())
+    }
+
     fn get_blocking(
         pool: &Arc<DuckDbConnectionPool>,
         dataset_name: &str,
@@ -151,5 +173,17 @@ impl BlobCheckpointStore for DuckDbBlobCheckpointStore {
             source: Box::new(source),
         })?
         .map_err(|source| CheckpointError::Store { source })
+    }
+
+    async fn delete(&self) -> Result<(), CheckpointError> {
+        let pool = Arc::clone(&self.pool);
+        let dataset_name = self.dataset_name.clone();
+        let table = self.table_name;
+        tokio::task::spawn_blocking(move || Self::delete_blocking(&pool, &dataset_name, table))
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?
+            .map_err(|source| CheckpointError::Store { source })
     }
 }

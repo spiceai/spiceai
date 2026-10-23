@@ -17,6 +17,7 @@ limitations under the License.
 pub mod analyzer_rule;
 pub mod composed_catalog;
 pub mod config;
+pub mod dependent_tables;
 pub mod dialect;
 pub mod dml_guard;
 pub mod error;
@@ -41,6 +42,7 @@ pub mod session_config;
 pub use runtime_query_engine::allowlist;
 pub use runtime_query_engine::query_engine;
 pub mod sort_columns;
+pub mod table_function_params;
 pub mod udf;
 pub mod url_table;
 use snafu::prelude::*;
@@ -75,6 +77,15 @@ pub fn is_spice_internal_dataset(dataset: &datafusion::common::TableReference) -
     }
 }
 pub const SPICE_DEFAULT_SCHEMA: &str = "public";
+
+/// Normalizes a table reference to a full table reference with catalog, schema, and table name
+/// so it can be used for comparison.
+#[must_use]
+pub fn resolve_table_reference(
+    table: datafusion::common::TableReference,
+) -> datafusion::common::ResolvedTableReference {
+    table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {

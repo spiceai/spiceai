@@ -64,6 +64,7 @@ use datafusion::sql::sqlparser::tokenizer::{Location, Token, TokenWithSpan, Toke
 use datafusion_dml::CatalogDmlHandler;
 use datafusion_expr::WriteOp;
 use datafusion_expr::dml::InsertOp;
+use runtime_datafusion::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings;
 use tokio::runtime::Handle;
 
 use crate::accelerated::AcceleratedTable;
@@ -315,7 +316,18 @@ pub async fn create_logical_plan_from_statement(
         }
     }
 
-    session.statement_to_plan(statement).await
+    plan_retaining_float_spellings(statement, session).await
+}
+
+/// `session.statement_to_plan`, with the spellings of number tokens the planned
+/// `f64` literals lose recorded on them, so a float literal cast to a decimal
+/// takes the decimal the SQL spelled (#14970).
+pub(crate) async fn plan_retaining_float_spellings(
+    statement: Statement,
+    session: &SessionState,
+) -> DFResult<LogicalPlan> {
+    let spellings = FloatLiteralSpellings::collect(&statement);
+    spellings.retain(session.statement_to_plan(statement).await?)
 }
 
 async fn plan_distributed_dml(
@@ -324,7 +336,7 @@ async fn plan_distributed_dml(
     ctx: &PlannerContext,
     expected_op: WriteOp,
 ) -> DFResult<LogicalPlan> {
-    let df_plan = session.statement_to_plan(statement).await?;
+    let df_plan = plan_retaining_float_spellings(statement, session).await?;
 
     if !matches!(ctx.cluster_role, Some(ClusterRole::Scheduler)) {
         return Ok(df_plan);
@@ -349,6 +361,23 @@ async fn plan_distributed_dml(
     };
 
     if !should_rewrite {
+        // Executors hold this table's rows by partition, so a write the scheduler
+        // applies itself never reaches them, and reads filtered to the recorded
+        // partitions miss its rows.
+        if matches!(expected_op, WriteOp::Insert(_))
+            && ctx.executor_registry.as_ref().is_some_and(|registry| {
+                registry
+                    .federated_partition_store()
+                    .get_cached_table_metadata(&dml.table_name)
+                    .is_some()
+            })
+            && !is_partitioned_acceleration(session, &dml.table_name).await
+        {
+            return Err(DataFusionError::Plan(format!(
+                "Cannot write to {}: its rows are partitioned across executors, but this scheduler has not registered its acceleration. Run its CREATE TABLE IF NOT EXISTS ... WITH (acceleration ...) PARTITION BY statement again, then retry the write.",
+                dml.table_name
+            )));
+        }
         return Ok(df_plan);
     }
 
@@ -382,7 +411,10 @@ fn is_cayenne_table(session: &SessionState, table_name: &TableReference) -> bool
     }
 }
 
-async fn is_distributed_insert_table(session: &SessionState, table_name: &TableReference) -> bool {
+pub(crate) async fn is_distributed_insert_table(
+    session: &SessionState,
+    table_name: &TableReference,
+) -> bool {
     // Distributed scheduler-mode INSERT rewriting applies to both:
     // 1. Cayenne catalog tables, which must be forwarded to executors, and
     // 2. dual-write accelerated tables (Iceberg federated catalog cache), which
@@ -391,22 +423,35 @@ async fn is_distributed_insert_table(session: &SessionState, table_name: &TableR
         return true;
     }
 
+    table_provider(session, table_name)
+        .await
+        .is_some_and(|table_provider| is_dual_write_table_provider(&table_provider))
+}
+
+/// Whether `table_name` is an acceleration whose partitions the executors hold.
+async fn is_partitioned_acceleration(session: &SessionState, table_name: &TableReference) -> bool {
+    table_provider(session, table_name)
+        .await
+        .is_some_and(|table_provider| {
+            spice_table::find_layer::<AcceleratedTable>(
+                table_provider.as_ref(),
+                spice_table::LayerWalk::Read,
+            )
+            .is_some_and(|accelerated| !accelerated.is_node_local())
+        })
+}
+
+async fn table_provider(
+    session: &SessionState,
+    table_name: &TableReference,
+) -> Option<Arc<dyn TableProvider>> {
     let catalog_name = table_name.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
     let schema_name = table_name.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
-
-    let Some(catalog) = session.catalog_list().catalog(catalog_name) else {
-        return false;
-    };
-
-    let Some(schema) = catalog.schema(schema_name) else {
-        return false;
-    };
-
-    let Ok(Some(table_provider)) = schema.table(table_name.table()).await else {
-        return false;
-    };
-
-    is_dual_write_table_provider(&table_provider)
+    let schema = session
+        .catalog_list()
+        .catalog(catalog_name)?
+        .schema(schema_name)?;
+    schema.table(table_name.table()).await.ok().flatten()
 }
 
 fn is_dual_write_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {

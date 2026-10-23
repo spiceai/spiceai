@@ -43,7 +43,9 @@ pub enum Error {
     ObjectStoreRead { source: ObjectStoreError },
 
     #[snafu(display("Failed to write job state to object store: {source}"))]
-    ObjectStoreWrite { source: ObjectStoreError },
+    ObjectStoreWrite {
+        source: object_store_occ::ConditionalWriteError,
+    },
 
     #[snafu(display("Failed to delete job state from object store: {source}"))]
     ObjectStoreDelete { source: ObjectStoreError },
@@ -106,9 +108,9 @@ pub enum Error {
     JobAlreadyFinished { job_id: String, status: String },
 
     #[snafu(display(
-        "Concurrent modification detected for chunk {chunk_index} of job {job_id}. Another scheduler already wrote this chunk."
+        "Job {job_id} is driven by another scheduler, so this scheduler stopped driving it"
     ))]
-    ChunkAlreadyExists { job_id: String, chunk_index: usize },
+    JobTakenOver { job_id: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

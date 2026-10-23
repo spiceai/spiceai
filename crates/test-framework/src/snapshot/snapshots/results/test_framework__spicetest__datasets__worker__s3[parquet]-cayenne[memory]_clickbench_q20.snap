@@ -1,0 +1,12 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: clickbench_q20"
+---
++--------------------+
+| UserID             |
++--------------------+
+| 435090932899640449 |
+| 435090932899640449 |
+| 435090932899640449 |
+| 435090932899640449 |
++--------------------+

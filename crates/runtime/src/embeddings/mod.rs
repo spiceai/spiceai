@@ -67,12 +67,27 @@ mod rrf_vector_search_tests {
     static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
         LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
-    /// Shared embedding model — a single `LazyLock` prevents concurrent
-    /// `Model2Vec::from_params` calls from contending on the `HuggingFace`
-    /// file lock when tests run in parallel.
-    static TEST_EMBEDDING_MODEL: LazyLock<Arc<Model2Vec>> = LazyLock::new(|| {
-        Arc::new(
-            Model2Vec::from_params(
+    /// Shared embedding model. The `LazyLock` serializes loads within one
+    /// process; [`load_test_embedding_model`] handles the other test processes
+    /// (nextest runs each test in its own) that load the same model at once.
+    static TEST_EMBEDDING_MODEL: LazyLock<Arc<Model2Vec>> =
+        LazyLock::new(|| Arc::new(load_test_embedding_model()));
+
+    /// How many times to retry a load that found another process downloading
+    /// the model. `hf-hub` already waits about 5s for the download lock on each
+    /// attempt, so this allows roughly a minute for the download to finish.
+    const MODEL_LOCK_RETRIES: u32 = 10;
+
+    /// Loads the test embedding model, retrying while another process holds the
+    /// `HuggingFace` hub's download lock for it. On a cold cache the first process
+    /// to reach the hub downloads the files under that lock, and `hf-hub` gives
+    /// up waiting after about 5s; once the download finishes the files are read
+    /// from the cache without taking the lock, so a retry then succeeds. Any
+    /// other error fails immediately.
+    fn load_test_embedding_model() -> Model2Vec {
+        let mut attempt = 0;
+        loop {
+            match Model2Vec::from_params(
                 "minishlab/potion-base-2M",
                 None,
                 None,
@@ -80,10 +95,19 @@ mod rrf_vector_search_tests {
                 None,
                 None,
                 None,
-            )
-            .expect("Must make embedding model"),
-        )
-    });
+            ) {
+                Ok(model) => return model,
+                Err(e)
+                    if attempt < MODEL_LOCK_RETRIES
+                        && format!("{e:?}").contains("Lock acquisition failed") =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                Err(e) => panic!("Must make embedding model after {attempt} retries: {e}"),
+            }
+        }
+    }
 
     macro_rules! extract_column {
         ($batches:expr, $column_name:expr, $array_cast_fn:ident, $nth:expr) => {

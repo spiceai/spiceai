@@ -13,12 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use model_capabilities::CapabilityStore;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 mod chat;
 mod embed;
 pub mod evaluate;
+pub(crate) mod messages;
+pub(crate) mod messages_tool_history;
 pub(crate) mod metrics;
 mod model_context;
 pub(crate) mod nsql;
@@ -28,19 +31,22 @@ pub(crate) mod rate_limit;
 pub mod rerank;
 mod responses;
 mod responses_tool_history;
+mod tool_trace;
 mod tool_use;
+mod tool_use_messages;
 mod tool_use_responses;
 mod util;
 mod wrapper;
 
 pub use chat::{LLMChatCompletionsModelStore, LoadedChatModel, try_to_chat_model};
 pub use embed::{EmbeddingModelStore, try_to_embedding};
-pub use evaluate::{EvaluateModelStore, is_evaluate_only, try_to_evaluate_model};
+pub use evaluate::{EvaluateModelStore, try_to_evaluate_model};
+pub use messages::{LLMMessagesModelStore, try_to_messages_model};
 pub use model_context::{
     ModelContextExtension, ModelContextLayer, add_tools_used, track_ai_inferences_with_spice_count,
 };
 pub use rerank::{RerankerModelStore, try_to_rerank_model};
-pub use responses::{LLMResponsesModelStore, ResponsesApiSupport, try_to_responses_model};
+pub use responses::{LLMResponsesModelStore, try_to_responses_model};
 pub use tool_use::ToolUsingChat;
 pub use tool_use_responses::ToolUsingResponses;
 
@@ -48,9 +54,10 @@ pub use tool_use_responses::ToolUsingResponses;
 pub struct LlmRuntimeStores {
     completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
     responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
+    messages_llms: Arc<RwLock<LLMMessagesModelStore>>,
     evaluate_models: Arc<RwLock<EvaluateModelStore>>,
     rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
-    responses_api_support: Arc<RwLock<HashMap<String, ResponsesApiSupport>>>,
+    capabilities: Arc<RwLock<CapabilityStore>>,
 }
 
 impl Default for LlmRuntimeStores {
@@ -58,9 +65,10 @@ impl Default for LlmRuntimeStores {
         Self {
             completion_llms: Arc::new(RwLock::new(HashMap::new())),
             responses_llms: Arc::new(RwLock::new(HashMap::new())),
+            messages_llms: Arc::new(RwLock::new(HashMap::new())),
             evaluate_models: Arc::new(RwLock::new(HashMap::new())),
             rate_controllers: Arc::new(RwLock::new(HashMap::new())),
-            responses_api_support: Arc::new(RwLock::new(HashMap::new())),
+            capabilities: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -76,6 +84,13 @@ impl LlmRuntimeStores {
         Arc::clone(&self.responses_llms)
     }
 
+    /// The Messages API handlers built when a model loads, by model name (see
+    /// [`LLMMessagesModelStore`]).
+    #[must_use]
+    pub fn messages_llms(&self) -> Arc<RwLock<LLMMessagesModelStore>> {
+        Arc::clone(&self.messages_llms)
+    }
+
     #[must_use]
     pub fn evaluate_models(&self) -> Arc<RwLock<EvaluateModelStore>> {
         Arc::clone(&self.evaluate_models)
@@ -89,8 +104,8 @@ impl LlmRuntimeStores {
     }
 
     #[must_use]
-    pub fn responses_api_support(&self) -> Arc<RwLock<HashMap<String, ResponsesApiSupport>>> {
-        Arc::clone(&self.responses_api_support)
+    pub fn capabilities(&self) -> Arc<RwLock<CapabilityStore>> {
+        Arc::clone(&self.capabilities)
     }
 }
 

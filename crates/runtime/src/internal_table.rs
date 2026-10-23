@@ -30,12 +30,12 @@ use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::builder::DatasetBuilder;
 use crate::federated::FederatedTable;
 use crate::secrets::Secrets;
-use crate::status;
 use crate::{
     accelerated::{AcceleratedTable, refresh::Refresh},
     dataaccelerator::{self},
     dataconnector::{DataConnector, DataConnectorError, sink::SinkConnector},
 };
+use runtime_status as status;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -158,6 +158,7 @@ pub async fn create_internal_accelerated_table(
     );
     builder.cpu_runtime(runtime.datafusion().refresh_runtime().cloned());
     builder.write_to_accelerator_only();
+    builder.node_local();
 
     builder.retention(retention);
 

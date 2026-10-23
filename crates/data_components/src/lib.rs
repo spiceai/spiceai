@@ -61,11 +61,13 @@ pub mod ducklake;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 pub mod federation;
+pub mod file_schema_drift;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
 pub mod function_support;
 pub mod iceberg;
+pub mod incremental_append;
 pub mod inferred_schema;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;

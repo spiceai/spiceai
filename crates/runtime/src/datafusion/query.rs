@@ -189,6 +189,12 @@ pub enum Error {
     ))]
     CayenneCatalogTableNotSupportedInDistributedQuery { table: String },
 
+    #[snafu(display(
+        "Querying '{table}' via async queries API is not supported: task history is read only on \
+        the scheduler. Use the synchronous query API (/v1/sql or Flight SQL) instead."
+    ))]
+    TaskHistoryNotSupportedInDistributedQuery { table: String },
+
     #[snafu(display("Query {query_id} was cancelled"))]
     QueryCancelled { query_id: String },
 
@@ -258,6 +264,11 @@ pub(super) enum QueryRuntimeBinding {
     /// an admission permit so they share the query budget.
     #[default]
     QueryRuntime,
+    /// A read that serves a peer scheduler's query: hop onto `cpu_runtime`
+    /// like a user query, but skip query admission. The peer's query holds a
+    /// permit on its own scheduler while it waits for this read, so taking a
+    /// permit here could leave two schedulers waiting on each other.
+    QueryRuntimeUngated,
     /// Background cache warming: stay on the current runtime (the refresh
     /// runtime) and skip query admission so warming cannot stall user queries.
     CurrentRuntimeUngated,
@@ -741,10 +752,23 @@ impl Query {
                 }
             }
         }
-        if matches!(self.runtime_binding, QueryRuntimeBinding::QueryRuntime)
-            && let Some(runtime_handle) = self.df.cpu_runtime().cloned()
+        if matches!(
+            self.runtime_binding,
+            QueryRuntimeBinding::QueryRuntime | QueryRuntimeBinding::QueryRuntimeUngated
+        ) && let Some(cpu_runtime) = self.df.cpu_runtime().cloned()
             && !probe.is_servable_in_place()
         {
+            // A lookup of a few rows by primary key runs apart from the analytical
+            // queries the CPU runtime is shared by: behind hundreds of their tasks,
+            // a lookup that takes milliseconds waits for seconds.
+            let lookup_runtime = match self.df.interactive_runtime().cloned() {
+                Some(interactive) => self
+                    .reads_bounded_keys(&request_context, &interactive)
+                    .await
+                    .then_some(interactive),
+                None => None,
+            };
+            let runtime_handle = lookup_runtime.unwrap_or(cpu_runtime);
             return self
                 .run_with_managed_runtime(request_context, runtime_handle, probe, guards)
                 .await;
@@ -1104,8 +1128,19 @@ impl Query {
         }
 
         // Distributed execution doesn't currently support querying accelerated datasets
-        // or Cayenne catalog tables
+        // or Cayenne catalog tables, and task history is read only on the scheduler.
         for tr in &input_tables {
+            if tr.schema() == Some(SPICE_RUNTIME_SCHEMA)
+                && matches!(
+                    tr.table(),
+                    crate::task_history::DEFAULT_TASK_HISTORY_TABLE
+                        | crate::task_history::LOCAL_TASK_HISTORY_TABLE
+                )
+            {
+                return Err(Error::TaskHistoryNotSupportedInDistributedQuery {
+                    table: tr.to_string(),
+                });
+            }
             if self.df.is_accelerated(tr).await {
                 return Err(Error::AcceleratedTableNotSupportedInDistributedQuery {
                     table: tr.to_string(),
@@ -1186,6 +1221,41 @@ impl Query {
             .ok()
             .and_then(|guard| guard.clone())
             .ok_or(Error::SchedulerUnavailable)
+    }
+
+    /// Whether this query reads a bounded set of rows by primary key
+    /// ([`super::point_lookup::is_bounded_key_lookup`]), so that it runs on the
+    /// interactive runtime instead of queueing behind analytical work on the CPU
+    /// runtime. Plans the SQL on `interactive` to decide — through the plans cache
+    /// the query's own planning reads — and answers `false` for anything it cannot
+    /// plan, which then reports its error where it always has.
+    async fn reads_bounded_keys(
+        &self,
+        request_context: &Arc<RequestContext>,
+        interactive: &Handle,
+    ) -> bool {
+        let (sql, parameters) = match &self.sql {
+            QueryMethod::Plan(plan)
+            | QueryMethod::Text {
+                pre_parsed_plan: Some(plan),
+                ..
+            } => return super::point_lookup::is_bounded_key_lookup(plan),
+            QueryMethod::Text {
+                sql, parameters, ..
+            } => (Arc::clone(sql), parameters.clone()),
+        };
+        let df = Arc::clone(&self.df);
+        let mut session = self.get_session_state(request_context);
+        session
+            .config_mut()
+            .set_extension(Arc::clone(request_context));
+        let plan_key = Query::shared_plans_cache_key(&df, &sql, request_context);
+        let classify = Arc::clone(request_context).scope(async move {
+            df.get_or_create_logical_plan(&session, plan_key.as_ref(), &sql, parameters.as_ref())
+                .await
+                .is_ok_and(|plan| super::point_lookup::is_bounded_key_lookup(&plan))
+        });
+        interactive.spawn(classify).await.unwrap_or(false)
     }
 
     async fn run_with_managed_runtime(
@@ -1280,7 +1350,7 @@ impl Query {
         };
         let skip_query_admission = matches!(
             self.runtime_binding,
-            QueryRuntimeBinding::CurrentRuntimeUngated
+            QueryRuntimeBinding::CurrentRuntimeUngated | QueryRuntimeBinding::QueryRuntimeUngated
         );
         let query_id_str: Arc<str> = Arc::from(self.query_id.to_string());
 
@@ -1980,7 +2050,11 @@ impl Query {
                 pre_parsed_plan: Some(ref plan),
                 ..
             } => plan.clone(),
-            QueryMethod::Text { ref sql, .. } => {
+            QueryMethod::Text {
+                ref sql,
+                ref parameters,
+                ..
+            } => {
                 // Looked up under the key `get_plan_or_cached` plans under, so a
                 // statement whose schema is advertised here is not planned again
                 // when it runs, and one that has already run is not planned again
@@ -2005,6 +2079,7 @@ impl Query {
                                 &session_ctx.state(),
                                 cached_plan_key.as_ref(),
                                 sql,
+                                parameters.as_ref(),
                             )
                             .await
                     }
@@ -3641,6 +3716,136 @@ mod tests {
         assert!(is_dml_extension(&plan));
     }
 
+    /// The ids `sql` returns through the runtime query path (runtime planner,
+    /// built analyzer rules, parameter binding) from a `Decimal128(38, 17)`
+    /// column holding 4.07 (id 1) and 4.0700000000000003 (id 2), two decimals
+    /// whose nearest `f64` is the same, and 173665.47 (id 3).
+    async fn ids_matching_decimal_literal(sql: &str, parameters: Option<ParamValues>) -> Vec<i64> {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(38, 17), false),
+        ]));
+        let amounts = arrow::array::Decimal128Array::from(vec![
+            407_000_000_000_000_000_i128,
+            407_000_000_000_000_030,
+            17_366_547_000_000_000_000_000,
+        ])
+        .with_precision_and_scale(38, 17)
+        .expect("valid decimal");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(amounts)],
+        )
+        .expect("valid batch");
+        df.ctx
+            .register_batch("decimals", batch)
+            .expect("register table");
+
+        let mut query = QueryBuilder::new(sql, df)
+            .parameters(parameters)
+            .build()
+            .run()
+            .await
+            .expect("Query::run");
+        let mut ids = Vec::new();
+        while let Some(batch) = query.data.next().await {
+            let batch = batch.expect("batch");
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ids");
+            ids.extend(column.values().iter().copied());
+        }
+        ids
+    }
+
+    /// #14970 through the production path: the runtime planner must retain a
+    /// lossy token's spelling and the built analyzer rules must cast from it,
+    /// and a bound float parameter must cast through its decimal spelling.
+    #[tokio::test]
+    async fn runtime_query_casts_float_literals_to_the_decimal_they_spell() {
+        assert_eq!(
+            ids_matching_decimal_literal(
+                "SELECT id FROM decimals WHERE amount = 4.07 ORDER BY id",
+                None
+            )
+            .await,
+            vec![1]
+        );
+        // The token's f64 is 4.07's, so only its retained spelling selects id 2.
+        assert_eq!(
+            ids_matching_decimal_literal(
+                "SELECT id FROM decimals WHERE amount = 4.0700000000000003 ORDER BY id",
+                None
+            )
+            .await,
+            vec![2]
+        );
+        assert_eq!(
+            ids_matching_decimal_literal(
+                "SELECT id FROM decimals WHERE id IN \
+                 (SELECT id FROM decimals WHERE amount = 4.0700000000000003) ORDER BY id",
+                None
+            )
+            .await,
+            vec![2]
+        );
+        // A bound float has no token, so it casts through its shortest
+        // spelling; the binary cast of 173665.47 at scale 17 matches no row.
+        let parameters =
+            convert_json_to_param_values(json!([173_665.47])).expect("json to paramvalues");
+        assert_eq!(
+            ids_matching_decimal_literal(
+                "SELECT id FROM decimals WHERE amount = $1 ORDER BY id",
+                Some(parameters)
+            )
+            .await,
+            vec![3]
+        );
+    }
+
+    /// `VALUES (CAST(<lossy token> AS DECIMAL))` through `Query::run`. The
+    /// `Values` plan names its output columns, but a cast inside a row is not
+    /// one of those columns: its token spelling has to survive so the cast is
+    /// `4.0700000000000003`, not the `f64` `4.07`.
+    #[tokio::test]
+    async fn runtime_query_casts_a_values_literal_to_the_decimal_it_spells() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+        let mut query =
+            QueryBuilder::new("VALUES (CAST(4.0700000000000003 AS DECIMAL(38, 17)))", df)
+                .build()
+                .run()
+                .await
+                .expect("Query::run");
+        let mut values = Vec::new();
+        while let Some(batch) = query.data.next().await {
+            let batch = batch.expect("batch");
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Decimal128Array>()
+                .expect("decimal");
+            values.extend(column.values().iter().copied());
+        }
+        assert_eq!(values, vec![407_000_000_000_000_030]);
+    }
+
     #[tokio::test]
     async fn parameterized_query() {
         let parameters = convert_json_to_param_values(json!([41])).expect("json to paramvalues");
@@ -4284,6 +4489,189 @@ mod tests {
             } => assert_eq!(cancelled, query_id.to_string()),
             other => panic!("expected QueryCancelled, got: {other:?}"),
         }
+    }
+
+    /// A lookup of a few rows by primary key runs on the interactive runtime, so it
+    /// answers while every worker of the CPU runtime is busy with other work; a
+    /// query that is not one still queues on the CPU runtime.
+    /// Runtime workers a test holds until it opens.
+    #[derive(Default)]
+    struct WorkerGate {
+        open: parking_lot::Mutex<bool>,
+        opened: parking_lot::Condvar,
+    }
+
+    impl WorkerGate {
+        fn wait(&self) {
+            let mut open = self.open.lock();
+            while !*open {
+                self.opened.wait(&mut open);
+            }
+        }
+
+        fn open(&self) {
+            *self.open.lock() = true;
+            self.opened.notify_all();
+        }
+    }
+
+    /// Opens its gate when dropped, so a test that fails while it holds runtime
+    /// workers unwinds instead of hanging at runtime teardown.
+    struct OpenOnDrop(Arc<WorkerGate>);
+
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_lookup_answers_while_the_cpu_runtime_is_busy() {
+        use datafusion::common::{Constraint, Constraints};
+        use datafusion::datasource::MemTable;
+        use futures::TryStreamExt as _;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        fn int64_values(batches: &[RecordBatch]) -> Vec<i64> {
+            let mut values: Vec<i64> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("an Int64 column")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            values.sort_unstable();
+            values
+        }
+
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+        let cpu_runtime =
+            runtime_async::ManagedTokioRuntime::try_new().expect("the CPU runtime should start");
+        let cpu_handle = cpu_runtime.handle().clone();
+        df.set_cpu_runtime(cpu_runtime);
+        df.set_interactive_runtime(
+            runtime_async::ManagedTokioRuntime::builder()
+                .with_thread_name("test-interactive")
+                .with_worker_threads(2)
+                .build()
+                .expect("the interactive runtime should start"),
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..64)),
+                Arc::new(Int64Array::from_iter_values((0..64).map(|id| id * 10))),
+            ],
+        )
+        .expect("batch");
+        let keyed = MemTable::try_new(schema, vec![vec![batch]])
+            .expect("table")
+            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]));
+        df.ctx
+            .register_table("keyed", Arc::new(keyed))
+            .expect("register the table");
+
+        // Hold every worker of the CPU runtime until the gate opens. It also opens
+        // when this test unwinds, so a failed assertion below fails the test
+        // instead of leaving it hung on blocked workers at runtime teardown.
+        let workers = cpu_handle.metrics().num_workers();
+        let gate = Arc::new(WorkerGate::default());
+        let _open_on_unwind = OpenOnDrop(Arc::clone(&gate));
+        let held = Arc::new(AtomicUsize::new(0));
+        for _ in 0..workers {
+            let gate = Arc::clone(&gate);
+            let held = Arc::clone(&held);
+            cpu_handle.spawn(async move {
+                held.fetch_add(1, Ordering::SeqCst);
+                gate.wait();
+            });
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while held.load(Ordering::SeqCst) < workers {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only {} of {workers} CPU runtime workers were held",
+                held.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let lookup = tokio::time::timeout(Duration::from_secs(10), async {
+            let result = QueryBuilder::new(
+                "SELECT value FROM keyed WHERE id = 7 OR id = 9",
+                Arc::clone(&df),
+            )
+            .build()
+            .run()
+            .await
+            .expect("the lookup runs");
+            result
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("the lookup's rows")
+        })
+        .await;
+
+        // A query that is not a key lookup queues on the held CPU runtime. Wait until
+        // its driver is there, then check it has not run.
+        let alive_before_scan = cpu_handle.metrics().num_alive_tasks();
+        let df_scan = Arc::clone(&df);
+        let scan = tokio::spawn(async move {
+            let result = QueryBuilder::new("SELECT count(*) FROM keyed", df_scan)
+                .build()
+                .run()
+                .await
+                .expect("the scan runs");
+            result
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("the scan's rows")
+        });
+        let hop_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while cpu_handle.metrics().num_alive_tasks() <= alive_before_scan {
+            assert!(
+                tokio::time::Instant::now() < hop_deadline,
+                "the scan's driver never queued on the held CPU runtime (alive={}, before={alive_before_scan})",
+                cpu_handle.metrics().num_alive_tasks()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let scan_finished_while_held = scan.is_finished();
+        gate.open();
+
+        let lookup = lookup.expect("a key lookup must answer while the CPU runtime is busy");
+        assert_eq!(int64_values(&lookup), vec![70, 90], "the lookup's rows");
+        assert!(
+            !scan_finished_while_held,
+            "a query that is not a key lookup must run on the CPU runtime"
+        );
+        let scan = tokio::time::timeout(Duration::from_secs(10), scan)
+            .await
+            .expect("the scan finishes once the CPU runtime is free")
+            .expect("the scan task does not panic");
+        assert_eq!(int64_values(&scan), vec![64], "the scan's row count");
     }
 
     /// A query fails mid-stream as readily as during planning, and the result
@@ -5294,6 +5682,7 @@ mod tests {
         let query_id = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
         let tracker = QueryTracker {
             task_history_enabled: false,
+            log_errors: spicepod::component::runtime::QueryErrorLogging::None,
             captured_output_enabled: false,
             schema: None,
             query_duration_secs: None,
@@ -5354,6 +5743,7 @@ mod tests {
         let query_id = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
         let tracker = QueryTracker {
             task_history_enabled: false,
+            log_errors: spicepod::component::runtime::QueryErrorLogging::None,
             captured_output_enabled: false,
             schema: None,
             query_duration_secs: None,
@@ -5421,6 +5811,7 @@ mod tests {
         let query_id = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
         let tracker = QueryTracker {
             task_history_enabled: false,
+            log_errors: spicepod::component::runtime::QueryErrorLogging::None,
             captured_output_enabled: false,
             schema: None,
             query_duration_secs: None,
@@ -5850,6 +6241,47 @@ mod placeholder_type_inference {
             plan.get_parameter_types()?.into_iter().collect();
         types.sort();
         Ok(types)
+    }
+
+    /// The shortest time a disjunction of `branches` composite-key equalities takes
+    /// to plan, from SQL text to logical plan, over three tries.
+    async fn disjunction_planning_time(branches: usize) -> std::time::Duration {
+        let ctx = session();
+        let state = ctx.state();
+        let sql = format!(
+            "SELECT id FROM t WHERE {}",
+            (0..branches)
+                .map(|i| format!("(id = {i} AND name = 'n{i}' AND tagged = 't{i}')"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        );
+        let mut fastest = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            state
+                .create_logical_plan(&sql)
+                .await
+                .expect("plan the disjunction");
+            fastest = fastest.min(started.elapsed());
+        }
+        fastest
+    }
+
+    /// Planning a wide disjunction that holds no placeholder grows linearly with
+    /// its width. Placeholder inference runs on every planned expression, and the
+    /// fork's version used to look up an operand's field at every node of the
+    /// chain, rendering the operand's whole subtree each time: a lookup of 100
+    /// composite keys spent ~150 ms in planning. Four times the branches must cost
+    /// well under eight times the time; that walk costs sixteen times or more.
+    #[tokio::test]
+    async fn a_wide_disjunction_plans_in_time_linear_in_its_width() {
+        let narrow = disjunction_planning_time(100).await;
+        let wide = disjunction_planning_time(400).await;
+        assert!(
+            wide < narrow * 8,
+            "planning 400 branches took {wide:?} against {narrow:?} for 100, more than \
+             linear in the width"
+        );
     }
 
     /// Every shape one of the fork patches added inference for. A missing patch

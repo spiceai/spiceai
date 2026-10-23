@@ -20,7 +20,7 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::model::ModelContextLayer;
 use crate::request::DatabricksAuthExtension;
-use crate::status::RuntimeStatus;
+use runtime_status::RuntimeStatus;
 
 use crate::Runtime;
 use crate::cluster::ExecutorRegistry;
@@ -105,6 +105,8 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::datasets::acceleration,
         v1::datasets::refresh,
         v1::cdc::post,
+        v1::otlp::post_metrics,
+        v1::otlp::post_logs,
         v1::catalogs::get,
         v1::ready::get,
         v1::status::get,
@@ -114,6 +116,8 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::search::post,
         v1::chat::post,
         v1::responses::post,
+        v1::messages::post,
+        v1::messages::count_tokens,
         v1::models::get,
         v1::workers::get,
         v1::nsql::get_context,
@@ -135,6 +139,9 @@ use tower_http::limit::RequestBodyLimitLayer;
         DatasetQueryParams,
         DatasetFilter,
         Format,
+        // `async_openai`'s `CompoundFilter` is `no_recursion` (it contains itself through
+        // `Filter`), so `utoipa` does not collect the schemas of its fields.
+        async_openai::types::responses::CompoundType,
         evaluate_api::openai::DecisionRequest,
         evaluate_api::openai::DecisionInput,
         evaluate_api::openai::DecisionInputMessage,
@@ -410,18 +417,18 @@ pub(crate) fn routes(
     metrics_tls: bool,
     #[cfg(feature = "mcp")] mcp_config: Option<&McpConfig>,
 ) -> Router {
-    let mut authenticated_router = Router::new()
-        .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
+    // Routes that need a principal with write access. The check is a route layer so it runs
+    // after authentication and before each handler's body extractors.
+    let write_router = Router::new()
         .route("/v1/sql/active", get(v1::queries::list_active))
         .route(
             "/v1/sql/{query_id}/cancel",
             post(v1::queries::cancel_active),
         )
-        .route("/v1/status", get(v1::status::get))
-        .route("/v1/catalogs", get(v1::catalogs::get))
-        .route("/v1/functions", get(v1::functions::list))
-        .route("/v1/datasets", get(v1::datasets::get))
         .route("/v1/datasets/{name}/cdc", post(v1::cdc::post))
+        // OTLP/HTTP receivers; same handlers as the gRPC receivers on the Flight port.
+        .route(v1::otlp::METRICS_PATH, post(v1::otlp::post_metrics))
+        .route(v1::otlp::LOGS_PATH, post(v1::otlp::post_logs))
         .route(
             "/v1/datasets/{name}/acceleration/refresh",
             post(v1::datasets::refresh),
@@ -431,6 +438,20 @@ pub(crate) fn routes(
             patch(v1::datasets::acceleration),
         )
         .route(
+            "/v1/datasets/{name}/acceleration/snapshots/current",
+            post(v1::snapshots::set_current_snapshot),
+        )
+        .route("/v1/packages/generate", post(v1::packages::generate))
+        .route("/v1/queries/{query_id}/cancel", post(v1::queries::cancel))
+        .route_layer(middleware::from_fn(v1::require_write_access));
+
+    let mut authenticated_router = Router::new()
+        .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
+        .route("/v1/status", get(v1::status::get))
+        .route("/v1/catalogs", get(v1::catalogs::get))
+        .route("/v1/functions", get(v1::functions::list))
+        .route("/v1/datasets", get(v1::datasets::get))
+        .route(
             "/v1/datasets/{name}/acceleration/snapshots",
             get(v1::snapshots::list_snapshots),
         )
@@ -438,12 +459,8 @@ pub(crate) fn routes(
             "/v1/datasets/{name}/acceleration/snapshots/{snapshot_id}",
             get(v1::snapshots::get_snapshot),
         )
-        .route(
-            "/v1/datasets/{name}/acceleration/snapshots/current",
-            post(v1::snapshots::set_current_snapshot),
-        )
         .route("/v1/spicepods", get(v1::spicepods::get))
-        .route("/v1/packages/generate", post(v1::packages::generate));
+        .merge(write_router);
 
     let iceberg_router = Router::new()
         .route("/v1/config", get(v1::iceberg::get_config))
@@ -502,6 +519,14 @@ pub(crate) fn routes(
                 "/v1/responses",
                 post(v1::responses::post).layer(ModelContextLayer),
             )
+            .route(
+                v1::messages::MESSAGES_PATH,
+                post(v1::messages::post).layer(ModelContextLayer),
+            )
+            .route(
+                v1::messages::COUNT_TOKENS_PATH,
+                post(v1::messages::count_tokens),
+            )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route(
                 "/v1/decisions",
@@ -512,11 +537,16 @@ pub(crate) fn routes(
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(rt.completion_llms()))
             .layer(Extension(rt.evaluate_models()))
-            .layer(Extension(rt.responses_api_support()))
+            .layer(Extension(rt.model_capabilities()))
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
-            .layer(Extension(rt.responses_llms()));
+            .layer(Extension(rt.responses_llms()))
+            .layer(Extension(v1::messages::MessagesModels {
+                messages: rt.messages_llms(),
+                chat: rt.completion_llms(),
+                capabilities: rt.model_capabilities(),
+            }));
     }
 
     // Add async queries API routes - registered unconditionally for discoverability and consistency.
@@ -540,8 +570,7 @@ pub(crate) fn routes(
         .route(
             "/v1/queries/{query_id}/results/chunks/{chunk_index}",
             get(v1::queries::get_chunk),
-        )
-        .route("/v1/queries/{query_id}/cancel", post(v1::queries::cancel));
+        );
 
     authenticated_router = authenticated_router.merge(queries_router);
 
@@ -604,7 +633,17 @@ pub(crate) fn routes(
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
+    let otlp_metrics_service = Arc::new(crate::opentelemetry::build_metrics_service(
+        rt.datafusion(),
+        Some(Arc::downgrade(rt)),
+    ));
+    let otlp_logs_service = Arc::new(crate::opentelemetry_logs::build_logs_service(
+        rt.datafusion(),
+        Some(Arc::downgrade(rt)),
+    ));
     authenticated_router = authenticated_router
+        .layer(Extension(otlp_metrics_service))
+        .layer(Extension(otlp_logs_service))
         .layer(Extension(Arc::clone(rt)))
         // Handlers that report a model's load state take the status on its own, so they can be
         // exercised without building a `Runtime`.
@@ -633,6 +672,12 @@ pub(crate) fn routes(
     authenticated_router = authenticated_router
         .route_layer(middleware::from_fn(super::mtls::require_channel_identity));
 
+    // OTLP/HTTP needs every `/v1/metrics` and `/v1/logs` error as a `google.rpc.Status` in the
+    // request's encoding, including the auth, mTLS, and body-limit rejections above, so this
+    // wraps them.
+    authenticated_router =
+        authenticated_router.route_layer(middleware::from_fn(v1::otlp::encode_layer_errors));
+
     // The executor registry only exists when the runtime is in scheduler role; it is `None`
     // otherwise. `/v1/ready`'s executor gating reads it through this layer.
     let executor_registry: Option<Arc<ExecutorRegistry>> = rt.df.executor_registry().cloned();
@@ -648,6 +693,9 @@ pub(crate) fn routes(
         .merge(authenticated_router)
         .route_layer(middleware::from_fn(super::mtls::mtls_request_layer))
         .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
+        // The Messages API needs every `/v1/messages` error in its error envelope, including the
+        // shutdown, mTLS, auth, and body-limit rejections above, so this wraps them.
+        .route_layer(middleware::from_fn(v1::messages::encode_layer_errors))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&rt.df),
             track_metrics,
@@ -1136,13 +1184,17 @@ const CORS_ALLOWED_HEADERS: &[&str] = &[
     "mcp-name",
     "mcp-session-id",
     "x-api-key",
+    // The Messages API's own headers, which a browser client of `/v1/messages` sends.
+    "anthropic-version",
+    "anthropic-beta",
+    "anthropic-dangerous-direct-browser-access",
 ];
 
 /// Closed-set `Access-Control-Allow-Headers` when a requested name is
 /// not a valid [`HeaderValue`]. Must stay aligned with
 /// [`CORS_ALLOWED_HEADERS`].
 const CORS_ALLOWED_HEADERS_VALUE: HeaderValue = HeaderValue::from_static(
-    "accept, content-type, authorization, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, x-api-key",
+    "accept, content-type, authorization, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access",
 );
 
 fn is_allowed_cors_request_header(name: &str) -> bool {

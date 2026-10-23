@@ -64,6 +64,10 @@ mod localpod_sync;
 mod on_conflict;
 #[cfg(feature = "sqlite")]
 mod sqlite_builtin_pushdown;
+#[cfg(any(feature = "sqlite", feature = "turso"))]
+mod sqlite_interval_arithmetic;
+#[cfg(feature = "sqlite")]
+mod sqlite_query_errors;
 
 #[cfg(not(target_os = "windows"))]
 mod newest_by_time;
@@ -108,6 +112,28 @@ pub(crate) async fn trigger_refresh(
         .await
         .map_err(|e| anyhow::anyhow!("refresh_table failed for {table}: {e}"))?
         .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {table}"))?;
+    Ok(())
+}
+
+/// Queue a refresh of `table` and wait for it to complete, within `timeout`.
+pub(crate) async fn refresh_and_wait(
+    rt: &Arc<runtime::Runtime>,
+    table: &str,
+    timeout: std::time::Duration,
+) -> Result<(), anyhow::Error> {
+    let waiter = rt
+        .datafusion()
+        .refresh_table(&datafusion::common::TableReference::from(table), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("refresh_table failed for {table}: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {table}"))?;
+    let outcome = tokio::time::timeout(timeout, waiter.wait())
+        .await
+        .map_err(|_| anyhow::anyhow!("the refresh of {table} did not complete in {timeout:?}"))?;
+    anyhow::ensure!(
+        outcome.is_answered(),
+        "the refresh of {table} did not complete: {outcome:?}"
+    );
     Ok(())
 }
 
@@ -160,6 +186,30 @@ pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Opt
         ));
     }
     None
+}
+
+/// A CSV file dataset, accelerated in memory by `engine` with full refreshes,
+/// or unaccelerated when `engine` is `None`.
+#[cfg(any(feature = "sqlite", feature = "turso"))]
+pub(crate) fn csv_dataset(
+    from: &str,
+    name: &str,
+    engine: Option<&str>,
+) -> spicepod::component::dataset::Dataset {
+    let mut dataset = spicepod::component::dataset::Dataset::new(from, name);
+    dataset.params = Some(Params::from_string_map(
+        vec![("file_format".to_string(), "csv".to_string())]
+            .into_iter()
+            .collect(),
+    ));
+    dataset.acceleration = engine.map(|engine| spicepod::acceleration::Acceleration {
+        enabled: true,
+        engine: Some(engine.to_string()),
+        mode: Mode::Memory,
+        refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
+        ..spicepod::acceleration::Acceleration::default()
+    });
+    dataset
 }
 
 /// Materializes the runtime's configured datasets — the [`Dataset`] values that

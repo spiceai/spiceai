@@ -40,26 +40,6 @@ use tokio::sync::RwLock;
 
 pub type LLMResponsesModelStore = HashMap<String, Arc<dyn Responses>>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResponsesApiSupport {
-    Supported,
-    UnsupportedProvider {
-        provider: String,
-    },
-    /// Provider is a decision model (`POST /v1/decisions`); chat and Responses are unsupported.
-    EvaluateOnly {
-        provider: String,
-    },
-    Unavailable,
-}
-
-impl ResponsesApiSupport {
-    #[must_use]
-    pub fn supports_responses_api(&self) -> bool {
-        matches!(self, ResponsesApiSupport::Supported)
-    }
-}
-
 const DEFAULT_SPICE_TOOL_RECURSION_LIMIT: usize = 10;
 
 static OPENAI_RESPONSES_DEFAULT_PARAM_KEYS: LazyLock<HashSet<&'static str>> =
@@ -78,17 +58,6 @@ pub async fn try_to_responses_model(
     params: &HashMap<String, SecretString>,
     rt: Arc<Runtime>,
 ) -> Result<Arc<dyn Responses>, LlmError> {
-    let source = component.get_source().ok_or(LlmError::UnknownModelSource {
-        from: component.from.clone(),
-    })?;
-
-    if !matches!(
-        source,
-        ModelSource::OpenAi | ModelSource::Azure | ModelSource::Xai
-    ) {
-        return Err(LlmError::ResponsesNotSupported { from: source });
-    }
-
     let model = construct_model(component, params, &rt.secrets()).await?;
 
     let openai_responses_tools: Option<Vec<OpenAIResponsesTools>> =
@@ -215,11 +184,7 @@ async fn construct_model(
 pub fn get_openai_responses_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
     let mut request_overrides: HashMap<String, Value> = HashMap::new();
     for &key in OPENAI_RESPONSES_DEFAULT_PARAM_KEYS.iter() {
-        if let Some(value) = model.params.get(key) {
-            request_overrides.insert(key.to_string(), value.clone());
-        } else if let Some(value) = model.params.get(&format!("{prefix}_{key}")) {
-            request_overrides.insert(key.to_string(), value.clone());
-        } else if let Some(value) = model.params.get(&format!("openai_{key}")) {
+        if let Some(value) = crate::model::chat::request_default(model, prefix, key) {
             request_overrides.insert(key.to_string(), value.clone());
         }
     }
@@ -332,6 +297,26 @@ fn xai(model_id: Option<&str>, params: &XaiModelParams) -> Result<Arc<dyn Respon
 mod tests {
     use super::*;
     use spicepod::component::model::Model;
+
+    #[test]
+    fn a_prefixed_responses_override_takes_precedence_over_its_bare_alias() {
+        let mut model = Model::new("azure:gpt-4o", "test_model");
+        model.params.insert(
+            "prompt_cache_key".to_string(),
+            Value::String("bare".to_string()),
+        );
+        model.params.insert(
+            "azure_prompt_cache_key".to_string(),
+            Value::String("prefixed".to_string()),
+        );
+        assert_eq!(
+            get_openai_responses_request_overrides(&model, "azure"),
+            vec![(
+                "prompt_cache_key".to_string(),
+                Value::String("prefixed".to_string())
+            )]
+        );
+    }
 
     #[test]
     fn test_get_openai_responses_request_overrides_with_prompt_cache() {

@@ -768,6 +768,154 @@ async fn shared_group_single_dataset_streams_snapshot_and_changes() -> Result<()
     Ok(())
 }
 
+/// The shared pump reads the binlog for every member of its group, so it must not depend on
+/// the runtime that subscribed the first member. Here that runtime has a single worker,
+/// which is blocked once the member is ready; a change committed afterwards must still reach
+/// the member, read on the test's own runtime. A pump spawned onto the subscribing runtime
+/// never runs again, and the change never arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_pump_reads_while_the_subscribing_runtime_is_blocked() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
+
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
+    let pool = common::get_mysql_conn(port)?;
+    setup_table(&pool, "blocked", &[(1, "b1")]).await?;
+
+    // Subscribe, bootstrap and reach readiness on a one-worker runtime of its own, then
+    // hand the stream over and block that worker until the test releases it.
+    let (stream_tx, stream_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let subscriber = std::thread::spawn(move || -> Result<(), anyhow::Error> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()?;
+        let stream = runtime.block_on(async {
+            let store: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
+            let mut stream =
+                start_replication_stream(stream_input(port, 210_601, "blocked", store));
+            drain_bootstrap(&mut stream, "blocked member", &[1]).await?;
+            wait_for_ready(&mut stream, "blocked member readiness").await?;
+            Ok::<_, anyhow::Error>(stream)
+        })?;
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel::<()>();
+        runtime.spawn(async move {
+            let _ = blocked_tx.send(());
+            // Holds the runtime's only worker: nothing else on this runtime runs until
+            // the test is done.
+            let _ = release_rx.recv();
+        });
+        blocked_rx.recv()?;
+        if stream_tx.send(stream).is_err() {
+            anyhow::bail!("the test stopped waiting for the stream");
+        }
+        Ok(())
+    });
+
+    let mut stream = stream_rx.await?;
+    exec(&pool, "INSERT INTO blocked VALUES (2, 'b2')").await?;
+    let delivered = expect_single_change(
+        &mut stream,
+        "insert while the subscriber is blocked",
+        "c",
+        2,
+    )
+    .await;
+
+    release_tx.send(())?;
+    subscriber
+        .join()
+        .map_err(|_| anyhow::anyhow!("the subscribing thread panicked"))??;
+    delivered?;
+
+    drop(stream);
+    pool.disconnect().await?;
+    Ok(())
+}
+
+/// A change carries its source transaction's commit time to the millisecond. `MySQL`
+/// writes the commit time in microseconds into each transaction's GTID event; an event
+/// header has whole seconds only, which read up to a second old, and the replication-lag
+/// metrics and the freshness goal report and act on that age as lag.
+///
+/// The container shares the host clock, so each commit falls between the moment its
+/// `INSERT` is sent and the moment it returns. A whole-second time fits that window,
+/// widened by the slack, only when the window holds a whole second. The test keeps
+/// committing until three windows do not, so it tells the two apart whatever the phase
+/// of the clock.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_carries_its_source_commit_time_to_the_millisecond() -> Result<(), anyhow::Error> {
+    // Allows for the timer granularity on either side of the window.
+    const SLACK_MS: i64 = 50;
+    // Windows holding no whole second, each of which a whole-second time fails.
+    const DISCRIMINATING_WINDOWS: usize = 3;
+    // Inserts allowed to find them; a window holds a whole second about one time in eight.
+    const MAX_INSERTS: i32 = 40;
+
+    fn unix_ms() -> i64 {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch");
+        i64::try_from(since_epoch.as_millis()).expect("milliseconds since the epoch fit in i64")
+    }
+
+    /// Whether some whole second, a multiple of 1000 ms, lies in `[lo, hi]`.
+    fn holds_a_whole_second(lo: i64, hi: i64) -> bool {
+        (lo + 999).div_euclid(1000) <= hi.div_euclid(1000)
+    }
+
+    let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
+
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
+    let pool = common::get_mysql_conn(port)?;
+    setup_table(&pool, "commit_time", &[(1, "c1")]).await?;
+
+    let store: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
+    let mut stream = start_replication_stream(stream_input(port, 210_801, "commit_time", store));
+    drain_bootstrap(&mut stream, "commit_time member", &[1]).await?;
+    wait_for_ready(&mut stream, "commit_time member readiness").await?;
+
+    let mut discriminating = 0;
+    for id in 2..2 + MAX_INSERTS {
+        let sent = unix_ms();
+        exec(
+            &pool,
+            &format!("INSERT INTO commit_time VALUES ({id}, 'c{id}')"),
+        )
+        .await?;
+        let returned = unix_ms();
+        let envelope = next_change_envelope(&mut stream, "commit_time insert").await?;
+        assert_eq!(ids_of(&envelope), vec![id], "insert {id}: id");
+        let committed = envelope
+            .source_commit_ts_ms()
+            .expect("a change carries its source commit time");
+        let (lo, hi) = (sent - SLACK_MS, returned + SLACK_MS);
+        assert!(
+            (lo..=hi).contains(&committed),
+            "insert {id}: source commit time {committed} ms is outside [{sent}, {returned}] ms, \
+             when the INSERT was sent and returned"
+        );
+        envelope.commit().await?;
+        if !holds_a_whole_second(lo, hi) {
+            discriminating += 1;
+            if discriminating == DISCRIMINATING_WINDOWS {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        discriminating, DISCRIMINATING_WINDOWS,
+        "only {discriminating} windows held no whole second, so the test could not tell a \
+         whole-second time from the commit time"
+    );
+
+    drop(stream);
+    pool.disconnect().await?;
+    Ok(())
+}
+
 /// A purged resume position with `invalid_checkpoint_behavior: restart` must
 /// rebuild the member in place instead of fatally erroring — for BOTH the
 /// file+offset and GTID positioning paths (a purge surfaces as `MySQL` error 1236

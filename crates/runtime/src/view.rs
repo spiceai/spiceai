@@ -14,102 +14,46 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
-    component::view::View, embeddings::index::table::wrap_table_as_index,
-    search::full_text::table::add_full_text_search_to_table,
+    component::view::View, dataaccelerator::spice_sys::dataset_checkpointer,
+    datafusion::TableInstance, embeddings::index::table::wrap_table_as_index,
+    search::full_text::table::add_full_text_search_to_table, status::RuntimeStatus,
 };
-use ::datafusion::{
-    common::TableReference,
-    sql::{parser, sqlparser::ast},
-};
+use ::datafusion::sql::parser;
+use arrow_schema::SchemaRef;
+use arrow_tools::schema::schema_difference;
+use async_trait::async_trait;
 use datafusion::{
     catalog::TableProvider,
+    common::TableReference,
     datasource::ViewTable,
     error::{DataFusionError, Result},
     prelude::SessionContext,
 };
+use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_search::embeddings::{table::EmbeddingTable, warm_index_on_zero_results};
+use runtime_table::refresh_source::{RefreshSource, RefreshSourceError};
 use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
-use std::{collections::HashSet, sync::Arc};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
-pub(crate) fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {
-    let mut table_names = Vec::new();
-    let mut cte_names = HashSet::new();
-
-    if let parser::Statement::Statement(statement) = statement.clone()
-        && let ast::Statement::Query(statement) = *statement
-    {
-        // Collect names of CTEs
-        if let Some(with) = statement.with {
-            for table in with.cte_tables {
-                cte_names.insert(TableReference::bare(table.alias.name.to_string()));
-                let cte_table_names = get_dependent_table_names(&parser::Statement::Statement(
-                    Box::new(ast::Statement::Query(table.query)),
-                ));
-                // Extend table_names with names found in CTEs if they reference actual tables
-                table_names.extend(cte_table_names);
-            }
-        }
-        // Extract table names from the main query
-        table_names.extend(extract_tables_from_set_expr(&statement.body, &cte_names));
-    }
-
-    // Filter out CTEs and temporary views (aliases of subqueries)
-    table_names
-        .into_iter()
-        .filter(|name| !cte_names.contains(name))
-        .collect()
-}
-
-fn extract_tables_from_set_expr(
-    expr: &ast::SetExpr,
-    cte_names: &HashSet<TableReference>,
-) -> Vec<TableReference> {
-    match expr {
-        ast::SetExpr::Select(select_statement) => {
-            let mut table_names = vec![];
-            for from in &select_statement.from {
-                let mut relations = vec![from.relation.clone()];
-                for join in &from.joins {
-                    relations.push(join.relation.clone());
-                }
-
-                for relation in relations {
-                    match relation {
-                        ast::TableFactor::Table { name, .. } => {
-                            let table_ref = name.to_string().into();
-                            if !cte_names.contains(&table_ref) {
-                                table_names.push(table_ref);
-                            }
-                        }
-                        ast::TableFactor::Derived { subquery, .. } => {
-                            table_names.extend(get_dependent_table_names(
-                                &parser::Statement::Statement(Box::new(ast::Statement::Query(
-                                    subquery,
-                                ))),
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            table_names
-        }
-        ast::SetExpr::SetOperation { left, right, .. } => {
-            let mut table_names = extract_tables_from_set_expr(left, cte_names);
-            table_names.extend(extract_tables_from_set_expr(right, cte_names));
-            table_names
-        }
-        _ => vec![],
-    }
-}
+pub(crate) use runtime_datafusion::dependent_tables::get_dependent_table_names;
 
 pub(crate) async fn prepare_view(
     ctx: &SessionContext,
     statement: &parser::Statement,
     view: &Arc<View>,
 ) -> Result<Arc<dyn TableProvider>> {
-    let plan = ctx.state().statement_to_plan(statement.clone()).await?;
+    // Keep the spellings of float tokens the planned `f64` literals lose, as the
+    // query planner does, so a view filtering a decimal column on such a literal
+    // matches what its SQL says.
+    let plan = runtime_datafusion::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings::collect(statement)
+        .retain(ctx.state().statement_to_plan(statement.clone()).await?)?;
     let view_table = ViewTable::new(plan, Some(view.sql.to_string()));
     let mut tbl_provider = Arc::new(view_table) as Arc<dyn TableProvider>;
 
@@ -169,172 +113,132 @@ pub(crate) async fn prepare_view(
     Ok(tbl_provider)
 }
 
-#[cfg(test)]
-mod tests {
-    use datafusion::sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
+/// How [`crate::datafusion::DataFusion::register_view`] may start an accelerated view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewStart {
+    /// Serve its existing acceleration, if it has one, while its plan is built.
+    ExistingAcceleration,
+    /// Build its plan first: its existing acceleration was built from another
+    /// definition.
+    Definition,
+}
 
-    use super::*;
+/// The source of an accelerated view registered from its existing acceleration
+/// before the tables it reads have loaded: the view's own plan, built once every
+/// table it reads is ready. `read_provider` waits for them rather than failing, so
+/// the plan resolves as soon as they are ready instead of at the next backoff step.
+///
+/// A plan whose schema is not the acceleration's means the view was redefined since
+/// the acceleration was built: the view is registered again from its definition, and
+/// this source never resolves.
+pub(crate) struct ViewRefreshSource {
+    ctx: Arc<SessionContext>,
+    statement: parser::Statement,
+    view: Arc<View>,
+    reads: Vec<TableReference>,
+    status: Arc<RuntimeStatus>,
+    served_schema: SchemaRef,
+    redefined: AtomicBool,
+    registered: tokio::sync::watch::Sender<Option<TableInstance>>,
+}
 
-    #[tokio::test]
-    async fn test_get_dependent_table_names_with_simple_query() {
-        let sql = r"
-            SELECT a, b FROM employees limit 10;
-        ";
-
-        let actual_table_names = extract_table_names_from_sql(sql);
-
-        let expected_table_names: HashSet<_> = vec![TableReference::bare("employees".to_string())]
-            .into_iter()
-            .collect();
-
-        assert_eq!(expected_table_names, actual_table_names);
+impl ViewRefreshSource {
+    pub(crate) fn new_arc(
+        ctx: Arc<SessionContext>,
+        statement: parser::Statement,
+        view: Arc<View>,
+        reads: Vec<TableReference>,
+        status: Arc<RuntimeStatus>,
+        served_schema: SchemaRef,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            ctx,
+            statement,
+            view,
+            reads,
+            status,
+            served_schema,
+            redefined: AtomicBool::new(false),
+            registered: tokio::sync::watch::Sender::new(None),
+        })
     }
 
-    #[tokio::test]
-    async fn test_get_dependent_table_names_with_schema() {
-        let sql = r"
-            SELECT a, b FROM dbo.employees limit 10;
-        ";
-
-        let actual_table_names = extract_table_names_from_sql(sql);
-
-        let expected_table_names: HashSet<TableReference> =
-            vec!["dbo.employees".into()].into_iter().collect();
-
-        assert_eq!(expected_table_names, actual_table_names);
+    /// Records the table the view is registered as against this source. A redefined
+    /// view is registered again only after that, so the new registration replaces this
+    /// one rather than being replaced by it, and only while that table is still the
+    /// one registered.
+    pub(crate) fn mark_registered(&self, instance: TableInstance) {
+        self.registered.send_replace(Some(instance));
     }
 
-    #[tokio::test]
-    async fn test_get_dependent_table_names_with_joins() {
-        let sql = r"
-            SELECT e.name, d.department_name
-            FROM employees e
-            JOIN departments d ON e.department_id = d.id
-        ";
-
-        let actual_table_names = extract_table_names_from_sql(sql);
-
-        let expected_table_names: HashSet<TableReference> =
-            vec!["employees".into(), "departments".into()]
-                .into_iter()
-                .collect();
-
-        assert_eq!(expected_table_names, actual_table_names);
+    /// The view's plan, built once every table it reads is ready, or `None` when it does
+    /// not serve the acceleration's schema: the view was redefined.
+    pub(crate) async fn plan_on_served_schema(&self) -> Result<Option<Arc<dyn TableProvider>>> {
+        let provider = self.plan().await?;
+        Ok(schema_difference(&self.served_schema, &provider.schema())
+            .is_none()
+            .then_some(provider))
     }
 
-    #[tokio::test]
-    async fn test_get_dependent_table_names_with_cte_and_join() {
-        let sql = r"
-            WITH tmp AS (
-                SELECT * FROM t1
-            )
-            SELECT tmp.id, t2.name
-            FROM tmp
-            JOIN t2 ON tmp.id = t2.id;
-        ";
+    async fn plan(&self) -> Result<Arc<dyn TableProvider>> {
+        crate::datafusion::wait_until_dependent_tables_are_ready(
+            &self.view.name,
+            &self.reads,
+            &self.status,
+        )
+        .await;
+        prepare_view(&self.ctx, &self.statement, &self.view).await
+    }
+}
 
-        let actual_table_names = extract_table_names_from_sql(sql);
+impl std::fmt::Debug for ViewRefreshSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ViewRefreshSource")
+            .field("view", &self.view.name)
+            .field("reads", &self.reads)
+            .finish_non_exhaustive()
+    }
+}
 
-        let expected_table_names: HashSet<TableReference> =
-            vec!["t1".into(), "t2".into()].into_iter().collect();
-
-        assert_eq!(expected_table_names, actual_table_names);
+#[async_trait]
+impl RefreshSource for ViewRefreshSource {
+    fn resolve_refresh_mode(&self, _requested: Option<RefreshMode>) -> RefreshMode {
+        // `ViewBuilder::try_from` rejects every refresh mode but `full`.
+        RefreshMode::Full
     }
 
-    #[tokio::test]
-    async fn test_get_dependent_table_names_with_cte_and_union() {
-        let sql = r"
-            WITH all_sales AS (
-                SELECT sales FROM s3_source
-                UNION ALL
-                SELECT fare_amount + tip_amount AS sales FROM dremio_source
-            )
-            SELECT SUM(sales) AS total_sales,
-                   COUNT(*) AS total_transactions,
-                   MAX(sales) AS max_sale,
-                   AVG(sales) AS avg_sale
-            FROM all_sales;
-        ";
-
-        let actual_table_names = extract_table_names_from_sql(sql);
-
-        let expected_table_names: HashSet<TableReference> =
-            vec!["s3_source".into(), "dremio_source".into()]
-                .into_iter()
-                .collect();
-
-        assert_eq!(expected_table_names, actual_table_names);
+    async fn read_provider(
+        &self,
+    ) -> std::result::Result<Arc<dyn TableProvider>, RefreshSourceError> {
+        let provider = self
+            .plan()
+            .await
+            .map_err(|e| Box::new(e) as RefreshSourceError)?;
+        if schema_difference(&self.served_schema, &provider.schema()).is_some() {
+            if !self.redefined.swap(true, Ordering::SeqCst) {
+                let mut registered = self.registered.subscribe();
+                if let Ok(instance) = registered.wait_for(Option::is_some).await
+                    && let Some(instance) = instance.clone()
+                {
+                    tokio::spawn(
+                        Arc::clone(&self.view.runtime)
+                            .reregister_view_from_definition(Arc::clone(&self.view), instance),
+                    );
+                }
+            }
+            std::future::pending::<()>().await;
+        }
+        Ok(provider)
     }
 
-    #[tokio::test]
-    async fn test_get_dependent_table_names_with_nested_subqueries() {
-        let sql = r"
-            SELECT * FROM (
-                SELECT * FROM (
-                    SELECT * FROM orders
-                ) AS subquery1
-            ) AS subquery2
-        ";
-
-        let actual_table_names = extract_table_names_from_sql(sql);
-
-        let expected_table_names: HashSet<TableReference> =
-            vec!["orders".into()].into_iter().collect();
-
-        assert_eq!(expected_table_names, actual_table_names);
-    }
-
-    fn extract_table_names_from_sql(sql: &str) -> HashSet<TableReference> {
-        let statements =
-            DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}).expect("to parse sql");
-        assert_eq!(statements.len(), 1);
-
-        let table_names = get_dependent_table_names(&statements[0]);
-        table_names.into_iter().collect()
-    }
-
-    #[tokio::test]
-    async fn test_get_dependent_table_names_with_cte_and_multiple_queries() {
-        let sql = r"
-            WITH cte1 AS (
-                SELECT * FROM table1
-            ), cte2 AS (
-                SELECT * FROM table2
-            )
-            SELECT * FROM cte1
-            UNION ALL
-            SELECT * FROM cte2
-            UNION
-            SELECT * FROM table3
-        ";
-
-        let actual_table_names = extract_table_names_from_sql(sql);
-
-        let expected_table_names: HashSet<TableReference> =
-            vec!["table1".into(), "table2".into(), "table3".into()]
-                .into_iter()
-                .collect();
-
-        assert_eq!(expected_table_names, actual_table_names);
-    }
-
-    #[tokio::test]
-    async fn test_get_dependent_table_names_with_set_operations() {
-        let sql = r"
-            SELECT * FROM table1
-            UNION
-            SELECT * FROM table2
-            INTERSECT
-            SELECT * FROM table3
-        ";
-
-        let actual_table_names = extract_table_names_from_sql(sql);
-
-        let expected_table_names: HashSet<TableReference> =
-            vec!["table1".into(), "table2".into(), "table3".into()]
-                .into_iter()
-                .collect();
-
-        assert_eq!(expected_table_names, actual_table_names);
+    async fn checkpointer(&self) -> Option<Arc<dyn DatasetCheckpointer>> {
+        dataset_checkpointer(
+            self.view.as_ref(),
+            self.view.runtime.accelerator_engine_registry(),
+            OpenOption::OpenExisting,
+            SnapshotBehavior::Disabled,
+        )
+        .await
+        .ok()
     }
 }

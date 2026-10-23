@@ -22,11 +22,13 @@ pub mod decisions;
 pub mod embeddings;
 pub mod functions;
 pub mod iceberg;
+pub mod messages;
 pub mod responses;
 pub mod snapshots;
 
 pub mod models;
 pub mod nsql;
+pub mod otlp;
 pub mod packages;
 pub mod queries;
 pub mod query;
@@ -58,7 +60,8 @@ use arrow::{array::RecordBatch, datatypes::SchemaRef, util::pretty::pretty_forma
 use async_stream::try_stream;
 use axum::{
     body::Body,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Response},
 };
 use axum_extra::TypedHeader;
@@ -84,6 +87,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use runtime_auth::AuthPrincipalRef;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
+use crate::datafusion::error::is_partitions_unavailable;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 #[cfg(feature = "openapi")]
 use utoipa::{
@@ -119,18 +123,34 @@ pub(crate) async fn current_principal_requires_read_only() -> bool {
         .is_some_and(|principal| !principal_has_write_access(principal))
 }
 
-pub(crate) async fn require_write_access() -> Option<Response> {
+/// Denies an OTLP gRPC export from a read-only API key. The OTLP gRPC services run on the
+/// Flight server, outside the [`require_write_access`] route layer, so each export handler
+/// calls this before it reads the request. With authentication disabled there is no
+/// principal, and the export is allowed.
+pub(crate) async fn ensure_otlp_grpc_write_access() -> Result<(), tonic::Status> {
     if current_principal_requires_read_only().await {
-        Some(
-            (
-                StatusCode::FORBIDDEN,
-                axum::Json(json!({ "message": "API key does not allow write access" })),
-            )
-                .into_response(),
-        )
-    } else {
-        None
+        return Err(tonic::Status::permission_denied(
+            "API key does not allow write access",
+        ));
     }
+    Ok(())
+}
+
+/// Route layer for routes that need a principal with write access.
+///
+/// It must sit inside the authentication layer, which sets the principal, and run as a
+/// layer rather than inside the handler: a handler's body extractors reject a request
+/// (415, 422) before the handler body runs, which would tell a read-only caller the
+/// route's request schema instead of answering 403.
+pub(crate) async fn require_write_access(req: Request<Body>, next: Next) -> Response {
+    if current_principal_requires_read_only().await {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({ "message": "API key does not allow write access" })),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 fn status_for_sql_error(message: &str) -> StatusCode {
@@ -412,6 +432,9 @@ enum SqlErrorKind {
     /// separately so it can be logged as the operator-actionable condition it
     /// is and answered with a retriable status.
     ResourcesExhausted,
+    /// A cluster scheduler cannot yet reach executors that hold the data the
+    /// query reads; a retry can succeed.
+    Unavailable,
 }
 
 impl SqlErrorKind {
@@ -419,6 +442,13 @@ impl SqlErrorKind {
         match e {
             QueryError::QueryCancelled { .. } => Self::Cancellation,
             QueryError::QueryTimedOut { .. } => Self::Timeout,
+            QueryError::UnableToExecuteQuery { source }
+            | QueryError::UnableToCreateMemoryStream { source }
+            | QueryError::UnableToCollectResults { source }
+                if is_partitions_unavailable(source) =>
+            {
+                Self::Unavailable
+            }
             _ => Self::General,
         }
     }
@@ -430,6 +460,8 @@ impl SqlErrorKind {
             Self::Timeout
         } else if ErrorCode::from(e) == ErrorCode::ResourcesExhausted {
             Self::ResourcesExhausted
+        } else if is_partitions_unavailable(e) {
+            Self::Unavailable
         } else {
             Self::General
         }
@@ -458,7 +490,9 @@ fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
         // a hard failure for a query that would likely succeed on another
         // replica. Flight already reports the same failure as the retriable
         // `RESOURCE_EXHAUSTED`.
-        SqlErrorKind::ResourcesExhausted => StatusCode::SERVICE_UNAVAILABLE,
+        SqlErrorKind::ResourcesExhausted | SqlErrorKind::Unavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         SqlErrorKind::General => status_for_sql_error(&message),
     };
     (status, message).into_response()
@@ -903,6 +937,39 @@ mod tests {
             SqlErrorKind::of_datafusion_error(&stream_cancel),
         );
         assert_eq!(response.status().as_u16(), 499);
+    }
+
+    /// A query a cluster scheduler cannot route yet is answered 503, which
+    /// clients and load balancers retry: from the planning error the query
+    /// API returns and from a streamed error alike.
+    #[test]
+    fn sql_error_response_classifies_unavailable_partitions() {
+        let unavailable = || {
+            datafusion::error::DataFusionError::Context(
+                "partitioned_table_scan_rewrite".to_string(),
+                Box::new(datafusion::error::DataFusionError::External(
+                    crate::datafusion::error::SpiceExternalError::partitions_unavailable(
+                        "Cannot query t: no ready executor serves 1 of its 2 partitions; retry the query"
+                            .to_string(),
+                    ),
+                )),
+            )
+        };
+        let planning = QueryError::UnableToExecuteQuery {
+            source: unavailable(),
+        };
+        let response = sql_error_response(
+            planning.to_string(),
+            SqlErrorKind::of_query_error(&planning),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let streamed = unavailable();
+        let response = sql_error_response(
+            streamed.to_string(),
+            SqlErrorKind::of_datafusion_error(&streamed),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// A memory-pool refusal has to be told apart from the cancellation and

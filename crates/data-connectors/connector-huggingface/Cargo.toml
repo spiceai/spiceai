@@ -18,6 +18,7 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "Hugging Face Hub datasets data connector for Spice.ai runtime"
 
 [dependencies]
@@ -30,29 +31,26 @@ datafusion.workspace = true
 futures.workspace = true
 # The same `glob` `ListingTableUrl` takes a pattern from.
 glob = "0.3.3"
+huggingface-hub = { path = "../../huggingface-hub" }
 linkme.workspace = true
-moka.workspace = true
 object_store.workspace = true
 parking_lot.workspace = true
-percent-encoding.workspace = true
-reqwest = { workspace = true, features = ["stream"] }
 runtime-component = { path = "../../runtime-component" }
 runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-object-store = { path = "../../runtime-object-store" }
 runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
-util = { path = "../../util", default-features = false }
 
 [dev-dependencies]
 arrow.workspace = true
 axum.workspace = true
 parquet.workspace = true
+percent-encoding.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

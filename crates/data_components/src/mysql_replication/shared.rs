@@ -113,9 +113,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::binlog::{
     AdoptedLayout, MIN_VALID_EVENT_POS, QueryKind, StatementKind, adopt_current_layout,
-    classify_query, classify_statement, commit_ts_ms, compute_pk_source_indexes,
+    classify_query, classify_statement, compute_pk_source_indexes, immediate_commit_ts_ms,
     layout_event_mismatch, log_transient_reconnect, open_binlog_stream, purged_position_error,
-    readiness_heartbeat, record_watermark,
+    readiness_heartbeat, record_watermark, transaction_commit_ts_ms,
 };
 use super::changes::{MemberLayout, MysqlChangeRows};
 use super::config::{BinlogPosition, ReplicationParams};
@@ -956,11 +956,7 @@ async fn attach_member(
     );
 
     if !source.pump_started.swap(true, Ordering::AcqRel) {
-        let pump_source = Arc::clone(source);
-        tokio::spawn(run_pump(
-            pump_source,
-            crate::cdc::ShutdownDrainGuard::hold(),
-        ));
+        spawn_pump(Arc::clone(source));
     } else if !snapshotting {
         // A resuming/rejoining member needs the pump to reconnect so it
         // repositions to the (possibly lower) new min and re-runs promotion. A
@@ -1393,6 +1389,73 @@ fn apply_invalid_checkpoint(
     }
 }
 
+/// Start the shared pump on a thread of its own, driven by its own current-thread runtime.
+///
+/// The pump reads the dump socket for every member of the group, so every moment it waits
+/// to be polled is a moment the socket goes undrained: the source then stalls in TCP flow
+/// control and the whole group falls behind together. Spawned onto the CDC apply runtime,
+/// the pump's yields queued behind the members' own apply work, and under a sustained
+/// stream that capped how fast the group could replicate. On its own thread a yield
+/// returns to the pump at once.
+///
+/// If the thread cannot be started, or its runtime cannot be built, the pump runs on the
+/// current runtime instead.
+fn spawn_pump(source: Arc<SharedSource>) {
+    spawn_pump_with(source, |pump| {
+        std::thread::Builder::new()
+            .name("mysql-binlog-pump".to_string())
+            .spawn(pump)
+            .map(drop)
+    });
+}
+
+/// [`spawn_pump`], with the thread started by `start_thread` so that a test can make the
+/// start fail.
+///
+/// A start that fails drops the closure it was given, as [`std::thread::Builder::spawn`]
+/// does, and so drops it on the subscribing task. Tokio panics when a runtime is dropped
+/// from an async context, so the closure builds the pump's runtime on the new thread
+/// rather than carrying one in.
+fn spawn_pump_with(
+    source: Arc<SharedSource>,
+    start_thread: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) {
+    let current = tokio::runtime::Handle::current();
+    let thread_current = current.clone();
+    let thread_source = Arc::clone(&source);
+    // Both guards are taken before the start, so the drain counts the pump wherever it
+    // ends up running: a start that fails drops the thread's guard with the closure, and
+    // the fallback runs on the guard it already holds.
+    let thread_guard = crate::cdc::ShutdownDrainGuard::hold();
+    let guard = crate::cdc::ShutdownDrainGuard::hold();
+    let pump = move || match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(run_pump(thread_source, thread_guard)),
+        Err(e) => {
+            warn_pump_on_current_runtime(&thread_source, &e);
+            thread_current.spawn(run_pump(thread_source, thread_guard));
+        }
+    };
+    match start_thread(Box::new(pump)) {
+        Ok(()) => drop(guard),
+        Err(e) => {
+            warn_pump_on_current_runtime(&source, &e);
+            current.spawn(run_pump(source, guard));
+        }
+    }
+}
+
+fn warn_pump_on_current_runtime(source: &SharedSource, error: &std::io::Error) {
+    tracing::warn!(
+        connection = %source.key.label(),
+        error = %error,
+        "Failed to start a dedicated thread to read the MySQL binlog for connection '{}', so the binlog is read on the shared CDC apply runtime and replication may fall behind under a heavy write load. Cause: {error}",
+        source.key.label()
+    );
+}
+
 /// Mark the source dead and drop it from the registry (only if the registry
 /// still points at this instance).
 fn finish_pump(source: &Arc<SharedSource>) {
@@ -1614,6 +1677,9 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
         // `GtidEvent`, folded into members' executed sets at commit/idle-credit).
         // `None` between transactions or when not GTID-positioning.
         let mut current_txn_gtid: Option<(uuid::Uuid, u64)> = None;
+        // Commit time of the transaction currently being read, in milliseconds, from
+        // its GTID event; taken by the commit or statement that closes it.
+        let mut current_txn_commit_ts_ms: Option<i64> = None;
 
         'recv: loop {
             if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -1862,7 +1928,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                         &routes,
                         std::mem::take(&mut txn),
                         &commit_pos,
-                        event_timestamp,
+                        transaction_commit_ts_ms(current_txn_commit_ts_ms.take(), event_timestamp),
                         shutdown_epoch,
                         current_txn_gtid,
                     )
@@ -1885,7 +1951,10 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                                 &routes,
                                 std::mem::take(&mut txn),
                                 &commit_pos,
-                                event_timestamp,
+                                transaction_commit_ts_ms(
+                                    current_txn_commit_ts_ms.take(),
+                                    event_timestamp,
+                                ),
                                 shutdown_epoch,
                                 current_txn_gtid,
                             )
@@ -1901,7 +1970,10 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                                 &default_db,
                                 &current_file,
                                 event_end_pos,
-                                event_timestamp,
+                                transaction_commit_ts_ms(
+                                    current_txn_commit_ts_ms.take(),
+                                    event_timestamp,
+                                ),
                                 shutdown_epoch,
                                 current_txn_gtid,
                             )
@@ -1925,8 +1997,10 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                     txn_open = true;
                     current_txn_gtid =
                         Some((uuid::Uuid::from_bytes(gtid_event.sid()), gtid_event.gno()));
+                    current_txn_commit_ts_ms =
+                        immediate_commit_ts_ms(gtid_event.immediate_commit_timestamp());
                 }
-                Some(EventData::AnonymousGtidEvent(_)) => {
+                Some(EventData::AnonymousGtidEvent(anonymous)) => {
                     // An anonymous transaction carries no GTID. Under GTID
                     // positioning it must not happen (source not fully
                     // `gtid_mode = ON`): the executed set could not describe it,
@@ -1946,6 +2020,8 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                     }
                     txn_open = true;
                     current_txn_gtid = None;
+                    current_txn_commit_ts_ms =
+                        immediate_commit_ts_ms(anonymous.0.immediate_commit_timestamp());
                 }
                 Some(_) | None => {}
             }
@@ -2020,11 +2096,10 @@ async fn deliver_commit(
     routes: &FxHashMap<u64, Route>,
     txn: FxHashMap<u64, Vec<RowsEventData<'static>>>,
     commit_pos: &BinlogPosition,
-    event_timestamp: u32,
+    commit_ts: Option<i64>,
     shutdown_epoch: u64,
     gtid: Option<(uuid::Uuid, u64)>,
 ) {
-    let commit_ts = commit_ts_ms(event_timestamp);
     for (table_id, events) in txn {
         if events.is_empty() {
             continue;
@@ -2044,7 +2119,7 @@ async fn deliver_commit(
         }
         // O(1), no decode: freshness watermark + transaction count. The per-row
         // op counters are recorded off-pump in `MysqlChangeRows::build`.
-        record_watermark(&member.metrics, event_timestamp);
+        record_watermark(&member.metrics, commit_ts);
         member.metrics.inc_transaction();
         let is_ready = crate::cdc::source_commit_within_ready_lag(commit_ts, member.ready_lag);
         // Hand the OWNED payload + immutable layout/columns snapshots downstream;
@@ -2102,7 +2177,7 @@ async fn handle_statement(
     default_db: &str,
     current_file: &str,
     event_end_pos: u64,
-    event_timestamp: u32,
+    commit_ts: Option<i64>,
     shutdown_epoch: u64,
     gtid: Option<(uuid::Uuid, u64)>,
 ) {
@@ -2125,8 +2200,7 @@ async fn handle_statement(
                 }
                 member.metrics.inc_truncate();
                 member.metrics.inc_transaction();
-                record_watermark(&member.metrics, event_timestamp);
-                let commit_ts = commit_ts_ms(event_timestamp);
+                record_watermark(&member.metrics, commit_ts);
                 let batch = {
                     let g = lock(&member.layout);
                     build_change_batch(
@@ -3413,6 +3487,46 @@ mod tests {
             stalled,
             "a successful send must not accrue stall time"
         );
+    }
+
+    /// A pump whose thread cannot start runs on the current runtime instead. The failed
+    /// start drops the closure it was given here, on the subscribing task, where dropping a
+    /// runtime panics, so the closure must not carry one.
+    #[tokio::test]
+    async fn a_pump_whose_thread_cannot_start_runs_on_the_current_runtime() {
+        // Nothing listens on a port just released, so the pump's first connection fails at
+        // once instead of reaching a server that happens to run on this machine.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("bind an ephemeral port")
+            .port();
+        let mut params = test_params();
+        params.opts =
+            mysql_async::Opts::from_url(&format!("mysql://user:pass@127.0.0.1:{port}/db"))
+                .expect("parse test connection url");
+        let key = SourceKey {
+            host: "127.0.0.1".to_string(),
+            port,
+            user: "user".to_string(),
+            pass: None,
+            ssl: None,
+            server_id: params.server_id,
+        };
+        let source = Arc::new(SharedSource::new(key, params));
+
+        spawn_pump_with(Arc::clone(&source), |pump| {
+            drop(pump);
+            Err(std::io::Error::other("the test refuses to start a thread"))
+        });
+
+        // With no members, the pump finishes, and marks its source dead, as soon as it runs.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !source.dead.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the pump should run on the current runtime and finish");
     }
 
     #[tokio::test]

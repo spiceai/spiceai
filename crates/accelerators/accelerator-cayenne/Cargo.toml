@@ -20,6 +20,7 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "Cayenne data accelerator: implements data-accelerator-api::DataAccelerator over the native Cayenne engine."
 
 [dependencies]
@@ -51,6 +52,7 @@ tracing.workspace = true
 byte-unit.workspace = true
 cpu-budget = { path = "../../cpu-budget" }
 aws-config.workspace = true
+aws-smithy-http-client.workspace = true
 bytes.workspace = true
 opentelemetry.workspace = true
 runtime-secrets = { path = "../../runtime-secrets" }
@@ -87,7 +89,7 @@ tracing-subscriber.workspace = true
 tempfile.workspace = true
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite", "test-support"] }
 datafusion-table-providers = { workspace = true, features = ["sqlite"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 
 [lints]
 workspace = true

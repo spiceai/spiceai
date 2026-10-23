@@ -394,12 +394,19 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Atomically commit deletion-vector rows and an inline-data rewrite for
     /// one logical delete. A failure leaves both catalog areas unchanged.
+    ///
+    /// `replaced_delete_file_ids` names delete-file rows that `delete_files`
+    /// supersede: a position deletion vector that holds every position deleted
+    /// from its data file replaces the earlier ones for that file. They are
+    /// removed in the same transaction, so no reader sees a file's deletions
+    /// missing or counted from two rows.
     async fn commit_delete_files_with_inlined_rewrite(
         &self,
         delete_files: Vec<DeleteFile>,
         table_id: &str,
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
+        replaced_delete_file_ids: Vec<String>,
     ) -> CatalogResult<()>;
 
     /// Get all active delete files for a table (across all virtual files).

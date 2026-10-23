@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, collections::HashSet, sync::Arc};
+use std::{collections::HashMap, collections::HashSet, collections::VecDeque, sync::Arc};
 
 use tokio_util::sync::CancellationToken;
 
@@ -22,9 +22,10 @@ use crate::{
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, LogErrors, Result,
     Runtime, UnableToAttachViewSnafu,
     component::view::{View, ViewBuilder},
-    datafusion::{DeferredRefreshOutcome, resolve_table_reference},
+    datafusion::{DeferredRefreshOutcome, TableInstance, resolve_table_reference},
     secrets::Secrets,
-    status, view,
+    status,
+    view::{self, ViewStart},
 };
 use app::App;
 use datafusion::{
@@ -46,6 +47,64 @@ use util::warn_spaced;
 pub(crate) struct ValidatedView {
     pub(crate) view: Arc<View>,
     pub(crate) dependencies: Vec<TableReference>,
+}
+
+/// The views that read `view`, directly or through other views, each with those of them
+/// and `view` that it reads itself. A view reads the tables its SQL resolves
+/// ([`view_reads`]), however qualified and including those only a subquery reads. A view
+/// in or behind a cycle of views reading each other is left out: it is not registered.
+fn views_reading(
+    state: &datafusion::execution::SessionState,
+    validated_views: &[ValidatedView],
+    view: &TableReference,
+) -> Vec<(Arc<View>, Vec<ResolvedTableReference>)> {
+    let reads: HashMap<ResolvedTableReference, Option<TablesRead>> = validated_views
+        .iter()
+        .map(|vv| {
+            (
+                resolve_table_reference(vv.view.name.clone()),
+                view_reads(state, &vv.view.sql),
+            )
+        })
+        .collect();
+    let in_or_behind_cycles = views_in_or_behind_cycles(&reads);
+    let reads_table = |reader: &ResolvedTableReference, table: &ResolvedTableReference| {
+        reader != table
+            && reads
+                .get(reader)
+                .and_then(Option::as_ref)
+                .is_some_and(|tables| tables.contains_key(table))
+    };
+
+    let view = resolve_table_reference(view.clone());
+    let mut affected = HashSet::from([view.clone()]);
+    let mut queue = VecDeque::from([view.clone()]);
+    while let Some(table) = queue.pop_front() {
+        for reader in reads.keys() {
+            if !in_or_behind_cycles.contains(reader)
+                && reads_table(reader, &table)
+                && affected.insert(reader.clone())
+            {
+                queue.push_back(reader.clone());
+            }
+        }
+    }
+
+    validated_views
+        .iter()
+        .filter_map(|vv| {
+            let name = resolve_table_reference(vv.view.name.clone());
+            if name == view || !affected.contains(&name) {
+                return None;
+            }
+            let reads = affected
+                .iter()
+                .filter(|table| reads_table(&name, table))
+                .cloned()
+                .collect();
+            Some((Arc::clone(&vv.view), reads))
+        })
+        .collect()
 }
 
 /// Extract view dependencies from SQL and return them in topological order.
@@ -226,7 +285,10 @@ impl Runtime {
     /// which is what every view did before. Each dataset the view reads only in
     /// a subquery also gets up to a minute to be registered once its load has
     /// ended, as `register_view` waits for a missing `FROM` table. A view a
-    /// Spicepod change has already taken over is left to that change.
+    /// Spicepod change has already taken over is left to that change. An
+    /// accelerated view with an existing acceleration to serve from waits for
+    /// nothing: it registers from that acceleration, and refreshes once what it
+    /// reads is ready.
     ///
     /// Returns the tasks loading the views.
     pub(crate) fn load_views(
@@ -375,7 +437,8 @@ impl Runtime {
                         .dedup()
                         .collect()
                 };
-                if !pending().is_empty() {
+                let served_from_acceleration = view.existing_acceleration_schema().await.is_some();
+                if !served_from_acceleration && !pending().is_empty() {
                     runtime
                         .status
                         .update_view(&view.name, status::ComponentStatus::Initializing);
@@ -414,15 +477,19 @@ impl Runtime {
                 // registered: a Spicepod change that replaces it stops the load and
                 // registers the replacement itself. Planning the view before then
                 // fails it for good, so give each dataset it reads only in a
-                // subquery its own minute to be registered.
-                for table in &subquery_datasets {
-                    let deadline = tokio::time::Instant::now() + SUBQUERY_DATASET_GRACE;
-                    while !runtime.df.table_exists(table) && tokio::time::Instant::now() < deadline
-                    {
-                        tokio::select! {
-                            () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
-                            () = shutdown.cancelled() => return,
-                            () = superseded.cancelled() => return,
+                // subquery its own minute to be registered. A view served from its
+                // acceleration builds its plan only once what it reads is ready.
+                if !served_from_acceleration {
+                    for table in &subquery_datasets {
+                        let deadline = tokio::time::Instant::now() + SUBQUERY_DATASET_GRACE;
+                        while !runtime.df.table_exists(table)
+                            && tokio::time::Instant::now() < deadline
+                        {
+                            tokio::select! {
+                                () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                                () = shutdown.cancelled() => return,
+                                () = superseded.cancelled() => return,
+                            }
                         }
                     }
                 }
@@ -430,9 +497,13 @@ impl Runtime {
                     return;
                 }
                 let secrets = runtime.secrets();
-                if let Err(e) =
-                    runtime.load_view_signalling(&view, secrets, Some(done), Some(view_load))
-                {
+                if let Err(e) = runtime.load_view_signalling(
+                    &view,
+                    secrets,
+                    Some(done),
+                    Some(view_load),
+                    ViewStart::ExistingAcceleration,
+                ) {
                     let view_name = &view.name;
                     tracing::error!("Unable to load view {view_name}: {e}");
                 }
@@ -470,7 +541,10 @@ impl Runtime {
             .cloned()
             .map(|spicepod_view| {
                 ViewBuilder::try_from(spicepod_view)
-                    .map(|builder| builder.build_with(Arc::clone(&rt_ref), Arc::clone(app)))
+                    .map_err(crate::Error::from)
+                    .map(|builder| {
+                        View::new(builder.build(), Arc::clone(&rt_ref), Arc::clone(app))
+                    })
             })
             .zip(&app.views)
             .filter_map(|(view, spicepod_view)| match view {
@@ -668,7 +742,116 @@ impl Runtime {
     }
 
     fn load_view(self: Arc<Self>, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
-        self.load_view_signalling(view, secrets, None, None)
+        self.load_view_signalling(view, secrets, None, None, ViewStart::ExistingAcceleration)
+    }
+
+    /// Registers `view` again from its definition, after the plan of its registration
+    /// from its existing acceleration (`registered`) showed that acceleration was built
+    /// from another definition. Nothing is done once `registered` is no longer the
+    /// view's table: a Spicepod change removed or replaced it.
+    ///
+    /// The views that read it planned against the schema it was served with, or failed
+    /// to plan against it, so they are registered again too, each once the views it
+    /// reads among them are. A view whose registration is still pending has not planned
+    /// yet, and plans against the new definition itself.
+    pub(crate) async fn reregister_view_from_definition(
+        self: Arc<Self>,
+        view: Arc<View>,
+        registered: TableInstance,
+    ) {
+        let (ended, readers) = {
+            let _serialize = self.apply_app_lock.lock().await;
+            if !self.df.table_instance_is_current(&registered).await {
+                return;
+            }
+            tracing::info!(
+                "View {} was redefined since its acceleration was built; rebuilding the acceleration from its definition.",
+                view.name
+            );
+            let Some(app) = self.read_app().await else {
+                return;
+            };
+            let validated_views = Arc::clone(&self).get_valid_views(&app, LogErrors(false));
+            let readers = views_reading(&self.df.ctx.state(), &validated_views, &view.name);
+            let ended = Arc::clone(&self)
+                .replace_view(&view, ViewStart::Definition)
+                .await;
+            (ended, readers)
+        };
+
+        // Cancelled once each view's registration has ended, so a reader waits only for
+        // the views it reads, and one that cannot register holds up no other branch.
+        let mut registered: HashMap<ResolvedTableReference, CancellationToken> =
+            HashMap::from([(resolve_table_reference(view.name.clone()), ended)]);
+        for (reader, _) in &readers {
+            registered.insert(
+                resolve_table_reference(reader.name.clone()),
+                CancellationToken::new(),
+            );
+        }
+        let registered = Arc::new(registered);
+        for (reader, reads) in readers {
+            let runtime = Arc::clone(&self);
+            let registered = Arc::clone(&registered);
+            tokio::spawn(async move {
+                let _registered = registered
+                    .get(&resolve_table_reference(reader.name.clone()))
+                    .map(|token| token.clone().drop_guard());
+                for table in &reads {
+                    if let Some(token) = registered.get(table) {
+                        token.cancelled().await;
+                    }
+                }
+                if let Some(ended) = runtime.replace_reader(&reader).await {
+                    ended.cancelled().await;
+                }
+            });
+        }
+    }
+
+    /// Registers `reader` again, unless a Spicepod change since removed or redefined it
+    /// (and registered what it changed itself) or its registration is still pending.
+    async fn replace_reader(self: Arc<Self>, reader: &Arc<View>) -> Option<CancellationToken> {
+        let _serialize = self.apply_app_lock.lock().await;
+        let app = self.read_app().await?;
+        let current = Arc::clone(&self)
+            .get_valid_views(&app, LogErrors(false))
+            .into_iter()
+            .find(|vv| vv.view.name == reader.name)?;
+        if current.view != *reader || self.view_loads.is_pending(&reader.name) {
+            return None;
+        }
+        Some(
+            Arc::clone(&self)
+                .replace_view(&current.view, ViewStart::ExistingAcceleration)
+                .await,
+        )
+    }
+
+    /// Registers `view` again as a Spicepod change would, in a registration that a
+    /// later Spicepod change stops as it stops a startup registration. Returns a token
+    /// cancelled once that registration has ended, registered or not.
+    async fn replace_view(
+        self: Arc<Self>,
+        view: &Arc<View>,
+        start: ViewStart,
+    ) -> CancellationToken {
+        let load = self.view_loads.begin_replacement(&view.name).await;
+        self.status
+            .update_view(&view.name, status::ComponentStatus::Refreshing);
+        Arc::clone(&self).remove_view(&view.name).await;
+        let secrets = self.secrets();
+        let ended = CancellationToken::new();
+        if let Err(e) = self.load_view_signalling(
+            view,
+            secrets,
+            Some(ended.clone().drop_guard()),
+            Some(load),
+            start,
+        ) {
+            tracing::error!("Unable to load view {}: {e}", view.name);
+        }
+        ended
     }
 
     /// Like [`Self::load_view`], holding `registered` until the view's registration
@@ -680,10 +863,11 @@ impl Runtime {
         secrets: Arc<RwLock<Secrets>>,
         registered: Option<tokio_util::sync::DropGuard>,
         startup_load: Option<crate::init::view_loads::ViewLoad>,
+        start: ViewStart,
     ) -> Result<()> {
         let df = Arc::clone(&self.df);
         let register_task = df
-            .register_view(Arc::clone(view), secrets)
+            .register_view(Arc::clone(view), secrets, start)
             .context(UnableToAttachViewSnafu)
             .inspect_err(|e| {
                 self.status.update_view(
@@ -855,13 +1039,14 @@ impl Runtime {
         // Remove views that are no longer in the app
         for view in &current_app.views {
             if !new_app.views.iter().any(|v| v.name == view.name) {
-                let view_builder = match ViewBuilder::try_from(view.clone()) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::error!("Could not remove view {}: {e}", view.name);
-                        continue;
-                    }
-                };
+                let view_builder =
+                    match ViewBuilder::try_from(view.clone()).map_err(crate::Error::from) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!("Could not remove view {}: {e}", view.name);
+                            continue;
+                        }
+                    };
                 self.status
                     .update_view(&view_builder.name, status::ComponentStatus::Disabled);
                 Arc::clone(&self).remove_view(&view_builder.name).await;

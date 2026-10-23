@@ -1,6 +1,13 @@
 version: v1
 kind: Spicepod
 name: s3[parquet]-duckdb[file]-64gib
+
+# DuckDB and the query pool share the runner's 72 GiB. Their limits must fit
+# below it with headroom, or the runtime shrinks the query pool to what is left.
+runtime:
+  query:
+    memory_limit: 8GiB
+
 datasets:
   - from: s3://benchmarks/tpch_sf100/customer.parquet
     name: customer
@@ -16,7 +23,7 @@ datasets:
       engine: duckdb
       mode: file
       params:
-        duckdb_memory_limit: 64GiB
+        duckdb_memory_limit: 56GiB
   - from: s3://benchmarks/tpch_sf100/lineitem.parquet
     name: lineitem
     params: *s3_params
