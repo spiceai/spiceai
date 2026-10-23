@@ -379,7 +379,8 @@ impl FileOpener for HeaderMappedOpener {
             // CsvOpener reads with GetOptions::default() and cannot take an
             // if_match/version without a fork. Pinning the store injects the
             // listed generation on both this header get_range and that opener
-            // get. Stores that list neither an ETag nor a version stay unwrapped.
+            // get. An ETag pins with If-Match only; version is used only when
+            // there is no ETag. Stores that list neither stay unwrapped.
             let store = pin_store_to_listed_generation(store, &partitioned_file.object_meta);
             let header =
                 read_csv_header(&store, &partitioned_file.object_meta, &options, compression)
@@ -404,9 +405,14 @@ impl FileOpener for HeaderMappedOpener {
     }
 }
 
-/// Wraps `store` so every `get_opts` for `meta.location` sends the listed
-/// `ETag` as `If-Match` and/or the listed version. A replacement mid-scan
-/// then fails the second read instead of binding another file's columns.
+/// Wraps `store` so every `get_opts` for `meta.location` is pinned to the
+/// listed generation. A replacement mid-scan then fails the second read
+/// instead of binding another file's columns.
+///
+/// When an `ETag` is listed, only `If-Match` is sent. A versioned S3 HEAD
+/// fills `ObjectMeta.version` from `x-amz-version-id`; injecting that into
+/// GET sends `?versionId=` and requires `s3:GetObjectVersion`. Trunk reads
+/// with `GetObject` only. Version is used only when there is no `ETag`.
 ///
 /// Smaller than forking `CsvOpener` (it has no pin hook) and smaller than
 /// reading the whole object once to parse the header from the data stream
@@ -420,11 +426,15 @@ fn pin_store_to_listed_generation(
     if meta.e_tag.is_none() && meta.version.is_none() {
         return store;
     }
+    let (if_match, version) = match &meta.e_tag {
+        Some(e_tag) => (Some(e_tag.clone()), None),
+        None => (None, meta.version.clone()),
+    };
     Arc::new(GenerationPinnedStore {
         inner: store,
         location: meta.location.clone(),
-        if_match: meta.e_tag.clone(),
-        version: meta.version.clone(),
+        if_match,
+        version,
     })
 }
 
@@ -481,7 +491,10 @@ impl ObjectStore for GenerationPinnedStore {
                 options.version.clone_from(&self.version);
             }
         }
-        self.inner.get_opts(location, options).await
+        self.inner
+            .get_opts(location, options)
+            .await
+            .map_err(pin_precondition_error)
     }
 
     fn delete_stream(
@@ -505,6 +518,18 @@ impl ObjectStore for GenerationPinnedStore {
         options: CopyOptions,
     ) -> object_store::Result<()> {
         self.inner.copy_opts(from, to, options).await
+    }
+}
+
+fn pin_precondition_error(err: object_store::Error) -> object_store::Error {
+    match err {
+        object_store::Error::Precondition { path, source } => object_store::Error::Precondition {
+            path: path.clone(),
+            source: Box::new(std::io::Error::other(format!(
+                "CSV {path} changed during scan; retry: {source}"
+            ))),
+        },
+        other => other,
     }
 }
 
@@ -778,6 +803,7 @@ mod tests {
     };
     use std::fmt::Write;
     use std::path::Path;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn header_probe_len() -> usize {
@@ -1442,5 +1468,146 @@ mod tests {
             message.to_ascii_lowercase().contains("precondition"),
             "expected a generation precondition, not swapped columns: {message}"
         );
+        assert!(
+            message.contains("changed during scan"),
+            "precondition must name the CSV and tell the user to retry: {message}"
+        );
+    }
+
+    /// Records the `GetOptions` the pin wrapper forwards so the S3 `If-Match`
+    /// contract can be asserted without a versioned bucket.
+    #[derive(Debug)]
+    struct CaptureGetOptions {
+        inner: InMemory,
+        last: Mutex<Option<GetOptions>>,
+    }
+
+    impl CaptureGetOptions {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                last: Mutex::new(None),
+            }
+        }
+
+        fn last_options(&self) -> GetOptions {
+            self.last
+                .lock()
+                .expect("capture mutex")
+                .clone()
+                .expect("get_opts must have been called")
+        }
+    }
+
+    impl std::fmt::Display for CaptureGetOptions {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CaptureGetOptions")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CaptureGetOptions {
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            *self.last.lock().expect("capture mutex") = Some(options.clone());
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn pin_with_etag_does_not_send_version() {
+        let inner = Arc::new(CaptureGetOptions::new());
+        let location = ObjectPath::from("base.csv");
+        inner
+            .put(&location, b"id,n\n1,2\n".to_vec().into())
+            .await
+            .expect("store csv");
+        let listed = inner.head(&location).await.expect("head");
+        assert!(listed.e_tag.is_some(), "InMemory must report an ETag");
+        let meta = ObjectMeta {
+            version: Some("s3-version-id".to_string()),
+            ..listed
+        };
+        let pinned =
+            pin_store_to_listed_generation(Arc::clone(&inner) as Arc<dyn ObjectStore>, &meta);
+        pinned.get(&location).await.expect("pinned get");
+        let options = inner.last_options();
+        assert_eq!(options.if_match, meta.e_tag, "ETag pins with If-Match");
+        assert_eq!(
+            options.version, None,
+            "If-Match-only when an ETag is listed; version would require s3:GetObjectVersion"
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_without_etag_sends_version() {
+        let inner = Arc::new(CaptureGetOptions::new());
+        let location = ObjectPath::from("base.csv");
+        inner
+            .put(&location, b"id,n\n1,2\n".to_vec().into())
+            .await
+            .expect("store csv");
+        let listed = inner.head(&location).await.expect("head");
+        let meta = ObjectMeta {
+            e_tag: None,
+            version: Some("ver-1".to_string()),
+            ..listed
+        };
+        let pinned =
+            pin_store_to_listed_generation(Arc::clone(&inner) as Arc<dyn ObjectStore>, &meta);
+        pinned.get(&location).await.expect("pinned get");
+        let options = inner.last_options();
+        assert_eq!(options.if_match, None);
+        assert_eq!(options.version.as_deref(), Some("ver-1"));
     }
 }

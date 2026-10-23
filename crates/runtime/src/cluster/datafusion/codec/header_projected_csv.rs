@@ -19,7 +19,9 @@ limitations under the License.
 //! `HeaderProjectedCsvSource` has no `FileSource::try_to_proto` hook, so
 //! `DataSourceExec` falls through to [`SpicePhysicalCodec`]. A stock `CsvScan`
 //! would decode as positional `CsvSource` and always as `UNCOMPRESSED`. This
-//! node keeps the header-name binding and the scan's `file_compression_type`.
+//! node keeps the header-name binding, the scan's `file_compression_type`,
+//! and the listed file generation (`e_tag` / `version`) that `DataFusion`'s
+//! `PartitionedFile` proto drops.
 
 use data_components::csv_header_projection::HeaderProjectedCsvSource;
 use datafusion::common::config::CsvOptions;
@@ -32,6 +34,7 @@ use datafusion::physical_plan::proto::{
     ExecutionPlanDecode, ExecutionPlanDecodeCtx, ExecutionPlanEncode, ExecutionPlanEncodeCtx,
 };
 use datafusion_datasource::file_compression_type::FileCompressionType;
+use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::physical_planning_context::ScalarSubqueryResults;
@@ -42,8 +45,9 @@ use datafusion_proto::physical_plan::{
 use datafusion_proto::protobuf::{FileScanExecConf, PhysicalExprNode, PhysicalPlanNode};
 use prost::Message;
 use runtime_proto::{
-    HeaderProjectedCsvScanExecNode, SpicePhysicalPlanNode, spice_physical_plan_node,
+    FileGeneration, HeaderProjectedCsvScanExecNode, SpicePhysicalPlanNode, spice_physical_plan_node,
 };
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -85,6 +89,7 @@ pub(super) fn encode_header_projected_csv(
                 newlines_in_values: source.newlines_in_values(),
                 truncate_rows: source.truncate_rows(),
                 file_compression_type: proto_compression(conf.file_compression_type),
+                file_generations: encode_file_generations(conf),
             },
         )),
     }))
@@ -131,14 +136,52 @@ pub(super) fn decode_header_projected_csv(
         ..Default::default()
     };
     let source = Arc::new(HeaderProjectedCsvSource::new(table_schema, csv_options));
-    let conf = FileScanConfigBuilder::from(FileScanConfig::try_from_proto(
+    let mut conf = FileScanConfigBuilder::from(FileScanConfig::try_from_proto(
         &base_conf,
         &decode_ctx,
         source,
     )?)
     .with_file_compression_type(file_compression_type)
     .build();
+    restore_file_generations(&mut conf, &node.file_generations);
     Ok(DataSourceExec::from_data_source(conf))
+}
+
+fn encode_file_generations(conf: &FileScanConfig) -> Vec<FileGeneration> {
+    conf.file_groups
+        .iter()
+        .flat_map(FileGroup::files)
+        .map(|file| FileGeneration {
+            path: file.object_meta.location.as_ref().to_owned(),
+            e_tag: file.object_meta.e_tag.clone(),
+            version: file.object_meta.version.clone(),
+        })
+        .collect()
+}
+
+/// Restores listed generations onto decoded `PartitionedFile`s. An empty
+/// `file_generations` is an older node: leave `e_tag`/`version` unset so
+/// the executor does not pin.
+fn restore_file_generations(conf: &mut FileScanConfig, generations: &[FileGeneration]) {
+    if generations.is_empty() {
+        return;
+    }
+    let by_path: HashMap<&str, &FileGeneration> = generations
+        .iter()
+        .map(|generation| (generation.path.as_str(), generation))
+        .collect();
+    for group in &mut conf.file_groups {
+        for index in 0..group.len() {
+            let path = group[index].object_meta.location.as_ref().to_owned();
+            if let Some(generation) = by_path.get(path.as_str()) {
+                group[index].object_meta.e_tag.clone_from(&generation.e_tag);
+                group[index]
+                    .object_meta
+                    .version
+                    .clone_from(&generation.version);
+            }
+        }
+    }
 }
 
 struct SpicePlanEncoder<'a> {
@@ -278,4 +321,55 @@ fn proto_str_to_byte(text: &str, description: &str) -> Result<u8> {
         return exec_err!("Invalid CSV {description}: expected single character, got {text}");
     }
     Ok(text.as_bytes()[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion_datasource::PartitionedFile;
+
+    fn scan_config(path: &str) -> FileScanConfig {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let source = Arc::new(HeaderProjectedCsvSource::new(
+            Arc::clone(&schema).into(),
+            CsvOptions::default(),
+        ));
+        FileScanConfigBuilder::new(ObjectStoreUrl::parse("memory://csv").expect("url"), source)
+            .with_file(PartitionedFile::new(path, 1))
+            .build()
+    }
+
+    #[test]
+    fn restore_file_generations_is_noop_for_old_nodes() {
+        let mut conf = scan_config("base.csv");
+        assert_eq!(conf.file_groups[0][0].object_meta.e_tag, None);
+        restore_file_generations(&mut conf, &[]);
+        assert_eq!(
+            conf.file_groups[0][0].object_meta.e_tag, None,
+            "older nodes without FileGeneration must decode with no pin"
+        );
+    }
+
+    #[test]
+    fn restore_file_generations_sets_etag() {
+        let mut conf = scan_config("base.csv");
+        restore_file_generations(
+            &mut conf,
+            &[FileGeneration {
+                path: "base.csv".to_string(),
+                e_tag: Some("etag-1".to_string()),
+                version: Some("v1".to_string()),
+            }],
+        );
+        assert_eq!(
+            conf.file_groups[0][0].object_meta.e_tag.as_deref(),
+            Some("etag-1")
+        );
+        assert_eq!(
+            conf.file_groups[0][0].object_meta.version.as_deref(),
+            Some("v1")
+        );
+    }
 }

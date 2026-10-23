@@ -1146,6 +1146,29 @@ mod tests {
             .find_map(|child| plan_file_compression(child.as_ref()))
     }
 
+    fn plan_csv_file_etags(plan: &dyn ExecutionPlan) -> Vec<Option<String>> {
+        use data_components::csv_header_projection::HeaderProjectedCsvSource;
+        use datafusion_datasource::source::DataSourceExec;
+
+        if let Some(exec) = plan.downcast_ref::<DataSourceExec>()
+            && let Some((conf, _)) = exec.downcast_to_file_source::<HeaderProjectedCsvSource>()
+        {
+            return conf
+                .file_groups
+                .iter()
+                .flat_map(|group| group.files())
+                .map(|file| file.object_meta.e_tag.clone())
+                .collect();
+        }
+        plan.children()
+            .into_iter()
+            .find_map(|child| {
+                let etags = plan_csv_file_etags(child.as_ref());
+                (!etags.is_empty()).then_some(etags)
+            })
+            .unwrap_or_default()
+    }
+
     async fn round_trip_header_projected_csv(
         table: Arc<dyn TableProvider>,
     ) -> (
@@ -1168,6 +1191,11 @@ mod tests {
             plan_has_header_projected_csv(plan.as_ref()),
             "planned scan must use HeaderProjectedCsvSource"
         );
+        let planned_etags = plan_csv_file_etags(plan.as_ref());
+        assert!(
+            planned_etags.iter().any(Option::is_some),
+            "local listing must report an ETag so the codec has a generation to carry"
+        );
         let codec = SpicePhysicalCodec {
             inner: Arc::new(BallistaPhysicalExtensionCodec::default()),
             runtime: None,
@@ -1180,6 +1208,11 @@ mod tests {
         assert!(
             plan_has_header_projected_csv(decoded.as_ref()),
             "decoded scan must stay HeaderProjectedCsvSource, not CsvSource"
+        );
+        assert_eq!(
+            plan_csv_file_etags(decoded.as_ref()),
+            planned_etags,
+            "FileGeneration must restore the listed ETag; DataFusion PartitionedFile proto drops it"
         );
         let batches = collect(Arc::clone(&decoded), ctx.task_ctx())
             .await

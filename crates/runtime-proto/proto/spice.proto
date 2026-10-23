@@ -335,6 +335,17 @@ message HeaderProjectedCsvScanExecNode {
     // on the wire and always decodes `UNCOMPRESSED`. An empty value is
     // uncompressed (proto3 default / older nodes).
     string file_compression_type = 9;
+    // Listed `ObjectMeta` generation per file. DataFusion's `PartitionedFile`
+    // proto has no `e_tag` or `version`, so without this the executor re-HEADs
+    // and the mid-scan pin is lost. Older nodes omit the field (no pin).
+    repeated FileGeneration file_generations = 10;
+}
+
+// Generation listed at plan time for one headered CSV/TSV file.
+message FileGeneration {
+    string path = 1;
+    optional string e_tag = 2;
+    optional string version = 3;
 }
 
 message SchemaCastScanExecNode {
