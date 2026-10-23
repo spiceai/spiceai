@@ -450,15 +450,31 @@ sql_query() {
   local sql="$1"
   local out="$2"
   mkdir -p "$(dirname "$out")"
+  local headers="${out}.headers"
+  local body="${out}.body"
+  local curl_rc=0
+  local code
+  # Write the artifact first so a transport or HTTP failure still leaves
+  # the request, status, headers, and body for evidence.
+  code="$(curl -sS -D "$headers" -o "$body" -w '%{http_code}' --max-time 30 \
+    -H "Content-Type: text/plain" \
+    -H "Accept: application/json" \
+    --data-binary "$sql" \
+    "http://${HTTP_ADDR}/v1/sql")" || curl_rc=$?
   {
     echo "SQL: ${sql}"
+    echo "HTTP: ${code:-000}"
     echo "---"
-    curl -sS -D - --max-time 30 \
-      -H "Content-Type: text/plain" \
-      -H "Accept: application/json" \
-      --data-binary "$sql" \
-      "http://${HTTP_ADDR}/v1/sql" || true
+    [[ -f "$headers" ]] && cat "$headers"
+    echo
+    [[ -f "$body" ]] && cat "$body"
   } >"$out"
+  if (( curl_rc != 0 )); then
+    die "SQL transport failed (curl=${curl_rc} http=${code:-000}) writing ${out}"
+  fi
+  if [[ ! "${code}" =~ ^2[0-9][0-9]$ ]]; then
+    die "SQL HTTP ${code} writing ${out}"
+  fi
 }
 
 extract_sums() {
@@ -471,18 +487,18 @@ idx = body.find("[")
 obj = body.find("{")
 if idx < 0 and obj < 0:
     print("parse_error")
-    raise SystemExit(0)
+    raise SystemExit(1)
 start = idx if idx >= 0 and (obj < 0 or idx < obj) else obj
 payload = body[start:].strip()
 try:
     data = json.loads(payload)
 except json.JSONDecodeError:
     print("parse_error")
-    raise SystemExit(0)
+    raise SystemExit(1)
 row = data[0] if isinstance(data, list) and data else data
 if not isinstance(row, dict):
     print("parse_error")
-    raise SystemExit(0)
+    raise SystemExit(1)
 def val(key):
     for k, v in row.items():
         if k == key or k.endswith("." + key) or k.lower().endswith(key):
@@ -490,7 +506,11 @@ def val(key):
                 return "null"
             return str(v)
     return "missing"
-print(f"{val('amount_cents')},{val('user_id')}")
+amount = val("amount_cents")
+user = val("user_id")
+print(f"{amount},{user}")
+if amount == "missing" or user == "missing":
+    raise SystemExit(1)
 PY
 }
 
@@ -665,10 +685,14 @@ query_dataset() {
   local sql="SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM ${dataset}"
   local out="${ev}/sql-${step}-${dataset}.json"
   sql_query "$sql" "$out"
-  local sums
-  sums="$(extract_sums "$out")"
+  local sums=""
+  local extract_rc=0
+  sums="$(extract_sums "$out")" || extract_rc=$?
   echo "${step} ${dataset} sums=${sums}"
   echo "${step} ${dataset} ${sums}" >>"${ev}/summary.txt"
+  if (( extract_rc != 0 )); then
+    die "SQL result unusable for ${step} ${dataset}: ${sums} (see ${out})"
+  fi
 }
 
 cmd_drive() {
