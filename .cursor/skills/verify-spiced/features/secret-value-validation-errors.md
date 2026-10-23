@@ -4,6 +4,8 @@
 
 When a validated param (enum/bool/int/…) is built from a secret reference, the ERROR log and `GET /v1/datasets?status=true` `error_message` must name the param and the secret reference (for example `${ env:PG_PW }`). They must never contain the resolved value.
 
+Secret-derived typed-param parse failures must not surface parser text at all (`invalid value for \`<key>\` from ${store:key}; expected a valid value`). That covers a `FromStr` that trims or lowercases and would otherwise echo a normalized form (`Found secret123` from `" Secret123 "`).
+
 Use only the canary `CANARYPGPW7731`. Never a real secret.
 
 ## Launch
