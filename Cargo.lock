@@ -14149,11 +14149,15 @@ name = "object_store_spawn"
 version = "2.4.0-unstable"
 dependencies = [
  "async-trait",
+ "axum",
  "bytes",
  "http-body 1.0.1",
+ "humantime",
  "object_store 0.13.2",
+ "reqwest 0.12.24",
  "snafu",
  "tokio",
+ "url",
 ]
 
 [[package]]
