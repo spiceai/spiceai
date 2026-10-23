@@ -43,11 +43,7 @@ runs:
         fi
 
         # Ordered list of Ubuntu archive mirrors close to Pittsburgh, PA
-        # (Teraswitch datacenter), with reliable fallbacks. The deb822
-        # sources format supports multiple URIs per source, and apt will
-        # try them in order on transport errors. The classic
-        # /etc/apt/sources.list format has no built-in failover, so only
-        # the primary is used there.
+        # (Teraswitch datacenter), with reliable fallbacks.
         #
         # Verified on https://launchpad.net/ubuntu/+archivemirrors :
         #   - mirror.pit.teraswitch.com       (Pittsburgh, PA - Teraswitch)
@@ -57,17 +53,27 @@ runs:
           "http://mirrors.edge.kernel.org/ubuntu/"
           "http://archive.ubuntu.com/ubuntu/"
         )
-
-        # Security updates are only published on security.ubuntu.com; keep
-        # that as-is.
         PRIMARY="${ARCHIVE_MIRRORS[0]}"
-        # Space-separated list used for deb822 URIs field (enables real
-        # multi-URI failover on noble+).
-        ALL_MIRRORS="${ARCHIVE_MIRRORS[*]}"
+
+        # The archive source uses apt's mirror method, which fetches each
+        # file from the first mirror in the list and moves to the next one
+        # when that mirror fails: a transport error, or an index whose size
+        # or hash does not match its Release file because the mirror is
+        # mid-sync. Several URIs in one deb822 stanza are not a failover
+        # list: apt treats each URI as a separate source and downloads every
+        # index from all of them, so one mirror mid-sync fails apt-get update
+        # even when the others served the same file. The priority tags keep
+        # the mirrors in the order above; without them apt shuffles the list.
+        MIRROR_LIST=/etc/apt/spice-ubuntu-mirrors.txt
+        MIRROR_URI="mirror+file:${MIRROR_LIST}"
+        for i in "${!ARCHIVE_MIRRORS[@]}"; do
+          printf '%s\tpriority:%d\n' "${ARCHIVE_MIRRORS[$i]}" "$((i + 1))"
+        done | sudo tee "${MIRROR_LIST}" > /dev/null
 
         # Ubuntu 24.04 (noble) ships sources in deb822 format at
         # /etc/apt/sources.list.d/ubuntu.sources; older releases use
-        # /etc/apt/sources.list. Handle both.
+        # /etc/apt/sources.list. Handle both. Security updates are only
+        # published on security.ubuntu.com, so those entries stay as they are.
         if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
           sudo cp /etc/apt/sources.list.d/ubuntu.sources \
                   /etc/apt/sources.list.d/ubuntu.sources.bak
@@ -75,30 +81,28 @@ runs:
           # stanzas. Replace only the archive URIs line and leave the
           # security stanza untouched.
           sudo sed -i -E \
-            -e "s|^URIs:[[:space:]]*https?://archive\.ubuntu\.com/ubuntu/?$|URIs: ${ALL_MIRRORS}|" \
+            -e "s|^URIs:[[:space:]]*https?://archive\.ubuntu\.com/ubuntu/?$|URIs: ${MIRROR_URI}|" \
             /etc/apt/sources.list.d/ubuntu.sources
           # If the substitution had no effect, surface diagnostics but do not
           # fail the action.
-          if ! grep -Fq "${PRIMARY}" /etc/apt/sources.list.d/ubuntu.sources; then
-            echo "::warning::configure-apt: primary mirror ${PRIMARY} not found in ubuntu.sources after substitution attempt"
+          if ! grep -Fq "${MIRROR_URI}" /etc/apt/sources.list.d/ubuntu.sources; then
+            echo "::warning::configure-apt: ${MIRROR_URI} not found in ubuntu.sources after substitution attempt"
             echo "--- current ubuntu.sources URIs ---" >&2
             grep '^URIs:' /etc/apt/sources.list.d/ubuntu.sources >&2 || true
           fi
         fi
         if [ -f /etc/apt/sources.list ]; then
           sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
-          # Classic sources.list has no multi-URI support; point every
-          # archive.ubuntu.com / us.archive.ubuntu.com entry (http or
-          # https) at the primary mirror. Retries above handle transient
-          # failures.
+          # Point every archive.ubuntu.com / us.archive.ubuntu.com entry
+          # (http or https) at the same mirror list.
           sudo sed -i -E \
-            -e "s|https?://archive\.ubuntu\.com/ubuntu/?|${PRIMARY}|g" \
-            -e "s|https?://us\.archive\.ubuntu\.com/ubuntu/?|${PRIMARY}|g" \
+            -e "s|https?://archive\.ubuntu\.com/ubuntu/?|${MIRROR_URI}|g" \
+            -e "s|https?://us\.archive\.ubuntu\.com/ubuntu/?|${MIRROR_URI}|g" \
             /etc/apt/sources.list
         fi
 
         echo "apt primary archive mirror: ${PRIMARY}"
-        echo "deb822 mirror failover list: ${ALL_MIRRORS}"
+        echo "apt mirror list ${MIRROR_LIST}, in failover order: ${ARCHIVE_MIRRORS[*]}"
         echo "apt acquire policy installed at /etc/apt/apt.conf.d/zz-spice-acquire"
 
     - name: Verify apt mirror configuration (Linux)
@@ -107,6 +111,13 @@ runs:
       run: |
         echo "=== Effective apt acquire settings ==="
         apt-config dump Acquire::Retries Acquire::http::Timeout Acquire::https::Timeout Acquire::ForceIPv4
+
+        echo "=== Archive mirror list ==="
+        if [ -f /etc/apt/spice-ubuntu-mirrors.txt ]; then
+          cat /etc/apt/spice-ubuntu-mirrors.txt
+        else
+          echo "not present"
+        fi
 
         echo "=== Active URIs in ubuntu.sources (deb822) ==="
         if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
@@ -117,7 +128,7 @@ runs:
 
         echo "=== Active archive lines in sources.list (classic) ==="
         if [ -f /etc/apt/sources.list ]; then
-          grep 'archive\.ubuntu\.com' /etc/apt/sources.list | grep -v '^#' || true
+          grep -E 'archive\.ubuntu\.com|mirror\+file:' /etc/apt/sources.list | grep -v '^#' || true
         else
           echo "not present"
         fi
