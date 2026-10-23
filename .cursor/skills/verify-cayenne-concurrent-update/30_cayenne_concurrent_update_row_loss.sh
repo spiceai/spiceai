@@ -29,6 +29,18 @@ if [ -z "$SPICED" ]; then
     exit 1
   fi
 fi
+# The launch below runs from a temp dir, so pin a relative SPICED now.
+case "$SPICED" in
+  /*) ;;
+  */*) SPICED="$(cd "$(dirname "$SPICED")" && pwd)/$(basename "$SPICED")" ;;
+  *) SPICED=$(command -v "$SPICED") || { echo "spiced not found: $SPICED" >&2; exit 1; } ;;
+esac
+# A runtime already answering on the harness port would take the UPDATEs meant
+# for the spiced launched below.
+if curl -sf 127.0.0.1:8393/v1/ready >/dev/null 2>&1; then
+  echo "127.0.0.1:8393 already serves a runtime; stop it so the harness tests the spiced it launches" >&2
+  exit 1
+fi
 
 DATA_SRC=$SKILL_DIR/data/orders.parquet
 if [ ! -f "$DATA_SRC" ]; then
@@ -60,6 +72,12 @@ P=$!
 ready=0
 for _ in $(seq 1 180); do
   if curl -sf 127.0.0.1:8393/v1/ready >/dev/null; then
+    if ! kill -0 "$P" 2>/dev/null; then
+      echo "the launched spiced exited, but 127.0.0.1:8393 reports ready: another process holds the port" >&2
+      tail -50 "$D/spiced.log" >&2
+      rm -rf "$D"
+      exit 1
+    fi
     ready=1
     break
   fi
