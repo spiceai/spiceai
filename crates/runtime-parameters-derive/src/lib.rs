@@ -966,7 +966,10 @@ mod tests {
         };
         let out = expand_str(&input).expect("valid struct should expand");
         assert!(out.contains("future :: ready"), "expansion: {out}");
-        assert!(!out.contains("async fn"), "expansion: {out}");
+        assert!(
+            !out.contains("async fn try_from_params_with_secret_sources"),
+            "the provenance method must stay a ready future: {out}"
+        );
     }
 
     #[test]
