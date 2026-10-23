@@ -559,7 +559,7 @@ impl BedrockConverse {
 
     #[expect(clippy::cast_possible_truncation, deprecated)]
     fn convert_converse_output(
-        model_id: &str,
+        &self,
         output: ConverseOutput,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let usage = output.usage().map(convert_usage);
@@ -615,13 +615,13 @@ impl BedrockConverse {
 
         Ok(CreateChatCompletionResponse {
             usage,
-            id: generate_stream_id(model_id),
+            id: generate_stream_id(&self.model_id),
             choices: vec![choices],
             created: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
                 .as_secs() as u32,
-            model: model_id.to_string(),
+            model: self.model_id.clone(),
             service_tier: None,
             system_fingerprint: None,
             object: "chat.completion".to_string(),
@@ -852,7 +852,7 @@ impl Chat for BedrockConverse {
             .do_converse(input)
             .await
             .map_err(|e| to_api_error(e.to_string()))?;
-        Self::convert_converse_output(&self.model_id, output)
+        self.convert_converse_output(output)
     }
 
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
@@ -864,6 +864,7 @@ impl Chat for BedrockConverse {
 mod tests {
     use super::*;
     use async_openai::types::chat::ChatCompletionRequestUserMessageArgs;
+    use aws_config::{BehaviorVersion, Region, SdkConfig};
     use aws_sdk_bedrockruntime::types::{ReasoningContentBlock, ReasoningTextBlock};
 
     #[test]
@@ -915,8 +916,18 @@ mod tests {
         ))
     }
 
+    /// A converse model with a client that is never sent a request.
+    fn converse(model_id: &str) -> BedrockConverse {
+        let config = SdkConfig::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::from_static("us-east-1"))
+            .build();
+        BedrockConverse::new(Arc::new(BedrockClient::from(&config)), model_id.to_string())
+    }
+
     fn converted_message(blocks: Vec<ContentBlock>) -> ChatCompletionResponseMessage {
-        BedrockConverse::convert_converse_output("test-model", converse_reply(blocks))
+        converse("test-model")
+            .convert_converse_output(converse_reply(blocks))
             .expect("converse output should convert")
             .choices
             .into_iter()
