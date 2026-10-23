@@ -287,7 +287,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "example": "\nfrom,name,replication_enabled,acceleration_enabled,status,error,error_message\npostgres:syncs,daily_journal_accelerated,false,true,Ready,,\ndatabricks:hive_metastore.default.messages,messages_accelerated,false,true,Error,dataset.auth,Unable to authenticate with datasource credentials\npostgres:aidemo_messages,general,false,false,Initializing,,\n"
+                "example": "\nfrom,name,replication_enabled,acceleration_enabled,status,error,error_message,last_refresh,next_refresh,properties.search,properties.vector_search\npostgres:syncs,daily_journal_accelerated,false,true,Ready,,,,,unsupported,unsupported\ndatabricks:hive_metastore.default.messages,messages_accelerated,false,true,Error,dataset.auth,Unable to authenticate with datasource credentials,,,unsupported,unsupported\npostgres:aidemo_messages,general,false,false,Initializing,,,,,unsupported,unsupported\n"
               }
             }
           },
@@ -298,7 +298,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "example": "An unexpected error occurred while processing datasets"
+                "example": "Failed to format the dataset list as CSV"
               }
             }
           }
