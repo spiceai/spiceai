@@ -1037,7 +1037,7 @@ mod tests {
         }
     }
 
-    fn write_csv(path: &std::path::Path, header: &str, rows: &[&str]) {
+    fn csv_text(header: &str, rows: &[&str]) -> String {
         let mut text = String::new();
         text.push_str(header);
         text.push('\n');
@@ -1045,12 +1045,30 @@ mod tests {
             text.push_str(row);
             text.push('\n');
         }
-        std::fs::write(path, text).expect("write csv");
+        text
     }
 
-    fn header_projected_listing_table(dir: &std::path::Path) -> Arc<dyn TableProvider> {
-        use data_components::csv_header_projection::HeaderProjectedCsvFormat;
-        use datafusion::datasource::file_format::csv::CsvFormat;
+    fn write_csv(path: &std::path::Path, header: &str, rows: &[&str]) {
+        std::fs::write(path, csv_text(header, rows)).expect("write csv");
+    }
+
+    fn write_gzip_csv(path: &std::path::Path, header: &str, rows: &[&str]) {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(csv_text(header, rows).as_bytes())
+            .expect("gzip write");
+        std::fs::write(path, encoder.finish().expect("gzip finish")).expect("write gz");
+    }
+
+    fn header_projected_listing_table_with_format(
+        dir: &std::path::Path,
+        format: Arc<dyn datafusion::datasource::file_format::FileFormat>,
+        extension: &str,
+    ) -> Arc<dyn TableProvider> {
         use datafusion::datasource::listing::{
             ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
         };
@@ -1062,13 +1080,38 @@ mod tests {
             Field::new("amount_cents", DataType::Int64, true),
             Field::new("ts", DataType::Utf8, true),
         ]));
-        let format =
-            HeaderProjectedCsvFormat::wrap(Arc::new(CsvFormat::default().with_has_header(true)));
         let url = ListingTableUrl::parse(format!("file://{}/", dir.display())).expect("url");
         let config = ListingTableConfig::new(url)
-            .with_listing_options(ListingOptions::new(format).with_file_extension(".csv"))
+            .with_listing_options(ListingOptions::new(format).with_file_extension(extension))
             .with_schema(schema);
         Arc::new(ListingTable::try_new(config).expect("listing table"))
+    }
+
+    fn header_projected_listing_table(dir: &std::path::Path) -> Arc<dyn TableProvider> {
+        use data_components::csv_header_projection::HeaderProjectedCsvFormat;
+        use datafusion::datasource::file_format::csv::CsvFormat;
+
+        header_projected_listing_table_with_format(
+            dir,
+            HeaderProjectedCsvFormat::wrap(Arc::new(CsvFormat::default().with_has_header(true))),
+            ".csv",
+        )
+    }
+
+    fn header_projected_gzip_listing_table(dir: &std::path::Path) -> Arc<dyn TableProvider> {
+        use data_components::csv_header_projection::HeaderProjectedCsvFormat;
+        use datafusion::datasource::file_format::csv::CsvFormat;
+        use datafusion_datasource::file_compression_type::FileCompressionType;
+
+        header_projected_listing_table_with_format(
+            dir,
+            HeaderProjectedCsvFormat::wrap(Arc::new(
+                CsvFormat::default()
+                    .with_has_header(true)
+                    .with_file_compression_type(FileCompressionType::GZIP),
+            )),
+            ".csv.gz",
+        )
     }
 
     fn plan_has_header_projected_csv(plan: &dyn ExecutionPlan) -> bool {
@@ -1087,22 +1130,33 @@ mod tests {
             .any(|child| plan_has_header_projected_csv(child.as_ref()))
     }
 
-    #[tokio::test]
-    async fn header_projected_csv_codec_round_trip_keeps_name_binding() {
-        use arrow::array::{Array, Int64Array};
+    fn plan_file_compression(
+        plan: &dyn ExecutionPlan,
+    ) -> Option<datafusion_datasource::file_compression_type::FileCompressionType> {
+        use data_components::csv_header_projection::HeaderProjectedCsvSource;
+        use datafusion_datasource::source::DataSourceExec;
+
+        if let Some(exec) = plan.downcast_ref::<DataSourceExec>()
+            && let Some((conf, _)) = exec.downcast_to_file_source::<HeaderProjectedCsvSource>()
+        {
+            return Some(conf.file_compression_type);
+        }
+        plan.children()
+            .into_iter()
+            .find_map(|child| plan_file_compression(child.as_ref()))
+    }
+
+    async fn round_trip_header_projected_csv(
+        table: Arc<dyn TableProvider>,
+    ) -> (
+        Arc<dyn ExecutionPlan>,
+        datafusion::arrow::array::RecordBatch,
+    ) {
         use datafusion::physical_plan::collect;
         use datafusion_proto::physical_plan::AsExecutionPlan;
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_csv(
-            &dir.path().join("events.csv"),
-            "event_id,amount_cents,region,user_id,ts",
-            &["1,100,us,10,t0", "2,200,eu,20,t1"],
-        );
-
         let ctx = SessionContext::new();
-        ctx.register_table("events", header_projected_listing_table(dir.path()))
-            .expect("register");
+        ctx.register_table("events", table).expect("register");
         let plan = ctx
             .sql("SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM events")
             .await
@@ -1127,10 +1181,15 @@ mod tests {
             plan_has_header_projected_csv(decoded.as_ref()),
             "decoded scan must stay HeaderProjectedCsvSource, not CsvSource"
         );
-        let batches = collect(decoded, ctx.task_ctx())
+        let batches = collect(Arc::clone(&decoded), ctx.task_ctx())
             .await
             .expect("execute decoded plan");
-        let batch = &batches[0];
+        (decoded, batches[0].clone())
+    }
+
+    fn assert_name_bound_sums(batch: &datafusion::arrow::array::RecordBatch) {
+        use arrow::array::{Array, Int64Array};
+
         let amounts = batch
             .column(0)
             .as_any()
@@ -1149,5 +1208,53 @@ mod tests {
             (Some(300), Some(30)),
             "reordered headers must still bind by name after the codec round-trip"
         );
+    }
+
+    #[tokio::test]
+    async fn header_projected_csv_codec_round_trip_keeps_name_binding() {
+        use datafusion_datasource::file_compression_type::FileCompressionType;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csv(
+            &dir.path().join("events.csv"),
+            "event_id,amount_cents,region,user_id,ts",
+            &["1,100,us,10,t0", "2,200,eu,20,t1"],
+        );
+
+        let (decoded, batch) =
+            round_trip_header_projected_csv(header_projected_listing_table(dir.path())).await;
+        assert_eq!(
+            plan_file_compression(decoded.as_ref()),
+            Some(FileCompressionType::UNCOMPRESSED),
+            "plain CSV must decode as uncompressed"
+        );
+        assert_name_bound_sums(&batch);
+    }
+
+    #[tokio::test]
+    async fn header_projected_csv_codec_round_trip_keeps_gzip_name_binding() {
+        use datafusion_datasource::file_compression_type::FileCompressionType;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_gzip_csv(
+            &dir.path().join("events.csv.gz"),
+            "event_id,amount_cents,region,user_id,ts",
+            &["1,100,us,10,t0", "2,200,eu,20,t1"],
+        );
+        let gzip_bytes = std::fs::read(dir.path().join("events.csv.gz")).expect("read gz");
+        assert_eq!(
+            gzip_bytes.get(..2),
+            Some(&[0x1f, 0x8b][..]),
+            "the fixture must be gzip so a UNCOMPRESSED decode fails"
+        );
+
+        let (decoded, batch) =
+            round_trip_header_projected_csv(header_projected_gzip_listing_table(dir.path())).await;
+        assert_eq!(
+            plan_file_compression(decoded.as_ref()),
+            Some(FileCompressionType::GZIP),
+            "gzip CSV must keep FileScanConfig.file_compression_type across the codec"
+        );
+        assert_name_bound_sums(&batch);
     }
 }

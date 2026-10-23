@@ -331,6 +331,10 @@ message HeaderProjectedCsvScanExecNode {
     optional string comment = 6;
     bool newlines_in_values = 7;
     bool truncate_rows = 8;
+    // `FileScanConfig.file_compression_type`. Stock `CsvScan` does not put this
+    // on the wire and always decodes `UNCOMPRESSED`. An empty value is
+    // uncompressed (proto3 default / older nodes).
+    string file_compression_type = 9;
 }
 
 message SchemaCastScanExecNode {

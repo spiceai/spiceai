@@ -7,7 +7,7 @@ A CSV file dataset with `has_header` true binds columns by header name. Reorderi
 - `csv-reorder` rewrites the same rows with columns swapped and keeps `sum(amount_cents)=300`, `sum(user_id)=30`.
 - `csv-rename` renames `amount_cents` to `amt`. Federated reads return `NULL` for `amount_cents` and one `WARN`. An Arrow refresh fails; status is `Error`; accelerated sums stay `300`/`30`.
 - `csv-restore` puts the original header back. Federated sums return; a refresh succeeds; status is `Ready`.
-- `csv-cluster-name-binding` a headered CSV scan serializes as a header-projection node, not a positional `CsvScan`. After the plan is decoded, a reordered header still returns `sum(amount_cents)=300`, `sum(user_id)=30`.
+- `csv-cluster-name-binding` a headered CSV scan serializes as a header-projection node, not a positional `CsvScan`. After the plan is decoded, a reordered header still returns `sum(amount_cents)=300`, `sum(user_id)=30`. Compression (`file_compression_type`) is carried on the node so a gzip/bzip2 scan still decompresses on the executor.
 
 ## How to get to it (user POV)
 
@@ -29,7 +29,7 @@ Preconditions:
 - **Rename the amount column.** Rewrite the header to `event_id,user_id,region,amt,ts`. Query `csv_fed`: `amount_cents` is `null`, `user_id` is `30`. The log has one `WARN` naming `'amount_cents'` and dataset `'csv_fed'`. Refresh `csv_acc`: the refresh ends in `Error` with a message naming `'amount_cents'`. Query `csv_acc`: sums are still `300`/`30`.
 - **Restore.** Rewrite the baseline header and rows. Query `csv_fed` (`300`/`30`). Refresh `csv_acc` until `Ready`. Query `csv_acc` (`300`/`30`).
 - **Proof.** Keep `sql-*-csv_*.json`, `datasets-*.json`, `refresh-*-csv_acc.*`, and the matching `WARN` / error lines from `spiced.log`.
-- **Cluster name-binding.** The HTTP helper is a single `spiced` and does not start a scheduler/executor. The codec round-trip `header_projected_csv_codec_round_trip_keeps_name_binding` encodes a scan of a reordered-header CSV through `SpicePhysicalCodec` and executes the decoded plan; sums stay `300`/`30` and the source stays `HeaderProjectedCsvSource`.
+- **Cluster name-binding.** The HTTP helper is a single `spiced` and does not start a scheduler/executor. `header_projected_csv_codec_round_trip_keeps_name_binding` and `header_projected_csv_codec_round_trip_keeps_gzip_name_binding` encode a scan of a reordered-header CSV (plain and gzip) through `SpicePhysicalCodec` and execute the decoded plan; sums stay `300`/`30`, the source stays `HeaderProjectedCsvSource`, and gzip keeps `FileCompressionType::GZIP`.
 
 ## Gotchas
 

@@ -18,11 +18,12 @@ limitations under the License.
 //!
 //! `HeaderProjectedCsvSource` has no `FileSource::try_to_proto` hook, so
 //! `DataSourceExec` falls through to [`SpicePhysicalCodec`]. A stock `CsvScan`
-//! would decode as positional `CsvSource`. This node keeps the header-name
-//! binding.
+//! would decode as positional `CsvSource` and always as `UNCOMPRESSED`. This
+//! node keeps the header-name binding and the scan's `file_compression_type`.
 
 use data_components::csv_header_projection::HeaderProjectedCsvSource;
 use datafusion::common::config::CsvOptions;
+use datafusion::common::parsers::CompressionTypeVariant;
 use datafusion::common::{DataFusionError, Result, exec_err, internal_datafusion_err};
 use datafusion::execution::{FunctionRegistry, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
@@ -43,6 +44,7 @@ use prost::Message;
 use runtime_proto::{
     HeaderProjectedCsvScanExecNode, SpicePhysicalPlanNode, spice_physical_plan_node,
 };
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub(super) fn encode_header_projected_csv(
@@ -82,6 +84,7 @@ pub(super) fn encode_header_projected_csv(
                     .transpose()?,
                 newlines_in_values: source.newlines_in_values(),
                 truncate_rows: source.truncate_rows(),
+                file_compression_type: proto_compression(conf.file_compression_type),
             },
         )),
     }))
@@ -107,6 +110,7 @@ pub(super) fn decode_header_projected_csv(
     let decode_ctx = ExecutionPlanDecodeCtx::new(&decoder);
 
     let table_schema = FileScanConfig::parse_table_schema_from_proto(&base_conf)?;
+    let file_compression_type = parse_compression(&node.file_compression_type)?;
     let csv_options = CsvOptions {
         has_header: Some(node.has_header),
         delimiter: proto_str_to_byte(&node.delimiter, "delimiter")?,
@@ -123,6 +127,7 @@ pub(super) fn decode_header_projected_csv(
             .transpose()?,
         newlines_in_values: Some(node.newlines_in_values),
         truncated_rows: Some(node.truncate_rows),
+        compression: file_compression_type.into(),
         ..Default::default()
     };
     let source = Arc::new(HeaderProjectedCsvSource::new(table_schema, csv_options));
@@ -131,7 +136,7 @@ pub(super) fn decode_header_projected_csv(
         &decode_ctx,
         source,
     )?)
-    .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
+    .with_file_compression_type(file_compression_type)
     .build();
     Ok(DataSourceExec::from_data_source(conf))
 }
@@ -236,6 +241,28 @@ impl ExecutionPlanDecode for SpicePlanDecoder<'_, '_> {
                 .or_else(|_| self.ctx.codec().try_decode_udwf(name, &[])),
         }
     }
+}
+
+fn proto_compression(compression: FileCompressionType) -> String {
+    match *compression.get_variant() {
+        CompressionTypeVariant::GZIP => "GZIP",
+        CompressionTypeVariant::BZIP2 => "BZIP2",
+        CompressionTypeVariant::XZ => "XZ",
+        CompressionTypeVariant::ZSTD => "ZSTD",
+        CompressionTypeVariant::UNCOMPRESSED => "UNCOMPRESSED",
+    }
+    .to_owned()
+}
+
+fn parse_compression(text: &str) -> Result<FileCompressionType> {
+    if text.is_empty() {
+        return Ok(FileCompressionType::UNCOMPRESSED);
+    }
+    FileCompressionType::from_str(text).map_err(|e| {
+        DataFusionError::Internal(format!(
+            "header-projected CSV scan has unknown file_compression_type '{text}': {e}"
+        ))
+    })
 }
 
 fn proto_byte_to_string(byte: u8, description: &str) -> Result<String> {
