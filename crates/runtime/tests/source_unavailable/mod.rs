@@ -2587,39 +2587,71 @@ mod served_with_snapshots_enabled {
             .ok_or_else(|| "COUNT(*) is not Int64".to_string())
     }
 
-    /// An acceleration reopened from disk is served and ready while its source is down.
-    #[tokio::test]
-    async fn an_append_acceleration_with_snapshots_is_served_and_ready_while_its_source_is_down()
-    -> Result<(), anyhow::Error> {
-        let _tracing = init_tracing(Some("integration=debug,info"));
-        let source = UnreachableSource::new("append-snapshots-down", 1);
-        source.register().await;
-        let dir = TempDir::new()?;
+    /// Whether a Cayenne snapshot archive was published under `dir`.
+    fn has_snapshot(dir: &Path) -> bool {
+        std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    has_snapshot(&path)
+                } else {
+                    path.extension().is_some_and(|ext| ext == "cayenne")
+                }
+            })
+        })
+    }
 
+    /// Loads the three source rows and stops once a snapshot of them is published, which
+    /// also checkpoints the acceleration.
+    async fn seed(source: &Arc<UnreachableSource>, dir: &Path) -> Result<(), anyhow::Error> {
         source.bring_up();
-        let (rt, loader) = start(app(source.prefix, dir.path())).await;
-        let seeded = wait_until_true(Duration::from_secs(30), || async {
-            count(&rt).await == Ok(3)
-                && dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
+        let (rt, loader) = start(app(source.prefix, dir)).await;
+        let seeded = wait_until_true(Duration::from_secs(60), || async {
+            count(&rt).await == Ok(3) && has_snapshot(&dir.join("snapshots"))
         })
         .await;
         let observed = (count(&rt).await, dataset_status(&rt, "orders"));
         stop(rt, loader).await;
-        anyhow::ensure!(seeded, "seeding the acceleration, got {observed:?}");
+        anyhow::ensure!(seeded, "seeding the acceleration and its snapshot, got {observed:?}");
+        Ok(())
+    }
 
+    /// Restarts with the source down, asserts the acceleration is served and the runtime
+    /// is ready, then that the dataset reports `Error` until the source is back.
+    async fn assert_served_while_source_is_down(
+        source: &Arc<UnreachableSource>,
+        dir: &Path,
+    ) -> Result<(), anyhow::Error> {
         source.take_down();
-        let (rt, loader) = start(app(source.prefix, dir.path())).await;
-        let served = wait_until_true(Duration::from_secs(10), || async {
+        let (rt, loader) = start(app(source.prefix, dir)).await;
+        let served = wait_until_true(Duration::from_secs(30), || async {
             count(&rt).await == Ok(3) && rt.status().is_ready()
         })
         .await;
         assert!(
             served,
-            "queries must be answered from the existing acceleration and the runtime must be ready, got {:?}, ready={} ({:?})",
+            "queries must be answered from the acceleration and the runtime must be ready, got {:?}, ready={} ({:?})",
             count(&rt).await,
             rt.status().is_ready(),
             dataset_status(&rt, "orders")
         );
+
+        let reports_error = wait_until_true(Duration::from_secs(30), || async {
+            matches!(
+                dataset_status(&rt, "orders"),
+                Some(ComponentStatus::Error(message))
+                    if message
+                        .as_deref()
+                        .is_some_and(|message| message.contains("Serving data from the existing acceleration"))
+            )
+        })
+        .await;
+        assert!(
+            reports_error,
+            "a source that cannot be reached sets Error, saying the dataset is still served ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        assert!(rt.status().is_ready(), "a served dataset in Error stays ready");
 
         source.bring_up();
         let reached = wait_until_true(Duration::from_secs(30), || async {
@@ -2634,5 +2666,32 @@ mod served_with_snapshots_enabled {
         assert_eq!(count(&rt).await, Ok(3));
         stop(rt, loader).await;
         Ok(())
+    }
+
+    /// An acceleration reopened from disk is served while its source is down.
+    #[tokio::test]
+    async fn a_reopened_append_acceleration_is_served_while_its_source_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let source = UnreachableSource::new("append-snapshots-reopened", 1);
+        source.register().await;
+        let dir = TempDir::new()?;
+        seed(&source, dir.path()).await?;
+        assert_served_while_source_is_down(&source, dir.path()).await
+    }
+
+    /// An acceleration restored from a snapshot is served while its source is down: with
+    /// nothing on disk and the source down, the rows can only come from the snapshot.
+    #[tokio::test]
+    async fn a_restored_append_acceleration_is_served_while_its_source_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let source = UnreachableSource::new("append-snapshots-restored", 1);
+        source.register().await;
+        let dir = TempDir::new()?;
+        seed(&source, dir.path()).await?;
+        std::fs::remove_dir_all(dir.path().join("data"))?;
+        std::fs::remove_dir_all(dir.path().join("metadata"))?;
+        assert_served_while_source_is_down(&source, dir.path()).await
     }
 }
