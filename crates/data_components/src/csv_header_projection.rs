@@ -51,7 +51,7 @@ use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource_csv::source::{CsvOpener, CsvSource};
-use futures::StreamExt;
+use futures::{StreamExt, stream};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 
 /// Initial object prefix read when parsing the header. The probe grows from
@@ -348,6 +348,12 @@ impl FileOpener for HeaderMappedOpener {
         let compression = self.file_compression_type;
         let store = Arc::clone(&self.object_store);
 
+        if partitioned_file.object_meta.size == 0 {
+            return Ok(Box::pin(async move {
+                Ok(stream::empty::<Result<RecordBatch>>().boxed())
+            }));
+        }
+
         Ok(Box::pin(async move {
             let header =
                 read_csv_header(&store, &partitioned_file.object_meta, &options, compression)
@@ -437,6 +443,11 @@ async fn read_csv_header(
     // complete object: a UTF-8 character or a bzip2 block can straddle that
     // cut. Grow from byte 0 until a quote-aware header record is available,
     // and only then treat a parse error as a malformed file.
+    // Listing skips size==0 objects; a truncate between list and open must
+    // not issue `get_range(0..0)`, which object_store rejects.
+    if meta.size == 0 {
+        return Ok(Vec::new());
+    }
     let mut end = meta.size.min(HEADER_PROBE_BYTES);
     loop {
         let whole_object = end >= meta.size;
@@ -852,6 +863,17 @@ mod tests {
             .expect("a federated read still answers");
         assert_eq!(amount, None, "amount_cents is gone from the header");
         assert_eq!(user, Some(30), "present columns stay bound by name");
+    }
+
+    #[tokio::test]
+    async fn zero_byte_csv_is_an_empty_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("base.csv"), []).expect("write empty");
+        let table = listing_table(dir.path(), header_format());
+        let sums = query_sums(table)
+            .await
+            .expect("a zero-byte file must not fail get_range(0..0)");
+        assert_eq!(sums, (None, None));
     }
 
     #[tokio::test]

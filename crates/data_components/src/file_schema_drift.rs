@@ -31,10 +31,16 @@ limitations under the License.
 //! scanned file carries is reported:
 //!
 //! - in a scan that feeds an acceleration refresh (the refresh session carries
-//!   [`AccelerationRefreshScan`]) that reads every file, the scan fails, so the refresh
-//!   fails and keeps the last loaded data. A refresh narrowed to some files (a partition
-//!   filter in `refresh_sql`, say) only warns, because the files it selects may predate the
-//!   column;
+//!   [`AccelerationRefreshScan`]) that reads every file, the scan fails when the
+//!   missing column is a rename (CSV header gone, or a JSON key gone *and* the
+//!   probe saw unregistered keys), so the refresh keeps the last loaded data.
+//!   Zero JSON records (`[]`, `{"data":[]}`, blank JSONL) are not drift: the
+//!   refresh is allowed to clear the acceleration. A JSON key absent from every
+//!   current record with no unregistered extra key is treated as a sparse
+//!   nullable omit: the scan warns and the refresh loads `NULL` for that
+//!   column. A refresh narrowed to some files (a partition filter in
+//!   `refresh_sql`, say) only warns, because the files it selects may predate
+//!   the column;
 //! - in any other scan, a `WARN` names the dataset and the columns once per change, and the
 //!   query still returns `NULL` for them.
 
@@ -47,13 +53,13 @@ use std::{
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use dataformat_json::{NonRepartitionedFileScanConfig, SpiceJsonFormat};
+use dataformat_json::{Format, JsonSchemaProbe, NonRepartitionedFileScanConfig, SpiceJsonFormat};
 use datafusion::{
     catalog::{ScanArgs, ScanResult, Session},
     common::tree_node::{TreeNode, TreeNodeRecursion},
     datasource::{
         TableProvider,
-        file_format::{FileFormat, json::JsonFormat},
+        file_format::{FileFormat, file_compression_type::FileCompressionType, json::JsonFormat},
     },
     error::{DataFusionError, Result as DFResult},
     execution::{config::SessionConfig, object_store::ObjectStoreUrl},
@@ -100,6 +106,11 @@ struct Drift {
     missing: Vec<String>,
     /// One scanned file, named in the message so the user can inspect it.
     example_file: String,
+    /// When `true`, a full acceleration refresh is refused (CSV header gone,
+    /// or a JSON key gone plus unregistered extras — the rename signal).
+    /// When `false`, the scan warns and a refresh is allowed to load `NULL`
+    /// for a sparse JSON key that every current record omitted.
+    fail_refresh: bool,
 }
 
 #[derive(Debug, Default)]
@@ -159,8 +170,10 @@ impl FileSchemaDriftGuard {
     /// # Errors
     ///
     /// Returns a [`DataFusionError::Plan`] naming the missing columns when `state` is an
-    /// acceleration refresh session ([`is_acceleration_refresh`]) and a projected registered
-    /// column is missing from every scanned file, or the error reading a file's schema in an
+    /// acceleration refresh session ([`is_acceleration_refresh`]), a projected registered
+    /// column is missing from every scanned file, and the probe treats that as a rename
+    /// (CSV header gone, or a JSON key gone plus unregistered extras). Zero JSON records and a sparse JSON omit warn
+    /// instead of failing. Also returns the error reading a file's schema in an
     /// acceleration refresh session. Any other scan skips the check when a file schema cannot
     /// be read.
     pub async fn check_scan(
@@ -243,8 +256,10 @@ impl FileSchemaDriftGuard {
 
         // A scan narrowed to some files (a partition filter, a `_location` predicate, a
         // limit) can legitimately read only older files that predate a column, so only a scan
-        // of every file proves the column gone.
-        if selects_all_files && is_acceleration_refresh(state) {
+        // of every file proves the column gone. JSON also requires the rename
+        // signal (`fail_refresh`): a missing key with no unregistered extra is
+        // a sparse omit, and zero records is not drift at all.
+        if selects_all_files && is_acceleration_refresh(state) && drift.fail_refresh {
             return Err(DataFusionError::Plan(refresh_error_message(
                 &self.dataset_name,
                 &drift,
@@ -262,6 +277,7 @@ impl FileSchemaDriftGuard {
             let report = Drift {
                 missing: unreported,
                 example_file: drift.example_file,
+                fail_refresh: drift.fail_refresh,
             };
             tracing::warn!("{}", read_warning_message(&self.dataset_name, &report));
             guard_state.warned.extend(report.missing);
@@ -307,15 +323,41 @@ impl FileSchemaDriftGuard {
         }
     }
 
+    fn is_json_format(&self) -> bool {
+        self.format.downcast_ref::<JsonFormat>().is_some()
+            || self.format.downcast_ref::<SpiceJsonFormat>().is_some()
+    }
+
     /// Reads the files' schemas, newest first and one file at a time (so unrelated columns
     /// whose types differ across files never have to merge), until every column in `columns`
     /// is found. Returns the columns no file carries.
+    ///
+    /// JSON probes also count records and collect unregistered keys. Zero
+    /// records is not drift. A missing key fails a refresh only when the probe
+    /// also saw a key that was never registered (the rename signal).
     ///
     /// # Errors
     ///
     /// Returns the error reading a file's schema. The probe is then inconclusive: the caller
     /// must neither report drift nor record the files as checked.
     async fn find_drift(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn object_store::ObjectStore>,
+        store_url: &ObjectStoreUrl,
+        columns: Vec<String>,
+        files: &[ObjectMeta],
+    ) -> DFResult<Option<Drift>> {
+        if self.is_json_format() {
+            return self
+                .find_json_drift(state, store, store_url, columns, files)
+                .await;
+        }
+        self.find_declared_column_drift(state, store, store_url, columns, files)
+            .await
+    }
+
+    async fn find_declared_column_drift(
         &self,
         state: &dyn Session,
         store: &Arc<dyn object_store::ObjectStore>,
@@ -341,7 +383,68 @@ impl FileSchemaDriftGuard {
             }
         }
 
-        // Keep the registered order so messages are stable.
+        Ok(Some(
+            self.drift_for_remaining(&remaining, files, store_url, true),
+        ))
+    }
+
+    async fn find_json_drift(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn object_store::ObjectStore>,
+        store_url: &ObjectStoreUrl,
+        columns: Vec<String>,
+        files: &[ObjectMeta],
+    ) -> DFResult<Option<Drift>> {
+        let mut remaining: BTreeSet<String> = columns.into_iter().collect();
+        let registered: BTreeSet<String> = self
+            .file_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let mut extras: BTreeSet<String> = BTreeSet::new();
+        let mut records = 0usize;
+        let (newest, rest) = files.split_at(files.len().min(1));
+        for chunk in std::iter::once(newest).chain(rest.chunks(SCHEMA_PROBE_CONCURRENCY)) {
+            let probes: Vec<_> = chunk
+                .iter()
+                .map(|file| probe_json_file(&self.format, state, store, file))
+                .collect();
+            for probe in futures::future::join_all(probes).await {
+                let probe = probe?;
+                records = records.saturating_add(probe.record_count);
+                remaining.retain(|name| probe.schema.field_with_name(name).is_err());
+                for field in probe.schema.fields() {
+                    if !registered.contains(field.name()) {
+                        extras.insert(field.name().clone());
+                    }
+                }
+            }
+            if remaining.is_empty() {
+                return Ok(None);
+            }
+        }
+
+        if records == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(self.drift_for_remaining(
+            &remaining,
+            files,
+            store_url,
+            !extras.is_empty(),
+        )))
+    }
+
+    fn drift_for_remaining(
+        &self,
+        remaining: &BTreeSet<String>,
+        files: &[ObjectMeta],
+        store_url: &ObjectStoreUrl,
+        fail_refresh: bool,
+    ) -> Drift {
         let missing: Vec<String> = self
             .file_schema
             .fields()
@@ -349,13 +452,14 @@ impl FileSchemaDriftGuard {
             .map(|f| f.name().clone())
             .filter(|name| remaining.contains(name))
             .collect();
-        Ok(Some(Drift {
+        Drift {
             missing,
             example_file: files
                 .first()
                 .map(|f| display_source_file(store_url, &f.location))
                 .unwrap_or_default(),
-        }))
+            fail_refresh,
+        }
     }
 }
 
@@ -401,6 +505,39 @@ fn scanned_files(plan: &Arc<dyn ExecutionPlan>) -> Option<(ObjectStoreUrl, Vec<O
     files.sort_by(|a, b| a.location.cmp(&b.location));
     files.dedup_by(|a, b| a.location == b.location);
     store_url.map(|url| (url, files))
+}
+
+/// Object-key probe for one JSON file: schema plus how many records were seen.
+/// `JsonFormat` (JSONL without a pointer) is probed as `SpiceJsonFormat`
+/// JSONL so the record count uses the same reader as array/pointer scans.
+async fn probe_json_file(
+    format: &Arc<dyn FileFormat>,
+    state: &dyn Session,
+    store: &Arc<dyn object_store::ObjectStore>,
+    file: &ObjectMeta,
+) -> DFResult<JsonSchemaProbe> {
+    let files = std::slice::from_ref(file);
+    if let Some(json) = format.as_ref().downcast_ref::<SpiceJsonFormat>() {
+        return json
+            .clone()
+            .with_schema_infer_max_rec(usize::MAX)
+            .probe_schema(state, store, files)
+            .await;
+    }
+    if let Some(json) = format.as_ref().downcast_ref::<JsonFormat>() {
+        let compression = json
+            .compression_type()
+            .unwrap_or(FileCompressionType::UNCOMPRESSED);
+        return SpiceJsonFormat::default()
+            .with_format(Format::Jsonl)
+            .with_schema_infer_max_rec(usize::MAX)
+            .with_file_compression_type(compression)
+            .probe_schema(state, store, files)
+            .await;
+    }
+    Err(DataFusionError::Internal(
+        "JSON schema probe invoked for a non-JSON format".to_string(),
+    ))
 }
 
 /// JSON schema inference defaults to a record sample, which cannot prove a
@@ -472,16 +609,24 @@ fn refresh_error_message(dataset: &str, drift: &Drift) -> String {
 
 fn read_warning_message(dataset: &str, drift: &Drift) -> String {
     let noun = column_noun(&drift.missing);
-    format!(
-        "Dataset '{dataset}': registered {noun} {cols} missing from every source file scanned (for example '{file}'), so queries return NULL for {them}. The source schema changed after the dataset was registered, for example a column was renamed or dropped. Restore the {noun} in the source files, or restart the runtime to adopt the new schema.",
-        cols = quoted(&drift.missing),
-        file = drift.example_file,
-        them = if drift.missing.len() == 1 {
-            "it"
-        } else {
-            "them"
-        },
-    )
+    let them = if drift.missing.len() == 1 {
+        "it"
+    } else {
+        "them"
+    };
+    if drift.fail_refresh {
+        format!(
+            "Dataset '{dataset}': registered {noun} {cols} missing from every source file scanned (for example '{file}'), so queries return NULL for {them}. The source schema changed after the dataset was registered, for example a column was renamed or dropped. Restore the {noun} in the source files, or restart the runtime to adopt the new schema.",
+            cols = quoted(&drift.missing),
+            file = drift.example_file,
+        )
+    } else {
+        format!(
+            "Dataset '{dataset}': registered {noun} {cols} absent from every current record in the source files (for example '{file}'), so queries return NULL for {them}. JSON objects often omit null keys; this is not treated as a rename because the files introduce no unregistered key. Restore the {noun} if they were dropped, or restart the runtime to adopt a schema without them.",
+            cols = quoted(&drift.missing),
+            file = drift.example_file,
+        )
+    }
 }
 
 /// The [`TableLayer`] that checks a file dataset's scans with a [`FileSchemaDriftGuard`].
@@ -925,6 +1070,152 @@ mod tests {
         assert_eq!(single_value(&batches), Some(2));
     }
 
+    fn row_count(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    async fn json_empty_source_clears(
+        label: &str,
+        table: Guarded,
+        path: &Path,
+        write_empty: impl Fn(&Path),
+    ) {
+        let before = query(&table, true, "SELECT sum(amount_cents), sum(id) FROM base")
+            .await
+            .unwrap_or_else(|e| panic!("{label}: refresh before empty: {e}"));
+        assert_eq!(two_values(&before), (Some(2), Some(1)), "{label} last good");
+
+        write_empty(path);
+
+        let federated = query(&table, false, "SELECT * FROM base")
+            .await
+            .unwrap_or_else(|e| panic!("{label}: federated empty read: {e}"));
+        assert_eq!(
+            row_count(&federated),
+            0,
+            "{label}: empty source has no rows"
+        );
+
+        let refreshed = query(&table, true, "SELECT * FROM base")
+            .await
+            .unwrap_or_else(|e| panic!("{label}: empty source must not fail refresh: {e}"));
+        assert_eq!(
+            row_count(&refreshed),
+            0,
+            "{label}: a full refresh of an empty source clears the table"
+        );
+        let sums = query(&table, true, "SELECT sum(amount_cents), sum(id) FROM base")
+            .await
+            .unwrap_or_else(|e| panic!("{label}: empty sums: {e}"));
+        assert_eq!(two_values(&sums), (None, None), "{label}: empty sums");
+    }
+
+    #[tokio::test]
+    async fn jsonl_refresh_of_an_empty_source_clears() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("base.json");
+        write_ndjson(&path, JSON_BASELINE);
+        let table = guarded_json_table(dir.path(), &["id", "amount_cents"]);
+        json_empty_source_clears("jsonl", table, &path, |p| {
+            std::fs::write(p, "\n\n").expect("blank jsonl");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn json_array_refresh_of_an_empty_source_clears() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("base.json");
+        write_json_array(&path, JSON_BASELINE);
+        let table = guarded_spice_json_table(
+            dir.path(),
+            &["id", "amount_cents"],
+            SpiceJsonFormat::default().with_format(Format::Json),
+        );
+        json_empty_source_clears("file_format json", table, &path, |p| {
+            write_json_array(p, &[]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn json_pointer_refresh_of_an_empty_source_clears() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("base.json");
+        write_json_pointer_doc(&path, JSON_BASELINE);
+        let table = guarded_spice_json_table(
+            dir.path(),
+            &["id", "amount_cents"],
+            SpiceJsonFormat::default()
+                .with_format(Format::Auto)
+                .with_json_pointer("/data".to_string()),
+        );
+        json_empty_source_clears("json_pointer", table, &path, |p| {
+            write_json_pointer_doc(p, &[]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn json_refresh_allows_a_sparse_nullable_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_ndjson(&dir.path().join("base.json"), JSON_BASELINE);
+        let table = guarded_json_table(dir.path(), &["id", "amount_cents"]);
+        let before = query(&table, true, "SELECT sum(amount_cents), sum(id) FROM base")
+            .await
+            .expect("refresh before omit");
+        assert_eq!(two_values(&before), (Some(2), Some(1)));
+
+        write_ndjson(
+            &dir.path().join("base.json"),
+            &[r#"{"id":1}"#, r#"{"id":3}"#],
+        );
+
+        let federated = query(&table, false, "SELECT sum(amount_cents), sum(id) FROM base")
+            .await
+            .expect("federated sparse read");
+        assert_eq!(two_values(&federated), (None, Some(4)));
+        assert!(
+            table
+                .layer
+                .guard
+                .state
+                .lock()
+                .warned
+                .contains("amount_cents"),
+            "omitting a nullable key still WARNs"
+        );
+
+        let refreshed = query(&table, true, "SELECT sum(amount_cents), sum(id) FROM base")
+            .await
+            .expect("a sparse nullable key is not a rename");
+        assert_eq!(
+            two_values(&refreshed),
+            (None, Some(4)),
+            "refresh loads NULL for the omitted key instead of failing"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_array_empty_objects_are_not_a_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_json_array(&dir.path().join("base.json"), JSON_BASELINE);
+        let table = guarded_spice_json_table(
+            dir.path(),
+            &["id", "amount_cents"],
+            SpiceJsonFormat::default().with_format(Format::Json),
+        );
+        write_json_array(&dir.path().join("base.json"), &["{}", "{}"]);
+        let refreshed = query(&table, true, "SELECT * FROM base")
+            .await
+            .expect("[{}] is one record with no keys, not zero records");
+        assert_eq!(row_count(&refreshed), 2);
+        let sums = query(&table, true, "SELECT sum(amount_cents), sum(id) FROM base")
+            .await
+            .expect("empty objects sum to NULL");
+        assert_eq!(two_values(&sums), (None, None));
+    }
+
     #[test]
     fn declared_column_formats_are_checked() {
         assert!(FileSchemaDriftGuard::supports_format(
@@ -1093,6 +1384,7 @@ mod tests {
         let drift = Drift {
             missing: vec!["a".to_string(), "b".to_string()],
             example_file: "dir/f.csv".to_string(),
+            fail_refresh: true,
         };
         let refresh = refresh_error_message("ds", &drift);
         assert!(
@@ -1105,5 +1397,14 @@ mod tests {
         );
         let read = read_warning_message("ds", &drift);
         assert!(read.contains("queries return NULL for them"), "{read}");
+
+        let sparse = Drift {
+            missing: vec!["amount_cents".to_string()],
+            example_file: "dir/f.json".to_string(),
+            fail_refresh: false,
+        };
+        let sparse_warn = read_warning_message("ds", &sparse);
+        assert!(sparse_warn.contains("omit null keys"), "{sparse_warn}");
+        assert!(sparse_warn.contains("'amount_cents'"), "{sparse_warn}");
     }
 }

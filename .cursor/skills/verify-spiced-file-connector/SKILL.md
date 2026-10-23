@@ -99,7 +99,7 @@ The mapped journeys are in `features/`. Drive them with:
   --label "$LABEL"
 ```
 
-`$LABEL` is `trunk` or `branch`. The helper writes, then queries, for baseline → reorder → rename → restore on CSV, JSONL, `file_format: json` (array), and `json_pointer`, federated and Arrow-accelerated. Federated reads see the file immediately. Accelerated reads see it only after refresh.
+`$LABEL` is `trunk` or `branch`. The helper writes, then queries, for baseline → reorder → rename → restore → empty-JSON on CSV, JSONL, `file_format: json` (array), and `json_pointer`, federated and Arrow-accelerated. Federated reads see the file immediately. Accelerated reads see it only after refresh. Emptying the JSON sources (`[]` / `{"data":[]}` / blank JSONL) must clear the JSON accelerations; CSV stays populated.
 
 ## Evidence
 
@@ -137,7 +137,7 @@ Trunk vs branch in one shot (builds are the caller's job):
 .cursor/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh cleanup --work "$WORK_DIR"
 ```
 
-Sends `TERM` (then `KILL` if needed) only to the pid in `$WORK_DIR/spiced.pid`. Removes the work dir's runtime scratch (pidfile, `.spice/`). Leaves `$EVIDENCE_DIR` untouched.
+Sends `TERM` (then `KILL` if needed) only to the pid in `$WORK_DIR/spiced.pid` when `$WORK_DIR/spiced.identity` still names that same process (pid, executable, `/proc/<pid>/stat` starttime). Refuses to signal when ownership cannot be established. Removes the work dir's runtime scratch (pidfile, identity, `.spice/`). Leaves `$EVIDENCE_DIR` untouched.
 
 ## Helpers
 

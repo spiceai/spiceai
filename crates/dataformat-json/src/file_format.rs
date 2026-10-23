@@ -215,6 +215,122 @@ impl SpiceJsonFormat {
         self.options.soda_metadata = enabled;
         self
     }
+
+    /// Infer the schema of `objects` and count how many JSON records were
+    /// inspected. The count is `0` for an empty array, an empty pointer
+    /// target, or blank JSONL. An empty object (`{}` / `[{}]`) is one record
+    /// with no keys, which is not the same as zero records.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reading a file, decompressing it, extracting a JSON
+    /// pointer, or inferring a schema from the records.
+    pub async fn probe_schema(
+        &self,
+        _state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        objects: &[ObjectMeta],
+    ) -> Result<JsonSchemaProbe> {
+        let mut schemas = Vec::new();
+        let mut records_to_read = self
+            .options
+            .schema_infer_max_rec
+            .unwrap_or(DEFAULT_SCHEMA_INFER_MAX_RECORD);
+        let mut record_count = 0;
+        let file_compression_type = FileCompressionType::from(self.options.compression);
+        for object in objects {
+            let mut take_while = || {
+                let should_take = records_to_read > 0;
+                if should_take {
+                    records_to_read -= 1;
+                    record_count += 1;
+                }
+                should_take
+            };
+
+            let r = store.as_ref().get(&object.location).await?;
+            let raw_buf = match r.payload {
+                GetResultPayload::File(file, _) => {
+                    let mut decoder = file_compression_type.convert_read(file)?;
+                    let mut raw_buf = Vec::new();
+                    decoder.read_to_end(&mut raw_buf)?;
+                    raw_buf
+                }
+                GetResultPayload::Stream(_) => {
+                    let data = r.bytes().await?;
+                    let mut decoder = file_compression_type.convert_read(data.reader())?;
+                    let mut raw_buf = Vec::new();
+                    decoder.read_to_end(&mut raw_buf)?;
+                    raw_buf
+                }
+            };
+            schemas.push(self.schema_from_raw_buf(&raw_buf, &mut take_while)?);
+            if records_to_read == 0 {
+                break;
+            }
+        }
+
+        Ok(JsonSchemaProbe {
+            schema: Arc::new(Schema::try_merge(schemas)?),
+            record_count,
+        })
+    }
+
+    fn schema_from_raw_buf(
+        &self,
+        raw_buf: &[u8],
+        take_while: &mut dyn FnMut() -> bool,
+    ) -> Result<Schema> {
+        let is_soda = self.options.format == Format::Soda
+            || (self.options.format == Format::Auto && is_soda_response(raw_buf));
+
+        if is_soda && self.options.json_pointer.is_some() {
+            return Err(DataFusionError::Configuration(
+                "'json_pointer' cannot be used with SODA format data. \
+                 SODA responses contain their own schema in 'meta.view.columns' \
+                 and data is extracted automatically. \
+                 Remove 'json_pointer' or set 'file_format: json' to treat the file as regular JSON."
+                    .to_string(),
+            ));
+        }
+
+        if is_soda {
+            let soda = SodaReader::from_vec(raw_buf, self.options.soda_metadata)?;
+            let schema = soda.schema().clone();
+            return Ok(if let Some(separator) = &self.options.flatten_json {
+                unnest_struct_schema(&schema, separator)
+            } else {
+                schema
+            });
+        }
+
+        let extracted = if let Some(path) = &self.options.json_pointer {
+            let reader = JsonPointerReader::from_vec(raw_buf, path)?;
+            let mut out = Vec::new();
+            std::io::BufReader::new(reader).read_to_end(&mut out)?;
+            Some(out)
+        } else {
+            None
+        };
+        let buf = extracted.as_deref().unwrap_or(raw_buf);
+        let schema = infer_json_schema_for_format(buf, self.options.format, take_while)?;
+        Ok(if let Some(separator) = &self.options.flatten_json {
+            unnest_struct_schema(&schema, separator)
+        } else {
+            schema
+        })
+    }
+}
+
+/// Schema inferred from a JSON source plus how many records were inspected.
+#[derive(Debug, Clone)]
+pub struct JsonSchemaProbe {
+    /// Union of object keys seen while probing `objects`.
+    pub schema: SchemaRef,
+    /// Records `take_while` accepted while inferring. `0` means the files
+    /// contained no JSON values (`[]`, `{"data":[]}` after a pointer, blank
+    /// JSONL). An empty object is one record with no keys.
+    pub record_count: usize,
 }
 
 #[async_trait]
@@ -238,139 +354,11 @@ impl FileFormat for SpiceJsonFormat {
 
     async fn infer_schema(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
     ) -> Result<SchemaRef> {
-        let mut schemas = Vec::new();
-        let mut records_to_read = self
-            .options
-            .schema_infer_max_rec
-            .unwrap_or(DEFAULT_SCHEMA_INFER_MAX_RECORD);
-        let file_compression_type = FileCompressionType::from(self.options.compression);
-        for object in objects {
-            let mut take_while = || {
-                let should_take = records_to_read > 0;
-                if should_take {
-                    records_to_read -= 1;
-                }
-                should_take
-            };
-
-            let r = store.as_ref().get(&object.location).await?;
-            let schema = match r.payload {
-                GetResultPayload::File(file, _) => {
-                    let mut decoder = file_compression_type.convert_read(file)?;
-
-                    // Buffer everything so we can probe for SODA when Auto.
-                    let mut raw_buf = Vec::new();
-                    decoder.read_to_end(&mut raw_buf)?;
-
-                    // Check SODA on raw data before json_pointer extraction.
-                    let is_soda = self.options.format == Format::Soda
-                        || (self.options.format == Format::Auto && is_soda_response(&raw_buf));
-
-                    if is_soda && self.options.json_pointer.is_some() {
-                        return Err(DataFusionError::Configuration(
-                            "'json_pointer' cannot be used with SODA format data. \
-                             SODA responses contain their own schema in 'meta.view.columns' \
-                             and data is extracted automatically. \
-                             Remove 'json_pointer' or set 'file_format: json' to treat the file as regular JSON."
-                                .to_string(),
-                        ));
-                    }
-
-                    if is_soda {
-                        let soda = SodaReader::from_vec(&raw_buf, self.options.soda_metadata)?;
-                        let schema = soda.schema().clone();
-                        if let Some(separator) = &self.options.flatten_json {
-                            unnest_struct_schema(&schema, separator)
-                        } else {
-                            schema
-                        }
-                    } else {
-                        let buf = if let Some(path) = &self.options.json_pointer {
-                            let extracted = JsonPointerReader::from_vec(&raw_buf, path)?;
-                            let mut out = Vec::new();
-                            std::io::BufReader::new(extracted).read_to_end(&mut out)?;
-                            out
-                        } else {
-                            raw_buf
-                        };
-
-                        let schema = infer_json_schema_for_format(
-                            &buf,
-                            self.options.format,
-                            &mut take_while,
-                        )?;
-
-                        if let Some(separator) = &self.options.flatten_json {
-                            unnest_struct_schema(&schema, separator)
-                        } else {
-                            schema
-                        }
-                    }
-                }
-                GetResultPayload::Stream(_) => {
-                    let data = r.bytes().await?;
-                    let mut decoder = file_compression_type.convert_read(data.reader())?;
-                    let mut raw_buf = Vec::new();
-                    decoder.read_to_end(&mut raw_buf)?;
-
-                    let is_soda = self.options.format == Format::Soda
-                        || (self.options.format == Format::Auto && is_soda_response(&raw_buf));
-
-                    if is_soda && self.options.json_pointer.is_some() {
-                        return Err(DataFusionError::Configuration(
-                            "'json_pointer' cannot be used with SODA format data. \
-                             SODA responses contain their own schema in 'meta.view.columns' \
-                             and data is extracted automatically. \
-                             Remove 'json_pointer' or set 'file_format: json' to treat the file as regular JSON."
-                                .to_string(),
-                        ));
-                    }
-
-                    if is_soda {
-                        let soda = SodaReader::from_vec(&raw_buf, self.options.soda_metadata)?;
-                        let schema = soda.schema().clone();
-                        if let Some(separator) = &self.options.flatten_json {
-                            unnest_struct_schema(&schema, separator)
-                        } else {
-                            schema
-                        }
-                    } else {
-                        let buf = if let Some(path) = &self.options.json_pointer {
-                            let extracted = JsonPointerReader::from_vec(&raw_buf, path)?;
-                            let mut out = Vec::new();
-                            std::io::BufReader::new(extracted).read_to_end(&mut out)?;
-                            out
-                        } else {
-                            raw_buf
-                        };
-
-                        let schema = infer_json_schema_for_format(
-                            &buf,
-                            self.options.format,
-                            &mut take_while,
-                        )?;
-
-                        if let Some(separator) = &self.options.flatten_json {
-                            unnest_struct_schema(&schema, separator)
-                        } else {
-                            schema
-                        }
-                    }
-                }
-            };
-
-            schemas.push(schema);
-            if records_to_read == 0 {
-                break;
-            }
-        }
-
-        let schema = Schema::try_merge(schemas)?;
-        Ok(Arc::new(schema))
+        Ok(self.probe_schema(state, store, objects).await?.schema)
     }
 
     async fn infer_stats(
@@ -798,6 +786,45 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn empty_json_array_inspects_zero_records() {
+        let mut n = 0;
+        let mut take = || {
+            n += 1;
+            true
+        };
+        let schema = infer_json_schema_for_format(b"[]", Format::Array, &mut take)
+            .expect("empty array is a valid schema");
+        assert_eq!(schema.fields().len(), 0);
+        assert_eq!(n, 0, "[] is zero records, not a missing-column list");
+    }
+
+    #[test]
+    fn empty_json_object_array_inspects_one_record() {
+        let mut n = 0;
+        let mut take = || {
+            n += 1;
+            true
+        };
+        let schema = infer_json_schema_for_format(b"[{}]", Format::Array, &mut take)
+            .expect("empty object is a valid record");
+        assert_eq!(schema.fields().len(), 0);
+        assert_eq!(n, 1, "[{{}}] is one record with no keys");
+    }
+
+    #[test]
+    fn blank_jsonl_inspects_zero_records() {
+        let mut n = 0;
+        let mut take = || {
+            n += 1;
+            true
+        };
+        let schema = infer_json_schema_for_format(b"\n\n  \n", Format::Jsonl, &mut take)
+            .expect("blank JSONL is a valid schema");
+        assert_eq!(schema.fields().len(), 0);
+        assert_eq!(n, 0);
     }
 
     #[test]

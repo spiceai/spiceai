@@ -56,6 +56,40 @@ parse_args() {
 pidfile() { echo "${WORK}/spiced.pid"; }
 logfile() { echo "${WORK}/spiced.log"; }
 binfile() { echo "${WORK}/spiced.binary"; }
+identityfile() { echo "${WORK}/spiced.identity"; }
+
+# /proc/<pid>/stat field 22 (starttime). comm can contain spaces and parens,
+# so split on the last `)` and take the 20th remaining field.
+process_starttime() {
+  local pid="$1"
+  python3 - "$pid" <<'PY'
+import pathlib, sys
+pid = sys.argv[1]
+text = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+print(text.rsplit(")", 1)[1].split()[19])
+PY
+}
+
+write_process_identity() {
+  local pid="$1"
+  local exe="$2"
+  local start
+  start="$(process_starttime "$pid")"
+  printf '%s\t%s\t%s\n' "$pid" "$exe" "$start" >"$(identityfile)"
+}
+
+# Same pid, same executable, same starttime as launch recorded.
+process_matches_identity() {
+  local pid="$1"
+  local want_exe="$2"
+  local want_start="$3"
+  kill -0 "$pid" 2>/dev/null || return 1
+  local exe start
+  exe="$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
+  [[ -n "$exe" && "$exe" == "$want_exe" ]] || return 1
+  start="$(process_starttime "$pid" 2>/dev/null || true)"
+  [[ -n "$start" && "$start" == "$want_start" ]]
+}
 
 # Resolve `--work` after creating it. `cmd_launch` then cds to `$WORK`; a
 # relative path such as `work` would make `logfile` expand to `work/spiced.log`
@@ -156,6 +190,13 @@ write_all_json_shapes() {
   write_events_jsonl "${WORK}/data/events.jsonl" "$one" "$two"
   write_events_json_array "${WORK}/data/events.json" "$one" "$two"
   write_events_json_pointer "${WORK}/data/events_pointer.json" "$one" "$two"
+}
+
+write_all_json_empty() {
+  # Blank-line JSONL, `[]`, and `{"data":[]}` — zero records, not missing keys.
+  printf '\n\n' >"${WORK}/data/events.jsonl"
+  write_events_json_array "${WORK}/data/events.json"
+  write_events_json_pointer "${WORK}/data/events_pointer.json"
 }
 
 seed_files() {
@@ -294,6 +335,7 @@ cmd_launch() {
   )"
   echo "$pid" >"$(pidfile)"
   printf '%s\n' "$SPICED" >"$(binfile)"
+  write_process_identity "$pid" "$SPICED"
   printf '%s\n' "$HTTP_ADDR" >"${WORK}/http.addr"
   printf '%s\n' "$FLIGHT_ADDR" >"${WORK}/flight.addr"
   echo "started pid=${pid} http=${HTTP_ADDR} flight=${FLIGHT_ADDR} log=$(logfile)"
@@ -662,18 +704,50 @@ cmd_drive() {
   datasets_status "${ev}/datasets-restore.json"
   ready_capture "${ev}/ready-restore.txt"
   echo "restore datasets: $(summarize_datasets "${ev}/datasets-restore.json")" | tee -a "${ev}/summary.txt"
+
+  write_all_json_empty
+  cp "${WORK}/data/events.jsonl" "${ev}/events.empty.jsonl"
+  cp "${WORK}/data/events.json" "${ev}/events.empty.json"
+  cp "${WORK}/data/events_pointer.json" "${ev}/events.empty.pointer.json"
+
+  for ds in json_fed json_array_fed json_ptr_fed; do
+    query_dataset empty-fed "$ds" "$ev"
+  done
+  refresh_all_and_wait empty "$ev"
+  for ds in json_acc json_array_acc json_ptr_acc; do
+    query_dataset empty-acc "$ds" "$ev"
+  done
+  query_dataset empty-acc csv_acc "$ev"
+  datasets_status "${ev}/datasets-empty.json"
+  ready_capture "${ev}/ready-empty.txt"
+  echo "empty datasets: $(summarize_datasets "${ev}/datasets-empty.json")" | tee -a "${ev}/summary.txt"
+
   cp "$(logfile)" "${ev}/spiced.log"
   echo "drive complete ${ev}"
 }
 
 cmd_cleanup() {
   require_work
-  local pf
+  local pf identf
   pf="$(pidfile)"
+  identf="$(identityfile)"
   if [[ -f "$pf" ]]; then
     local pid
     pid="$(cat "$pf")"
-    if kill -0 "$pid" 2>/dev/null; then
+    if ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$pf" "$identf"
+      echo "pid ${pid} is already gone"
+    else
+      [[ -f "$identf" ]] || die "no process identity at ${identf}; refusing to signal pid ${pid}"
+      local want_pid want_exe want_start
+      IFS=$'\t' read -r want_pid want_exe want_start <"$identf"
+      [[ "$pid" == "$want_pid" ]] || die "pidfile ${pid} does not match identity ${want_pid}; refusing to signal"
+      local bin
+      bin="$(cat "$(binfile)" 2>/dev/null || true)"
+      [[ -n "$bin" && "$bin" == "$want_exe" ]] || die "identity exe ${want_exe} does not match $(binfile); refusing to signal pid ${pid}"
+      if ! process_matches_identity "$pid" "$want_exe" "$want_start"; then
+        die "pid ${pid} is not the launched spiced (exe/starttime mismatch); refusing to signal"
+      fi
       kill -TERM "$pid" 2>/dev/null || true
       local i
       for i in $(seq 1 40); do
@@ -681,13 +755,17 @@ cmd_cleanup() {
         sleep 0.1
       done
       if kill -0 "$pid" 2>/dev/null; then
+        if ! process_matches_identity "$pid" "$want_exe" "$want_start"; then
+          die "pid ${pid} changed identity before KILL; refusing to signal"
+        fi
         kill -KILL "$pid" 2>/dev/null || true
       fi
+      rm -f "$pf" "$identf"
+      echo "stopped pid=${pid}"
     fi
-    rm -f "$pf"
-    echo "stopped pid=${pid}"
   else
     echo "no pidfile; nothing to stop"
+    rm -f "$identf"
   fi
   rm -rf "${WORK}/.spice"
 }
@@ -832,6 +910,26 @@ lines += [
     "",
     f"- trunk datasets: {datasets('trunk', 'restore')}",
     f"- branch datasets: {datasets('branch', 'restore')}",
+    "",
+    "## Empty JSON",
+    "",
+]
+for step, ds in (
+    ("empty-fed", "json_fed"),
+    ("empty-acc", "json_acc"),
+    ("empty-fed", "json_array_fed"),
+    ("empty-acc", "json_array_acc"),
+    ("empty-fed", "json_ptr_fed"),
+    ("empty-acc", "json_ptr_acc"),
+    ("empty-acc", "csv_acc"),
+):
+    lines.append(f"- `{ds}` {step} trunk `{sums('trunk', step, ds)}` / branch `{sums('branch', step, ds)}`")
+lines += [
+    "",
+    f"- trunk `/v1/ready`: `{ready('trunk', 'empty')}`",
+    f"- branch `/v1/ready`: `{ready('branch', 'empty')}`",
+    f"- trunk datasets: {datasets('trunk', 'empty')}",
+    f"- branch datasets: {datasets('branch', 'empty')}",
     "",
 ]
 report.write_text("\n".join(lines) + "\n", encoding="utf-8")

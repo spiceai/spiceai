@@ -28,4 +28,4 @@ This directory is the maintained source for verifying user-visible file-connecto
 ## Features
 
 - [CSV file connector](./csv-file-connector.md) covers header reorder, column rename, and restore on federated and Arrow-accelerated CSV.
-- [JSON file connector](./json-file-connector.md) covers object-key reorder, column rename, and restore on federated and Arrow-accelerated JSONL, `file_format: json` (array), and `json_pointer`.
+- [JSON file connector](./json-file-connector.md) covers object-key reorder, column rename, restore, and populated-to-empty on federated and Arrow-accelerated JSONL, `file_format: json` (array), and `json_pointer`.

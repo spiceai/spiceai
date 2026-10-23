@@ -9,8 +9,9 @@ A JSON/NDJSON file dataset binds object keys by name. Reordering keys keeps valu
 - `json-reorder` rewrites the same objects with keys in a different order and keeps `sum(amount_cents)=300`, `sum(user_id)=30`.
 - `json-rename` renames `amount_cents` to `amt`. Federated reads return `NULL` for `amount_cents` and one `WARN`. An Arrow refresh fails; status is `Error`; accelerated sums stay `300`/`30`.
 - `json-restore` puts the original key back. Federated sums return; a refresh succeeds; status is `Ready`.
-- `json-array` is `file_format: json` over `data/events.json` (a JSON array). Same reorder / rename / restore as JSONL.
-- `json-pointer` is `file_format: json` plus `json_pointer: /data` over `data/events_pointer.json` (`{"data":[...]}`). Same reorder / rename / restore as JSONL.
+- `json-empty` rewrites each source to zero records (`[]`, `{"data":[]}`, blank JSONL). Federated sums are `null`/`null`. An Arrow refresh succeeds and clears the acceleration (`Ready`, `null`/`null`). This is not a rename: no records means no missing-column list.
+- `json-array` is `file_format: json` over `data/events.json` (a JSON array). Same reorder / rename / restore / empty as JSONL.
+- `json-pointer` is `file_format: json` plus `json_pointer: /data` over `data/events_pointer.json` (`{"data":[...]}`). Same reorder / rename / restore / empty as JSONL.
 
 ## How to get to it (user POV)
 
@@ -31,6 +32,7 @@ Preconditions:
 - **Reorder keys.** Rewrite each source with `amount_cents` before `user_id`. Query the federated datasets. Refresh the accelerated datasets, then query them. All stay `300`/`30`. Status stays `Ready`.
 - **Rename the amount key.** Rewrite each source with `amt` instead of `amount_cents`. Query each federated dataset: `amount_cents` is `null`, `user_id` is `30`. The log has one `WARN` per federated dataset naming `'amount_cents'`. Refresh each accelerated dataset: the refresh ends in `Error` with a message naming `'amount_cents'`. Query each accelerated dataset: sums are still `300`/`30`.
 - **Restore.** Rewrite the baseline objects. Query federated (`300`/`30`). Refresh accelerated until `Ready`. Query accelerated (`300`/`30`).
+- **Empty.** Rewrite JSONL to blank lines, `events.json` to `[]`, and `events_pointer.json` to `{"data":[]}`. Query each federated JSON dataset: `null`/`null`. Refresh each accelerated JSON dataset until `Ready`. Query them: `null`/`null`. CSV stays populated (`300`/`30`).
 - **Proof.** Keep `sql-*-json_*.json`, `datasets-*.json`, `refresh-*-json_*acc.*`, and the matching `WARN` / error lines from `spiced.log`. The WARN example path starts with `/`.
 
 ## Gotchas
