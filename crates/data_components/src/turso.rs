@@ -148,7 +148,10 @@ use datafusion_federation::{
         SQLFederationProvider, SQLTableSource,
     },
 };
-use datafusion_table_providers::sqlite::sqlite_interval::SQLiteIntervalVisitor;
+use datafusion_table_providers::sqlite::{
+    federation::SQLiteRemoteTable,
+    sqlite_interval::{SQLiteIntervalVisitor, mark_federated_date_operands},
+};
 
 use crate::function_support::{FunctionSupport, unfederate_plan_with_unsupported_functions};
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -809,7 +812,11 @@ impl TursoTableProvider {
                 // 1. RFC3339 TEXT (default): Full precision + timezone preservation
                 // 2. INTEGER milliseconds (performance): Millisecond precision only
                 //
-                // The read path automatically detects and converts both formats to the
+                // A computed timestamp can also arrive as the `YYYY-MM-DD HH:MM:SS[.SSS]`
+                // TEXT that SQLite's date and time functions answer in UTC, such as the
+                // `datetime()` a shifted timestamp is rendered through.
+                //
+                // The read path automatically detects and converts each format to the
                 // schema's expected timestamp type and unit.
                 use timestamp_conversion::{MICROS_PER_MILLI, MILLIS_PER_SECOND, NANOS_PER_MILLI};
 
@@ -827,24 +834,26 @@ impl TursoTableProvider {
                                 TimeUnit::Nanosecond => millis.checked_mul(NANOS_PER_MILLI),
                             }
                         }
-                        TursoValue::Text(rfc3339_str) => {
-                            // RFC3339 TEXT format: Parse and convert to target unit.
+                        TursoValue::Text(text) => {
+                            // TEXT format: Parse and convert to target unit.
                             // Use unit-appropriate methods to avoid i64 nanosecond overflow
                             // for dates outside ~1677-2262.
-                            use chrono::DateTime;
+                            // A parse failure returns NULL (lenient read behavior).
+                            use chrono::{DateTime, NaiveDateTime};
 
-                            // Parse RFC3339 string
-                            if let Ok(dt) = DateTime::parse_from_rfc3339(rfc3339_str) {
-                                match unit {
+                            DateTime::parse_from_rfc3339(text)
+                                .map(|dt| dt.to_utc())
+                                .or_else(|_| {
+                                    NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+                                        .map(|naive| naive.and_utc())
+                                })
+                                .ok()
+                                .and_then(|dt| match unit {
                                     TimeUnit::Second => Some(dt.timestamp()),
                                     TimeUnit::Millisecond => Some(dt.timestamp_millis()),
                                     TimeUnit::Microsecond => Some(dt.timestamp_micros()),
                                     TimeUnit::Nanosecond => dt.timestamp_nanos_opt(),
-                                }
-                            } else {
-                                // Parse failed, return NULL (lenient read behavior)
-                                None
-                            }
+                                })
                         }
                         TursoValue::Null => None,
                         _ => None,
@@ -1225,8 +1234,9 @@ impl TursoTableProvider {
 
     /// Returns AST analyzer rules for Turso-specific SQL transformations.
     ///
-    /// Uses the shared `SQLiteIntervalVisitor` to convert INTERVAL literals to
-    /// `CAST(date/datetime(col, modifier) AS TEXT)` calls.
+    /// Uses the shared `SQLiteIntervalVisitor` to convert INTERVAL arithmetic to
+    /// `CAST(datetime(col, modifier) AS TEXT)`, or `date()` for a `DATE` operand
+    /// the logical optimizers marked (see [`SQLExecutor::logical_optimizer`]).
     ///
     /// Also applies `TursoBetweenVisitor` to rewrite numeric `BETWEEN` expressions
     /// into explicit `CAST(... AS REAL)` comparisons, since Turso does not have the
@@ -1346,16 +1356,20 @@ impl TableProvider for TursoTableProvider {
 
 // Federation support for Turso
 impl TursoTableProvider {
-    /// Creates a federated table source for cross-database queries
+    /// Creates a federated table source for cross-database queries. Its table is
+    /// `SQLiteRemoteTable`, whose logical optimizer marks the `DATE` operands of
+    /// interval arithmetic (see [`SQLExecutor::logical_optimizer`]).
     fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
         let table_name = TableReference::bare(self.table_name.clone());
         let schema = Arc::clone(&self.schema);
         let fed_provider = Arc::new(SQLFederationProvider::new(self));
 
-        Arc::new(SQLTableSource::new_with_schema(
+        Arc::new(SQLTableSource::new_with_table(
             fed_provider,
-            RemoteTableRef::from(table_name),
-            schema,
+            Arc::new(SQLiteRemoteTable::new(
+                RemoteTableRef::from(table_name),
+                schema,
+            )),
         ))
     }
 
@@ -1417,10 +1431,26 @@ impl SQLExecutor for TursoTableProvider {
         Some(AstAnalyzer::new(vec![Self::turso_ast_analyzer()]))
     }
 
+    /// Unfederates a statement that calls a function Turso does not support,
+    /// and otherwise marks the `DATE` operands of its interval arithmetic, so
+    /// [`Self::turso_ast_analyzer`] shifts a date through `date()` and anything
+    /// else through `datetime()`: unparsed, a date and a timestamp are both
+    /// `TEXT`. The scan's `SQLiteRemoteTable` marks them too, but its optimizer
+    /// is not gathered for a table that only appears inside a subquery.
     fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
-        let function_support = self.function_support.clone()?;
+        let function_support = self.function_support.clone();
         Some(Box::new(move |plan| {
-            unfederate_plan_with_unsupported_functions(plan, &function_support)
+            let plan = match &function_support {
+                Some(fs) => unfederate_plan_with_unsupported_functions(plan, fs)?,
+                None => plan,
+            };
+            // An unfederated statement is no longer an extension node and runs
+            // in DataFusion, which needs no marker.
+            if matches!(plan, LogicalPlan::Extension(_)) {
+                mark_federated_date_operands(plan)
+            } else {
+                Ok(plan)
+            }
         }))
     }
 
@@ -3705,6 +3735,47 @@ mod tests {
             !result.contains("BETWEEN"),
             "BETWEEN with negative bounds should be rewritten, got: {result}"
         );
+    }
+
+    /// Regression test for #14714: a timestamp shifted by an interval reaches
+    /// Turso as `datetime(ts, '-1 hours')`, which answers
+    /// `YYYY-MM-DD HH:MM:SS[.SSS]` in UTC rather than RFC3339. It is read as
+    /// that UTC instant, not as NULL.
+    #[test]
+    fn a_timestamp_sqlite_datetime_answers_is_read_as_utc() {
+        let rows = vec![
+            vec![TursoValue::Text("2026-10-02 11:34:56".to_string())],
+            vec![TursoValue::Text("2026-10-02 11:34:56.125".to_string())],
+            vec![TursoValue::Text("2026-10-02T11:34:56+00:00".to_string())],
+            vec![TursoValue::Text("2026-10-02".to_string())],
+        ];
+        for tz in [None, Some(Arc::from("+05:00"))] {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+                true,
+            )]));
+            let batch =
+                TursoTableProvider::values_to_record_batch(&rows, &schema).expect("values convert");
+            let arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("TimestampMicrosecondArray");
+            // 2026-10-02T11:34:56Z
+            let expected = 1_790_940_896_000_000;
+            assert_eq!(
+                arr.iter().collect::<Vec<_>>(),
+                vec![
+                    Some(expected),
+                    Some(expected + 125_000),
+                    Some(expected),
+                    // A date alone is no timestamp `datetime()` answers.
+                    None,
+                ],
+                "time zone {tz:?}"
+            );
+        }
     }
 
     #[test]
