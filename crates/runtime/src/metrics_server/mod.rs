@@ -746,32 +746,7 @@ fn occupied_bucket_bounds(h: &Histogram) -> (f64, f64) {
         last_upper = f64::INFINITY;
     }
 
-    // Occupying the first explicit bucket leaves `previous_upper` at -Inf.
-    // A scheme whose finite bounds are all ≥ 0 has domain lower 0; a negative
-    // bound means we do not know, and must not invent a nonnegative floor.
-    if !first_lower.is_finite()
-        && let Some(domain_lower) = nonnegative_domain_lower(h)
-    {
-        first_lower = domain_lower;
-    }
-
     (first_lower, last_upper)
-}
-
-/// `Some(0.0)` when every finite explicit bound is ≥ 0.
-fn nonnegative_domain_lower(h: &Histogram) -> Option<f64> {
-    let mut saw_finite = false;
-    for bucket in h.get_bucket() {
-        let upper = bucket.upper_bound();
-        if !upper.is_finite() {
-            continue;
-        }
-        if upper < 0.0 {
-            return None;
-        }
-        saw_finite = true;
-    }
-    saw_finite.then_some(0.0)
 }
 
 fn last_finite_explicit_bound(h: &Histogram) -> Option<f64> {
@@ -1375,9 +1350,9 @@ mod tests {
 
     /// Occupying the first explicit bucket leaves `first_lower` at `-Inf`.
     /// Combined with overflow, appending `+Inf` interpolates p90+ to Inf, and
-    /// the sum clamp cannot bound that unless the explicit scheme is
-    /// nonnegative (domain lower 0). `query_returned_rows` starts at 1:
-    /// `[1, 1_000_000]` must stay finite.
+    /// the sum clamp cannot invent a finite bound. The last finite explicit
+    /// bound is the overflow estimate. `query_returned_rows` `[1, 1_000_000]`
+    /// must stay finite without inferring a 0 floor from nonnegative uppers.
     #[test]
     fn first_and_overflow_buckets_keep_finite_quantiles() {
         let observations = [1.0, 1_000_000.0];
@@ -1406,7 +1381,10 @@ mod tests {
         );
 
         let (first_lower, last_upper) = occupied_bucket_bounds(&histogram);
-        assert_float_eq(first_lower, 0.0);
+        assert!(
+            first_lower.is_infinite() && first_lower.is_sign_negative(),
+            "first-bucket occupancy must leave the lower bound open, got {first_lower}"
+        );
         assert!(
             last_upper.is_infinite(),
             "overflow must leave the upper bound open, got {last_upper}"
@@ -1433,17 +1411,18 @@ mod tests {
             "p90 of first-plus-overflow interpolates to Inf, got {interpolated_p90}"
         );
 
-        let aggregate_upper = 1_000_001.0;
-        assert_float_eq(
+        assert!(
             clamp_derived_quantile(
                 interpolated_p90,
                 histogram.get_sample_count(),
                 histogram.get_sample_sum(),
                 first_lower,
                 last_upper,
-            ),
-            aggregate_upper,
+            )
+            .is_infinite(),
+            "open bounds cannot invent a finite sum ceiling"
         );
+        let overflow_estimate = last_finite.upper_bound();
 
         let family =
             labeled_histogram_family("query_returned_rows", &[("query", "q1", &histogram)]);
@@ -1461,7 +1440,7 @@ mod tests {
                 value.is_finite(),
                 "quantile {quantile} (index {idx}) must be finite, got {value}"
             );
-            assert_float_eq(*value, aggregate_upper);
+            assert_float_eq(*value, overflow_estimate);
         }
 
         let registry = prometheus::Registry::new();
@@ -1493,7 +1472,7 @@ mod tests {
         );
         for quantile in ["0.9", "0.95", "0.99"] {
             let needle = format!(
-                "query_returned_rows_summary{{query=\"q1\",quantile=\"{quantile}\"}} 1000001"
+                "query_returned_rows_summary{{query=\"q1\",quantile=\"{quantile}\"}} 500000"
             );
             assert!(text.contains(&needle), "expected {needle} in:\n{text}");
         }
@@ -1536,6 +1515,91 @@ mod tests {
         for value in high {
             assert_float_eq(value, 100.0);
         }
+    }
+
+    fn summary_quantile_value(family: &MetricFamily, quantile: f64) -> f64 {
+        histogram_family_to_summary(family).get_metric()[0]
+            .get_summary()
+            .quantile
+            .iter()
+            .find(|entry| (entry.quantile() - quantile).abs() < f64::EPSILON)
+            .expect("requested quantile is present")
+            .value()
+    }
+
+    /// Nonnegative bucket uppers do not prove a nonnegative domain: the first
+    /// bucket still accepts negative samples. Inferring 0 rewrites p90 of
+    /// `[-100, 10]` from 9 (in `(5, 10]`) to 0.
+    #[test]
+    fn signed_observations_keep_finite_rank_bucket() {
+        let bounds = [1.0, 2.0, 5.0, 10.0, 100.0];
+        let histogram = explicit_histogram(&bounds, &[-100.0, 10.0], true);
+        let (first_lower, last_upper) = occupied_bucket_bounds(&histogram);
+        assert!(
+            first_lower.is_infinite() && first_lower.is_sign_negative(),
+            "first-bucket occupancy must leave the lower bound open, got {first_lower}"
+        );
+        assert_float_eq(last_upper, 10.0);
+
+        let family = labeled_histogram_family("signed_delta", &[("series", "a", &histogram)]);
+        assert_float_eq(summary_quantile_value(&family, 0.9), 9.0);
+
+        let registry = prometheus::Registry::new();
+        let observed = HistogramVec::new(
+            HistogramOpts::new("signed_delta", "Signed observations").buckets(bounds.to_vec()),
+            &["series"],
+        )
+        .expect("signed histogram");
+        registry
+            .register(Box::new(observed.clone()))
+            .expect("register signed histogram");
+        observed.with_label_values(&["a"]).observe(-100.0);
+        observed.with_label_values(&["a"]).observe(10.0);
+
+        let text = encode_registry(&registry);
+        let text = std::str::from_utf8(&text).expect("utf8 prometheus text");
+        parse_prometheus_text_strict(text).expect("strict prometheus exposition");
+        assert!(
+            text.contains("signed_delta_summary{series=\"a\",quantile=\"0.9\"} 9"),
+            "p90 must stay in (5, 10], got:\n{text}"
+        );
+    }
+
+    /// Inferring a 0 floor on nonnegative bounds also rewrites overflow: p90 of
+    /// `[-100, 110]` on `[0, 100]` becomes 10 instead of the last finite bound.
+    #[test]
+    fn signed_observations_keep_overflow_at_last_finite_bound() {
+        let bounds = [0.0, 100.0];
+        let histogram = explicit_histogram(&bounds, &[-100.0, 110.0], true);
+        let (first_lower, last_upper) = occupied_bucket_bounds(&histogram);
+        assert!(
+            first_lower.is_infinite() && first_lower.is_sign_negative(),
+            "first-bucket occupancy must leave the lower bound open, got {first_lower}"
+        );
+        assert!(last_upper.is_infinite());
+
+        let family = labeled_histogram_family("signed_delta", &[("series", "a", &histogram)]);
+        assert_float_eq(summary_quantile_value(&family, 0.9), 100.0);
+
+        let registry = prometheus::Registry::new();
+        let observed = HistogramVec::new(
+            HistogramOpts::new("signed_overflow", "Signed overflow").buckets(bounds.to_vec()),
+            &["series"],
+        )
+        .expect("signed overflow histogram");
+        registry
+            .register(Box::new(observed.clone()))
+            .expect("register signed overflow histogram");
+        observed.with_label_values(&["a"]).observe(-100.0);
+        observed.with_label_values(&["a"]).observe(110.0);
+
+        let text = encode_registry(&registry);
+        let text = std::str::from_utf8(&text).expect("utf8 prometheus text");
+        parse_prometheus_text_strict(text).expect("strict prometheus exposition");
+        assert!(
+            text.contains("signed_overflow_summary{series=\"a\",quantile=\"0.9\"} 100"),
+            "overflow p90 must be the last finite bound, got:\n{text}"
+        );
     }
 
     /// Overflow past the last explicit bucket is not bounded by that bucket.
