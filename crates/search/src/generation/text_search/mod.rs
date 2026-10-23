@@ -480,63 +480,16 @@ impl FullTextSearchFieldIndex {
 /// Prefer Tantivy's full `QueryParser` so operators (AND/OR/NOT), phrases ("exact match"),
 /// field-scoped queries (title:foo) and boosts (term^2) are honored. Fall back to a bag-of-words
 /// OR clause for inputs the parser rejects (e.g. unbalanced quotes, lone special characters in
-/// conversational queries) or would panic on (see [`has_fieldless_exists`]).
+/// conversational queries).
 fn parse_user_query(parser: &QueryParser, literal: &str) -> Result<Box<dyn Query>> {
-    let parsed = if has_fieldless_exists(literal) {
-        None
-    } else {
-        parser.parse_query(literal).ok()
-    };
-    match parsed {
-        Some(parsed) => Ok(parsed),
-        None => parser
+    match parser.parse_query(literal) {
+        Ok(parsed) => Ok(parsed),
+        Err(_) => parser
             .build_query_from_user_input_ast(parse_query_literal(literal))
             .context(InvalidTextSearchQuerySnafu {
                 query: literal.to_string(),
             }),
     }
-}
-
-/// Whether `q` has a `*` that Tantivy's grammar would read as an exists query with no field.
-///
-/// `QueryParser::parse_query` (tantivy-query-grammar 0.26) panics on such a `*` with "Exist query
-/// without a field isn't allowed" instead of returning an error
-/// (<https://github.com/quickwit-oss/tantivy/issues/3031>). The grammar reaches that panic only
-/// through its exists rule, which reads a `*` followed by whitespace or a character that must be
-/// escaped in a word. So this matches:
-/// - a `*` followed by a character the exists rule accepts but a match-all `*` does not:
-///   `a *(b)`, `*"x"`, `*\u{a0}` (see [`ends_fieldless_star`]);
-/// - a `+` or `-` followed by whitespace and then `*` (`- *`, `a + *`), where the grammar skips the
-///   whitespace into the exists rule and the match-all `*` never applies.
-///
-/// It looks only at the characters around each `*`, never at whether that `*` starts a term or
-/// sits in a phrase, range or regex: the grammar decides those in ways a scanner can misjudge
-/// (`a ""**(`, `/'/ *(` and `text:[a' TO z] *(` all panic), and a misjudged context would hide
-/// the `*`. The cost is that some queries the grammar parses also match (`"foo*" AND bar`,
-/// `text:[a TO *]`) and take the bag-of-words fallback.
-fn has_fieldless_exists(q: &str) -> bool {
-    let chars: Vec<char> = q.chars().collect();
-    chars.iter().enumerate().any(|(i, &c)| match c {
-        '*' => chars.get(i + 1).copied().is_some_and(ends_fieldless_star),
-        '+' | '-' => {
-            let rest = &chars[i + 1..];
-            let spaces = rest.iter().take_while(|n| n.is_whitespace()).count();
-            spaces > 0 && rest.get(spaces) == Some(&'*')
-        }
-        _ => false,
-    })
-}
-
-/// Whether `c`, right after a `*`, can make Tantivy's grammar read the `*` as a fieldless exists
-/// query. The exists rule accepts any `char::is_whitespace` or a character that must be escaped in
-/// a word; the match-all rule, tried first, takes only ASCII space, tab, CR, LF and `)`. Whatever
-/// only the exists rule accepts reaches the panic.
-fn ends_fieldless_star(c: char) -> bool {
-    (c.is_whitespace() && !matches!(c, ' ' | '\t' | '\r' | '\n'))
-        || matches!(
-            c,
-            '^' | '`' | ':' | '{' | '}' | '"' | '\'' | '[' | ']' | '\\' | '('
-        )
 }
 
 // Parse a user-provided query to interpret it without terms (e.g. `IN ['foo', 'bar']`) or clauses (foo AND bar).
@@ -705,9 +658,7 @@ pub fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::generation::text_search::{
-        has_fieldless_exists, parse_query_literal, parse_user_query,
-    };
+    use crate::generation::text_search::{parse_query_literal, parse_user_query};
     use tantivy::{
         Index,
         query::QueryParser,
@@ -720,10 +671,11 @@ pub(crate) mod tests {
         QueryParser::for_index(&Index::create_in_ram(builder.build()), vec![text])
     }
 
-    /// A fieldless `*` panicked inside Tantivy's parser (quickwit-oss/tantivy#3031), failing the
-    /// whole search request.
+    /// A `*` that Tantivy's grammar read as an exists query with no field panicked inside the
+    /// parser (quickwit-oss/tantivy#3031), failing the whole search request. Regression test for
+    /// the vendored `tantivy-query-grammar` fix.
     #[test]
-    fn test_fieldless_star_falls_back_instead_of_panicking() {
+    fn test_fieldless_star_does_not_panic() {
         let parser = text_parser();
         let mut queries = vec![
             "- *".to_string(),
@@ -745,7 +697,6 @@ pub(crate) mod tests {
             }
         }
         for q in &queries {
-            assert!(has_fieldless_exists(q), "{q:?}");
             parse_user_query(&parser, q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
         }
     }
@@ -778,32 +729,6 @@ pub(crate) mod tests {
                 }
                 digits[pos] = 0;
             }
-        }
-    }
-
-    /// Queries the grammar handles keep the full parser, operators and all.
-    #[test]
-    fn test_parseable_queries_keep_the_full_parser() {
-        let parser = text_parser();
-        for q in [
-            "a *",
-            "*",
-            "(a *)",
-            "a * b",
-            "foo*",
-            "a*b",
-            "a *~",
-            "a *+",
-            "text:sea^20 whale^70",
-            "\"exact phrase\" AND -other",
-            "foo* AND -bar*",
-            "text:[alpha TO beta]",
-            "a -*",
-        ] {
-            assert!(!has_fieldless_exists(q), "{q:?}");
-            let full = parser.parse_query(q).expect(q);
-            let ours = parse_user_query(&parser, q).expect(q);
-            assert_eq!(format!("{full:?}"), format!("{ours:?}"), "{q:?}");
         }
     }
 
