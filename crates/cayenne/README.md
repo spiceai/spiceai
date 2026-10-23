@@ -420,7 +420,7 @@ Provides:
 
 - Query execution with key- and position-based deletion-vector filtering, protected-snapshot routing, and inlined-data union.
 - Insert operations via DataFusion's `insert_into` API (regular path) and the dedicated `write_cdc_append_stream` (CDC-pipelined path).
-- Deletes via DataFusion's SQL `DELETE FROM` path go through `CayenneDeletionSink`, which writes Arrow-IPC deletion vectors. Position-based deletes are wrapped in `PkKeysetInvalidatingDeletionSink` so the cached scan file statistics are dropped after the visible row count changes; PK-based deletes are wrapped in `InlineAwareDeletionSink` so any inline-memtable rows that match the filter are tombstoned in the same call as the file-side deletion vector. (Scan-time filter strategies are read-side — see *Deletion vectors* above.)
+- Deletes via DataFusion's SQL `DELETE FROM` path go through `CayenneDeletionSink`, which writes Arrow-IPC deletion vectors, wrapped in `InlineAwareDeletionSink` so any inline-memtable rows that match the filter are removed in the same catalog commit as the file-side deletion vectors. On a table without a primary key each position deletion vector holds every deleted position of its data file and replaces that file's earlier vector, and the cached scan file statistics are dropped after the visible row count changes. (Scan-time filter strategies are read-side — see *Deletion vectors* above.)
 - Sequence-based ordering for correct delete/insert visibility.
 - Protected snapshot tracking for concurrent access.
 - Per-scan `ListingTable` cache and per-`RuntimeEnv` object-store registration short-circuit.
