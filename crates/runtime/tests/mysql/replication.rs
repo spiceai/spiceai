@@ -712,15 +712,12 @@ const SNAPSHOT_STALL: Duration = Duration::from_secs(15);
 
 /// The snapshot session's `net_write_timeout` floor
 /// (`SNAPSHOT_NET_WRITE_TIMEOUT_SECS` in `mysql_replication::bootstrap`).
-const SNAPSHOT_NET_WRITE_TIMEOUT_FLOOR_SECS: u32 = 1200;
+const SNAPSHOT_NET_WRITE_TIMEOUT_FLOOR_SECS: u64 = 1200;
 
-/// A Cayenne table excludes writers for the whole of a move of its warm-tier
-/// data to the datalake — minutes for a large table — so the snapshot's apply
-/// loop stops taking rows, the reader stops draining its socket, and the source
-/// aborts the snapshot once `net_write_timeout` passes. The dataset then failed
-/// with `bytes remaining on stream` (CH-benCHmark SF1000 `order_line`). A
-/// snapshot whose consumer stalls past the source's timeout must still deliver
-/// every row exactly once.
+/// A snapshot whose consumer stalls past the source's `net_write_timeout` must
+/// still deliver every row exactly once, rather than failing with `bytes
+/// remaining on stream` (see `SNAPSHOT_NET_WRITE_TIMEOUT_SECS` for why the
+/// consumer stalls).
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_survives_a_writer_stall_past_the_sources_net_write_timeout()
 -> Result<(), anyhow::Error> {
@@ -747,20 +744,11 @@ async fn snapshot_survives_a_writer_stall_past_the_sources_net_write_timeout()
     ))
     .await?;
 
-    let schema = dataset_schema();
-    let schema_json = serde_json::to_string(schema.as_ref())
-        .expect("dataset schema must serialize for checkpoint meta");
     let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
     let mut stream = start_replication_stream(ReplicationStreamInput {
         dataset_name: "stall_rows".into(),
-        params: params_for(port, 200_501),
-        schema,
-        primary_keys: vec!["id".into()],
-        database: "mysqldb".into(),
         table: "stall_rows".into(),
-        position_store: store as Arc<dyn PositionStore>,
-        schema_json: Some(schema_json),
-        metrics: ReplicationMetricsCollector::new(),
+        ..stream_input(port, 200_501, store as Arc<dyn PositionStore>)
     });
 
     let envelope = next_envelope(&mut stream, "truncate barrier").await?;
@@ -778,17 +766,18 @@ async fn snapshot_survives_a_writer_stall_past_the_sources_net_write_timeout()
     // snapshot session, which has to carry the floor rather than the 2s it
     // inherited. Asserted once the snapshot has drained, so a stream that died
     // fails on its own error.
-    let snapshot_session_timeout: Option<u32> = conn
+    let snapshot_session: Option<u64> = conn
         .query_first(
-            "SELECT CAST(v.VARIABLE_VALUE AS UNSIGNED) \
-             FROM performance_schema.variables_by_thread v \
-             JOIN performance_schema.threads t ON t.THREAD_ID = v.THREAD_ID \
-             WHERE v.VARIABLE_NAME = 'net_write_timeout' \
-             AND t.PROCESSLIST_ID <> CONNECTION_ID() \
-             AND t.PROCESSLIST_INFO LIKE 'SELECT %FROM `mysqldb`.`stall_rows`'",
+            "SELECT id FROM information_schema.processlist \
+             WHERE id <> CONNECTION_ID() \
+             AND info LIKE 'SELECT %FROM `mysqldb`.`stall_rows`'",
         )
         .await?;
     drop(conn);
+    let snapshot_session_timeout = match snapshot_session {
+        Some(id) => common::session_net_write_timeout(&pool, id).await?,
+        None => None,
+    };
 
     // The rest of the snapshot, up to the zero-row boundary that follows it.
     loop {

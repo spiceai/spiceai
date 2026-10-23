@@ -45,16 +45,12 @@ use crate::cdc::{ChangeEnvelope, ChangesStream, NoOpCommitter};
 /// The reader hands rows to the apply loop through a two-batch channel, so the
 /// socket stops draining whenever the accelerator stops accepting this table's
 /// writes. A Cayenne table excludes writers for the whole of a move of its
-/// warm-tier data to the datalake, which on CH-benCHmark SF1000 took up to ~10
-/// minutes for `order_line` (300M rows). Moves of 2 to 5.5 minutes that started
-/// mid-snapshot made the source abort the snapshot at the default, and the
-/// dataset failed with `bytes remaining on stream`. The binlog dump survives the
+/// warm-tier data to the datalake, which takes minutes on a table of hundreds of
+/// millions of rows; past the timeout the source aborts the snapshot and the
+/// dataset fails with `bytes remaining on stream`. The binlog dump survives the
 /// same abort by resuming from its acked position; a snapshot has no position to
-/// resume from, so its floor clears the longest exclusion observed with ~2x
-/// margin rather than sharing the dump's.
-///
-/// A floor rather than an assignment, as on the dump session: an operator's
-/// higher setting is never lowered (see `net_write_timeout_floor_statement`).
+/// resume from, so its floor is well above the longest such exclusion rather
+/// than sharing the dump's.
 const SNAPSHOT_NET_WRITE_TIMEOUT_SECS: u32 = 1200;
 
 pub(super) struct SnapshotInput {
