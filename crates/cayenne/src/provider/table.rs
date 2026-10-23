@@ -27303,13 +27303,13 @@ impl CayenneTableProvider {
             .head(&url.prefix().clone().join(file_name))
             .await
             .ok()?;
-        let stats = self
+        let file_stats = self
             .context
             .file_format()
             .infer_stats(state, &store, self.table_schema(), &meta)
             .await
             .ok()?;
-        stats
+        file_stats
             .num_rows
             .get_value()
             .and_then(|rows| i64::try_from(*rows).ok())

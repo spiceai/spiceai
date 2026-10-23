@@ -52,6 +52,15 @@ struct ExistingDeleteFileRecord {
     reinsert_sequence: Option<i64>,
 }
 
+struct ColdPromotionCommit<'a> {
+    table_id: &'a str,
+    replaced_snapshot_id: &'a str,
+    new_snapshot_id: &'a str,
+    cutoff: i64,
+    folded_protected_snapshot_ids: &'a [String],
+    cold_files: &'a [ColdTierFile],
+}
+
 fn metastore_value_at(values: &[MetastoreValue], index: usize) -> CatalogResult<&MetastoreValue> {
     values.get(index).ok_or_else(|| CatalogError::Database {
         message: format!("Expected metastore value at index {index}"),
@@ -1183,23 +1192,18 @@ impl CayenneCatalog {
     async fn commit_cold_promotion_in_txn(
         &self,
         txn: &mut dyn MetastoreTransaction,
-        table_id: &str,
-        replaced_snapshot_id: &str,
-        new_snapshot_id: &str,
-        cutoff: i64,
-        folded_protected_snapshot_ids: &[String],
-        cold_files: &[ColdTierFile],
+        commit: &ColdPromotionCommit<'_>,
     ) -> CatalogResult<()> {
         self.commit_compaction_fenced_in_txn(
             txn,
-            table_id,
-            replaced_snapshot_id,
-            new_snapshot_id,
-            cutoff,
-            folded_protected_snapshot_ids,
+            commit.table_id,
+            commit.replaced_snapshot_id,
+            commit.new_snapshot_id,
+            commit.cutoff,
+            commit.folded_protected_snapshot_ids,
         )
         .await?;
-        let table_id_literal = sql_text_literal(table_id);
+        let table_id_literal = sql_text_literal(commit.table_id);
         let batch_sql = format!(
             "DELETE FROM cayenne_table_statistics WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = {table_id_literal}; \
@@ -1211,7 +1215,7 @@ impl CayenneCatalog {
                 source: Box::new(e),
             }
         })?;
-        Self::insert_cold_tier_files_in_txn(txn, cold_files).await
+        Self::insert_cold_tier_files_in_txn(txn, commit.cold_files).await
     }
 
     /// Register `cold_files` in the cold manifest. One statement per file rather
@@ -4531,6 +4535,15 @@ impl MetadataCatalog for CayenneCatalog {
             });
         }
 
+        let commit = ColdPromotionCommit {
+            table_id,
+            replaced_snapshot_id,
+            new_snapshot_id,
+            cutoff,
+            folded_protected_snapshot_ids,
+            cold_files,
+        };
+
         for attempt in 1..=max_attempts {
             let mut tx =
                 self.begin_transaction()
@@ -4540,18 +4553,7 @@ impl MetadataCatalog for CayenneCatalog {
                         source: Box::new(e),
                     })?;
 
-            match self
-                .commit_cold_promotion_in_txn(
-                    &mut *tx,
-                    table_id,
-                    replaced_snapshot_id,
-                    new_snapshot_id,
-                    cutoff,
-                    folded_protected_snapshot_ids,
-                    cold_files,
-                )
-                .await
-            {
+            match self.commit_cold_promotion_in_txn(&mut *tx, &commit).await {
                 Ok(()) => match tx.commit().await {
                     Ok(()) => {
                         #[cfg(test)]
