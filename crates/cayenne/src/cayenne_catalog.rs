@@ -266,6 +266,9 @@ impl MetastoreImpl {
 pub struct CayenneCatalog {
     connection_string: String,
     metastore: MetastoreImpl,
+    /// Simulate a successful transaction whose COMMIT response is lost.
+    #[cfg(test)]
+    test_cold_promotion_commit_report_failure: std::sync::atomic::AtomicBool,
 }
 
 impl CayenneCatalog {
@@ -297,7 +300,21 @@ impl CayenneCatalog {
         Ok(Self {
             connection_string,
             metastore,
+            #[cfg(test)]
+            test_cold_promotion_commit_report_failure: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn report_next_cold_promotion_commit_as_failed(&self) {
+        self.test_cold_promotion_commit_report_failure
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cold_promotion_commit_failure_pending(&self) -> bool {
+        self.test_cold_promotion_commit_report_failure
+            .load(Ordering::Acquire)
     }
 
     /// Number of metastore query / execute / begin operations this catalog has
@@ -4536,7 +4553,19 @@ impl MetadataCatalog for CayenneCatalog {
                 .await
             {
                 Ok(()) => match tx.commit().await {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        #[cfg(test)]
+                        if self
+                            .test_cold_promotion_commit_report_failure
+                            .swap(false, Ordering::AcqRel)
+                        {
+                            return Err(CatalogError::InvalidOperationNoSource {
+                                message: "injected cold-promotion COMMIT response failure"
+                                    .to_string(),
+                            });
+                        }
+                        return Ok(());
+                    }
                     Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
                         let delay = retry_backoff_delay(attempt);
                         tracing::debug!(

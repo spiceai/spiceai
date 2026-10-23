@@ -25,7 +25,8 @@ use super::*;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::TimestampNanosecondArray;
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion_table_providers::util::column_reference::ColumnReference;
 
 /// How long a write may take while a promotion is paused. A write held behind the
@@ -39,13 +40,14 @@ fn id_value_schema() -> SchemaRef {
     ]))
 }
 
-/// Primary key `id`, upsert on conflict, the cold tier on the local file system and
-/// triggered by any warm file.
+/// Primary key `id`, the cold tier on the local file system and triggered by any
+/// warm file. `clean_append` skips conflict detection for fixtures with unique keys.
 async fn cold_table(
     name: &str,
     inline: bool,
+    clean_append: bool,
     ctx: &SessionContext,
-) -> (CayenneTableProvider, tempfile::TempDir) {
+) -> (CayenneTableProvider, tempfile::TempDir, Arc<CayenneCatalog>) {
     let temp_dir = tempfile::tempdir().expect("temp dir created");
     let metadata_dir = temp_dir.path().join("metadata");
     std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
@@ -54,16 +56,15 @@ async fn cold_table(
     let catalog = Arc::new(
         CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
             .expect("catalog created"),
-    ) as Arc<dyn MetadataCatalog>;
+    );
     catalog.init().await.expect("catalog initialized");
     let inline_rows = if inline { 1_000 } else { 0 };
     let options = CreateTableOptions {
         table_name: name.to_string(),
         schema: id_value_schema(),
         primary_key: vec!["id".to_string()],
-        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-            "id".to_string(),
-        ]))),
+        on_conflict: (!clean_append)
+            .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
         base_path: temp_dir.path().join("data").to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: VortexConfig {
@@ -72,6 +73,11 @@ async fn cold_table(
             cold_tier_warm_max_files: 1,
             cold_target_file_size_mb: 16,
             deletion_mode: crate::metadata::DeletionMode::Key,
+            pk_conflict_detection: if clean_append {
+                crate::metadata::PkConflictDetection::None
+            } else {
+                crate::metadata::PkConflictDetection::Auto
+            },
             inline_max_rows: inline_rows,
             inline_max_bytes: if inline { 1 << 20 } else { 0 },
             inline_max_buffer_bytes: if inline { 1 << 22 } else { 0 },
@@ -79,11 +85,13 @@ async fn cold_table(
             ..VortexConfig::default()
         },
     };
-    let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+    let catalog_for_provider = Arc::clone(&catalog);
+    let catalog_for_provider: Arc<dyn MetadataCatalog> = catalog_for_provider;
+    let provider = CayenneTableProviderBuilder::new(catalog_for_provider, ctx.runtime_env())
         .create(options)
         .await
         .expect("table created");
-    (provider, temp_dir)
+    (provider, temp_dir, catalog)
 }
 
 fn rows_batch(rows: &[(i64, i64)]) -> RecordBatch {
@@ -108,6 +116,31 @@ async fn scan_rows(provider: &CayenneTableProvider) -> Vec<(i64, i64)> {
         .await
         .expect("scan plan");
     collect_rows(plan, &ctx).await
+}
+
+async fn scan_ids(provider: &CayenneTableProvider) -> Vec<i64> {
+    let ctx = SessionContext::new();
+    let plan = provider
+        .scan(&ctx.state(), Some(&vec![0]), &[], None)
+        .await
+        .expect("scan plan");
+    let batches = collect(plan, ctx.task_ctx()).await.expect("scan rows");
+    let mut ids = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column")
+                .values()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
 }
 
 async fn collect_rows(plan: Arc<dyn ExecutionPlan>, ctx: &SessionContext) -> Vec<(i64, i64)> {
@@ -309,6 +342,178 @@ async fn load(provider: &CayenneTableProvider, model: &mut Model, start: i64, n:
     Op::Append { start, n }.apply(provider, model, 0).await;
 }
 
+/// A retention delete can unlink a file after the first carry copied it into the
+/// prospective warm snapshot. The second carry and commit must reject that snapshot.
+#[tokio::test]
+async fn retention_of_a_carried_file_discards_cold_promotion() {
+    const NAME: &str = "off_lock_retention_of_carried_file";
+    let ctx = SessionContext::new();
+    let temp_dir = tempfile::tempdir().expect("temp dir created");
+    let metadata_dir = temp_dir.path().join("metadata");
+    let cold_dir = temp_dir.path().join("cold");
+    std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+    std::fs::create_dir_all(&cold_dir).expect("cold dir created");
+    let catalog = Arc::new(
+        CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
+            .expect("catalog created"),
+    ) as Arc<dyn MetadataCatalog>;
+    catalog.init().await.expect("catalog initialized");
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+    ]));
+    let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+        .create(CreateTableOptions {
+            table_name: NAME.to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: temp_dir.path().join("data").to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cold_tier_location: Some(format!("file://{}", cold_dir.display())),
+                cold_tier_warm_max_files: 1,
+                cold_target_file_size_mb: 16,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                pk_conflict_detection: crate::metadata::PkConflictDetection::None,
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                inline_max_buffer_bytes: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        })
+        .await
+        .expect("retention table created");
+
+    let batch = |start: i64, time: i64| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from((start..start + 50).collect::<Vec<_>>())),
+                Arc::new(TimestampNanosecondArray::from(vec![time; 50])),
+            ],
+        )
+        .expect("batch")
+    };
+    insert_batch(&provider, batch(0, 10)).await;
+    let captured_snapshot = provider.get_current_snapshot_id();
+    assert_eq!(warm_files(&provider).await, 1, "fixture: one captured file");
+    let parked = park_promotion(&provider).await;
+    insert_batch(&provider, batch(50, 1)).await;
+    assert_eq!(
+        provider.get_current_snapshot_id(),
+        captured_snapshot,
+        "fixture: the append stays in the captured current snapshot"
+    );
+    assert_eq!(
+        warm_files(&provider).await,
+        2,
+        "fixture: the first carry has an appended file to link"
+    );
+
+    let racer = provider.clone_for_write_operations();
+    let racer_ctx = ctx.clone();
+    *provider.test_cold_promotion_post_carry_hook.lock() = Some(Box::new(move || {
+        Box::pin(async move {
+            // Call the physical retention path directly so these disjoint-key
+            // appends stay in the current snapshot until the race is staged.
+            let plan =
+                racer
+                    .delete_using_files(&[datafusion_expr::col("event_time").lt(
+                        datafusion_expr::lit(ScalarValue::TimestampNanosecond(Some(2), None)),
+                    )])
+                    .expect("retention delete plan");
+            let output = collect(plan, racer_ctx.task_ctx())
+                .await
+                .expect("retention delete executed");
+            let deleted = output[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .expect("delete count is UInt64")
+                .value(0);
+            assert_eq!(deleted, 50, "the carried file was physically removed");
+            assert!(
+                !racer.has_rows_hidden_from_file_statistics(),
+                "retention unlinked the file rather than hiding its rows"
+            );
+        })
+    }));
+
+    assert!(
+        !parked.resume().await,
+        "the promotion must discard the copied file after retention removes its source"
+    );
+    assert!(
+        provider
+            .test_cold_promotion_post_carry_hook
+            .lock()
+            .is_none()
+    );
+    let expected: Vec<i64> = (0..50).collect();
+    assert_eq!(
+        scan_ids(&provider).await,
+        expected,
+        "expired rows stay deleted"
+    );
+    let reopened =
+        CayenneTableProviderBuilder::new(Arc::clone(provider.catalog()), ctx.runtime_env())
+            .open(NAME)
+            .await
+            .expect("reopen table");
+    assert_eq!(
+        scan_ids(&reopened).await,
+        expected,
+        "deletion survives reopen"
+    );
+}
+
+/// A transaction may commit and still report a transport error. Read back the
+/// snapshot pointer before discarding files that the committed catalog now owns.
+#[tokio::test]
+async fn committed_cold_promotion_with_failed_response_keeps_its_files() {
+    const NAME: &str = "off_lock_committed_but_reported_failed";
+    let ctx = SessionContext::new();
+    let (provider, _temp_dir, catalog) = cold_table(NAME, false, true, &ctx).await;
+    let mut model = Model::default();
+    load(&provider, &mut model, 0, 100).await;
+    flush(&provider).await;
+
+    let parked = park_promotion(&provider).await;
+    load(&provider, &mut model, 100, 50).await;
+    assert_eq!(
+        warm_files(&provider).await,
+        2,
+        "the append is ready to carry"
+    );
+    catalog.report_next_cold_promotion_commit_as_failed();
+    assert!(
+        parked.resume().await,
+        "the catalog commit succeeded despite its reported failure"
+    );
+    assert!(
+        !catalog.cold_promotion_commit_failure_pending(),
+        "the off-lock catalog commit consumed the injected failure"
+    );
+    assert_eq!(
+        cold_manifest_rows(&provider).await,
+        100,
+        "the committed cold files contain all source rows"
+    );
+    assert_eq!(
+        warm_files(&provider).await,
+        1,
+        "the appended file was carried"
+    );
+    assert_eq!(scan_rows(&provider).await, model.rows());
+    assert_eq!(reopened_rows(&provider, NAME).await, model.rows());
+}
+
 /// Appends that land while a promotion encodes finish while it is paused, and stay in
 /// the warm tier when it commits: the cold files hold exactly the rows it read, every
 /// row stays visible exactly once, a scan planned before the commit still reads the
@@ -321,7 +526,7 @@ async fn load(provider: &CayenneTableProvider, model: &mut Model, start: i64, n:
 #[tokio::test]
 async fn appends_during_an_off_lock_promotion_stay_warm(#[case] name: &str, #[case] inline: bool) {
     let ctx = SessionContext::new();
-    let (provider, _temp_dir) = cold_table(name, inline, &ctx).await;
+    let (provider, _temp_dir, _catalog) = cold_table(name, inline, false, &ctx).await;
     let mut model = Model::default();
     load(&provider, &mut model, 0, 100).await;
     flush(&provider).await;
@@ -436,7 +641,7 @@ async fn a_delete_or_upsert_during_an_off_lock_promotion_discards_it(
     #[case] op: Op,
 ) {
     let ctx = SessionContext::new();
-    let (provider, _temp_dir) = cold_table(name, inline, &ctx).await;
+    let (provider, _temp_dir, _catalog) = cold_table(name, inline, false, &ctx).await;
     let mut model = Model::default();
     load(&provider, &mut model, 0, 100).await;
     flush(&provider).await;
@@ -520,7 +725,7 @@ async fn random_writes_during_an_off_lock_promotion_match_the_model(#[case] inli
     for seed in 1..=6_u64 {
         let ctx = SessionContext::new();
         let name = format!("off_lock_random_{}_{seed}", u8::from(inline));
-        let (provider, _temp_dir) = cold_table(&name, inline, &ctx).await;
+        let (provider, _temp_dir, _catalog) = cold_table(&name, inline, false, &ctx).await;
         let mut rng = Xorshift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let mut model = Model::default();
         let mut next_id = 0_i64;

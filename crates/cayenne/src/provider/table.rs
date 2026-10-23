@@ -2601,6 +2601,9 @@ pub struct CayenneTableProvider {
     #[cfg(test)]
     pub(crate) test_cold_promotion_post_capture_hook:
         Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only hook after the first carry, before writers are held off.
+    #[cfg(test)]
+    pub(crate) test_cold_promotion_post_carry_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -3394,6 +3397,8 @@ pub(crate) enum RewriteScope {
 struct ColdPromotionCapture {
     /// The current snapshot the scan read; its directory takes the appends.
     snapshot_id: String,
+    /// Forced file removal or schema evolution invalidates the captured scan.
+    structural_version: u64,
     /// The stored schema the cold files were written under.
     schema: SchemaRef,
     /// Names of the files of `snapshot_id` the scan reads.
@@ -10434,6 +10439,8 @@ impl CayenneTableProvider {
             test_rewrite_post_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_cold_promotion_post_capture_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_cold_promotion_post_carry_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -12900,6 +12907,10 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_cold_promotion_post_capture_hook: Arc::clone(
                 &self.test_cold_promotion_post_capture_hook,
+            ),
+            #[cfg(test)]
+            test_cold_promotion_post_carry_hook: Arc::clone(
+                &self.test_cold_promotion_post_carry_hook,
             ),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
@@ -25975,8 +25986,7 @@ impl CayenneTableProvider {
                     table = self.table_metadata.table_name.as_str(),
                     %error,
                     new_snapshot_id = new_snapshot_id.as_str(),
-                    "Failed to populate snapshot manifest before compaction commit; \
-                     scan falls back to directory listing"
+                    "Failed to populate snapshot manifest before compaction commit; scan falls back to directory listing"
                 );
                 None
             }
@@ -27161,6 +27171,7 @@ impl CayenneTableProvider {
             .collect();
         let capture = ColdPromotionCapture {
             snapshot_id: raw.current_snapshot_id.clone(),
+            structural_version: scan_view.structural_version,
             schema: self.table_schema(),
             scanned_files,
             folded: raw.protected_map.keys().cloned().collect(),
@@ -27183,6 +27194,13 @@ impl CayenneTableProvider {
         &self,
         capture: &ColdPromotionCapture,
     ) -> Option<&'static str> {
+        if self
+            .structural_version
+            .read_validated(|| ())
+            .is_none_or(|(version, ())| version != capture.structural_version)
+        {
+            return Some("files were removed or the schema changed during the data move");
+        }
         if self.get_current_snapshot_id() != capture.snapshot_id {
             return Some("the table's data was replaced during the data move");
         }
@@ -27208,9 +27226,8 @@ impl CayenneTableProvider {
 
     /// Link the files appended to the captured snapshot since the last call into
     /// `new_snapshot_id`, recording each in `carried` with its footer row count.
-    /// Returns `false` when a file the scan read is no longer in the snapshot, which
-    /// the commit cannot fold in: its rows are in the cold files but a delete of the
-    /// file meant them gone.
+    /// Returns `false` when a file the scan read or a previously carried file is no
+    /// longer in the snapshot: committing could restore rows removed in the meantime.
     async fn carry_appended_warm_files(
         &self,
         capture: &ColdPromotionCapture,
@@ -27226,6 +27243,9 @@ impl CayenneTableProvider {
             .scanned_files
             .iter()
             .any(|name| !present.contains(name.as_str()))
+            || carried
+                .iter()
+                .any(|file| !present.contains(file.name.as_str()))
         {
             return Ok(false);
         }
@@ -27737,6 +27757,13 @@ impl CayenneTableProvider {
                     return Err(error);
                 }
             }
+            #[cfg(test)]
+            {
+                let hook = self.test_cold_promotion_post_carry_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
+            }
             match self
                 .reconcile_cold_promotion(
                     capture,
@@ -27798,7 +27825,8 @@ impl CayenneTableProvider {
                     table = self.table_metadata.table_name.as_str(),
                     %error,
                     new_snapshot_id = new_snapshot_id.as_str(),
-                    "Failed to populate the snapshot manifest before the datalake data move commit; scan falls back to directory listing"
+                    "Failed to populate snapshot manifest before compaction commit; \
+                     scan falls back to directory listing"
                 );
             }
         }
@@ -27853,20 +27881,51 @@ impl CayenneTableProvider {
                     )
                     .await
                 {
-                    drop(fence);
-                    self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
-                        .await;
                     if matches!(
                         error,
                         CatalogError::SnapshotReplaced { .. }
                             | CatalogError::ProtectedSnapshotsReplaced { .. }
                     ) {
+                        drop(fence);
+                        self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                            .await;
                         self.discard_cold_promotion(
                             "the metastore moved to another warm snapshot during the data move",
                         );
                         return Ok(false);
                     }
-                    return Err(Error::Catalog { source: error });
+                    // A failed COMMIT response is not evidence of a rollback.
+                    // Read the authoritative snapshot pointer before deleting
+                    // files that may already be serving as the new warm tier.
+                    match self
+                        .catalog
+                        .get_table(&self.table_metadata.table_name)
+                        .await
+                    {
+                        Ok(table)
+                            if table.table_id == self.table_metadata.table_id
+                                && table.current_snapshot_id == new_snapshot_id => {}
+                        Ok(table)
+                            if table.table_id == self.table_metadata.table_id
+                                && table.current_snapshot_id == capture.snapshot_id =>
+                        {
+                            drop(fence);
+                            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                                .await;
+                            return Err(Error::Catalog { source: error });
+                        }
+                        _ => {
+                            self.publication_outcome_unknown
+                                .store(true, Ordering::Release);
+                            drop(fence);
+                            return Err(Error::IncompleteWrite {
+                                table: self.table_metadata.table_name.clone(),
+                                message: format!(
+                                    "the datalake data move's commit failed ({error}), and its outcome could not be confirmed. Its files are kept, and the table must be reloaded from its catalog. Restart Spice to reload it"
+                                ),
+                            });
+                        }
+                    }
                 }
                 self.publish_cold_promotion_fenced(
                     &new_snapshot_id,
@@ -43320,6 +43379,18 @@ impl TableProvider for CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let ensure_known = || {
+            if self.publication_outcome_unknown.load(Ordering::Acquire) {
+                return Err(datafusion_common::DataFusionError::External(Box::new(
+                    Error::IncompleteWrite {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "an earlier write could not confirm whether it committed, so queries are refused until the table is reloaded from its catalog. Restart Spice to reload it".to_string(),
+                    },
+                )));
+            }
+            Ok(())
+        };
+        ensure_known()?;
         let reuse = self.prepare_scan(state, filters).await?;
         // Obtain the scan-view bundle from the demand cache. See
         // [`Self::scan_view_at_current_input`]. The KDI merge + visible mem-tier
@@ -43334,6 +43405,9 @@ impl TableProvider for CayenneTableProvider {
         // The fields are cloned out (cheap `Arc` / short-`String` / `im`-HAMT clones)
         // so downstream plan-build owns them exactly as when it captured inline.
         let scan_view = self.scan_view_at_current_input(reuse).await?;
+        // A failed catalog commit may have become uncertain while this capture
+        // waited for its listing fence. Its saved view cannot be published then.
+        ensure_known()?;
         #[cfg(test)]
         {
             let hook = self.test_post_scan_view_selection_hook.lock().take();
