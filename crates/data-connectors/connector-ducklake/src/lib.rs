@@ -20,11 +20,10 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::duckdb::with_utc_session_timezone;
+use data_components::duckdb::{install_and_load_extension, with_utc_session_timezone};
 use data_components::ducklake::writer::DuckDbFederatedTableWriter;
 use data_components::ducklake::{
     DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
-    install_and_load_extension,
 };
 use data_connector_api::ConnectorContext;
 use data_connector_api::{

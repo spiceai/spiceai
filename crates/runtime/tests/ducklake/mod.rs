@@ -21,7 +21,7 @@ use crate::utils::{register_test_connectors, runtime_ready_check, test_request_c
 use crate::{configure_test_datafusion, init_tracing};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use data_components::ducklake::install_and_load_extension;
+use data_components::duckdb::install_and_load_extension;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
