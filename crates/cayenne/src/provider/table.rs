@@ -38762,20 +38762,33 @@ impl CayenneTableProvider {
         &self,
         filters: &[Expr],
     ) -> datafusion_common::Result<InlinedDeleteMatches> {
-        if self.pk_deletion_strategy.is_position_based() || self.cached_inlined_row_count() == 0 {
+        // No shortcut on an empty live count: a committed-but-unpublished row is
+        // not in that count yet, and the delete must still cover it.
+        if self.pk_deletion_strategy.is_position_based() {
             return Ok(InlinedDeleteMatches::default());
         }
-        self.cached_inlined_view().await.map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to read inlined data for delete on table {}: {e}",
-                self.table_metadata.table_name
-            ))
-        })?;
-        #[cfg(test)]
-        self.run_test_inline_delete_match_hook().await;
         // One cache entry gives the view and the watermark it materialized
-        // through, so the held-back read below starts exactly where it stops.
-        let cache = self.inlined_cache.load_full();
+        // through, so the held-back read below starts exactly where it stops. It
+        // must be the entry for the live generation: a scan that read the corpus
+        // before an earlier delete can store its older entry after this warm, and
+        // matching against it would take that delete's hidden rows off the live
+        // count a second time. `write_lock` keeps inline writers from advancing
+        // the generation, so the loop ends once the stale entry is replaced.
+        let cache = loop {
+            let generation = self.inlined_generation.load(Ordering::Acquire);
+            self.cached_inlined_view().await.map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to read inlined data for delete on table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
+            #[cfg(test)]
+            self.run_test_inline_delete_match_hook().await;
+            let cache = self.inlined_cache.load_full();
+            if cache.generation == generation {
+                break cache;
+            }
+        };
         let held_back = self
             .catalog
             .get_inlined_data_above_sequence(
