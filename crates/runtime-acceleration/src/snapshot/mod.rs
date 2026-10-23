@@ -599,7 +599,7 @@ pub enum SnapshotDownloadError {
         source: object_store::Error,
     },
     #[snafu(display(
-        "Snapshot {snapshot_id} of dataset '{dataset}' has no file at '{location}': it has not reached the snapshot location yet, as while a replica is still receiving it, or it was deleted from it, for example by a bucket lifecycle rule"
+        "Snapshot {snapshot_id} of dataset '{dataset}' has no file at '{location}': the file has not been copied to this location yet, or it was deleted from it, for example by a bucket lifecycle rule"
     ))]
     SnapshotFileMissing {
         dataset: String,
