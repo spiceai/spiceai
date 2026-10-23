@@ -230,11 +230,16 @@ fn display_result(result: &str, elapsed: f64) {
         return;
     }
 
-    // Count rows (subtract 3 for header lines in table format)
-    let row_count = result.lines().count().saturating_sub(3);
+    let row_count = table_row_count(result);
 
     println!("{result}");
     println!("\nTime: {elapsed:.6} seconds. {row_count} rows.");
+}
+
+/// Counts the data rows of a pretty-printed table: every line except the top border,
+/// header, header separator and bottom border.
+fn table_row_count(table: &str) -> usize {
+    table.lines().count().saturating_sub(4)
 }
 
 #[cfg(test)]
@@ -242,7 +247,25 @@ mod tests {
     use super::*;
     use crate::context::Deadline;
     use crate::test_support::SlowServer;
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow::util::pretty::pretty_format_batches;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    /// The runtime renders `text/plain` results with `pretty_format_batches`, so the row count
+    /// must match the batch, not the number of lines in the rendered table.
+    #[test]
+    fn row_count_matches_the_rendered_batch() {
+        for rows in [0, 1, 3] {
+            let ids: ArrayRef = Arc::new(Int64Array::from_iter_values(0..rows));
+            let batch = RecordBatch::try_from_iter([("id", ids)]).expect("valid batch");
+            let table = pretty_format_batches(std::slice::from_ref(&batch))
+                .expect("formats")
+                .to_string();
+
+            assert_eq!(table_row_count(&table), batch.num_rows(), "{table}");
+        }
+    }
 
     /// Text-to-SQL is a model round trip, so it must not run under the control-plane
     /// deadline either — the same defect as
