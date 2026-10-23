@@ -66610,6 +66610,44 @@ mod tests {
         assert!(tombstones[0].published);
     }
 
+    /// A caching-mode replacement on an upsert table plans its append, deletes the
+    /// replaced key, then executes the append. Repeated, each round leaves exactly
+    /// the new row and keeps the live inline count exact: the planned upsert must
+    /// not supersede the row the delete already hid a second time.
+    #[tokio::test]
+    async fn a_replacement_planned_before_its_delete_keeps_one_row_and_the_live_count() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_durable_inline_keyed_table("planned_replacement", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20]),
+        )
+        .await;
+
+        for value in [11_i64, 12, 13] {
+            let replacement = id_value_batch(Arc::clone(&schema), &[1], &[value]);
+            let input =
+                MemorySourceConfig::try_new_exec(&[vec![replacement]], Arc::clone(&schema), None)
+                    .expect("memory exec created");
+            let append = provider
+                .insert_into(&ctx.state(), input, InsertOp::Append)
+                .await
+                .expect("append planned");
+            delete_where_id(&ctx, &provider, 1).await;
+            collect(append, ctx.task_ctx())
+                .await
+                .expect("append executed");
+
+            assert_eq!(
+                collect_id_value_pairs(&ctx, &provider, "planned_replacement").await,
+                vec![(1, value), (2, 20)]
+            );
+            assert_eq!(provider.cached_inlined_row_count(), 2);
+        }
+    }
+
     /// A key re-inserted after a tombstoned delete is visible: the tombstone hides
     /// only inline copies committed before it.
     #[tokio::test]
