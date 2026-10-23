@@ -20,8 +20,64 @@ limitations under the License.
 //! This module provides a catalog provider that connects to a `DuckLake` catalog using `DuckDB`
 //! with the `ducklake` extension.
 
+use std::fs::{File, OpenOptions};
+
+use parking_lot::Mutex;
+
 pub mod provider;
 pub mod writer;
+
+/// Serializes extension installs between the connections of this process.
+static EXTENSION_INSTALL: Mutex<()> = Mutex::new(());
+
+/// Installs and loads a `DuckDB` extension, one caller at a time on this host.
+///
+/// `INSTALL` downloads the extension to a temporary file, deletes the installed
+/// copy, and moves the new one into place. Two connections installing the same
+/// extension into an empty extension directory therefore delete each other's
+/// files: one `INSTALL` fails with `Could not remove file`, or a `LOAD` finds the
+/// file it was about to open already gone. A lock held across both statements,
+/// in this process and through an advisory lock on a file every process on the
+/// host shares, keeps one caller's install and load from overlapping another's.
+///
+/// # Errors
+///
+/// Returns a `duckdb::Error` if `INSTALL` or `LOAD` fails.
+pub fn install_and_load_extension(
+    conn: &duckdb::Connection,
+    extension: &'static str,
+) -> Result<(), duckdb::Error> {
+    let _guard = EXTENSION_INSTALL.lock();
+    let _host_lock = lock_extension_installs_on_host();
+    conn.execute(&format!("INSTALL {extension}"), [])?;
+    conn.execute(&format!("LOAD {extension}"), [])?;
+    Ok(())
+}
+
+/// Takes the host-wide install lock, released when the returned file is dropped.
+///
+/// Returns `None` when the lock file cannot be opened or locked, for example in a
+/// read-only temporary directory; installs are then serialized only within this
+/// process.
+fn lock_extension_installs_on_host() -> Option<File> {
+    let path = std::env::temp_dir().join("spice-duckdb-extension-install.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .or_else(|_| File::open(&path));
+    match file.and_then(|file| file.lock().map(|()| file)) {
+        Ok(file) => Some(file),
+        Err(e) => {
+            tracing::debug!(
+                "Could not lock {} to serialize DuckDB extension installs across processes: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
 
 /// S3 credential parameters for `DuckLake` connectors.
 ///
@@ -52,8 +108,7 @@ pub fn configure_duckdb_httpfs(
     conn: &duckdb::Connection,
     s3: &DuckLakeS3Params,
 ) -> Result<(), duckdb::Error> {
-    conn.execute("INSTALL httpfs", [])?;
-    conn.execute("LOAD httpfs", [])?;
+    install_and_load_extension(conn, "httpfs")?;
 
     if let Some(secret_sql) = build_ducklake_s3_secret_sql(s3) {
         conn.execute(&secret_sql, [])?;
