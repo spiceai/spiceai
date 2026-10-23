@@ -60,7 +60,7 @@ fn kind_of_code(code: &str) -> Option<ApiErrorKind> {
 /// [`super::BedrockClient`] can wrap the SDK error (see [`super::BedrockAuthError`]), and gives
 /// back a bare [`ThrottlingException`] when its throttling retries are spent.
 fn aws_error_code<'a>(err: &'a (dyn Error + 'static)) -> Option<&'a str> {
-    std::iter::successors(Some(err), |e| e.source()).find_map(|e| {
+    std::iter::successors(Some(err), |&e| e.source()).find_map(|e| {
         if let Some(e) = e.downcast_ref::<ConverseError>() {
             e.code()
         } else if let Some(e) = e.downcast_ref::<ConverseStreamError>() {
