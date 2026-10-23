@@ -57,6 +57,25 @@ pidfile() { echo "${WORK}/spiced.pid"; }
 logfile() { echo "${WORK}/spiced.log"; }
 binfile() { echo "${WORK}/spiced.binary"; }
 
+# Resolve `--spiced` in the caller's directory. `cmd_launch` then cds to
+# `$WORK`; a relative path such as `target/debug/spiced` would miss there.
+resolve_spiced() {
+  local path="$1"
+  [[ -n "$path" ]] || die "spiced path is empty"
+  [[ -x "$path" ]] || die "spiced is not executable: $path"
+  local resolved
+  resolved="$(readlink -f -- "$path" 2>/dev/null || true)"
+  if [[ -z "$resolved" ]]; then
+    if [[ "$path" == /* ]]; then
+      resolved="$path"
+    else
+      resolved="$(cd "$(dirname -- "$path")" && pwd)/$(basename -- "$path")"
+    fi
+  fi
+  [[ -x "$resolved" ]] || die "spiced is not executable: $resolved"
+  printf '%s\n' "$resolved"
+}
+
 write_events_csv() {
   local path="$1"
   local header="$2"
@@ -168,7 +187,7 @@ wait_ready() {
 cmd_launch() {
   [[ -n "$WORK" && -n "$SPICED" ]] || die "--work and --spiced are required"
   require_cmd curl
-  [[ -x "$SPICED" ]] || die "spiced is not executable: $SPICED"
+  SPICED="$(resolve_spiced "$SPICED")"
   [[ -f "${WORK}/spicepod.yaml" ]] || seed_spicepod
   HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:$(free_port)}"
   FLIGHT_ADDR="${FLIGHT_ADDR:-127.0.0.1:$(free_port)}"
@@ -643,10 +662,10 @@ run_one_side() {
 cmd_compare() {
   [[ -n "$TRUNK_SPICED" && -n "$BRANCH_SPICED" && -n "$EVIDENCE" ]] || \
     die "--trunk-spiced --branch-spiced --evidence are required"
-  [[ -x "$TRUNK_SPICED" ]] || die "trunk spiced not executable: $TRUNK_SPICED"
-  [[ -x "$BRANCH_SPICED" ]] || die "branch spiced not executable: $BRANCH_SPICED"
+  TRUNK_SPICED="$(resolve_spiced "$TRUNK_SPICED")"
+  BRANCH_SPICED="$(resolve_spiced "$BRANCH_SPICED")"
   mkdir -p "$EVIDENCE"
-  echo "compare trunk=$(readlink -f "$TRUNK_SPICED") branch=$(readlink -f "$BRANCH_SPICED")"
+  echo "compare trunk=${TRUNK_SPICED} branch=${BRANCH_SPICED}"
   run_one_side trunk "$TRUNK_SPICED" "$EVIDENCE"
   run_one_side branch "$BRANCH_SPICED" "$EVIDENCE"
   write_compare_report "$EVIDENCE"

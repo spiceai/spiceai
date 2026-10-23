@@ -43,7 +43,9 @@ Start only this instance, with logs and a pidfile under `$WORK_DIR`:
   --metrics "$METRICS_ADDR"
 ```
 
-Exact process command the helper runs (cwd is `$WORK_DIR`, so `file:` paths resolve):
+`--spiced` may be relative to the caller's directory. The helper canonicalizes it to an absolute path before changing to `$WORK_DIR`, and writes that path to `$WORK_DIR/spiced.binary`.
+
+Exact process command the helper runs (cwd is `$WORK_DIR`, so `file:` paths resolve; `$SPICED` is already absolute):
 
 ```bash
 cd "$WORK_DIR"
