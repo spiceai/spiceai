@@ -1108,9 +1108,7 @@ async fn inline_tombstone_rows(fixture: &common::TestFixture, table: &CayenneTab
 /// cold files, including each file's minimum and maximum, must leave exactly
 /// one live row per key carrying the latest value. The oracle is an in-memory
 /// map of the same operation history.
-async fn test_cold_tier_upsert_range_precheck_impl(
-    fixture: common::TestFixture,
-) -> TestResult<()> {
+async fn test_cold_tier_upsert_range_precheck_impl(fixture: common::TestFixture) -> TestResult<()> {
     use std::collections::BTreeMap;
 
     let schema = Arc::new(Schema::new(vec![
@@ -1145,8 +1143,15 @@ async fn test_cold_tier_upsert_range_precheck_impl(
         flush_warm(&table).await;
         assert!(table.promote_warm_to_cold().await?, "promotion fires");
     }
-    let cold_files = fixture.catalog.list_cold_tier_files(table.table_id()).await?;
-    assert_eq!(cold_files.len(), 2, "two cold files with disjoint key ranges");
+    let cold_files = fixture
+        .catalog
+        .list_cold_tier_files(table.table_id())
+        .await?;
+    assert_eq!(
+        cold_files.len(),
+        2,
+        "two cold files with disjoint key ranges"
+    );
 
     // (a) Brand-new keys outside both ranges: below, between and above.
     let before = inline_tombstone_rows(&fixture, &table).await;
@@ -1189,9 +1194,15 @@ async fn test_cold_tier_upsert_range_precheck_impl(
 
     // The result must also hold after the superseded cold copies are rewritten.
     flush_warm(&table).await;
-    assert!(table.promote_warm_to_cold().await?, "second promotion fires");
+    assert!(
+        table.promote_warm_to_cold().await?,
+        "second promotion fires"
+    );
     let actual = collect_pairs(&ctx, "SELECT id, value FROM range_t ORDER BY id").await?;
-    assert_eq!(actual, expected, "latest versions survive the dirty rewrite");
+    assert_eq!(
+        actual, expected,
+        "latest versions survive the dirty rewrite"
+    );
     Ok(())
 }
 

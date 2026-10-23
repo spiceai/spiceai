@@ -1194,8 +1194,7 @@ impl ColdPkExistence {
             f.range.as_ref().is_none_or(|r| {
                 // Different lengths mean the encoding is not the one the range
                 // was built in, so the range cannot exclude the key.
-                key.len() != r.min.len()
-                    || (key >= r.min.as_ref() && key <= r.max.as_ref())
+                key.len() != r.min.len() || (key >= r.min.as_ref() && key <= r.max.as_ref())
             }) && f.bloom.maybe_contains(key)
         })
     }
