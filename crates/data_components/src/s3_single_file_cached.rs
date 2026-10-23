@@ -90,7 +90,10 @@ pub struct S3SingleFileCached {
     inner: Arc<ListingTable>,
     object_store: Arc<dyn ObjectStore>,
     file_path: ObjectStorePath,
+    /// The file version the acceleration was last loaded from.
     cached_metadata: RwLock<Option<object_store::ObjectMeta>>,
+    /// A changed version the last check saw, recorded as loaded once its refresh succeeds.
+    pending_metadata: RwLock<Option<object_store::ObjectMeta>>,
     dataset_name: String,
     /// Checks scans for registered columns the file no longer carries.
     schema_drift_guard: Option<crate::file_schema_drift::FileSchemaDriftGuard>,
@@ -126,6 +129,7 @@ impl S3SingleFileCached {
             object_store,
             file_path,
             cached_metadata: RwLock::new(None),
+            pending_metadata: RwLock::new(None),
             dataset_name,
             schema_drift_guard: None,
         })
@@ -213,8 +217,7 @@ impl S3SingleFileCached {
             return Ok(true);
         }
 
-        // Update cache with new metadata
-        *self.cached_metadata.write().await = Some(current_metadata);
+        *self.pending_metadata.write().await = Some(current_metadata);
 
         Ok(false)
     }
@@ -239,6 +242,13 @@ impl RefreshSkipTableProvider for S3SingleFileCached {
         // Drop the cached file metadata so the next `should_skip_refresh` treats the file as
         // changed and re-materializes the full source (see `reset_skip_state` on the trait).
         *self.cached_metadata.write().await = None;
+        *self.pending_metadata.write().await = None;
+    }
+
+    async fn commit_skip_state(&self) {
+        if let Some(loaded) = self.pending_metadata.write().await.take() {
+            *self.cached_metadata.write().await = Some(loaded);
+        }
     }
 }
 
@@ -400,6 +410,7 @@ mod tests {
             object_store: store,
             file_path,
             cached_metadata: RwLock::new(cached_meta),
+            pending_metadata: RwLock::new(None),
             dataset_name: "test_dataset".to_string(),
             schema_drift_guard: None,
         }
@@ -606,11 +617,14 @@ mod tests {
         );
     }
 
+    /// A refresh that reads a changed file can fail after the check, so the next
+    /// refresh must read the file again until one that read it succeeds.
     #[tokio::test]
-    async fn test_should_update_cache_when_metadata_changes() {
+    async fn a_changed_file_is_skipped_only_after_a_refresh_that_read_it_succeeds() {
         let old_meta = make_meta("file", 128, 10, Some("etag"), Some("v1"));
         let new_meta = make_meta("file", 256, 20, Some("etag2"), Some("v2"));
         let store = Arc::new(HeadOnlyObjectStore::new(vec![
+            new_meta.clone(),
             new_meta.clone(),
             new_meta.clone(),
         ])) as Arc<dyn ObjectStore>;
@@ -620,13 +634,23 @@ mod tests {
             !cached_table
                 .should_skip_refresh()
                 .await
-                .expect("first attempt")
+                .expect("first attempt"),
+            "a changed file is read"
         );
+        assert!(
+            !cached_table
+                .should_skip_refresh()
+                .await
+                .expect("retry after a failed refresh"),
+            "a changed file whose refresh did not succeed is read again"
+        );
+        cached_table.commit_skip_state().await;
         assert!(
             cached_table
                 .should_skip_refresh()
                 .await
-                .expect("second attempt")
+                .expect("after a successful refresh"),
+            "a file loaded by a successful refresh is skipped"
         );
     }
 
@@ -704,7 +728,8 @@ mod tests {
             "refresh must re-materialize after reset even when the source is unchanged"
         );
 
-        // And it becomes skippable again once the cache is repopulated.
+        // And it becomes skippable again once the refresh that read it succeeds.
+        cached_table.commit_skip_state().await;
         assert!(
             cached_table
                 .should_skip_refresh()

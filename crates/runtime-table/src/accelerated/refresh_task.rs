@@ -911,6 +911,9 @@ impl RefreshTask {
         // skip check and reset the provider's cached version so the *next* plain refresh
         // re-materializes the full source instead of skipping against the narrowed data. A reload
         // reads the source whether or not it changed, so it skips the check.
+        // The source whose skip check found it changed. The version it saw is recorded as
+        // loaded only once this refresh writes its rows.
+        let mut checked_source = None;
         if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
             let table_provider = self.federated.table_provider().await;
 
@@ -945,6 +948,7 @@ impl RefreshTask {
                         );
                     }
                 }
+                checked_source = Some(table_provider);
             }
         }
 
@@ -1098,6 +1102,12 @@ impl RefreshTask {
 
         if let Some(cursor) = append_cursor_to_save {
             self.save_append_cursor(&cursor).await;
+        }
+        if let Some(source) = checked_source {
+            data_components::refresh_skip::commit_refresh_skip_state_for_table_provider(
+                source.as_ref(),
+            )
+            .await;
         }
 
         Ok(RefreshOutcome::Refreshed)
