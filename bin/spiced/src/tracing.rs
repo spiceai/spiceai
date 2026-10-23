@@ -95,6 +95,9 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "extensions",
     "spice_cloud",
     "llms",
+    // Downloads from the Hugging Face Hub: what is downloaded, its progress, and a load that
+    // falls back to the cache.
+    "huggingface_hub",
     "tpc_extension",
     "workers",
     "search",

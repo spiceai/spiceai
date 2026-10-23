@@ -26,6 +26,7 @@ use crate::component::dataset::{
     acceleration::{Acceleration, Engine, RefreshMode},
 };
 use crate::dataaccelerator::spice_sys::dataset_checkpointer;
+use crate::dataaccelerator::{AccelerationSource, AcceleratorEngineRegistry};
 use datafusion::{
     catalog::Session,
     common::{Constraint, Constraints, project_schema},
@@ -82,12 +83,20 @@ pub(crate) async fn accelerated_checkpoint_schema(dataset: &Dataset) -> Option<S
 /// a table from the checkpoint schema uses [`accelerated_checkpoint_schema`], which
 /// leaves that key out.
 pub(crate) async fn recorded_checkpoint_schema(dataset: &Dataset) -> Option<SchemaRef> {
-    if !dataset.is_file_accelerated() {
+    recorded_acceleration_checkpoint_schema(dataset, dataset.runtime.accelerator_engine_registry())
+        .await
+}
+
+/// [`recorded_checkpoint_schema`] for any accelerated component, a view included.
+pub(crate) async fn recorded_acceleration_checkpoint_schema(
+    source: &dyn AccelerationSource,
+    registry: Arc<AcceleratorEngineRegistry>,
+) -> Option<SchemaRef> {
+    if !source.is_file_accelerated() {
         return None;
     }
-    let registry = dataset.runtime.accelerator_engine_registry();
     let checkpoint = dataset_checkpointer(
-        dataset,
+        source,
         registry,
         OpenOption::OpenExisting,
         SnapshotBehavior::Disabled,

@@ -1530,6 +1530,7 @@ pub struct FederatedPartitionProvider {
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
     flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
     partition_store: Arc<PartitionStore>,
+    accelerations_partition_store: Arc<PartitionStore>,
     executor_statistics:
         Arc<parking_lot::RwLock<HashMap<String, HashMap<String, ExecutorTableStatistics>>>>,
     node_id: Option<Arc<str>>,
@@ -1543,6 +1544,7 @@ impl FederatedPartitionProvider {
             connections: Arc::clone(&registry.connections),
             flight_sql_clients: Arc::clone(&registry.flight_sql_clients),
             partition_store: Arc::clone(&registry.federated_partition_store),
+            accelerations_partition_store: Arc::clone(&registry.accelerations_partition_store),
             executor_statistics: Arc::clone(&registry.executor_statistics),
             node_id: registry.node_id.clone(),
         }
@@ -1551,9 +1553,15 @@ impl FederatedPartitionProvider {
 
 impl TablePartitionProvider for FederatedPartitionProvider {
     fn should_partition(&self, tbl: &TableScan) -> bool {
+        // The accelerated rewrite routes a table whose partitions the acceleration
+        // store holds, and its per-executor scans keep the table's name.
         self.partition_store
             .get_cached_table_metadata(&tbl.table_name)
             .is_some()
+            && self
+                .accelerations_partition_store
+                .get_cached_table_metadata(&tbl.table_name)
+                .is_none()
     }
 
     fn get_partitions(
@@ -2232,6 +2240,58 @@ mod tests {
             .collect();
         served.sort();
         assert_eq!(served, [vec!["'east'", "'north'"], vec!["'west'"]]);
+    }
+
+    /// The accelerated rewrite runs first. A table whose partitions the acceleration
+    /// store holds is routed there, and the per-executor scans it leaves keep the
+    /// table's name, so the federated rewrite must not partition them again. The
+    /// single-executor scan it leaves for a table only the federated store
+    /// partitions is still expanded.
+    #[tokio::test]
+    async fn a_table_the_acceleration_store_partitions_is_not_partitioned_again() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        let table = TableReference::bare("t");
+        registry
+            .federated_partition_store()
+            .initialize_metadata(&table, vec!["id".to_string()])
+            .await
+            .expect("initialize federated");
+        let provider = FederatedPartitionProvider::from_registry(&registry);
+        let client = registry
+            .flight_sql_clients_snapshot()
+            .await
+            .remove("executor-1")
+            .expect("client");
+        let executor_scan = {
+            let source = flight_sql_table_provider("executor-1", client, &table, id_schema(), None);
+            let plan = datafusion::logical_expr::LogicalPlanBuilder::scan(
+                table.clone(),
+                datafusion::datasource::provider_as_source(source),
+                None,
+            )
+            .expect("scan")
+            .build()
+            .expect("plan");
+            let datafusion::logical_expr::LogicalPlan::TableScan(scan) = plan else {
+                panic!("a table scan");
+            };
+            scan
+        };
+        assert!(
+            provider.should_partition(&executor_scan),
+            "a table only the federated store partitions is expanded"
+        );
+
+        registry
+            .accelerations_partition_store()
+            .initialize_metadata(&table, vec!["id".to_string()])
+            .await
+            .expect("initialize acceleration");
+        assert!(
+            !provider.should_partition(&executor_scan),
+            "a table the acceleration store partitions is left to the accelerated rewrite"
+        );
     }
 
     async fn ready_executor(registry: &ExecutorRegistry, executor_id: &str, process_id: &str) {
