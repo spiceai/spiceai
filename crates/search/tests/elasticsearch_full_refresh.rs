@@ -29,7 +29,9 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use elasticsearch::{Client, Elasticsearch};
-use search::index::elasticsearch::{ElasticsearchIndexWriteMaintenance, ElasticsearchTextIndex};
+use search::index::elasticsearch::{
+    ElasticsearchIndexWriteMaintenance, ElasticsearchIndexWriteOptions, ElasticsearchTextIndex,
+};
 use spice_table::{Index, WriteWindow};
 
 fn es_url() -> String {
@@ -82,6 +84,10 @@ struct TestIndex {
 
 impl TestIndex {
     async fn new(test: &str) -> Self {
+        Self::with_options(test, ElasticsearchIndexWriteOptions::default()).await
+    }
+
+    async fn with_options(test: &str, options: ElasticsearchIndexWriteOptions) -> Self {
         let http = reqwest::Client::new();
         wait_for_es(&http).await;
         let name = format!("search-12413-{test}-{}", std::process::id());
@@ -95,7 +101,7 @@ impl TestIndex {
             primary_key: vec![Field::new("id", DataType::Int64, false)],
             source_schema: schema(),
             batch_write_rows: 500,
-            write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
+            write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::new(options)),
         };
         Self {
             http,
@@ -309,6 +315,86 @@ async fn a_full_refresh_after_a_cancelled_one_removes_the_rows_it_dropped() {
         t.ids().await,
         BTreeSet::from([2, 3]),
         "row 1 is gone from the source; the cancelled refresh rewriting it must not keep it"
+    );
+    t.drop_index().await;
+}
+
+/// A refresh request can override the refresh mode, so an append can be the request that
+/// supersedes a full refresh mid-write. The dropped refresh's snapshot is not the append's to
+/// reconcile: the refresh never re-sent most of the rows the dataset still has, so reconciling
+/// would delete their documents.
+#[tokio::test]
+async fn an_append_after_a_cancelled_full_refresh_removes_nothing() {
+    let t = TestIndex::new("append-after-cancel").await;
+    t.write(WriteWindow::ReplaceAll, rows([1, 2, 3], "first"))
+        .await;
+
+    // A full refresh starts, rewrites row 1, and is dropped before it completes.
+    t.index
+        .on_write_start(WriteWindow::ReplaceAll)
+        .await
+        .expect("on_write_start succeeds");
+    t.index
+        .compute_index(vec![rows([1], "cancelled")])
+        .await
+        .expect("the cancelled refresh's rows land");
+
+    t.write(WriteWindow::Append, rows([4], "appended")).await;
+
+    assert_eq!(
+        t.ids().await,
+        BTreeSet::from([1, 2, 3, 4]),
+        "an append removes nothing, whatever snapshot a dropped full refresh left behind"
+    );
+    t.drop_index().await;
+}
+
+/// The `refresh_interval` override is tuning the write does not depend on: when Elasticsearch
+/// rejects it, the sink logs the failure and writes anyway. That write is still a full refresh,
+/// so it still has to remove the documents of the rows it dropped.
+#[tokio::test]
+async fn a_full_refresh_whose_refresh_interval_override_is_rejected_removes_the_rows_it_dropped() {
+    let t = TestIndex::with_options(
+        "rejected-override",
+        ElasticsearchIndexWriteOptions {
+            // Not a time value, so Elasticsearch rejects the settings update.
+            refresh_interval_during_write: Some("not-a-duration".to_string()),
+            force_merge_segments: None,
+        },
+    )
+    .await;
+    // The first write creates the index, so there is no index yet to read settings from.
+    t.index
+        .on_write_start(WriteWindow::ReplaceAll)
+        .await
+        .expect_err("the index does not exist yet, so its refresh_interval cannot be read");
+    t.index
+        .compute_index(vec![rows([1, 2, 3], "first")])
+        .await
+        .expect("the first write lands");
+    t.index
+        .on_write_complete()
+        .await
+        .expect("on_write_complete succeeds");
+    assert_eq!(t.ids().await, BTreeSet::from([1, 2, 3]));
+
+    t.index
+        .on_write_start(WriteWindow::ReplaceAll)
+        .await
+        .expect_err("Elasticsearch rejects the refresh_interval override");
+    t.index
+        .compute_index(vec![rows([1, 3], "second")])
+        .await
+        .expect("the refresh's rows land");
+    t.index
+        .on_write_complete()
+        .await
+        .expect("on_write_complete succeeds");
+
+    assert_eq!(
+        t.ids().await,
+        BTreeSet::from([1, 3]),
+        "row 2 is gone from the source; a rejected override must not cost the refresh its reconcile"
     );
     t.drop_index().await;
 }
