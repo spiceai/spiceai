@@ -71,8 +71,8 @@ runs:
 
         # Ubuntu 24.04 (noble) ships sources in deb822 format at
         # /etc/apt/sources.list.d/ubuntu.sources; older releases use
-        # /etc/apt/sources.list. Handle both. Security updates are only
-        # published on security.ubuntu.com, so those entries stay as they are.
+        # /etc/apt/sources.list. Handle both. Entries for security.ubuntu.com
+        # stay as they are.
         if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
           sudo cp /etc/apt/sources.list.d/ubuntu.sources \
                   /etc/apt/sources.list.d/ubuntu.sources.bak
