@@ -95,6 +95,14 @@ fn params_err(name: &str, e: ParamsError) -> Error {
             param_key: user_key,
             reason,
         },
+        ParamsError::InvalidSecretValue {
+            user_key,
+            secret_source,
+        } => Error::InvalidParam {
+            name: name.to_string(),
+            param_key: user_key,
+            reason: format!("invalid value from {secret_source}; expected a valid value"),
+        },
         ParamsError::UnknownParameter {
             user_key,
             supported,

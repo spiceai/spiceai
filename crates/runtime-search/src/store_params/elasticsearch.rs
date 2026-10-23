@@ -55,9 +55,9 @@ impl FromStr for EsDistanceMetric {
             "l2_norm" | "l2" | "euclidean" => Ok(EsDistanceMetric::L2Norm),
             "dot_product" | "dot" => Ok(EsDistanceMetric::DotProduct),
             "max_inner_product" | "mip" => Ok(EsDistanceMetric::MaxInnerProduct),
-            other => Err(format!(
-                "Expected one of: cosine | l2_norm | dot_product | max_inner_product. Found {other}."
-            )),
+            _ => Err(
+                "Expected one of: cosine | l2_norm | dot_product | max_inner_product.".to_string(),
+            ),
         }
     }
 }

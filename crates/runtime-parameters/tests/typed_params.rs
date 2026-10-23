@@ -74,7 +74,7 @@ impl FromStr for Tier {
         match s {
             "free" => Ok(Tier::Free),
             "paid" => Ok(Tier::Paid),
-            other => Err(format!("must be one of: free, paid. Found {other}")),
+            _ => Err("must be one of: free, paid".to_string()),
         }
     }
 }
