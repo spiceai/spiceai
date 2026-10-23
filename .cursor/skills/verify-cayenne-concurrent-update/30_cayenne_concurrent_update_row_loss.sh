@@ -29,12 +29,20 @@ if [ -z "$SPICED" ]; then
     exit 1
   fi
 fi
-# The launch below runs from a temp dir, so pin a relative SPICED now.
-case "$SPICED" in
-  /*) ;;
-  */*) SPICED="$(cd "$(dirname "$SPICED")" && pwd)/$(basename "$SPICED")" ;;
-  *) SPICED=$(command -v "$SPICED") || { echo "spiced not found: $SPICED" >&2; exit 1; } ;;
-esac
+# Setup and the launches below run from other directories, so pin relative
+# SPICED and PYTHON overrides now.
+abs_cmd() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    */*)
+      dir=$(cd "$(dirname "$1")" 2>/dev/null && pwd) || return 1
+      printf '%s/%s\n' "$dir" "$(basename "$1")"
+      ;;
+    *) command -v "$1" ;;
+  esac
+}
+SPICED=$(abs_cmd "$SPICED") || { echo "spiced not found: $SPICED" >&2; exit 1; }
+PYTHON=$(abs_cmd "$PYTHON") || { echo "python not found: $PYTHON" >&2; exit 1; }
 # A runtime already answering on the harness port would take the UPDATEs meant
 # for the spiced launched below.
 if curl -sf 127.0.0.1:8393/v1/ready >/dev/null 2>&1; then
@@ -44,7 +52,10 @@ fi
 
 DATA_SRC=$SKILL_DIR/data/orders.parquet
 if [ ! -f "$DATA_SRC" ]; then
-  (cd "$SKILL_DIR" && "$PYTHON" 00_setup_data.py)
+  (cd "$SKILL_DIR" && "$PYTHON" 00_setup_data.py) || {
+    echo "failed to generate $DATA_SRC with $PYTHON" >&2
+    exit 1
+  }
 fi
 
 D=$(mktemp -d /tmp/cay-upd-XXXX)
