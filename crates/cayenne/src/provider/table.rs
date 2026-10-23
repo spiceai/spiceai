@@ -38745,7 +38745,9 @@ impl CayenneTableProvider {
     /// `checkpoint_inlined_data`'s no-batches arm re-syncs that counter from the empty
     /// corpus and stores `0` over a populated tier — the clobber
     /// `delete_mem_tier_rows_matching` separately documents having to defend against.
-    async fn checkpoint_inlined_data_if_present_for_delete(&self) -> datafusion_common::Result<()> {
+    pub(crate) async fn checkpoint_inlined_data_if_present_for_delete(
+        &self,
+    ) -> datafusion_common::Result<()> {
         if self.is_memory_resident_mode() {
             return Ok(());
         }
@@ -43290,13 +43292,10 @@ impl TableProvider for CayenneTableProvider {
         filters: Vec<Expr>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         if self.file_based_deletes_preferred(&filters) {
-            // File-based retention operates on listing table files. Materialize
-            // pending inline rows first so retention can reason about file stats.
-            {
-                let _guard = self.write_lock.lock().await;
-                self.checkpoint_inlined_data_if_present_for_delete().await?;
-            }
-
+            // Inline checkpoint and protected-snapshot listings are resolved
+            // inside `FileBasedDeletionSink::delete_from`'s `write_lock` hold —
+            // a plan-time capture plus a separate earlier hold is the two-hold
+            // gap #14217 names for this arm.
             tracing::debug!(
                 "Table '{}': using file-based retention delete path",
                 self.table_metadata.table_name,
@@ -43375,8 +43374,6 @@ impl TableProvider for CayenneTableProvider {
             .project(proj_exprs)?
             .build()?;
 
-        let source_plan = state.create_physical_plan(&plan).await?;
-
         // Transaction: `UpdateExec` runs delete + insert, and its delete leg
         // publishes deletion vectors immediately — that breaks atomicity (a
         // rollback would lose rows, and even a successful commit exposes a torn
@@ -43386,6 +43383,7 @@ impl TableProvider for CayenneTableProvider {
         // the executor applies those deletions atomically under the fence at
         // COMMIT.
         if active_transaction(state, self.table_id()).is_some() {
+            let source_plan = state.create_physical_plan(&plan).await?;
             // The staged upsert supersedes by primary key, so a reassigned PK
             // column would leave the prior row in place. Reject it (v1 supports
             // value updates only).
@@ -43438,16 +43436,18 @@ impl TableProvider for CayenneTableProvider {
             combined_filter,
             session_state.clone(),
         )?;
-        let update = data_components::update::UpdateExec::new(
-            source_plan,
-            Arc::new(self.clone_for_write()),
+        // Autocommit: do not freeze the physical scan here. Shared `UpdateExec`
+        // materializes a plan-time capture and only takes `write_lock` for the
+        // later delete + insert, so a concurrent same-key writer can tombstone
+        // the live replacement and insert nothing. `CayenneUpdateExec` rebuilds
+        // the scan after it holds `write_lock` — the #13828 pattern for UPDATE.
+        Ok(Arc::new(super::update_exec::CayenneUpdateExec::new(
+            plan,
+            self.clone_for_write(),
             session_state,
             filters,
-        );
-        Ok(Arc::new(match check {
-            Some(check) => update.with_validator(Arc::new(check)),
-            None => update,
-        }))
+            check.map(|check| Arc::new(check) as Arc<dyn data_components::update::UpdateValidator>),
+        )))
     }
 }
 
@@ -43506,22 +43506,8 @@ impl CayenneTableProvider {
         }
         let filter = &filters[0];
 
-        // Build protected snapshot listing tables for PK-based strategies only.
-        // Position-based tables have no protected snapshots.
-        let protected_snapshot_tables = if self.pk_deletion_strategy.is_position_based() {
-            None
-        } else {
-            Some(
-                self.build_protected_snapshot_listing_tables()?
-                    .into_iter()
-                    .map(|(snapshot_id, _, table)| (snapshot_id, table))
-                    .collect(),
-            )
-        };
-
         let sink: Arc<dyn DeletionSink> = Arc::new(FileBasedDeletionSink::new(
             Arc::clone(&self.listing_table),
-            protected_snapshot_tables,
             filter.clone(),
             self.table_metadata.table_name.clone(),
             Arc::clone(&self.catalog),
@@ -43719,10 +43705,13 @@ impl CayenneTableProvider {
     /// [`TableProvider::delete_from`], which requires a verified "rows affected"
     /// count. CDC discards that count, so the apply loop calls this path to build
     /// the same key-based [`InlineAwareDeletionSink`] as `delete_from` but with a
-    /// count-skipping inner sink. A `pk IN (...)` filter, or an equivalent
-    /// composite OR-of-AND filter, can then persist deletion vectors without
-    /// scanning. Other key-delete filter shapes may still scan through the shared
-    /// sink.
+    /// count-skipping inner sink (`DeletionRequestSource::Cdc`). The sink is
+    /// built inside the execution-time `write_lock` hold
+    /// ([`DeletionSinkSource::BuildAtExecution`]) so a mem-tier apply is judged
+    /// by the same capture the delete is (#14217). A `pk IN (...)` filter, or an
+    /// equivalent composite OR-of-AND filter, can then persist deletion vectors
+    /// without scanning. Other key-delete filter shapes may still scan through
+    /// the shared sink.
     ///
     /// Returns `Ok(Some(_))` when Cayenne handled the delete. The returned count
     /// is not guaranteed to be exact: count-skipping paths return a sentinel 0,
@@ -43746,12 +43735,9 @@ impl CayenneTableProvider {
             return Ok(None);
         }
 
-        let file_sink = self
-            .build_deletion_vector_sink(filters, None, DeletionRequestSource::Cdc)
-            .await?;
         let sink = InlineAwareDeletionSink {
             table: self.clone_for_write(),
-            file_sink: DeletionSinkSource::Prebuilt(Box::new(file_sink)),
+            file_sink: DeletionSinkSource::BuildAtExecution(DeletionRequestSource::Cdc),
             filters: filters.to_vec(),
         };
         let deleted = sink
@@ -43843,7 +43829,7 @@ impl CayenneTableProvider {
     /// to its rows — and it is returned rather than looked up by the caller because a
     /// second load of `protected_snapshots` can race a staged publish (see the comment
     /// on the load below). A caller that does not need it drops it explicitly.
-    fn build_protected_snapshot_listing_tables(
+    pub(crate) fn build_protected_snapshot_listing_tables(
         &self,
     ) -> datafusion_common::Result<Vec<(String, i64, Arc<ListingTable>)>> {
         // ONE load, and the threshold travels with the table it belongs to. Loading this
@@ -69724,6 +69710,182 @@ mod tests {
             "the delete must be judged against the table as it is when it RUNS: `(8, 20)` \
              matches `value < 50` and goes, `(7, 60)` does not match and must survive — a \
              key tombstone drawn from the superseded `(7, 10)` would take it with it"
+        );
+    }
+
+    /// Autocommit `UPDATE` used to freeze the read-side scan at `update()` plan
+    /// build and only take `write_lock` for the later delete + insert. Two plans
+    /// built against version V1 then executed in order: the first writes V2; the
+    /// second materializes zero rows (live tombstones hide V1, V2 is not in the
+    /// frozen listing), tombstones the live key, and inserts nothing — silent
+    /// loss, every statement still reports success.
+    ///
+    /// Verified to fail when the source plan is captured at plan time: after the
+    /// second `collect`, `id=7` is left at the stale increment `(7, 11)` (or
+    /// gone, when the second materialize sees zero rows and the delete
+    /// tombstones the live key).
+    #[tokio::test]
+    async fn an_update_planned_before_a_same_key_write_must_not_delete_the_row() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_budgeted_upsert_table("update_plan_execute_gap", 64, ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[7], &[10])).await;
+        assert_eq!(scan_id_values(&provider).await, vec![(7, 10)]);
+
+        let increment = vec![(
+            "value".to_string(),
+            datafusion_expr::col("value") + datafusion_expr::lit(1_i64),
+        )];
+        let filter = vec![datafusion_expr::col("id").eq(datafusion_expr::lit(7_i64))];
+        let first = provider
+            .update(&ctx.state(), increment.clone(), filter.clone())
+            .await
+            .expect("first update plan");
+        let second = provider
+            .update(&ctx.state(), increment, filter)
+            .await
+            .expect("second update plan");
+
+        datafusion::physical_plan::collect(first, ctx.task_ctx())
+            .await
+            .expect("first update executed");
+        datafusion::physical_plan::collect(second, ctx.task_ctx())
+            .await
+            .expect("second update executed");
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 12)],
+            "each UPDATE must be judged against the table as it is when it RUNS: two \
+             pre-built `value = value + 1` plans on id=7 must leave the row at 12, not \
+             tombstone the live version and insert nothing"
+        );
+    }
+
+    /// Concurrent autocommit `UPDATE`s of one primary key must serialize (or
+    /// fail with a retryable conflict). A mix of `count=1` and `count=0` that
+    /// drops the row is the plan-build/execute gap above, under contention.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_key_autocommit_updates_keep_the_row() {
+        const UPDATES: i64 = 16;
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_budgeted_upsert_table("update_concurrent_same_key", 64, ctx.runtime_env()).await;
+        let provider = Arc::new(provider);
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(provider.as_ref(), id_value_batch(schema, &[7], &[10])).await;
+        assert_eq!(scan_id_values(provider.as_ref()).await, vec![(7, 10)]);
+        let mut joins = Vec::with_capacity(usize::try_from(UPDATES).expect("fits"));
+        for _ in 0..UPDATES {
+            let table = Arc::clone(&provider);
+            joins.push(tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let plan = table
+                    .update(
+                        &ctx.state(),
+                        vec![(
+                            "value".to_string(),
+                            datafusion_expr::col("value") + datafusion_expr::lit(1_i64),
+                        )],
+                        vec![datafusion_expr::col("id").eq(datafusion_expr::lit(7_i64))],
+                    )
+                    .await
+                    .expect("update plan");
+                let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+                    .await
+                    .expect("update executed");
+                let count = batches
+                    .first()
+                    .and_then(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::UInt64Array>()
+                    })
+                    .and_then(|counts| counts.values().first().copied())
+                    .expect("update count");
+                assert_eq!(
+                    count, 1,
+                    "an UPDATE of an existing key must report count=1, not a silent 0"
+                );
+            }));
+        }
+        for join in joins {
+            join.await.expect("update task");
+        }
+
+        assert_eq!(
+            scan_id_values(provider.as_ref()).await,
+            vec![(7, 10 + UPDATES)],
+            "every successful same-key increment must apply and the row must remain"
+        );
+    }
+
+    /// `delete_from_cdc_fast` used to prebuild the sink outside `write_lock` and
+    /// skip the mem-tier checkpoint the user-`DELETE` path runs inside that lock
+    /// (#14217). On a `cdc_durability: memory` table that is not memory-resident,
+    /// the filtered mem-tier delete is a no-op, so a predicate that matches only
+    /// RAM-resident rows deletes nothing — and a durable superseded version that
+    /// *does* match can tombstone the key and take the live RAM replacement.
+    ///
+    /// Verified to fail when the sink is prebuilt: `(8, 20)` survives and/or
+    /// `(7, 60)` is gone.
+    #[tokio::test]
+    async fn a_cdc_fast_delete_is_judged_against_the_live_mem_tier() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "delete_cdc_fast_mem_tier",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        assert!(
+            provider.is_cdc_mem_tier_armed(),
+            "precondition: the applies must take the in-memory CDC path this test is about"
+        );
+
+        cdc_apply(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7, 9], &[10, 90]),
+        )
+        .await;
+        cdc_apply(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7, 8], &[60, 20]),
+        )
+        .await;
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 60), (8, 20), (9, 90)],
+            "precondition: both applies are visible"
+        );
+        assert!(
+            !provider.mem_tier.is_empty(),
+            "precondition: the applies must still be RAM-resident"
+        );
+
+        let deleted = provider
+            .delete_from_cdc_fast(&[datafusion_expr::col("value").lt(datafusion_expr::lit(50_i64))])
+            .await
+            .expect("cdc fast delete");
+        assert!(
+            deleted.is_some(),
+            "cdc fast path must handle a key-based predicate delete"
+        );
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 60), (9, 90)],
+            "delete_from_cdc_fast must judge the live mem-tier: `(8, 20)` matches \
+             `value < 50` and goes, `(7, 60)` does not match and must survive"
         );
     }
 

@@ -126,11 +126,13 @@ pub(crate) mod transaction;
 pub(crate) mod tuning;
 #[cfg(test)]
 mod tuning_sim;
+pub(crate) mod update_exec;
 pub(crate) mod update_keys;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
 pub(crate) mod wal_checksum;
 pub(crate) mod write_budget;
+pub(crate) mod write_lock_held;
 pub(crate) mod write_recovery;
 
 pub use write_recovery::RebuildableWrite;

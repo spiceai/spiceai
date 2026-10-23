@@ -215,7 +215,11 @@ impl DataSink for CayenneDataSink {
             // repeated keys are resolved before validation sees them (an APPEND's
             // validation then supersedes the resident rows its keys meet, as the
             // appended segment's own tombstones; an OVERWRITE replaces the tier).
-            let write_guard = self.table.write_lock().lock().await;
+            let write_guard = if super::write_lock_held::is_held() {
+                None
+            } else {
+                Some(self.table.write_lock().lock().await)
+            };
             let mut raw = normalized;
             while let Some(batch) = raw.next().await {
                 let batch = batch?;
@@ -362,7 +366,14 @@ impl DataSink for CayenneDataSink {
         } else {
             // Append path: `write_all_append` uses the existing-staging helpers
             // that assume the caller already holds the write lock.
-            let write_guard = self.table.write_lock_arc().lock_owned().await;
+            let write_guard = if super::write_lock_held::is_held() {
+                // Exclusive access is the outer `write_lock` hold. The dummy
+                // only satisfies `PreparedResolvedAppend`, which needs an owned
+                // guard to outlive a spawned commit.
+                super::write_lock_held::dummy_owned_guard()
+            } else {
+                self.table.write_lock_arc().lock_owned().await
+            };
             self.write_all_append(normalized, context, write_guard)
                 .await
                 .map_err(Into::into)
@@ -599,6 +610,12 @@ impl CayenneDataSink {
     /// says it would be taken.
     async fn lock_for_first_load(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         if !self.table.takes_first_load() {
+            return None;
+        }
+        // Autocommit UPDATE already holds `write_lock` across rematerialize +
+        // delete + insert. A second acquire deadlocks. First-load is an empty-
+        // table optimization; an UPDATE insert is not that path.
+        if super::write_lock_held::is_held() {
             return None;
         }
         let write_guard = self.table.write_lock_arc().lock_owned().await;

@@ -394,10 +394,13 @@ impl InlinedDataRewrite {
 /// frozen at build time. How far that freeze can drift from the delete depends on
 /// who builds the sink and when.
 pub(crate) enum DeletionSinkSource {
-    /// Built by the caller immediately before it drives the sink itself
-    /// (`delete_from_cdc_fast`, the CDC apply loop's own delete path). Its window
-    /// is whatever separates those two statements; this is its pre-existing shape,
-    /// neither widened nor narrowed here.
+    /// Built by the caller immediately before it drives the sink itself.
+    /// Prefer [`Self::BuildAtExecution`] for any path that can interleave a
+    /// writer between construction and `delete_from`.
+    #[expect(
+        dead_code,
+        reason = "kept so a caller that already holds a built sink can still drive it; user DELETE and CDC fast now use BuildAtExecution"
+    )]
     Prebuilt(Box<CayenneDeletionSink>),
     /// Built inside the execution-time `write_lock` hold, after the in-memory CDC
     /// tier is checkpointed in that same hold.
@@ -630,7 +633,11 @@ impl DeletionSink for InlineAwareDeletionSink {
         &self,
         _context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let _write_guard = self.table.write_lock.lock().await;
+        let _write_guard = if super::write_lock_held::is_held() {
+            None
+        } else {
+            Some(self.table.write_lock.lock().await)
+        };
         self.table.ensure_publication_outcome_known()?;
         self.table.mark_maintained_aggregates_stale();
         let position_based = self.table.pk_deletion_strategy.is_position_based();
