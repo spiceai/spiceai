@@ -26,12 +26,17 @@ limitations under the License.
 //! This plan keeps the logical read, rebuilds the physical scan after it holds
 //! `write_lock`, and runs delete + insert before releasing it — the #13828
 //! pattern applied to `UPDATE`.
+//!
+//! A partitioned sink calls [`PreparableUpdate::prepare`] on every partition
+//! before executing any, so a primary-key collision in a later partition
+//! refuses the statement with nothing written.
 
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use data_components::update::UpdateValidator;
+use async_trait::async_trait;
+use data_components::update::{PreparableUpdate, UpdateValidator};
 use datafusion::execution::SessionState;
 use datafusion::physical_plan::execute_stream;
 use datafusion_catalog::TableProvider;
@@ -59,6 +64,10 @@ pub(crate) struct CayenneUpdateExec {
     session_state: SessionState,
     filters: Vec<Expr>,
     validator: Option<Arc<dyn UpdateValidator>>,
+    /// Rows [`PreparableUpdate::prepare`] materialized and checked. The next
+    /// execution writes these so a partitioned sink can refuse every partition
+    /// when one partition's validator fails.
+    prepared: Arc<tokio::sync::Mutex<Option<Vec<RecordBatch>>>>,
     properties: Arc<PlanProperties>,
 }
 
@@ -87,8 +96,25 @@ impl CayenneUpdateExec {
             session_state,
             filters,
             validator,
+            prepared: Arc::new(tokio::sync::Mutex::new(None)),
             properties,
         }
+    }
+}
+
+#[async_trait]
+impl PreparableUpdate for CayenneUpdateExec {
+    async fn prepare(&self, context: Arc<TaskContext>) -> Result<(), DataFusionError> {
+        let rows = materialize_from_logical(
+            &self.logical_plan,
+            &self.session_state,
+            &self.table,
+            self.validator.as_deref(),
+            context,
+        )
+        .await?;
+        *self.prepared.lock().await = Some(rows);
+        Ok(())
     }
 }
 
@@ -157,6 +183,7 @@ impl ExecutionPlan for CayenneUpdateExec {
         let session_state = self.session_state.clone();
         let filters = self.filters.clone();
         let validator = self.validator.clone();
+        let prepared = Arc::clone(&self.prepared);
         let schema = Arc::new(Schema::new(vec![Field::new(
             "count",
             DataType::UInt64,
@@ -164,18 +191,22 @@ impl ExecutionPlan for CayenneUpdateExec {
         )]));
 
         let stream = futures::stream::once(async move {
-            let _write_guard = table.write_lock().lock().await;
+            let write_guard = Arc::new(table.write_lock_arc().lock_owned().await);
             table
                 .ensure_publication_outcome_known()
                 .map_err(DataFusionError::from)?;
-            write_lock_held::scope(apply_update(
-                logical_plan,
-                table.clone_for_write(),
-                session_state,
-                filters,
-                validator,
-                context,
-            ))
+            write_lock_held::scope(
+                write_guard,
+                apply_update(
+                    logical_plan,
+                    table.clone_for_write(),
+                    session_state,
+                    filters,
+                    validator,
+                    prepared,
+                    context,
+                ),
+            )
             .await
         });
 
@@ -189,28 +220,23 @@ async fn apply_update(
     session_state: SessionState,
     filters: Vec<Expr>,
     validator: Option<Arc<dyn UpdateValidator>>,
+    prepared: Arc<tokio::sync::Mutex<Option<Vec<RecordBatch>>>>,
     context: Arc<TaskContext>,
 ) -> Result<RecordBatch, DataFusionError> {
-    let source_plan = session_state.create_physical_plan(&logical_plan).await?;
-    let source_plan: Arc<dyn ExecutionPlan> = if source_plan
-        .properties()
-        .output_partitioning()
-        .partition_count()
-        > 1
-    {
-        Arc::new(CoalescePartitionsExec::new(source_plan))
-    } else {
-        source_plan
+    let rows = match prepared.lock().await.take() {
+        Some(rows) => rows,
+        None => {
+            materialize_from_logical(
+                &logical_plan,
+                &session_state,
+                &table,
+                validator.as_deref(),
+                Arc::clone(&context),
+            )
+            .await?
+        }
     };
-
     let provider: Arc<dyn TableProvider> = Arc::new(table.clone_for_write());
-    let rows = materialize(
-        &source_plan,
-        &provider,
-        validator.as_deref(),
-        Arc::clone(&context),
-    )
-    .await?;
     let target_schema = provider.schema();
 
     let delete_plan = provider.delete_from(&session_state, filters).await?;
@@ -242,6 +268,28 @@ async fn apply_update(
         false,
     )])
     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+async fn materialize_from_logical(
+    logical_plan: &LogicalPlan,
+    session_state: &SessionState,
+    table: &CayenneTableProvider,
+    validator: Option<&dyn UpdateValidator>,
+    context: Arc<TaskContext>,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
+    let source_plan = session_state.create_physical_plan(logical_plan).await?;
+    let source_plan: Arc<dyn ExecutionPlan> = if source_plan
+        .properties()
+        .output_partitioning()
+        .partition_count()
+        > 1
+    {
+        Arc::new(CoalescePartitionsExec::new(source_plan))
+    } else {
+        source_plan
+    };
+    let provider: Arc<dyn TableProvider> = Arc::new(table.clone_for_write());
+    materialize(&source_plan, &provider, validator, context).await
 }
 
 async fn materialize(

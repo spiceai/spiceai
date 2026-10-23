@@ -365,15 +365,11 @@ impl DataSink for CayenneDataSink {
                 .map_err(Into::into)
         } else {
             // Append path: `write_all_append` uses the existing-staging helpers
-            // that assume the caller already holds the write lock.
-            let write_guard = if super::write_lock_held::is_held() {
-                // Exclusive access is the outer `write_lock` hold. The dummy
-                // only satisfies `PreparedResolvedAppend`, which needs an owned
-                // guard to outlive a spawned commit.
-                super::write_lock_held::dummy_owned_guard()
-            } else {
-                self.table.write_lock_arc().lock_owned().await
-            };
+            // that assume the caller already holds the write lock. When
+            // autocommit UPDATE already holds it, `acquire_or_share` must not
+            // take it again (the mutex is not reentrant).
+            let write_guard =
+                super::write_lock_held::acquire_or_share(&self.table.write_lock_arc()).await;
             self.write_all_append(normalized, context, write_guard)
                 .await
                 .map_err(Into::into)
@@ -570,7 +566,11 @@ impl CayenneDataSink {
                     futures::stream::iter(segment.into_iter().map(Ok)),
                 ));
             let segment_start = std::time::Instant::now();
-            let write_guard = self.table.write_lock_arc().lock_owned().await;
+            // Autocommit UPDATE holds `write_lock` across rematerialize +
+            // delete + insert. A second acquire deadlocks after the delete
+            // has already committed. `acquire_or_share` reuses that hold.
+            let write_guard =
+                super::write_lock_held::acquire_or_share(&self.table.write_lock_arc()).await;
             let lock_wait_ms = segment_start.elapsed().as_millis();
             let segment_rows = self
                 .write_all_append(segment_stream, context, write_guard)

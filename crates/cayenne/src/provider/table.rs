@@ -6702,7 +6702,10 @@ impl CayenneTableProvider {
         ));
 
         let lock_wait_start = Instant::now();
-        let write_guard = self.write_lock_arc().lock_owned().await;
+        // Autocommit UPDATE already holds `write_lock`. A second acquire
+        // deadlocks. `acquire_or_share` reuses that hold; spawned commit
+        // keeps a clone of it (task-locals do not cross `tokio::spawn`).
+        let write_guard = super::write_lock_held::acquire_or_share(&self.write_lock_arc()).await;
         let lock_wait_elapsed = lock_wait_start.elapsed();
         if lock_wait_elapsed > Duration::from_millis(10) {
             tracing::debug!(
@@ -43471,13 +43474,18 @@ impl TableProvider for CayenneTableProvider {
         // later delete + insert, so a concurrent same-key writer can tombstone
         // the live replacement and insert nothing. `CayenneUpdateExec` rebuilds
         // the scan after it holds `write_lock` — the #13828 pattern for UPDATE.
-        Ok(Arc::new(super::update_exec::CayenneUpdateExec::new(
+        // Wrapped so a partitioned sink can `prepare` every partition before
+        // writing any (a later partition's PK collision must change none).
+        let exec = Arc::new(super::update_exec::CayenneUpdateExec::new(
             plan,
             self.clone_for_write(),
             session_state,
             filters,
             check.map(|check| Arc::new(check) as Arc<dyn data_components::update::UpdateValidator>),
-        )))
+        ));
+        Ok(Arc::new(
+            data_components::update::PreparableUpdateExec::wrap(exec),
+        ))
     }
 }
 
@@ -66680,6 +66688,45 @@ mod tests {
         (provider, temp_dir)
     }
 
+    /// Unkeyed `id`/`value` table with the default publish interval and
+    /// inlining, so a surviving row keeps `holds_no_rows` false and an UPDATE
+    /// insert takes `write_append_segmented`.
+    async fn create_unkeyed_table(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, temp_dir)
+    }
+
     async fn create_cdc_upsert_table(
         table_name: &str,
         runtime_env: Arc<RuntimeEnv>,
@@ -69849,6 +69896,70 @@ mod tests {
             scan_id_values(provider.as_ref()).await,
             vec![(7, 10 + UPDATES)],
             "every successful same-key increment must apply and the row must remain"
+        );
+    }
+
+    /// Autocommit `UPDATE` holds `write_lock` across rematerialize + delete +
+    /// insert. An unkeyed table with a default `stream_publish_interval` and a
+    /// surviving inline row (`holds_no_rows` is false) routes the insert through
+    /// `write_append_segmented`, which used to re-acquire the same non-reentrant
+    /// mutex after the delete had committed.
+    #[tokio::test]
+    async fn an_unkeyed_update_of_one_of_two_rows_completes() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_unkeyed_table("update_unkeyed_one_of_two", ctx.runtime_env()).await;
+        assert!(
+            provider.metadata().primary_key.is_empty(),
+            "precondition: the table has no primary key"
+        );
+        assert!(
+            provider.context().stream_publish_interval().is_some(),
+            "precondition: the default publish interval routes the insert through \
+             write_append_segmented"
+        );
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[7, 8], &[10, 20])).await;
+        assert_eq!(scan_id_values(&provider).await, vec![(7, 10), (8, 20)]);
+        assert!(
+            !provider.holds_no_rows().await,
+            "precondition: a surviving row must keep holds_no_rows false so the \
+             UPDATE insert takes write_append_segmented"
+        );
+
+        let plan = provider
+            .update(
+                &ctx.state(),
+                vec![(
+                    "value".to_string(),
+                    datafusion_expr::col("value") + datafusion_expr::lit(1_i64),
+                )],
+                vec![datafusion_expr::col("id").eq(datafusion_expr::lit(7_i64))],
+            )
+            .await
+            .expect("update plan");
+        let batches = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            datafusion::physical_plan::collect(plan, ctx.task_ctx()),
+        )
+        .await
+        .expect("unkeyed UPDATE must not deadlock on a nested write_lock acquire")
+        .expect("update executed");
+        let count = batches
+            .first()
+            .and_then(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt64Array>()
+            })
+            .and_then(|counts| counts.values().first().copied())
+            .expect("update count");
+        assert_eq!(count, 1, "updating one of two unkeyed rows reports count=1");
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 11), (8, 20)],
+            "the matching row is incremented and the other row is unchanged"
         );
     }
 
