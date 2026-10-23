@@ -731,15 +731,9 @@ impl DeletionSink for InlineAwareDeletionSink {
             if let Some(prepared) = &mut prepared_file_delete {
                 prepared.mark_catalog_committed();
             }
-            if let Some(prepared) = prepared_file_delete {
-                prepared.publish()?;
-            }
-            if !inline_rewrite.is_empty() {
-                self.table.publish_inlined_rewrite(&inline_rewrite);
-            }
-            if let Some(prepared) = inline_tombstone {
-                self.table.publish_inline_delete_tombstone(prepared);
-            }
+            self.table
+                .publish_committed_delete(prepared_file_delete, &inline_rewrite, inline_tombstone)
+                .await?;
         }
 
         let mut deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {

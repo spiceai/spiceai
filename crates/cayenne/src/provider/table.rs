@@ -2531,6 +2531,11 @@ pub struct CayenneTableProvider {
     /// can store a stale cache in that window. Consumed on first fire.
     #[cfg(test)]
     test_inline_delete_match_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by `publish_committed_delete` after it publishes the
+    /// file-side deletions and before it publishes the inline tombstone, so a
+    /// test can scan in that window. Consumed on first fire.
+    #[cfg(test)]
+    test_delete_publish_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only counters and fault injection for the statistics listing.
     #[cfg(test)]
     test_listing: Arc<TestListingSeams>,
@@ -10357,6 +10362,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_inline_delete_match_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_delete_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_listing: Arc::default(),
             #[cfg(test)]
             test_post_keyset_capture_hook: Arc::new(ParkingMutex::new(None)),
@@ -12816,6 +12823,8 @@ impl CayenneTableProvider {
             test_post_snapshot_list_hook: Arc::clone(&self.test_post_snapshot_list_hook),
             #[cfg(test)]
             test_inline_delete_match_hook: Arc::clone(&self.test_inline_delete_match_hook),
+            #[cfg(test)]
+            test_delete_publish_hook: Arc::clone(&self.test_delete_publish_hook),
             #[cfg(test)]
             test_listing: Arc::clone(&self.test_listing),
             #[cfg(test)]
@@ -31158,6 +31167,14 @@ impl CayenneTableProvider {
     /// Fire (and consume) the test-only post-snapshot-LIST hook, if one is
     /// installed. See [`Self::test_post_snapshot_list_hook`].
     #[cfg(test)]
+    async fn run_test_delete_publish_hook(&self) {
+        let hook = self.test_delete_publish_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    #[cfg(test)]
     async fn run_test_inline_delete_match_hook(&self) {
         let hook = self.test_inline_delete_match_hook.lock().take();
         if let Some(hook) = hook {
@@ -38941,6 +38958,28 @@ impl CayenneTableProvider {
             row_keys: keys.row_keys,
             live_rows: i64::try_from(visible_rows).unwrap_or(i64::MAX),
         }))
+    }
+
+    /// Publish a committed delete: its file-side deletions, its inline rewrite,
+    /// and its inline tombstone.
+    pub(crate) async fn publish_committed_delete(
+        &self,
+        prepared_file_delete: Option<super::delete::PreparedDeletionPublish>,
+        inline_rewrite: &InlinedDataRewrite,
+        inline_tombstone: Option<PreparedInlineDeleteTombstone>,
+    ) -> Result<()> {
+        if let Some(prepared) = prepared_file_delete {
+            prepared.publish()?;
+        }
+        #[cfg(test)]
+        self.run_test_delete_publish_hook().await;
+        if !inline_rewrite.is_empty() {
+            self.publish_inlined_rewrite(inline_rewrite);
+        }
+        if let Some(prepared) = inline_tombstone {
+            self.publish_inline_delete_tombstone(prepared);
+        }
+        Ok(())
     }
 
     /// Publish a committed inline delete tombstone. Its removal is applied to the
@@ -66827,6 +66866,79 @@ mod tests {
             collect_id_value_pairs(&ctx, &reopened, "held_back_only_delete").await,
             Vec::<(i64, i64)>::new()
         );
+    }
+
+    /// A scan concurrent with a delete that covers a file-backed row and an inline
+    /// row sees the table before the delete or after it, never with only one of
+    /// the two removed: the delete publishes both halves under the hold scans
+    /// capture under, so the scan cannot complete between them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scan_never_sees_a_delete_applied_to_only_one_tier() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_durable_inline_keyed_table("delete_publish_atomic", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        {
+            let _write_guard = provider.write_lock.lock().await;
+            provider
+                .checkpoint_inlined_data()
+                .await
+                .expect("move row 1 into a file");
+        }
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "delete_publish_atomic").await,
+            vec![(1, 10), (2, 20)],
+            "precondition: row 1 is file-backed, row 2 is inline"
+        );
+
+        // Between the file-side and the inline publish, start a scan and give it
+        // time to finish. It must still be waiting when the window closes.
+        let reader = provider.clone_for_write();
+        let scan: Arc<ParkingMutex<Option<tokio::task::JoinHandle<Vec<(i64, i64)>>>>> =
+            Arc::default();
+        let finished_inside_window = Arc::new(AtomicBool::new(false));
+        {
+            let scan = Arc::clone(&scan);
+            let finished_inside_window = Arc::clone(&finished_inside_window);
+            *provider.test_delete_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let handle = tokio::spawn(async move {
+                        let ctx = SessionContext::new();
+                        collect_id_value_pairs(&ctx, &reader, "delete_publish_atomic").await
+                    });
+                    // A negative check: the scan must not complete while the
+                    // publish holds the window, so wait long enough that an
+                    // unblocked scan of this two-row table would have finished.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    finished_inside_window.store(handle.is_finished(), Ordering::SeqCst);
+                    *scan.lock() = Some(handle);
+                })
+            }));
+        }
+
+        let plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("id").in_list(
+                    vec![datafusion_expr::lit(1_i64), datafusion_expr::lit(2_i64)],
+                    false,
+                )],
+            )
+            .await
+            .expect("delete plan");
+        datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("delete executed");
+
+        let handle = scan.lock().take().expect("the publish hook started a scan");
+        let seen = handle.await.expect("scan task");
+        assert!(
+            !finished_inside_window.load(Ordering::SeqCst),
+            "a scan completed between the file-side and the inline publish, seeing {seen:?}"
+        );
+        assert_eq!(seen, Vec::<(i64, i64)>::new());
     }
 
     /// Read back all `(id, value)` pairs, sorted by id, for assertion.
