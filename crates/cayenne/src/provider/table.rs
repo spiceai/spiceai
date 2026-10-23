@@ -69963,6 +69963,52 @@ mod tests {
         );
     }
 
+    /// A partitioned table's sink prepares every partition's UPDATE before it
+    /// executes any (`prepare_update_plan`), outside `write_lock`. A same-key
+    /// write that lands between that prepare and the execution must not be
+    /// overwritten by rows read before it: two `value = value + 1` UPDATEs of
+    /// id=7 must leave 12.
+    #[tokio::test]
+    async fn a_write_between_prepare_and_execute_is_not_overwritten() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_budgeted_upsert_table("update_prepare_execute_gap", 64, ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[7], &[10])).await;
+
+        let increment = vec![(
+            "value".to_string(),
+            datafusion_expr::col("value") + datafusion_expr::lit(1_i64),
+        )];
+        let filter = vec![datafusion_expr::col("id").eq(datafusion_expr::lit(7_i64))];
+        let prepared = provider
+            .update(&ctx.state(), increment.clone(), filter.clone())
+            .await
+            .expect("prepared update plan");
+        data_components::update::prepare_update_plan(prepared.as_ref(), ctx.task_ctx())
+            .await
+            .expect("prepare");
+
+        let between = provider
+            .update(&ctx.state(), increment, filter)
+            .await
+            .expect("update plan");
+        datafusion::physical_plan::collect(between, ctx.task_ctx())
+            .await
+            .expect("the update between prepare and execute");
+        assert_eq!(scan_id_values(&provider).await, vec![(7, 11)]);
+
+        datafusion::physical_plan::collect(prepared, ctx.task_ctx())
+            .await
+            .expect("the prepared update executes");
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 12)],
+            "the prepared UPDATE must apply to the version the other write left, not to the \
+             rows it read before that write"
+        );
+    }
+
     /// The time-retention delete arm (`delete_using_files`) takes `write_lock`
     /// again after its inner delete, to apply the delete to the mem-tier. An
     /// autocommit `UPDATE` whose filter has the retention shape reaches it while

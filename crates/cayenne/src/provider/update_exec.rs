@@ -29,7 +29,9 @@ limitations under the License.
 //!
 //! A partitioned sink calls [`PreparableUpdate::prepare`] on every partition
 //! before executing any, so a primary-key collision in a later partition
-//! refuses the statement with nothing written.
+//! refuses the statement with nothing written. That check reads outside
+//! `write_lock`, so execution reads and checks the rows again inside it: what
+//! an UPDATE writes is never a read taken outside the lock.
 
 use std::sync::Arc;
 
@@ -64,10 +66,6 @@ pub(crate) struct CayenneUpdateExec {
     session_state: SessionState,
     filters: Vec<Expr>,
     validator: Option<Arc<dyn UpdateValidator>>,
-    /// Rows [`PreparableUpdate::prepare`] materialized and checked. The next
-    /// execution writes these so a partitioned sink can refuse every partition
-    /// when one partition's validator fails.
-    prepared: Arc<tokio::sync::Mutex<Option<Vec<RecordBatch>>>>,
     properties: Arc<PlanProperties>,
 }
 
@@ -96,7 +94,6 @@ impl CayenneUpdateExec {
             session_state,
             filters,
             validator,
-            prepared: Arc::new(tokio::sync::Mutex::new(None)),
             properties,
         }
     }
@@ -105,15 +102,17 @@ impl CayenneUpdateExec {
 #[async_trait]
 impl PreparableUpdate for CayenneUpdateExec {
     async fn prepare(&self, context: Arc<TaskContext>) -> Result<(), DataFusionError> {
-        let rows = materialize_from_logical(
+        let Some(validator) = self.validator.as_deref() else {
+            return Ok(());
+        };
+        materialize_from_logical(
             &self.logical_plan,
             &self.session_state,
             &self.table,
-            self.validator.as_deref(),
+            Some(validator),
             context,
         )
         .await?;
-        *self.prepared.lock().await = Some(rows);
         Ok(())
     }
 }
@@ -183,7 +182,6 @@ impl ExecutionPlan for CayenneUpdateExec {
         let session_state = self.session_state.clone();
         let filters = self.filters.clone();
         let validator = self.validator.clone();
-        let prepared = Arc::clone(&self.prepared);
         let schema = Arc::new(Schema::new(vec![Field::new(
             "count",
             DataType::UInt64,
@@ -203,7 +201,6 @@ impl ExecutionPlan for CayenneUpdateExec {
                     session_state,
                     filters,
                     validator,
-                    prepared,
                     context,
                 ),
             )
@@ -220,22 +217,16 @@ async fn apply_update(
     session_state: SessionState,
     filters: Vec<Expr>,
     validator: Option<Arc<dyn UpdateValidator>>,
-    prepared: Arc<tokio::sync::Mutex<Option<Vec<RecordBatch>>>>,
     context: Arc<TaskContext>,
 ) -> Result<RecordBatch, DataFusionError> {
-    let rows = match prepared.lock().await.take() {
-        Some(rows) => rows,
-        None => {
-            materialize_from_logical(
-                &logical_plan,
-                &session_state,
-                &table,
-                validator.as_deref(),
-                Arc::clone(&context),
-            )
-            .await?
-        }
-    };
+    let rows = materialize_from_logical(
+        &logical_plan,
+        &session_state,
+        &table,
+        validator.as_deref(),
+        Arc::clone(&context),
+    )
+    .await?;
     let provider: Arc<dyn TableProvider> = Arc::new(table.clone_for_write());
     let target_schema = provider.schema();
 
