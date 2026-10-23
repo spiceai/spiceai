@@ -27,7 +27,7 @@ limitations under the License.
 //! thread and waits for it to free the model.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     num::NonZeroU32,
     path::{Path, PathBuf},
     pin::Pin,
@@ -145,11 +145,15 @@ const GEMMA_THINK_TOKEN: &str = "<|think|>";
 pub struct LlamaCpp {
     decoder: DecodeThread,
     model_name: String,
-    template: String,
+    template: Template,
     special: SpecialTokens,
     reasoning_support: ReasoningSupport,
     counter: AtomicUsize,
 }
+
+/// A model's chat template: one, or named ones from a `tokenizer_config.json`, which a request
+/// chooses between as on the mistral.rs engine (`tool_use` with tools, `default` without).
+type Template = Either<String, Vec<HashMap<String, String>>>;
 
 /// The token strings a chat template may refer to.
 #[derive(Debug, Clone, Default)]
@@ -319,8 +323,12 @@ impl LlamaCpp {
         // As on the mistral.rs path, a template file's template wins over a GGUF's own, and a
         // GGUF's own wins over `chat_template`.
         let template = file_template
-            .or(loaded.template)
-            .or_else(|| options.chat_template_literal.map(ToString::to_string))
+            .or(loaded.template.map(Either::Left))
+            .or_else(|| {
+                options
+                    .chat_template_literal
+                    .map(|literal| Either::Left(literal.to_string()))
+            })
             .ok_or_else(|| ChatError::FailedToLoadModel {
                 source:
                     "the GGUF file carries no chat template, and the model sets no `chat_template`"
@@ -411,9 +419,12 @@ impl LlamaCpp {
         // and otherwise only held to by refusing to end until the model makes one.
         let obliged = obliged_tools(tool_choice.as_ref(), &tools);
         let callable = callable_tools(tool_choice.as_ref(), &tools);
+        // The template this request renders with, for what its markup decides.
+        let template = chosen_template(&self.template, !tools.is_empty())
+            .map_err(OpenAIError::InvalidArgument)?;
         let grammar = content_grammar(
             &self.model_name,
-            &self.template,
+            template,
             req.response_format.as_ref(),
             &callable,
             &obliged,
@@ -450,7 +461,7 @@ impl LlamaCpp {
         for tools in matchers {
             let (events, rx) = mpsc::channel(STREAM_BUFFER);
             let job = Job {
-                reasoning: reasoning_parser(&self.template, &prompt),
+                reasoning: reasoning_parser(template, &prompt),
                 prompt: prompt.clone(),
                 limit: completion_limit(req),
                 // Each choice samples with its own seed, so choices differ above temperature 0.
@@ -697,7 +708,7 @@ fn tool_call(call: &ToolCallResponse) -> ChatCompletionMessageToolCalls {
 
 /// Renders a conversation the way the mistral.rs engine does.
 fn render(
-    template: &str,
+    template: &Template,
     special: &SpecialTokens,
     messages: Vec<IndexMap<String, MessageContent>>,
     enable_thinking: Option<bool>,
@@ -709,7 +720,7 @@ fn render(
         true,
         enable_thinking,
         reasoning_effort,
-        &ChatTemplateValue(Either::Left(template.to_string())),
+        &ChatTemplateValue(template.clone()),
         special.bos.clone(),
         special.eos.clone(),
         None,
@@ -889,10 +900,9 @@ fn failed(message: String) -> ChatError {
 }
 
 /// The chat template in `file`: the whole of a `.jinja` file, or the `chat_template` of a
-/// `tokenizer_config.json`, which holds either one template or a list of named ones, of which
-/// the one named `default` is the model's. A `tokenizer_config.json` without a
-/// `chat_template` holds none.
-async fn template_in_file(file: &Path) -> Result<Option<String>> {
+/// `tokenizer_config.json`, which holds either one template or a list of named ones. A
+/// `tokenizer_config.json` without a `chat_template` holds none.
+async fn template_in_file(file: &Path) -> Result<Option<Template>> {
     let unreadable = |reason: String| {
         failed(format!(
             "could not read the chat template in '{}': {reason}",
@@ -906,26 +916,79 @@ async fn template_in_file(file: &Path) -> Result<Option<String>> {
         .extension()
         .is_some_and(|extension| extension == "jinja")
     {
-        return Ok(Some(text));
+        return Ok(Some(Either::Left(text)));
     }
     let config: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| unreadable(e.to_string()))?;
     match config.get("chat_template") {
         None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(template)) => Ok(Some(template.clone())),
-        Some(serde_json::Value::Array(templates)) => templates
-            .iter()
-            .find(|named| named.get("name").and_then(serde_json::Value::as_str) == Some("default"))
-            .and_then(|named| named.get("template"))
-            .and_then(serde_json::Value::as_str)
-            .map(|template| Some(template.to_string()))
-            .ok_or_else(|| {
-                unreadable("its `chat_template` list has no template named `default`".to_string())
-            }),
+        Some(serde_json::Value::String(template)) => Ok(Some(Either::Left(template.clone()))),
+        Some(named @ serde_json::Value::Array(_)) => {
+            let named: Vec<HashMap<String, String>> = serde_json::from_value(named.clone())
+                .map_err(|_| {
+                    unreadable(
+                        "its `chat_template` list holds an entry that is not names and templates"
+                            .to_string(),
+                    )
+                })?;
+            let template = Either::Right(named);
+            chosen_template(&template, false).map_err(unreadable)?;
+            Ok(Some(template))
+        }
         Some(_) => Err(unreadable(
             "its `chat_template` is neither a template nor a list of named templates".to_string(),
         )),
     }
+}
+
+/// Every template `template` holds.
+fn templates(template: &Template) -> impl Iterator<Item = &str> {
+    let (one, named) = match template {
+        Either::Left(one) => (Some(one.as_str()), None),
+        Either::Right(named) => (None, Some(named)),
+    };
+    one.into_iter()
+        .chain(named.into_iter().flatten().flat_map(|entry| {
+            ["template", "tool_use", "default"]
+                .into_iter()
+                .filter_map(|key| entry.get(key).map(String::as_str))
+        }))
+}
+
+/// The template a request renders with, chosen as the mistral.rs engine chooses: of named
+/// templates, `tool_use` for a request with tools and `default` for one without. A request
+/// with tools fails where no template is named `tool_use`.
+fn chosen_template(template: &Template, with_tools: bool) -> std::result::Result<&str, String> {
+    let named = match template {
+        Either::Left(one) => return Ok(one),
+        Either::Right(named) => named,
+    };
+    let has_tool_use = named.iter().any(|entry| {
+        entry.get("name").is_some_and(|name| name == "tool_use") || entry.contains_key("tool_use")
+    });
+    if with_tools && !has_tool_use {
+        return Err(
+            "Tools were provided but this chat template does not handle tool usage".to_string(),
+        );
+    }
+    let mut found = None;
+    for entry in named {
+        if let Some(name) = entry.get("name") {
+            found = entry.get("template");
+            if (name == "tool_use" && with_tools) || (name == "default" && !with_tools) {
+                break;
+            }
+        } else if with_tools && entry.contains_key("tool_use") {
+            found = entry.get("tool_use");
+            break;
+        } else if !with_tools && entry.contains_key("default") {
+            found = entry.get("default");
+            break;
+        }
+    }
+    found.map(String::as_str).ok_or_else(|| {
+        "its `chat_template` list holds no template named `default` or `tool_use`".to_string()
+    })
 }
 
 /// Why `path` did not load. An architecture this release's llama.cpp does not know gets its
@@ -950,8 +1013,12 @@ fn load_error(path: &Path, error: llama_cpp::Error) -> ChatError {
 /// A Harmony reply (gpt-oss) is read token by token rather than as text, which this engine
 /// does not do, so a model whose chat template writes one is refused rather than served with
 /// its channel markup in the content.
-fn check_reply_format(template: &str, architecture: Option<String>, file: String) -> Result<()> {
-    if is_harmony_template(template) {
+fn check_reply_format(
+    template: &Template,
+    architecture: Option<String>,
+    file: String,
+) -> Result<()> {
+    if templates(template).any(is_harmony_template) {
         return Err(ChatError::UnsupportedArchitecture {
             architecture: architecture.unwrap_or_else(|| "gpt-oss".to_string()),
             file,
@@ -2414,7 +2481,7 @@ mod tests {
     #[test]
     fn a_harmony_model_is_refused_as_an_unsupported_architecture() {
         let refused = check_reply_format(
-            HARMONY,
+            &Either::Left(HARMONY.to_string()),
             Some("gpt-oss".to_string()),
             "gpt-oss-20b-mxfp4.gguf".to_string(),
         )
@@ -2424,8 +2491,57 @@ mod tests {
             "Architecture 'gpt-oss' in gpt-oss-20b-mxfp4.gguf is not supported by this Spice release. Upgrade Spice, or use a GGUF of a supported architecture: https://spiceai.org/docs/components/models#gguf-architectures"
         );
         assert!(reasoning_parser(HARMONY, "").is_none());
-        check_reply_format(THINKS, None, "qwen.gguf".to_string()).expect("a think-tag template");
-        check_reply_format(GEMMA4, None, "gemma.gguf".to_string()).expect("a Gemma 4 template");
+        check_reply_format(
+            &Either::Left(THINKS.to_string()),
+            None,
+            "qwen.gguf".to_string(),
+        )
+        .expect("a think-tag template");
+        check_reply_format(
+            &Either::Left(GEMMA4.to_string()),
+            None,
+            "gemma.gguf".to_string(),
+        )
+        .expect("a Gemma 4 template");
+    }
+
+    /// Named templates are chosen as the mistral.rs engine chooses them, and a Harmony template
+    /// among them is refused as a lone one is.
+    #[test]
+    fn named_templates_are_chosen_as_mistral_rs_chooses() {
+        let entry = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect()
+        };
+        let named = Either::Right(vec![
+            entry(&[("name", "default"), ("template", "D")]),
+            entry(&[("name", "tool_use"), ("template", "T")]),
+        ]);
+        assert_eq!(chosen_template(&named, false), Ok("D"));
+        assert_eq!(chosen_template(&named, true), Ok("T"));
+        let keyed = Either::Right(vec![
+            entry(&[("default", "D")]),
+            entry(&[("tool_use", "T")]),
+        ]);
+        assert_eq!(chosen_template(&keyed, false), Ok("D"));
+        assert_eq!(chosen_template(&keyed, true), Ok("T"));
+        let default_only = Either::Right(vec![entry(&[("name", "default"), ("template", "D")])]);
+        assert_eq!(
+            chosen_template(&default_only, true),
+            Err(
+                "Tools were provided but this chat template does not handle tool usage".to_string()
+            )
+        );
+        let harmony = Either::Right(vec![
+            entry(&[("name", "default"), ("template", THINKS)]),
+            entry(&[("name", "tool_use"), ("template", HARMONY)]),
+        ]);
+        assert!(matches!(
+            check_reply_format(&harmony, None, "gpt-oss.gguf".to_string()),
+            Err(ChatError::UnsupportedArchitecture { .. })
+        ));
     }
 
     #[test]

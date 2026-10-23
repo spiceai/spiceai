@@ -762,3 +762,68 @@ async fn the_chat_template_in_tokenizer_config_wins_over_the_gguf_own() {
         .expect("the GGUF loads");
     assert_eq!(ask(model, json!([question])).await, with_system);
 }
+
+/// A `tokenizer_config.json` may name its templates, as the mistral.rs engine reads them: a
+/// request with tools renders with `tool_use`, and one without with `default`. Here `tool_use`
+/// is the GGUF's own template and `default` the same with the tools left out, as a template
+/// that does not handle tools is. Each request is answered as the GGUF answers it.
+#[tokio::test]
+async fn named_templates_in_tokenizer_config_are_chosen_per_request() {
+    let ask = |model: Arc<dyn Chat>, tools: Option<Value>| async move {
+        let mut body = json!({
+            "model": "qwen3",
+            "messages": [{ "role": "user", "content": "What is the weather in Paris right now?" }],
+            "temperature": 0,
+            "reasoning_effort": "none",
+            "max_tokens": 64,
+        });
+        if let (Some(tools), Some(body)) = (tools, body.as_object_mut()) {
+            body.insert("tools".to_string(), tools);
+        }
+        let message = model
+            .chat_request(request(body))
+            .await
+            .expect("a reply")
+            .choices[0]
+            .message
+            .clone();
+        let calls: Vec<(String, String)> = message
+            .tool_calls
+            .iter()
+            .flatten()
+            .filter_map(|call| match call {
+                ChatCompletionMessageToolCalls::Function(call) => {
+                    Some((call.function.name.clone(), call.function.arguments.clone()))
+                }
+                ChatCompletionMessageToolCalls::Custom(_) => None,
+            })
+            .collect();
+        (message.content, calls)
+    };
+    let own = qwen3().await;
+    let without_tools = ask(Arc::clone(&own), None).await;
+    let with_tools = ask(own, Some(weather_tools())).await;
+    assert_eq!(
+        with_tools.1,
+        [("get_weather".to_string(), r#"{"city":"Paris"}"#.to_string())],
+        "{with_tools:?}"
+    );
+    assert!(without_tools.1.is_empty(), "{without_tools:?}");
+
+    let gguf = qwen3_gguf().await;
+    let template = fixture::string_value(&gguf, "tokenizer.chat_template");
+    let scratch = tempfile::tempdir().expect("a scratch directory");
+    let config = scratch.path().join("tokenizer_config.json");
+    let named = json!({
+        "chat_template": [
+            { "name": "default", "template": format!("{{%- set tools = none %}}{template}") },
+            { "name": "tool_use", "template": template },
+        ],
+    });
+    std::fs::write(&config, named.to_string()).expect("tokenizer_config.json writes");
+    let model = load_file(&gguf, Some(&config))
+        .await
+        .expect("the GGUF loads");
+    assert_eq!(ask(Arc::clone(&model), None).await, without_tools);
+    assert_eq!(ask(model, Some(weather_tools())).await, with_tools);
+}
