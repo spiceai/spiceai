@@ -910,14 +910,15 @@ impl RefreshTask {
         // previously-materialized rows (issue #11353). When an override is present, bypass the
         // skip check and reset the provider's cached version so the *next* plain refresh
         // re-materializes the full source instead of skipping against the narrowed data. A reload
-        // reads the source whether or not it changed, so it skips the check.
+        // reads the source whether or not it changed, so it skips the check and resets the cached
+        // version too: the rows it writes no longer match it.
         // The source whose skip check found it changed. The version it saw is recorded as
         // loaded only once this refresh writes its rows.
         let mut checked_source = None;
         if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
             let table_provider = self.federated.table_provider().await;
 
-            if refresh.override_sql_raw.is_some() {
+            if refresh.override_sql_raw.is_some() || refresh.reload {
                 data_components::refresh_skip::reset_refresh_skip_state_for_table_provider(
                     table_provider.as_ref(),
                 )

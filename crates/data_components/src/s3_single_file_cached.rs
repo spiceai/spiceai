@@ -217,6 +217,9 @@ impl S3SingleFileCached {
             return Ok(true);
         }
 
+        // The refresh that reads the changed file can replace the accelerated rows and still
+        // fail, so no version counts as loaded until it succeeds.
+        *self.cached_metadata.write().await = None;
         *self.pending_metadata.write().await = Some(current_metadata);
 
         Ok(false)
@@ -651,6 +654,31 @@ mod tests {
                 .await
                 .expect("after a successful refresh"),
             "a file loaded by a successful refresh is skipped"
+        );
+    }
+
+    /// A refresh of a changed file can replace the accelerated rows and then fail, so
+    /// the version loaded before it no longer counts as loaded if the file returns to it.
+    #[tokio::test]
+    async fn a_failed_refresh_of_a_changed_file_forgets_the_version_loaded_before() {
+        let old_meta = make_meta("file", 128, 10, Some("etag"), Some("v1"));
+        let new_meta = make_meta("file", 256, 20, Some("etag2"), Some("v2"));
+        let store = Arc::new(HeadOnlyObjectStore::new(vec![new_meta, old_meta.clone()]))
+            as Arc<dyn ObjectStore>;
+        let cached_table = build_cached_table(store, Some(old_meta));
+
+        assert!(
+            !cached_table
+                .should_skip_refresh()
+                .await
+                .expect("changed file")
+        );
+        assert!(
+            !cached_table
+                .should_skip_refresh()
+                .await
+                .expect("file restored to the version loaded before"),
+            "a version loaded before a failed refresh of a changed file is read again"
         );
     }
 
