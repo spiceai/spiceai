@@ -10,8 +10,8 @@ on:
         type: string
       # Benchmarks another release's spiced with this ref's testoperator and spec files. The
       # newest commit within ten of the ref that has a MinIO build is used, so a release tag
-      # resolves to the build of its release-branch commit. Explain-plan snapshots are not
-      # compared, since plans differ between releases, and no snapshot is written back.
+      # resolves to the build of its release-branch commit. No result or explain-plan snapshot
+      # is compared or written back, since those record this ref's answers and plans.
       spiced_ref:
         description: 'Branch or tag whose spiced to benchmark, e.g. v2.3.3 or release/2.4; empty = trunk. Ignored when spiced_commit is set'
         required: false
@@ -185,10 +185,6 @@ jobs:
         run: |
           update_mode="${{ github.event.inputs.update_snapshots }}"
           if [ -n "${SPICED_REF}" ]; then
-            if [ "${update_mode}" = "always" ]; then
-              echo "::error::update_snapshots=always would record ${SPICED_REF}'s results as this branch's snapshots."
-              exit 1
-            fi
             update_mode="no"
           elif [ "${update_mode}" = "default" ] || [ -z "${update_mode}" ]; then
             branch_name="${{ github.ref_name }}"
@@ -614,7 +610,7 @@ jobs:
             --disable-caching=${{ github.event.inputs.disable_caching }} \
             --validate=${{ github.event.inputs.validate_results }} \
             ${LAYOUT:+--layout "$LAYOUT"} \
-            --explain-plan-snapshot=${{ github.event.inputs.spiced_ref == '' }} \
+            --snapshots=${{ github.event.inputs.spiced_ref == '' }} \
             --metrics \
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
