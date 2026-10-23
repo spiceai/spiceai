@@ -501,25 +501,23 @@ fn parse_user_query(parser: &QueryParser, literal: &str) -> Result<Box<dyn Query
 ///
 /// `QueryParser::parse_query` (tantivy-query-grammar 0.26) panics on such a `*` with "Exist query
 /// without a field isn't allowed" instead of returning an error
-/// (<https://github.com/quickwit-oss/tantivy/issues/3031>). That is:
-/// - a `*` that starts a term (at the start, or after whitespace, `(`, `+` or `-`) and is followed
-///   by a character that ends a word but does not end a match-all `*`: `a *(b)`, `*"x"`,
-///   `*\u{a0}` (see [`ends_fieldless_star`]);
-/// - a `+` or `-` followed by whitespace and then `*`: `- *`, `a + *`.
+/// (<https://github.com/quickwit-oss/tantivy/issues/3031>). The grammar reaches that panic only
+/// through its exists rule, which reads a `*` followed by whitespace or a character that must be
+/// escaped in a word. So this matches:
+/// - a `*` followed by a character the exists rule accepts but a match-all `*` does not:
+///   `a *(b)`, `*"x"`, `*\u{a0}` (see [`ends_fieldless_star`]);
+/// - a `+` or `-` followed by whitespace and then `*` (`- *`, `a + *`), where the grammar skips the
+///   whitespace into the exists rule and the match-all `*` never applies.
 ///
-/// The check ignores quotes, ranges and regexes on purpose: the grammar ends a phrase, range or
-/// regex in ways a scanner tracking them can misjudge (`/'/ *(` and `text:[a' TO z] *(` both
-/// panic), and a misjudged context would hide the `*`. It is conservative instead: a few queries
-/// the grammar does parse also match (`+ *x`, `text:[a TO *]`), and those take the bag-of-words
-/// fallback.
+/// It looks only at the characters around each `*`, never at whether that `*` starts a term or
+/// sits in a phrase, range or regex: the grammar decides those in ways a scanner can misjudge
+/// (`a ""**(`, `/'/ *(` and `text:[a' TO z] *(` all panic), and a misjudged context would hide
+/// the `*`. The cost is that some queries the grammar parses also match (`"foo*" AND bar`,
+/// `text:[a TO *]`) and take the bag-of-words fallback.
 fn has_fieldless_exists(q: &str) -> bool {
     let chars: Vec<char> = q.chars().collect();
     chars.iter().enumerate().any(|(i, &c)| match c {
-        '*' => {
-            let starts_term =
-                i == 0 || matches!(chars[i - 1], '(' | '+' | '-') || chars[i - 1].is_whitespace();
-            starts_term && chars.get(i + 1).copied().is_some_and(ends_fieldless_star)
-        }
+        '*' => chars.get(i + 1).copied().is_some_and(ends_fieldless_star),
         '+' | '-' => {
             let rest = &chars[i + 1..];
             let spaces = rest.iter().take_while(|n| n.is_whitespace()).count();
@@ -529,10 +527,10 @@ fn has_fieldless_exists(q: &str) -> bool {
     })
 }
 
-/// Whether `c`, right after a term-starting `*`, makes Tantivy's grammar read the `*` as a
-/// fieldless exists query. The exists rule accepts any `char::is_whitespace` or a character that
-/// must be escaped in a word; the match-all rule, tried first, takes only ASCII space, tab, CR, LF
-/// and `)`. Whatever only the exists rule accepts reaches the panic.
+/// Whether `c`, right after a `*`, can make Tantivy's grammar read the `*` as a fieldless exists
+/// query. The exists rule accepts any `char::is_whitespace` or a character that must be escaped in
+/// a word; the match-all rule, tried first, takes only ASCII space, tab, CR, LF and `)`. Whatever
+/// only the exists rule accepts reaches the panic.
 fn ends_fieldless_star(c: char) -> bool {
     (c.is_whitespace() && !matches!(c, ' ' | '\t' | '\r' | '\n'))
         || matches!(
@@ -734,6 +732,7 @@ pub(crate) mod tests {
             "/'/ *(".to_string(),
             "text:[a' TO z] *(".to_string(),
             "\"it's\" *(".to_string(),
+            "a \"\"**(".to_string(),
             "(+ *)".to_string(),
             "-  * b".to_string(),
         ];
@@ -797,8 +796,7 @@ pub(crate) mod tests {
             "a *+",
             "text:sea^20 whale^70",
             "\"exact phrase\" AND -other",
-            "\"foo*\" AND bar",
-            "'it*' AND bar",
+            "foo* AND -bar*",
             "text:[alpha TO beta]",
             "a -*",
         ] {
