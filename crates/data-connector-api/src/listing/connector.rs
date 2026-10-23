@@ -73,6 +73,7 @@ use data_components::object::{
 };
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ExposedParamLookup, Parameters};
+use util::levenshtein::closest_match;
 
 use super::{
     DelimitedFormat, ParsedFileExtension, detect_file_extension_from_path,
@@ -1197,7 +1198,15 @@ pub trait ListingTableConnector: DataConnector {
                     )),
                 }
             },
-            (Some(format), _) => Ok((None, format!(".{format}"))),
+            (Some(format), _) if is_document_file_format(format) => {
+                Ok((None, format!(".{format}")))
+            }
+            (Some(format), _) => Err(crate::DataConnectorError::InvalidConfiguration {
+                dataconnector: format!("{self}"),
+                message: unknown_file_format_message(dataset, params, format),
+                connector_component: ConnectorComponent::from(dataset),
+                source: "Unknown file format".into(),
+            }),
             (_, _) => Err(
                     crate::DataConnectorError::InvalidConfiguration {
                         dataconnector: format!("{self}"),
@@ -1240,12 +1249,16 @@ pub trait ListingTableConnector: DataConnector {
         if let ExposedParamLookup::Present(infer_max_rec_str) =
             params.get("schema_infer_max_records").expose()
         {
-            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(crate::InvalidConfigurationSnafu {
+            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(
+                crate::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
-                        "JSONL parameter 'schema_infer_max_records' must be an integer, not {infer_max_rec_str}"),
-                    connector_component: ConnectorComponent::from(dataset)
-                })?;
+                        "JSONL parameter 'schema_infer_max_records' must be an integer, not {}",
+                        params.display_value("schema_infer_max_records", infer_max_rec_str)
+                    ),
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            )?;
             format = format.with_schema_infer_max_rec(schema_infer_max_rec);
         }
 
@@ -1277,12 +1290,16 @@ pub trait ListingTableConnector: DataConnector {
         if let ExposedParamLookup::Present(infer_max_rec_str) =
             params.get("schema_infer_max_records").expose()
         {
-            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(crate::InvalidConfigurationSnafu {
+            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(
+                crate::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
-                        "JSON parameter 'schema_infer_max_records' must be an integer, not {infer_max_rec_str}"),
-                    connector_component: ConnectorComponent::from(dataset)
-                })?;
+                        "JSON parameter 'schema_infer_max_records' must be an integer, not {}",
+                        params.display_value("schema_infer_max_records", infer_max_rec_str)
+                    ),
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            )?;
             format = format.with_schema_infer_max_rec(schema_infer_max_rec);
         }
 
@@ -1290,7 +1307,9 @@ pub trait ListingTableConnector: DataConnector {
             let json_format = json_format_str.parse::<Format>().boxed().context(crate::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
-                        "Invalid JSON format: {json_format_str}, supported formats are: 'json', 'jsonl', 'ndjson', 'ldjson', 'array', 'object', 'soda', 'socrata', 'auto'"),
+                        "Invalid JSON format: {}, supported formats are: 'json', 'jsonl', 'ndjson', 'ldjson', 'array', 'object', 'soda', 'socrata', 'auto'",
+                        params.display_value("json_format", json_format_str)
+                    ),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
             format = format.with_format(json_format);
@@ -2071,7 +2090,8 @@ fn resolve_file_compression_type(
             crate::InvalidConfigurationSnafu {
                 dataconnector: dataconnector.to_string(),
                 message: format!(
-                    "Invalid file_compression_type: {compression}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"
+                    "Invalid file_compression_type: {}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+                    params.display_value("file_compression_type", compression)
                 ),
                 connector_component: ConnectorComponent::from(dataset),
             },
@@ -2109,6 +2129,81 @@ fn default_jsonl_extension(
         Some("ldjson") => ".ldjson",
         _ => ".jsonl",
     }
+}
+
+const DOCUMENT_FILE_FORMATS: &[&str] = &[
+    "docx", "htm", "html", "markdown", "md", "pdf", "pptx", "rst", "text", "txt", "xlsx",
+];
+
+fn is_document_file_format(format: &str) -> bool {
+    DOCUMENT_FILE_FORMATS.contains(&format)
+}
+
+fn structured_file_formats() -> Vec<&'static str> {
+    let mut formats = vec![
+        "auto", "csv", "json", "jsonl", "ldjson", "ndjson", "orc", "parquet", "soda", "socrata",
+        "tsv",
+    ];
+    #[cfg(not(windows))]
+    formats.push("vortex");
+    formats
+}
+
+fn valid_listing_file_formats() -> Vec<&'static str> {
+    let mut formats = structured_file_formats();
+    formats.extend_from_slice(DOCUMENT_FILE_FORMATS);
+    formats.sort_unstable();
+    formats
+}
+
+/// Closest valid format for a typo.
+///
+/// [`closest_match`] allows one edit per three characters (minimum 1), so
+/// a three-letter adjacent transposition such as `cvs` → `csv` is rejected.
+/// Those are the typos this error exists to catch, so an adjacent swap that
+/// lands on a valid format is accepted as a fallback.
+fn closest_file_format(format: &str, valid: &[&str]) -> Option<String> {
+    if let Some(hint) = closest_match(format, valid) {
+        return Some(hint);
+    }
+    adjacent_transposition_match(format, valid)
+}
+
+fn adjacent_transposition_match(typo: &str, valid: &[&str]) -> Option<String> {
+    let mut chars: Vec<char> = typo.chars().collect();
+    for i in 0..chars.len().saturating_sub(1) {
+        chars.swap(i, i + 1);
+        let candidate: String = chars.iter().collect();
+        chars.swap(i, i + 1);
+        if let Some(hit) = valid
+            .iter()
+            .find(|option| option.eq_ignore_ascii_case(&candidate))
+        {
+            return Some((*hit).to_string());
+        }
+    }
+    None
+}
+
+fn unknown_file_format_message(dataset: &DatasetSpec, params: &Parameters, format: &str) -> String {
+    let valid = valid_listing_file_formats();
+    let valid_list = valid.join(", ");
+    let dataset_name = dataset.name.to_string();
+    let (format_clause, suggest) = match params.secret_source("file_format") {
+        Some(source) => (format!(" from {source}"), false),
+        None if params.origins_tracked() => (format!(" '{format}'"), true),
+        None => (String::new(), false),
+    };
+    let suggestion = if suggest {
+        closest_file_format(format, &valid)
+            .map(|hint| format!(" Did you mean `{hint}`?"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    format!(
+        "Unknown `file_format`{format_clause} for dataset '{dataset_name}'. Valid formats: {valid_list}.{suggestion} Update `file_format` and retry. See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+    )
 }
 
 // 1024³
@@ -2749,7 +2844,8 @@ mod tests {
                 to_secret_map(params).into_iter().collect(),
                 "test",
                 TEST_PARAMETERS,
-            ),
+            )
+            .with_tracked_origins(),
         };
 
         (
@@ -2769,6 +2865,171 @@ mod tests {
                 "Cannot setup the dataset test (TestConnector) with an invalid configuration. The required 'file_format' parameter is missing. Ensure the parameter is provided, and try again."
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_cvs_is_rejected_with_suggestion() {
+        let (connector, dataset) = setup_connector(
+            "test:test/".to_string(),
+            HashMap::from([("file_format".to_string(), "cvs".to_string())]),
+        );
+
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("unknown file_format must fail dataset setup");
+        let message = err.to_string();
+        assert!(
+            message.contains("Unknown `file_format` 'cvs'"),
+            "error must name the invalid format: {message}"
+        );
+        assert!(
+            message.contains("Did you mean `csv`?"),
+            "error must suggest the closest valid format: {message}"
+        );
+        assert!(
+            message.contains("Valid formats:"),
+            "error must list valid formats: {message}"
+        );
+        assert!(
+            message.contains(
+                "https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+            ),
+            "error must link to the file-format docs: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_parqet_is_rejected_with_suggestion() {
+        let (connector, dataset) = setup_connector(
+            "test:test/".to_string(),
+            HashMap::from([("file_format".to_string(), "parqet".to_string())]),
+        );
+
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("unknown file_format must fail dataset setup");
+        let message = err.to_string();
+        assert!(
+            message.contains("Unknown `file_format` 'parqet'"),
+            "error must name the invalid format: {message}"
+        );
+        assert!(
+            message.contains("Did you mean `parquet`?"),
+            "error must suggest parquet: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_document_file_format_md_still_uses_text_table() {
+        let (connector, dataset) = setup_connector(
+            "test:test/".to_string(),
+            HashMap::from([("file_format".to_string(), "md".to_string())]),
+        );
+
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("md is a valid document format");
+        assert!(
+            file_format.is_none(),
+            "document formats must keep the text-table path"
+        );
+        assert_eq!(extension, ".md");
+    }
+
+    #[tokio::test]
+    async fn test_document_file_format_pdf_still_uses_text_table() {
+        let (connector, dataset) = setup_connector(
+            "test:test/".to_string(),
+            HashMap::from([("file_format".to_string(), "pdf".to_string())]),
+        );
+
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("pdf is a valid document format");
+        assert!(file_format.is_none());
+        assert_eq!(extension, ".pdf");
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_from_secret_does_not_echo_value() {
+        const CANARY: &str = "CANARYPGPW7731";
+        const REFERENCE: &str = "${ env:FILE_FMT }";
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([(
+                    "file_format".to_string(),
+                    CANARY.to_string(),
+                )]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_format".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new("test:test/".to_string(), TableReference::bare("test"));
+
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("unknown secret-derived file_format must fail");
+        let message = err.to_string();
+        assert!(
+            !message.contains(CANARY),
+            "unknown file_format errors must not echo a resolved secret: {message}"
+        );
+        assert!(
+            message.contains(REFERENCE),
+            "unknown file_format errors must name the secret reference: {message}"
+        );
+        assert!(
+            !message.contains("Did you mean"),
+            "do not suggest a correction from a secret-derived value: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_file_compression_type_from_secret_does_not_echo_value() {
+        const CANARY: &str = "CANARYPGPW7731";
+        const REFERENCE: &str = "${ env:PG_PW }";
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([
+                    ("file_format".to_string(), "csv".to_string()),
+                    ("file_compression_type".to_string(), CANARY.to_string()),
+                ]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_compression_type".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new("test:test/".to_string(), TableReference::bare("test"));
+
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("secret-derived compression must fail");
+        let message = err.to_string();
+        assert!(
+            !message.contains(CANARY),
+            "file_compression_type errors must not echo a resolved secret: {message}"
+        );
+        assert!(
+            message.contains(REFERENCE),
+            "file_compression_type errors must name the secret reference: {message}"
+        );
     }
 
     #[tokio::test]

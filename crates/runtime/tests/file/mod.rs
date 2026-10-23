@@ -837,3 +837,162 @@ async fn file_connector_projection_pushdown() -> Result<(), anyhow::Error> {
         })
         .await
 }
+
+fn write_orders_csv(path: &std::path::Path) -> Result<(), anyhow::Error> {
+    std::fs::write(path, "id,name\n1,alpha\n2,bravo\n")?;
+    Ok(())
+}
+
+/// Unknown `file_format: cvs` must fail dataset setup with a did-you-mean
+/// error instead of silently becoming a 1-row document table.
+#[tokio::test]
+async fn file_connector_unknown_file_format_is_a_configuration_error() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::TempDir::new()?;
+            let csv = dir.path().join("orders.csv");
+            write_orders_csv(&csv)?;
+
+            let mut dataset = Dataset::new(format!("file:{}", csv.display()), "typo_cvs");
+            dataset.params = Some(Params {
+                data: HashMap::from([(
+                    "file_format".to_string(),
+                    ParamValue::String("cvs".to_string()),
+                )]),
+            });
+
+            let app = AppBuilder::new("file_format_typo")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let status = rt
+                .status()
+                .get_dataset_status(&datafusion::common::TableReference::bare("typo_cvs"))
+                .expect("dataset status");
+            assert!(
+                status.is_error(),
+                "unknown file_format must not go Ready, got {status:?}"
+            );
+            let message = status
+                .error_message()
+                .expect("configuration error must be recorded");
+            assert!(
+                message.contains("Unknown `file_format` 'cvs'"),
+                "status error_message must name the invalid format: {message}"
+            );
+            assert!(
+                message.contains("Did you mean `csv`?"),
+                "status error_message must suggest csv: {message}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// A secret-derived bool param must not echo the resolved canary in the
+/// dataset status `error_message`.
+#[tokio::test]
+async fn file_connector_secret_param_validation_does_not_echo_canary() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            const CANARY: &str = "CANARYPGPW7731";
+            const KEY: &str = "SEC1_CANARY_PG_PW";
+            const REFERENCE: &str = "${ env:SEC1_CANARY_PG_PW }";
+
+            // SAFETY: unique test key; nextest runs this test in its own process.
+            unsafe {
+                std::env::set_var(KEY, CANARY);
+            }
+
+            let dir = tempfile::TempDir::new()?;
+            let csv = dir.path().join("orders.csv");
+            write_orders_csv(&csv)?;
+
+            let mut dataset = Dataset::new(format!("file:{}", csv.display()), "leak");
+            dataset.params = Some(Params {
+                data: HashMap::from([
+                    (
+                        "file_format".to_string(),
+                        ParamValue::String("csv".to_string()),
+                    ),
+                    (
+                        "csv_has_header".to_string(),
+                        ParamValue::String(REFERENCE.to_string()),
+                    ),
+                ]),
+            });
+
+            let app = AppBuilder::new("secret_echo")
+                .with_secret(spicepod::component::secret::Secret {
+                    from: "env".to_string(),
+                    name: "env".to_string(),
+                    description: None,
+                    params: None,
+                })
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    unsafe {
+                        std::env::remove_var(KEY);
+                    }
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            unsafe {
+                std::env::remove_var(KEY);
+            }
+
+            let status = rt
+                .status()
+                .get_dataset_status(&datafusion::common::TableReference::bare("leak"))
+                .expect("dataset status");
+            assert!(
+                status.is_error(),
+                "an invalid secret-derived bool must fail dataset setup, got {status:?}"
+            );
+            let message = status
+                .error_message()
+                .expect("validation error must be recorded on the dataset");
+            assert!(
+                !message.contains(CANARY),
+                "dataset status error_message must not contain the canary: {message}"
+            );
+            assert!(
+                message.contains("csv_has_header"),
+                "error_message must name the parameter: {message}"
+            );
+            assert!(
+                message.contains(REFERENCE),
+                "error_message must name the secret reference: {message}"
+            );
+
+            Ok(())
+        })
+        .await
+}
