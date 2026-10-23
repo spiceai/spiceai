@@ -26,9 +26,9 @@ limitations under the License.
 //!
 //! [`FileSchemaDriftGuard`] checks each scan's files for the projected registered columns.
 //! Only formats whose per-file column list can be proven complete are checked
-//! (see [`FileSchemaDriftGuard::supports_format`]): a CSV/TSV header, or a
-//! JSON/NDJSON object-key scan that reads every record. A column that no
-//! scanned file carries is reported:
+//! (see [`FileSchemaDriftGuard::supports_format`]): Parquet and ORC footers, a
+//! CSV/TSV header, or a JSON/NDJSON object-key scan that reads every record.
+//! A column that no scanned file carries is reported:
 //!
 //! - in a scan that feeds an acceleration refresh (the refresh session carries
 //!   [`AccelerationRefreshScan`]) that reads every file, the scan fails when the
@@ -138,14 +138,14 @@ pub struct FileSchemaDriftGuard {
 
 impl FileSchemaDriftGuard {
     /// Whether scans of `format` can be checked: the file's full column list can
-    /// be proven (a CSV/TSV header via [`HeaderProjectedCsvFormat`], or every
-    /// JSON/NDJSON record's object keys). A column missing from that list is
-    /// absent from every record. Parquet and ORC footers are the same kind of
-    /// declaration; they are left to the pending file-schema-drift change that
-    /// lands that path.
+    /// be proven (Parquet and ORC footers, a CSV/TSV header via
+    /// [`HeaderProjectedCsvFormat`], or every JSON/NDJSON record's object keys).
+    /// A column missing from that list is absent from every record. Plain
+    /// headerless CSV is positional and is not checked.
     #[must_use]
     pub fn supports_format(format: &dyn FileFormat) -> bool {
-        format.downcast_ref::<HeaderProjectedCsvFormat>().is_some()
+        matches!(format.get_ext().as_str(), "parquet" | "orc")
+            || format.downcast_ref::<HeaderProjectedCsvFormat>().is_some()
             || format.downcast_ref::<JsonFormat>().is_some()
             || format.downcast_ref::<SpiceJsonFormat>().is_some()
     }
@@ -798,6 +798,25 @@ mod tests {
         layer: Arc<FileSchemaDriftLayer>,
     }
 
+    fn write_parquet(path: &Path, columns: &[&str], values: &[i64]) {
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|c| Field::new(*c, DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        ));
+        let arrays = columns
+            .iter()
+            .map(|_| Arc::new(Int64Array::from(values.to_vec())) as arrow::array::ArrayRef)
+            .collect();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).expect("batch");
+        let file = std::fs::File::create(path).expect("create parquet file");
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close parquet writer");
+    }
+
     fn guarded_table(dir: &Path, columns: &[&str]) -> Guarded {
         let schema = registered_schema(columns);
         let format: Arc<dyn FileFormat> =
@@ -806,6 +825,25 @@ mod tests {
         let config = ListingTableConfig::new(url)
             .with_listing_options(
                 ListingOptions::new(Arc::clone(&format)).with_file_extension(".csv"),
+            )
+            .with_schema(Arc::clone(&schema));
+        let listing: Arc<dyn TableProvider> =
+            Arc::new(ListingTable::try_new(config).expect("listing table"));
+        let layer = Arc::new(FileSchemaDriftLayer::new(FileSchemaDriftGuard::new(
+            "base", schema, format,
+        )));
+        let table: Arc<dyn TableProvider> =
+            SpiceTable::over(Arc::clone(&layer) as Arc<dyn TableLayer>, listing);
+        Guarded { table, layer }
+    }
+
+    fn guarded_parquet_table(dir: &Path, columns: &[&str]) -> Guarded {
+        let schema = registered_schema(columns);
+        let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::default());
+        let url = ListingTableUrl::parse(format!("file://{}/", dir.display())).expect("url");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(
+                ListingOptions::new(Arc::clone(&format)).with_file_extension(".parquet"),
             )
             .with_schema(Arc::clone(&schema));
         let listing: Arc<dyn TableProvider> =
@@ -1219,6 +1257,9 @@ mod tests {
     #[test]
     fn declared_column_formats_are_checked() {
         assert!(FileSchemaDriftGuard::supports_format(
+            &ParquetFormat::default()
+        ));
+        assert!(FileSchemaDriftGuard::supports_format(
             HeaderProjectedCsvFormat::wrap(Arc::new(CsvFormat::default().with_has_header(true)))
                 .as_ref()
         ));
@@ -1228,9 +1269,6 @@ mod tests {
         ));
         assert!(!FileSchemaDriftGuard::supports_format(
             &CsvFormat::default().with_has_header(true)
-        ));
-        assert!(!FileSchemaDriftGuard::supports_format(
-            &ParquetFormat::default()
         ));
     }
 
@@ -1246,6 +1284,210 @@ mod tests {
         assert!(guard.scan_selects_all_files(&[col("id").gt(lit(1))], None));
         assert!(!guard.scan_selects_all_files(&[col("p").eq(lit(1))], None));
         assert!(!guard.scan_selects_all_files(&[], Some(10)));
+    }
+
+    #[tokio::test]
+    async fn parquet_refresh_scan_fails_when_a_registered_column_is_renamed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_parquet(
+            &dir.path().join("base.parquet"),
+            &["id", "amount_cents"],
+            &[1, 2],
+        );
+        let table = guarded_parquet_table(dir.path(), &["id", "amount_cents"]);
+
+        let before = query(&table, true, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("refresh scan before the rename");
+        assert_eq!(single_value(&before), Some(3));
+
+        write_parquet(&dir.path().join("base.parquet"), &["id", "amt"], &[1, 2, 3]);
+
+        let err = query(&table, true, "SELECT * FROM base")
+            .await
+            .expect_err("a refresh scan must not load NULLs for a renamed column");
+        let message = err.to_string();
+        assert!(message.contains("'amount_cents'"), "{message}");
+        assert!(message.contains("Dataset 'base'"), "{message}");
+        assert!(message.contains("base.parquet"), "{message}");
+        assert!(!message.contains("'id'"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn parquet_federated_scan_warns_and_returns_null_when_a_registered_column_is_renamed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_parquet(&dir.path().join("base.parquet"), &["id", "amt"], &[1, 2]);
+        let table = guarded_parquet_table(dir.path(), &["id", "amount_cents"]);
+
+        let batches = query(&table, false, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("a federated read still answers");
+        assert_eq!(single_value(&batches), None);
+        assert!(
+            table
+                .layer
+                .guard
+                .state
+                .lock()
+                .warned
+                .contains("amount_cents")
+        );
+
+        query(&table, false, "SELECT sum(id) FROM base")
+            .await
+            .expect("read of a present column");
+        assert!(
+            table
+                .layer
+                .guard
+                .state
+                .lock()
+                .warned
+                .contains("amount_cents")
+        );
+
+        write_parquet(
+            &dir.path().join("base.parquet"),
+            &["id", "amount_cents"],
+            &[1, 2],
+        );
+        let batches = query(&table, false, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("read after restore");
+        assert_eq!(single_value(&batches), Some(3));
+        assert!(table.layer.guard.state.lock().warned.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parquet_refresh_scan_allows_an_added_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_parquet(
+            &dir.path().join("base.parquet"),
+            &["id", "amount_cents", "note"],
+            &[1, 2],
+        );
+        let table = guarded_parquet_table(dir.path(), &["id", "amount_cents"]);
+
+        let batches = query(&table, true, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("an added column is ordinary schema evolution");
+        assert_eq!(single_value(&batches), Some(3));
+    }
+
+    #[tokio::test]
+    async fn parquet_refresh_scan_allows_older_files_without_a_newer_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_parquet(&dir.path().join("a_old.parquet"), &["id"], &[1]);
+        write_parquet(
+            &dir.path().join("b_new.parquet"),
+            &["id", "amount_cents"],
+            &[2],
+        );
+        let table = guarded_parquet_table(dir.path(), &["id", "amount_cents"]);
+
+        let batches = query(&table, true, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("a column some scanned file carries is not drift");
+        assert_eq!(single_value(&batches), Some(2));
+    }
+
+    #[tokio::test]
+    async fn refresh_scan_detects_drift_when_unrelated_columns_conflict_across_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_parquet(&dir.path().join("a.parquet"), &["id", "extra"], &[1]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+            ],
+        )
+        .expect("batch");
+        let file = std::fs::File::create(dir.path().join("b.parquet")).expect("create");
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let table = guarded_parquet_table(dir.path(), &["id", "amount_cents"]);
+
+        let err = query(&table, true, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect_err("drift must be found without merging unrelated column types");
+        assert!(err.to_string().contains("'amount_cents'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn refresh_scan_of_an_older_partition_only_warns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("p=1")).expect("p=1");
+        std::fs::create_dir_all(dir.path().join("p=2")).expect("p=2");
+        write_parquet(&dir.path().join("p=1/a.parquet"), &["id"], &[1]);
+        write_parquet(
+            &dir.path().join("p=2/b.parquet"),
+            &["id", "amount_cents"],
+            &[2],
+        );
+
+        let schema = registered_schema(&["id", "amount_cents"]);
+        let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::default());
+        let url = ListingTableUrl::parse(format!("file://{}/", dir.path().display())).expect("url");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(
+                ListingOptions::new(Arc::clone(&format))
+                    .with_file_extension(".parquet")
+                    .with_table_partition_cols(vec![("p".to_string(), DataType::Int64)]),
+            )
+            .with_schema(Arc::clone(&schema));
+        let listing: Arc<dyn TableProvider> =
+            Arc::new(ListingTable::try_new(config).expect("listing table"));
+        let layer = Arc::new(FileSchemaDriftLayer::new(FileSchemaDriftGuard::new(
+            "base", schema, format,
+        )));
+        let table = Guarded {
+            table: SpiceTable::over(Arc::clone(&layer) as Arc<dyn TableLayer>, listing),
+            layer,
+        };
+
+        let batches = query(
+            &table,
+            true,
+            "SELECT sum(amount_cents) FROM base WHERE p = 1",
+        )
+        .await
+        .expect("an older partition that predates the column is not drift");
+        assert_eq!(single_value(&batches), None);
+        assert!(
+            table
+                .layer
+                .guard
+                .state
+                .lock()
+                .warned
+                .contains("amount_cents")
+        );
+
+        let batches = query(&table, true, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("the full scan finds the column in the newer partition");
+        assert_eq!(single_value(&batches), Some(2));
+    }
+
+    #[tokio::test]
+    async fn parquet_refresh_scan_ignores_a_missing_column_it_does_not_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_parquet(&dir.path().join("base.parquet"), &["id", "amt"], &[1, 2]);
+        let table = guarded_parquet_table(dir.path(), &["id", "amount_cents"]);
+
+        let batches = query(&table, true, "SELECT sum(id) FROM base")
+            .await
+            .expect("the renamed column is not read");
+        assert_eq!(single_value(&batches), Some(3));
+        query(&table, true, "SELECT count(*) FROM base")
+            .await
+            .expect("count(*) reads no column");
     }
 
     const JSON_BASELINE: &[&str] = &[r#"{"id":1,"amount_cents":2}"#];
