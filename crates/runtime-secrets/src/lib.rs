@@ -911,11 +911,36 @@ pub async fn get_params_with_secrets(
     params_with_secrets
 }
 
+/// Injects secrets from spicepod `params` templates and deserializes them
+/// into `P`, carrying `${ store:key }` provenance into parse errors.
+///
+/// When any part of a value is secret-derived — including a fragment such
+/// as `1e${ env:SECRET }` — a parse failure returns
+/// [`runtime_parameters_typed::ParamsError::InvalidSecretValue`] instead of
+/// the parser's text, so a duration or enum parser cannot echo the secret.
+///
+/// # Errors
+///
+/// Returns [`runtime_parameters_typed::ParamsError`] when a required
+/// parameter is missing or a value cannot be parsed.
+#[expect(clippy::implicit_hasher)]
+pub async fn typed_params_from_templates<P: TypedParams>(
+    component_name: &str,
+    secrets: &Arc<RwLock<Secrets>>,
+    templates: &HashMap<String, String>,
+) -> runtime_parameters_typed::Result<P> {
+    let secret_sources = secret_sources_from_templates(templates);
+    let injected = get_params_with_secrets(Arc::clone(secrets), templates).await;
+    P::try_from_params_with_secret_sources(component_name, injected, secrets, &secret_sources).await
+}
+
 /// Secret-reference templates that appear in `params`, keyed by parameter name.
 ///
 /// The map value is the original `${ store:key }` text (or a comma-separated
-/// list when a parameter interpolates several references). Parameters whose
-/// values contain no secret syntax are omitted.
+/// list when a parameter interpolates several references). A parameter is
+/// recorded when **any** part of its value is secret-derived, including a
+/// fragment such as `1e${ env:SECRET }`. Parameters whose values contain no
+/// secret syntax are omitted.
 #[must_use]
 #[expect(clippy::implicit_hasher)]
 pub fn secret_sources_from_templates(params: &HashMap<String, String>) -> HashMap<String, String> {
@@ -2677,6 +2702,81 @@ param3: ${ secrets:MY_VAR }
             sources.get("mixed").map(String::as_str),
             Some("${env:USER}, ${ secrets:HOST }")
         );
+    }
+
+    #[test]
+    fn secret_sources_from_templates_records_partial_interpolation() {
+        let params = std::collections::HashMap::from([(
+            "client_timeout".to_string(),
+            "1e${ env:SECRET }".to_string(),
+        )]);
+        let sources = super::secret_sources_from_templates(&params);
+        assert_eq!(
+            sources.get("client_timeout").map(String::as_str),
+            Some("${ env:SECRET }"),
+            "a secret fragment still marks the whole parameter secret-derived"
+        );
+    }
+
+    fn parse_echoing_timeout(raw: &str) -> Result<u64, String> {
+        if let Some(tail) = raw.strip_prefix("1e")
+            && tail.chars().all(|c| c.is_ascii_digit())
+        {
+            return Err(format!("Exponent magnitude {tail} exceeds maximum (20)"));
+        }
+        raw.parse::<u64>().map_err(|e| e.to_string())
+    }
+
+    /// Test fixture for partial secret interpolation through
+    /// [`super::typed_params_from_templates`].
+    #[derive(Debug, runtime_parameters_derive::TypedParams)]
+    #[params(prefix = "test")]
+    struct PartialSecretTimeoutParams {
+        /// Total request timeout.
+        #[expect(dead_code)]
+        #[param(runtime, parse_with = parse_echoing_timeout)]
+        client_timeout: Option<u64>,
+    }
+
+    #[tokio::test]
+    async fn typed_params_from_templates_partial_interpolation_does_not_echo_secret() {
+        let _env_guard = lock_env().await;
+        let key = format!("SPICE_TEST_PARTIAL_SECRET_{}", rand::random::<u64>());
+        unsafe { std::env::set_var(&key, "1234") };
+
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[])
+            .await
+            .expect("default env store should load");
+
+        let templates = std::collections::HashMap::from([(
+            "client_timeout".to_string(),
+            format!("1e${{ env:{key} }}"),
+        )]);
+        let source = format!("${{ env:{key} }}");
+        let err = super::typed_params_from_templates::<PartialSecretTimeoutParams>(
+            "test component",
+            &std::sync::Arc::new(tokio::sync::RwLock::new(secrets)),
+            &templates,
+        )
+        .await
+        .expect_err("1e1234 is not a valid timeout");
+        let message = err.to_string();
+        assert!(
+            !message.contains("1234"),
+            "secret-derived parse errors must not echo a secret substring: {message}"
+        );
+        assert!(
+            !message.contains("Exponent"),
+            "secret-derived parse errors must not surface parser text: {message}"
+        );
+        assert_eq!(
+            message,
+            format!("invalid value for `client_timeout` from {source}; expected a valid value")
+        );
+
+        unsafe { std::env::remove_var(&key) };
     }
 
     fn write_env_file(path: &std::path::Path, contents: &str) {

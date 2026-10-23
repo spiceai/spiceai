@@ -486,6 +486,14 @@ fn expand_field(
     }
 
     // Typing: `SecretString` passes through unexposed; everything else parses.
+    // Provenance is looked up on the user-facing key and then aliases so a
+    // spicepod that writes the alias still masks partial interpolations.
+    let secret_source = quote! {
+        ::runtime_parameters_typed::secret_source_for_keys(
+            &secret_sources,
+            &[#user_key, #(#alias_keys),*],
+        )
+    };
     let parse_value = if is_secret_string {
         quote! { __v }
     } else if let Some(parse_with) = &spec.parse_with {
@@ -494,7 +502,7 @@ fn expand_field(
                 #user_key,
                 &__v,
                 #parse_with,
-                secret_sources.get(#user_key).map(::std::string::String::as_str),
+                #secret_source,
             )?
         }
     } else {
@@ -502,7 +510,7 @@ fn expand_field(
             ::runtime_parameters_typed::parse_param::<#inner_ty>(
                 #user_key,
                 &__v,
-                secret_sources.get(#user_key).map(::std::string::String::as_str),
+                #secret_source,
             )?
         }
     };

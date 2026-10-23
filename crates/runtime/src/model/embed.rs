@@ -32,7 +32,7 @@ use llms::bedrock::{
     },
 };
 use runtime_parameters_typed::TypedParams;
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_secrets::{Secrets, get_params_with_secrets, secret_sources_from_templates};
 
 use object_store::ObjectStoreExt;
 
@@ -97,17 +97,20 @@ pub async fn try_to_embedding(
             from: component.from.clone(),
         })?;
     let params = get_params_with_secrets(Arc::clone(&secrets), &string_params).await;
+    let secret_sources = secret_sources_from_templates(&string_params);
     let component_name = format!("embedding {}", component.name);
 
     match prefix {
         EmbeddingPrefix::Azure => {
-            let typed = embedding_params::azure::AzureEmbeddingParams::try_from_params(
-                &component_name,
-                params,
-                &secrets,
-            )
-            .await
-            .map_err(params_err)?;
+            let typed =
+                embedding_params::azure::AzureEmbeddingParams::try_from_params_with_secret_sources(
+                    &component_name,
+                    params,
+                    &secrets,
+                    &secret_sources,
+                )
+                .await
+                .map_err(params_err)?;
             azure(
                 model_id,
                 component.name.as_str(),
@@ -116,10 +119,11 @@ pub async fn try_to_embedding(
             )
         }
         EmbeddingPrefix::OpenAi => {
-            let typed = embedding_params::openai::OpenAiEmbeddingParams::try_from_params(
+            let typed = embedding_params::openai::OpenAiEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
@@ -134,13 +138,15 @@ pub async fn try_to_embedding(
         }
         #[cfg(feature = "models")]
         EmbeddingPrefix::File => {
-            let typed = embedding_params::file::FileEmbeddingParams::try_from_params(
-                &component_name,
-                params,
-                &secrets,
-            )
-            .await
-            .map_err(params_err)?;
+            let typed =
+                embedding_params::file::FileEmbeddingParams::try_from_params_with_secret_sources(
+                    &component_name,
+                    params,
+                    &secrets,
+                    &secret_sources,
+                )
+                .await
+                .map_err(params_err)?;
             file(
                 model_id.as_deref(),
                 component,
@@ -155,10 +161,11 @@ pub async fn try_to_embedding(
         }),
         #[cfg(feature = "models")]
         EmbeddingPrefix::HuggingFace => {
-            let typed = embedding_params::huggingface::HuggingFaceEmbeddingParams::try_from_params(
+            let typed = embedding_params::huggingface::HuggingFaceEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
@@ -169,20 +176,22 @@ pub async fn try_to_embedding(
             from: "huggingface".to_string(),
         }),
         EmbeddingPrefix::Google => {
-            let typed = embedding_params::google::GoogleEmbeddingParams::try_from_params(
+            let typed = embedding_params::google::GoogleEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
             google(model_id, &typed, embeddings_cache.clone()).await
         }
         EmbeddingPrefix::Databricks => {
-            let typed = embedding_params::databricks::DatabricksEmbeddingParams::try_from_params(
+            let typed = embedding_params::databricks::DatabricksEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
@@ -196,10 +205,11 @@ pub async fn try_to_embedding(
         }
         #[cfg(feature = "bedrock")]
         EmbeddingPrefix::Bedrock => {
-            let typed = embedding_params::bedrock::BedrockEmbeddingParams::try_from_params(
+            let typed = embedding_params::bedrock::BedrockEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
@@ -211,10 +221,11 @@ pub async fn try_to_embedding(
         }),
         #[cfg(feature = "models")]
         EmbeddingPrefix::Model2Vec => {
-            let typed = embedding_params::model2vec::Model2VecEmbeddingParams::try_from_params(
+            let typed = embedding_params::model2vec::Model2VecEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;

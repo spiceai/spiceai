@@ -74,7 +74,9 @@ pub enum ParamsError {
 
     /// Secret-derived parse failures must not include parser text: a `FromStr`
     /// impl that trims or lowercases the input can echo a value that
-    /// [`redact_value_in_reason`] would miss.
+    /// [`redact_value_in_reason`] would miss, and a parser can echo only a
+    /// fragment of a partial interpolation (for example `1e` plus a secret
+    /// reference).
     #[snafu(display(
         "invalid value for `{user_key}` from {secret_source}; expected a valid value"
     ))]
@@ -152,8 +154,9 @@ pub trait TypedParams: Sized {
 /// Parses a single parameter value via [`FromStr`], wrapping failures with the
 /// user-facing (prefixed) key.
 ///
-/// When `secret_source` is `Some`, the parser message is discarded so a
-/// normalized echo (`Found secret123` after trim/lowercase) cannot leak.
+/// When `secret_source` is `Some` — including when only a fragment of the raw
+/// value was interpolated (`1e${ env:SECRET }`) — the parser message is
+/// discarded so a normalized or substring echo cannot leak.
 ///
 /// # Errors
 ///
@@ -204,6 +207,19 @@ fn invalid_parse(
         user_key: user_key.to_string(),
         reason: redact_value_in_reason(parser_message, raw),
     }
+}
+
+/// Looks up secret-reference provenance for a parameter, trying the
+/// user-facing key and then any aliases. A hit means any part of the raw
+/// value was secret-derived (including `1e${ env:SECRET }`).
+#[must_use]
+#[expect(clippy::implicit_hasher)]
+pub fn secret_source_for_keys<'a>(
+    secret_sources: &'a HashMap<String, String>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| secret_sources.get(*key).map(String::as_str))
 }
 
 /// Defense in depth: if a `FromStr` / custom parser echoes the input, replace
@@ -555,5 +571,15 @@ mod tests {
             message,
             format!("invalid value for `client_timeout` from {SOURCE}; expected a valid value")
         );
+    }
+
+    #[test]
+    fn secret_source_for_keys_prefers_user_key_then_alias() {
+        let sources = HashMap::from([("timeout".to_string(), "${ env:SECRET }".to_string())]);
+        assert_eq!(
+            secret_source_for_keys(&sources, &["client_timeout", "timeout"]),
+            Some("${ env:SECRET }")
+        );
+        assert_eq!(secret_source_for_keys(&sources, &["client_timeout"]), None);
     }
 }
