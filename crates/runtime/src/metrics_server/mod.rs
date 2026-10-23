@@ -684,13 +684,22 @@ fn histogram_to_summary_metric(histogram_labels: &[LabelPair], h: &Histogram) ->
 
     for &p in &PERCENTILES {
         let interpolated = calculate_percentile(&cumulative_counts, &bounds, total_count, p);
-        let value = clamp_derived_quantile(
+        let mut value = clamp_derived_quantile(
             interpolated,
             total_count,
             total_sum,
             first_lower,
             last_upper,
         );
+        // Overflow interpolation is Inf. When both occupied bounds are open
+        // (first explicit bucket plus overflow), the sum clamp cannot invent a
+        // finite upper bound. Keep the last finite explicit estimate rather
+        // than publishing Inf for a finite sample.
+        if value.is_infinite()
+            && let Some(finite) = last_finite_explicit_bound(h)
+        {
+            value = finite;
+        }
         let mut quantile = prometheus::proto::Quantile::new();
         quantile.set_quantile(p / 100.0);
         quantile.set_value(value);
@@ -737,7 +746,39 @@ fn occupied_bucket_bounds(h: &Histogram) -> (f64, f64) {
         last_upper = f64::INFINITY;
     }
 
+    // Occupying the first explicit bucket leaves `previous_upper` at -Inf.
+    // A scheme whose finite bounds are all ≥ 0 has domain lower 0; a negative
+    // bound means we do not know, and must not invent a nonnegative floor.
+    if !first_lower.is_finite()
+        && let Some(domain_lower) = nonnegative_domain_lower(h)
+    {
+        first_lower = domain_lower;
+    }
+
     (first_lower, last_upper)
+}
+
+/// `Some(0.0)` when every finite explicit bound is ≥ 0.
+fn nonnegative_domain_lower(h: &Histogram) -> Option<f64> {
+    let mut saw_finite = false;
+    for bucket in h.get_bucket() {
+        let upper = bucket.upper_bound();
+        if !upper.is_finite() {
+            continue;
+        }
+        if upper < 0.0 {
+            return None;
+        }
+        saw_finite = true;
+    }
+    saw_finite.then_some(0.0)
+}
+
+fn last_finite_explicit_bound(h: &Histogram) -> Option<f64> {
+    h.get_bucket()
+        .iter()
+        .map(Bucket::upper_bound)
+        .rfind(|bound| bound.is_finite())
 }
 
 /// Bucket interpolation can report a quantile no observation could have, given
@@ -986,13 +1027,10 @@ mod tests {
         registry
     }
 
-    fn duration_histogram(latencies: &[f64], include_inf: bool) -> Histogram {
+    fn explicit_histogram(bounds: &[f64], observations: &[f64], include_inf: bool) -> Histogram {
         let mut histogram = Histogram::new();
-        for &upper in &telemetry::DURATION_MS_HISTOGRAM_BUCKETS {
-            let count = latencies
-                .iter()
-                .filter(|&&latency| latency <= upper)
-                .count();
+        for &upper in bounds {
+            let count = observations.iter().filter(|&&value| value <= upper).count();
             let mut bucket = Bucket::new();
             bucket.set_cumulative_count(u64::try_from(count).expect("observation count"));
             bucket.set_upper_bound(upper);
@@ -1000,13 +1038,21 @@ mod tests {
         }
         if include_inf {
             let mut inf = Bucket::new();
-            inf.set_cumulative_count(u64::try_from(latencies.len()).expect("observation count"));
+            inf.set_cumulative_count(u64::try_from(observations.len()).expect("observation count"));
             inf.set_upper_bound(f64::INFINITY);
             histogram.bucket.push(inf);
         }
-        histogram.set_sample_count(u64::try_from(latencies.len()).expect("observation count"));
-        histogram.set_sample_sum(latencies.iter().copied().sum());
+        histogram.set_sample_count(u64::try_from(observations.len()).expect("observation count"));
+        histogram.set_sample_sum(observations.iter().copied().sum());
         histogram
+    }
+
+    fn duration_histogram(latencies: &[f64], include_inf: bool) -> Histogram {
+        explicit_histogram(
+            &telemetry::DURATION_MS_HISTOGRAM_BUCKETS,
+            latencies,
+            include_inf,
+        )
     }
 
     fn histogram_with_single_observation(latency_ms: f64) -> Histogram {
@@ -1324,6 +1370,171 @@ mod tests {
                 "dataset_acceleration_refresh_duration_ms_summary{{dataset=\"products\",quantile=\"{quantile}\"}} 700000"
             );
             assert!(text.contains(&needle), "expected {needle} in:\n{text}");
+        }
+    }
+
+    /// Occupying the first explicit bucket leaves `first_lower` at `-Inf`.
+    /// Combined with overflow, appending `+Inf` interpolates p90+ to Inf, and
+    /// the sum clamp cannot bound that unless the explicit scheme is
+    /// nonnegative (domain lower 0). `query_returned_rows` starts at 1:
+    /// `[1, 1_000_000]` must stay finite.
+    #[test]
+    fn first_and_overflow_buckets_keep_finite_quantiles() {
+        let observations = [1.0, 1_000_000.0];
+        let histogram = explicit_histogram(
+            &telemetry::ROWS_RETURNED_HISTOGRAM_BUCKETS,
+            &observations,
+            true,
+        );
+        let first = histogram
+            .get_bucket()
+            .first()
+            .expect("rows histogram has buckets");
+        assert!(
+            first.cumulative_count() > 0,
+            "first explicit bucket must be occupied"
+        );
+        let last_finite = histogram
+            .get_bucket()
+            .iter()
+            .rev()
+            .find(|bucket| bucket.upper_bound().is_finite())
+            .expect("finite bound");
+        assert!(
+            last_finite.cumulative_count() < histogram.get_sample_count(),
+            "overflow observations must sit past the last finite bucket"
+        );
+
+        let (first_lower, last_upper) = occupied_bucket_bounds(&histogram);
+        assert_float_eq(first_lower, 0.0);
+        assert!(
+            last_upper.is_infinite(),
+            "overflow must leave the upper bound open, got {last_upper}"
+        );
+
+        let mut counts: Vec<u64> = histogram
+            .get_bucket()
+            .iter()
+            .map(Bucket::cumulative_count)
+            .collect();
+        let mut bounds: Vec<f64> = histogram
+            .get_bucket()
+            .iter()
+            .map(Bucket::upper_bound)
+            .collect();
+        if counts.last().copied().unwrap_or(0) < histogram.get_sample_count() {
+            counts.push(histogram.get_sample_count());
+            bounds.push(f64::INFINITY);
+        }
+        let interpolated_p90 =
+            calculate_percentile(&counts, &bounds, histogram.get_sample_count(), 90.0);
+        assert!(
+            interpolated_p90.is_infinite(),
+            "p90 of first-plus-overflow interpolates to Inf, got {interpolated_p90}"
+        );
+
+        let aggregate_upper = 1_000_001.0;
+        assert_float_eq(
+            clamp_derived_quantile(
+                interpolated_p90,
+                histogram.get_sample_count(),
+                histogram.get_sample_sum(),
+                first_lower,
+                last_upper,
+            ),
+            aggregate_upper,
+        );
+
+        let family =
+            labeled_histogram_family("query_returned_rows", &[("query", "q1", &histogram)]);
+        let quantiles: Vec<(f64, f64)> = histogram_family_to_summary(&family).get_metric()[0]
+            .get_summary()
+            .quantile
+            .iter()
+            .map(|quantile| (quantile.quantile(), quantile.value()))
+            .collect();
+        assert_eq!(quantiles.len(), 4);
+        assert_float_eq(quantiles[0].0, 0.5);
+        assert_float_eq(quantiles[0].1, 1.0);
+        for (idx, (quantile, value)) in quantiles.iter().enumerate().skip(1) {
+            assert!(
+                value.is_finite(),
+                "quantile {quantile} (index {idx}) must be finite, got {value}"
+            );
+            assert_float_eq(*value, aggregate_upper);
+        }
+
+        let registry = prometheus::Registry::new();
+        let observed = HistogramVec::new(
+            HistogramOpts::new("query_returned_rows", "Number of rows returned by a query")
+                .buckets(telemetry::ROWS_RETURNED_HISTOGRAM_BUCKETS.to_vec()),
+            &["query"],
+        )
+        .expect("rows returned histogram");
+        registry
+            .register(Box::new(observed.clone()))
+            .expect("register rows returned histogram");
+        observed.with_label_values(&["q1"]).observe(1.0);
+        observed.with_label_values(&["q1"]).observe(1_000_000.0);
+
+        let text = encode_registry(&registry);
+        let text = std::str::from_utf8(&text).expect("utf8 prometheus text");
+        parse_prometheus_text_strict(text).expect("strict prometheus exposition");
+        let summary_inf = text
+            .lines()
+            .any(|line| line.starts_with("query_returned_rows_summary{") && line.contains("+Inf"));
+        assert!(
+            !summary_inf,
+            "derived summary quantiles must be finite, got:\n{text}"
+        );
+        assert!(
+            text.contains("query_returned_rows_summary{query=\"q1\",quantile=\"0.5\"} 1"),
+            "p50 should be the first-bucket sample, got:\n{text}"
+        );
+        for quantile in ["0.9", "0.95", "0.99"] {
+            let needle = format!(
+                "query_returned_rows_summary{{query=\"q1\",quantile=\"{quantile}\"}} 1000001"
+            );
+            assert!(text.contains(&needle), "expected {needle} in:\n{text}");
+        }
+    }
+
+    /// A scheme with a negative bound has no known domain floor. First-bucket
+    /// plus overflow still interpolates to Inf; the last finite explicit bound
+    /// is the overflow estimate, not 0.
+    #[test]
+    fn signed_first_and_overflow_falls_back_to_last_finite_bound() {
+        let bounds = [-100.0, -10.0, 10.0, 100.0];
+        let histogram = explicit_histogram(&bounds, &[-100.0, 1_000_000.0], true);
+        let (first_lower, last_upper) = occupied_bucket_bounds(&histogram);
+        assert!(
+            first_lower.is_infinite() && first_lower.is_sign_negative(),
+            "signed scheme must not invent a 0 floor, got {first_lower}"
+        );
+        assert!(last_upper.is_infinite());
+        assert!(
+            clamp_derived_quantile(
+                f64::INFINITY,
+                histogram.get_sample_count(),
+                histogram.get_sample_sum(),
+                first_lower,
+                last_upper,
+            )
+            .is_infinite(),
+            "open bounds cannot invent a finite sum ceiling"
+        );
+
+        let family = labeled_histogram_family("signed_delta", &[("series", "a", &histogram)]);
+        let high: Vec<f64> = histogram_family_to_summary(&family).get_metric()[0]
+            .get_summary()
+            .quantile
+            .iter()
+            .filter(|quantile| quantile.quantile() >= 0.9)
+            .map(prometheus::proto::Quantile::value)
+            .collect();
+        assert_eq!(high.len(), 3);
+        for value in high {
+            assert_float_eq(value, 100.0);
         }
     }
 
