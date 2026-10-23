@@ -18499,6 +18499,7 @@ dependencies = [
  "futures",
  "humantime",
  "insta",
+ "object_store",
  "opentelemetry",
  "opentelemetry-prometheus",
  "opentelemetry_sdk",
