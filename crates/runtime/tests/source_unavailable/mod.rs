@@ -2499,3 +2499,140 @@ mod served_from_acceleration {
         Ok(())
     }
 }
+
+/// `append` datasets with a `time_column` and acceleration snapshots enabled.
+// Cayenne does not build on Windows.
+#[cfg(all(feature = "snapshots", not(windows)))]
+mod served_with_snapshots_enabled {
+    use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+
+    use app::AppBuilder;
+    use arrow::array::Int64Array;
+    use runtime::{Runtime, status::ComponentStatus};
+    use spicepod::{
+        acceleration::{Acceleration, Mode, RefreshMode, SnapshotBehavior},
+        component::{
+            dataset::{Dataset as SpicepodDataset, TimeFormat},
+            snapshot::{BootstrapOnFailureBehavior, Snapshots},
+        },
+        param::Params,
+    };
+    use tempfile::TempDir;
+
+    use super::{UnreachableSource, dataset_status};
+    use crate::{
+        configure_test_datafusion, init_tracing,
+        utils::{run_query, wait_until_true},
+    };
+
+    fn app(prefix: &str, dir: &Path) -> app::App {
+        let mut dataset = SpicepodDataset::new(format!("{prefix}://orders"), "orders");
+        dataset.time_column = Some("id".to_string());
+        dataset.time_format = Some(TimeFormat::UnixSeconds);
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: Mode::File,
+            primary_key: Some("id".to_string()),
+            refresh_mode: Some(RefreshMode::Append),
+            refresh_check_interval: Some("1s".to_string()),
+            snapshots: SnapshotBehavior::Enabled,
+            params: Some(Params::from_string_map(HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    dir.join("data").display().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    dir.join("metadata").display().to_string(),
+                ),
+            ]))),
+            ..Default::default()
+        });
+        AppBuilder::new("source_unavailable")
+            .with_dataset(dataset)
+            .with_snapshots(Snapshots {
+                enabled: true,
+                location: Some(format!("file://{}/", dir.join("snapshots").display())),
+                bootstrap_on_failure_behavior: BootstrapOnFailureBehavior::Fallback,
+                params: None,
+            })
+            .build()
+    }
+
+    async fn start(app: app::App) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
+        configure_test_datafusion();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let loader = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.load_components().await }
+        });
+        (rt, loader)
+    }
+
+    async fn stop(rt: Arc<Runtime>, loader: tokio::task::JoinHandle<()>) {
+        rt.shutdown().await;
+        loader.abort();
+    }
+
+    /// `COUNT(*)` of `orders`, or why the query failed.
+    async fn count(rt: &Arc<Runtime>) -> Result<i64, String> {
+        let batches = run_query(rt, "SELECT COUNT(*) AS n FROM orders")
+            .await
+            .map_err(|err| err.to_string())?;
+        batches
+            .first()
+            .and_then(|batch| batch.column(0).as_any().downcast_ref::<Int64Array>())
+            .map(|counts| counts.value(0))
+            .ok_or_else(|| "COUNT(*) is not Int64".to_string())
+    }
+
+    /// An acceleration reopened from disk is served and ready while its source is down.
+    #[tokio::test]
+    async fn an_append_acceleration_with_snapshots_is_served_and_ready_while_its_source_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let source = UnreachableSource::new("append-snapshots-down", 1);
+        source.register().await;
+        let dir = TempDir::new()?;
+
+        source.bring_up();
+        let (rt, loader) = start(app(source.prefix, dir.path())).await;
+        let seeded = wait_until_true(Duration::from_secs(30), || async {
+            count(&rt).await == Ok(3)
+                && dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
+        })
+        .await;
+        let observed = (count(&rt).await, dataset_status(&rt, "orders"));
+        stop(rt, loader).await;
+        anyhow::ensure!(seeded, "seeding the acceleration, got {observed:?}");
+
+        source.take_down();
+        let (rt, loader) = start(app(source.prefix, dir.path())).await;
+        let served = wait_until_true(Duration::from_secs(10), || async {
+            count(&rt).await == Ok(3) && rt.status().is_ready()
+        })
+        .await;
+        assert!(
+            served,
+            "queries must be answered from the existing acceleration and the runtime must be ready, got {:?}, ready={} ({:?})",
+            count(&rt).await,
+            rt.status().is_ready(),
+            dataset_status(&rt, "orders")
+        );
+
+        source.bring_up();
+        let reached = wait_until_true(Duration::from_secs(30), || async {
+            dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
+        })
+        .await;
+        assert!(
+            reached,
+            "the dataset must report Ready once its source is reached ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        assert_eq!(count(&rt).await, Ok(3));
+        stop(rt, loader).await;
+        Ok(())
+    }
+}
