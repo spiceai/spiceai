@@ -2437,9 +2437,12 @@ mod tests {
         )
         .expect("the poly read/write layer");
         let writer = poly.writer();
-        let writer = writer
-            .downcast_ref::<datafusion_table_providers::duckdb::write::DuckDBTableWriter>()
-            .expect("DuckDBTableWriter");
+        // `RewriteInternalTableNames` sits on the write stack and stops a
+        // `LayerWalk::Write`, so peel with `Read` to reach the engine writer.
+        let writer = spice_table::find_concrete::<
+            datafusion_table_providers::duckdb::write::DuckDBTableWriter,
+        >(writer.as_ref(), spice_table::LayerWalk::Read)
+        .expect("DuckDBTableWriter");
         Ok(writer.write_settings().clone())
     }
 
