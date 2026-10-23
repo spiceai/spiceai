@@ -936,13 +936,14 @@ pub trait ListingTableConnector: DataConnector {
         let (_, extension) = self.get_file_format_and_extension(dataset).await?;
 
         let table = ObjectStoreMetadataTable::try_new(store, &store_url, Some(extension.clone()))
-            .context(crate::InvalidConfigurationSnafu {
-            dataconnector: format!("{self}"),
-            message: format!(
-                "Invalid file extension ({extension}) for source ({})",
-                dataset.name
-            ),
-            connector_component: ConnectorComponent::from(dataset),
+            .map_err(|source| {
+            invalid_file_extension_error(
+                format!("{self}"),
+                dataset,
+                self.get_params(),
+                &extension,
+                source,
+            )
         })?;
         Ok(table as Arc<dyn TableProvider>)
     }
@@ -1623,13 +1624,14 @@ pub trait ListingTableConnector: DataConnector {
                 content_formatter,
                 metadata_columns,
             )
-            .context(crate::InvalidConfigurationSnafu {
-                dataconnector: format!("{self}"),
-                connector_component: ConnectorComponent::from(dataset),
-                message: format!(
-                    "Invalid file extension ({extension}) for source ({})",
-                    dataset.name
-                ),
+            .map_err(|source| {
+                invalid_file_extension_error(
+                    format!("{self}"),
+                    dataset,
+                    self.get_params(),
+                    extension,
+                    source,
+                )
             })?,
         ))
     }
@@ -2202,6 +2204,35 @@ fn resolve_file_compression_type(
     }
 
     Ok(detected_compression.unwrap_or(FileCompressionType::UNCOMPRESSED))
+}
+
+/// Configuration error for an unusable listing `file_extension`.
+///
+/// Secret-derived values are shown as their `${ store:key }` reference, and
+/// the regex compiler error is replaced so the resolved pattern cannot leak
+/// through [`std::error::Error::source`].
+fn invalid_file_extension_error(
+    dataconnector: String,
+    dataset: &DatasetSpec,
+    params: &Parameters,
+    extension: &str,
+    source: Box<dyn std::error::Error + Send + Sync>,
+) -> crate::DataConnectorError {
+    let displayed = params.display_value("file_extension", extension);
+    let source = if params.secret_source("file_extension").is_some() {
+        "invalid regex".into()
+    } else {
+        source
+    };
+    crate::DataConnectorError::InvalidConfiguration {
+        dataconnector,
+        connector_component: ConnectorComponent::from(dataset),
+        message: format!(
+            "Invalid file extension ({displayed}) for source ({})",
+            dataset.name
+        ),
+        source,
+    }
 }
 
 /// Document parser registry key for a listing dataset. Distinct from the
@@ -3007,6 +3038,7 @@ mod tests {
     use crate::listing::LISTING_TABLE_PARAMETERS;
     use crate::{ConnectorParams, DataConnectorFactory};
     use runtime_parameters::ParameterSpec;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -3079,6 +3111,55 @@ mod tests {
                     connector_component: ConnectorComponent::from(dataset),
                     message: "Invalid URL".to_string(),
                 })
+        }
+    }
+
+    /// Listing connector whose [`ObjectStore`] is injected, so tests can
+    /// exercise `list_all_files` without writing thousands of files to disk.
+    #[derive(Debug)]
+    struct ListingStoreConnector {
+        params: Parameters,
+        store: Arc<dyn ObjectStore>,
+    }
+
+    impl std::fmt::Display for ListingStoreConnector {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ListingStoreConnector")
+        }
+    }
+
+    impl ListingTableConnector for ListingStoreConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn get_params(&self) -> &Parameters {
+            &self.params
+        }
+
+        fn get_tokio_io_runtime(&self) -> Handle {
+            Handle::current()
+        }
+
+        fn get_object_store_url(
+            &self,
+            dataset: &DatasetSpec,
+            url: Option<&str>,
+        ) -> DataConnectorResult<Url> {
+            Url::parse(url.unwrap_or(dataset.from.as_str()))
+                .boxed()
+                .context(crate::InvalidConfigurationSnafu {
+                    dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: "Invalid URL".to_string(),
+                })
+        }
+
+        fn get_object_store(
+            &self,
+            _dataset: &DatasetSpec,
+        ) -> DataConnectorResult<Arc<dyn ObjectStore>> {
+            Ok(Arc::clone(&self.store))
         }
     }
 
@@ -3297,6 +3378,55 @@ mod tests {
             HashMap::from([("file_format".to_string(), "cvs".to_string())]),
         );
         assert_text_table_format(&connector, &dataset, "cvs").await;
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_incomplete_scan_loads_as_text() {
+        let meta_files: Vec<ObjectMeta> = (0..=SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT)
+            .map(|i| create_meta(&format!("file{i}.csv"), 100, 100))
+            .collect();
+        let store = Arc::new(TestObjectStore::new(meta_files));
+        let connector = ListingStoreConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([(
+                    "file_format".to_string(),
+                    "cvs".to_string(),
+                )]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_tracked_origins(),
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
+        };
+        let dataset = DatasetSpec::new("file:///unused/".to_string(), TableReference::bare("test"));
+
+        assert!(
+            !listing_confirms_structured_typo(&connector, &dataset, "cvs", "csv").await,
+            "hitting the scan cap is not listing confirmation"
+        );
+        assert!(
+            store.list_calls() >= 1,
+            "incomplete-scan coverage must list objects, not degrade on a store error"
+        );
+
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .unwrap_or_else(|err| panic!("cvs must keep the text-table path: {err}"));
+        assert!(file_format.is_none(), "cvs must use the text-table path");
+        assert_eq!(extension, ".cvs");
+        let warning = unknown_file_format_fallback_warning(
+            &dataset,
+            connector.get_params(),
+            "cvs",
+            Some("csv"),
+        );
+        assert!(
+            warning.contains("plain-text table"),
+            "incomplete scan must stay on the text fallthrough: {warning}"
+        );
     }
 
     #[tokio::test]
@@ -3771,6 +3901,88 @@ mod tests {
             message.contains(REFERENCE),
             "file_compression_type errors must name the secret reference: {message}"
         );
+    }
+
+    fn error_chain_text(err: &dyn std::error::Error) -> String {
+        let mut out = err.to_string();
+        let mut cur = err.source();
+        while let Some(inner) = cur {
+            out.push('\n');
+            out.push_str(&inner.to_string());
+            cur = inner.source();
+        }
+        out
+    }
+
+    fn secret_invalid_file_extension_connector(
+        format: &str,
+    ) -> (TestConnector, DatasetSpec, tempfile::TempDir) {
+        const CANARY: &str = ".CANARYPGPW7731[";
+        const REFERENCE: &str = "${ env:SECRET }";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "hello").expect("write listed object");
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([
+                    ("file_format".to_string(), format.to_string()),
+                    ("file_extension".to_string(), CANARY.to_string()),
+                ]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_extension".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new(
+            format!("file://{}/", dir.path().display()),
+            TableReference::bare("test"),
+        );
+        (connector, dataset, dir)
+    }
+
+    fn assert_invalid_file_extension_hides_secret(err: &DataConnectorError) {
+        const CANARY: &str = "CANARYPGPW7731";
+        const REFERENCE: &str = "${ env:SECRET }";
+        let chain = error_chain_text(err);
+        assert!(
+            chain.contains(REFERENCE),
+            "invalid file_extension errors must name the secret reference: {chain}"
+        );
+        assert!(
+            !chain.contains(CANARY),
+            "invalid file_extension errors must not echo a resolved secret: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_secret_file_extension_text_does_not_echo_value() {
+        let (connector, dataset, _dir) = secret_invalid_file_extension_connector("text");
+        let url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("directory url");
+        let (_file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("text plus file_extension must resolve");
+        let err = connector
+            .create_text_table(&dataset, &url, &extension, Some("text"))
+            .await
+            .expect_err("invalid secret-derived file_extension must fail text table setup");
+        assert_invalid_file_extension_hides_secret(&err);
+    }
+
+    #[tokio::test]
+    async fn test_secret_file_extension_csv_does_not_echo_value() {
+        let (connector, dataset, _dir) = secret_invalid_file_extension_connector("csv");
+        let err = connector
+            .construct_metadata_provider(&dataset)
+            .await
+            .expect_err("invalid secret-derived file_extension must fail metadata setup");
+        assert_invalid_file_extension_hides_secret(&err);
     }
 
     #[tokio::test]
@@ -4592,11 +4804,19 @@ mod tests {
     #[derive(Debug)]
     struct TestObjectStore {
         meta: Vec<ObjectMeta>,
+        list_calls: AtomicUsize,
     }
 
     impl TestObjectStore {
         fn new(meta: Vec<ObjectMeta>) -> Self {
-            Self { meta }
+            Self {
+                meta,
+                list_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn list_calls(&self) -> usize {
+            self.list_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -4612,6 +4832,7 @@ mod tests {
             &self,
             _prefix: Option<&Path>,
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
             stream::iter(self.meta.clone().into_iter().map(Ok)).boxed()
         }
 
