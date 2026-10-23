@@ -2526,6 +2526,11 @@ pub struct CayenneTableProvider {
     /// otherwise re-store a stale file set. Consumed on first fire.
     #[cfg(test)]
     test_post_snapshot_list_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by `matching_inlined_keys` after it warms the inline
+    /// cache and before it reads the cache entry it matches against, so a test
+    /// can store a stale cache in that window. Consumed on first fire.
+    #[cfg(test)]
+    test_inline_delete_match_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only counters and fault injection for the statistics listing.
     #[cfg(test)]
     test_listing: Arc<TestListingSeams>,
@@ -10350,6 +10355,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_inline_delete_match_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_listing: Arc::default(),
             #[cfg(test)]
             test_post_keyset_capture_hook: Arc::new(ParkingMutex::new(None)),
@@ -12807,6 +12814,8 @@ impl CayenneTableProvider {
             ),
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::clone(&self.test_post_snapshot_list_hook),
+            #[cfg(test)]
+            test_inline_delete_match_hook: Arc::clone(&self.test_inline_delete_match_hook),
             #[cfg(test)]
             test_listing: Arc::clone(&self.test_listing),
             #[cfg(test)]
@@ -31149,6 +31158,14 @@ impl CayenneTableProvider {
     /// Fire (and consume) the test-only post-snapshot-LIST hook, if one is
     /// installed. See [`Self::test_post_snapshot_list_hook`].
     #[cfg(test)]
+    async fn run_test_inline_delete_match_hook(&self) {
+        let hook = self.test_inline_delete_match_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    #[cfg(test)]
     async fn run_test_post_snapshot_list_hook(&self) {
         let hook = self.test_post_snapshot_list_hook.lock().take();
         if let Some(hook) = hook {
@@ -38754,6 +38771,8 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name
             ))
         })?;
+        #[cfg(test)]
+        self.run_test_inline_delete_match_hook().await;
         // One cache entry gives the view and the watermark it materialized
         // through, so the held-back read below starts exactly where it stops.
         let cache = self.inlined_cache.load_full();
@@ -66708,6 +66727,92 @@ mod tests {
         assert_eq!(
             collect_id_value_pairs(&ctx, &reopened, "held_back_delete").await,
             vec![(1, 10)]
+        );
+    }
+
+    /// A delete that matches against a stale inline cache, stored by a scan that
+    /// materialized it before an earlier delete published its tombstone, must not
+    /// take the already-hidden row off the live count again: an undercounted live
+    /// count makes scans skip the inline corpus and drop live rows.
+    #[tokio::test]
+    async fn a_delete_matching_a_stale_inline_cache_keeps_the_live_count() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_durable_inline_keyed_table("stale_cache_delete", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])).await;
+        provider
+            .read_inlined_batches()
+            .await
+            .expect("warm the inline cache");
+        let stale = provider.inlined_cache.load_full();
+        delete_where_id(&ctx, &provider, 1).await;
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            1,
+            "precondition: the first delete took its row off the live count"
+        );
+
+        // A scan that read the corpus before the first delete stores its cache
+        // just after the second delete warms the cache.
+        let inlined_cache = Arc::clone(&provider.inlined_cache);
+        *provider.test_inline_delete_match_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                inlined_cache.store(stale);
+            })
+        }));
+        delete_where_id(&ctx, &provider, 1).await;
+
+        assert_eq!(provider.cached_inlined_row_count(), 1);
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "stale_cache_delete").await,
+            vec![(2, 20)]
+        );
+    }
+
+    /// A delete covers a committed-but-unpublished inline row even when no inline
+    /// row is visible yet. The control table shows the row becomes visible on
+    /// reopen without the delete.
+    #[tokio::test]
+    async fn a_delete_covers_a_held_back_row_when_no_inline_row_is_visible() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+
+        let (control, control_catalog, _control_tmp) = create_durable_inline_keyed_table(
+            "held_back_only_control",
+            Arc::clone(&runtime_env),
+        )
+        .await;
+        add_held_back_inline_row(&control, &control_catalog, 5, 50).await;
+        drop(control);
+        let control = CayenneTableProviderBuilder::new(control_catalog, Arc::clone(&runtime_env))
+            .open("held_back_only_control")
+            .await
+            .expect("reopen the control table");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &control, "held_back_only_control").await,
+            vec![(5, 50)],
+            "precondition: reopening makes the held-back row visible"
+        );
+
+        let (provider, catalog, _tmp) =
+            create_durable_inline_keyed_table("held_back_only_delete", Arc::clone(&runtime_env))
+                .await;
+        add_held_back_inline_row(&provider, &catalog, 5, 50).await;
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            0,
+            "precondition: no inline row is visible"
+        );
+        delete_where_id(&ctx, &provider, 5).await;
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("held_back_only_delete")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "held_back_only_delete").await,
+            Vec::<(i64, i64)>::new()
         );
     }
 
