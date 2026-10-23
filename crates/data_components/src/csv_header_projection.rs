@@ -206,8 +206,11 @@ impl FileFormat for HeaderProjectedCsvFormat {
 }
 
 /// [`FileSource`] that remaps each file's header onto the registered file schema.
+///
+/// Cluster encode/decode must reconstruct this type, never a plain [`CsvSource`]:
+/// `CsvScan` is positional and would undo header-name binding.
 #[derive(Clone)]
-struct HeaderProjectedCsvSource {
+pub struct HeaderProjectedCsvSource {
     options: CsvOptions,
     batch_size: Option<usize>,
     table_schema: TableSchema,
@@ -216,7 +219,8 @@ struct HeaderProjectedCsvSource {
 }
 
 impl HeaderProjectedCsvSource {
-    fn new(table_schema: TableSchema, options: CsvOptions) -> Self {
+    #[must_use]
+    pub fn new(table_schema: TableSchema, options: CsvOptions) -> Self {
         Self {
             options,
             batch_size: None,
@@ -226,12 +230,24 @@ impl HeaderProjectedCsvSource {
         }
     }
 
-    fn has_header(&self) -> bool {
+    #[must_use]
+    pub fn csv_options(&self) -> &CsvOptions {
+        &self.options
+    }
+
+    #[must_use]
+    pub fn has_header(&self) -> bool {
         self.options.has_header.unwrap_or(true)
     }
 
-    fn newlines_in_values(&self) -> bool {
+    #[must_use]
+    pub fn newlines_in_values(&self) -> bool {
         self.options.newlines_in_values.unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn truncate_rows(&self) -> bool {
+        self.options.truncated_rows.unwrap_or(false)
     }
 }
 

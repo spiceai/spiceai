@@ -28,6 +28,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::Partitioning;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
+use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::ScalarUDF;
 use datafusion_proto::bytes::Serializeable;
 use datafusion_proto::generated::datafusion_common;
@@ -50,6 +51,7 @@ use runtime_proto::{
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use super::header_projected_csv::{decode_header_projected_csv, encode_header_projected_csv};
 use super::spice_logical_codec::SpiceLogicalCodec;
 
 /// Serialization support for custom Spice execution nodes
@@ -211,6 +213,9 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     limit,
                 )))
             }
+            Some(spice_physical_plan_node::Node::HeaderProjectedCsvScan(node)) => {
+                decode_header_projected_csv(&node, ctx, self, proto_converter)
+            }
             Some(spice_physical_plan_node::Node::IcebergTableScan(node)) => {
                 let runtime = self.runtime()?;
                 let table_ref = TableReference::from(node.table_ref.as_str());
@@ -327,6 +332,15 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
         buf: &mut Vec<u8>,
         proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
+        if let Some(exec) = node.downcast_ref::<DataSourceExec>()
+            && let Some(wrapper) = encode_header_projected_csv(exec, self, proto_converter)?
+        {
+            wrapper
+                .encode(buf)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            return Ok(());
+        }
+
         let wrapper = if let Some(concrete) = node.downcast_ref::<SchemaCastScanExec>() {
             let mut schema_buf = vec![];
             let serialized_schema = datafusion_common::Schema::try_from(concrete.schema())?;
@@ -1021,5 +1035,119 @@ mod tests {
             }
             other => panic!("expected an IcebergTableScan recipe node, got {other:?}"),
         }
+    }
+
+    fn write_csv(path: &std::path::Path, header: &str, rows: &[&str]) {
+        let mut text = String::new();
+        text.push_str(header);
+        text.push('\n');
+        for row in rows {
+            text.push_str(row);
+            text.push('\n');
+        }
+        std::fs::write(path, text).expect("write csv");
+    }
+
+    fn header_projected_listing_table(dir: &std::path::Path) -> Arc<dyn TableProvider> {
+        use data_components::csv_header_projection::HeaderProjectedCsvFormat;
+        use datafusion::datasource::file_format::csv::CsvFormat;
+        use datafusion::datasource::listing::{
+            ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int64, true),
+            Field::new("user_id", DataType::Int64, true),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("amount_cents", DataType::Int64, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]));
+        let format =
+            HeaderProjectedCsvFormat::wrap(Arc::new(CsvFormat::default().with_has_header(true)));
+        let url = ListingTableUrl::parse(format!("file://{}/", dir.display())).expect("url");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(ListingOptions::new(format).with_file_extension(".csv"))
+            .with_schema(schema);
+        Arc::new(ListingTable::try_new(config).expect("listing table"))
+    }
+
+    fn plan_has_header_projected_csv(plan: &dyn ExecutionPlan) -> bool {
+        use data_components::csv_header_projection::HeaderProjectedCsvSource;
+        use datafusion_datasource::source::DataSourceExec;
+
+        if let Some(exec) = plan.downcast_ref::<DataSourceExec>()
+            && exec
+                .downcast_to_file_source::<HeaderProjectedCsvSource>()
+                .is_some()
+        {
+            return true;
+        }
+        plan.children()
+            .into_iter()
+            .any(|child| plan_has_header_projected_csv(child.as_ref()))
+    }
+
+    #[tokio::test]
+    async fn header_projected_csv_codec_round_trip_keeps_name_binding() {
+        use arrow::array::{Array, Int64Array};
+        use datafusion::physical_plan::collect;
+        use datafusion_proto::physical_plan::AsExecutionPlan;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csv(
+            &dir.path().join("events.csv"),
+            "event_id,amount_cents,region,user_id,ts",
+            &["1,100,us,10,t0", "2,200,eu,20,t1"],
+        );
+
+        let ctx = SessionContext::new();
+        ctx.register_table("events", header_projected_listing_table(dir.path()))
+            .expect("register");
+        let plan = ctx
+            .sql("SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM events")
+            .await
+            .expect("sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        assert!(
+            plan_has_header_projected_csv(plan.as_ref()),
+            "planned scan must use HeaderProjectedCsvSource"
+        );
+        let codec = SpicePhysicalCodec {
+            inner: Arc::new(BallistaPhysicalExtensionCodec::default()),
+            runtime: None,
+        };
+        let proto = PhysicalPlanNode::try_from_physical_plan(Arc::clone(&plan), &codec)
+            .expect("headered CSV scan must serialize through SpicePhysicalCodec");
+        let decoded = proto
+            .try_into_physical_plan(ctx.task_ctx().as_ref(), &codec)
+            .expect("headered CSV scan must deserialize to HeaderProjectedCsvSource");
+        assert!(
+            plan_has_header_projected_csv(decoded.as_ref()),
+            "decoded scan must stay HeaderProjectedCsvSource, not CsvSource"
+        );
+        let batches = collect(decoded, ctx.task_ctx())
+            .await
+            .expect("execute decoded plan");
+        let batch = &batches[0];
+        let amounts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("amount_cents");
+        let users = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("user_id");
+        assert_eq!(
+            (
+                (!amounts.is_null(0)).then(|| amounts.value(0)),
+                (!users.is_null(0)).then(|| users.value(0)),
+            ),
+            (Some(300), Some(30)),
+            "reordered headers must still bind by name after the codec round-trip"
+        );
     }
 }
