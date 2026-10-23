@@ -771,6 +771,37 @@ pub(crate) mod tests {
         }
     }
 
+    /// Every query of up to four characters over the grammar's operator and delimiter characters,
+    /// plus whitespace the grammar's rules disagree on, parses without a panic.
+    #[test]
+    fn test_short_queries_never_panic() {
+        let parser = text_parser();
+        let alphabet: Vec<char> = "a* ()\"[]:^'{}\\+-\u{a0}".chars().collect();
+        let mut digits = Vec::new();
+        loop {
+            let q: String = digits.iter().map(|&d| alphabet[d]).collect();
+            parse_user_query(&parser, &q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
+            // Advance `digits` as an odometer over `alphabet`, growing to four characters.
+            let mut pos = digits.len();
+            loop {
+                if pos == 0 {
+                    if digits.len() == 4 {
+                        return;
+                    }
+                    digits.iter_mut().for_each(|d| *d = 0);
+                    digits.push(0);
+                    break;
+                }
+                pos -= 1;
+                digits[pos] += 1;
+                if digits[pos] < alphabet.len() {
+                    break;
+                }
+                digits[pos] = 0;
+            }
+        }
+    }
+
     /// Queries the grammar handles keep the full parser, operators and all.
     #[test]
     fn test_parseable_queries_keep_the_full_parser() {
