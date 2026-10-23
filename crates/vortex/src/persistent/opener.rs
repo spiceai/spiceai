@@ -74,6 +74,7 @@ use crate::metrics::PARTITION_LABEL;
 use crate::metrics::PATH_LABEL;
 use crate::persistent::cache::CachedVortexMetadata;
 use crate::persistent::cache::cache_footer;
+use crate::persistent::cache::can_cache_footer_after_open;
 use crate::persistent::deferred_projection::DeferredProjectionReader;
 use crate::persistent::key_blocks;
 use crate::persistent::reader::VortexReaderFactory;
@@ -315,7 +316,12 @@ impl FileOpener for VortexOpener {
             // `synthetic_object_meta`) is only ever rewritten under a new
             // path, so the size-and-mtime validity check cannot serve a stale
             // footer; a listing with real store mtimes invalidates on change.
-            if !footer_cached && let Some(file_metadata_cache) = file_metadata_cache.as_ref() {
+            // Preserve the uncached open when its initial read also supplies
+            // row data that a footer-only cache entry would leave out.
+            if !footer_cached
+                && let Some(file_metadata_cache) = file_metadata_cache.as_ref()
+                && can_cache_footer_after_open(vxf.footer(), file.object_meta.size)
+            {
                 cache_footer(
                     file_metadata_cache,
                     file.object_meta.clone(),

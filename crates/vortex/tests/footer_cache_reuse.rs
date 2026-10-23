@@ -14,11 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A scan that opens a Vortex file must keep the footer it read, so the next
-//! open of that file (another split, or a later query) does not read the
-//! footer from the object store again. Files on a remote store pay a
-//! round trip per footer read, so a footer that is re-read on every open makes
-//! every query pay that latency again.
+//! Large-file scans retain their footers to avoid repeated footer requests.
+//! Files that fit in the initial footer read retain a single full-file request
+//! per scan, including when the segment cache is disabled.
 
 use std::fmt;
 use std::sync::Arc;
@@ -43,13 +41,13 @@ use url::Url;
 use vortex::VortexSessionDefault;
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::arrow::ArrowSessionExt;
-use vortex::file::WriteOptionsSessionExt;
+use vortex::file::{EOF_SIZE, MAX_POSTSCRIPT_SIZE, WriteOptionsSessionExt};
 use vortex::io::VortexWrite;
 use vortex::io::object_store::ObjectStoreWrite;
 use vortex::session::VortexSession;
 use vortex_datafusion::VortexFormatFactory;
 
-const ROWS: i64 = 4_096;
+const INITIAL_READ_SIZE: u64 = MAX_POSTSCRIPT_SIZE as u64 + EOF_SIZE as u64;
 
 /// Records the byte range of every `GET`, as `(start, end)` with `None` for an
 /// open end.
@@ -120,7 +118,7 @@ impl ObjectStore for RecordingStore {
     }
 }
 
-async fn write_file(store: &Arc<dyn ObjectStore>, name: &str) -> u64 {
+async fn write_file(store: &Arc<dyn ObjectStore>, name: &str, ids: &[i64], values: &[i64]) -> u64 {
     let session = VortexSession::default();
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -129,8 +127,8 @@ async fn write_file(store: &Arc<dyn ObjectStore>, name: &str) -> u64 {
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
-            Arc::new(Int64Array::from_iter_values(0..ROWS)),
-            Arc::new(Int64Array::from_iter_values((0..ROWS).map(|r| r * 3))),
+            Arc::new(Int64Array::from_iter_values(ids.iter().copied())),
+            Arc::new(Int64Array::from_iter_values(values.iter().copied())),
         ],
     )
     .expect("batch matches schema");
@@ -153,31 +151,69 @@ async fn write_file(store: &Arc<dyn ObjectStore>, name: &str) -> u64 {
     store.head(&path).await.expect("head written file").size
 }
 
-async fn count(ctx: &SessionContext) -> i64 {
+async fn aggregate(ctx: &SessionContext) -> (i64, i64) {
     let batches = ctx
-        .sql("SELECT sum(v) AS s FROM t WHERE id >= 0")
+        .sql("SELECT count(*) AS n, sum(v) AS s FROM t WHERE id >= 0")
         .await
-        .expect("plan query")
+        .expect("plan aggregate")
         .collect()
         .await
-        .expect("run query");
-    batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("sum is i64")
-        .value(0)
+        .expect("run aggregate");
+    assert_eq!(batches.len(), 1, "aggregate returns one batch");
+    assert_eq!(batches[0].num_rows(), 1, "aggregate returns one row");
+    let value = |column| {
+        batches[0]
+            .column(column)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("aggregate is i64")
+            .value(0)
+    };
+    (value(0), value(1))
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_second_scan_does_not_re_read_the_footer() {
+async fn assert_exact_rows(ctx: &SessionContext, ids: &[i64], values: &[i64]) {
+    let batches = ctx
+        .sql("SELECT id, v FROM t WHERE id >= 0 ORDER BY id, v")
+        .await
+        .expect("plan rows")
+        .collect()
+        .await
+        .expect("read rows");
+    let actual = batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is i64");
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("v is i64");
+            ids.iter().zip(values.iter())
+        })
+        .collect::<Vec<_>>();
+    let mut expected = ids
+        .iter()
+        .zip(values)
+        .map(|(id, value)| (Some(*id), Some(*value)))
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(actual, expected, "every row and value matches the fixture");
+}
+
+async fn setup(ids: &[i64], values: &[i64]) -> (Arc<RecordingStore>, SessionContext, u64) {
     let recording = Arc::new(RecordingStore {
         inner: InMemory::new(),
         gets: Mutex::new(Vec::new()),
     });
-    let store: Arc<dyn ObjectStore> = recording.clone();
-    let size = write_file(&store, "data/part-000.vortex").await;
+    let store = Arc::clone(&recording) as Arc<dyn ObjectStore>;
+    let size = write_file(&store, "data/part-000.vortex", ids, values).await;
 
+    // The ordinary factory has no segment cache unless one is requested.
     let factory = Arc::new(VortexFormatFactory::new());
     let mut builder = SessionStateBuilder::new()
         .with_default_features()
@@ -204,37 +240,123 @@ async fn a_second_scan_does_not_re_read_the_footer() {
         .get_file_metadata_cache()
         .clear();
 
-    // A footer read reaches the end of the file; segment reads stop short of
-    // the footer.
+    (recording, ctx, size)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn small_file_scans_keep_one_full_file_read() {
+    let ids = (0..4_096).collect::<Vec<i64>>();
+    let values = ids.iter().map(|row| row * 3).collect::<Vec<_>>();
+    let (recording, ctx, size) = setup(&ids, &values).await;
+    assert!(size <= INITIAL_READ_SIZE, "fixture fits the initial read");
+    let expected = (
+        i64::try_from(values.len()).expect("row count fits i64"),
+        values.iter().sum::<i64>(),
+    );
+
+    for scan in 1..=2 {
+        recording.gets.lock().clear();
+        assert_eq!(aggregate(&ctx).await, expected);
+        let gets = recording.gets.lock().clone();
+        eprintln!("small-file scan {scan} GETs: {gets:?}");
+        assert_eq!(
+            gets.len(),
+            1,
+            "one request supplies the whole file: {gets:?}"
+        );
+        let full_file = match &gets[0].1 {
+            GetRange::Bounded(range) => range.start == 0 && range.end == size,
+            GetRange::Offset(offset) => *offset == 0,
+            GetRange::Suffix(length) => *length >= size,
+        };
+        assert!(full_file, "the request includes every file byte: {gets:?}");
+    }
+    assert_exact_rows(&ctx, &ids, &values).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn large_file_second_scan_reuses_the_footer() {
+    let ids = (0..32_768).collect::<Vec<i64>>();
+    let values = random_values(32_768, 0);
+    let (recording, ctx, size) = setup(&ids, &values).await;
+    assert!(size > INITIAL_READ_SIZE, "fixture exceeds the initial read");
+    let expected = (
+        i64::try_from(values.len()).expect("row count fits i64"),
+        values.iter().sum::<i64>(),
+    );
+
+    // A footer request reaches EOF; data segment requests stop before it.
     let footer_reads = |gets: &[(String, GetRange)]| {
         gets.iter()
             .filter(|(_, range)| match range {
-                GetRange::Bounded(r) => r.end >= size,
+                GetRange::Bounded(range) => range.end >= size,
                 GetRange::Offset(_) | GetRange::Suffix(_) => true,
             })
             .count()
     };
 
-    let expected: i64 = (0..ROWS).map(|r| r * 3).sum();
-
     recording.gets.lock().clear();
-    assert_eq!(count(&ctx).await, expected);
+    assert_eq!(aggregate(&ctx).await, expected);
     let first = recording.gets.lock().clone();
-    eprintln!("first scan GETs: {first:?}");
-
-    recording.gets.lock().clear();
-    assert_eq!(count(&ctx).await, expected);
-    let second = recording.gets.lock().clone();
-    eprintln!("second scan GETs: {second:?}");
-
+    eprintln!("large-file first scan GETs: {first:?}");
     assert_eq!(
         footer_reads(&first),
         1,
-        "the first scan reads the footer once: {first:?}"
+        "first scan reads the footer: {first:?}"
     );
+
+    recording.gets.lock().clear();
+    assert_eq!(aggregate(&ctx).await, expected);
+    let second = recording.gets.lock().clone();
+    eprintln!("large-file second scan GETs: {second:?}");
     assert_eq!(
         footer_reads(&second),
         0,
-        "the second scan must reuse the footer the first one read: {second:?}"
+        "second scan reuses the footer: {second:?}"
     );
+    assert_exact_rows(&ctx, &ids, &values).await;
+}
+
+fn random_values(rows: u64, seed: u64) -> Vec<i64> {
+    // Mix each row into 40 bits so the column does not compress to a constant
+    // or sequence. Bounded positive values keep the aggregate in i64.
+    (0..rows)
+        .map(|row| {
+            let mut value = (row ^ seed).wrapping_add(0x9e37_79b9_7f4a_7c15);
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            i64::try_from((value ^ (value >> 31)) & ((1_u64 << 40) - 1))
+                .expect("40-bit value fits i64")
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_tail_read_keeps_prefetched_column_data() {
+    let ids = random_values(12_000, 0);
+    let values = random_values(12_000, 1 << 32);
+    let (recording, ctx, size) = setup(&ids, &values).await;
+    assert!(size > INITIAL_READ_SIZE, "fixture exceeds the initial read");
+    assert!(size < 2 * INITIAL_READ_SIZE, "one column fits in the tail");
+    let expected = (
+        i64::try_from(values.len()).expect("row count fits i64"),
+        values.iter().sum::<i64>(),
+    );
+
+    for scan in 1..=2 {
+        recording.gets.lock().clear();
+        assert_eq!(aggregate(&ctx).await, expected);
+        let gets = recording.gets.lock().clone();
+        eprintln!("partial-file scan {scan} GETs: {gets:?}");
+        assert_eq!(gets.len(), 2, "tail read supplies one column: {gets:?}");
+        assert!(
+            gets.iter().any(|(_, range)| matches!(
+                range,
+                GetRange::Bounded(range)
+                    if range.start == size - INITIAL_READ_SIZE && range.end == size
+            )),
+            "scan retains the initial tail read: {gets:?}"
+        );
+    }
+    assert_exact_rows(&ctx, &ids, &values).await;
 }
