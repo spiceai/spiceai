@@ -16,8 +16,6 @@ limitations under the License.
 // `llms::chat::…` paths resolve, including SNAFU's generated context selectors.
 pub use chat_api::*;
 #[cfg(feature = "local_llm")]
-use secrecy::SecretString;
-#[cfg(feature = "local_llm")]
 use snafu::ResultExt;
 use std::path::Path;
 #[cfg(any(feature = "local_llm", test))]
@@ -350,14 +348,8 @@ pub fn message_to_mistral(
     }
 }
 
-/// The Hugging Face Hub settings a model names: its `hf_token` and `hf_endpoint`, which the
-/// environment's settings fill in (see [`huggingface_hub::settings`]).
 #[cfg(feature = "local_llm")]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct HubParams<'a> {
-    pub token: Option<&'a SecretString>,
-    pub endpoint: Option<&'a str>,
-}
+use crate::hf::HubParams;
 
 /// Create a model to run locally, from a Hugging Face model repository.
 ///

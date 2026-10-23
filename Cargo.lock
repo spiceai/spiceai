@@ -8208,7 +8208,6 @@ dependencies = [
  "async-trait",
  "cache",
  "chunking",
- "hf-hub",
  "runtime-rate-control",
  "snafu",
  "tokio",
