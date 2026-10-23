@@ -41,6 +41,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     compare,
+    ledger::Ledger,
     script::{Action, RunVariants, Script, Step, Timing, VariantSpec, matrix_combinations},
     source::{self, Source},
     spiced::Spiced,
@@ -304,6 +305,9 @@ pub struct Options {
     pub work_dir: PathBuf,
     pub keep: bool,
     pub spice_cli: PathBuf,
+    /// The expected failures, which a check retrying until it passes may stop
+    /// at; `None` to wait out every limit, as `--record-failures` does.
+    pub ledger: Option<Arc<Ledger>>,
 }
 
 /// A failed check: where it ran, which step, and what went wrong.
@@ -425,6 +429,9 @@ struct Instance {
     background: BTreeMap<String, Background>,
     /// `/metrics` scrapes taken by `mark-metrics`, by id.
     metric_marks: BTreeMap<String, String>,
+    /// The ledger and this combination's run label, against which a retried
+    /// check recognizes a failure already listed for it.
+    expected: Option<(Arc<Ledger>, String)>,
 }
 
 /// How long `spiced` gets to shut down after SIGTERM before `stop` and
@@ -461,6 +468,14 @@ struct BackgroundStats {
 impl Instance {
     fn sql(&self, text: &str) -> Result<String> {
         template::substitute_text(text, &self.context)
+    }
+
+    /// Whether `error`, from the check with ledger key `key`, is the failure
+    /// the ledger lists for this instance's run of it.
+    fn fails_as_listed(&self, script: &Script, key: &str, error: &anyhow::Error) -> bool {
+        self.expected.as_ref().is_some_and(|(ledger, run)| {
+            ledger.lists(script, run, &self.label, key, &format!("{error:#}"))
+        })
     }
 }
 
@@ -643,6 +658,12 @@ async fn run_combination(
 
     let result = async {
         let mut instances = create_instances(script, options, combo, run_id, &sources).await?;
+        for instance in &mut instances {
+            instance.expected = options
+                .ledger
+                .as_ref()
+                .map(|ledger| (Arc::clone(ledger), run_label.to_string()));
+        }
         match schedule {
             Schedule::Lockstep => {
                 run_lockstep(
@@ -891,6 +912,7 @@ async fn create_instances(
                 spice_cli: options.spice_cli.clone(),
                 background: BTreeMap::new(),
                 cache_dir: options.work_dir.join("cache"),
+                expected: None,
             });
         }
     }

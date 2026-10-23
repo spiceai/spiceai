@@ -198,6 +198,18 @@ impl Ledger {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// Whether this failure of a check is one the ledger lists for it, as
+    /// listed. A check retrying until it passes stops at such a failure
+    /// rather than wait out its limit to report the same thing. A `may-pass`
+    /// entry is a race, which the check keeps retrying to give the chance to
+    /// pass.
+    pub fn lists(&self, script: &Script, run: &str, who: &str, key: &str, message: &str) -> bool {
+        let signature = signature(message);
+        self.entries(script)
+            .iter()
+            .any(|e| !e.may_pass && e.id() == (run, who, key, None) && e.matches(&signature))
+    }
+
     /// Weighs a script's failures against its entries.
     pub fn judge(&self, script: &Script, failures: &[Failure]) -> Verdict {
         let entries = self.entries(script);
@@ -672,6 +684,37 @@ mod tests {
             BTreeMap::from([(script.file_stem.clone(), entries)]),
         );
         Ledger { files }
+    }
+
+    #[test]
+    fn lists_only_the_listed_failure_of_the_listed_check() {
+        let script = script_in("t");
+        let retried = |attempts: u32, failure: &str| {
+            format!("still failing after {attempts} attempts over 30s: {failure}")
+        };
+        let mut listed = entry("a", false);
+        listed.key = "query: SELECT 1".into();
+        listed.signature = signature(&retried(61, "Spice rejected the query: no such table"));
+        let mut racy = listed.clone();
+        racy.who = "b".into();
+        racy.may_pass = true;
+        let ledger = ledger(&script, vec![listed, racy]);
+        let first_attempt = retried(1, "Spice rejected the query: no such table");
+        assert!(ledger.lists(&script, "s", "a", "query: SELECT 1", &first_attempt));
+        assert!(!ledger.lists(
+            &script,
+            "s",
+            "a",
+            "query: SELECT 1",
+            &retried(1, "Spice rejected the query: connection refused")
+        ));
+        assert!(!ledger.lists(&script, "s", "a", "query: SELECT 2", &first_attempt));
+        assert!(!ledger.lists(&script, "s", "c", "query: SELECT 1", &first_attempt));
+        assert!(!ledger.lists(&script, "s[k=v]", "a", "query: SELECT 1", &first_attempt));
+        assert!(
+            !ledger.lists(&script, "s", "b", "query: SELECT 1", &first_attempt),
+            "a may-pass entry keeps retrying"
+        );
     }
 
     #[test]

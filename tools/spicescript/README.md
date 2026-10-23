@@ -75,7 +75,7 @@ DuckDB CLI matching Spice's embedded DuckDB into `~/.cache/spicescript/`
 | `--jobs N` | Run up to N `spiced` processes at once (default 1). Every instance of every matrix combination is a job of its own, taking a slot per process, executors included, and freeing it when it finishes. A combination that stops and starts a source its instances share, or whose variants work together (`run-variants: side-by-side`), runs its instances a step at a time as one job; a script with `defaults.exclusive` runs alone. Scripts ask for slots longest first, from recorded durations. Each script's output is printed when it finishes, with progress lines and the slowest scripts at the end. |
 | `--partition I/N` | Run only share I of N (1-based), for splitting a suite across CI jobs. Scripts go longest first, by recorded duration, to the share with the least work so far, so every job computes the same split and the shares take about as long. |
 | `--record-durations` | Write each script's run time to `recordings/durations.json` beside it. A script without a recorded duration is refused unless this is set, so a new script gets one when it's added. Record from a `--jobs 1` run. |
-| `--max-wait DURATION` | Cap every wait (`eventually`, readiness, refreshes) at this length. For known-failing scripts, which otherwise wait out every limit. |
+| `--max-wait DURATION` | Cap every wait (`eventually`, readiness, refreshes) at this length. For known-failing scripts, which otherwise wait out every limit that is not a query's listed failure (see [Expected failures](#expected-failures)). |
 | `--matrix KEY=VALUE` | Choose which **runs** happen: only the matrix combinations with this value of a key under `matrix:` (as `${matrix.KEY}` prints it), such as `src=clickhouse`; repeat a key for several values. Scripts without the key or any of the values are skipped. Expected failures of the combinations left out are neither required to fail nor dropped by `--record-failures`. |
 | `--variant NAME` | Choose which **instances** start in each run: only this name under `variants:`, such as `cayenne`; repeat it for several. Scripts with none of them are skipped. Expected failures of the variants left out, and of comparisons between variants (the run compares a different set), are neither required to fail nor dropped by `--record-failures`. Neither option combines with `--record-durations`. |
 | `--work-dir DIR` | Where instances keep their spicepods, data and `spiced.log` (default `target/spicescript`). |
@@ -343,6 +343,12 @@ A run fails on:
 - a listed check that passes: if it is fixed, re-record and move the script
   out of `known-failing/`;
 - an entry with no group.
+
+A query retried with `eventually` stops at the first attempt that fails the
+way the ledger lists for it, instead of waiting out its limit to report the
+same failure. Any other failure keeps retrying, and so does a `may-pass`
+entry, which is a race that gets the chance to pass. `--record-failures`
+waits out every limit.
 
 `--record-failures` writes the ledger from a run, keeping the group and
 `may-pass` of entries that are still there. A new entry's group is the

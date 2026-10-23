@@ -104,6 +104,7 @@ pub(super) async fn run_query(
     script: &Script,
     instance: &mut Instance,
     q: &QueryStep,
+    key: &str,
     sources: &Sources,
 ) -> Result<Option<Vec<RecordBatch>>> {
     let expect = q.expect.as_ref().or(script.defaults.expect.as_ref());
@@ -134,10 +135,15 @@ pub(super) async fn run_query(
         match (timing, attempt) {
             (Timing::Once, result) => return result,
             (Timing::Eventually(_), Ok(answer)) => return Ok(answer),
-            (Timing::Eventually(limit), Err(e)) if started.elapsed() >= max_wait(limit) => {
-                return Err(e.context(format!(
+            (Timing::Eventually(limit), Err(e)) => {
+                let e = e.context(format!(
                     "still failing after {attempts} attempts over {limit:?}"
-                )));
+                ));
+                if started.elapsed() >= max_wait(limit) || instance.fails_as_listed(script, key, &e)
+                {
+                    return Err(e);
+                }
+                tokio::time::sleep(POLL).await;
             }
             (Timing::Consistently(_), Err(e)) => {
                 return Err(e.context(format!(
