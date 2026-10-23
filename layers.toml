@@ -278,6 +278,9 @@ messages-api = "foundation"
 # What each model can serve and the gate every serving path asks; its closure is `spicepod`.
 model-capabilities = "foundation"
 embed-api = "shared-utility"
+# The Hugging Face Hub client: models, embeddings, rerankers and the Hugging Face data
+# connector all read the Hub through it.
+huggingface-hub = "shared-utility"
 rerank-api = "foundation"
 runtime-cloud-connect = "foundation"
 runtime-datafusion-index = "foundation"
