@@ -38,5 +38,5 @@ Preconditions:
 - Do not treat an open port as ready. Wait for `/v1/ready`.
 - A positional reader (the pre-fix runtime) swaps `300`/`30` after reorder and keeps serving the fourth column as `amount_cents` after rename. Those swapped or stale numbers are the trunk bug, not a pass.
 - Two datasets share `data/events.csv`. Rewrite the file once; query federated, then refresh accelerated.
-- `POST .../refresh` returns before the refresh finishes. Poll status.
+- `POST .../refresh` returns before the refresh finishes. Poll status only after a 2xx POST. A transport error or non-2xx response is a failed refresh, not a reason to poll.
 - After `csv_acc` is `Error`, `/v1/ready` may be `503`. Federated queries still run.

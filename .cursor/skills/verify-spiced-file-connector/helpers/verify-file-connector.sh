@@ -530,12 +530,25 @@ ready_capture() {
 refresh_dataset() {
   local name="$1"
   local out="$2"
+  mkdir -p "$(dirname "$out")"
+  local curl_rc=0
   local code
+  local snippet=""
+  # Write the artifact first so a transport or HTTP failure still leaves
+  # the status and body for evidence.
+  : >"${out}.body"
   code="$(curl -sS -o "${out}.body" -w '%{http_code}' --max-time 15 \
-    -X POST "http://${HTTP_ADDR}/v1/datasets/${name}/acceleration/refresh" || echo 000)"
-  echo "$code" >"${out}.status"
-  cat "${out}.body" >"${out}.body.txt" 2>/dev/null || true
-  echo "refresh ${name} -> HTTP ${code} $(tr -d '\n' <"${out}.body" | head -c 200)"
+    -X POST "http://${HTTP_ADDR}/v1/datasets/${name}/acceleration/refresh")" || curl_rc=$?
+  echo "${code:-000}" >"${out}.status"
+  cat "${out}.body" >"${out}.body.txt"
+  snippet="$(tr -d '\n' <"${out}.body" | head -c 200 || true)"
+  echo "refresh ${name} -> HTTP ${code:-000} ${snippet}"
+  if (( curl_rc != 0 )); then
+    die "refresh ${name} transport failed (curl=${curl_rc} http=${code:-000})"
+  fi
+  if [[ ! "${code}" =~ ^2[0-9][0-9]$ ]]; then
+    die "refresh ${name} HTTP ${code:-000}"
+  fi
 }
 
 dataset_refresh_fields() {

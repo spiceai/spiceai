@@ -22,6 +22,7 @@ This directory is the maintained source for verifying user-visible file-connecto
 
 - Proof is the query response, dataset status, and matching `WARN` / refresh-error log lines — not a unit test.
 - A refresh that returns `201` is not done; poll status until it leaves `Refreshing`.
+- A refresh POST that fails transport or returns non-2xx is not accepted; stop before polling so a leftover `Ready` or an older task-history row cannot look like completion.
 - After a refresh is expected to fail, `/v1/ready` may be `503`. Still query over HTTP.
 - Report an unreachable path with the command and the unmet precondition.
 

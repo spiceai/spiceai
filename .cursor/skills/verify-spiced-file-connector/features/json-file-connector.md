@@ -41,7 +41,7 @@ Preconditions:
 
 - JSON already binds by name, so a key reorder on trunk is not the bug. The trunk bug is a rename: sampled schema inference cannot prove a key absent, so an Arrow refresh overwrites the column with `NULL` and status stays `Ready`.
 - Two datasets share `data/events.jsonl`. Rewrite the file once; query federated, then refresh accelerated.
-- `POST .../refresh` returns before the refresh finishes. Poll status.
+- `POST .../refresh` returns before the refresh finishes. Poll status only after a 2xx POST. A transport error or non-2xx response is a failed refresh, not a reason to poll.
 - After `json_acc` is `Error`, `/v1/ready` may be `503`. Federated queries still run.
 - A sparse `amount_cents` that appears only after the first records is not a rename. Do not treat that file as the rename fixture.
 - An unregistered key that changes type after registration (`extra: 1` then `extra: {}`) is not a rename. The listing test `create_listing_table_allows_json_unregistered_field_type_change_on_refresh` is the proof; the HTTP helper does not rewrite that fixture.
