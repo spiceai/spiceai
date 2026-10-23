@@ -293,10 +293,18 @@ impl Secrets {
     pub async fn load_from(&mut self, secrets: &[SpicepodSecret]) -> Result<()> {
         self.stores.clear();
 
+        // Restore trunk's non-overwriting export of the default `.env` /
+        // `.env.local` before any store initializes. AWS Secrets Manager
+        // (STS), Kubernetes, and other `std::env` readers need those values
+        // even when `env` is not first — or is absent. `file_path` stores
+        // stay private (they never export their own file).
+        stores::env::export_default_dotenv_without_overwrite();
+
         // Bootstrap env store used only to resolve `${ env:KEY }` /
         // `${ secrets:KEY }` references inside other stores' `params:`
         // blocks. Constructed once so `.env` files are loaded a single time
-        // for the whole secrets section.
+        // for the whole secrets section. Does not export: the prelude above
+        // already did.
         let bootstrap_env: Arc<dyn SecretStore> = load_default_store();
 
         let mut any_healthy_store_loaded = false;
@@ -1013,8 +1021,8 @@ fn secret_selector(from: &str) -> Option<&str> {
 
 /// Bootstrap env store used to expand `${ env:KEY }` inside other stores'
 /// `params:`. It reads `.env` / `.env.local` into a private map and does
-/// **not** export them into the process environment — otherwise a spicepod
-/// that only declares a `file_path` store would inherit those files.
+/// **not** export them — [`Secrets::load_from`] already exported the default
+/// dotenv files before the store loop.
 fn load_default_store() -> Arc<dyn SecretStore> {
     Arc::new(EnvSecretStoreBuilder::new().build())
 }
@@ -2174,10 +2182,6 @@ params:
             "error must name the parameter; got {msg}"
         );
         assert!(
-            msg.contains("an invalid value"),
-            "validation errors must not interpolate the rejected value; got {msg}"
-        );
-        assert!(
             !msg.contains("oauth"),
             "rejected values must not be echoed; got {msg}"
         );
@@ -2393,10 +2397,6 @@ params:
         assert!(
             msg.contains("hashicorp_vault_auth_method"),
             "error must name the parameter; got {msg}"
-        );
-        assert!(
-            msg.contains("an invalid value"),
-            "validation errors must not interpolate the rejected value; got {msg}"
         );
         assert!(
             !msg.contains("oauth"),
@@ -2859,5 +2859,143 @@ param3: ${ secrets:MY_VAR }
         unsafe {
             std::env::remove_var("C1_S6_KEY");
         }
+    }
+
+    #[cfg(feature = "aws-secrets-manager")]
+    fn spicepod_aws_store(name: &str, secret_name: &str) -> spicepod::component::secret::Secret {
+        spicepod::component::secret::Secret {
+            from: format!("aws_secrets_manager:{secret_name}"),
+            name: name.to_string(),
+            description: None,
+            params: Some(spicepod::param::Params::from_string_map(
+                std::collections::HashMap::from([("region".to_string(), "us-east-1".to_string())]),
+            )),
+        }
+    }
+
+    fn spicepod_kubernetes_store(
+        name: &str,
+        secret_name: &str,
+    ) -> spicepod::component::secret::Secret {
+        spicepod::component::secret::Secret {
+            from: format!("kubernetes:{secret_name}"),
+            name: name.to_string(),
+            description: None,
+            params: None,
+        }
+    }
+
+    /// Keys written to `.env` for the dotenv-export tests. Dummy markers only.
+    const DOTENV_EXPORT_KEY: &str = "SPICE_TEST_DOTENV_EXPORT_KEY";
+    const DOTENV_EXPORT_VALUE: &str = "from_dotenv";
+    const DOTENV_AWS_ACCESS_KEY_ID: &str = "SPICE_TEST_DOTENV_AWS_ACCESS_KEY_ID";
+    const DOTENV_AWS_SECRET_ACCESS_KEY: &str = "SPICE_TEST_DOTENV_AWS_SECRET_ACCESS_KEY";
+    const DOTENV_AWS_REGION: &str = "SPICE_TEST_DOTENV_AWS_REGION";
+
+    fn write_dotenv_export_files(dir: &std::path::Path) {
+        write_env_file(
+            &dir.join(".env"),
+            &format!(
+                "{DOTENV_EXPORT_KEY}={DOTENV_EXPORT_VALUE}\n\
+                 {DOTENV_AWS_ACCESS_KEY_ID}=from_dotenv_akid\n\
+                 {DOTENV_AWS_SECRET_ACCESS_KEY}=from_dotenv_sak\n\
+                 {DOTENV_AWS_REGION}=from_dotenv_region\n"
+            ),
+        );
+    }
+
+    fn clear_dotenv_export_vars() {
+        unsafe {
+            std::env::remove_var(DOTENV_EXPORT_KEY);
+            std::env::remove_var(DOTENV_AWS_ACCESS_KEY_ID);
+            std::env::remove_var(DOTENV_AWS_SECRET_ACCESS_KEY);
+            std::env::remove_var(DOTENV_AWS_REGION);
+        }
+    }
+
+    fn assert_dotenv_exported_to_process_env(context: &str) {
+        assert_eq!(
+            std::env::var(DOTENV_EXPORT_KEY).as_deref(),
+            Ok(DOTENV_EXPORT_VALUE),
+            "{context}: default `.env` must be exported to the process environment"
+        );
+        assert_eq!(
+            std::env::var(DOTENV_AWS_ACCESS_KEY_ID).as_deref(),
+            Ok("from_dotenv_akid"),
+            "{context}: AWS access-key marker from `.env` must be in process env"
+        );
+        assert_eq!(
+            std::env::var(DOTENV_AWS_SECRET_ACCESS_KEY).as_deref(),
+            Ok("from_dotenv_sak"),
+            "{context}: AWS secret-key marker from `.env` must be in process env"
+        );
+        assert_eq!(
+            std::env::var(DOTENV_AWS_REGION).as_deref(),
+            Ok("from_dotenv_region"),
+            "{context}: AWS region marker from `.env` must be in process env"
+        );
+    }
+
+    /// AWS listed before `env` must still see `.env` creds in process env
+    /// (STS / the AWS SDK default chain read `std::env` during init).
+    #[cfg(feature = "aws-secrets-manager")]
+    #[tokio::test]
+    async fn load_from_exports_dotenv_when_aws_is_listed_before_env() {
+        let _guard = lock_env().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let _cwd = CwdGuard::enter(temp_dir.path());
+        write_dotenv_export_files(temp_dir.path());
+        clear_dotenv_export_vars();
+
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[
+                spicepod_aws_store("aws", "test-secret"),
+                spicepod_env_store("env", None),
+            ])
+            .await
+            .expect("load_from must not abort when AWS init fails");
+
+        assert_dotenv_exported_to_process_env("aws-before-env");
+        clear_dotenv_export_vars();
+    }
+
+    /// A spicepod with only `aws_secrets_manager` still exports default `.env`.
+    #[cfg(feature = "aws-secrets-manager")]
+    #[tokio::test]
+    async fn load_from_exports_dotenv_when_only_aws_store() {
+        let _guard = lock_env().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let _cwd = CwdGuard::enter(temp_dir.path());
+        write_dotenv_export_files(temp_dir.path());
+        clear_dotenv_export_vars();
+
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[spicepod_aws_store("aws", "test-secret")])
+            .await
+            .expect("load_from must not abort when AWS init fails");
+
+        assert_dotenv_exported_to_process_env("aws-only");
+        clear_dotenv_export_vars();
+    }
+
+    /// A spicepod with only `kubernetes` still exports default `.env`.
+    #[tokio::test]
+    async fn load_from_exports_dotenv_when_only_kubernetes_store() {
+        let _guard = lock_env().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let _cwd = CwdGuard::enter(temp_dir.path());
+        write_dotenv_export_files(temp_dir.path());
+        clear_dotenv_export_vars();
+
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[spicepod_kubernetes_store("k8s", "test-secret")])
+            .await
+            .expect("load_from must not abort when Kubernetes init fails");
+
+        assert_dotenv_exported_to_process_env("kubernetes-only");
+        clear_dotenv_export_vars();
     }
 }

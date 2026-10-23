@@ -31,13 +31,14 @@ limitations under the License.
 //!
 //! # Process environment
 //!
-//! The default (no `file_path`) store also exports its file-loaded values
-//! into the process environment without overwriting existing variables, so
+//! `Secrets::load_from` always exports project `.env` / `.env.local` into the
+//! process environment without overwrite **before** any store initializes, so
 //! libraries that read `std::env` directly (the AWS SDK default credential
-//! chain) keep working. A `file_path` store never exports. The bootstrap
-//! store used to expand other stores' `params:` also does not export, so a
-//! spicepod that only declares a `file_path` store does not inherit project
-//! `.env` files through the process environment.
+//! chain, `AWS_REGION`, `GOOGLE_APPLICATION_CREDENTIALS`) keep working even
+//! when `env` is not first — or is absent. A registered default env store
+//! (no `file_path`) also exports the same way. A `file_path` store never
+//! exports its own file. The bootstrap store used to expand other stores'
+//! `params:` does not export again; the prelude already did.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -210,6 +211,15 @@ where
             }
         }
     }
+}
+
+/// Non-overwriting export of project `.env` / `.env.local` into the process
+/// environment. Called once at the start of [`crate::Secrets::load_from`] so
+/// stores that read `std::env` during init see those values even when no
+/// `env` store is registered first — or at all.
+pub(crate) fn export_default_dotenv_without_overwrite() {
+    let values = load_values(None);
+    export_without_overwrite(&values);
 }
 
 /// # Safety
