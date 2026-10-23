@@ -480,19 +480,18 @@ impl ElasticsearchIndexWriteMaintenance {
     ///
     /// A [`WriteWindow::ReplaceAll`] write snapshots the index (see [`ReplaceSnapshot`]) so
     /// [`Self::on_write_complete`] can delete the documents of every row the write dropped.
-    /// Every start replaces the snapshot it finds: a replacing write's with a fresh one, any
-    /// other write's with none. The sinks run each index's `on_write_start` before the write
-    /// sends any row, so a fresh snapshot never misses one of this write's rows. A snapshot
-    /// still here was left by a replacing write that was dropped without `on_write_failed`,
-    /// as a refresh request arriving mid-refresh drops the running one. That snapshot
-    /// predates the dropped write's rows: a replacing write reconciling against it would keep
-    /// a row the dropped write rewrote, and an append reconciling against it would delete the
-    /// documents of every row the dropped write had not re-sent yet.
+    /// The sinks run each index's `on_write_start` before the write sends any row, so the
+    /// snapshot never misses one of this write's rows. Every start first closes the snapshot
+    /// it finds: one still here belongs to a replacing write that was dropped without
+    /// `on_write_failed`, as a refresh request arriving mid-refresh drops the running one and
+    /// can change the refresh mode. It predates the dropped write's rows, so a replacing write
+    /// reconciling against it would keep a row the dropped write rewrote, and an append would
+    /// delete the documents of every row the dropped write had not re-sent.
     ///
     /// A failed start that opened the cycle leaves no cycle open: the caller does not call
     /// `on_write_failed` on an index whose own start failed, so the next write would otherwise
     /// skip the tuning. A failed start inside a cycle an earlier start opened leaves that
-    /// cycle open, so its `on_write_complete` still restores what it overrode. The snapshot
+    /// cycle open, so its `on_write_complete` still restores what it overrode. A snapshot
     /// outlives a failed tuning: the tuning is best-effort, the sink writes without it, and
     /// that write still has to remove the rows it dropped.
     pub async fn on_write_start(
@@ -502,24 +501,26 @@ impl ElasticsearchIndexWriteMaintenance {
         window: WriteWindow,
     ) -> Result<(), DataFusionError> {
         let first_start = !self.write_cycle_active.swap(true, Ordering::AcqRel);
-        let snapshot = match window {
-            WriteWindow::ReplaceAll => ReplaceSnapshot::open(client, es_index).await,
-            WriteWindow::Append => Ok(None),
+        let stale = self.replace_snapshot.lock().take();
+        if let Some(stale) = stale {
+            stale.close(client.as_ref(), es_index).await;
+        }
+        let started = async {
+            if window == WriteWindow::ReplaceAll {
+                let snapshot = ReplaceSnapshot::open(client, es_index).await?;
+                *self.replace_snapshot.lock() = snapshot;
+            }
+            if first_start {
+                self.tune_refresh_interval(client.as_ref(), es_index)
+                    .await?;
+            }
+            Ok(())
         };
-        let snapshot = snapshot.inspect_err(|_| {
-            self.replace_snapshot.lock().take();
+        started.await.inspect_err(|_| {
             if first_start {
                 self.abandon_write_cycle();
             }
-        })?;
-        *self.replace_snapshot.lock() = snapshot;
-
-        if first_start {
-            self.tune_refresh_interval(client.as_ref(), es_index)
-                .await
-                .inspect_err(|_| self.abandon_write_cycle())?;
-        }
-        Ok(())
+        })
     }
 
     async fn tune_refresh_interval(
@@ -576,10 +577,9 @@ impl ElasticsearchIndexWriteMaintenance {
         if let Some(snapshot) = snapshot {
             snapshot.close(client, es_index).await;
         }
-        if !self.write_cycle_active.swap(false, Ordering::AcqRel) {
-            return Ok(());
+        if self.write_cycle_active.swap(false, Ordering::AcqRel) {
+            self.restore_refresh_interval(client, es_index).await?;
         }
-        self.restore_refresh_interval(client, es_index).await?;
         Ok(())
     }
 
@@ -588,10 +588,10 @@ impl ElasticsearchIndexWriteMaintenance {
         client: &dyn Elasticsearch,
         es_index: &str,
     ) -> Result<(), DataFusionError> {
-        // Reconcile whether or not a cycle is open: a start whose tuning failed abandons its
-        // cycle but keeps its snapshot, and the write went ahead. Delete before the refresh
-        // below, so it publishes the deletions with the write; a failure still restores the
-        // refresh interval before it is reported.
+        // Reconcile whether or not a cycle is open, since a snapshot outlives a failed tuning
+        // (see `on_write_start`). Deleting first lets the refresh below, when one runs, publish
+        // the deletions with the write; a failure still restores the refresh interval before
+        // it is reported.
         let snapshot = self.replace_snapshot.lock().take();
         let reconciled = match snapshot {
             Some(snapshot) => snapshot.delete_unrewritten(client, es_index).await.map(|n| {

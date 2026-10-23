@@ -117,6 +117,12 @@ impl TestIndex {
             .on_write_start(window)
             .await
             .expect("on_write_start succeeds");
+        self.finish_write(batch).await;
+    }
+
+    /// Sends `batch` and completes the write, as the sink does after `on_write_start` returns,
+    /// whether that start succeeded or failed best-effort.
+    async fn finish_write(&self, batch: RecordBatch) {
         self.index
             .compute_index(vec![batch])
             .await
@@ -125,6 +131,20 @@ impl TestIndex {
             .on_write_complete()
             .await
             .expect("on_write_complete succeeds");
+    }
+
+    /// Starts a write and sends `batch`, then abandons it without `on_write_complete` or
+    /// `on_write_failed`, as the refresh runner does when a new refresh request arrives
+    /// mid-refresh.
+    async fn dropped_write(&self, window: WriteWindow, batch: RecordBatch) {
+        self.index
+            .on_write_start(window)
+            .await
+            .expect("on_write_start succeeds");
+        self.index
+            .compute_index(vec![batch])
+            .await
+            .expect("the dropped write's rows land");
     }
 
     /// Every document `_id` the index holds, after a refresh makes the last write visible.
@@ -298,14 +318,8 @@ async fn a_full_refresh_after_a_cancelled_one_removes_the_rows_it_dropped() {
         .await;
 
     // A refresh starts, rewrites row 1, and is dropped before it completes.
-    t.index
-        .on_write_start(WriteWindow::ReplaceAll)
-        .await
-        .expect("on_write_start succeeds");
-    t.index
-        .compute_index(vec![rows([1], "cancelled")])
-        .await
-        .expect("the cancelled refresh's rows land");
+    t.dropped_write(WriteWindow::ReplaceAll, rows([1], "cancelled"))
+        .await;
 
     // The next refresh no longer has row 1.
     t.write(WriteWindow::ReplaceAll, rows([2, 3], "second"))
@@ -320,9 +334,7 @@ async fn a_full_refresh_after_a_cancelled_one_removes_the_rows_it_dropped() {
 }
 
 /// A refresh request can override the refresh mode, so an append can be the request that
-/// supersedes a full refresh mid-write. The dropped refresh's snapshot is not the append's to
-/// reconcile: the refresh never re-sent most of the rows the dataset still has, so reconciling
-/// would delete their documents.
+/// supersedes a full refresh mid-write.
 #[tokio::test]
 async fn an_append_after_a_cancelled_full_refresh_removes_nothing() {
     let t = TestIndex::new("append-after-cancel").await;
@@ -330,14 +342,8 @@ async fn an_append_after_a_cancelled_full_refresh_removes_nothing() {
         .await;
 
     // A full refresh starts, rewrites row 1, and is dropped before it completes.
-    t.index
-        .on_write_start(WriteWindow::ReplaceAll)
-        .await
-        .expect("on_write_start succeeds");
-    t.index
-        .compute_index(vec![rows([1], "cancelled")])
-        .await
-        .expect("the cancelled refresh's rows land");
+    t.dropped_write(WriteWindow::ReplaceAll, rows([1], "cancelled"))
+        .await;
 
     t.write(WriteWindow::Append, rows([4], "appended")).await;
 
@@ -349,9 +355,8 @@ async fn an_append_after_a_cancelled_full_refresh_removes_nothing() {
     t.drop_index().await;
 }
 
-/// The `refresh_interval` override is tuning the write does not depend on: when Elasticsearch
-/// rejects it, the sink logs the failure and writes anyway. That write is still a full refresh,
-/// so it still has to remove the documents of the rows it dropped.
+/// When Elasticsearch rejects the `refresh_interval` override, the sink logs the failure and
+/// writes anyway, and that write is still a full refresh.
 #[tokio::test]
 async fn a_full_refresh_whose_refresh_interval_override_is_rejected_removes_the_rows_it_dropped() {
     let t = TestIndex::with_options(
@@ -368,28 +373,14 @@ async fn a_full_refresh_whose_refresh_interval_override_is_rejected_removes_the_
         .on_write_start(WriteWindow::ReplaceAll)
         .await
         .expect_err("the index does not exist yet, so its refresh_interval cannot be read");
-    t.index
-        .compute_index(vec![rows([1, 2, 3], "first")])
-        .await
-        .expect("the first write lands");
-    t.index
-        .on_write_complete()
-        .await
-        .expect("on_write_complete succeeds");
+    t.finish_write(rows([1, 2, 3], "first")).await;
     assert_eq!(t.ids().await, BTreeSet::from([1, 2, 3]));
 
     t.index
         .on_write_start(WriteWindow::ReplaceAll)
         .await
         .expect_err("Elasticsearch rejects the refresh_interval override");
-    t.index
-        .compute_index(vec![rows([1, 3], "second")])
-        .await
-        .expect("the refresh's rows land");
-    t.index
-        .on_write_complete()
-        .await
-        .expect("on_write_complete succeeds");
+    t.finish_write(rows([1, 3], "second")).await;
 
     assert_eq!(
         t.ids().await,
