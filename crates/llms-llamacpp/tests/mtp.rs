@@ -17,7 +17,8 @@ limitations under the License.
 //! Qwen3.5-0.8B, whose GGUF carries an MTP (`NextN`) layer the model drafts its own tokens with.
 
 use llama_cpp::{Backend, Model, ModelParams};
-use llms::chat::{HubParams, LocalModelOptions, ReasoningDefault};
+use llms::chat::{LocalModelOptions, ReasoningDefault};
+use llms::hf::HubParams;
 use serde_json::json;
 
 use crate::{fixture, numbers, request};

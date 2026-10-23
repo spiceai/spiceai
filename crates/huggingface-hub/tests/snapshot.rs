@@ -101,9 +101,18 @@ impl Fixture {
         revision: Option<&str>,
         extra: &[(&'static str, &str)],
     ) -> Result<Snapshot, huggingface_hub::DownloadError> {
+        self.try_open_for(requester(), revision, extra).await
+    }
+
+    async fn try_open_for(
+        &self,
+        requester: Requester,
+        revision: Option<&str>,
+        extra: &[(&'static str, &str)],
+    ) -> Result<Snapshot, huggingface_hub::DownloadError> {
         Snapshot::open(
             self.settings(extra).await,
-            requester(),
+            requester,
             RepoId::new(RepoType::Model, "o", "m").expect("a valid repository"),
             revision,
         )
@@ -116,6 +125,7 @@ fn requester() -> Requester {
         kind: "model",
         name: "test".to_string(),
         docs_url: "https://spiceai.org/docs/components/models/huggingface",
+        retried: true,
     }
 }
 
@@ -636,6 +646,30 @@ async fn a_renamed_repo_is_read_through_the_hubs_redirect() {
             && seen.iter().any(|path| path.starts_with("/o/old/resolve/"))
             && seen.iter().any(|path| path.starts_with("/o/m/resolve/")),
         "{seen:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_component_spice_loads_once_says_to_restart() {
+    // Spice loads an embedding model or a reranker once, so only a restart downloads it again.
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    fixture.mock.faults(|faults| faults.hub_down = true);
+
+    let embedding_model = Requester {
+        kind: "embedding model",
+        name: "e5".to_string(),
+        docs_url: "https://spiceai.org/docs/components/embeddings/huggingface",
+        retried: false,
+    };
+    let error = fixture
+        .try_open_for(embedding_model, None, &[])
+        .await
+        .expect_err("nothing is cached");
+    assert_eq!(
+        error.to_string(),
+        "Failed to download embedding model 'e5' from Hugging Face repo 'o/m' (revision 'main'): the Hugging Face Hub returned HTTP 503 after 5 attempt(s): The Hub is down. Check the network connection, then restart Spice. See: https://spiceai.org/docs/components/embeddings/huggingface"
     );
 }
 
