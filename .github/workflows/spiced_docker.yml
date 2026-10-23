@@ -208,6 +208,24 @@ jobs:
               ;;
           esac
 
+          # A release can be marked 'latest' before build_and_release has
+          # attached its binaries, and Dockerfile-release would 404 on them.
+          # build_and_release builds the images itself once its `publish` jobs
+          # attach them, so skip an architecture whose binary is not there yet.
+          # A failed lookup still fails the run.
+          if [ "$event_name" = "release" ]; then
+            assets=$(gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" --json assets -q '.assets[].name')
+            for arch in x86_64 aarch64; do
+              if ! grep -qxF "spiced_linux_${arch}.tar.gz" <<<"$assets"; then
+                echo "::notice::${release_tag} has no spiced_linux_${arch}.tar.gz yet; build_and_release builds this image once it attaches the binary."
+                case "$arch" in
+                  x86_64) run_amd64=false ;;
+                  aarch64) run_arm64=false ;;
+                esac
+              fi
+            done
+          fi
+
           # Determine if this release should be tagged as 'latest'.
           #
           # Rule: ONLY apply the ':latest' Docker tag when the GitHub release
