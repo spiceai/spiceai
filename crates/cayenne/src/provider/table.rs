@@ -38961,13 +38961,20 @@ impl CayenneTableProvider {
     }
 
     /// Publish a committed delete: its file-side deletions, its inline rewrite,
-    /// and its inline tombstone.
+    /// and its inline tombstone, all under one hold. Scans capture the inline
+    /// view and the deletion view under the listing fence and
+    /// `scan_state_lock`, so no scan sees the delete applied to the files but not
+    /// to the inline rows, or the reverse. The locks are taken in the order the
+    /// inline insert publish takes them.
     pub(crate) async fn publish_committed_delete(
         &self,
         prepared_file_delete: Option<super::delete::PreparedDeletionPublish>,
         inline_rewrite: &InlinedDataRewrite,
         inline_tombstone: Option<PreparedInlineDeleteTombstone>,
     ) -> Result<()> {
+        let _visibility = self.visibility_lock_arc().lock_owned().await;
+        let _fence = self.lock_listing_fence_write_owned().await;
+        let _view_guard = self.scan_state_lock.write().await;
         if let Some(prepared) = prepared_file_delete {
             prepared.publish()?;
         }
