@@ -516,7 +516,7 @@ async fn concurrent_same_key_partitioned_updates_keep_the_row() {
     test_request_context()
         .scope(async {
             const UPDATES: i64 = 8;
-            let rows = "id,region,ts,v\n1,us,2026-01-01T00:00:00,10\n";
+            let rows = "id,region,ts,v\n1,us,2026-01-01T00:00:00,\"10\"\n";
             let case = Case {
                 mode: Mode::File,
                 refresh: RefreshMode::Full,
@@ -532,7 +532,11 @@ async fn concurrent_same_key_partitioned_updates_keep_the_row() {
             )
             .await;
             assert!(ready, "{label}: the row loads");
-            assert_eq!(value_of(&rt, 1).await, ["10"], "{label}: seed");
+            assert_eq!(
+                rows_of(&rt, "SELECT CAST(v AS VARCHAR) FROM t WHERE id = 1").await,
+                ["10"],
+                "{label}: seed"
+            );
 
             let rt = Arc::new(rt);
             let mut joins = Vec::with_capacity(usize::try_from(UPDATES).expect("fits"));
@@ -574,7 +578,7 @@ async fn concurrent_same_key_partitioned_updates_keep_the_row() {
             }
 
             assert_eq!(
-                value_of(&rt, 1).await,
+                rows_of(&rt, "SELECT CAST(v AS VARCHAR) FROM t WHERE id = 1").await,
                 [format!("{}", 10 + UPDATES)],
                 "{label}: every increment applies and the row remains"
             );
