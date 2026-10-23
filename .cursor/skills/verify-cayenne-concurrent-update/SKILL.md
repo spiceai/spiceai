@@ -16,6 +16,7 @@ After `N` updates with `T` threads, in both `MODE=file` and `MODE=memory`:
 - `amount = start + (number of count=1 responses)`
 - no statement returns `count: 0` without a conflict error
 - every HTTP status is 200, or a 409 with a retryable conflict (no silent 0)
+- every HTTP 200 UPDATE body is a 0 or 1 affected-row count (empty array, non-JSON, missing `count`, or any other N fails the harness)
 
 Minimum arms: `2 200` and `16 200`, file and memory.
 
@@ -34,6 +35,12 @@ MODE=memory .cursor/skills/verify-cayenne-concurrent-update/30_cayenne_concurren
 ```
 
 The script starts its own `spiced` on `8393/50393/9393`, loads 1000 parquet rows into `o_cayenne`, runs the updates, prints before/after, checks the success criteria, and tears down. It generates `data/orders.parquet` next to the script via `00_setup_data.py` on first run.
+
+Reply parsing lives in `30_cayenne_concurrent_update_row_loss.py`. Replay malformed HTTP 200 bodies against a stub transport (no `spiced`):
+
+```bash
+python3 .cursor/skills/verify-cayenne-concurrent-update/30_cayenne_concurrent_update_row_loss.py --replay-malformed
+```
 
 `spiced` must be the binary under test (`make install-dev` or `cargo build -p spiced`). Set `SPICED=` to pin a binary. Record the commit SHA with every run.
 
