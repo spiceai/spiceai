@@ -257,8 +257,12 @@ async fn run(cli: Cli) -> Result<bool> {
     while let Some((script, report, out, waited)) = futures::StreamExt::next(&mut running).await {
         print!("{out}");
         let report = report?;
-        // From its first slot, not from when it started waiting for one.
-        let took = report.started.map_or(waited, |t| t.elapsed());
+        // The time it held slots, not the time it waited for them.
+        let took = if report.ran.is_zero() {
+            waited
+        } else {
+            report.ran
+        };
         done += 1;
         let problems = if cli.record_failures {
             ledger.record(script, &report.failures);

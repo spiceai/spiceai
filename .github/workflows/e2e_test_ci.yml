@@ -2918,17 +2918,23 @@ jobs:
     name: ${{ matrix.name }}
     needs: [build, build_spicescript]
     runs-on: spiceai-dev-runners
-    timeout-minutes: 120
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Scripts that pass: any failure fails the job.
-          - { name: 'spicescript: scripts', args: test/spicescript }
+          # Scripts that pass: any failure fails the job. Each shard runs
+          # its share of the scripts (--partition), balanced by their
+          # recorded durations.
+          - { name: 'spicescript: scripts (1/4)', partition: 1/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (2/4)', partition: 2/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (3/4)', partition: 3/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (4/4)', partition: 4/4, args: test/spicescript }
           # Scripts that reproduce open bugs: each must fail exactly as its
           # group's recordings/expected-failures.json says, so a fix or a
           # change in how a bug shows also fails the job.
-          - { name: 'spicescript: known failing', args: --max-wait 30s test/spicescript/known-failing }
+          - { name: 'spicescript: known failing (1/2)', partition: 1/2, args: --max-wait 30s test/spicescript/known-failing }
+          - { name: 'spicescript: known failing (2/2)', partition: 2/2, args: --max-wait 30s test/spicescript/known-failing }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -2986,6 +2992,7 @@ jobs:
       - name: Run scenario scripts
         run: |
           "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+            --partition ${{ matrix.partition }} \
             --spiced "$(command -v spiced)" \
             --spice-cli "$(command -v spice)" \
             --work-dir "$RUNNER_TEMP/spicescript" \

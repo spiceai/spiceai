@@ -128,12 +128,86 @@ impl Slots {
         }
     }
 
-    /// Waits for `n` slots (all of them when `n` is more than there are).
-    async fn take(&self, n: u32) -> Result<tokio::sync::OwnedSemaphorePermit> {
-        Arc::clone(&self.semaphore)
+    /// Waits for `n` slots (all of them when `n` is more than there are),
+    /// counting the time they are held toward each of `busy`.
+    async fn take(&self, n: u32, busy: &[Arc<Busy>]) -> Result<Held> {
+        let permit = Arc::clone(&self.semaphore)
             .acquire_many_owned(n.clamp(1, self.size))
             .await
-            .context("the --jobs budget was closed")
+            .context("the --jobs budget was closed")?;
+        for b in busy {
+            b.enter();
+        }
+        Ok(Held {
+            _permit: permit,
+            busy: busy.to_vec(),
+        })
+    }
+}
+
+/// The time a script, or one of its matrix combinations, holds slots: the
+/// time it runs, without the time it waits for them. Overlapping holds by
+/// several instances count once.
+#[derive(Default)]
+pub struct Busy(parking_lot::Mutex<BusyState>);
+
+#[derive(Default)]
+struct BusyState {
+    holding: usize,
+    since: Option<Instant>,
+    total: Duration,
+}
+
+impl Busy {
+    fn enter(&self) {
+        let mut state = self.0.lock();
+        if state.holding == 0 {
+            state.since = Some(Instant::now());
+        }
+        state.holding += 1;
+    }
+
+    fn leave(&self) {
+        let mut state = self.0.lock();
+        state.holding = state.holding.saturating_sub(1);
+        if state.holding == 0
+            && let Some(since) = state.since.take()
+        {
+            state.total += since.elapsed();
+        }
+    }
+
+    pub fn total(&self) -> Duration {
+        let state = self.0.lock();
+        state.total + state.since.map_or(Duration::ZERO, |since| since.elapsed())
+    }
+}
+
+/// [`Slots`] taken for one matrix combination of a script, their time counted
+/// toward the script's tracker and the combination's.
+struct ComboSlots<'a> {
+    slots: &'a Slots,
+    busy: [Arc<Busy>; 2],
+}
+
+impl ComboSlots<'_> {
+    async fn take(&self, n: u32) -> Result<Held> {
+        self.slots.take(n, &self.busy).await
+    }
+}
+
+/// Slots taken from [`Slots`]; their time counts toward each tracker until
+/// they are dropped.
+struct Held {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    busy: Vec<Arc<Busy>>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        for b in &self.busy {
+            b.leave();
+        }
     }
 }
 
@@ -313,9 +387,9 @@ impl std::error::Error for QueryFailures {}
 pub struct Report {
     pub passed: usize,
     pub failures: Vec<Failure>,
-    /// When the script first held slots: its run time starts here, not
-    /// while it waited for them.
-    pub started: Option<Instant>,
+    /// How long the script held slots: its run time, without the time it
+    /// waited for them.
+    pub ran: Duration,
 }
 
 struct Instance {
@@ -445,45 +519,58 @@ impl Sources {
 }
 
 pub async fn run_script(script: &Script, options: &Options, slots: &Slots) -> Result<Report> {
+    let script_busy = Arc::new(Busy::default());
     let runs = matrix_combinations(&script.matrix)
         .into_iter()
         .enumerate()
-        .map(|(combo_index, combo)| async move {
-            let run_label = script.run_label(&combo);
-            let run_id = format!(
-                "{}-{combo_index}-{}",
-                sanitize(&script.name),
-                std::process::id()
-            );
-            buffered(async {
-                match &script.description {
-                    Some(d) => say!("== {run_label}: {}", one_line(d, 120)),
-                    None => say!("== {run_label}"),
-                }
-                let started = Instant::now();
-                let mut report = Report::default();
-                if let Err(e) = run_combination(
-                    script,
-                    options,
-                    slots,
-                    &combo,
-                    &run_id,
-                    &run_label,
-                    &mut report,
-                )
-                .await
-                {
-                    report
-                        .failures
-                        .push(Failure::outside_steps(&run_label, "", &format!("{e:#}")));
-                }
-                say!(
-                    "== {run_label} finished in {:.1}s",
-                    started.elapsed().as_secs_f64()
+        .map(|(combo_index, combo)| {
+            let script_busy = Arc::clone(&script_busy);
+            async move {
+                let run_label = script.run_label(&combo);
+                let run_id = format!(
+                    "{}-{combo_index}-{}",
+                    sanitize(&script.name),
+                    std::process::id()
                 );
-                report
-            })
-            .await
+                buffered(async {
+                    match &script.description {
+                        Some(d) => say!("== {run_label}: {}", one_line(d, 120)),
+                        None => say!("== {run_label}"),
+                    }
+                    let started = Instant::now();
+                    let combo_busy = Arc::new(Busy::default());
+                    let combo_slots = ComboSlots {
+                        slots,
+                        busy: [Arc::clone(&script_busy), Arc::clone(&combo_busy)],
+                    };
+                    let mut report = Report::default();
+                    if let Err(e) = run_combination(
+                        script,
+                        options,
+                        &combo_slots,
+                        &combo,
+                        &run_id,
+                        &run_label,
+                        &mut report,
+                    )
+                    .await
+                    {
+                        report.failures.push(Failure::outside_steps(
+                            &run_label,
+                            "",
+                            &format!("{e:#}"),
+                        ));
+                    }
+                    let ran = combo_busy.total();
+                    say!(
+                        "== {run_label} finished: ran {:.1}s, waited {:.1}s for slots",
+                        ran.as_secs_f64(),
+                        started.elapsed().saturating_sub(ran).as_secs_f64()
+                    );
+                    report
+                })
+                .await
+            }
         });
     // Combinations run side by side as slots allow; their output keeps
     // their order.
@@ -492,18 +579,15 @@ pub async fn run_script(script: &Script, options: &Options, slots: &Slots) -> Re
         say!("{}", out.trim_end_matches('\n'));
         report.passed += part.passed;
         report.failures.extend(part.failures);
-        report.started = match (report.started, part.started) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
     }
+    report.ran = script_busy.total();
     Ok(report)
 }
 
 async fn run_combination(
     script: &Script,
     options: &Options,
-    slots: &Slots,
+    slots: &ComboSlots<'_>,
     combo: &Map<String, Value>,
     run_id: &str,
     run_label: &str,
@@ -529,11 +613,6 @@ async fn run_combination(
             Schedule::Exclusive => u32::MAX,
         })
         .await?;
-    report.started = Some(
-        report
-            .started
-            .map_or_else(Instant::now, |t| t.min(Instant::now())),
-    );
     let mut sources = Sources {
         by_name: IndexMap::new(),
         state: BTreeMap::new(),
@@ -896,9 +975,9 @@ async fn run_independent(
     steps: &[Step],
     instances: &mut [Instance],
     sources: &Sources,
-    slots: &Slots,
+    slots: &ComboSlots<'_>,
     weight: u32,
-    first_permit: tokio::sync::OwnedSemaphorePermit,
+    first_permit: Held,
     report: &mut Report,
     run_label: &str,
 ) {
@@ -1204,6 +1283,29 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn busy_counts_overlapping_holds_once_and_no_idle_time() {
+        // Real time is what is measured, so the test sleeps: one hold, a
+        // second overlapping it, the first ends, the second ends, then idle.
+        let busy = Busy::default();
+        let step = Duration::from_millis(40);
+        busy.enter();
+        std::thread::sleep(step);
+        busy.enter();
+        std::thread::sleep(step);
+        busy.leave();
+        std::thread::sleep(step);
+        busy.leave();
+        std::thread::sleep(step * 2);
+        let total = busy.total();
+        // Held for 3 steps (120 ms). Each hold counted on its own would be
+        // 160 ms, and counting the idle time 200 ms.
+        assert!(
+            total >= step * 3 && total < Duration::from_millis(150),
+            "{total:?}"
+        );
+    }
 
     #[test]
     fn matrix_is_the_cartesian_product_in_declaration_order() {
