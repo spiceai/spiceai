@@ -445,7 +445,12 @@ async fn huggingface(
     };
 
     let model_type = params.model_type.as_deref();
-    let hf_token = params.hf_token.as_ref();
+    let hub = llms::hf::HubParams {
+        token: params.hf_token.as_ref(),
+        // A chat model's `hf_token` is never loaded from a secret store.
+        token_in_spicepod: true,
+        endpoint: params.hf_endpoint.as_deref(),
+    };
 
     // For GGUF models, we require user specify via `.files[].path`
     let gguf_path = component
@@ -482,8 +487,8 @@ async fn huggingface(
     llms::chat::create_hf_model(
         &id,
         model_type,
-        gguf_path,
-        hf_token,
+        gguf_path.as_deref().and_then(|path| path.to_str()),
+        hub,
         chat_template_literal,
         distributed,
         llms::chat::ReasoningDefault {
