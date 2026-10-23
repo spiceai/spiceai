@@ -142,7 +142,7 @@ Each side runs in a subshell. An `EXIT` trap installed before launch always runs
 .cursor/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh cleanup --work "$WORK_DIR"
 ```
 
-Sends `TERM` (then `KILL` if needed) only to the pid in `$WORK_DIR/spiced.pid` when `$WORK_DIR/spiced.identity` still names that same process (pid, executable, `/proc/<pid>/stat` starttime). Refuses to signal when ownership cannot be established. Removes the work dir's runtime scratch (pidfile, identity, `.spice/`). Leaves `$EVIDENCE_DIR` untouched.
+Sends `TERM` (then `KILL` if needed) only to the pid in `$WORK_DIR/spiced.pid` when `$WORK_DIR/spiced.identity` still names that same process (pid, executable, `/proc/<pid>/stat` starttime). An unreaped zombie (state `Z`) is stopped: `kill -0` still succeeds, but `/proc/<pid>/exe` is gone, so cleanup treats `Z` as gone instead of an ownership change. An unreadable process state is not treated as terminated. Refuses to signal when ownership cannot be established. Removes the work dir's runtime scratch (pidfile, identity, `.spice/`). Leaves `$EVIDENCE_DIR` untouched.
 
 ## Helpers
 

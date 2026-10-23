@@ -58,16 +58,50 @@ logfile() { echo "${WORK}/spiced.log"; }
 binfile() { echo "${WORK}/spiced.binary"; }
 identityfile() { echo "${WORK}/spiced.identity"; }
 
-# /proc/<pid>/stat field 22 (starttime). comm can contain spaces and parens,
-# so split on the last `)` and take the 20th remaining field.
-process_starttime() {
+# /proc/<pid>/stat fields after comm. comm can contain spaces and parens,
+# so split on the last `)`. Index 0 is state; 19 is starttime (field 22).
+# Empty stdout when the file is unreadable — never treat empty as a value.
+process_stat_field() {
   local pid="$1"
-  python3 - "$pid" <<'PY'
+  local index="$2"
+  python3 - "$pid" "$index" <<'PY'
 import pathlib, sys
 pid = sys.argv[1]
-text = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-print(text.rsplit(")", 1)[1].split()[19])
+index = int(sys.argv[2])
+try:
+    text = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+except OSError:
+    sys.exit(0)
+parts = text.rsplit(")", 1)
+if len(parts) != 2:
+    sys.exit(0)
+fields = parts[1].split()
+if index < 0 or index >= len(fields):
+    sys.exit(0)
+print(fields[index])
 PY
+}
+
+process_starttime() {
+  local start
+  start="$(process_stat_field "$1" 19)"
+  [[ -n "$start" ]] || return 1
+  printf '%s\n' "$start"
+}
+
+process_state() {
+  process_stat_field "$1" 0
+}
+
+# Gone, or an unreaped zombie. `kill -0` succeeds for state Z, but
+# `/proc/<pid>/exe` is gone, so an identity check would look like a
+# recycled PID. An unreadable state is not proof of termination.
+process_is_stopped() {
+  local pid="$1"
+  kill -0 "$pid" 2>/dev/null || return 0
+  local state
+  state="$(process_state "$pid")"
+  [[ "$state" == "Z" ]]
 }
 
 write_process_identity() {
@@ -766,7 +800,7 @@ cmd_cleanup() {
   if [[ -f "$pf" ]]; then
     local pid
     pid="$(cat "$pf")"
-    if ! kill -0 "$pid" 2>/dev/null; then
+    if process_is_stopped "$pid"; then
       rm -f "$pf" "$identf"
       echo "pid ${pid} is already gone"
     else
@@ -783,14 +817,19 @@ cmd_cleanup() {
       kill -TERM "$pid" 2>/dev/null || true
       local i
       for i in $(seq 1 40); do
-        kill -0 "$pid" 2>/dev/null || break
+        process_is_stopped "$pid" && break
         sleep 0.1
       done
-      if kill -0 "$pid" 2>/dev/null; then
+      if ! process_is_stopped "$pid"; then
         if ! process_matches_identity "$pid" "$want_exe" "$want_start"; then
-          die "pid ${pid} changed identity before KILL; refusing to signal"
+          # Already sent TERM. A dying process can lose `/proc/<pid>/exe`
+          # before state is `Z` or `kill -0` fails. Re-check before treating
+          # that as a recycled PID.
+          process_is_stopped "$pid" || \
+            die "pid ${pid} changed identity before KILL; refusing to signal"
+        else
+          kill -KILL "$pid" 2>/dev/null || true
         fi
-        kill -KILL "$pid" 2>/dev/null || true
       fi
       rm -f "$pf" "$identf"
       echo "stopped pid=${pid}"
