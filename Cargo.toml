@@ -30,6 +30,7 @@ members = [
     "crates/document_parse",
     "crates/dotenv",
     "crates/duration-parse",
+    "crates/http-body-limit",
     "crates/dynamodb-streams",
     "crates/event_stream",
     "crates/flight_client",

@@ -59,6 +59,7 @@ futures.workspace = true
 moka.workspace = true
 globset.workspace = true
 hash-index = { path = "../hash-index", features = ["metrics"] }
+http-body-limit = { path = "../http-body-limit" }
 http.workspace = true
 httpdate.workspace = true
 iceberg.workspace = true
