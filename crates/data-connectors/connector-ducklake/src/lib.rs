@@ -20,7 +20,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::duckdb::with_utc_session_timezone;
+use data_components::duckdb::{install_and_load_extension, with_utc_session_timezone};
 use data_components::ducklake::writer::DuckDbFederatedTableWriter;
 use data_components::ducklake::{
     DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
@@ -181,19 +181,7 @@ fn create_ducklake_factory(
             source: Box::new(Error::FailedToGetDuckDbConnection),
         })?;
 
-    duckdb_wrapper
-        .conn
-        .execute("INSTALL ducklake", [])
-        .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
-        .map_err(|e| DataConnectorError::UnableToConnectInternal {
-            dataconnector: "ducklake".to_string(),
-            connector_component: params.component.clone(),
-            source: Box::new(e),
-        })?;
-
-    duckdb_wrapper
-        .conn
-        .execute("LOAD ducklake", [])
+    install_and_load_extension(&duckdb_wrapper.conn, "ducklake")
         .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
         .map_err(|e| DataConnectorError::UnableToConnectInternal {
             dataconnector: "ducklake".to_string(),
