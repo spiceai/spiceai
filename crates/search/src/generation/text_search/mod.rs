@@ -497,17 +497,60 @@ fn parse_user_query(parser: &QueryParser, literal: &str) -> Result<Box<dyn Query
     }
 }
 
-/// Whether `q` has a `*` directly followed by a character Tantivy's grammar reads as ending a word
-/// (other than `)`), e.g. `a *(b)` or `*"x"`.
+/// Whether `q` has a `*` that Tantivy's grammar would read as an exists query with no field.
 ///
-/// `QueryParser::parse_query` (tantivy-query-grammar 0.26) reads such a `*` as an exists query with
-/// no field and panics with "Exist query without a field isn't allowed" instead of returning an
-/// error (<https://github.com/quickwit-oss/tantivy/issues/3031>). The check also matches a `*`
-/// inside a word (`a*(`), which the grammar parses; those queries take the bag-of-words fallback.
+/// `QueryParser::parse_query` (tantivy-query-grammar 0.26) panics on such a `*` with "Exist query
+/// without a field isn't allowed" instead of returning an error
+/// (<https://github.com/quickwit-oss/tantivy/issues/3031>). Outside a quoted phrase and a range or
+/// set's brackets, that is:
+/// - a `*` that starts a term (at the start, or after whitespace, `(`, `+` or `-`) and is followed
+///   by a character that ends a word, other than `)`: `a *(b)`, `*"x"`;
+/// - a `+` or `-` followed by whitespace and then `*`: `- *`, `a + *`.
+///
+/// The check is conservative: a few queries the grammar does parse also match (`+ *x`), and those
+/// take the bag-of-words fallback.
 fn has_fieldless_exists(q: &str) -> bool {
-    q.as_bytes()
-        .windows(2)
-        .any(|w| w[0] == b'*' && b"^`:{}\"'[]\\(".contains(&w[1]))
+    let b = q.as_bytes();
+    let mut quote = None;
+    let mut bracket_depth = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            }
+        } else if c == b'"' || c == b'\'' {
+            quote = Some(c);
+        } else if c == b'[' || c == b'{' {
+            bracket_depth += 1;
+        } else if c == b']' || c == b'}' {
+            bracket_depth = bracket_depth.saturating_sub(1);
+        } else if bracket_depth == 0 {
+            if c == b'*' {
+                let starts_term = i == 0
+                    || matches!(b[i - 1], b'(' | b'+' | b'-')
+                    || b[i - 1].is_ascii_whitespace();
+                if starts_term && b.get(i + 1).is_some_and(|n| b"^`:{}\"'[]\\(".contains(n)) {
+                    return true;
+                }
+            } else if c == b'+' || c == b'-' {
+                let star = b[i + 1..]
+                    .iter()
+                    .position(|n| !n.is_ascii_whitespace())
+                    .map(|n| i + 1 + n);
+                if star.is_some_and(|j| j > i + 1 && b[j] == b'*') {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 // Parse a user-provided query to interpret it without terms (e.g. `IN ['foo', 'bar']`) or clauses (foo AND bar).
@@ -691,17 +734,26 @@ pub(crate) mod tests {
         QueryParser::for_index(&Index::create_in_ram(builder.build()), vec![text])
     }
 
-    /// A bare `*` before a word-ending character panicked inside Tantivy's parser
-    /// (quickwit-oss/tantivy#3031), failing the whole search request.
+    /// A fieldless `*` panicked inside Tantivy's parser (quickwit-oss/tantivy#3031), failing the
+    /// whole search request.
     #[test]
-    fn test_bare_star_before_word_end_falls_back_instead_of_panicking() {
+    fn test_fieldless_star_falls_back_instead_of_panicking() {
         let parser = text_parser();
-        for prefix in ["", "a ", "(", "+", "-", "NOT ", "a AND ", "a\t"] {
+        let mut queries = vec![
+            "- *".to_string(),
+            "+ *".to_string(),
+            "a - *".to_string(),
+            "(+ *)".to_string(),
+            "-  * b".to_string(),
+        ];
+        for prefix in ["", "a ", "(", "+", "-", "NOT ", "a AND ", "a\t", "\"x\" "] {
             for end in ['^', '`', ':', '{', '}', '"', '\'', '[', ']', '\\', '('] {
-                let q = format!("{prefix}*{end}b");
-                assert!(has_fieldless_exists(&q), "{q:?}");
-                parse_user_query(&parser, &q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
+                queries.push(format!("{prefix}*{end}b"));
             }
+        }
+        for q in &queries {
+            assert!(has_fieldless_exists(q), "{q:?}");
+            parse_user_query(&parser, q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
         }
     }
 
@@ -720,6 +772,11 @@ pub(crate) mod tests {
             "a *+",
             "text:sea^20 whale^70",
             "\"exact phrase\" AND -other",
+            "\"foo*\" AND bar",
+            "'it*' AND bar",
+            "text:[alpha TO *]",
+            "text:{alpha TO *}",
+            "a -*",
         ] {
             assert!(!has_fieldless_exists(q), "{q:?}");
             let full = parser.parse_query(q).expect(q);
