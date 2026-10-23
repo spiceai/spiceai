@@ -15,7 +15,7 @@ limitations under the License.
 */
 use crate::{
     component::view::View, dataaccelerator::spice_sys::dataset_checkpointer,
-    embeddings::index::table::wrap_table_as_index,
+    datafusion::TableInstance, embeddings::index::table::wrap_table_as_index,
     search::full_text::table::add_full_text_search_to_table, status::RuntimeStatus,
 };
 use ::datafusion::sql::parser;
@@ -139,7 +139,7 @@ pub(crate) struct ViewRefreshSource {
     status: Arc<RuntimeStatus>,
     served_schema: SchemaRef,
     redefined: AtomicBool,
-    registered: tokio::sync::watch::Sender<bool>,
+    registered: tokio::sync::watch::Sender<Option<TableInstance>>,
 }
 
 impl ViewRefreshSource {
@@ -159,15 +159,16 @@ impl ViewRefreshSource {
             status,
             served_schema,
             redefined: AtomicBool::new(false),
-            registered: tokio::sync::watch::Sender::new(false),
+            registered: tokio::sync::watch::Sender::new(None),
         })
     }
 
-    /// Records that the view is registered against this source. A redefined view is
-    /// registered again only after that, so the new registration replaces this one
-    /// rather than being replaced by it.
-    pub(crate) fn mark_registered(&self) {
-        self.registered.send_replace(true);
+    /// Records the table the view is registered as against this source. A redefined
+    /// view is registered again only after that, so the new registration replaces this
+    /// one rather than being replaced by it, and only while that table is still the
+    /// one registered.
+    pub(crate) fn mark_registered(&self, instance: TableInstance) {
+        self.registered.send_replace(Some(instance));
     }
 
     /// The view's plan, built once every table it reads is ready, or `None` when it does
@@ -214,17 +215,16 @@ impl RefreshSource for ViewRefreshSource {
             .await
             .map_err(|e| Box::new(e) as RefreshSourceError)?;
         if schema_difference(&self.served_schema, &provider.schema()).is_some() {
-            if !self.redefined.swap(true, Ordering::SeqCst)
-                && self.registered.subscribe().wait_for(|r| *r).await.is_ok()
-            {
-                tracing::info!(
-                    "View {} was redefined since its acceleration was built; rebuilding the acceleration from its definition.",
-                    self.view.name
-                );
-                tokio::spawn(
-                    Arc::clone(&self.view.runtime)
-                        .reregister_view_from_definition(Arc::clone(&self.view)),
-                );
+            if !self.redefined.swap(true, Ordering::SeqCst) {
+                let mut registered = self.registered.subscribe();
+                if let Ok(instance) = registered.wait_for(Option::is_some).await
+                    && let Some(instance) = instance.clone()
+                {
+                    tokio::spawn(
+                        Arc::clone(&self.view.runtime)
+                            .reregister_view_from_definition(Arc::clone(&self.view), instance),
+                    );
+                }
             }
             std::future::pending::<()>().await;
         }
