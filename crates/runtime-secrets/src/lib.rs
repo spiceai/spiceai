@@ -2741,8 +2741,10 @@ param3: ${ secrets:MY_VAR }
     #[tokio::test]
     async fn typed_params_from_templates_partial_interpolation_does_not_echo_secret() {
         let _env_guard = lock_env().await;
-        let key = format!("SPICE_TEST_PARTIAL_SECRET_{}", rand::random::<u64>());
-        unsafe { std::env::set_var(&key, "1234") };
+        // Fixed and digit-free: the expected message names the key, so a random
+        // numeric suffix could itself contain the `1234` canary.
+        let key = "SPICE_TEST_PARTIAL_SECRET_TIMEOUT";
+        unsafe { std::env::set_var(key, "1234") };
 
         let mut secrets = super::Secrets::new();
         secrets
@@ -2776,7 +2778,7 @@ param3: ${ secrets:MY_VAR }
             format!("invalid value for `client_timeout` from {source}; expected a valid value")
         );
 
-        unsafe { std::env::remove_var(&key) };
+        unsafe { std::env::remove_var(key) };
     }
 
     fn write_env_file(path: &std::path::Path, contents: &str) {
