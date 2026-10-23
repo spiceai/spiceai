@@ -150,7 +150,11 @@ async fn actual_http_pagination_tracks_followed_pages_not_configuration() {
                         .await.expect("HTTP response");
                 }
             });
-            let provider = HttpTableProvider::new(url.parse().expect("URL"), reqwest::Client::default(), "text".into(), true)
+            // The origin is local, so skip system proxy detection: on macOS it lists the
+            // test binary's directory, which can block for minutes when many test
+            // processes start at once.
+            let client = reqwest::Client::builder().no_proxy().build().expect("HTTP client");
+            let provider = HttpTableProvider::new(url.parse().expect("URL"), client, "text".into(), true)
                 .with_allowed_paths(["/items"]).expect("allowed path")
                 .with_max_retries(0)
                 .with_pagination(PaginationConfig::default()).expect("automatic pagination");

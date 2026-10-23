@@ -331,6 +331,15 @@ pub(crate) fn test_request_context() -> Arc<RequestContext> {
     Arc::clone(&TEST_REQUEST_CONTEXT)
 }
 
+/// `N` distinct free ports. Every listener stays bound until all `N` are picked, so the
+/// operating system cannot return the same port twice.
+pub(crate) fn free_ports<const N: usize>() -> [u16; N] {
+    let listeners: [std::net::TcpListener; N] = std::array::from_fn(|_| {
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port")
+    });
+    listeners.map(|listener| listener.local_addr().expect("local addr").port())
+}
+
 pub(crate) async fn run_query(
     rt: &Arc<Runtime>,
     query: &str,

@@ -1023,7 +1023,7 @@ mod tests {
     ///   different text columns than the parquet the TPC-H answer files were
     ///   computed from, so no answer file is their oracle.
     ///
-    /// - The five `ClickBench` arms whose acceleration holds only part of the
+    /// - The six `ClickBench` arms whose acceleration holds only part of the
     ///   source, because a runner cannot hold all of it: their `refresh_sql` keeps
     ///   a subset, while the `__test_reference.*` clone drops acceleration and
     ///   reads every row, so it answers a different question. A `LIMIT` subset
@@ -1034,6 +1034,7 @@ mod tests {
     const BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION: &[&str] = &[
         "clickbench/sf1/accelerated/s3[parquet]-arrow.yaml",
         "clickbench/sf1/accelerated/s3[parquet]-arrow-partitioned.yaml",
+        "clickbench/sf1/accelerated/s3[parquet]-cayenne[memory].yaml",
         "clickbench/sf1/accelerated/s3[parquet]-postgres.yaml",
         "clickbench/sf1/accelerated/s3[parquet]-sqlite[memory].yaml",
         "clickbench/sf1/accelerated/s3[parquet]-turso[file].yaml",
