@@ -368,7 +368,7 @@ mod tests {
             Question::Noul { .. } => {
                 let yes = id == "refund" && evidence.contains("money back");
                 Answer::Noul {
-                    noul: if yes != flip { 0.9 } else { 0.1 },
+                    noul: if yes ^ flip { 0.9 } else { 0.1 },
                 }
             }
             Question::Choice { criteria, .. } => {
@@ -394,7 +394,7 @@ mod tests {
             Question::Score { criteria, .. } => {
                 let top = criteria.len().saturating_sub(1);
                 let furious = evidence.contains("UNACCEPTABLE");
-                let level = if furious != flip { top } else { 0 };
+                let level = if furious ^ flip { top } else { 0 };
                 let probabilities = (0..=top)
                     .map(|i| (i.to_string(), if i == level { 1.0 } else { 0.0 }))
                     .collect();
