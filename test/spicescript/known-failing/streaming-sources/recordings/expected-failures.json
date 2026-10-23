@@ -9,7 +9,7 @@
       "varies": true,
       "group": "streaming-sources",
       "may-pass": true,
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: \\d+, actual: \\d+ \\}"
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}"
     },
     {
       "run": "dynamodb-declared-streams-race",
@@ -18,7 +18,7 @@
       "kind": "error",
       "group": "streaming-sources",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: \\d+, actual: \\d+ \\}",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}",
       "may-pass": true
     },
     {
@@ -28,7 +28,7 @@
       "kind": "error",
       "group": "streaming-sources",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: \\d+, actual: \\d+ \\}",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}",
       "may-pass": true
     },
     {
@@ -38,7 +38,7 @@
       "kind": "error",
       "group": "streaming-sources",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: \\d+, actual: \\d+ \\}",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}",
       "may-pass": true
     },
     {
@@ -48,7 +48,7 @@
       "kind": "error",
       "group": "streaming-sources",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: \\d+, actual: \\d+ \\}",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}",
       "may-pass": true
     },
     {
@@ -58,7 +58,7 @@
       "kind": "error",
       "group": "streaming-sources",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: \\d+, actual: \\d+ \\}",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}",
       "may-pass": true
     },
     {
@@ -70,7 +70,7 @@
       "varies": true,
       "group": "streaming-sources",
       "may-pass": true,
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: \\d+, actual: \\d+ \\}"
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}"
     },
     {
       "run": "dynamodb-declared-streams-race",
@@ -79,7 +79,7 @@
       "kind": "error",
       "group": "streaming-sources",
       "signature": "Acceleration not ready; loading initial data for (created|streamed)\\d",
-      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: \\d+, actual: \\d+ \\}",
+      "pattern": "Acceleration not ready; loading initial data for (created|streamed)\\d|answer differs from the expected one: RowCountMismatch \\{ expected: 3, actual: [0-2] \\}",
       "may-pass": true
     }
   ],
