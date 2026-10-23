@@ -979,7 +979,7 @@ fn create_new_recursive_req(
 ) -> CreateResponse {
     let mut new_req = req.clone();
     new_req.input = InputParam::Items(new_msg);
-    new_req.tool_choice = Some(next_round_tool_choice(new_req.tool_choice.take()));
+    new_req.tool_choice = next_round_tool_choice(new_req.tool_choice.take());
 
     // Adjust input `max_output_tokens` if usage is known to ensure we don't exceed the limit.
     if let Some(max_output_tokens) = new_req.max_output_tokens
@@ -994,10 +994,10 @@ fn create_new_recursive_req(
 /// The `tool_choice` for the round after one that called tools — the Responses
 /// counterpart of `tool_use::next_round_tool_choice`: a choice that forces a call
 /// applies to one round (issue #14459), and `allowed_tools` keeps its tool list in
-/// `auto` mode. An unset choice is sent as `auto` as well.
-fn next_round_tool_choice(choice: Option<ToolChoiceParam>) -> ToolChoiceParam {
+/// `auto` mode. Any other choice, unset included, stays as it is, so each round sends the
+/// provider the same request prefix.
+fn next_round_tool_choice(choice: Option<ToolChoiceParam>) -> Option<ToolChoiceParam> {
     match choice {
-        None => ToolChoiceParam::Mode(ToolChoiceOptions::Auto),
         Some(
             ToolChoiceParam::Function(_)
             | ToolChoiceParam::Mcp(_)
@@ -1008,15 +1008,16 @@ fn next_round_tool_choice(choice: Option<ToolChoiceParam>) -> ToolChoiceParam {
             | ToolChoiceParam::Mode(ToolChoiceOptions::Required),
         ) => {
             tracing::debug!("Not forcing a tool call again after a round that made one.");
-            ToolChoiceParam::Mode(ToolChoiceOptions::Auto)
+            Some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto))
         }
         Some(ToolChoiceParam::AllowedTools(mut allowed)) => {
             allowed.mode = ToolChoiceAllowedMode::Auto;
-            ToolChoiceParam::AllowedTools(allowed)
+            Some(ToolChoiceParam::AllowedTools(allowed))
         }
-        Some(choice @ ToolChoiceParam::Mode(ToolChoiceOptions::Auto | ToolChoiceOptions::None)) => {
-            choice
-        }
+        unforced @ (None
+        | Some(ToolChoiceParam::Mode(
+            ToolChoiceOptions::Auto | ToolChoiceOptions::None,
+        ))) => unforced,
     }
 }
 
@@ -1727,7 +1728,6 @@ mod tests {
                     Arc::clone(&provider) as Arc<dyn Responses>,
                     "scripted",
                     None,
-                    vec![],
                 )),
                 vec![],
                 vec![Arc::new(ListDatasets(AtomicUsize::new(0))) as Arc<dyn SpiceModelTool>],
@@ -1889,36 +1889,61 @@ mod tests {
     // regression test for #14459
     #[test]
     fn test_next_round_tool_choice() {
-        let auto = ToolChoiceParam::Mode(ToolChoiceOptions::Auto);
+        let auto = Some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto));
         for forced in [
-            None,
-            Some(ToolChoiceParam::Mode(ToolChoiceOptions::Required)),
-            Some(ToolChoiceParam::Function(ToolChoiceFunction {
+            ToolChoiceParam::Mode(ToolChoiceOptions::Required),
+            ToolChoiceParam::Function(ToolChoiceFunction {
                 name: "list_datasets".to_string(),
-            })),
-            Some(ToolChoiceParam::Custom(ToolChoiceCustom {
+            }),
+            ToolChoiceParam::Custom(ToolChoiceCustom {
                 name: "client_tool".to_string(),
-            })),
-            Some(ToolChoiceParam::ApplyPatch),
-            Some(ToolChoiceParam::Shell),
-            Some(ToolChoiceParam::Hosted(ToolChoiceTypes::WebSearchPreview)),
+            }),
+            ToolChoiceParam::ApplyPatch,
+            ToolChoiceParam::Shell,
+            ToolChoiceParam::Hosted(ToolChoiceTypes::WebSearchPreview),
         ] {
-            assert_eq!(next_round_tool_choice(forced.clone()), auto, "{forced:?}");
+            assert_eq!(
+                next_round_tool_choice(Some(forced.clone())),
+                auto,
+                "{forced:?}"
+            );
         }
 
         // `allowed_tools` keeps its tool list, in `auto` mode.
         assert_eq!(
             next_round_tool_choice(Some(allowed_tools(ToolChoiceAllowedMode::Required))),
-            allowed_tools(ToolChoiceAllowedMode::Auto)
+            Some(allowed_tools(ToolChoiceAllowedMode::Auto))
         );
 
-        // Choices that force nothing pass through unchanged.
+        // Choices that force nothing pass through unchanged, so each round sends the provider
+        // the same request prefix.
         for unforced in [
-            ToolChoiceParam::Mode(ToolChoiceOptions::Auto),
-            ToolChoiceParam::Mode(ToolChoiceOptions::None),
-            allowed_tools(ToolChoiceAllowedMode::Auto),
+            None,
+            Some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto)),
+            Some(ToolChoiceParam::Mode(ToolChoiceOptions::None)),
+            Some(allowed_tools(ToolChoiceAllowedMode::Auto)),
         ] {
-            assert_eq!(next_round_tool_choice(Some(unforced.clone())), unforced);
+            assert_eq!(next_round_tool_choice(unforced.clone()), unforced);
         }
+    }
+
+    /// With no `tool_choice`, each round sends the provider none.
+    #[tokio::test]
+    async fn test_an_unset_tool_choice_stays_unset_on_every_round() {
+        let provider = ScriptedResponses::new(vec![vec!["list_datasets"]]);
+        let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
+
+        model(&provider, &tool, None)
+            .responses_request(request(false))
+            .await
+            .expect("a response");
+
+        let choices: Vec<_> = provider
+            .requests
+            .lock()
+            .iter()
+            .map(|req| req.tool_choice.clone())
+            .collect();
+        assert_eq!(choices, [None, None]);
     }
 }

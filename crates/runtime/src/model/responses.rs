@@ -20,7 +20,7 @@ use crate::model::params::azure::AzureModelParams;
 use crate::model::params::openai::OpenAiModelParams;
 use crate::model::params::xai::XaiModelParams;
 use crate::model::tool_use_responses::OpenAIResponsesTools;
-use crate::model::wrapper::responses::ResponsesWrapper;
+use crate::model::wrapper::responses::{ResponsesRequestDefaults, ResponsesWrapper};
 use crate::tools::registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools};
 use crate::tools::utils::{create_table_allowlist, get_tools_with_allowlist};
 use llms::chat::Error as LlmError;
@@ -114,7 +114,16 @@ pub async fn try_to_responses_model(
         Some(_) | None => model,
     };
 
-    Ok(tool_model)
+    // The Spicepod's request defaults go above the tool loop, so they apply once to each client
+    // request rather than again to each round of the loop.
+    let source = component.get_source().ok_or(LlmError::UnknownModelSource {
+        from: component.from.clone(),
+    })?;
+    Ok(Arc::new(ResponsesRequestDefaults::new(
+        tool_model,
+        component.name.as_str(),
+        get_openai_responses_request_overrides(component, source.short_name()),
+    )))
 }
 
 async fn typed_params<P: TypedParams>(
@@ -177,7 +186,6 @@ async fn construct_model(
         model,
         component.name.as_str(),
         system_prompt,
-        get_openai_responses_request_overrides(component, source.short_name()),
     )))
 }
 
