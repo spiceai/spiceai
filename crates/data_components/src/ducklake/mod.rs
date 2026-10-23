@@ -69,9 +69,13 @@ fn extension_directory(conn: &duckdb::Connection) -> Option<PathBuf> {
         _ => util::home_dir::home_dir(),
     };
     match setting("extension_directory") {
-        Some(dir) if dir == "~" => home(),
-        Some(dir) if !dir.is_empty() => match dir.strip_prefix("~/") {
-            Some(rest) => home().map(|home| home.join(rest)),
+        // `DuckDB` expands a leading `~` by concatenation, whatever separator follows it.
+        Some(dir) if !dir.is_empty() => match dir.strip_prefix('~') {
+            Some(rest) => home().map(|home| {
+                let mut expanded = home.into_os_string();
+                expanded.push(rest);
+                PathBuf::from(expanded)
+            }),
             None => Some(PathBuf::from(dir)),
         },
         _ => home().map(|home| home.join(".duckdb").join("extensions")),
