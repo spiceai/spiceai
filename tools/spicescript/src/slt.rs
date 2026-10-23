@@ -258,26 +258,11 @@ pub fn matches(query: &SltQuery, mut rows: Vec<Vec<String>>) -> bool {
         let digest = format!("{:x}", md5.finalize());
         return count == values.len().to_string() && hash == digest;
     }
-    // One value per line (SQLite's layout), or one row per line with its
-    // values separated by spaces (DataFusion's). A text value may hold spaces
-    // itself, so a line is read as a row only when the record has several
-    // columns and the line splits into exactly one field per column.
-    if query.expected.len() == values.len() {
-        return query.expected == values;
-    }
-    let columns = query.types.len();
-    if columns < 2 {
-        return false;
-    }
-    let mut split = Vec::with_capacity(values.len());
-    for line in &query.expected {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() != columns {
-            return false;
-        }
-        split.extend(fields);
-    }
-    split.len() == values.len() && split.iter().zip(&values).all(|(a, b)| a == b)
+    // One value per line, SQLite's layout, which the corpora here use. A
+    // file with one row per line (DataFusion's) is not read: a line of a text
+    // value holding a space and a row of two values look the same, so either
+    // reading could pass the other's answer.
+    query.expected == values
 }
 
 /// How a query whose answer differs from the recorded one is classified.
@@ -358,10 +343,6 @@ mod tests {
             &query(SortMode::ValueSort, &["1", "2", "a", "b"], "IT"),
             rows.clone()
         ));
-        assert!(matches(
-            &query(SortMode::RowSort, &["1 a", "2 b"], "IT"),
-            rows.clone()
-        ));
         // md5("1\na\n2\nb\n")
         let hash = format!("{:x}", Md5::digest(b"1\na\n2\nb\n"));
         let line = format!("4 values hashing to {hash}");
@@ -373,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn a_value_with_spaces_is_not_several_rows() {
+    fn a_value_with_spaces_is_not_several_values() {
         let two_rows = vec![vec!["a".to_string()], vec!["b".to_string()]];
         assert!(!matches(
             &query(SortMode::NoSort, &["a b"], "T"),
@@ -388,22 +369,20 @@ mod tests {
             &query(SortMode::NoSort, &["a b", "c"], "T"),
             three_rows
         ));
-        // Several values per line must be one row per line.
-        let rows = vec![
-            vec!["1".to_string(), "2".into()],
-            vec!["3".into(), "4".into()],
+        // A two-column record expecting the values `a b` and `c d` (one row)
+        // does not pass two rows `a`, `b` and `c`, `d`.
+        let two_by_two = vec![
+            vec!["a".to_string(), "b".into()],
+            vec!["c".into(), "d".into()],
         ];
+        assert!(!matches(
+            &query(SortMode::NoSort, &["a b", "c d"], "TT"),
+            two_by_two
+        ));
+        let one_row = vec![vec!["a b".to_string(), "c d".into()]];
         assert!(matches(
-            &query(SortMode::NoSort, &["1 2", "3 4"], "II"),
-            rows.clone()
-        ));
-        assert!(!matches(
-            &query(SortMode::NoSort, &["1 2 3 4"], "II"),
-            rows.clone()
-        ));
-        assert!(!matches(
-            &query(SortMode::NoSort, &["1", "2 3 4"], "II"),
-            rows
+            &query(SortMode::NoSort, &["a b", "c d"], "TT"),
+            one_row
         ));
     }
 }
