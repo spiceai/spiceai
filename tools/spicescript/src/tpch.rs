@@ -234,7 +234,29 @@ pub async fn load(source: &dyn Source, namespace: &str, work: &Path, scale: f64)
             .await
             .with_context(|| format!("Failed to load TPC-H table {table}"))?;
     }
+    if let Some(statements) = index_statements(source.dialect()) {
+        source
+            .exec(namespace, &statements)
+            .await
+            .context("Failed to index the TPC-H tables")?;
+    }
     Ok(total)
+}
+
+/// Indexes on the foreign keys TPC-H's correlated subqueries look up (Q20
+/// and Q17 on `lineitem`, Q2 on `partsupp`), created after the rows are
+/// loaded. Without them PostgreSQL runs Q20's subquery as a scan of
+/// `lineitem` per `partsupp` row: 12 s at scale 0.01, against 15 ms with
+/// them. `ClickHouse` orders each table by its key instead.
+fn index_statements(dialect: Dialect) -> Option<String> {
+    match dialect {
+        Dialect::Postgres | Dialect::Mysql => Some(
+            "CREATE INDEX lineitem_part_supp ON lineitem (l_partkey, l_suppkey);\n\
+             CREATE INDEX partsupp_part ON partsupp (ps_partkey);"
+                .to_string(),
+        ),
+        Dialect::ClickHouse => None,
+    }
 }
 
 #[cfg(test)]

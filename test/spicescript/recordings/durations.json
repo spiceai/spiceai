@@ -117,7 +117,7 @@
   "time-columns-retention": 11,
   "tlp": 108,
   "tls": 3,
-  "tpch-coverage": 71,
-  "tpch-oracles": 30,
+  "tpch-coverage": 25,
+  "tpch-oracles": 26,
   "views": 11
 }
