@@ -90,7 +90,7 @@ HTTP SQL is the harness. `POST /v1/sql` with `Content-Type: text/plain` and `Acc
 SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM <dataset>
 ```
 
-On-demand refresh: capture a completion marker (`last_refresh`, `error_message`, and `runtime.task_history` `acceleration_refresh` count), then `POST /v1/datasets/<name>/acceleration/refresh`. A transport error or a non-2xx refresh POST is a failure: write the status/body artifacts, then stop. Do not wait for a leftover `Ready` or an older task-history row. After a 2xx POST, poll until a *new* completion: a later task-history row, a new `last_refresh` (success), or a new `error_message` (failure does not advance `last_refresh`). A leftover `Ready` or `Error` from before the POST is not completion.
+On-demand refresh: capture a completion marker (`last_refresh`, `error_message`, and `runtime.task_history` `acceleration_refresh` count) first, then `POST /v1/datasets/<name>/acceleration/refresh`. A transport error, a non-2xx, or an invalid `/v1/datasets` or task-history count fails before the POST — an incomplete marker is never compared, so leftover `Ready` cannot look newer than an empty baseline. A transport error or a non-2xx refresh POST is a failure: write the status/body artifacts, then stop. Do not wait for a leftover `Ready` or an older task-history row. After a 2xx POST, poll until a *new* completion: a later task-history row, a new `last_refresh` (success), or a new `error_message` (failure does not advance `last_refresh`). A leftover `Ready` or `Error` from before the POST is not completion. Keep the same marker checks on every poll.
 
 The mapped journeys are in `features/`. Drive them with:
 
@@ -122,6 +122,7 @@ Standards:
 
 - Drive the shipped binary over HTTP. A unit test is not evidence.
 - A SQL transport failure, a non-2xx `/v1/sql` response, a body that is not JSON, or a row missing `amount_cents` / `user_id` fails `drive` / `compare`. Valid SQL `NULL` sums (`null,null`) stay accepted. Response artifacts are still written.
+- A failed baseline completion marker (transport, non-2xx, or invalid `/v1/datasets` / task-history count) fails `drive` / `compare` before the refresh POST. An incomplete marker is never compared.
 - A refresh transport failure or a non-2xx `POST /v1/datasets/<name>/acceleration/refresh` fails `drive` / `compare` before polling. Status and body artifacts are still written.
 - A doctor `/v1/ready` transport failure is refused. HTTP 503 after an expected refresh Error is still HTTP and is accepted.
 - Capture the action (file rewrite, refresh POST) and the resulting sums/status/log, not only the last query.

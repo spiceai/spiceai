@@ -564,58 +564,114 @@ refresh_dataset() {
   fi
 }
 
+# Marker helpers write under $WORK when drive/compare set it, otherwise
+# $TMPDIR. Sourced recipes that only export WORK before `source` lose that
+# value (this file resets it); never write `/datasets-status.body`.
+marker_artifact() {
+  local name="$1"
+  local dir="${WORK:-${TMPDIR:-/tmp}}"
+  mkdir -p "$dir"
+  printf '%s/%s\n' "$dir" "$name"
+}
+
 dataset_refresh_fields() {
   local name="$1"
-  local json
-  json="$(curl -sS --max-time 10 "http://${HTTP_ADDR}/v1/datasets?status=true")"
-  python3 - "$json" "$name" <<'PY'
+  local curl_rc=0
+  local code
+  local body
+  body="$(marker_artifact datasets-status.body)"
+  # Write the body first so a transport or HTTP failure still leaves it.
+  : >"$body"
+  code="$(curl -sS -o "$body" -w '%{http_code}' --max-time 10 \
+    "http://${HTTP_ADDR}/v1/datasets?status=true")" || curl_rc=$?
+  if (( curl_rc != 0 )); then
+    die "dataset status transport failed (curl=${curl_rc} http=${code:-000}) for ${name}"
+  fi
+  if [[ ! "${code}" =~ ^2[0-9][0-9]$ ]]; then
+    die "dataset status HTTP ${code:-000} for ${name}"
+  fi
+  python3 - "$body" "$name" <<'PY' || die "dataset status invalid for ${name}"
 import json, sys
-data = json.loads(sys.argv[1])
-name = sys.argv[2]
+path, name = sys.argv[1], sys.argv[2]
+raw = open(path, encoding="utf-8").read()
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError as e:
+    print(f"dataset status is not JSON for {name}: {e}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(data, list):
+    print(f"dataset status is not a list for {name}", file=sys.stderr)
+    raise SystemExit(1)
 for d in data:
     if d.get("name") == name:
-        print(f"{d.get('status') or ''}\t{d.get('last_refresh') or ''}\t{d.get('error_message') or ''}")
+        status = d.get("status") or ""
+        if not status:
+            print(f"dataset {name} has no status", file=sys.stderr)
+            raise SystemExit(1)
+        print(f"{status}\t{d.get('last_refresh') or ''}\t{d.get('error_message') or ''}")
         raise SystemExit(0)
-print("missing\t\t")
+print(f"dataset {name} missing from /v1/datasets", file=sys.stderr)
+raise SystemExit(1)
 PY
 }
 
 refresh_task_count() {
   local name="$1"
   [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid dataset name: $name"
-  local payload
-  payload="$(curl -sS --max-time 15 \
+  local curl_rc=0
+  local code
+  local body
+  body="$(marker_artifact refresh-task-count.body)"
+  : >"$body"
+  code="$(curl -sS -o "$body" -w '%{http_code}' --max-time 15 \
     -H "Content-Type: text/plain" \
     -H "Accept: application/json" \
     --data-binary "SELECT count(*) AS n FROM runtime.task_history WHERE task = 'acceleration_refresh' AND \"input\" = '${name}'" \
-    "http://${HTTP_ADDR}/v1/sql" || true)"
-  python3 - "$payload" <<'PY'
+    "http://${HTTP_ADDR}/v1/sql")" || curl_rc=$?
+  if (( curl_rc != 0 )); then
+    die "refresh task count transport failed (curl=${curl_rc} http=${code:-000}) for ${name}"
+  fi
+  if [[ ! "${code}" =~ ^2[0-9][0-9]$ ]]; then
+    die "refresh task count HTTP ${code:-000} for ${name}"
+  fi
+  python3 - "$body" <<'PY' || die "refresh task count unusable for ${name}"
 import json, sys
-text = sys.argv[1]
+text = open(sys.argv[1], encoding="utf-8").read()
 idx = text.find("[")
 if idx < 0:
-    print("")
-    raise SystemExit(0)
+    print("refresh task count is not JSON", file=sys.stderr)
+    raise SystemExit(1)
 try:
     data = json.loads(text[idx:])
-except json.JSONDecodeError:
-    print("")
-    raise SystemExit(0)
+except json.JSONDecodeError as e:
+    print(f"refresh task count is not JSON: {e}", file=sys.stderr)
+    raise SystemExit(1)
 row = data[0] if isinstance(data, list) and data else data
 if not isinstance(row, dict):
-    print("")
-    raise SystemExit(0)
+    print("refresh task count has no row", file=sys.stderr)
+    raise SystemExit(1)
 for key, value in row.items():
     if key == "n" or key.endswith(".n"):
         print(int(value))
         raise SystemExit(0)
-print("")
+print("refresh task count missing n", file=sys.stderr)
+raise SystemExit(1)
 PY
 }
 
 refresh_completion_marker() {
   local name="$1"
-  printf '%s\t%s\n' "$(dataset_refresh_fields "$name")" "$(refresh_task_count "$name")"
+  local fields n
+  # Checked assignments, not `printf "$(a)" "$(b)"`: a failed substitution
+  # there is hidden and leftover Ready then looks newer than an empty baseline.
+  # `set -e` does not abort a failing assignment, so each `|| die` is required.
+  fields="$(dataset_refresh_fields "$name")" || \
+    die "dataset refresh fields for ${name} could not be captured"
+  n="$(refresh_task_count "$name")" || \
+    die "refresh task count for ${name} could not be captured"
+  [[ "$fields" == *$'\t'*$'\t'* ]] || die "incomplete refresh fields for ${name}"
+  [[ "$n" =~ ^[0-9]+$ ]] || die "incomplete refresh task count for ${name}: ${n}"
+  printf '%s\t%s\n' "$fields" "$n"
 }
 
 # A new completion is a terminal status plus a marker that moved: a new
@@ -649,8 +705,10 @@ wait_refresh_settled() {
   local baseline="$2"
   local deadline=$((SECONDS + 60))
   local now=""
+  [[ -n "$baseline" ]] || die "dataset ${name} has no baseline completion marker"
   while (( SECONDS < deadline )); do
-    now="$(refresh_completion_marker "$name")"
+    now="$(refresh_completion_marker "$name")" || \
+      die "completion marker for ${name} could not be captured while waiting"
     if [[ "$(refresh_is_complete "$baseline" "$now")" == "yes" ]]; then
       echo "refresh settled ${name} status=${now%%$'\t'*}"
       return 0
@@ -664,9 +722,12 @@ refresh_all_and_wait() {
   local step="$1"
   local ev="$2"
   local ds
+  local marker
   local baselines=()
   for ds in "${ACC_DATASETS[@]}"; do
-    baselines+=("$(refresh_completion_marker "$ds")")
+    marker="$(refresh_completion_marker "$ds")" || \
+      die "baseline completion marker for ${ds} could not be captured"
+    baselines+=("$marker")
     refresh_dataset "$ds" "${ev}/refresh-${step}-${ds}"
   done
   local i=0
