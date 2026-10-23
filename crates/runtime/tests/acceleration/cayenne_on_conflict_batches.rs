@@ -508,6 +508,80 @@ async fn a_partitioned_update_one_partition_refuses_changes_none() {
         .await;
 }
 
+/// Concurrent same-key UPDATEs on a partitioned Cayenne table must rematerialize
+/// under each partition's `write_lock`. `PartitionedUpdateSink` prepares every
+/// partition before applying any; writing those prepared rows lost increments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_same_key_partitioned_updates_keep_the_row() {
+    test_request_context()
+        .scope(async {
+            const UPDATES: i64 = 8;
+            let rows = "id,region,ts,v\n1,us,2026-01-01T00:00:00,10\n";
+            let case = Case {
+                mode: Mode::File,
+                refresh: RefreshMode::Full,
+                partitioned: true,
+            };
+            let label = format!("{}/concurrent-same-key", case.label());
+            let (rt, ready, _dir) = load_with_access(
+                rows,
+                &case,
+                Some(OnConflictBehavior::Upsert),
+                &label,
+                AccessMode::ReadWrite,
+            )
+            .await;
+            assert!(ready, "{label}: the row loads");
+            assert_eq!(value_of(&rt, 1).await, ["10"], "{label}: seed");
+
+            let rt = Arc::new(rt);
+            let mut joins = Vec::with_capacity(usize::try_from(UPDATES).expect("fits"));
+            for _ in 0..UPDATES {
+                let runtime = Arc::clone(&rt);
+                joins.push(tokio::spawn(async move {
+                    let batches = runtime
+                        .datafusion()
+                        .query_builder(
+                            "UPDATE t SET v = CAST(CAST(v AS BIGINT) + 1 AS VARCHAR) WHERE id = 1",
+                        )
+                        .build()
+                        .run()
+                        .await
+                        .expect("update plans")
+                        .data
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .expect("update runs");
+                    let reported: u64 = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            batch
+                                .column(0)
+                                .as_primitive::<arrow::datatypes::UInt64Type>()
+                                .values()
+                                .iter()
+                                .copied()
+                        })
+                        .sum();
+                    assert_eq!(
+                        reported, 1,
+                        "an UPDATE of an existing partitioned key must report count=1"
+                    );
+                }));
+            }
+            for join in joins {
+                join.await.expect("update task");
+            }
+
+            assert_eq!(
+                value_of(&rt, 1).await,
+                [format!("{}", 10 + UPDATES)],
+                "{label}: every increment applies and the row remains"
+            );
+        })
+        .await;
+}
+
 /// An `INSERT` reports the rows it inserted or replaced, as PostgreSQL does: a
 /// copy of a key that a later copy in the same statement replaced is not counted,
 /// and a row replacing a stored key is (#14576).

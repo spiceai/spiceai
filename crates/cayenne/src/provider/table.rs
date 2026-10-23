@@ -66727,6 +66727,112 @@ mod tests {
         (provider, temp_dir)
     }
 
+    /// Unkeyed table with time-based retention on `event_time`, so an `UPDATE`
+    /// whose predicate is `event_time < cutoff` takes `delete_using_files`.
+    /// Inlining is off so the matching rows live in Vortex files the file-delete
+    /// path actually unlinks.
+    async fn create_file_retention_update_table(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, TempDir) {
+        use arrow::datatypes::TimeUnit;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+        // Long period so post-write retention does not race the fixture. The
+        // UPDATE predicate is still `event_time < cutoff` on this column, which
+        // is what `file_based_deletes_preferred` matches.
+        let retention =
+            crate::TimeRetentionFilterBuilder::try_new("event_time", 365 * 24 * 3600, &schema)
+                .expect("retention builder");
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .with_time_retention_filter_builder(retention)
+            .create(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_dir,
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    inline_max_bytes: 0,
+                    inline_max_buffer_bytes: 0,
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("file-retention table created");
+        (provider, temp_dir)
+    }
+
+    fn event_time_batch(schema: SchemaRef, ids: &[i64], event_time_us: &[i64]) -> RecordBatch {
+        use arrow::array::{Int64Array, TimestampMicrosecondArray};
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(
+                    TimestampMicrosecondArray::from(event_time_us.to_vec()).with_timezone("UTC"),
+                ),
+            ],
+        )
+        .expect("id/event_time batch is valid")
+    }
+
+    async fn scan_ids(provider: &CayenneTableProvider) -> Vec<i64> {
+        use arrow::array::Int64Array;
+
+        let ctx = SessionContext::new();
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan");
+        let batches = collect(plan, ctx.task_ctx()).await.expect("scan");
+        let mut ids = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column is Int64");
+            ids.extend(column.values().iter().copied());
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    fn update_count(batches: &[RecordBatch]) -> u64 {
+        batches
+            .first()
+            .and_then(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt64Array>()
+            })
+            .and_then(|counts| counts.values().first().copied())
+            .expect("update count")
+    }
+
     async fn create_cdc_upsert_table(
         table_name: &str,
         runtime_env: Arc<RuntimeEnv>,
@@ -69960,6 +70066,258 @@ mod tests {
             scan_id_values(&provider).await,
             vec![(7, 11), (8, 20)],
             "the matching row is incremented and the other row is unchanged"
+        );
+    }
+
+    /// Autocommit `UPDATE` holds `write_lock` across rematerialize + delete +
+    /// insert. A predicate that matches time-based retention (`event_time <
+    /// cutoff`) routes the delete through `delete_using_files`. After the inner
+    /// file delete, `PkKeysetInvalidatingDeletionSink` used to re-acquire the
+    /// same non-reentrant mutex — hang after the files were already unlinked.
+    #[tokio::test]
+    async fn an_update_that_hits_file_based_retention_delete_completes() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_file_retention_update_table("update_file_retention", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let now_us = chrono::Utc::now().timestamp_micros();
+        let expired_us = now_us - 10_000_000;
+        let fresh_us = now_us;
+        let cutoff_us = now_us - 5_000_000;
+        insert_batch(
+            &provider,
+            event_time_batch(Arc::clone(&schema), &[7], &[expired_us]),
+        )
+        .await;
+        insert_batch(
+            &provider,
+            event_time_batch(Arc::clone(&schema), &[8], &[fresh_us]),
+        )
+        .await;
+        assert_eq!(scan_ids(&provider).await, vec![7, 8]);
+
+        let filter = datafusion_expr::col("event_time").lt(datafusion_expr::lit(
+            ScalarValue::TimestampMicrosecond(Some(cutoff_us), Some("UTC".into())),
+        ));
+        assert!(
+            provider.file_based_deletes_preferred(std::slice::from_ref(&filter)),
+            "precondition: this UPDATE must take delete_using_files"
+        );
+
+        let plan = provider
+            .update(
+                &ctx.state(),
+                vec![(
+                    "id".to_string(),
+                    datafusion_expr::col("id") + datafusion_expr::lit(1_000_i64),
+                )],
+                vec![filter],
+            )
+            .await
+            .expect("update plan");
+        let batches = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            datafusion::physical_plan::collect(plan, ctx.task_ctx()),
+        )
+        .await
+        .expect(
+            "UPDATE on the file-based retention delete path must not deadlock on a nested \
+             write_lock acquire after the files are already deleted",
+        )
+        .expect("update executed");
+        assert_eq!(update_count(&batches), 1, "one expired file-row is updated");
+        assert_eq!(
+            scan_ids(&provider).await,
+            vec![8, 1007],
+            "the expired row is rewritten with id+1000 and the fresh row is unchanged"
+        );
+    }
+
+    /// Unkeyed replacement rows that cannot stay inline take
+    /// `write_prepared_stream` → staged current-snapshot append. Completing this
+    /// UPDATE proves that path does not re-acquire `write_lock` after the delete.
+    #[tokio::test]
+    async fn an_unkeyed_update_of_file_resident_rows_completes() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("update_unkeyed_file_resident", ctx.runtime_env()).await;
+        assert!(
+            provider.metadata().primary_key.is_empty(),
+            "precondition: the table has no primary key"
+        );
+        assert_eq!(
+            provider.metadata().vortex_config.inline_max_rows,
+            0,
+            "precondition: replacement rows cannot stay inline"
+        );
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[7, 8], &[10, 20])).await;
+        assert_eq!(scan_id_values(&provider).await, vec![(7, 10), (8, 20)]);
+
+        let plan = provider
+            .update(
+                &ctx.state(),
+                vec![(
+                    "value".to_string(),
+                    datafusion_expr::col("value") + datafusion_expr::lit(1_i64),
+                )],
+                vec![datafusion_expr::col("id").eq(datafusion_expr::lit(7_i64))],
+            )
+            .await
+            .expect("update plan");
+        let batches = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            datafusion::physical_plan::collect(plan, ctx.task_ctx()),
+        )
+        .await
+        .expect(
+            "unkeyed UPDATE of file-resident rows must not deadlock on a nested write_lock \
+             acquire during staged-append publish",
+        )
+        .expect("update executed");
+        assert_eq!(update_count(&batches), 1);
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 11), (8, 20)],
+            "the matching file-resident row is incremented and the other row is unchanged"
+        );
+    }
+
+    /// `write_cdc_pipelined` stages a `CurrentSnapshot` append and `finish`
+    /// takes `write_lock` in `lock_current_snapshot_for_apply`. An outer hold
+    /// (autocommit `UPDATE`) must reuse that lock via `acquire_or_share`.
+    #[tokio::test]
+    async fn a_held_write_lock_does_not_deadlock_current_snapshot_staged_finish() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("held_lock_staged_finish", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[8], &[20])).await;
+
+        let write_guard = Arc::new(provider.write_lock_arc().lock_owned().await);
+        let finish = crate::provider::write_lock_held::scope(write_guard, async {
+            let staged = provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch(schema, &[7], &[10])),
+                    &ctx.task_ctx(),
+                )
+                .await
+                .expect("staged append");
+            assert!(
+                staged.has_pending_finalize(),
+                "precondition: finish must take lock_current_snapshot_for_apply"
+            );
+            staged.finish().await.expect("staged finish")
+        });
+        let rows = tokio::time::timeout(std::time::Duration::from_secs(15), finish)
+            .await
+            .expect(
+                "CurrentSnapshot staged finish must not deadlock on write_lock when the \
+                 caller already holds it",
+            );
+        assert_eq!(rows, 1);
+        assert_eq!(scan_id_values(&provider).await, vec![(7, 10), (8, 20)]);
+    }
+
+    /// A partitioned sink calls `prepare` on every partition before executing
+    /// any. Those prepared rows used to be written as-is, so two same-key
+    /// `value = value + 1` plans that both prepared against V1 both wrote V2.
+    #[tokio::test]
+    async fn a_prepared_same_key_update_must_not_write_stale_rows() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_budgeted_upsert_table("update_prepared_stale", 64, ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[7], &[10])).await;
+        assert_eq!(scan_id_values(&provider).await, vec![(7, 10)]);
+
+        let increment = vec![(
+            "value".to_string(),
+            datafusion_expr::col("value") + datafusion_expr::lit(1_i64),
+        )];
+        let filter = vec![datafusion_expr::col("id").eq(datafusion_expr::lit(7_i64))];
+        let first = provider
+            .update(&ctx.state(), increment.clone(), filter.clone())
+            .await
+            .expect("first update plan");
+        let second = provider
+            .update(&ctx.state(), increment, filter)
+            .await
+            .expect("second update plan");
+
+        data_components::update::prepare_update_plan(first.as_ref(), ctx.task_ctx())
+            .await
+            .expect("prepare first");
+        data_components::update::prepare_update_plan(second.as_ref(), ctx.task_ctx())
+            .await
+            .expect("prepare second");
+
+        datafusion::physical_plan::collect(first, ctx.task_ctx())
+            .await
+            .expect("first update executed");
+        datafusion::physical_plan::collect(second, ctx.task_ctx())
+            .await
+            .expect("second update executed");
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 12)],
+            "each prepared UPDATE must rematerialize under write_lock: two plans that \
+             both prepared `value = value + 1` on id=7 must leave the row at 12, not \
+             both write the stale increment 11"
+        );
+    }
+
+    /// Concurrent same-key UPDATEs that go through the partitioned
+    /// prepare-then-apply sequence must serialize to the live version.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_prepared_same_key_updates_keep_the_row() {
+        const UPDATES: i64 = 8;
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_budgeted_upsert_table("update_prepared_concurrent", 64, ctx.runtime_env()).await;
+        let provider = Arc::new(provider);
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(provider.as_ref(), id_value_batch(schema, &[7], &[10])).await;
+        assert_eq!(scan_id_values(provider.as_ref()).await, vec![(7, 10)]);
+
+        let mut joins = Vec::with_capacity(usize::try_from(UPDATES).expect("fits"));
+        for _ in 0..UPDATES {
+            let table = Arc::clone(&provider);
+            joins.push(tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let plan = table
+                    .update(
+                        &ctx.state(),
+                        vec![(
+                            "value".to_string(),
+                            datafusion_expr::col("value") + datafusion_expr::lit(1_i64),
+                        )],
+                        vec![datafusion_expr::col("id").eq(datafusion_expr::lit(7_i64))],
+                    )
+                    .await
+                    .expect("update plan");
+                data_components::update::prepare_update_plan(plan.as_ref(), ctx.task_ctx())
+                    .await
+                    .expect("prepare");
+                let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+                    .await
+                    .expect("update executed");
+                assert_eq!(
+                    update_count(&batches),
+                    1,
+                    "an UPDATE of an existing key must report count=1, not a silent 0"
+                );
+            }));
+        }
+        for join in joins {
+            join.await.expect("update task");
+        }
+
+        assert_eq!(
+            scan_id_values(provider.as_ref()).await,
+            vec![(7, 10 + UPDATES)],
+            "every successful prepared same-key increment must apply and the row must remain"
         );
     }
 

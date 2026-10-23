@@ -523,13 +523,17 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
         // (`pk_deletion_strategy` is `PositionBased` exactly then), so without this
         // a `mode: memory` table could neither be emptied nor filtered.
         //
-        // `apply_mem_tier_delete` needs the table `write_lock`, which the inner
-        // sink takes and releases internally, so acquire it here rather than
-        // nesting. Before the `deleted > 0` bookkeeping below: on a table whose
-        // rows are ONLY in the mem-tier the inner count is 0, and the cached scan
-        // statistics still need invalidating once this changes the visible count.
+        // `apply_mem_tier_delete` needs the table `write_lock`. The inner sink
+        // takes and releases it internally, so this is a new acquire — unless
+        // autocommit UPDATE already holds the same non-reentrant mutex across
+        // rematerialize + delete + insert (`write_lock_held`). Nesting then
+        // deadlocks after the files are already unlinked.
         {
-            let _guard = self.table.write_lock.lock().await;
+            let _guard = if super::write_lock_held::is_held() {
+                None
+            } else {
+                Some(self.table.write_lock.lock().await)
+            };
             deleted = deleted.saturating_add(
                 apply_mem_tier_delete(&self.table, &self.filters)
                     .await

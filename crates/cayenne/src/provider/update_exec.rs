@@ -29,7 +29,11 @@ limitations under the License.
 //!
 //! A partitioned sink calls [`PreparableUpdate::prepare`] on every partition
 //! before executing any, so a primary-key collision in a later partition
-//! refuses the statement with nothing written.
+//! refuses the statement with nothing written. `prepare` only validates.
+//! `execute` always rematerializes under `write_lock` — writing prepare-time
+//! rows would replay a stale capture (two same-key `value = value + 1` plans
+//! that both prepared against V1 would both write V2). Snapshot id is not a
+//! freshness signal here: an inline write does not rotate it.
 
 use std::sync::Arc;
 
@@ -64,10 +68,6 @@ pub(crate) struct CayenneUpdateExec {
     session_state: SessionState,
     filters: Vec<Expr>,
     validator: Option<Arc<dyn UpdateValidator>>,
-    /// Rows [`PreparableUpdate::prepare`] materialized and checked. The next
-    /// execution writes these so a partitioned sink can refuse every partition
-    /// when one partition's validator fails.
-    prepared: Arc<tokio::sync::Mutex<Option<Vec<RecordBatch>>>>,
     properties: Arc<PlanProperties>,
 }
 
@@ -96,7 +96,6 @@ impl CayenneUpdateExec {
             session_state,
             filters,
             validator,
-            prepared: Arc::new(tokio::sync::Mutex::new(None)),
             properties,
         }
     }
@@ -105,7 +104,9 @@ impl CayenneUpdateExec {
 #[async_trait]
 impl PreparableUpdate for CayenneUpdateExec {
     async fn prepare(&self, context: Arc<TaskContext>) -> Result<(), DataFusionError> {
-        let rows = materialize_from_logical(
+        // Validate only. The next execution rematerializes under `write_lock`
+        // so a partitioned prepare-then-apply does not write a stale capture.
+        materialize_from_logical(
             &self.logical_plan,
             &self.session_state,
             &self.table,
@@ -113,7 +114,6 @@ impl PreparableUpdate for CayenneUpdateExec {
             context,
         )
         .await?;
-        *self.prepared.lock().await = Some(rows);
         Ok(())
     }
 }
@@ -183,7 +183,6 @@ impl ExecutionPlan for CayenneUpdateExec {
         let session_state = self.session_state.clone();
         let filters = self.filters.clone();
         let validator = self.validator.clone();
-        let prepared = Arc::clone(&self.prepared);
         let schema = Arc::new(Schema::new(vec![Field::new(
             "count",
             DataType::UInt64,
@@ -203,7 +202,6 @@ impl ExecutionPlan for CayenneUpdateExec {
                     session_state,
                     filters,
                     validator,
-                    prepared,
                     context,
                 ),
             )
@@ -220,22 +218,19 @@ async fn apply_update(
     session_state: SessionState,
     filters: Vec<Expr>,
     validator: Option<Arc<dyn UpdateValidator>>,
-    prepared: Arc<tokio::sync::Mutex<Option<Vec<RecordBatch>>>>,
     context: Arc<TaskContext>,
 ) -> Result<RecordBatch, DataFusionError> {
-    let rows = match prepared.lock().await.take() {
-        Some(rows) => rows,
-        None => {
-            materialize_from_logical(
-                &logical_plan,
-                &session_state,
-                &table,
-                validator.as_deref(),
-                Arc::clone(&context),
-            )
-            .await?
-        }
-    };
+    // Always rematerialize under the already-held `write_lock`. Prepare-time
+    // rows are a stale capture: an inline write does not rotate `snapshot_id`,
+    // so a "rematerialize if the snapshot changed" check would miss it.
+    let rows = materialize_from_logical(
+        &logical_plan,
+        &session_state,
+        &table,
+        validator.as_deref(),
+        Arc::clone(&context),
+    )
+    .await?;
     let provider: Arc<dyn TableProvider> = Arc::new(table.clone_for_write());
     let target_schema = provider.schema();
 
