@@ -25,6 +25,7 @@ use crate::bedrock::chat::util::{
     chat_choice_stream, convert_usage, extract_from_content_block, into_fallible_stream,
     to_api_error, tool_config, try_convert_finish_reason, try_convert_role, value_to_document,
 };
+use crate::bedrock::model_id::ModelId;
 use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
 use crate::streaming_utils::{create_stream_response, generate_stream_id};
@@ -77,9 +78,8 @@ use tokio::sync::RwLock;
 /// [`BedrockConverse`] provides an `OpenAI` compatible interface (i.e. `impl Chat` ), for models on AWS bedrock that are compatible with the [Converse API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html).
 pub struct BedrockConverse {
     client: Arc<BedrockClient>,
-    model_id: String,
+    model_id: ModelId,
     guardrail: Option<GuardRail>,
-    reasoning: ReasoningControl,
 }
 
 impl BedrockConverse {
@@ -87,8 +87,7 @@ impl BedrockConverse {
     pub fn new(client: Arc<BedrockClient>, model_id: String) -> Self {
         Self {
             client,
-            reasoning: ReasoningControl::for_model(&model_id),
-            model_id,
+            model_id: ModelId::from(model_id),
             guardrail: None,
         }
     }
@@ -103,7 +102,7 @@ impl BedrockConverse {
     /// Instead of performing these changes in the underlying conversion (i.e. within Converse
     /// APIs), we do it here for consistency with other model providers.
     fn alter_request(&self, mut req: CreateChatCompletionRequest) -> CreateChatCompletionRequest {
-        req.model.clone_from(&self.model_id);
+        self.model_id.as_str().clone_into(&mut req.model);
         // Bedrock should set Option::None parameters to a schema with no inputs, but doesn't.
         // Must be done explicitly.
         if let Some(ref mut tools) = req.tools {
@@ -422,7 +421,7 @@ impl BedrockConverse {
         &self,
         req: &CreateChatCompletionRequest,
     ) -> Result<Option<ReasoningRequest>, OpenAIError> {
-        self.reasoning.request(
+        ReasoningControl::for_model(&self.model_id).request(
             &self.model_id,
             req.reasoning_effort.as_ref(),
             Self::max_tokens(req),
@@ -497,7 +496,7 @@ impl BedrockConverse {
         let mut bldr = client
             .client
             .converse_stream()
-            .model_id(self.model_id.clone())
+            .model_id(self.model_id.as_str())
             .set_messages(Some(messages))
             .inference_config(inf_cfg)
             .set_system(Some(system))
@@ -567,7 +566,7 @@ impl BedrockConverse {
         let mut bldr = client
             .client
             .converse()
-            .model_id(self.model_id.clone())
+            .model_id(self.model_id.as_str())
             .set_messages(Some(messages))
             .inference_config(inf_cfg)
             .set_system(Some(system))
@@ -648,13 +647,13 @@ impl BedrockConverse {
 
         Ok(CreateChatCompletionResponse {
             usage,
-            id: generate_stream_id(&self.model_id),
+            id: generate_stream_id(self.model_id.as_str()),
             choices: vec![choices],
             created: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
                 .as_secs() as u32,
-            model: self.model_id.clone(),
+            model: self.model_id.to_string(),
             service_tier: None,
             system_fingerprint: None,
             object: "chat.completion".to_string(),

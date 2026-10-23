@@ -33,6 +33,7 @@ use aws_smithy_types::Document;
 use serde::Serialize;
 
 use super::util::value_to_document;
+use crate::bedrock::model_id::{FoundationModel, ModelId, Provider};
 
 /// Smallest Claude `budget_tokens` that Bedrock accepts.
 const CLAUDE_MIN_BUDGET_TOKENS: u32 = 1024;
@@ -170,26 +171,20 @@ impl ClaudeVersion {
 }
 
 impl ReasoningControl {
-    /// The reasoning control for a Bedrock model ID, inference profile ID, or ARN.
-    pub(super) fn for_model(model_id: &str) -> Self {
-        // An ARN ends in `.../<model or inference profile ID>`.
-        let id = model_id.rsplit('/').next().unwrap_or(model_id);
-        // An inference profile ID puts a geography before the provider, for example
-        // `us.anthropic.claude-sonnet-4-5-20250929-v1:0`.
-        let mut parts = id.split('.');
-        let Some(provider) = parts.find(|p| matches!(*p, "anthropic" | "amazon" | "openai")) else {
+    /// The reasoning control for the model that `model_id` names.
+    pub(super) fn for_model(model_id: &ModelId) -> Self {
+        let Some(FoundationModel { provider, name }) = model_id.foundation_model() else {
             return Self::Unsupported;
         };
-        let name = parts.collect::<Vec<_>>().join(".");
 
         match provider {
-            "anthropic" => match ClaudeVersion::parse(&name) {
+            Provider::Anthropic => match ClaudeVersion::parse(name) {
                 Some(v) if v >= ClaudeVersion::ADAPTIVE_THINKING => Self::ClaudeAdaptive,
                 Some(v) if v >= ClaudeVersion::EXTENDED_THINKING => Self::ClaudeBudget,
                 _ => Self::Unsupported,
             },
-            "amazon" if name.starts_with("nova-2-lite") => Self::Nova,
-            "openai" if name.starts_with("gpt-oss-") => Self::GptOss,
+            Provider::Amazon if name.starts_with("nova-2-lite") => Self::Nova,
+            Provider::OpenAi if name.starts_with("gpt-oss-") => Self::GptOss,
             _ => Self::Unsupported,
         }
     }
@@ -198,7 +193,7 @@ impl ReasoningControl {
     /// model's default already gives that effort.
     pub(super) fn request(
         self,
-        model_id: &str,
+        model_id: &ModelId,
         effort: Option<&ReasoningEffort>,
         max_tokens: Option<u32>,
     ) -> Result<Option<ReasoningRequest>, OpenAIError> {
@@ -211,7 +206,7 @@ impl ReasoningControl {
             (Self::ClaudeBudget | Self::Nova, None) => return Ok(None),
             (Self::ClaudeBudget, Some(effort)) => {
                 let (budget_tokens, max_tokens) =
-                    claude_budget(model_id, effort.claude_budget_tokens(), max_tokens)?;
+                    claude_budget(model_id.as_str(), effort.claude_budget_tokens(), max_tokens)?;
                 (
                     AdditionalModelRequestFields::Claude {
                         thinking: ClaudeThinking::Enabled { budget_tokens },
@@ -258,7 +253,7 @@ impl ReasoningControl {
             (Self::Unsupported, _) => {
                 tracing::warn!(
                     "{}",
-                    unsupported_effort_warning(model_id, effort_name(effort))
+                    unsupported_effort_warning(model_id.as_str(), effort_name(effort))
                 );
                 return Ok(None);
             }
@@ -322,8 +317,9 @@ mod tests {
         effort: ReasoningEffort,
         max_tokens: Option<u32>,
     ) -> Option<ReasoningRequest> {
-        ReasoningControl::for_model(model_id)
-            .request(model_id, Some(&effort), max_tokens)
+        let model_id = ModelId::from(model_id);
+        ReasoningControl::for_model(&model_id)
+            .request(&model_id, Some(&effort), max_tokens)
             .expect("reasoning request should build")
     }
 
@@ -399,7 +395,11 @@ mod tests {
             ("openai.gpt-oss-20b-1:0", ReasoningControl::GptOss),
         ];
         for (model_id, control) in cases {
-            assert_eq!(ReasoningControl::for_model(model_id), control, "{model_id}");
+            assert_eq!(
+                ReasoningControl::for_model(&ModelId::from(model_id)),
+                control,
+                "{model_id}"
+            );
         }
     }
 
@@ -433,6 +433,7 @@ mod tests {
     #[test]
     fn claude_thinking_budget_stays_below_max_tokens() {
         let model = "anthropic.claude-opus-4-5-20251101-v1:0";
+        let model_id = ModelId::from(model);
         assert_eq!(
             fields(model, ReasoningEffort::High, Some(10000)),
             expected(
@@ -448,8 +449,8 @@ mod tests {
             )
         );
 
-        let Err(OpenAIError::InvalidArgument(message)) = ReasoningControl::for_model(model)
-            .request(model, Some(&ReasoningEffort::Low), Some(1024))
+        let Err(OpenAIError::InvalidArgument(message)) = ReasoningControl::for_model(&model_id)
+            .request(&model_id, Some(&ReasoningEffort::Low), Some(1024))
         else {
             panic!("max_tokens of 1024 leaves no room for the smallest thinking budget");
         };
@@ -519,9 +520,10 @@ mod tests {
             "us.amazon.nova-2-lite-v1:0",
             "openai.gpt-oss-120b-1:0",
         ] {
+            let model_id = ModelId::from(model);
             assert_eq!(
-                ReasoningControl::for_model(model)
-                    .request(model, None, Some(100))
+                ReasoningControl::for_model(&model_id)
+                    .request(&model_id, None, Some(100))
                     .expect("no effort should build"),
                 None,
                 "{model}"
