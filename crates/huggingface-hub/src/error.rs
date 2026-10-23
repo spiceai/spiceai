@@ -228,12 +228,13 @@ impl DownloadError {
     fn cause_and_fix(&self) -> (String, Option<String>) {
         let context = self.context.as_ref();
         let token = context.token.as_ref();
+        let retried = context.requester.retried;
         let no_token_fix = "set `hf_token`, set `HF_TOKEN`, or run `hf auth login`";
         match self.cause.as_ref() {
             Cause::Hub(error)
             | Cause::Fetch(FetchError::Hub {
                 source: error,
-            }) => hub_cause_and_fix(error, token, no_token_fix, &context.revision),
+            }) => hub_cause_and_fix(error, token, no_token_fix, &context.revision, retried),
             Cause::Fetch(FetchError::Write { path, source }) => {
                 let cache = display_path(&context.cache_dir);
                 let fix = match source.kind() {
@@ -252,13 +253,19 @@ impl DownloadError {
                     fix,
                 )
             }
-            Cause::Fetch(error @ (FetchError::Checksum { .. } | FetchError::Size { .. })) => (
-                error.to_string(),
-                Some(
-                    "Spice downloads it again on the next attempt; if this repeats, a proxy between Spice and the Hub may be changing the bytes"
-                        .to_string(),
-                ),
-            ),
+            Cause::Fetch(error @ (FetchError::Checksum { .. } | FetchError::Size { .. })) => {
+                let again = if retried {
+                    "Spice downloads it again on the next attempt"
+                } else {
+                    "Restart Spice to download it again"
+                };
+                (
+                    error.to_string(),
+                    Some(format!(
+                        "{again}; if this repeats, a proxy between Spice and the Hub may be changing the bytes"
+                    )),
+                )
+            }
             Cause::Fetch(error @ FetchError::InvalidEntry { .. }) => (error.to_string(), None),
             // Worded as a cause already, with its own fix.
             Cause::Settings(error) => (error.to_string(), None),
@@ -291,7 +298,7 @@ impl DownloadError {
                 format!(
                     "the Hugging Face Hub could not be reached ({reason}), and the Hugging Face cache does not hold {what}"
                 ),
-                Some(RETRY_FIX.to_string()),
+                Some(unreachable_fix(retried)),
             ),
             Cause::Unusable { message } => (message.clone(), None),
             Cause::InvalidRepo => (
@@ -322,7 +329,13 @@ fn hub_cause_and_fix(
     token: Option<&TokenSource>,
     no_token_fix: &str,
     revision: &str,
+    retried: bool,
 ) -> (String, Option<String>) {
+    let after_the_limit = if retried {
+        "Spice retries the download"
+    } else {
+        "Restart Spice once the limit resets"
+    };
     match (error, token) {
         (client::Error::TokenRejected { status, .. }, Some(source)) => {
             let expired = if matches!(source, TokenSource::File(_)) {
@@ -376,20 +389,20 @@ fn hub_cause_and_fix(
         (client::Error::RateLimited { reset_hint, .. }, None) => (
             format!("the Hub kept rate-limiting requests{reset_hint}"),
             Some(format!(
-                "Spice retries the download; to raise the limit, {no_token_fix}"
+                "{after_the_limit}; to raise the limit, {no_token_fix}"
             )),
         ),
         (client::Error::RateLimited { reset_hint, .. }, Some(_)) => (
             format!("the Hub kept rate-limiting requests{reset_hint}"),
-            Some("Spice retries the download".to_string()),
+            Some(after_the_limit.to_string()),
         ),
         (client::Error::Request { .. }, _) => (
             format!("the Hugging Face Hub {}", unreachable_reason_clause(error)),
-            Some(RETRY_FIX.to_string()),
+            Some(unreachable_fix(retried)),
         ),
         (client::Error::Status { status, .. }, _) => (
             format!("the Hugging Face Hub {}", unreachable_reason_clause(error)),
-            (*status >= 500).then(|| RETRY_FIX.to_string()),
+            (*status >= 500).then(|| unreachable_fix(retried)),
         ),
         (error, _) => (lowercase_first(&error.to_string()), None),
     }
@@ -397,7 +410,13 @@ fn hub_cause_and_fix(
 
 /// What a user can do while the Hub cannot be reached. `HF_HUB_OFFLINE` is no way out: a
 /// load has already fallen back to the cache, and found it lacking, by the time this shows.
-const RETRY_FIX: &str = "Spice retries the download; check the network connection";
+fn unreachable_fix(retried: bool) -> String {
+    if retried {
+        "Spice retries the download; check the network connection".to_string()
+    } else {
+        "Check the network connection, then restart Spice".to_string()
+    }
+}
 
 /// Why the Hub could not answer, as a short phrase for a warning: `connection timed out`,
 /// `HTTP 503`.
@@ -454,5 +473,110 @@ fn lowercase_first(message: &str) -> String {
             first.to_lowercase().chain(chars).collect()
         }
         _ => message.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn error(retried: bool, token: Option<TokenSource>, cause: Cause) -> String {
+        let context = DownloadContext {
+            requester: Requester {
+                kind: "embedding model",
+                name: "e5".to_string(),
+                docs_url: "https://spiceai.org/docs/components/embeddings/huggingface",
+                retried,
+            },
+            repo: "o/m".to_string(),
+            revision: "main".to_string(),
+            token,
+            cache_dir: PathBuf::from("/cache"),
+        };
+        context.error(None, cause).to_string()
+    }
+
+    fn repo() -> RepoId {
+        RepoId::new(RepoType::Model, "o", "m").expect("a valid repository")
+    }
+
+    /// Each piece of advice that depends on whether Spice loads the component again: a model
+    /// is retried, an embedding model or reranker is loaded once.
+    #[test]
+    fn advice_says_whether_spice_retries() {
+        let unavailable = || {
+            Cause::Hub(client::Error::Status {
+                repo: repo(),
+                status: 503,
+                attempts: 5,
+                message: ": The Hub is down.".to_string(),
+            })
+        };
+        let rate_limited = || {
+            Cause::Hub(client::Error::RateLimited {
+                repo: repo(),
+                reset_hint: String::new(),
+            })
+        };
+        let corrupted = || {
+            Cause::Fetch(FetchError::Checksum {
+                algorithm: "SHA-256",
+                expected: "abc".to_string(),
+            })
+        };
+        let outage_without_file = || Cause::Missing {
+            what: "'tokenizer.json'".to_string(),
+            source: Source::CacheInOutage {
+                reason: "HTTP 503".to_string(),
+            },
+        };
+        let prefix = "Failed to download embedding model 'e5' from Hugging Face repo 'o/m' (revision 'main'):";
+        let docs = "See: https://spiceai.org/docs/components/embeddings/huggingface";
+        let env_token = || Some(TokenSource::Env("HF_TOKEN"));
+        let cases = [
+            (
+                error(true, None, unavailable()),
+                "the Hugging Face Hub returned HTTP 503 after 5 attempt(s): The Hub is down. Spice retries the download; check the network connection.",
+            ),
+            (
+                error(false, None, unavailable()),
+                "the Hugging Face Hub returned HTTP 503 after 5 attempt(s): The Hub is down. Check the network connection, then restart Spice.",
+            ),
+            (
+                error(true, None, rate_limited()),
+                "the Hub kept rate-limiting requests. Spice retries the download; to raise the limit, set `hf_token`, set `HF_TOKEN`, or run `hf auth login`.",
+            ),
+            (
+                error(false, None, rate_limited()),
+                "the Hub kept rate-limiting requests. Restart Spice once the limit resets; to raise the limit, set `hf_token`, set `HF_TOKEN`, or run `hf auth login`.",
+            ),
+            (
+                error(true, env_token(), rate_limited()),
+                "the Hub kept rate-limiting requests. Spice retries the download.",
+            ),
+            (
+                error(false, env_token(), rate_limited()),
+                "the Hub kept rate-limiting requests. Restart Spice once the limit resets.",
+            ),
+            (
+                error(true, None, corrupted()),
+                "the downloaded file does not match the Hub's SHA-256 (abc), so it was discarded. Spice downloads it again on the next attempt; if this repeats, a proxy between Spice and the Hub may be changing the bytes.",
+            ),
+            (
+                error(false, None, corrupted()),
+                "the downloaded file does not match the Hub's SHA-256 (abc), so it was discarded. Restart Spice to download it again; if this repeats, a proxy between Spice and the Hub may be changing the bytes.",
+            ),
+            (
+                error(true, None, outage_without_file()),
+                "the Hugging Face Hub could not be reached (HTTP 503), and the Hugging Face cache does not hold 'tokenizer.json'. Spice retries the download; check the network connection.",
+            ),
+            (
+                error(false, None, outage_without_file()),
+                "the Hugging Face Hub could not be reached (HTTP 503), and the Hugging Face cache does not hold 'tokenizer.json'. Check the network connection, then restart Spice.",
+            ),
+        ];
+        for (actual, expected) in cases {
+            assert_eq!(actual, format!("{prefix} {expected} {docs}"));
+        }
     }
 }

@@ -76,6 +76,7 @@ pub mod checkpoint_primary_key;
 pub mod fallback_retention;
 pub use fallback_retention::{Error as FallbackRetentionKeepError, FallbackRetentionKeep};
 pub mod federation;
+pub(crate) mod index_rebuild;
 pub mod partition_scope;
 pub mod refresh;
 pub mod refresh_completion;
@@ -258,6 +259,15 @@ pub enum Error {
 
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
     NoPrimaryKeysDefined { dataset_name: String },
+
+    #[snafu(display(
+        "Failed to rebuild the search index of dataset '{dataset_name}' from its acceleration, so the dataset is not loaded rather than answering searches from an incomplete index. Fix the cause below and restart; for details, visit: https://spiceai.org/docs/features/search/full-text-search. Cause: {}",
+        format_datafusion_error(source)
+    ))]
+    FailedToRebuildIndex {
+        dataset_name: String,
+        source: DataFusionError,
+    },
 
     #[snafu(transparent)]
     PkFilterExpr {
@@ -507,6 +517,8 @@ pub struct Builder {
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
+    /// See [`Builder::initial_status`].
+    initial_status: Option<status::ComponentStatus>,
     snapshot_creation_config: Option<SnapshotCreationConfig>,
     /// Per-dataset state for `RefreshMode::Snapshot`. Required when the
     /// refresh mode is Snapshot; ignored otherwise.
@@ -578,6 +590,7 @@ impl Builder {
             write_back: false,
             write_back_deliverer: None,
             initial_load_complete: false,
+            initial_status: None,
             refresh_semaphore: None,
             snapshot_creation_config: None,
             snapshot_refresh_state: None,
@@ -865,6 +878,14 @@ impl Builder {
     /// This will allow the table to be marked as ready immediately.
     pub fn initial_load_complete(&mut self, initial_load_complete: bool) -> &mut Self {
         self.initial_load_complete = initial_load_complete;
+        self
+    }
+
+    /// The status the dataset reports once its existing acceleration can serve it. It is
+    /// applied when the refresher starts, after the dataset's search indexes are rebuilt from
+    /// that acceleration, so the dataset is never reported ready while the rebuild runs.
+    pub fn initial_status(&mut self, initial_status: status::ComponentStatus) -> &mut Self {
+        self.initial_status = Some(initial_status);
         self
     }
 
@@ -1215,6 +1236,7 @@ impl Builder {
         refresher.with_snapshot_refresh_state(self.snapshot_refresh_state);
         refresher.with_append_cursor_store(self.append_cursor_store);
         refresher.set_bootstrap_status(self.bootstrap_status);
+        refresher.set_initial_status(self.initial_status.clone());
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());
@@ -1847,6 +1869,13 @@ impl AcceleratedTable {
     #[must_use]
     pub fn is_accelerator_only(&self) -> bool {
         matches!(self.write_mode, WriteMode::AcceleratorOnly)
+    }
+
+    /// Whether writes go to the federated source, from which the refresh
+    /// propagates them to the accelerator.
+    #[must_use]
+    pub fn is_write_through(&self) -> bool {
+        matches!(self.write_mode, WriteMode::WriteThrough)
     }
 
     /// Why `operation` is refused on this node, if it is: on a scheduler, a table whose
