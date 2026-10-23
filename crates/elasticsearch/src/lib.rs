@@ -179,7 +179,22 @@ pub struct KnnQuery {
 pub struct SearchResponse {
     #[serde(default)]
     pub pit_id: Option<String>,
+    /// Whether the search stopped at its timeout. Elasticsearch still answers with the hits
+    /// it gathered by then, and no error.
+    #[serde(default)]
+    pub timed_out: bool,
+    /// How many shards answered. A search some shards failed still succeeds, with only the
+    /// other shards' hits.
+    #[serde(default, rename = "_shards")]
+    pub shards: Option<ShardsSummary>,
     pub hits: HitsEnvelope,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShardsSummary {
+    pub total: u64,
+    #[serde(default)]
+    pub failed: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

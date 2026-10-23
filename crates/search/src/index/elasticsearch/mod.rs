@@ -360,6 +360,19 @@ impl ReplaceSnapshot {
             if let Some(new_id) = page.pit_id {
                 *pit_id = new_id;
             }
+            // A page missing a shard's hits would end the reconcile early, or skip that
+            // shard's documents, as if they were not there.
+            if let Some(shards) = page.shards.as_ref().filter(|shards| shards.failed > 0) {
+                return Err(format!(
+                    "{} of {} shards failed to answer the snapshot search, so their documents were not checked",
+                    shards.failed, shards.total
+                ));
+            }
+            if page.timed_out {
+                return Err(
+                    "the snapshot search timed out, so not every document was checked".to_string(),
+                );
+            }
             let hits = page.hits.hits;
             let Some(last) = hits.last() else {
                 return Ok(deleted);
@@ -488,12 +501,13 @@ impl ElasticsearchIndexWriteMaintenance {
     /// reconciling against it would keep a row the dropped write rewrote, and an append would
     /// delete the documents of every row the dropped write had not re-sent.
     ///
-    /// A failed start that opened the cycle leaves no cycle open: the caller does not call
-    /// `on_write_failed` on an index whose own start failed, so the next write would otherwise
-    /// skip the tuning. A failed start inside a cycle an earlier start opened leaves that
-    /// cycle open, so its `on_write_complete` still restores what it overrode. A snapshot
-    /// outlives a failed tuning: the tuning is best-effort, the sink writes without it, and
-    /// that write still has to remove the rows it dropped.
+    /// The tuning and the snapshot are independent, and the sink writes whichever of them
+    /// fails, so neither failure costs the write the other. A failed tuning that opened the
+    /// cycle leaves no cycle open: the caller does not call `on_write_failed` on an index whose
+    /// own start failed, so the next write would otherwise skip the tuning. A refused snapshot
+    /// leaves the cycle the tuning opened, so the write's `on_write_complete` restores what the
+    /// tuning overrode. A snapshot outlives a failed tuning, since the write still has to
+    /// remove the rows it dropped.
     pub async fn on_write_start(
         &self,
         client: &Arc<dyn Elasticsearch>,
@@ -505,22 +519,21 @@ impl ElasticsearchIndexWriteMaintenance {
         if let Some(stale) = stale {
             stale.close(client.as_ref(), es_index).await;
         }
-        let started = async {
-            if window == WriteWindow::ReplaceAll {
-                let snapshot = ReplaceSnapshot::open(client, es_index).await?;
-                *self.replace_snapshot.lock() = snapshot;
-            }
-            if first_start {
-                self.tune_refresh_interval(client.as_ref(), es_index)
-                    .await?;
-            }
+        let tuned = if first_start {
+            self.tune_refresh_interval(client.as_ref(), es_index)
+                .await
+                .inspect_err(|_| self.abandon_write_cycle())
+        } else {
             Ok(())
         };
-        started.await.inspect_err(|_| {
-            if first_start {
-                self.abandon_write_cycle();
-            }
-        })
+        let snapshotted = if window == WriteWindow::ReplaceAll {
+            ReplaceSnapshot::open(client, es_index)
+                .await
+                .map(|snapshot| *self.replace_snapshot.lock() = snapshot)
+        } else {
+            Ok(())
+        };
+        snapshotted.and(tuned)
     }
 
     async fn tune_refresh_interval(
@@ -1206,6 +1219,8 @@ mod write_maintenance_tests {
         fail_put_settings: bool,
         /// When set, `open_point_in_time` fails, so a replacing write cannot snapshot the index.
         fail_open_point_in_time: bool,
+        /// The body every `search_point_in_time` call answers with.
+        snapshot_page: Option<serde_json::Value>,
     }
 
     #[async_trait::async_trait]
@@ -1284,7 +1299,11 @@ mod write_maintenance_tests {
             &self,
             _: &serde_json::Value,
         ) -> elasticsearch::Result<SearchResponse> {
-            unimplemented!()
+            let page = self
+                .snapshot_page
+                .clone()
+                .expect("search_point_in_time is only expected where a page is set");
+            Ok(serde_json::from_value(page).expect("the test page is a search response"))
         }
         async fn close_point_in_time(&self, _: &str) -> elasticsearch::Result<()> {
             unimplemented!()
@@ -1463,6 +1482,71 @@ mod write_maintenance_tests {
             2,
             "refresh_interval must be overridden once and restored once"
         );
+    }
+
+    /// The `refresh_interval` override does not depend on the snapshot: a replacing write whose
+    /// snapshot is refused still bulk-loads with the override, and its completion restores it.
+    #[tokio::test]
+    async fn a_refused_snapshot_on_the_first_start_still_tunes_refresh_interval() {
+        let client = Arc::new(MockElasticsearch {
+            refresh_interval: std::sync::Mutex::new(Some("30s".to_string())),
+            fail_open_point_in_time: true,
+            ..Default::default()
+        });
+        let m = make_maintenance(ElasticsearchIndexWriteOptions {
+            refresh_interval_during_write: Some("-1".to_string()),
+            force_merge_segments: None,
+        });
+
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::ReplaceAll)
+            .await
+            .expect_err("the snapshot was refused");
+        m.on_write_complete(client.as_ref(), "my-index")
+            .await
+            .expect("complete");
+
+        assert_eq!(
+            client.put_settings_calls.load(Ordering::Relaxed),
+            2,
+            "refresh_interval must be overridden once and restored once"
+        );
+    }
+
+    /// Elasticsearch answers a search that not every shard completed with the hits it has and
+    /// no error. A reconcile that read such a page as complete would stop early, or skip a
+    /// shard's documents, and report success while their stale documents stay searchable.
+    #[tokio::test]
+    async fn an_incomplete_snapshot_page_fails_the_reconcile() {
+        for (page, expected) in [
+            (
+                serde_json::json!({
+                    "pit_id": "pit-1",
+                    "timed_out": false,
+                    "_shards": { "total": 2, "successful": 1, "skipped": 0, "failed": 1 },
+                    "hits": { "hits": [] },
+                }),
+                "1 of 2 shards failed to answer the snapshot search, so their documents were not checked",
+            ),
+            (
+                serde_json::json!({
+                    "pit_id": "pit-1",
+                    "timed_out": true,
+                    "_shards": { "total": 2, "successful": 2, "skipped": 0, "failed": 0 },
+                    "hits": { "hits": [] },
+                }),
+                "the snapshot search timed out, so not every document was checked",
+            ),
+        ] {
+            let client = MockElasticsearch {
+                snapshot_page: Some(page),
+                ..Default::default()
+            };
+            let mut pit_id = "pit-0".to_string();
+            assert_eq!(
+                ReplaceSnapshot::delete_pages(&client, "my-index", &mut pit_id).await,
+                Err(expected.to_string())
+            );
+        }
     }
 
     /// `on_write_complete` restores the refresh_interval and calls `_refresh`.

@@ -913,6 +913,8 @@ mod tests {
     fn search_response(hits: Vec<Hit>, pit_id: Option<&str>) -> SearchResponse {
         SearchResponse {
             pit_id: pit_id.map(ToString::to_string),
+            timed_out: false,
+            shards: None,
             hits: HitsEnvelope {
                 total: Some(HitsTotal {
                     value: u64::try_from(hits.len()).expect("hit count should fit in u64"),
