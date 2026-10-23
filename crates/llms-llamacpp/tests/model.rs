@@ -20,7 +20,12 @@ use async_openai::types::chat::{ChatCompletionMessageToolCalls, FinishReason};
 use futures::StreamExt;
 use serde_json::{Value, json};
 
-use crate::{qwen3, request};
+use std::path::Path;
+use std::sync::Arc;
+
+use llms::chat::{Chat, LocalModelOptions, ReasoningDefault};
+
+use crate::{fixture, numbers, qwen3, qwen3_gguf, request};
 
 fn weather_tools() -> Value {
     json!([{
@@ -35,13 +40,6 @@ fn weather_tools() -> Value {
             },
         },
     }])
-}
-
-fn numbers(text: &str) -> Vec<u32> {
-    text.split(|c: char| !c.is_ascii_digit())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().expect("a run of digits is a number"))
-        .collect()
 }
 
 #[tokio::test]
@@ -562,4 +560,205 @@ async fn frequency_and_presence_penalties_reduce_repetition() {
         presence < plain,
         "presence_penalty: {presence} vs {plain}: {presence_text} | {plain_text}"
     );
+}
+
+fn weather_and_time_tools() -> Value {
+    let mut tools = weather_tools();
+    tools.as_array_mut().expect("a list of tools").push(json!({
+        "type": "function",
+        "function": {
+            "name": "get_time",
+            "description": "Get the current time in a city",
+            "parameters": {
+                "type": "object",
+                "properties": { "city": { "type": "string", "description": "The city" } },
+                "required": ["city"],
+            },
+        },
+    }));
+    tools
+}
+
+/// Under `allowed_tools` in `auto` mode, a `json_object` reply beside tools may be a call to an
+/// allowed tool only. Asked for what only an excluded tool answers, which the model calls when
+/// every tool is allowed, it calls the allowed one instead: the excluded call, which the reply's
+/// reader would refuse, never comes back as text in place of the JSON.
+#[tokio::test]
+async fn allowed_tools_in_auto_mode_keeps_a_json_reply_to_the_allowed_tools() {
+    let model = qwen3().await;
+    let ask = |tool_choice: Value| {
+        let model = Arc::clone(&model);
+        async move {
+            model
+                .chat_request(request(json!({
+                    "model": "qwen3",
+                    "messages": [{ "role": "user", "content": "What time is it in Tokyo right now?" }],
+                    "tools": weather_and_time_tools(),
+                    "tool_choice": tool_choice,
+                    "response_format": { "type": "json_object" },
+                    "temperature": 0,
+                    "reasoning_effort": "none",
+                    "max_tokens": 128,
+                })))
+                .await
+                .expect("a reply")
+                .choices[0]
+                .message
+                .clone()
+        }
+    };
+    let called = |message: &async_openai::types::chat::ChatCompletionResponseMessage| {
+        message
+            .tool_calls
+            .iter()
+            .flatten()
+            .map(|call| match call {
+                ChatCompletionMessageToolCalls::Function(call) => call.function.name.clone(),
+                ChatCompletionMessageToolCalls::Custom(call) => call.custom_tool.name.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let unrestricted = ask(json!("auto")).await;
+    assert_eq!(called(&unrestricted), ["get_time"], "{unrestricted:?}");
+
+    let restricted = ask(json!({
+        "type": "allowed_tools",
+        "allowed_tools": { "mode": "auto", "tools": [{ "type": "function", "function": { "name": "get_weather" } }] },
+    }))
+    .await;
+    assert_eq!(called(&restricted), ["get_weather"], "{restricted:?}");
+    assert_eq!(
+        restricted.content, None,
+        "no call leaks as text: {restricted:?}"
+    );
+    let Some(ChatCompletionMessageToolCalls::Function(call)) = restricted
+        .tool_calls
+        .as_ref()
+        .and_then(|calls| calls.first())
+    else {
+        panic!("a function call: {restricted:?}");
+    };
+    let arguments: Value = serde_json::from_str(&call.function.arguments).expect("JSON arguments");
+    assert_eq!(arguments, json!({ "city": "Tokyo" }));
+}
+
+/// Loads a GGUF on the llama.cpp engine as the runtime loads a `file:` model.
+async fn load_file(
+    gguf: &Path,
+    tokenizer_config: Option<&Path>,
+) -> llms::chat::Result<Arc<dyn Chat>> {
+    llms::chat::create_local_model(
+        &[gguf.to_str().expect("a UTF-8 path").to_string()],
+        None,
+        None,
+        tokenizer_config.map(|path| path.to_str().expect("a UTF-8 path")),
+        None,
+        None,
+        LocalModelOptions {
+            reasoning: ReasoningDefault {
+                model_name: "qwen3",
+                effort: None,
+            },
+            ..LocalModelOptions::default()
+        },
+    )
+    .await
+}
+
+fn count_to_ten() -> Value {
+    json!({
+        "model": "qwen3",
+        "messages": [{ "role": "user", "content": "Count from 1 to 10. Reply with only the numbers, separated by commas." }],
+        "temperature": 0,
+        "reasoning_effort": "none",
+        "max_tokens": 64,
+    })
+}
+
+/// A GGUF that carries no chat template renders with the one in the model's
+/// `tokenizer_config.json`: given the template the GGUF had, the reply is the one the GGUF
+/// gives with it.
+#[tokio::test]
+async fn a_gguf_without_a_chat_template_renders_with_tokenizer_config() {
+    let expected = qwen3()
+        .await
+        .chat_request(request(count_to_ten()))
+        .await
+        .expect("a reply")
+        .choices[0]
+        .message
+        .content
+        .clone();
+
+    let scratch = tempfile::tempdir().expect("a scratch directory");
+    let gguf = fixture::copy(&qwen3_gguf().await, scratch.path());
+    let template =
+        fixture::rename_string_key(&gguf, "tokenizer.chat_template", "tokenizer.no_chat_templ");
+    let Err(error) = load_file(&gguf, None).await else {
+        panic!("a GGUF without a chat template should not load without one");
+    };
+    assert_eq!(
+        error.to_string(),
+        "Failed to load the model. An error occurred: the GGUF file carries no chat template, and the model sets no `chat_template` Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    );
+
+    let config = scratch.path().join("tokenizer_config.json");
+    std::fs::write(&config, json!({ "chat_template": template }).to_string())
+        .expect("tokenizer_config.json writes");
+    let model = load_file(&gguf, Some(&config))
+        .await
+        .expect("the GGUF loads with the chat template in tokenizer_config.json");
+    let reply = model
+        .chat_request(request(count_to_ten()))
+        .await
+        .expect("a reply");
+    assert_eq!(reply.choices[0].message.content, expected);
+}
+
+/// The chat template in a model's `tokenizer_config.json` wins over the GGUF's own, as it does
+/// on the mistral.rs engine. The file's template is the GGUF's with a system message added, so
+/// a request without one is answered as the GGUF answers the request with it.
+#[tokio::test]
+async fn the_chat_template_in_tokenizer_config_wins_over_the_gguf_own() {
+    let system = "Reply with only the word banana, whatever you are asked.";
+    let question = json!({ "role": "user", "content": "What is 2 + 2?" });
+    let ask = |model: Arc<dyn Chat>, messages: Value| async move {
+        model
+            .chat_request(request(json!({
+                "model": "qwen3",
+                "messages": messages,
+                "temperature": 0,
+                "reasoning_effort": "none",
+                "max_tokens": 32,
+            })))
+            .await
+            .expect("a reply")
+            .choices[0]
+            .message
+            .content
+            .clone()
+    };
+    let own = qwen3().await;
+    let with_system = ask(
+        Arc::clone(&own),
+        json!([{ "role": "system", "content": system }, question]),
+    )
+    .await;
+    let without = ask(own, json!([question])).await;
+    assert_ne!(with_system, without, "the system message changes the reply");
+
+    let gguf = qwen3_gguf().await;
+    let template = format!(
+        "{{%- set messages = [{{\"role\": \"system\", \"content\": {system:?}}}] + messages %}}{}",
+        fixture::string_value(&gguf, "tokenizer.chat_template")
+    );
+    let scratch = tempfile::tempdir().expect("a scratch directory");
+    let config = scratch.path().join("tokenizer_config.json");
+    std::fs::write(&config, json!({ "chat_template": template }).to_string())
+        .expect("tokenizer_config.json writes");
+    let model = load_file(&gguf, Some(&config))
+        .await
+        .expect("the GGUF loads");
+    assert_eq!(ask(model, json!([question])).await, with_system);
 }

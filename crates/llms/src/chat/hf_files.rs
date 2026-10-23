@@ -25,7 +25,7 @@ limitations under the License.
 //! every top-level JSON or Jinja file comes along, so a config the engine reads by name is
 //! there whichever it is.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use huggingface_hub::{DownloadError, RepoType, Requester, Settings, Snapshot};
@@ -151,6 +151,20 @@ fn configs(names: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// The file mistral.rs reads a downloaded repository's chat template from: its
+/// `chat_template.jinja`, else its `tokenizer_config.json`. Every top-level JSON and Jinja file
+/// of the repository is downloaded with the model, so a file missing from `dir` is missing from
+/// the repository.
+pub async fn chat_template_file(dir: &Path) -> Option<PathBuf> {
+    for name in ["chat_template.jinja", "tokenizer_config.json"] {
+        let path = dir.join(name);
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// Where the weights mistral.rs loads are named.
 #[derive(Debug, PartialEq, Eq)]
 enum Weights {
@@ -229,6 +243,20 @@ mod tests {
 
     fn owned(names: &[&str]) -> Vec<String> {
         names.iter().map(ToString::to_string).collect()
+    }
+
+    /// As mistral.rs does, a repository's `chat_template.jinja` is read before its
+    /// `tokenizer_config.json`, and a repository with neither has no template file.
+    #[tokio::test]
+    async fn the_chat_template_file_is_the_jinja_file_before_tokenizer_config() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        assert_eq!(chat_template_file(dir.path()).await, None);
+        let config = dir.path().join("tokenizer_config.json");
+        std::fs::write(&config, "{}").expect("tokenizer_config.json writes");
+        assert_eq!(chat_template_file(dir.path()).await, Some(config));
+        let jinja = dir.path().join("chat_template.jinja");
+        std::fs::write(&jinja, "").expect("chat_template.jinja writes");
+        assert_eq!(chat_template_file(dir.path()).await, Some(jinja));
     }
 
     #[test]

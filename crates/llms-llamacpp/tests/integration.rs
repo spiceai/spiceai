@@ -15,15 +15,17 @@ limitations under the License.
 */
 
 //! The llama.cpp engine's integration tests. `load_errors` needs no network and runs in
-//! `make nextest`; `model` and `differential` download Qwen3-0.6B (639 MB) from Hugging Face
-//! and run in `integration_llms.yml`.
+//! `make nextest`; `model` and `differential` download Qwen3-0.6B (639 MB), and `mtp`
+//! Qwen3.5-0.8B (550 MB), from Hugging Face, and run in `integration_llms.yml`.
 
 // The engine registers itself through a `linkme` slice, which only a linked crate fills.
 use llms_llamacpp as _;
 
 mod differential;
+mod fixture;
 mod load_errors;
 mod model;
+mod mtp;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,6 +62,26 @@ pub(crate) async fn qwen3() -> Arc<dyn Chat> {
     )
     .await
     .expect("Qwen3-0.6B loads on llama.cpp")
+}
+
+/// The downloaded Qwen3-0.6B GGUF, for a test that loads a changed copy of it.
+pub(crate) async fn qwen3_gguf() -> PathBuf {
+    llms::chat::hf_files::download_model(
+        &format!("{MODEL}:{REVISION}"),
+        &[FILE],
+        llms::chat::HubParams::default(),
+        "qwen3-0.6b",
+    )
+    .await
+    .expect("Qwen3-0.6B downloads")
+    .join(FILE)
+}
+
+pub(crate) fn numbers(text: &str) -> Vec<u32> {
+    text.split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().expect("a run of digits is a number"))
+        .collect()
 }
 
 pub(crate) fn request(body: serde_json::Value) -> CreateChatCompletionRequest {

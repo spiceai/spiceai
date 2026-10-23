@@ -101,8 +101,10 @@ impl MistralLlama {
         options: LocalModelOptions<'_>,
         ring_config_path: Option<tempfile::TempPath>,
     ) -> Result<Self> {
+        // mistral.rs reads the template file from `tokenizer_config` itself.
         let LocalModelOptions {
             chat_template_literal,
+            chat_template_file: _,
             context_length,
             paged_attention,
             reasoning,

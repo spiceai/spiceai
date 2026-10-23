@@ -296,8 +296,9 @@ jobs:
 
   llama-cpp-engine:
     name: llama.cpp engine (Qwen3-0.6B GGUF)
-    # The engine's model and differential tests download Qwen3-0.6B (639 MB) from
-    # Hugging Face and run it; its no-network tests run in `make nextest`.
+    # The engine's model and differential tests download Qwen3-0.6B (639 MB), and its MTP
+    # tests Qwen3.5-0.8B (550 MB), from Hugging Face and run them; its no-network tests run
+    # in `make nextest`.
     if: github.event_name != 'workflow_dispatch' || inputs.run != 'hosted'
     runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
     # Sized like the build job above: a cold cache rebuilds llama.cpp and mistral.rs.
@@ -315,10 +316,10 @@ jobs:
       - name: Set up the C and C++ toolchain
         uses: ./.github/actions/setup-cc
 
-      - name: Run the llama.cpp engine's model and differential tests
+      - name: Run the llama.cpp engine's model, differential and MTP tests
         env:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
-          cargo test -p llms-llamacpp --features metal --test integration -- model:: differential::
+          cargo test -p llms-llamacpp --features metal --test integration -- model:: differential:: mtp::

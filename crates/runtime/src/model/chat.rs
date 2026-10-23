@@ -862,6 +862,7 @@ async fn file(
                 model_name: &component.name,
                 effort: default_reasoning_effort.as_ref(),
             },
+            ..llms::chat::LocalModelOptions::default()
         },
     )
     .await

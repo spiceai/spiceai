@@ -67,7 +67,7 @@ use mistralrs_core::reasoning_parsers::{
     },
 };
 use mistralrs_core::{
-    AllowedToolChoice, AllowedToolsMode, ChatTemplateValue, MessageContent,
+    AllowedToolChoice, AllowedToolsMode, AllowedToolsToolChoice, ChatTemplateValue, MessageContent,
     ReasoningEffort as TemplateReasoningEffort, Tool, ToolCallResponse, ToolCallingMatcher,
     ToolChoice, apply_chat_template_to,
 };
@@ -284,6 +284,12 @@ impl LlamaCpp {
         if options.paged_attention == PagedAttentionMode::Disabled {
             tracing::info!("{}", paged_attention_note(options.reasoning.model_name));
         }
+        // The template file is read first, so one that can't be read fails the load before the
+        // model is read.
+        let file_template = match options.chat_template_file {
+            Some(file) => template_in_file(file).await?,
+            None => None,
+        };
         let (ready_tx, ready_rx) = oneshot::channel();
         let (jobs_tx, jobs_rx) = std_mpsc::channel();
         let (freed_tx, freed_rx) = std_mpsc::channel::<()>();
@@ -310,9 +316,10 @@ impl LlamaCpp {
             source: Box::new(e),
         })??;
 
-        // As on the mistral.rs path, a GGUF's own template wins over `chat_template`.
-        let template = loaded
-            .template
+        // As on the mistral.rs path, a template file's template wins over a GGUF's own, and a
+        // GGUF's own wins over `chat_template`.
+        let template = file_template
+            .or(loaded.template)
             .or_else(|| options.chat_template_literal.map(ToString::to_string))
             .ok_or_else(|| ChatError::FailedToLoadModel {
                 source:
@@ -403,17 +410,12 @@ impl LlamaCpp {
         // A required call is forced with a grammar where the template's format allows one,
         // and otherwise only held to by refusing to end until the model makes one.
         let obliged = obliged_tools(tool_choice.as_ref(), &tools);
-        // Under `tool_choice: none` a call is only ever content, so the grammar offers none.
-        let callable: &[Tool] = if matches!(tool_choice, Some(ToolChoice::None)) {
-            &[]
-        } else {
-            &tools
-        };
+        let callable = callable_tools(tool_choice.as_ref(), &tools);
         let grammar = content_grammar(
             &self.model_name,
             &self.template,
             req.response_format.as_ref(),
-            callable,
+            &callable,
             &obliged,
         )?;
         // Each choice reads its own reply, so each has its own reader.
@@ -729,17 +731,18 @@ fn serve(
     // A GGUF may carry its own MTP (NextN) layers, which only load when asked for; a file
     // without them loads as it would otherwise. A model that no longer fits with its MTP
     // layer still loads without it, and decodes without drafting.
-    let model = match Model::load(backend, path, &ModelParams::default().with_load_mtp(true)) {
-        Ok(model) => model,
-        Err(with_mtp) => {
-            let Ok(model) = Model::load(backend, path, &ModelParams::default()) else {
-                let _ = ready.send(Err(load_error(path, with_mtp)));
-                return;
-            };
-            tracing::info!("{}", without_mtp_note(name, &with_mtp));
-            model
-        }
-    };
+    let (model, loaded_mtp) =
+        match Model::load(backend, path, &ModelParams::default().with_load_mtp(true)) {
+            Ok(model) => (model, true),
+            Err(with_mtp) => {
+                let Ok(model) = Model::load(backend, path, &ModelParams::default()) else {
+                    let _ = ready.send(Err(load_error(path, with_mtp)));
+                    return;
+                };
+                tracing::info!("{}", without_mtp_note(name, &with_mtp));
+                (model, false)
+            }
+        };
     let draft_model = match draft.map(|d| {
         let params = ModelParams::default().with_load_mtp(true);
         let head = Model::load(backend, d, &params).map_err(|e| {
@@ -762,8 +765,9 @@ fn serve(
         None => None,
     };
     // Without a separate head, a model with its own MTP layer drafts for itself, as
-    // llama.cpp's server does.
-    let drafts_itself = draft_model.is_none() && model.n_layer_nextn() > 0;
+    // llama.cpp's server does. A model loaded without the layer still counts it in its
+    // header, so only one loaded with it drafts.
+    let drafts_itself = draft_model.is_none() && loaded_mtp && model.n_layer_nextn() > 0;
     // The contexts borrow the models, so all of them live in this frame for the thread's
     // lifetime. With a draft head, verification rolls back up to `MTP_DRAFT` rejected tokens,
     // and a hybrid model's recurrent layers can roll back only as many tokens as the context
@@ -881,6 +885,46 @@ fn paged_attention_note(model: &str) -> String {
 fn failed(message: String) -> ChatError {
     ChatError::FailedToLoadModel {
         source: message.into(),
+    }
+}
+
+/// The chat template in `file`: the whole of a `.jinja` file, or the `chat_template` of a
+/// `tokenizer_config.json`, which holds either one template or a list of named ones, of which
+/// the one named `default` is the model's. A `tokenizer_config.json` without a
+/// `chat_template` holds none.
+async fn template_in_file(file: &Path) -> Result<Option<String>> {
+    let unreadable = |reason: String| {
+        failed(format!(
+            "could not read the chat template in '{}': {reason}",
+            file.display()
+        ))
+    };
+    let text = tokio::fs::read_to_string(file)
+        .await
+        .map_err(|e| unreadable(e.to_string()))?;
+    if file
+        .extension()
+        .is_some_and(|extension| extension == "jinja")
+    {
+        return Ok(Some(text));
+    }
+    let config: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| unreadable(e.to_string()))?;
+    match config.get("chat_template") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(template)) => Ok(Some(template.clone())),
+        Some(serde_json::Value::Array(templates)) => templates
+            .iter()
+            .find(|named| named.get("name").and_then(serde_json::Value::as_str) == Some("default"))
+            .and_then(|named| named.get("template"))
+            .and_then(serde_json::Value::as_str)
+            .map(|template| Some(template.to_string()))
+            .ok_or_else(|| {
+                unreadable("its `chat_template` list has no template named `default`".to_string())
+            }),
+        Some(_) => Err(unreadable(
+            "its `chat_template` is neither a template nor a list of named templates".to_string(),
+        )),
     }
 }
 
@@ -1659,17 +1703,32 @@ fn obliged_tools<'t>(choice: Option<&ToolChoice>, tools: &'t [Tool]) -> Vec<&'t 
         Some(ToolChoice::AllowedTools(allowed))
             if matches!(allowed.mode, AllowedToolsMode::Required) =>
         {
-            tools
-                .iter()
-                .filter(|t| {
-                    allowed.tools.iter().any(|a| {
-                        matches!(a, AllowedToolChoice::Function { name } if *name == t.function.name)
-                    })
-                })
-                .collect()
+            allowed_tools(allowed, tools)
         }
         _ => Vec::new(),
     }
+}
+
+/// The tools a reply may call under `tool_choice`: none under `none`, since a call is then only
+/// ever content; the allowed ones under `allowed_tools`; and otherwise every tool offered.
+fn callable_tools<'t>(choice: Option<&ToolChoice>, tools: &'t [Tool]) -> Vec<&'t Tool> {
+    match choice {
+        Some(ToolChoice::None) => Vec::new(),
+        Some(ToolChoice::AllowedTools(allowed)) => allowed_tools(allowed, tools),
+        _ => tools.iter().collect(),
+    }
+}
+
+/// The tools among `tools` that `allowed` names.
+fn allowed_tools<'t>(allowed: &AllowedToolsToolChoice, tools: &'t [Tool]) -> Vec<&'t Tool> {
+    tools
+        .iter()
+        .filter(|t| {
+            allowed.tools.iter().any(
+                |a| matches!(a, AllowedToolChoice::Function { name } if *name == t.function.name),
+            )
+        })
+        .collect()
 }
 
 /// Whether a chat template writes tool calls as `<tool_call>{"name": ..., "arguments": ...}</tool_call>`,
@@ -1691,7 +1750,7 @@ fn content_grammar(
     model: &str,
     template: &str,
     format: Option<&ResponseFormat>,
-    tools: &[Tool],
+    tools: &[&Tool],
     obliged: &[&Tool],
 ) -> std::result::Result<Option<String>, OpenAIError> {
     let reply = match format {
@@ -1720,8 +1779,7 @@ fn content_grammar(
             "Model '{model}' can't combine a `json_schema` or `json_object` `response_format` with `tools`: its chat template's tool-call format can't be enforced alongside a schema. Send one or the other."
         )));
     }
-    let offered: Vec<&Tool> = tools.iter().collect();
-    let call = json_grammar(&call_schema(&offered), "tools")?;
+    let call = json_grammar(&call_schema(tools), "tools")?;
     Ok(Some(either_grammar(&call, &reply)))
 }
 
@@ -2203,7 +2261,7 @@ mod tests {
     #[test]
     fn a_required_call_is_forced_in_a_template_that_tags_calls() {
         let tool = weather_tool();
-        let grammar = content_grammar("m", TAGGED, None, std::slice::from_ref(&tool), &[&tool])
+        let grammar = content_grammar("m", TAGGED, None, &[&tool], &[&tool])
             .expect("the tool's schema converts")
             .expect("a required call in a tagged template has a grammar");
         assert!(
@@ -2221,14 +2279,8 @@ mod tests {
             "the name is held to the tool's: {grammar}"
         );
         assert_eq!(
-            content_grammar(
-                "m",
-                "{{ '[TOOL_CALLS]' }}",
-                None,
-                std::slice::from_ref(&tool),
-                &[&tool]
-            )
-            .expect("no conversion"),
+            content_grammar("m", "{{ '[TOOL_CALLS]' }}", None, &[&tool], &[&tool])
+                .expect("no conversion"),
             None,
             "another template format has no grammar; end-of-generation is held off instead"
         );
@@ -2237,15 +2289,9 @@ mod tests {
     #[test]
     fn a_structured_reply_beside_tools_is_either_a_call_or_the_reply() {
         let tool = weather_tool();
-        let grammar = content_grammar(
-            "m",
-            TAGGED,
-            Some(&answer_schema()),
-            std::slice::from_ref(&tool),
-            &[],
-        )
-        .expect("both convert")
-        .expect("a grammar");
+        let grammar = content_grammar("m", TAGGED, Some(&answer_schema()), &[&tool], &[])
+            .expect("both convert")
+            .expect("a grammar");
         assert!(
             grammar.ends_with(
                 "root ::= \"<tool_call>\\n\" call-root \"\\n</tool_call>\" | reply-root\n"
@@ -2261,7 +2307,7 @@ mod tests {
             "qwen",
             "{{ '[TOOL_CALLS]' }}",
             Some(&answer_schema()),
-            std::slice::from_ref(&tool),
+            &[&tool],
             &[],
         )
         .expect_err("another template format can't combine the two");

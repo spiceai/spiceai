@@ -402,8 +402,10 @@ pub async fn create_hf_model(
         && let Some(engine) = engine::engine_for(gguf_files)
     {
         let weights: Vec<PathBuf> = gguf_files.iter().map(|file| dir.join(file)).collect();
+        let template_file = hf_files::chat_template_file(&dir).await;
         let options = LocalModelOptions {
             chat_template_literal,
+            chat_template_file: template_file.as_deref(),
             reasoning,
             ..LocalModelOptions::default()
         };
@@ -444,6 +446,9 @@ pub async fn create_hf_model(
 pub struct LocalModelOptions<'a> {
     /// Overrides the chat template; ignored for GGUF when the file carries its own.
     pub chat_template_literal: Option<&'a str>,
+    /// The model's `tokenizer_config.json`, or a `.jinja` file, whose chat template wins over a
+    /// GGUF's own, as it does on the mistral.rs engine.
+    pub chat_template_file: Option<&'a Path>,
     /// Sequence-length budget for layer placement and KV-cache sizing.
     pub context_length: Option<usize>,
     /// Attention implementation to request from the engine.
@@ -477,6 +482,10 @@ pub async fn create_local_model(
     if distributed.is_none() {
         let weights = model_weights.iter().map(PathBuf::from).collect::<Vec<_>>();
         if let Some(engine) = engine::engine_for(&weights) {
+            let options = LocalModelOptions {
+                chat_template_file: tokenizer_config.map(Path::new),
+                ..options
+            };
             return (engine.load)(&weights, options).await;
         }
     }

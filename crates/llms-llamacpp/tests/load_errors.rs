@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Load failures, with no network: a file that is not a GGUF, and a GGUF of an architecture
-//! llama.cpp does not know.
+//! Load failures, with no network: a file that is not a GGUF, a GGUF of an architecture
+//! llama.cpp does not know, and a chat template file that cannot be read.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -86,5 +86,32 @@ async fn an_unknown_architecture_says_this_release_does_not_support_it() {
     assert_eq!(
         error.to_string(),
         "Architecture 'foo' in foo-model.gguf is not supported by this Spice release. Upgrade Spice, or use a GGUF of a supported architecture: https://spiceai.org/docs/components/models#gguf-architectures"
+    );
+}
+
+/// A model's `tokenizer_config.json` is read before the model, so one that is not JSON fails
+/// the load, naming the file, before llama.cpp reads the weights: here not a GGUF, which
+/// llama.cpp would refuse with an error of its own.
+#[tokio::test]
+async fn a_tokenizer_config_that_is_not_json_names_the_file() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let config = dir.path().join("tokenizer_config.json");
+    std::fs::write(&config, b"{ not json").expect("the file is written");
+    let weights = [dir.path().join("model.gguf")];
+    std::fs::write(&weights[0], b"not a model at all").expect("the file is written");
+    let engine = llms::chat::engine::engine_for(&weights).expect("a .gguf goes to llama.cpp");
+    let options = LocalModelOptions {
+        chat_template_file: Some(&config),
+        ..LocalModelOptions::default()
+    };
+    let Err(error) = (engine.load)(&weights, options).await else {
+        panic!("a tokenizer_config.json that is not JSON should fail the load");
+    };
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to load the model. An error occurred: could not read the chat template in '{}': key must be a string at line 1 column 3 Report a bug on GitHub: https://github.com/spiceai/spiceai/issues",
+            config.display()
+        )
     );
 }
