@@ -345,18 +345,26 @@ cmd_launch() {
 cmd_doctor() {
   [[ -n "$HTTP_ADDR" ]] || die "--http is required"
   require_work
-  local pf
+  local pf identf
   pf="$(pidfile)"
+  identf="$(identityfile)"
   [[ -f "$pf" ]] || die "no pidfile at $pf"
+  [[ -f "$identf" ]] || die "no process identity at ${identf}; refusing to accept pid $(cat "$pf")"
   local pid
   pid="$(cat "$pf")"
-  kill -0 "$pid" 2>/dev/null || die "pid $pid is not running"
+  local want_pid want_exe want_start
+  IFS=$'\t' read -r want_pid want_exe want_start <"$identf"
+  [[ "$pid" == "$want_pid" ]] || die "pidfile ${pid} does not match identity ${want_pid}"
+  if ! process_matches_identity "$pid" "$want_exe" "$want_start"; then
+    die "pid ${pid} is not the launched spiced (exe/starttime mismatch); refusing to accept"
+  fi
   local exe
   exe="$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
   if [[ -n "$SPICED" ]]; then
     local want
     want="$(readlink -f "$SPICED")"
-    [[ "$exe" == "$want" ]] || die "pid $pid exe is ${exe}, expected ${want}"
+    [[ "$want" == "$want_exe" && "$exe" == "$want" ]] || \
+      die "pid $pid exe is ${exe}, expected ${want} (launch identity ${want_exe})"
   fi
   local code body
   code="$(curl -sS -o "${WORK}/ready.body" -w '%{http_code}' --max-time 5 "http://${HTTP_ADDR}/v1/ready" || echo 000)"
