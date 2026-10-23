@@ -633,6 +633,12 @@ impl DeletionSink for InlineAwareDeletionSink {
         let _write_guard = self.table.write_lock.lock().await;
         self.table.ensure_publication_outcome_known()?;
         self.table.mark_maintained_aggregates_stale();
+        let position_based = self.table.pk_deletion_strategy.is_position_based();
+        if position_based {
+            // As `PkKeysetInvalidatingDeletionSink` does before a delete it cannot
+            // enumerate by key: a filter delete leaves no per-key stamps to trust.
+            self.table.mark_pk_keyset_occ_degraded();
+        }
 
         // Make the in-memory CDC tier durable and capture the scan sources inside
         // THIS hold, so no apply lands between the capture and the delete it is
@@ -663,6 +669,16 @@ impl DeletionSink for InlineAwareDeletionSink {
         let file_deleted = prepared_file_delete
             .as_ref()
             .map_or(0, super::delete::PreparedDeletionPublish::deleted_count);
+        // A table with no primary key writes each touched file's whole deletion
+        // vector, which replaces the file's earlier ones in the same commit.
+        let replaced_vectors = match &prepared_file_delete {
+            Some(prepared) if prepared.replaces_earlier_deletion_vectors() => {
+                file_sink
+                    .position_deletion_vectors_replaced_by(prepared.delete_files())
+                    .await?
+            }
+            _ => Vec::new(),
+        };
 
         if !inline_rewrite.is_empty() || prepared_file_delete.is_some() {
             let delete_files = prepared_file_delete
@@ -676,6 +692,10 @@ impl DeletionSink for InlineAwareDeletionSink {
                     self.table.table_id(),
                     inline_rewrite.updated_data.clone(),
                     inline_rewrite.deleted_inlined_ids.clone(),
+                    replaced_vectors
+                        .iter()
+                        .map(|row| row.delete_file_id.clone())
+                        .collect(),
                 )
                 .await
             {
@@ -690,6 +710,7 @@ impl DeletionSink for InlineAwareDeletionSink {
             if !inline_rewrite.is_empty() {
                 self.table.publish_inlined_rewrite(&inline_rewrite);
             }
+            file_sink.remove_replaced_deletion_vector_files(replaced_vectors);
         }
 
         let mut deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
@@ -727,7 +748,11 @@ impl DeletionSink for InlineAwareDeletionSink {
             } else {
                 self.table.clear_cached_pk_keyset();
             }
-            if file_deleted > 0 && self.table.pk_deletion_strategy.is_position_based() {
+            // A table with no primary key answers counts from per-file statistics
+            // that a position delete changes; drop them on any delete, as
+            // `PkKeysetInvalidatingDeletionSink` does, since inline and mem-tier rows
+            // count toward the visible total too.
+            if position_based {
                 self.table.clear_scan_file_statistics_cache();
             }
         }
@@ -1048,9 +1073,13 @@ pub(crate) enum PkDeletionSnapshot {
 /// pure delete and must be committed delete-only (a phantom reinsert marker
 /// would resurrect older durable copies on the main scan path). See
 /// `commit_mem_tier_checkpoint_metadata`.
+///
+/// Row keys are held as their [`hash_index::hash_key_128`] digests, the key
+/// identity the deletion index already uses, so the set costs no allocation per
+/// flushed row.
 pub(crate) enum CheckpointCorpusKeys {
     Int64(HashSet<i64>),
-    RowKeys(HashSet<Box<[u8]>>),
+    RowKeys(HashSet<u128, PrehashedBuildHasher>),
     None,
 }
 
@@ -1060,7 +1089,7 @@ impl CheckpointCorpusKeys {
     }
 
     pub(crate) fn contains_row_key(&self, key: &[u8]) -> bool {
-        matches!(self, Self::RowKeys(keys) if keys.contains(key))
+        matches!(self, Self::RowKeys(keys) if keys.contains(&hash_index::hash_key_128(key)))
     }
 }
 
@@ -1201,6 +1230,9 @@ pub(crate) struct ProtectedSnapshotScan<'a> {
     pub(crate) limit: Option<usize>,
     pub(crate) pk_indices_in_projection: &'a [usize],
     pub(crate) protected_snapshots: Arc<HashMap<String, i64>>,
+    /// Each protected snapshot's files, captured with `protected_snapshots`
+    /// under the scan's listing fence.
+    pub(crate) protected_files: Arc<HashMap<String, super::table::CapturedSnapshotFiles>>,
     pub(crate) deletion_snapshot: &'a PkDeletionSnapshot,
     /// View-typed read schema so protected-snapshot scans match the main file
     /// scan in the union (see `viewify_read_schema`).

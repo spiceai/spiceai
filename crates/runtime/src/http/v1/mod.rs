@@ -22,6 +22,7 @@ pub mod decisions;
 pub mod embeddings;
 pub mod functions;
 pub mod iceberg;
+pub mod messages;
 pub mod responses;
 pub mod snapshots;
 
@@ -59,7 +60,8 @@ use arrow::{array::RecordBatch, datatypes::SchemaRef, util::pretty::pretty_forma
 use async_stream::try_stream;
 use axum::{
     body::Body,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Response},
 };
 use axum_extra::TypedHeader;
@@ -121,18 +123,34 @@ pub(crate) async fn current_principal_requires_read_only() -> bool {
         .is_some_and(|principal| !principal_has_write_access(principal))
 }
 
-pub(crate) async fn require_write_access() -> Option<Response> {
+/// Denies an OTLP gRPC export from a read-only API key. The OTLP gRPC services run on the
+/// Flight server, outside the [`require_write_access`] route layer, so each export handler
+/// calls this before it reads the request. With authentication disabled there is no
+/// principal, and the export is allowed.
+pub(crate) async fn ensure_otlp_grpc_write_access() -> Result<(), tonic::Status> {
     if current_principal_requires_read_only().await {
-        Some(
-            (
-                StatusCode::FORBIDDEN,
-                axum::Json(json!({ "message": "API key does not allow write access" })),
-            )
-                .into_response(),
-        )
-    } else {
-        None
+        return Err(tonic::Status::permission_denied(
+            "API key does not allow write access",
+        ));
     }
+    Ok(())
+}
+
+/// Route layer for routes that need a principal with write access.
+///
+/// It must sit inside the authentication layer, which sets the principal, and run as a
+/// layer rather than inside the handler: a handler's body extractors reject a request
+/// (415, 422) before the handler body runs, which would tell a read-only caller the
+/// route's request schema instead of answering 403.
+pub(crate) async fn require_write_access(req: Request<Body>, next: Next) -> Response {
+    if current_principal_requires_read_only().await {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({ "message": "API key does not allow write access" })),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 fn status_for_sql_error(message: &str) -> StatusCode {

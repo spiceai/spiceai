@@ -43,6 +43,7 @@ base64.workspace = true
 flate2 = "1.1"
 byte-unit.workspace = true
 bytes.workspace = true
+ctor.workspace = true
 cache = { path = "../cache" }
 chrono.workspace = true
 chunking = { path = "../chunking" }
@@ -101,6 +102,8 @@ linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 evaluate-api = { path = "../evaluate-api" }
 evaluate-chat = { path = "../evaluate-chat" }
+messages-api = { path = "../messages-api" }
+messages-chat = { path = "../messages-chat" }
 model-capabilities = { path = "../model-capabilities" }
 runtime-decide = { path = "../runtime-decide" }
 mediatype = "0.21.0"
@@ -142,7 +145,7 @@ prost.workspace = true
 rand.workspace = true
 rayon = { workspace = true }
 regex.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 rmcp = { workspace = true, optional = true, features = [
     "client",
     "server",
@@ -173,6 +176,7 @@ runtime-execution-plans = { path = "../runtime-execution-plans" }
 runtime-table = { path = "../runtime-table" }
 runtime-resources = { path = "../runtime-resources" }
 runtime-object-store = { path = "../runtime-object-store" }
+runtime-otel-push = { path = "../runtime-otel-push" }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-parameters-typed = { path = "../runtime-parameters-typed" }
 runtime-proto = { path = "../runtime-proto" }
@@ -195,7 +199,7 @@ search = { path = "../search", default-features = false, features = [
     "text_search",
 ], optional = false }
 secrecy.workspace = true
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive", "rc"] }
 blake3 = { workspace = true, optional = true }
 serde_json.workspace = true
 snafu.workspace = true
@@ -224,6 +228,7 @@ tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 turso-shared = { workspace = true }
 twox-hash.workspace = true
+typetag = "0.2.22"
 url.workspace = true
 util = { path = "../util", features = ["datafusion", "http"] }
 utoipa = { workspace = true, features = ["axum_extras"], optional = true }
@@ -242,6 +247,7 @@ yaml = { path = "../yaml" }
 
 [dev-dependencies]
 anyhow.workspace = true
+runtime-drasi = { path = "../runtime-drasi", features = ["test-util"] }
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
@@ -511,6 +517,12 @@ path = "tests/cayenne_runtime_tuning.rs"
 [[test]]
 name = "results_cache_growth"
 path = "tests/results_cache_growth.rs"
+
+# Runs in `make nextest`, which must not load `integration` (see `rate_control`).
+[[test]]
+name = "chat_tool_use"
+path = "tests/chat_tool_use.rs"
+required-features = ["models"]
 
 # Runs as its own step in `integration.yml`, with a retry budget sized to fit it.
 [[test]]

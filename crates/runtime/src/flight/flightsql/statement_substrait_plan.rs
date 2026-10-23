@@ -30,11 +30,13 @@ use arrow_flight::{
 };
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
+use datafusion_substrait::extensions::Extensions;
+use datafusion_substrait::logical_plan::consumer::from_substrait_plan_with_consumer;
 use datafusion_substrait::substrait::proto::Plan;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
+use super::substrait_consumer::SpiceSubstraitConsumer;
 use crate::datafusion::query::QueryBuilder;
 use crate::datafusion::request_context_extension::get_current_datafusion;
 use crate::datafusion::sql_validator::validate_sql_query_read_only;
@@ -81,7 +83,15 @@ async fn decode_plan(
     let (proto, cache_key) = decode_plan_proto(cmd)?;
 
     let session = datafusion.ctx.state();
-    let plan = from_substrait_plan(&session, &proto)
+    let extensions = Extensions::try_from(&proto.extensions).map_err(map_substrait_error)?;
+    // `from_substrait_plan` refuses these too; the consumer below cannot see them.
+    if !extensions.type_variations.is_empty() {
+        return Err(map_substrait_error(DataFusionError::NotImplemented(
+            "Type variation extensions are not supported".to_string(),
+        )));
+    }
+    let consumer = SpiceSubstraitConsumer::new(&extensions, &session);
+    let plan = from_substrait_plan_with_consumer(&consumer, &proto)
         .await
         .map_err(map_substrait_error)?;
 
@@ -225,7 +235,7 @@ mod tests {
 
         let df = Arc::new(
             DataFusion::builder(
-                crate::status::RuntimeStatus::new(),
+                runtime_status::RuntimeStatus::new(),
                 Arc::new(crate::dataaccelerator::AcceleratorEngineRegistry::default()),
                 tokio::runtime::Handle::current(),
             )
@@ -403,6 +413,134 @@ mod tests {
                 batches,
                 vec![expected.clone()],
                 "r_name declared {declared}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The session registers `datafusion-spark`'s `like` and `ilike`, and
+    /// `datafusion-substrait` resolves a Substrait `like` to a same-named UDF
+    /// first. Unless `decode_plan` lowers it to `Expr::Like`, the unparser sends
+    /// a `DuckDB` acceleration `like(a, b)`, which `DuckDB` has no function for
+    /// (regression test for #15290). A pattern with a backslash must also carry
+    /// `ESCAPE '\'`: `DuckDB` has no default escape character, so without it the
+    /// pushed-down `LIKE` matches different rows than `DataFusion` evaluates.
+    #[tokio::test]
+    async fn decode_plan_lowers_a_substrait_like_to_a_like_expression() -> Result<(), anyhow::Error>
+    {
+        use arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::sql::unparser::{Unparser, dialect::DuckDBDialect};
+        use datafusion_substrait::logical_plan::producer::to_substrait_plan;
+
+        let df = Arc::new(
+            DataFusion::builder(
+                crate::status::RuntimeStatus::new(),
+                Arc::new(crate::dataaccelerator::AcceleratorEngineRegistry::default()),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("p_type", DataType::Utf8, false),
+            Field::new("p_size", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "LARGE BRASS",
+                    "SMALL TIN",
+                    "PROMO brass",
+                    "a_b",
+                    r"a\_b",
+                    "50%",
+                    "50x",
+                ])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![15, 15, 3, 4, 5, 6, 7])),
+            ],
+        )?;
+        df.ctx.register_table(
+            "part",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]])?),
+        )?;
+
+        // (query, expected rows, whether the `DuckDB` SQL must name the escape)
+        let queries = [
+            (
+                "SELECT p_type FROM part WHERE p_size = 15 AND p_type LIKE '%BRASS' ORDER BY p_type",
+                "+-------------+\n| p_type      |\n+-------------+\n| LARGE BRASS |\n+-------------+",
+                false,
+            ),
+            (
+                "SELECT sum(CASE WHEN p_type LIKE 'PROMO%' THEN p_size ELSE 0 END) AS promo FROM part",
+                "+-------+\n| promo |\n+-------+\n| 3     |\n+-------+",
+                false,
+            ),
+            (
+                "SELECT p_type FROM part WHERE p_type ILIKE '%brass' AND p_type NOT LIKE 'LARGE%' ORDER BY p_type",
+                "+-------------+\n| p_type      |\n+-------------+\n| PROMO brass |\n+-------------+",
+                false,
+            ),
+            (
+                "SELECT p_type FROM part WHERE p_size IN (SELECT p_size FROM part WHERE p_type LIKE 'L%') ORDER BY p_type",
+                "+-------------+\n| p_type      |\n+-------------+\n| LARGE BRASS |\n| SMALL TIN   |\n+-------------+",
+                false,
+            ),
+            (
+                r"SELECT p_type FROM part WHERE p_type LIKE '%a\_b%' ORDER BY p_type",
+                "+--------+\n| p_type |\n+--------+\n| a_b    |\n+--------+",
+                true,
+            ),
+            (
+                r"SELECT p_type FROM part WHERE p_type LIKE '50\%' ORDER BY p_type",
+                "+--------+\n| p_type |\n+--------+\n| 50%    |\n+--------+",
+                true,
+            ),
+            // The bytes of `50\%`: a cast pattern is not known to be backslash-free.
+            (
+                "SELECT p_type FROM part WHERE p_type LIKE CAST(X'35305C25' AS VARCHAR) ORDER BY p_type",
+                "+--------+\n| p_type |\n+--------+\n| 50%    |\n+--------+",
+                true,
+            ),
+        ];
+        for (sql, expected, names_escape) in queries {
+            let plan = df.ctx.sql(sql).await?.into_unoptimized_plan();
+            let proto = to_substrait_plan(&plan, &df.ctx.state())?;
+            let (decoded, _) = decode_plan(
+                &cmd(Some(SubstraitPlan {
+                    plan: Bytes::from(proto.encode_to_vec()),
+                    version: "0.63.0".to_string(),
+                })),
+                &df,
+            )
+            .await
+            .map_err(|status| anyhow::anyhow!("{sql}: {status}"))?;
+
+            let duckdb_sql = Unparser::new(&DuckDBDialect::new())
+                .plan_to_sql(&decoded)?
+                .to_string();
+            assert!(
+                !duckdb_sql.contains("like(") && duckdb_sql.contains("LIKE"),
+                "{sql} unparsed for DuckDB as: {duckdb_sql}"
+            );
+            assert_eq!(
+                duckdb_sql.contains(r"ESCAPE '\'"),
+                names_escape,
+                "{sql} unparsed for DuckDB as: {duckdb_sql}"
+            );
+
+            let batches = df
+                .ctx
+                .execute_logical_plan(decoded)
+                .await?
+                .collect()
+                .await?;
+            assert_eq!(
+                arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
+                expected,
+                "{sql}"
             );
         }
         Ok(())

@@ -36,6 +36,7 @@ use std::{
 
 use serde_json::{Value, json};
 mod ai_udf;
+mod anthropic;
 mod bedrock;
 mod decisions;
 mod embedding;
@@ -43,6 +44,7 @@ pub(crate) mod hf;
 #[cfg(feature = "duckdb")]
 mod hnsw_index;
 mod local;
+mod messages;
 mod models_http_endpoint;
 pub(crate) mod openai;
 #[cfg(feature = "s3_vectors")]

@@ -87,3 +87,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use runtime::get_api_doc;
+    use serde_json::Value;
+
+    /// Collects the names of the component schemas that `value` references.
+    fn schema_refs(value: &Value, refs: &mut BTreeSet<String>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::String(reference)) = map.get("$ref")
+                    && let Some(name) = reference.strip_prefix("#/components/schemas/")
+                {
+                    refs.insert(name.to_string());
+                }
+                for child in map.values() {
+                    schema_refs(child, refs);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    schema_refs(item, refs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A `$ref` to a schema the document does not define leaves the published
+    /// `OpenAPI` spec, and every client or docs page built from it, with a type
+    /// nobody can resolve.
+    #[test]
+    fn every_schema_reference_resolves() {
+        let spec = serde_json::to_value(get_api_doc()).expect("the OpenAPI document serializes");
+        let schemas = spec
+            .pointer("/components/schemas")
+            .and_then(Value::as_object)
+            .expect("the OpenAPI document has component schemas");
+        let mut refs = BTreeSet::new();
+        schema_refs(&spec, &mut refs);
+
+        let dangling: Vec<&String> = refs
+            .iter()
+            .filter(|name| !schemas.contains_key(name.as_str()))
+            .collect();
+        assert!(
+            dangling.is_empty(),
+            "schemas referenced but not defined: {dangling:?}"
+        );
+    }
+}

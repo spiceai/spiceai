@@ -156,6 +156,9 @@ impl DeletionIdentifier {
 pub struct DeletionVectorWriteSpec {
     /// Row identifiers (position-based with file path, or key-based)
     pub identifiers: DeletionIdentifier,
+    /// The sequence the file's deletes carry in the catalog, when it differs
+    /// from the writer's table metadata (see [`Self::with_sequence_number`]).
+    sequence_number: Option<i64>,
 }
 
 impl DeletionVectorWriteSpec {
@@ -177,6 +180,7 @@ impl DeletionVectorWriteSpec {
                 row_ids,
                 pre_sorted: false,
             },
+            sequence_number: None,
         }
     }
 
@@ -191,6 +195,7 @@ impl DeletionVectorWriteSpec {
                 row_ids,
                 pre_sorted: true,
             },
+            sequence_number: None,
         }
     }
 
@@ -199,7 +204,17 @@ impl DeletionVectorWriteSpec {
     pub fn new_key_based(row_keys: Vec<Box<[u8]>>) -> Self {
         Self {
             identifiers: DeletionIdentifier::KeyBased(row_keys),
+            sequence_number: None,
         }
+    }
+
+    /// Record this file's deletes at `sequence_number` instead of the writer's
+    /// table sequence, so one [`DeletionVectorWriter::write`] can write files for
+    /// several delete sequences together.
+    #[must_use]
+    pub fn with_sequence_number(mut self, sequence_number: i64) -> Self {
+        self.sequence_number = Some(sequence_number);
+        self
     }
 
     /// Returns `true` if there are no row IDs to write.
@@ -221,6 +236,22 @@ pub struct DeletionVectorWriteResult {
 // ============================================================================
 // Writer
 // ============================================================================
+
+/// Most deletion-vector files [`DeletionVectorWriter::write`] has in flight at
+/// once, each holding a blocking-pool thread through its write and file sync.
+const DELETION_VECTOR_WRITE_CONCURRENCY: usize = 64;
+
+/// One written deletion-vector file: its path, delete count, size, the
+/// identifiers it holds, the data file a position-based delete targets, and the
+/// sequence its spec asked for.
+type WrittenDeletionFile = (
+    PathBuf,
+    usize,
+    u64,
+    DeletionIdentifier,
+    Option<String>,
+    Option<i64>,
+);
 
 /// Writes deletion-vector files for a specific Cayenne table snapshot.
 #[derive(Debug)]
@@ -396,31 +427,35 @@ impl<'a> DeletionVectorWriter<'a> {
             .map_err(|source| Error::TaskPanicked { table, source })??;
         }
 
-        // Write every spec's deletion-vector file CONCURRENTLY. The files are
+        // Write every spec's deletion-vector file CONCURRENTLY, at most
+        // `DELETION_VECTOR_WRITE_CONCURRENCY` at a time. The files are
         // independent (one per spec, UUIDv7 filenames), so their writes + file
         // fsyncs overlap on the blocking pool — on network-attached storage
         // (EBS) this turns N serialized ~1 ms fsync round-trips into ~1 round
-        // of in-flight barriers. `join_all` preserves spec order in the
-        // returned results. The cleanup guard owns every generated path until
-        // this method returns a complete result. If this future is cancelled,
-        // it waits for detached blocking writers before unlinking their paths.
+        // of in-flight barriers — while a checkpoint carrying thousands of
+        // delete sequences cannot occupy the whole pool. `buffered` preserves
+        // spec order in the returned results. Every future, and with it its
+        // completion token, exists before the first is polled, so the cleanup
+        // guard's count covers specs that never start. The cleanup guard owns
+        // every generated path until this method returns a complete result. If
+        // this future is cancelled, it waits for detached blocking writers
+        // before unlinking their paths.
         let batch_paths = (0..specs.len())
             .map(|_| Self::deletion_file_path(&deletion_dir))
             .collect::<Vec<_>>();
         let mut cleanup_guard = UncommittedDeleteFilesGuard::new(batch_paths.clone());
-        let write_futures =
-            specs
-                .into_iter()
-                .zip(batch_paths.iter().cloned())
-                .map(|(spec, file_path)| {
-                    let mut completion = Some(cleanup_guard.completion());
-                    let table_name = self.table.table_name.clone();
-                    #[cfg(test)]
-                    let test_hook = self.test_hook.as_ref().map(Arc::clone);
-                    async move {
-                        let (batch, schema, count, identifiers, source_data_file_path) = match spec
-                            .identifiers
-                        {
+        let write_futures = specs
+            .into_iter()
+            .zip(batch_paths.iter().cloned())
+            .map(|(spec, file_path)| {
+                let mut completion = Some(cleanup_guard.completion());
+                let sequence_number = spec.sequence_number;
+                let table_name = self.table.table_name.clone();
+                #[cfg(test)]
+                let test_hook = self.test_hook.as_ref().map(Arc::clone);
+                async move {
+                    let (batch, schema, count, identifiers, source_data_file_path) =
+                        match spec.identifiers {
                             DeletionIdentifier::PositionBased {
                                 file_path: source_file,
                                 mut row_ids,
@@ -467,51 +502,56 @@ impl<'a> DeletionVectorWriter<'a> {
                             }
                         };
 
-                        // From this point the completion token is transferred into the
-                        // detached blocking writer. Any earlier `?` drops it here and
-                        // decrements the pending count, so cancellation cleanup cannot
-                        // wait forever for a writer that was never spawned.
+                    // From this point the completion token is transferred into the
+                    // detached blocking writer. Any earlier `?` drops it here and
+                    // decrements the pending count, so cancellation cleanup cannot
+                    // wait forever for a writer that was never spawned.
 
-                        #[cfg(test)]
-                        let file_size_bytes = write_deletion_file(
-                            &file_path,
-                            Arc::clone(&schema),
-                            batch,
-                            &table_name,
-                            completion.take(),
-                            test_hook,
-                        )
-                        .await?;
-                        #[cfg(not(test))]
-                        let file_size_bytes = write_deletion_file(
-                            &file_path,
-                            Arc::clone(&schema),
-                            batch,
-                            &table_name,
-                            completion.take(),
-                        )
-                        .await?;
+                    #[cfg(test)]
+                    let file_size_bytes = write_deletion_file(
+                        &file_path,
+                        Arc::clone(&schema),
+                        batch,
+                        &table_name,
+                        completion.take(),
+                        test_hook,
+                    )
+                    .await?;
+                    #[cfg(not(test))]
+                    let file_size_bytes = write_deletion_file(
+                        &file_path,
+                        Arc::clone(&schema),
+                        batch,
+                        &table_name,
+                        completion.take(),
+                    )
+                    .await?;
 
-                        Ok::<_, Error>((
-                            file_path,
-                            count,
-                            file_size_bytes,
-                            identifiers,
-                            source_data_file_path,
-                        ))
-                    }
-                });
-        let written: Vec<(PathBuf, usize, u64, DeletionIdentifier, Option<String>)> =
-            match futures::future::join_all(write_futures)
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>>>()
+                    Ok::<_, Error>((
+                        file_path,
+                        count,
+                        file_size_bytes,
+                        identifiers,
+                        source_data_file_path,
+                        sequence_number,
+                    ))
+                }
+            })
+            .collect::<Vec<_>>();
+        let written: Vec<WrittenDeletionFile> =
+            match futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::buffered(
+                futures::stream::iter(write_futures),
+                DELETION_VECTOR_WRITE_CONCURRENCY,
+            ))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
             {
                 Ok(written) => written,
                 Err(error) => {
-                    // Every write future owns a distinct UUID path. `join_all`
-                    // waits for all of them, so after one fails no sibling write is
-                    // still racing this cleanup. Remove every final-path artifact
+                    // Every write future owns a distinct UUID path. The stream
+                    // runs all of them to completion, so after one fails no sibling
+                    // write is still racing this cleanup. Remove every final-path artifact
                     // from the failed logical batch before returning; otherwise a
                     // later failure or task cancellation at a caller could leak
                     // unreferenced deletion vectors indefinitely.
@@ -538,13 +578,21 @@ impl<'a> DeletionVectorWriter<'a> {
         }
 
         let mut results = Vec::with_capacity(written.len());
-        for (file_path, count, file_size_bytes, identifiers, source_data_file_path) in written {
+        for (
+            file_path,
+            count,
+            file_size_bytes,
+            identifiers,
+            source_data_file_path,
+            sequence_number,
+        ) in written
+        {
             let deletion_type = match &identifiers {
                 DeletionIdentifier::PositionBased { .. } => DeletionType::PositionBased,
                 DeletionIdentifier::KeyBased(_) => DeletionType::KeyBased,
             };
 
-            let delete_file = build_delete_file(
+            let mut delete_file = build_delete_file(
                 self.table,
                 &file_path,
                 count,
@@ -552,6 +600,9 @@ impl<'a> DeletionVectorWriter<'a> {
                 deletion_type,
                 source_data_file_path,
             )?;
+            if let Some(sequence_number) = sequence_number {
+                delete_file.sequence_number = sequence_number;
+            }
 
             results.push(DeletionVectorWriteResult {
                 delete_file,
@@ -907,6 +958,44 @@ pub(crate) async fn cleanup_uncommitted_delete_paths(paths: &[PathBuf]) {
     }
 }
 
+/// Remove the files of deletion-vector rows that a committed catalog change
+/// dropped: rows a newer vector for the same data file superseded, or rows a
+/// rewrite cleared after folding their deletes into its output. No row names
+/// these files once that change commits, so nothing else would ever remove them.
+///
+/// Runs in the background. It first takes `file_deletion_fence` exclusively,
+/// which an acceleration-snapshot archive holds shared while it copies the
+/// table's files, and a caller holding the table's write lock must not wait for
+/// that. Object-store keys (`path_is_relative`) are left in place, as the
+/// orphaned-vector sweep leaves them.
+pub(crate) fn remove_dropped_deletion_vector_files(
+    files: Vec<DeleteFile>,
+    file_deletion_fence: Arc<tokio::sync::RwLock<()>>,
+) {
+    let paths: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|file| !file.path_is_relative)
+        .map(|file| PathBuf::from(file.path))
+        .collect();
+    if paths.is_empty() {
+        return;
+    }
+    crate::provider::compaction::spawn_compaction(async move {
+        let _deleting = file_deletion_fence.write().await;
+        for path in paths {
+            if let Err(error) = tokio::fs::remove_file(&path).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::debug!(
+                    path = %path.display(),
+                    %error,
+                    "Failed to remove a deletion-vector file no catalog row references"
+                );
+            }
+        }
+    });
+}
+
 fn build_delete_file(
     table: &TableMetadata,
     file_path: &Path,
@@ -1091,6 +1180,54 @@ mod tests {
             error.to_string().contains("exceeds the supported maximum"),
             "unexpected error: {error}"
         );
+    }
+
+    /// One write carries files for more delete sequences than it runs at once,
+    /// and each file reads back at its own spec's sequence and keys, in spec
+    /// order; a spec with no sequence keeps the table's.
+    #[tokio::test]
+    async fn one_write_records_each_spec_at_its_own_sequence() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let mut table_metadata = build_table_metadata(&temp_dir);
+        table_metadata.current_sequence_number = 7;
+        let key = |i: usize| -> Box<[u8]> { format!("key-{i}").into_bytes().into_boxed_slice() };
+        let sequence = |i: usize| 1000 + i64::try_from(i).expect("small index");
+        let groups = DELETION_VECTOR_WRITE_CONCURRENCY * 3 + 1;
+        let mut specs: Vec<DeletionVectorWriteSpec> = (0..groups)
+            .map(|i| {
+                DeletionVectorWriteSpec::new_key_based(vec![key(i), key(i + groups)])
+                    .with_sequence_number(sequence(i))
+            })
+            .collect();
+        specs.push(DeletionVectorWriteSpec::new_key_based(vec![
+            key(3 * groups),
+        ]));
+        let results = DeletionVectorWriter::new(&table_metadata)
+            .write(specs)
+            .await
+            .expect("write deletion vectors");
+
+        assert_eq!(results.len(), groups + 1);
+        let recorded: Vec<i64> = results
+            .iter()
+            .map(|result| result.delete_file.sequence_number)
+            .collect();
+        let expected: Vec<i64> = (0..groups).map(sequence).chain([7]).collect();
+        assert_eq!(recorded, expected);
+
+        let (positions, keys, reinserted, missing) = detect_deletion_type_and_read(
+            results
+                .into_iter()
+                .map(|result| result.delete_file)
+                .collect(),
+        )
+        .expect("read the written deletion vectors back");
+        assert!(positions.is_empty() && reinserted.is_empty() && missing.is_empty());
+        let mut expected_keys: HashMap<Box<[u8]>, i64> = (0..groups)
+            .flat_map(|i| [(key(i), sequence(i)), (key(i + groups), sequence(i))])
+            .collect();
+        expected_keys.insert(key(3 * groups), 7);
+        assert_eq!(keys, expected_keys);
     }
 
     #[tokio::test]

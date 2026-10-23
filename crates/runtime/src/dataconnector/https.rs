@@ -41,8 +41,10 @@ use data_components::http::auth::{
 };
 use data_components::http::json_nest::HttpJsonNesting;
 use data_components::rate_limit::RateLimiter;
+use percent_encoding::percent_decode_str;
 use runtime_datafusion::url_table::{is_blocked_internal_hostname, is_internal_ip};
-use secrecy::ExposeSecret;
+use runtime_object_store::http_auth;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::semantic::Column;
@@ -54,7 +56,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
-use url::Url;
+use url::{Url, form_urlencoded};
 
 use super::{ConnectorComponent, ConnectorParams};
 use super::{
@@ -2218,9 +2220,27 @@ impl ListingTableConnector for HttpListingConnector {
             let _ = u.set_port(Some(n));
         }
 
-        if let Some(p) = self.params.get("password").expose().ok()
-            && u.set_password(Some(p)).is_err()
-        {
+        // The user name and password reach the object store as an `Authorization`
+        // header through `http_auth`, so the URL carries neither.
+        let username = self.params.get("username").expose().ok().map_or_else(
+            || {
+                percent_decode_str(u.username())
+                    .decode_utf8_lossy()
+                    .into_owned()
+            },
+            ToString::to_string,
+        );
+        let password = match self.params.get("password").ok() {
+            Some(password) => Some(password.clone()),
+            None => u.password().map(|password| {
+                SecretString::from(
+                    percent_decode_str(password)
+                        .decode_utf8_lossy()
+                        .into_owned(),
+                )
+            }),
+        };
+        if u.set_username("").is_err() || u.set_password(None).is_err() {
             return Err(
                 DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
                     dataconnector: "https".to_string(),
@@ -2229,18 +2249,27 @@ impl ListingTableConnector for HttpListingConnector {
             );
         }
 
-        if let Some(p) = self.params.get("username").expose().ok()
-            && u.set_username(p).is_err()
-        {
-            return Err(
-                DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
-                    dataconnector: "https".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                },
-            );
+        let mut fragment = build_fragments(&self.params, vec!["client_timeout"]);
+        // The operator wrote `http://` in the dataset URL. That is the
+        // permission the object store's `allow_http` setting requires. An
+        // `https://` dataset stays HTTPS-only, so a redirect cannot switch
+        // the fetch to plaintext.
+        if u.scheme() == "http" {
+            if !fragment.is_empty() {
+                fragment.push('&');
+            }
+            fragment.push_str("allow_http=true");
         }
-
-        u.set_fragment(Some(&build_fragments(&self.params, vec!["client_timeout"])));
+        if !username.is_empty() || password.is_some() {
+            let token = http_auth::register(
+                &u,
+                &username,
+                password.unwrap_or_else(|| SecretString::from(String::new())),
+            );
+            form_urlencoded::Serializer::for_suffix(&mut fragment, 0)
+                .append_pair(http_auth::FRAGMENT_KEY, &token);
+        }
+        u.set_fragment(Some(&fragment));
 
         Ok(u)
     }
@@ -2354,6 +2383,23 @@ mod tests {
         });
 
         dataset
+    }
+
+    #[tokio::test]
+    async fn http_dataset_url_opts_into_plaintext() {
+        let dataset = test_dataset("http://example.com/data/", RefreshMode::Full, None).await;
+        let connector =
+            HttpListingConnector::new(test_params(&[]).await, tokio::runtime::Handle::current());
+        let url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("an http dataset URL is valid");
+        assert_eq!(url.fragment(), Some("allow_http=true"));
+
+        let https = test_dataset("https://example.com/data/", RefreshMode::Full, None).await;
+        let url = connector
+            .get_object_store_url(&https, None)
+            .expect("an https dataset URL is valid");
+        assert_eq!(url.fragment(), Some(""));
     }
 
     fn test_client_identity_pems() -> (String, String) {

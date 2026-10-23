@@ -36,9 +36,11 @@ use async_openai::types::chat::{
     ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestFunctionMessage,
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContent, ReasoningEffort,
 };
 
+#[cfg(feature = "local_llm")]
+pub mod hf_files;
 #[cfg(feature = "local_llm")]
 pub mod mistral;
 pub mod nsql;
@@ -348,23 +350,42 @@ pub fn message_to_mistral(
     }
 }
 
-/// Create a model to run locally, via files from Huggingface.
+/// The Hugging Face Hub settings a model names: its `hf_token` and `hf_endpoint`, which the
+/// environment's settings fill in (see [`huggingface_hub::settings`]).
+#[cfg(feature = "local_llm")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HubParams<'a> {
+    pub token: Option<&'a SecretString>,
+    pub endpoint: Option<&'a str>,
+}
+
+/// Create a model to run locally, from a Hugging Face model repository.
 ///
-/// `model_id` uniquely refers to a Huggingface model.
+/// `model_id` names the repository, `org/name`, with an optional `:revision`. Spice downloads
+/// the files the engine loads into the Hugging Face cache ([`hf_files`]), and the engine loads
+/// the cache's snapshot directory: it never downloads anything itself.
 /// `model_type` is the type of model, if needed to be explicit. Often this can
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
 /// `from_gguf` is a path to a GGUF file within the huggingface model repo. If provided, the model will be loaded from this GGUF. This is useful for loading quantized models.
-/// `hf_token_literal` is a literal string of the Huggingface API token. If not provided, the token will be read from the HF token cache (i.e. `~/.cache/huggingface/token` or set via `HF_TOKEN_PATH`).
+/// `hub` is the model's `hf_token` and `hf_endpoint`.
 /// `distributed` optionally runs the model tensor-parallel across multiple nodes.
+/// `reasoning` names the model and its `reasoning_effort` default for the load-time check.
 #[cfg(feature = "local_llm")]
 pub async fn create_hf_model(
     model_id: &str,
     model_type: Option<&str>,
-    from_gguf: Option<PathBuf>,
-    hf_token_literal: Option<&SecretString>,
+    from_gguf: Option<&str>,
+    hub: HubParams<'_>,
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
+    reasoning: ReasoningDefault<'_>,
 ) -> Result<Arc<dyn Chat>> {
+    let dir = hf_files::download_model(model_id, from_gguf, hub, reasoning.model_name)
+        .await
+        .map_err(|error| Error::FailedToDownloadModel {
+            configuration: error.is_configuration_error(),
+            source: Box::new(error),
+        })?;
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the
     // pipeline. The returned guard keeps the temp file alive for the model.
@@ -378,13 +399,13 @@ pub async fn create_hf_model(
         unsafe { std::env::remove_var("RING_CONFIG") };
         None
     };
-    mistral::MistralLlama::from_hf(
-        model_id,
+    mistral::MistralLlama::from_snapshot(
+        &dir,
         model_type,
-        hf_token_literal,
         from_gguf,
         chat_template_literal,
         ring_config,
+        reasoning,
     )
     .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
@@ -404,6 +425,18 @@ pub struct LocalModelOptions<'a> {
     pub context_length: Option<usize>,
     /// Attention implementation to request from the engine.
     pub paged_attention: PagedAttentionMode,
+    /// The model's name and `reasoning_effort` default, checked against its chat template.
+    pub reasoning: ReasoningDefault<'a>,
+}
+
+/// A local model's Spicepod name and its `reasoning_effort` default. The loader checks the
+/// default against the model's chat template, so a default the template can't honor fails
+/// the load instead of every request. The name is what the refusal names.
+#[cfg(feature = "local_llm")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReasoningDefault<'a> {
+    pub model_name: &'a str,
+    pub effort: Option<&'a ReasoningEffort>,
 }
 
 #[cfg(feature = "local_llm")]

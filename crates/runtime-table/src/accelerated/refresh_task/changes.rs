@@ -1222,6 +1222,46 @@ impl RefreshTask {
         true
     }
 
+    /// Reload the partitions this executor serves after they changed, as one
+    /// atomic replacement through the partition-filtered full refresh — the same
+    /// path [`Self::rebuild_from_source`] takes. The change stream is already
+    /// scoped to the new partitions, and changes received during the reload
+    /// apply after it, so the acceleration converges on the new partitions.
+    ///
+    /// Returns `None` when the change stream must stop, and `Some(false)` when the
+    /// reload failed but streaming continues: the scheduler sends the partitions
+    /// again, which requests another reload.
+    async fn reload_served_partitions(&self, context: &mut ApplyContext<'_>) -> Option<bool> {
+        if !self.prepare_rebuild(context).await {
+            return None;
+        }
+        let mut refresh = context.refresh.read().await.clone();
+        refresh.mode = RefreshMode::Full;
+        if let Err(e) = self.run(refresh).await {
+            tracing::warn!(
+                "Failed to reload the partitions this executor serves for dataset {}, so it does not report them loaded and keeps streaming changes: {e}",
+                context.dataset_name,
+            );
+            return Some(false);
+        }
+        if let Some(cache_provider_ref) = context.caching
+            && let Some(cache_provider) = cache_provider_ref.upgrade()
+            && let Err(e) = cache_provider
+                .invalidate_for_refresh(context.dataset_name.clone())
+                .await
+        {
+            tracing::warn!(
+                "Failed to invalidate cached query plans and search results for dataset {} after reloading its partitions, so they may reflect the previous partitions until they expire: {e}",
+                context.dataset_name
+            );
+        }
+        tracing::info!(
+            "Dataset {}: reloaded the partitions this executor serves; resuming change streaming.",
+            context.dataset_name,
+        );
+        Some(true)
+    }
+
     /// Replace the accelerator from a [`cdc::ChangeBatch::rebuild_from_this_batch`]
     /// snapshot already carried on the `history_unavailable` envelope. This is
     /// the same atomic `InsertOp::Overwrite` a full refresh uses, but it does
@@ -7849,5 +7889,116 @@ mod tests {
             "each envelope builds once"
         );
         assert_eq!(log.ids().await, vec![1, 2, 3, 4]);
+    }
+
+    /// A partition update on a cluster executor reloads the partitions a change
+    /// stream serves: the acceleration is replaced through the partition-filtered
+    /// full refresh, and the waiter for that request is answered once it landed.
+    #[tokio::test]
+    async fn a_reload_request_replaces_the_acceleration_with_the_served_partitions() {
+        let dataset = "reload_served_partitions";
+        let schema = Arc::new(create_test_data_schema());
+        let federated = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(
+                    &[1, 2, 3, 4, 5, 6],
+                    &["a", "b", "c", "d", "e", "f"],
+                )]],
+            )
+            .expect("federated mem table"),
+        );
+        let accelerator = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&[5], &["no longer served"])]],
+            )
+            .expect("accelerator mem table"),
+        );
+        let task = make_refresh_task_with_source(
+            dataset,
+            federated as Arc<dyn TableProvider>,
+            Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+        );
+        let (trigger, requests) = tokio::sync::mpsc::channel(8);
+        *task.reload_requests.lock() = Some(requests);
+
+        let mut sql = crate::accelerated::refresh::RefreshSQL::new(
+            TableReference::bare(dataset),
+            crate::accelerated::refresh::RefreshSQLColumns::All,
+            vec![],
+            None,
+        );
+        sql.set_partition_filters(Some(vec![
+            datafusion::prelude::col("id").lt(datafusion::prelude::lit(4)),
+        ]));
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            sql: Some(sql),
+            ..Refresh::default()
+        }));
+        let completion = RefreshCompletion::new();
+        let (changes, source) =
+            tokio::sync::mpsc::channel::<Result<ChangeEnvelope, cdc::StreamError>>(1);
+        let running = tokio::spawn({
+            let completion = completion.clone();
+            async move {
+                task.start_changes_stream(
+                    refresh,
+                    tokio_stream::wrappers::ReceiverStream::new(source).boxed(),
+                    None,
+                    Some(completion),
+                    Arc::new(AtomicBool::new(true)),
+                )
+                .await
+            }
+        });
+
+        let id = completion.issue();
+        let waiter = completion.waiter_for(id);
+        trigger
+            .send(id)
+            .await
+            .expect("the change stream takes reload requests");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), waiter.wait())
+            .await
+            .expect("the reload must be answered");
+        assert_eq!(
+            outcome,
+            crate::accelerated::refresh_completion::RefreshCompletionOutcome::Answered
+        );
+
+        let batches = SessionContext::new()
+            .read_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>)
+            .expect("read accelerator")
+            .collect()
+            .await
+            .expect("collect accelerator");
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .expect("id")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "the acceleration must hold exactly the served partitions' rows"
+        );
+
+        drop(changes);
+        drop(trigger);
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the change stream ends once its source ends")
+            .expect("join")
+            .expect("the change stream ends cleanly");
     }
 }
