@@ -53,7 +53,6 @@ runs:
           "http://mirrors.edge.kernel.org/ubuntu/"
           "http://archive.ubuntu.com/ubuntu/"
         )
-        PRIMARY="${ARCHIVE_MIRRORS[0]}"
 
         # The archive source uses apt's mirror method, which fetches each
         # file from the first mirror in the list and moves to the next one
@@ -101,7 +100,6 @@ runs:
             /etc/apt/sources.list
         fi
 
-        echo "apt primary archive mirror: ${PRIMARY}"
         echo "apt mirror list ${MIRROR_LIST}, in failover order: ${ARCHIVE_MIRRORS[*]}"
         echo "apt acquire policy installed at /etc/apt/apt.conf.d/zz-spice-acquire"
 
