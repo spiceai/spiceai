@@ -1201,12 +1201,23 @@ pub trait ListingTableConnector: DataConnector {
             (Some(format), _) if is_document_file_format(format) => {
                 Ok((None, format!(".{format}")))
             }
-            (Some(format), _) => Err(crate::DataConnectorError::InvalidConfiguration {
-                dataconnector: format!("{self}"),
-                message: unknown_file_format_message(dataset, params, format),
-                connector_component: ConnectorComponent::from(dataset),
-                source: "Unknown file format".into(),
-            }),
+            (Some(format), _) => {
+                let valid = valid_listing_file_formats();
+                if closest_file_format(format, &valid).is_some() {
+                    Err(crate::DataConnectorError::InvalidConfiguration {
+                        dataconnector: format!("{self}"),
+                        message: unknown_file_format_message(dataset, params, format),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: "Unknown file format".into(),
+                    })
+                } else {
+                    // Trunk treated unknown formats such as `log`, `xml`, and
+                    // `yaml` as a plain-text table. Keep that fallthrough
+                    // unless the value is a near-miss of a known format.
+                    tracing::warn!("{}", unknown_file_format_fallback_warning(dataset, params, format));
+                    Ok((None, format!(".{format}")))
+                }
+            }
             (_, _) => Err(
                     crate::DataConnectorError::InvalidConfiguration {
                         dataconnector: format!("{self}"),
@@ -2206,6 +2217,24 @@ fn unknown_file_format_message(dataset: &DatasetSpec, params: &Parameters, forma
     )
 }
 
+/// Warning when an unknown `file_format` is not a near-miss and falls through
+/// to the plain-text table (trunk-compatible).
+fn unknown_file_format_fallback_warning(
+    dataset: &DatasetSpec,
+    params: &Parameters,
+    format: &str,
+) -> String {
+    let dataset_name = dataset.name.to_string();
+    let format_clause = match params.secret_source("file_format") {
+        Some(source) => format!(" from {source}"),
+        None if params.origins_tracked() => format!(" '{format}'"),
+        None => String::new(),
+    };
+    format!(
+        "Unknown `file_format`{format_clause} for dataset '{dataset_name}' is not a recognized structured or document format, so the dataset is loaded as a plain-text table. Set `file_format` to a known format if that is not intended. See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+    )
+}
+
 // 1024³
 const BYTES_PER_GIB: f64 = 1_073_741_824.0;
 
@@ -2922,6 +2951,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_unknown_file_format_log_falls_through_to_text_table() {
+        let (connector, dataset) = setup_connector(
+            "test:test/".to_string(),
+            HashMap::from([("file_format".to_string(), "log".to_string())]),
+        );
+
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("unknown non-near-miss file_format must keep the text-table path");
+        assert!(
+            file_format.is_none(),
+            "log is not a near-miss of a known format and must use the text-table path"
+        );
+        assert_eq!(extension, ".log");
+        let warning = unknown_file_format_fallback_warning(&dataset, &connector.params, "log");
+        assert!(
+            warning.contains("Unknown `file_format` 'log'"),
+            "fallback warning must name the format: {warning}"
+        );
+        assert!(
+            warning.contains("plain-text table"),
+            "fallback warning must say the dataset is loaded as a plain-text table: {warning}"
+        );
+        assert!(
+            warning.contains(
+                "https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+            ),
+            "fallback warning must link to the file-format docs: {warning}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_document_file_format_md_still_uses_text_table() {
         let (connector, dataset) = setup_connector(
             "test:test/".to_string(),
@@ -2956,7 +3018,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unknown_file_format_from_secret_does_not_echo_value() {
-        const CANARY: &str = "CANARYPGPW7731";
+        const CANARY: &str = "cvs";
         const REFERENCE: &str = "${ env:FILE_FMT }";
         let connector = TestConnector {
             params: Parameters::new(
@@ -2979,7 +3041,7 @@ mod tests {
         let err = connector
             .get_file_format_and_extension(&dataset)
             .await
-            .expect_err("unknown secret-derived file_format must fail");
+            .expect_err("near-miss secret-derived file_format must fail");
         let message = err.to_string();
         assert!(
             !message.contains(CANARY),
@@ -2992,6 +3054,44 @@ mod tests {
         assert!(
             !message.contains("Did you mean"),
             "do not suggest a correction from a secret-derived value: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_secret_non_near_miss_falls_through_without_echo() {
+        const CANARY: &str = "CANARYPGPW7731";
+        const REFERENCE: &str = "${ env:FILE_FMT }";
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([(
+                    "file_format".to_string(),
+                    CANARY.to_string(),
+                )]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_format".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new("test:test/".to_string(), TableReference::bare("test"));
+
+        let (file_format, _extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("non-near-miss secret-derived file_format must fall through");
+        assert!(file_format.is_none());
+        let warning = unknown_file_format_fallback_warning(&dataset, &connector.params, CANARY);
+        assert!(
+            !warning.contains(CANARY),
+            "fallback warning must not echo a resolved secret: {warning}"
+        );
+        assert!(
+            warning.contains(REFERENCE),
+            "fallback warning must name the secret reference: {warning}"
         );
     }
 

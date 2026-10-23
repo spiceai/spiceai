@@ -11,8 +11,8 @@ Project-local verification for a built `spiced`. Do not claim a fix or a regress
 
 Read the matching file under `features/` before running a journey:
 
-- `features/env-secret-precedence.md` — last-declared env store and `file_path` isolation
-- `features/file-format-validation.md` — unknown `file_format` is a configuration error
+- `features/env-secret-precedence.md` — last-declared env store, `file_path` isolation, and default `.env` export
+- `features/file-format-validation.md` — near-miss `file_format` is a configuration error; other unknown formats fall through
 - `features/secret-value-validation-errors.md` — secret-derived param values are not echoed
 
 ## Loop

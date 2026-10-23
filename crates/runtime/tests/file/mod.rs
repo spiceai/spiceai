@@ -904,6 +904,60 @@ async fn file_connector_unknown_file_format_is_a_configuration_error() -> Result
         .await
 }
 
+/// Unknown `file_format: log` is not a near-miss of a known format, so it
+/// keeps trunk's plain-text table path and the dataset goes Ready.
+#[tokio::test]
+async fn file_connector_unknown_file_format_log_stays_ready() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::TempDir::new()?;
+            let csv = dir.path().join("orders.csv");
+            write_orders_csv(&csv)?;
+
+            let mut dataset = Dataset::new(format!("file:{}", csv.display()), "fmt_log");
+            dataset.params = Some(Params {
+                data: HashMap::from([(
+                    "file_format".to_string(),
+                    ParamValue::String("log".to_string()),
+                )]),
+            });
+
+            let app = AppBuilder::new("file_format_log")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let status = rt
+                .status()
+                .get_dataset_status(&datafusion::common::TableReference::bare("fmt_log"))
+                .expect("dataset status");
+            assert!(
+                !status.is_error(),
+                "file_format log must not be a configuration error, got {status:?}"
+            );
+            assert_eq!(
+                status.to_string(),
+                "Ready",
+                "file_format log must stay Ready (plain-text table), got {status:?}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
 /// A secret-derived bool param must not echo the resolved canary in the
 /// dataset status `error_message`.
 #[tokio::test]
