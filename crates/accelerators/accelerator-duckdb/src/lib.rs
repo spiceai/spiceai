@@ -1728,23 +1728,25 @@ pub(crate) async fn create_table_provider(
         None => Arc::new(duckdb_writer.clone()),
     };
 
-    // Wrap with upsert deduplication if needed
-    let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
-        duckdb_writer,
-        &cmd.options,
-        cmd.constraints.clone(),
-    );
+    let write_provider: Arc<dyn TableProvider> = duckdb_writer;
     let write_provider = guard_unique_index_overwrites(write_provider, cmd);
     // Reject a NULL primary key and an in-batch duplicate before DuckDB, and
     // map `__data_<dataset>_<n>` in remaining constraint errors back to the
-    // user dataset. `keep_first` sits above this so `on_conflict: drop` still
-    // keeps the first copy rather than failing the repeat.
+    // user dataset. Configured `upsert_dedup` sits above this so it can
+    // collapse a repeated key before uniqueness is judged. `keep_first` sits
+    // above both so `on_conflict: drop` still keeps the first copy.
     let write_provider = pk_write_guard::wrap_with_pk_write_guard_if_needed(
         write_provider,
         cmd.schema.as_arrow(),
         &cmd.constraints,
         pk_write_guard::GuardStrategy::Stream,
+        keep_first::NanKey::Value,
         Some(cmd.name.table().to_string()),
+    );
+    let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+        write_provider,
+        &cmd.options,
+        cmd.constraints.clone(),
     );
     // DuckDB writes a whole stream as one `INSERT … ON CONFLICT DO NOTHING`,
     // which refuses a key repeated within one batch and resolves one repeated
@@ -2942,6 +2944,19 @@ mod tests {
     }
 
     async fn upsert_id_v_table(name: &str, schema: Arc<Schema>) -> Arc<dyn TableProvider> {
+        upsert_id_v_table_with_options(
+            name,
+            schema,
+            [("on_conflict".to_string(), "upsert:id".to_string())],
+        )
+        .await
+    }
+
+    async fn upsert_id_v_table_with_options(
+        name: &str,
+        schema: Arc<Schema>,
+        options: impl IntoIterator<Item = (String, String)>,
+    ) -> Arc<dyn TableProvider> {
         let external_table = CreateExternalTable {
             schema: ToDFSchema::to_dfschema_ref(schema)
                 .expect("to convert Arrow schema to DataFusion schema"),
@@ -2954,9 +2969,7 @@ mod tests {
             definition: None,
             order_exprs: vec![],
             unbounded: false,
-            options: [("on_conflict".to_string(), "upsert:id".to_string())]
-                .into_iter()
-                .collect(),
+            options: options.into_iter().collect(),
             constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
             column_defaults: HashMap::default(),
             temporary: false,
@@ -3047,6 +3060,29 @@ mod tests {
                 || message.to_lowercase().contains("constraint"),
             "the error must name the dataset or the unique constraint, got: {message}"
         );
+    }
+
+    /// Configured last-write-wins must collapse a repeated key before the
+    /// uniqueness guard sees the batch.
+    #[tokio::test]
+    async fn last_write_wins_collapses_an_in_batch_duplicate_before_the_guard() {
+        let table = upsert_id_v_table_with_options(
+            "lww_before_guard",
+            id_v_schema(),
+            [
+                ("on_conflict".to_string(), "upsert:id".to_string()),
+                ("upsert_last_write_wins".to_string(), "true".to_string()),
+            ],
+        )
+        .await;
+        write_batches(
+            &table,
+            vec![id_v_batch(&[(1, "a"), (1, "b")])],
+            InsertOp::Append,
+        )
+        .await
+        .expect("last-write-wins must collapse the repeat before uniqueness is judged");
+        assert_eq!(id_v_rows(&table).await, vec![(1, "b".to_string())]);
     }
 
     #[tokio::test]

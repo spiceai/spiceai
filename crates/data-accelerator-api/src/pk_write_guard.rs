@@ -14,13 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Rejects a NULL primary key, and a key a single write repeats, before the
+//! Rejects a NULL primary key, and a key a single batch repeats, before the
 //! write reaches `DuckDB` or `SQLite`.
 //!
 //! A primary-key table still upserts a key it already stores — that default is
 //! unchanged. This layer only refuses what those engines already treat as a
 //! constraint error (or, for `SQLite`, silently accept): a null key, and a key
-//! repeated inside one statement.
+//! repeated inside one batch. A later batch of the same write may repeat a
+//! key; that is an upsert, as `test_append_to_accelerator_duckdb` requires.
+//!
+//! `SQLite` stores a bound NaN as NULL, so under [`NanKey::Null`] a NaN key
+//! is refused the same way. `DuckDB` keeps NaN as a value.
 //!
 //! `SQLite`'s sink reports a failed input stream as `Query is not read-only`
 //! (#14757): it writes on a blocking thread and treats a closed batch channel
@@ -30,6 +34,7 @@ limitations under the License.
 
 use std::{collections::HashSet, sync::Arc};
 
+use crate::keep_first::NanKey;
 use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
@@ -70,7 +75,8 @@ pub enum GuardStrategy {
 }
 
 /// Layers [`PkWriteGuard`] over `provider` when `constraints` name a primary
-/// key. `rewrite_dataset` maps `DuckDB` `__data_<name>_<n>` names in write
+/// key. `nan` is how the engine below stores a NaN in a key column.
+/// `rewrite_dataset` maps `DuckDB` `__data_<name>_<n>` names in write
 /// errors back to `name` even when the table has no primary key; `None`
 /// leaves messages unchanged.
 #[must_use]
@@ -79,13 +85,21 @@ pub fn wrap_with_pk_write_guard_if_needed(
     schema: &Schema,
     constraints: &Constraints,
     strategy: GuardStrategy,
+    nan: NanKey,
     rewrite_dataset: Option<String>,
 ) -> Arc<dyn TableProvider> {
     let key_sets = primary_key_sets(schema, constraints);
     let provider = if key_sets.is_empty() {
         provider
     } else {
-        SpiceTable::over(Arc::new(PkWriteGuard { key_sets, strategy }), provider)
+        SpiceTable::over(
+            Arc::new(PkWriteGuard {
+                key_sets,
+                strategy,
+                nan,
+            }),
+            provider,
+        )
     };
     wrap_with_internal_name_rewrite(provider, rewrite_dataset)
 }
@@ -233,6 +247,7 @@ fn memory_input(
 pub struct PkWriteGuard {
     key_sets: Vec<Vec<String>>,
     strategy: GuardStrategy,
+    nan: NanKey,
 }
 
 #[async_trait]
@@ -263,7 +278,7 @@ impl TableLayer for PkWriteGuard {
         let key_indices = key_indices(input.schema().as_ref(), &self.key_sets)?;
         match self.strategy {
             GuardStrategy::Stream => {
-                let exec = PkWriteGuardExec::new(input, Arc::clone(&key_indices));
+                let exec = PkWriteGuardExec::new(input, Arc::clone(&key_indices), self.nan);
                 below.insert_into(state, Arc::new(exec), op).await
             }
             GuardStrategy::CollectThenInsert => Ok(Arc::new(PkCollectThenInsertExec::new(
@@ -272,6 +287,7 @@ impl TableLayer for PkWriteGuard {
                 session_state(state)?,
                 op,
                 key_indices,
+                self.nan,
             ))),
         }
     }
@@ -292,10 +308,11 @@ fn key_indices(
         .collect::<Result<Arc<[_]>, _>>()?)
 }
 
-/// The keys one write has already admitted, so a later row repeating any
-/// primary key fails rather than racing the engine.
+/// The keys one batch has already admitted. A later batch of the same write
+/// may repeat a key; that is an upsert onto the stored row.
 struct SeenKeys {
     keys: Vec<KeySet>,
+    nan: NanKey,
 }
 
 struct KeySet {
@@ -304,7 +321,7 @@ struct KeySet {
 }
 
 impl SeenKeys {
-    fn new(key_indices: &[Vec<usize>]) -> Self {
+    fn new(key_indices: &[Vec<usize>], nan: NanKey) -> Self {
         Self {
             keys: key_indices
                 .iter()
@@ -313,18 +330,20 @@ impl SeenKeys {
                     admitted: HashSet::new(),
                 })
                 .collect(),
+            nan,
         }
     }
 
     fn admit(&mut self, batch: &RecordBatch) -> datafusion::error::Result<()> {
         for key in &mut self.keys {
+            key.admitted.clear();
             for row in 0..batch.num_rows() {
                 let values = key
                     .indices
                     .iter()
                     .map(|&index| ScalarValue::try_from_array(batch.column(index), row))
                     .collect::<datafusion::error::Result<Vec<_>>>()?;
-                if values.iter().any(ScalarValue::is_null) {
+                if values.iter().any(|value| is_null_key(value, self.nan)) {
                     return Err(DataFusionError::Execution(null_primary_key_message(
                         batch,
                         &key.indices,
@@ -339,16 +358,32 @@ impl SeenKeys {
     }
 }
 
+fn is_null_key(value: &ScalarValue, nan: NanKey) -> bool {
+    if value.is_null() {
+        return true;
+    }
+    if nan != NanKey::Null {
+        return false;
+    }
+    match value {
+        ScalarValue::Float16(Some(number)) => number.is_nan(),
+        ScalarValue::Float32(Some(number)) => number.is_nan(),
+        ScalarValue::Float64(Some(number)) => number.is_nan(),
+        _ => false,
+    }
+}
+
 /// Validates each batch, then forwards it to the engine beneath.
 #[derive(Debug)]
 struct PkWriteGuardExec {
     input: Arc<dyn ExecutionPlan>,
     key_indices: Arc<[Vec<usize>]>,
+    nan: NanKey,
     properties: Arc<PlanProperties>,
 }
 
 impl PkWriteGuardExec {
-    fn new(input: Arc<dyn ExecutionPlan>, key_indices: Arc<[Vec<usize>]>) -> Self {
+    fn new(input: Arc<dyn ExecutionPlan>, key_indices: Arc<[Vec<usize>]>, nan: NanKey) -> Self {
         let input = if input.output_partitioning().partition_count() > 1 {
             Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
         } else {
@@ -358,6 +393,7 @@ impl PkWriteGuardExec {
             properties: Arc::clone(input.properties()),
             input,
             key_indices,
+            nan,
         }
     }
 }
@@ -412,7 +448,11 @@ impl ExecutionPlan for PkWriteGuardExec {
         let [child] = <[_; 1]>::try_from(children).map_err(|_| {
             DataFusionError::Internal("PkWriteGuardExec requires exactly one child".to_string())
         })?;
-        Ok(Arc::new(Self::new(child, Arc::clone(&self.key_indices))))
+        Ok(Arc::new(Self::new(
+            child,
+            Arc::clone(&self.key_indices),
+            self.nan,
+        )))
     }
 
     fn execute(
@@ -422,7 +462,7 @@ impl ExecutionPlan for PkWriteGuardExec {
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let mut input = self.input.execute(partition, context)?;
         let schema = self.schema();
-        let mut seen = SeenKeys::new(&self.key_indices);
+        let mut seen = SeenKeys::new(&self.key_indices, self.nan);
         let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&schema), 2);
         let tx = builder.tx();
         builder.spawn(async move {
@@ -448,6 +488,7 @@ struct PkCollectThenInsertExec {
     session: SessionState,
     op: InsertOp,
     key_indices: Arc<[Vec<usize>]>,
+    nan: NanKey,
     properties: Arc<PlanProperties>,
 }
 
@@ -458,6 +499,7 @@ impl PkCollectThenInsertExec {
         session: SessionState,
         op: InsertOp,
         key_indices: Arc<[Vec<usize>]>,
+        nan: NanKey,
     ) -> Self {
         let input = if input.output_partitioning().partition_count() > 1 {
             Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
@@ -476,6 +518,7 @@ impl PkCollectThenInsertExec {
             session,
             op,
             key_indices,
+            nan,
             properties,
         }
     }
@@ -535,6 +578,7 @@ impl ExecutionPlan for PkCollectThenInsertExec {
             self.session.clone(),
             self.op,
             Arc::clone(&self.key_indices),
+            self.nan,
         )))
     }
 
@@ -548,13 +592,14 @@ impl ExecutionPlan for PkCollectThenInsertExec {
         let session = self.session.clone();
         let op = self.op;
         let key_indices = Arc::clone(&self.key_indices);
+        let nan = self.nan;
         let schema = input.schema();
         let stream = futures::stream::once(async move {
             let mut reservation =
                 MemoryConsumer::new("PkCollectThenInsertExec").register(context.memory_pool());
             let mut input = input.execute(0, Arc::clone(&context))?;
             let mut batches = Vec::new();
-            let mut seen = SeenKeys::new(&key_indices);
+            let mut seen = SeenKeys::new(&key_indices, nan);
             while let Some(batch) = input.next().await {
                 let batch = batch?;
                 seen.admit(&batch)?;
@@ -702,15 +747,17 @@ impl ExecutionPlan for RewriteInternalTableNamesExec {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardStrategy, SeenKeys, null_primary_key_message, rewrite_internal_data_table_names,
-        wrap_with_pk_write_guard_if_needed,
+        GuardStrategy, SeenKeys, is_null_key, null_primary_key_message,
+        rewrite_internal_data_table_names, wrap_with_pk_write_guard_if_needed,
     };
-    use arrow::array::{Int64Array, StringArray};
+    use crate::keep_first::NanKey;
+    use arrow::array::{Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::catalog::MemTable;
     use datafusion::common::{Constraint, Constraints};
     use datafusion::datasource::TableProvider;
+    use datafusion::scalar::ScalarValue;
     use spice_table::{LayerWalk, find_layer};
     use std::sync::Arc;
 
@@ -803,7 +850,7 @@ mod tests {
 
     #[test]
     fn admit_rejects_a_null_primary_key() {
-        let mut seen = SeenKeys::new(&[vec![0]]);
+        let mut seen = SeenKeys::new(&[vec![0]], NanKey::Value);
         let error = seen
             .admit(&batch(&[(None, "nullpk")]))
             .expect_err("NULL primary key");
@@ -816,7 +863,7 @@ mod tests {
 
     #[test]
     fn admit_rejects_an_in_batch_duplicate_key() {
-        let mut seen = SeenKeys::new(&[vec![0]]);
+        let mut seen = SeenKeys::new(&[vec![0]], NanKey::Value);
         let error = seen
             .admit(&batch(&[(Some(1), "a"), (Some(1), "b")]))
             .expect_err("duplicate key");
@@ -829,14 +876,49 @@ mod tests {
     }
 
     #[test]
-    fn admit_rejects_a_key_repeated_across_batches() {
-        let mut seen = SeenKeys::new(&[vec![0]]);
+    fn admit_allows_a_key_repeated_across_batches() {
+        let mut seen = SeenKeys::new(&[vec![0]], NanKey::Value);
         seen.admit(&batch(&[(Some(1), "a")]))
-            .expect("first copy is new");
-        let error = seen
-            .admit(&batch(&[(Some(1), "b")]))
-            .expect_err("second copy");
-        assert!(error.to_string().contains("uniqueness"), "{error}");
+            .expect("first batch is new");
+        seen.admit(&batch(&[(Some(1), "b")]))
+            .expect("a later batch may upsert the same key");
+    }
+
+    #[test]
+    fn admit_rejects_a_nan_key_when_the_engine_stores_nan_as_null() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Float64, true),
+            Field::new("v", DataType::Utf8, false),
+        ]));
+        let nan_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Float64Array::from(vec![Some(f64::NAN)])),
+                Arc::new(StringArray::from(vec!["nan"])),
+            ],
+        )
+        .expect("nan batch");
+        let mut sqlite = SeenKeys::new(&[vec![0]], NanKey::Null);
+        let error = sqlite
+            .admit(&nan_batch)
+            .expect_err("SQLite stores a NaN as NULL");
+        assert!(
+            error.to_string().contains("Primary key") && error.to_string().contains("null"),
+            "{error}"
+        );
+
+        let mut duckdb = SeenKeys::new(&[vec![0]], NanKey::Value);
+        duckdb
+            .admit(&nan_batch)
+            .expect("DuckDB keeps a NaN as a value");
+    }
+
+    #[test]
+    fn is_null_key_treats_nan_as_null_only_for_sqlite() {
+        let nan = ScalarValue::Float64(Some(f64::NAN));
+        assert!(is_null_key(&nan, NanKey::Null));
+        assert!(!is_null_key(&nan, NanKey::Value));
+        assert!(is_null_key(&ScalarValue::Float64(None), NanKey::Value));
     }
 
     #[test]
@@ -848,6 +930,7 @@ mod tests {
             &schema(),
             &pk(),
             GuardStrategy::Stream,
+            NanKey::Value,
             None,
         );
         assert!(find_layer::<super::PkWriteGuard>(with_pk.as_ref(), LayerWalk::Write).is_some());
@@ -857,6 +940,7 @@ mod tests {
             &schema(),
             &Constraints::new_unverified(vec![]),
             GuardStrategy::Stream,
+            NanKey::Value,
             None,
         );
         assert!(find_layer::<super::PkWriteGuard>(without.as_ref(), LayerWalk::Write).is_none());
@@ -871,6 +955,7 @@ mod tests {
             &schema(),
             &Constraints::new_unverified(vec![]),
             GuardStrategy::Stream,
+            NanKey::Value,
             Some("o_duckdb".to_string()),
         );
         assert!(find_layer::<super::PkWriteGuard>(wrapped.as_ref(), LayerWalk::Write).is_none());
