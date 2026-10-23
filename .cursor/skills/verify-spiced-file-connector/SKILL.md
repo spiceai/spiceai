@@ -43,7 +43,7 @@ Start only this instance, with logs and a pidfile under `$WORK_DIR`:
   --metrics "$METRICS_ADDR"
 ```
 
-`--spiced` may be relative to the caller's directory. The helper canonicalizes it to an absolute path before changing to `$WORK_DIR`, and writes that path to `$WORK_DIR/spiced.binary`.
+`--spiced` and `--work` may be relative to the caller's directory. The helper canonicalizes both to absolute paths before changing to `$WORK_DIR` (so `logfile` / `pidfile` do not become `$WORK_DIR/$WORK_DIR/...`), and writes the binary path to `$WORK_DIR/spiced.binary`.
 
 Exact process command the helper runs (cwd is `$WORK_DIR`, so `file:` paths resolve; `$SPICED` is already absolute):
 
@@ -87,7 +87,7 @@ HTTP SQL is the harness. `POST /v1/sql` with `Content-Type: text/plain` and `Acc
 SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM <dataset>
 ```
 
-On-demand refresh: `POST /v1/datasets/<name>/acceleration/refresh` then poll `GET /v1/datasets?status=true` until that dataset leaves `Refreshing`.
+On-demand refresh: capture a completion marker (`last_refresh`, `error_message`, and `runtime.task_history` `acceleration_refresh` count), then `POST /v1/datasets/<name>/acceleration/refresh`, then poll until a *new* completion: a later task-history row, a new `last_refresh` (success), or a new `error_message` (failure does not advance `last_refresh`). A leftover `Ready` or `Error` from before the POST is not completion.
 
 The mapped journeys are in `features/`. Drive them with:
 

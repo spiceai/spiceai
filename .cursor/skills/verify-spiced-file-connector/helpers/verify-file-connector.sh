@@ -57,6 +57,15 @@ pidfile() { echo "${WORK}/spiced.pid"; }
 logfile() { echo "${WORK}/spiced.log"; }
 binfile() { echo "${WORK}/spiced.binary"; }
 
+# Resolve `--work` after creating it. `cmd_launch` then cds to `$WORK`; a
+# relative path such as `work` would make `logfile` expand to `work/spiced.log`
+# inside that directory (`work/work/spiced.log`).
+require_work() {
+  [[ -n "$WORK" ]] || die "--work is required"
+  mkdir -p "$WORK"
+  WORK="$(cd "$WORK" && pwd)"
+}
+
 # Resolve `--spiced` in the caller's directory. `cmd_launch` then cds to
 # `$WORK`; a relative path such as `target/debug/spiced` would miss there.
 resolve_spiced() {
@@ -223,8 +232,7 @@ YAML
 }
 
 cmd_seed() {
-  [[ -n "$WORK" ]] || die "--work is required"
-  mkdir -p "$WORK"
+  require_work
   seed_spicepod
   echo "seeded ${WORK}/spicepod.yaml"
 }
@@ -268,12 +276,12 @@ wait_ready() {
 cmd_launch() {
   [[ -n "$WORK" && -n "$SPICED" ]] || die "--work and --spiced are required"
   require_cmd curl
+  require_work
   SPICED="$(resolve_spiced "$SPICED")"
   [[ -f "${WORK}/spicepod.yaml" ]] || seed_spicepod
   HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:$(free_port)}"
   FLIGHT_ADDR="${FLIGHT_ADDR:-127.0.0.1:$(free_port)}"
   METRICS_ADDR="${METRICS_ADDR:-127.0.0.1:$(free_port)}"
-  mkdir -p "$WORK"
   : >"$(logfile)"
   # Resolve `file:` paths and the spicepod from the work directory.
   local pid
@@ -293,7 +301,8 @@ cmd_launch() {
 }
 
 cmd_doctor() {
-  [[ -n "$WORK" && -n "$HTTP_ADDR" ]] || die "--work and --http are required"
+  [[ -n "$HTTP_ADDR" ]] || die "--http is required"
+  require_work
   local pf
   pf="$(pidfile)"
   [[ -f "$pf" ]] || die "no pidfile at $pf"
@@ -401,31 +410,116 @@ refresh_dataset() {
   echo "refresh ${name} -> HTTP ${code} $(tr -d '\n' <"${out}.body" | head -c 200)"
 }
 
-wait_refresh_settled() {
+dataset_refresh_fields() {
   local name="$1"
-  local deadline=$((SECONDS + 60))
-  while (( SECONDS < deadline )); do
-    local json
-    json="$(curl -sS --max-time 10 "http://${HTTP_ADDR}/v1/datasets?status=true")"
-    local status
-    status="$(python3 - "$json" "$name" <<'PY'
+  local json
+  json="$(curl -sS --max-time 10 "http://${HTTP_ADDR}/v1/datasets?status=true")"
+  python3 - "$json" "$name" <<'PY'
 import json, sys
 data = json.loads(sys.argv[1])
 name = sys.argv[2]
 for d in data:
     if d.get("name") == name:
-        print(d.get("status") or "")
+        print(f"{d.get('status') or ''}\t{d.get('last_refresh') or ''}\t{d.get('error_message') or ''}")
         raise SystemExit(0)
-print("missing")
+print("missing\t\t")
 PY
-)"
-    if [[ "$status" != "Refreshing" && "$status" != "Initializing" && "$status" != "missing" ]]; then
-      echo "refresh settled ${name} status=${status}"
+}
+
+refresh_task_count() {
+  local name="$1"
+  [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid dataset name: $name"
+  local payload
+  payload="$(curl -sS --max-time 15 \
+    -H "Content-Type: text/plain" \
+    -H "Accept: application/json" \
+    --data-binary "SELECT count(*) AS n FROM runtime.task_history WHERE task = 'acceleration_refresh' AND \"input\" = '${name}'" \
+    "http://${HTTP_ADDR}/v1/sql" || true)"
+  python3 - "$payload" <<'PY'
+import json, sys
+text = sys.argv[1]
+idx = text.find("[")
+if idx < 0:
+    print("")
+    raise SystemExit(0)
+try:
+    data = json.loads(text[idx:])
+except json.JSONDecodeError:
+    print("")
+    raise SystemExit(0)
+row = data[0] if isinstance(data, list) and data else data
+if not isinstance(row, dict):
+    print("")
+    raise SystemExit(0)
+for key, value in row.items():
+    if key == "n" or key.endswith(".n"):
+        print(int(value))
+        raise SystemExit(0)
+print("")
+PY
+}
+
+refresh_completion_marker() {
+  local name="$1"
+  printf '%s\t%s\n' "$(dataset_refresh_fields "$name")" "$(refresh_task_count "$name")"
+}
+
+# A new completion is a terminal status plus a marker that moved: a new
+# `acceleration_refresh` task-history row, a new `last_refresh` (success), or a
+# new `error_message` (failure does not advance `last_refresh`).
+refresh_is_complete() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+
+def split(raw: str) -> tuple[str, str, str, str]:
+    parts = raw.split("\t")
+    while len(parts) < 4:
+        parts.append("")
+    return parts[0], parts[1], parts[2], parts[3]
+
+_, b_last, b_err, b_n = split(sys.argv[1])
+n_status, n_last, n_err, n_n = split(sys.argv[2])
+terminal = n_status not in {"Refreshing", "Initializing", "missing", ""}
+try:
+    new_task = bool(b_n) and bool(n_n) and int(n_n) > int(b_n)
+except ValueError:
+    new_task = False
+last_moved = bool(n_last) and n_last != b_last
+err_moved = n_err != b_err
+print("yes" if terminal and (new_task or last_moved or err_moved) else "no")
+PY
+}
+
+wait_refresh_settled() {
+  local name="$1"
+  local baseline="$2"
+  local deadline=$((SECONDS + 60))
+  local now=""
+  while (( SECONDS < deadline )); do
+    now="$(refresh_completion_marker "$name")"
+    if [[ "$(refresh_is_complete "$baseline" "$now")" == "yes" ]]; then
+      echo "refresh settled ${name} status=${now%%$'\t'*}"
       return 0
     fi
     sleep 0.25
   done
-  die "dataset ${name} still Refreshing after 60s"
+  die "dataset ${name} refresh did not complete within 60s (last: ${now:-none})"
+}
+
+refresh_all_and_wait() {
+  local step="$1"
+  local ev="$2"
+  local ds
+  local baselines=()
+  for ds in "${ACC_DATASETS[@]}"; do
+    baselines+=("$(refresh_completion_marker "$ds")")
+    refresh_dataset "$ds" "${ev}/refresh-${step}-${ds}"
+  done
+  local i=0
+  for ds in "${ACC_DATASETS[@]}"; do
+    wait_refresh_settled "$ds" "${baselines[$i]}"
+    i=$((i + 1))
+  done
 }
 
 summarize_datasets() {
@@ -470,8 +564,9 @@ query_dataset() {
 }
 
 cmd_drive() {
-  [[ -n "$WORK" && -n "$HTTP_ADDR" && -n "$EVIDENCE" && -n "$LABEL" ]] || \
+  [[ -n "$HTTP_ADDR" && -n "$EVIDENCE" && -n "$LABEL" ]] || \
     die "--work --http --evidence --label are required"
+  require_work
   local ev="${EVIDENCE}/${LABEL}"
   mkdir -p "$ev"
   : >"${ev}/summary.txt"
@@ -514,12 +609,7 @@ cmd_drive() {
   for ds in "${FED_DATASETS[@]}"; do
     query_dataset reorder-fed "$ds" "$ev"
   done
-  for ds in "${ACC_DATASETS[@]}"; do
-    refresh_dataset "$ds" "${ev}/refresh-reorder-${ds}"
-  done
-  for ds in "${ACC_DATASETS[@]}"; do
-    wait_refresh_settled "$ds"
-  done
+  refresh_all_and_wait reorder "$ev"
   for ds in "${ACC_DATASETS[@]}"; do
     query_dataset reorder-acc "$ds" "$ev"
   done
@@ -543,12 +633,7 @@ cmd_drive() {
     query_dataset rename-fed "$ds" "$ev"
   done
   capture_log_slice "$(logfile)" "$log_at" "${ev}/log-rename-fed.txt"
-  for ds in "${ACC_DATASETS[@]}"; do
-    refresh_dataset "$ds" "${ev}/refresh-rename-${ds}"
-  done
-  for ds in "${ACC_DATASETS[@]}"; do
-    wait_refresh_settled "$ds"
-  done
+  refresh_all_and_wait rename "$ev"
   for ds in "${ACC_DATASETS[@]}"; do
     query_dataset rename-acc "$ds" "$ev"
   done
@@ -570,12 +655,7 @@ cmd_drive() {
   for ds in "${FED_DATASETS[@]}"; do
     query_dataset restore-fed "$ds" "$ev"
   done
-  for ds in "${ACC_DATASETS[@]}"; do
-    refresh_dataset "$ds" "${ev}/refresh-restore-${ds}"
-  done
-  for ds in "${ACC_DATASETS[@]}"; do
-    wait_refresh_settled "$ds"
-  done
+  refresh_all_and_wait restore "$ev"
   for ds in "${ACC_DATASETS[@]}"; do
     query_dataset restore-acc "$ds" "$ev"
   done
@@ -587,7 +667,7 @@ cmd_drive() {
 }
 
 cmd_cleanup() {
-  [[ -n "$WORK" ]] || die "--work is required"
+  require_work
   local pf
   pf="$(pidfile)"
   if [[ -f "$pf" ]]; then
