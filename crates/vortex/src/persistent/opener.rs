@@ -125,6 +125,9 @@ pub(crate) struct VortexOpener {
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     pub projection_pushdown: bool,
     pub scan_concurrency: Option<usize>,
+    /// Splits the scan may have in flight while it decodes only `scan_concurrency` at once
+    /// (see `VortexSource::resolved_scan_io_overlap`).
+    pub scan_io_overlap: Option<usize>,
     /// Provider consulted after runtime dynamic filters have been populated.
     pub runtime_access_plan_provider: Option<Arc<dyn VortexRuntimeAccessPlanProvider>>,
     /// Column whose equality predicates a whole-file scan answers from the file's
@@ -171,6 +174,7 @@ impl FileOpener for VortexOpener {
         let natural_split_ranges = Arc::clone(&self.natural_split_ranges);
         let has_output_ordering = self.has_output_ordering;
         let scan_concurrency = self.scan_concurrency;
+        let scan_io_overlap = self.scan_io_overlap;
 
         let expr_convertor = Arc::clone(&self.expression_convertor);
         let projection_pushdown = self.projection_pushdown;
@@ -635,6 +639,12 @@ impl FileOpener for VortexOpener {
                     // machine's cores rather than the share a cgroup granted, so
                     // neither the charge nor the cap would mean what it says.
                     scan_builder = scan_builder.with_absolute_concurrency(concurrency);
+                }
+
+                // Reads from a remote store are waited on, not decoded: keep more splits
+                // fetching while the decoding concurrency above stays as it is.
+                if let Some(max_in_flight) = scan_io_overlap {
+                    scan_builder = scan_builder.with_split_io_overlap(max_in_flight);
                 }
 
                 scan_builder
@@ -1211,6 +1221,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            scan_io_overlap: None,
             runtime_access_plan_provider: None,
             key_column: None,
         }
@@ -1776,6 +1787,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            scan_io_overlap: None,
             runtime_access_plan_provider: None,
             key_column: None,
         };
@@ -1855,6 +1867,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            scan_io_overlap: None,
             runtime_access_plan_provider: None,
             key_column: None,
         };
@@ -2005,6 +2018,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            scan_io_overlap: None,
             runtime_access_plan_provider: None,
             key_column: None,
         };
@@ -2065,6 +2079,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            scan_io_overlap: None,
             runtime_access_plan_provider: None,
             key_column: None,
         }
@@ -2295,6 +2310,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            scan_io_overlap: None,
             runtime_access_plan_provider: None,
             key_column: None,
         };
