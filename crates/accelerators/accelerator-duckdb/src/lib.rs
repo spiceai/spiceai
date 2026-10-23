@@ -1739,7 +1739,6 @@ pub(crate) async fn create_table_provider(
         write_provider,
         cmd.schema.as_arrow(),
         &cmd.constraints,
-        pk_write_guard::GuardStrategy::Stream,
         keep_first::NanKey::Value,
         Some(cmd.name.table().to_string()),
     );

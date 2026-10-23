@@ -632,17 +632,17 @@ impl DataAccelerator for SqliteAccelerator {
         let read_provider = Arc::clone(&sqlite_writer.read_provider);
         let sqlite_writer = Arc::new(sqlite_writer.clone());
 
-        // Validate NULL primary keys and in-batch duplicates before SQLite
-        // sees the stream. SQLite's sink otherwise reports a failed write as
-        // `Query is not read-only` (#14757), and a non-INTEGER PRIMARY KEY
-        // accepts NULL. Configured `upsert_dedup` sits above this so it can
-        // collapse a repeated key before uniqueness is judged. `keep_first`
-        // sits above both so `on_conflict: drop` still keeps the first copy.
+        // Validate NULL primary keys and in-batch duplicates as the stream
+        // flows into SQLite. The sink otherwise reports a failed write as
+        // `Query is not read-only` (#14757); the guard records its first
+        // error and prefers it. A non-INTEGER PRIMARY KEY accepts NULL.
+        // Configured `upsert_dedup` sits above this so it can collapse a
+        // repeated key before uniqueness is judged. `keep_first` sits above
+        // both so `on_conflict: drop` still keeps the first copy.
         let write_provider = pk_write_guard::wrap_with_pk_write_guard_if_needed(
             sqlite_writer,
             cmd.schema.as_arrow(),
             &cmd.constraints,
-            pk_write_guard::GuardStrategy::CollectThenInsert,
             keep_first::NanKey::Null,
             None,
         );
@@ -867,9 +867,10 @@ mod tests {
     use data_accelerator_api::DataAccelerator;
     use datafusion::{
         common::{Constraint, Constraints, TableReference, ToDFSchema},
-        execution::context::SessionContext,
+        execution::{context::SessionContext, runtime_env::RuntimeEnvBuilder},
         logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
         physical_plan::collect,
+        prelude::SessionConfig,
         scalar::ScalarValue,
     };
     use datafusion_table_providers::util::test::MockExec;
@@ -1321,6 +1322,68 @@ mod tests {
         )
         .await;
         assert_eq!(id_v_rows(&table).await, vec![(1, "b".to_string())]);
+    }
+
+    /// A write whose batches each fit in the session memory limit must succeed
+    /// even when the *total* does not. Collecting the whole write first
+    /// (`PkCollectThenInsertExec` on `774ff2260e`) charged every batch to the
+    /// pool and failed this case; streaming does not.
+    #[tokio::test]
+    async fn a_multi_batch_write_stays_within_a_per_batch_memory_limit() {
+        const LIMIT: usize = 32 * 1024;
+        let payload = "x".repeat(256);
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|batch_index| {
+                let rows: Vec<(i64, String)> = (0..64)
+                    .map(|row| {
+                        (
+                            i64::from(batch_index) * 64 + i64::from(row),
+                            payload.clone(),
+                        )
+                    })
+                    .collect();
+                RecordBatch::try_new(
+                    id_v_schema(),
+                    vec![
+                        Arc::new(Int64Array::from(
+                            rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                        )),
+                        Arc::new(StringArray::from(
+                            rows.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+                        )),
+                    ],
+                )
+                .expect("batch")
+            })
+            .collect();
+        let per_batch = batches
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .collect::<Vec<_>>();
+        let total: usize = per_batch.iter().sum();
+        assert!(
+            per_batch.iter().all(|&size| size < LIMIT),
+            "each batch must fit in the limit, sizes={per_batch:?} limit={LIMIT}"
+        );
+        assert!(
+            total > LIMIT,
+            "the write as a whole must exceed the limit, total={total} limit={LIMIT}"
+        );
+
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(LIMIT, 1.0)
+            .build_arc()
+            .expect("runtime");
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+        let table = upsert_id_v_table("memory_bound", id_v_schema()).await;
+        let exec = MockExec::new(batches.into_iter().map(Ok).collect(), id_v_schema());
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion should be planned");
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("streaming must not charge the whole write to the memory pool");
     }
 
     /// With `drop` on two constraints, an append must not drop a row because of

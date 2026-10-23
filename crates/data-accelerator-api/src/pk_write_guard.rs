@@ -28,51 +28,44 @@ limitations under the License.
 //!
 //! `SQLite`'s sink reports a failed input stream as `Query is not read-only`
 //! (#14757): it writes on a blocking thread and treats a closed batch channel
-//! as `InvalidQuery` before the stream's error is read. [`GuardStrategy::CollectThenInsert`]
-//! validates the stream first and only then plans the insert, so a null key,
-//! an in-batch duplicate, or a parse error is the error the caller sees.
+//! as `InvalidQuery` before the stream's error is read. The guard still
+//! streams (one batch at a time, like the sink's `mpsc::channel(1)`), records
+//! the first stream or uniqueness error, and prefers that over the sink's
+//! misleading message.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 use crate::keep_first::NanKey;
 use arrow::{
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    datatypes::{Schema, SchemaRef},
     record_batch::RecordBatch,
 };
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
     common::{Constraint, Constraints},
-    datasource::{TableProvider, memory::MemorySourceConfig, source::DataSourceExec},
+    datasource::TableProvider,
     error::DataFusionError,
-    execution::{
-        SessionState, TaskContext,
-        memory_pool::{MemoryConsumer, MemoryReservation},
-    },
+    execution::TaskContext,
     logical_expr::dml::InsertOp,
-    physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
-        Partitioning, PlanProperties, SendableRecordBatchStream,
+        PlanProperties, SendableRecordBatchStream,
         coalesce_partitions::CoalescePartitionsExec,
         stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter},
     },
     scalar::ScalarValue,
 };
 use datafusion_table_providers::util::constraints::Error as ConstraintError;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
 
-/// How the guard feeds a validated write to the engine beneath.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuardStrategy {
-    /// Validate each batch as it flows into the engine (`DuckDB` reports a
-    /// stream error as itself).
-    Stream,
-    /// Drain and validate the write, then insert the kept batches (`SQLite`
-    /// otherwise mis-reports a failed stream as `Query is not read-only`).
-    CollectThenInsert,
-}
+/// The first error the guard stream saw. `SQLite`'s sink may replace it with
+/// `Query is not read-only` (#14757); [`PreferGuardErrorExec`] puts it back.
+type GuardErrorSlot = Arc<Mutex<Option<String>>>;
 
 /// Layers [`PkWriteGuard`] over `provider` when `constraints` name a primary
 /// key. `nan` is how the engine below stores a NaN in a key column.
@@ -84,7 +77,6 @@ pub fn wrap_with_pk_write_guard_if_needed(
     provider: Arc<dyn TableProvider>,
     schema: &Schema,
     constraints: &Constraints,
-    strategy: GuardStrategy,
     nan: NanKey,
     rewrite_dataset: Option<String>,
 ) -> Arc<dyn TableProvider> {
@@ -92,14 +84,7 @@ pub fn wrap_with_pk_write_guard_if_needed(
     let provider = if key_sets.is_empty() {
         provider
     } else {
-        SpiceTable::over(
-            Arc::new(PkWriteGuard {
-                key_sets,
-                strategy,
-                nan,
-            }),
-            provider,
-        )
+        SpiceTable::over(Arc::new(PkWriteGuard { key_sets, nan }), provider)
     };
     wrap_with_internal_name_rewrite(provider, rewrite_dataset)
 }
@@ -209,44 +194,30 @@ fn uniqueness_error(schema: &Schema, indices: &[usize]) -> DataFusionError {
     ))
 }
 
-fn session_state(state: &dyn Session) -> datafusion::error::Result<SessionState> {
-    state
-        .as_any()
-        .downcast_ref::<SessionState>()
-        .cloned()
-        .ok_or_else(|| {
-            DataFusionError::Internal(
-                "a primary-key write guard requires a DataFusion session state".to_string(),
-            )
-        })
+fn remember_guard_error(slot: &GuardErrorSlot, error: &DataFusionError) {
+    let mut stored = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if stored.is_none() {
+        *stored = Some(error.to_string());
+    }
 }
 
-fn count_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new(
-        "count",
-        DataType::UInt64,
-        false,
-    )]))
-}
-
-fn memory_input(
-    schema: SchemaRef,
-    batches: Vec<RecordBatch>,
-) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-    let partitions = if batches.is_empty() {
-        vec![vec![]]
-    } else {
-        vec![batches]
-    };
-    let source = MemorySourceConfig::try_new(&partitions, schema, None)?;
-    Ok(Arc::new(DataSourceExec::new(Arc::new(source))))
+fn prefer_stored_guard_error(slot: &GuardErrorSlot, sink: DataFusionError) -> DataFusionError {
+    let stored = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    match stored {
+        Some(message) => DataFusionError::Execution(message),
+        None => sink,
+    }
 }
 
 /// Validates primary-key columns on a write; see the module docs.
 #[derive(Debug)]
 pub struct PkWriteGuard {
     key_sets: Vec<Vec<String>>,
-    strategy: GuardStrategy,
     nan: NanKey,
 }
 
@@ -276,20 +247,11 @@ impl TableLayer for PkWriteGuard {
         op: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let key_indices = key_indices(input.schema().as_ref(), &self.key_sets)?;
-        match self.strategy {
-            GuardStrategy::Stream => {
-                let exec = PkWriteGuardExec::new(input, Arc::clone(&key_indices), self.nan);
-                below.insert_into(state, Arc::new(exec), op).await
-            }
-            GuardStrategy::CollectThenInsert => Ok(Arc::new(PkCollectThenInsertExec::new(
-                input,
-                Arc::clone(below),
-                session_state(state)?,
-                op,
-                key_indices,
-                self.nan,
-            ))),
-        }
+        let slot: GuardErrorSlot = Arc::new(Mutex::new(None));
+        let exec =
+            PkWriteGuardExec::new(input, Arc::clone(&key_indices), self.nan, Arc::clone(&slot));
+        let plan = below.insert_into(state, Arc::new(exec), op).await?;
+        Ok(Arc::new(PreferGuardErrorExec::new(plan, slot)))
     }
 }
 
@@ -379,11 +341,17 @@ struct PkWriteGuardExec {
     input: Arc<dyn ExecutionPlan>,
     key_indices: Arc<[Vec<usize>]>,
     nan: NanKey,
+    slot: GuardErrorSlot,
     properties: Arc<PlanProperties>,
 }
 
 impl PkWriteGuardExec {
-    fn new(input: Arc<dyn ExecutionPlan>, key_indices: Arc<[Vec<usize>]>, nan: NanKey) -> Self {
+    fn new(
+        input: Arc<dyn ExecutionPlan>,
+        key_indices: Arc<[Vec<usize>]>,
+        nan: NanKey,
+        slot: GuardErrorSlot,
+    ) -> Self {
         let input = if input.output_partitioning().partition_count() > 1 {
             Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
         } else {
@@ -394,6 +362,7 @@ impl PkWriteGuardExec {
             input,
             key_indices,
             nan,
+            slot,
         }
     }
 }
@@ -452,6 +421,7 @@ impl ExecutionPlan for PkWriteGuardExec {
             child,
             Arc::clone(&self.key_indices),
             self.nan,
+            Arc::clone(&self.slot),
         )))
     }
 
@@ -463,12 +433,22 @@ impl ExecutionPlan for PkWriteGuardExec {
         let mut input = self.input.execute(partition, context)?;
         let schema = self.schema();
         let mut seen = SeenKeys::new(&self.key_indices, self.nan);
-        let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&schema), 2);
+        let slot = Arc::clone(&self.slot);
+        let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&schema), 1);
         let tx = builder.tx();
         builder.spawn(async move {
-            while let Some(batch) = input.next().await {
-                let batch = batch?;
-                seen.admit(&batch)?;
+            while let Some(item) = input.next().await {
+                let batch = match item {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        remember_guard_error(&slot, &error);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = seen.admit(&batch) {
+                    remember_guard_error(&slot, &error);
+                    return Err(error);
+                }
                 if tx.send(Ok(batch)).await.is_err() {
                     break;
                 }
@@ -479,64 +459,38 @@ impl ExecutionPlan for PkWriteGuardExec {
     }
 }
 
-/// Drains the input, validates it, then inserts into `below` so `SQLite` never
-/// sees a failed stream.
+/// Prefers the guard stream's first error over a sink that reports
+/// `Query is not read-only` after that stream failed (#14757).
 #[derive(Debug)]
-struct PkCollectThenInsertExec {
+struct PreferGuardErrorExec {
     input: Arc<dyn ExecutionPlan>,
-    below: Arc<dyn TableProvider>,
-    session: SessionState,
-    op: InsertOp,
-    key_indices: Arc<[Vec<usize>]>,
-    nan: NanKey,
+    slot: GuardErrorSlot,
     properties: Arc<PlanProperties>,
 }
 
-impl PkCollectThenInsertExec {
-    fn new(
-        input: Arc<dyn ExecutionPlan>,
-        below: Arc<dyn TableProvider>,
-        session: SessionState,
-        op: InsertOp,
-        key_indices: Arc<[Vec<usize>]>,
-        nan: NanKey,
-    ) -> Self {
-        let input = if input.output_partitioning().partition_count() > 1 {
-            Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
-        } else {
-            input
-        };
-        let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(count_schema()),
-            Partitioning::UnknownPartitioning(1),
-            input.pipeline_behavior(),
-            input.boundedness(),
-        ));
+impl PreferGuardErrorExec {
+    fn new(input: Arc<dyn ExecutionPlan>, slot: GuardErrorSlot) -> Self {
         Self {
+            properties: Arc::clone(input.properties()),
             input,
-            below,
-            session,
-            op,
-            key_indices,
-            nan,
-            properties,
+            slot,
         }
     }
 }
 
-impl DisplayAs for PkCollectThenInsertExec {
+impl DisplayAs for PreferGuardErrorExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "PkCollectThenInsertExec")
+        write!(f, "PreferGuardErrorExec")
     }
 }
 
-impl ExecutionPlan for PkCollectThenInsertExec {
+impl ExecutionPlan for PreferGuardErrorExec {
     fn name(&self) -> &'static str {
-        "PkCollectThenInsertExec"
+        "PreferGuardErrorExec"
     }
 
     fn schema(&self) -> SchemaRef {
-        count_schema()
+        self.input.schema()
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -547,7 +501,7 @@ impl ExecutionPlan for PkCollectThenInsertExec {
         vec![&self.input]
     }
 
-    /// The key columns are held as indices, not physical expressions.
+    /// This node rewrites errors; it holds no physical expressions.
     fn apply_expressions(
         &self,
         _f: &mut dyn FnMut(
@@ -559,71 +513,31 @@ impl ExecutionPlan for PkCollectThenInsertExec {
         Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
-    }
-
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let [child] = <[_; 1]>::try_from(children).map_err(|_| {
-            DataFusionError::Internal(
-                "PkCollectThenInsertExec requires exactly one child".to_string(),
-            )
+            DataFusionError::Internal("PreferGuardErrorExec requires exactly one child".to_string())
         })?;
-        Ok(Arc::new(Self::new(
-            child,
-            Arc::clone(&self.below),
-            self.session.clone(),
-            self.op,
-            Arc::clone(&self.key_indices),
-            self.nan,
-        )))
+        Ok(Arc::new(Self::new(child, Arc::clone(&self.slot))))
     }
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        let input = Arc::clone(&self.input);
-        let below = Arc::clone(&self.below);
-        let session = self.session.clone();
-        let op = self.op;
-        let key_indices = Arc::clone(&self.key_indices);
-        let nan = self.nan;
-        let schema = input.schema();
-        let stream = futures::stream::once(async move {
-            let mut reservation =
-                MemoryConsumer::new("PkCollectThenInsertExec").register(context.memory_pool());
-            let mut input = input.execute(0, Arc::clone(&context))?;
-            let mut batches = Vec::new();
-            let mut seen = SeenKeys::new(&key_indices, nan);
-            while let Some(batch) = input.next().await {
-                let batch = batch?;
-                seen.admit(&batch)?;
-                grow_reservation(&mut reservation, &batch)?;
-                batches.push(batch);
-            }
-            let write = below
-                .insert_into(&session, memory_input(schema, batches)?, op)
-                .await?;
-            write.execute(0, context)
-        })
-        .try_flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            count_schema(),
-            stream,
-        )))
+        let schema = self.schema();
+        let slot = Arc::clone(&self.slot);
+        let stream = match self.input.execute(partition, context) {
+            Ok(stream) => stream,
+            Err(error) => return Err(prefer_stored_guard_error(&slot, error)),
+        };
+        let stream =
+            stream.map(move |item| item.map_err(|error| prefer_stored_guard_error(&slot, error)));
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
-}
-
-fn grow_reservation(
-    reservation: &mut MemoryReservation,
-    batch: &RecordBatch,
-) -> datafusion::error::Result<()> {
-    reservation.try_grow(batch.get_array_memory_size())
 }
 
 /// Maps `DuckDB` `__data_<dataset>_<n>` names in write errors back to `dataset`.
@@ -657,7 +571,10 @@ impl TableLayer for RewriteInternalTableNames {
         input: Arc<dyn ExecutionPlan>,
         op: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let plan = below.insert_into(state, input, op).await?;
+        let plan = below
+            .insert_into(state, input, op)
+            .await
+            .map_err(|error| rewrite_internal_data_table_error(error, &self.dataset))?;
         Ok(Arc::new(RewriteInternalTableNamesExec::new(
             plan,
             self.dataset.clone(),
@@ -747,18 +664,21 @@ impl ExecutionPlan for RewriteInternalTableNamesExec {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardStrategy, SeenKeys, is_null_key, null_primary_key_message,
-        rewrite_internal_data_table_names, wrap_with_pk_write_guard_if_needed,
+        SeenKeys, is_null_key, null_primary_key_message, rewrite_internal_data_table_names,
+        wrap_with_internal_name_rewrite, wrap_with_pk_write_guard_if_needed,
     };
     use crate::keep_first::NanKey;
     use arrow::array::{Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use async_trait::async_trait;
     use datafusion::catalog::MemTable;
     use datafusion::common::{Constraint, Constraints};
     use datafusion::datasource::TableProvider;
+    use datafusion::logical_expr::dml::InsertOp;
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::scalar::ScalarValue;
-    use spice_table::{LayerWalk, find_layer};
+    use spice_table::{LayerWalk, SpiceTable, TableLayer, find_layer};
     use std::sync::Arc;
 
     fn schema() -> Arc<Schema> {
@@ -929,7 +849,6 @@ mod tests {
             Arc::clone(&inner),
             &schema(),
             &pk(),
-            GuardStrategy::Stream,
             NanKey::Value,
             None,
         );
@@ -939,7 +858,6 @@ mod tests {
             inner,
             &schema(),
             &Constraints::new_unverified(vec![]),
-            GuardStrategy::Stream,
             NanKey::Value,
             None,
         );
@@ -954,7 +872,6 @@ mod tests {
             inner,
             &schema(),
             &Constraints::new_unverified(vec![]),
-            GuardStrategy::Stream,
             NanKey::Value,
             Some("o_duckdb".to_string()),
         );
@@ -962,6 +879,98 @@ mod tests {
         assert!(
             find_layer::<super::RewriteInternalTableNames>(wrapped.as_ref(), LayerWalk::Write)
                 .is_some()
+        );
+    }
+
+    #[derive(Debug)]
+    struct FailAtPlanTime;
+
+    #[async_trait]
+    impl TableLayer for FailAtPlanTime {
+        fn route<'a>(
+            &'a self,
+            walk: LayerWalk,
+            below: &'a Arc<dyn TableProvider>,
+        ) -> Option<&'a Arc<dyn TableProvider>> {
+            match walk {
+                LayerWalk::Read
+                | LayerWalk::CdcDetection
+                | LayerWalk::Source
+                | LayerWalk::RetentionDelete
+                | LayerWalk::Index
+                | LayerWalk::Passthrough => Some(below),
+                LayerWalk::Write => None,
+            }
+        }
+
+        async fn insert_into(
+            &self,
+            _below: &Arc<dyn TableProvider>,
+            _state: &dyn datafusion::catalog::Session,
+            _input: Arc<dyn ExecutionPlan>,
+            _op: InsertOp,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            Err(datafusion::error::DataFusionError::Execution(
+                "Constraint Error: NOT NULL constraint failed: __data_o_duckdb_1730000000000.id"
+                    .to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrite_maps_a_plan_time_insert_into_error() {
+        use datafusion::prelude::SessionContext;
+        use datafusion_table_providers::util::test::MockExec;
+
+        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"))
+            as Arc<dyn TableProvider>;
+        let leaking = SpiceTable::over(Arc::new(FailAtPlanTime), inner);
+        let wrapped = wrap_with_internal_name_rewrite(leaking, Some("o_duckdb".to_string()));
+        let ctx = SessionContext::new();
+        let input = Arc::new(MockExec::new(vec![Ok(batch(&[(Some(1), "a")]))], schema()));
+        let error = wrapped
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .expect_err("a plan-time DuckDB name must be rewritten");
+        let message = error.to_string();
+        assert!(
+            !message.contains("__data_"),
+            "plan-time rewrite must hide the internal table, got: {message}"
+        );
+        assert!(
+            message.contains("o_duckdb.id"),
+            "plan-time rewrite must name the user dataset, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefer_guard_error_over_query_is_not_read_only() {
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+        use datafusion_table_providers::util::test::MockExec;
+        use std::sync::Mutex;
+
+        let slot = Arc::new(Mutex::new(Some(
+            "Incoming data violates uniqueness constraint on column(s): id".to_string(),
+        )));
+        let input = Arc::new(MockExec::new(
+            vec![Err(datafusion::error::DataFusionError::Execution(
+                "Query is not read-only".to_string(),
+            ))],
+            schema(),
+        ));
+        let exec = super::PreferGuardErrorExec::new(input, slot);
+        let error = collect(Arc::new(exec), SessionContext::new().task_ctx())
+            .await
+            .expect_err("the sink's read-only message must yield to the guard");
+        let message = error.to_string();
+        assert!(
+            message.contains("uniqueness"),
+            "the guard error must be reported, got: {message}"
+        );
+        assert!(
+            !message.contains("Query is not read-only"),
+            "the sink's mis-report must not win, got: {message}"
         );
     }
 }
