@@ -1157,6 +1157,76 @@ impl CayenneCatalog {
     ///
     /// # Errors
     ///
+    /// In-transaction body of [`MetadataCatalog::commit_cold_promotion`].
+    ///
+    /// The sequence-fenced compaction commit does the snapshot compare-and-swap,
+    /// the bounded delete-file / insert-record clear and the folded protected
+    /// snapshots' sequence rows; the rest clears what describes the replaced warm
+    /// content and swaps the cold manifest.
+    async fn commit_cold_promotion_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+        cutoff: i64,
+        folded_protected_snapshot_ids: &[String],
+        cold_files: &[ColdTierFile],
+    ) -> CatalogResult<()> {
+        self.commit_compaction_fenced_in_txn(
+            txn,
+            table_id,
+            replaced_snapshot_id,
+            new_snapshot_id,
+            cutoff,
+            folded_protected_snapshot_ids,
+        )
+        .await?;
+        let table_id_literal = sql_text_literal(table_id);
+        let batch_sql = format!(
+            "DELETE FROM cayenne_table_statistics WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_pk_index WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_cold_tier_file WHERE table_id = {table_id_literal};"
+        );
+        txn.execute_batch(&batch_sql).await.map_err(|e| {
+            CatalogError::FailedToSetCurrentSnapshot {
+                source: Box::new(e),
+            }
+        })?;
+        Self::insert_cold_tier_files_in_txn(txn, cold_files).await
+    }
+
+    /// Register `cold_files` in the cold manifest. One statement per file rather
+    /// than `execute_many`: each row carries a statistics blob and a primary-key
+    /// bloom of up to `COLD_PK_BLOOM_PER_FILE_MAX_BYTES`, so binding them all at
+    /// once would hold a second copy of every bloom for the whole write
+    /// transaction, while a round trip per file is noise beside writing its blobs.
+    async fn insert_cold_tier_files_in_txn(
+        txn: &mut dyn MetastoreTransaction,
+        cold_files: &[ColdTierFile],
+    ) -> CatalogResult<()> {
+        for f in cold_files {
+            txn.execute(ExecuteParams {
+                sql: COLD_TIER_FILE_UPSERT_SQL,
+                params: vec![
+                    MetastoreValue::Text(f.table_id.clone()),
+                    MetastoreValue::Text(f.file_url.clone()),
+                    MetastoreValue::Integer(f.row_count),
+                    MetastoreValue::Integer(f.file_size_bytes),
+                    MetastoreValue::Integer(f.min_sequence),
+                    MetastoreValue::Integer(f.max_sequence),
+                    MetastoreValue::Blob(f.statistics_blob.clone()),
+                    f.pk_bloom
+                        .clone()
+                        .map_or(MetastoreValue::Null, MetastoreValue::Blob),
+                ],
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     /// In-transaction body of [`MetadataCatalog::commit_overwrite_to_cold`]: the
     /// cold-tier graduation's per-attempt work, factored out so the retry loop
     /// mirrors [`Self::commit_overwrite`]. In one transaction it (a) runs the
@@ -1190,30 +1260,7 @@ impl CayenneCatalog {
         // tier's inline corpus along with everything else keyed on the old snapshot.
         self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None, &[])
             .await?;
-        // One statement per file rather than `execute_many`: each row carries
-        // a statistics blob and a primary-key bloom of up to
-        // `COLD_PK_BLOOM_PER_FILE_MAX_BYTES`, so binding them all at once would
-        // hold a second copy of every bloom for the whole write transaction,
-        // while a round trip per file is noise beside writing its blobs.
-        for f in cold_files {
-            txn.execute(ExecuteParams {
-                sql: COLD_TIER_FILE_UPSERT_SQL,
-                params: vec![
-                    MetastoreValue::Text(f.table_id.clone()),
-                    MetastoreValue::Text(f.file_url.clone()),
-                    MetastoreValue::Integer(f.row_count),
-                    MetastoreValue::Integer(f.file_size_bytes),
-                    MetastoreValue::Integer(f.min_sequence),
-                    MetastoreValue::Integer(f.max_sequence),
-                    MetastoreValue::Blob(f.statistics_blob.clone()),
-                    f.pk_bloom
-                        .clone()
-                        .map_or(MetastoreValue::Null, MetastoreValue::Blob),
-                ],
-            })
-            .await?;
-        }
-        Ok(())
+        Self::insert_cold_tier_files_in_txn(txn, cold_files).await
     }
 
     /// # Errors
@@ -4444,6 +4491,90 @@ impl MetadataCatalog for CayenneCatalog {
         Err(CatalogError::InvalidOperationNoSource {
             message: format!(
                 "commit_overwrite_to_cold exhausted {max_attempts} attempts without success or a terminal error"
+            ),
+        })
+    }
+
+    async fn commit_cold_promotion(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+        cutoff: i64,
+        folded_protected_snapshot_ids: &[String],
+        cold_files: &[ColdTierFile],
+    ) -> CatalogResult<()> {
+        // Same retry-on-conflict envelope as `commit_overwrite_to_cold`. A lost
+        // snapshot or protected-snapshot compare-and-swap is terminal: the caller
+        // discards its output and promotes again from the table's new state.
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        if max_attempts == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "commit_cold_promotion requires at least one attempt".to_string(),
+            });
+        }
+
+        for attempt in 1..=max_attempts {
+            let mut tx =
+                self.begin_transaction()
+                    .await
+                    .map_err(|e| CatalogError::InvalidOperation {
+                        message: "Failed to begin the datalake data-move transaction.".to_string(),
+                        source: Box::new(e),
+                    })?;
+
+            match self
+                .commit_cold_promotion_in_txn(
+                    &mut *tx,
+                    table_id,
+                    replaced_snapshot_id,
+                    new_snapshot_id,
+                    cutoff,
+                    folded_protected_snapshot_ids,
+                    cold_files,
+                )
+                .await
+            {
+                Ok(()) => match tx.commit().await {
+                    Ok(()) => return Ok(()),
+                    Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                        let delay = retry_backoff_delay(attempt);
+                        tracing::debug!(
+                            attempt,
+                            max_attempts,
+                            ?delay,
+                            "Retrying the datalake data-move transaction after commit conflict"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => {
+                        return Err(CatalogError::InvalidOperation {
+                            message: "Failed to commit the datalake data-move transaction."
+                                .to_string(),
+                            source: Box::new(e),
+                        });
+                    }
+                },
+                Err(e) if is_retryable_write_conflict(&e) => {
+                    if !end_conflicted_attempt(
+                        tx,
+                        attempt,
+                        max_attempts,
+                        "commit datalake data move",
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
+                }
+                // Drop `tx` → automatic rollback; leaves the catalog unchanged.
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "commit_cold_promotion exhausted {max_attempts} attempts without success or a terminal error"
             ),
         })
     }
