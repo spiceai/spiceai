@@ -1148,6 +1148,7 @@ mod tests {
 
     fn plan_csv_file_etags(plan: &dyn ExecutionPlan) -> Vec<Option<String>> {
         use data_components::csv_header_projection::HeaderProjectedCsvSource;
+        use datafusion_datasource::file_groups::FileGroup;
         use datafusion_datasource::source::DataSourceExec;
 
         if let Some(exec) = plan.downcast_ref::<DataSourceExec>()
@@ -1156,7 +1157,7 @@ mod tests {
             return conf
                 .file_groups
                 .iter()
-                .flat_map(|group| group.files())
+                .flat_map(FileGroup::files)
                 .map(|file| file.object_meta.e_tag.clone())
                 .collect();
         }
