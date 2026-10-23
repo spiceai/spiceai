@@ -1859,6 +1859,18 @@
       "may-pass": true
     }
   ],
+  "mysql-cdc-shared-binlog": [
+    {
+      "run": "mysql-cdc-shared-binlog[engine=cayenne]",
+      "who": "restart",
+      "key": "query: SELECT * FROM a #3",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cdc-mysql",
+      "may-pass": true
+    }
+  ],
   "mysql-literals": [
     {
       "run": "mysql-literals",
