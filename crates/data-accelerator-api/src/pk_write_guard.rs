@@ -143,14 +143,21 @@ pub fn rewrite_internal_data_table_names(message: &str, dataset: &str) -> String
 }
 
 /// Rewrites `error`'s display text when it leaks a `__data_<dataset>_*` name.
+/// Keeps the retry marker: a refresh that already classified the write as
+/// retriable must not become permanent just because the table name changed.
 #[must_use]
 pub fn rewrite_internal_data_table_error(error: DataFusionError, dataset: &str) -> DataFusionError {
     let message = error.to_string();
     let rewritten = rewrite_internal_data_table_names(&message, dataset);
     if rewritten == message {
-        error
+        return error;
+    }
+    let retriable = is_retriable_error(&error);
+    let error = DataFusionError::Execution(rewritten);
+    if retriable {
+        check_and_mark_retriable_error(error)
     } else {
-        DataFusionError::Execution(rewritten)
+        error
     }
 }
 
@@ -242,7 +249,14 @@ fn restore_guard_error(snapshot: &GuardErrorSnapshot) -> DataFusionError {
     }
 }
 
+fn sink_is_sqlite_closed_channel_lie(error: &DataFusionError) -> bool {
+    error.to_string().contains("Query is not read-only")
+}
+
 fn prefer_stored_guard_error(slot: &GuardErrorSlot, sink: DataFusionError) -> DataFusionError {
+    if !sink_is_sqlite_closed_channel_lie(&sink) {
+        return sink;
+    }
     let stored = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -701,8 +715,9 @@ impl ExecutionPlan for RewriteInternalTableNamesExec {
 #[cfg(test)]
 mod tests {
     use super::{
-        SeenKeys, is_null_key, null_primary_key_message, rewrite_internal_data_table_names,
-        wrap_with_internal_name_rewrite, wrap_with_pk_write_guard_if_needed,
+        SeenKeys, is_null_key, null_primary_key_message, rewrite_internal_data_table_error,
+        rewrite_internal_data_table_names, wrap_with_internal_name_rewrite,
+        wrap_with_pk_write_guard_if_needed,
     };
     use crate::keep_first::NanKey;
     use arrow::array::{Float64Array, Int64Array, StringArray};
@@ -760,6 +775,35 @@ mod tests {
         assert_eq!(
             rewrite_internal_data_table_names(message, "o_duckdb"),
             message
+        );
+    }
+
+    #[test]
+    fn rewrite_keeps_a_retriable_error_retriable() {
+        use datafusion_table_providers::util::retriable_error::{
+            check_and_mark_retriable_error, is_retriable_error,
+        };
+
+        let marked = check_and_mark_retriable_error(datafusion::error::DataFusionError::Execution(
+            "failed to write __data_o_duckdb_1730000000000: connection reset by peer".to_string(),
+        ));
+        assert!(
+            is_retriable_error(&marked),
+            "the fixture must start retriable"
+        );
+        let rewritten = rewrite_internal_data_table_error(marked, "o_duckdb");
+        assert!(
+            is_retriable_error(&rewritten),
+            "rewriting a leaked table name must not drop the retry marker, got: {rewritten}"
+        );
+        let message = rewritten.to_string();
+        assert!(
+            !message.contains("__data_"),
+            "the rewrite must hide the internal table, got: {message}"
+        );
+        assert!(
+            message.contains("o_duckdb"),
+            "the rewrite must name the dataset, got: {message}"
         );
     }
 
@@ -1151,6 +1195,43 @@ mod tests {
         assert!(
             !message.contains("Query is not read-only"),
             "the sink's mis-report must not win, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefer_guard_error_keeps_an_independent_sink_storage_error() {
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+        use datafusion_table_providers::util::retriable_error::is_retriable_error;
+        use datafusion_table_providers::util::test::MockExec;
+        use std::sync::Mutex;
+
+        let unmarked =
+            datafusion::error::DataFusionError::Execution("connection reset by peer".to_string());
+        let slot = Arc::new(Mutex::new(None));
+        let _ = super::remember_input_stream_error(&slot, unmarked);
+        let input = Arc::new(MockExec::new(
+            vec![Err(datafusion::error::DataFusionError::Execution(
+                "database or disk is full".to_string(),
+            ))],
+            schema(),
+        ));
+        let exec = super::PreferGuardErrorExec::new(input, slot);
+        let error = collect(Arc::new(exec), SessionContext::new().task_ctx())
+            .await
+            .expect_err("an independent sink storage error must still fail the write");
+        let message = error.to_string();
+        assert!(
+            message.contains("database or disk is full"),
+            "an independent storage failure must be reported, got: {message}"
+        );
+        assert!(
+            !message.contains("connection reset by peer"),
+            "a later input-stream error must not replace an independent sink failure, got: {message}"
+        );
+        assert!(
+            !is_retriable_error(&error),
+            "an unmarked storage failure must stay unmarked, got: {error}"
         );
     }
 }
