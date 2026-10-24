@@ -34,8 +34,9 @@ integer `/`, and the `EXPLAIN` guard are required there.
 Needs a `spiced` with the `duckdb` (and optionally `sqlite`) feature, `curl`,
 and `python3` with `pyarrow` (`pip install 'numpy>=2' pyarrow`). The script
 starts `spiced` unless `REUSE=1`, writes each `/v1/sql` body under `WORKDIR`,
-and exits non-zero when `t_duckdb` disagrees with `t_fed` or `EXPLAIN`
-still pushes decimal `/` as `//`.
+and exits non-zero when `t_duckdb` disagrees with `t_fed`, `t_sqlite`
+`price/7` or integer `/` is wrong, or `EXPLAIN` still pushes decimal `/`
+as `//`. A launched `spiced` is killed on `EXIT` unless `KEEP=1`.
 
 ```bash
 # from the repo root; writes a workdir under /tmp
