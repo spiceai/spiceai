@@ -493,8 +493,8 @@ async fn a_model_dropped_under_a_stalled_stream_stops_promptly() {
     // loads a model per test and runs them at once, and on a contended runner the buffer has
     // held 48 chunks 3 s after the first. So an attempt whose buffer was not yet full is run
     // again with twice the wait, until one shows the decode thread blocked on a full buffer.
-    let mut wait = std::time::Duration::from_secs(3);
-    loop {
+    let mut last = 0;
+    for wait in [3, 6, 12, 24, 48].map(std::time::Duration::from_secs) {
         let model = qwen3().await;
         let mut stream = model
             .chat_stream(request(json!({
@@ -527,12 +527,9 @@ async fn a_model_dropped_under_a_stalled_stream_stops_promptly() {
         if buffered >= 64 {
             return;
         }
-        assert!(
-            wait < std::time::Duration::from_secs(48),
-            "the buffer held {buffered} chunks {wait:?} after the first, so it never filled"
-        );
-        wait *= 2;
+        last = buffered;
     }
+    panic!("the buffer held {last} chunks 48 s after the first, so it never filled");
 }
 
 /// `frequency_penalty` and `presence_penalty` reach the sampler: at temperature 0, a reply
