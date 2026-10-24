@@ -147,17 +147,27 @@ def raw(name: str) -> str:
     return text
 
 
+# json.loads("null") is None. Distinguish that from a decode failure so a
+# null body cannot skip later exact-row checks.
+_DECODE_FAILED = object()
+EXPECTED_HALF = [{"half": 3}]
+EXPECTED_SQLITE_PRICE = [{"id": 1, "p7": 0.014285}]
+
+
 def parse_json(name: str, text: str):
     try:
         return json.loads(text)
     except json.JSONDecodeError as err:
         failed.append(f"{name} is not JSON (SQL error?): {err}: {text}")
-        return None
+        return _DECODE_FAILED
 
 
 def require_rows(name: str, text: str):
     data = parse_json(name, text)
+    if data is _DECODE_FAILED:
+        return None
     if data is None:
+        failed.append(f"{name} is JSON null: {text}")
         return None
     if isinstance(data, dict) and ("error" in data or "message" in data):
         failed.append(f"{name} is an error object: {text}")
@@ -178,12 +188,13 @@ def has_rounded_price(text: str) -> bool:
     return "0.014286" in compact
 
 
-def require_half_3(name: str, text: str) -> None:
+def require_exact_rows(name: str, text: str, expected: list, what: str) -> None:
     rows = require_rows(name, text)
     if rows is None:
         return
-    if rows != [{"half": 3}]:
-        failed.append(f"{name} integer n/2 was not exactly [{{\"half\":3}}]: {text}")
+    if rows != expected:
+        compact = json.dumps(expected, separators=(",", ":"))
+        failed.append(f"{name} {what} was not exactly {compact}: {text}")
 
 
 def plans_from_explain(text: str) -> str:
@@ -233,9 +244,9 @@ explain_int_sqlite = raw("explain_int_sqlite")
 require_rows("t_fed", fed)
 require_rows("t_duckdb", duck)
 require_rows("t_sqlite", sqlite)
-sqlite_price_rows = require_rows("t_sqlite_price", sqlite_price)
-require_half_3("t_duckdb_int", half)
-require_half_3("t_sqlite_int", sqlite_half)
+require_exact_rows("t_sqlite_price", sqlite_price, EXPECTED_SQLITE_PRICE, "price/7")
+require_exact_rows("t_duckdb_int", half, EXPECTED_HALF, "integer n/2")
+require_exact_rows("t_sqlite_int", sqlite_half, EXPECTED_HALF, "integer n/2")
 
 if duck != fed:
     failed.append(f"t_duckdb != t_fed\n  fed={fed}\n  duck={duck}")
@@ -260,18 +271,9 @@ int_sql = require_base_sql("explain_int", explain_int)
 if int_sql is not None and "//" not in int_sql:
     failed.append(f"integer EXPLAIN lost //: {int_sql}")
 
-# SQLite price/7: the dedicated id=1 query, and p7 in the full-row body.
-# Never require amt/3 digits here (lossy storage, #14662).
-if sqlite_price_rows is not None:
-    if not has_truncating_price(sqlite_price) or has_rounded_price(sqlite_price):
-        failed.append(
-            f"SQLite price/7 must truncate (0.014285, not 0.014286): {sqlite_price}"
-        )
-    p7_values = [
-        row.get("p7") for row in sqlite_price_rows if isinstance(row, dict) and "p7" in row
-    ]
-    if not p7_values:
-        failed.append(f"SQLite price/7 response has no p7 field: {sqlite_price}")
+# Dedicated SQLite price/7 is compared to the exact parsed row above, so
+# -0.014285 and untruncated 0.014285714285714286 fail. Still reject a
+# rounded p7 in the full-row body. Never require amt/3 (#14662).
 if has_rounded_price(sqlite):
     failed.append(f"SQLite full-row price/7 rounded instead of truncating: {sqlite}")
 
