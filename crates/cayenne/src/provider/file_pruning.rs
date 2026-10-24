@@ -44,6 +44,11 @@ use datafusion_pruning::{FilePruner, build_pruning_predicate};
 use super::column_stats::ColumnStatsAccumulator;
 
 /// Build a physical conjunction from data-column scan filters for file/segment pruning.
+///
+/// # Errors
+///
+/// Returns an error if a filter cannot be planned as a physical expression
+/// against `schema`.
 pub fn build_listing_pruning_predicate(
     schema: &SchemaRef,
     filters: &[Expr],

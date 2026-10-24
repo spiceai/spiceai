@@ -96,7 +96,7 @@ fn bench(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("segment_statistics_pruning");
     for containers in [10_usize, 50, 170, 500] {
-        let mut seed = 0x5eed_0000_0000_0001_u64 ^ containers as u64;
+        let mut seed = 0x5eed_0000_0000_0001_u64 ^ u64::try_from(containers).unwrap_or(0);
         let stats: Vec<Arc<Statistics>> = (0..containers)
             .map(|_| container(&schema, &mut seed))
             .collect();
