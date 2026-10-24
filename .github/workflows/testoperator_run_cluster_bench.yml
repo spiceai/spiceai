@@ -166,6 +166,9 @@ permissions:
   contents: write
   packages: read
   pull-requests: write
+  # `actions: write` approves the PR's held pull_request runs
+  # (.github/scripts/approve_bot_pr_runs.sh).
+  actions: write
 
 # Centralized defaults so workflow_dispatch runs have one fallback chain.
 # Defaults exercise the public-S3 TPC-H Ballista distributed-query path
@@ -506,6 +509,8 @@ jobs:
           PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq '.[].url')"
           if [ -n "${PR_URL}" ]; then
             echo "PR already exists -> ${PR_URL}"
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
+            bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
             exit 0
           fi
 
@@ -603,3 +608,4 @@ jobs:
             --base "${{ github.ref_name }}" \
             --head "${BRANCH_NAME}" \
             --label area/ci
+          bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"

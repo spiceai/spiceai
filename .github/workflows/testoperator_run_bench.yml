@@ -765,7 +765,6 @@ jobs:
             PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
             if [[ -n "${PR_URL}" ]]; then
               echo "PR already exists -> ${PR_URL}"
-              exit 0
             else
               BODY=$(cat <<EOF
           Automated benchmark snapshot update from workflow run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
@@ -784,6 +783,8 @@ jobs:
                 gh pr merge --squash --auto ${BRANCH_NAME}
               fi
             fi
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
+            bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
