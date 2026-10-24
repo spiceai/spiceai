@@ -31,7 +31,7 @@ use std::sync::{Arc, LazyLock, Weak};
 use parking_lot::Mutex;
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 
-use datafusion::arrow::array::{Array, AsArray, UInt32Array};
+use datafusion::arrow::array::{Array, ArrayData, AsArray, UInt32Array};
 use datafusion::arrow::compute::{concat_batches, lexsort_to_indices, take_record_batch};
 use datafusion::arrow::datatypes::{DataType, SchemaRef, i256};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -582,18 +582,57 @@ fn write_run(
     }))
 }
 
-/// What `array` adds to a concatenation's 32-bit offsets: a string or binary
-/// column's value bytes, the whole size of any other type that holds 32-bit
-/// offsets (an upper bound), and nothing for a type without them.
+/// The most a concatenation of `array` adds to any one of its 32-bit offset
+/// buffers: a string or binary column's value bytes, a list's or map's child
+/// elements, and the same of every array nested in it. Nested arrays a parent
+/// slices without its own offsets (a struct's fields, dictionary values) count
+/// whole, an upper bound. Nothing for a type without 32-bit offsets.
 fn offset_bytes(array: &dyn Array) -> usize {
-    let span = |offsets: &[i32]| match (offsets.first(), offsets.last()) {
-        (Some(first), Some(last)) => usize::try_from(last - first).unwrap_or(0),
-        _ => 0,
-    };
     match array.data_type() {
-        DataType::Utf8 => span(array.as_string::<i32>().value_offsets()),
-        DataType::Binary => span(array.as_binary::<i32>().value_offsets()),
-        data_type if has_offsets_i32(data_type) => array.get_array_memory_size(),
+        DataType::Utf8 => offsets_span(array.as_string::<i32>().value_offsets()),
+        DataType::Binary => offsets_span(array.as_binary::<i32>().value_offsets()),
+        data_type if has_offsets_i32(data_type) => data_offset_bytes(&array.to_data()),
+        _ => 0,
+    }
+}
+
+/// [`offset_bytes`] of `data`.
+fn data_offset_bytes(data: &ArrayData) -> usize {
+    match data.data_type() {
+        DataType::Utf8 | DataType::Binary | DataType::List(_) | DataType::Map(..) => {
+            let offsets = data.buffers().first().map_or(&[][..], |buffer| {
+                let all = buffer.typed_data::<i32>();
+                all.get(data.offset()..=data.offset() + data.len())
+                    .unwrap_or(all)
+            });
+            let span = offsets_span(offsets);
+            let (Some(first), Some(child)) = (offsets.first(), data.child_data().first()) else {
+                return span;
+            };
+            let first = usize::try_from(*first).unwrap_or(0);
+            span.max(data_offset_bytes(
+                &child.slice(first, span.min(child.len().saturating_sub(first))),
+            ))
+        }
+        // A list view's offsets and sizes index its whole child.
+        DataType::ListView(_) => data
+            .child_data()
+            .first()
+            .map_or(0, |child| child.len().max(data_offset_bytes(child))),
+        data_type if has_offsets_i32(data_type) => data
+            .child_data()
+            .iter()
+            .map(data_offset_bytes)
+            .max()
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// How far `offsets` span, from the first to the last.
+fn offsets_span(offsets: &[i32]) -> usize {
+    match (offsets.first(), offsets.last()) {
+        (Some(first), Some(last)) => usize::try_from(last - first).unwrap_or(0),
         _ => 0,
     }
 }
@@ -764,6 +803,11 @@ async fn sort_partition_into_runs(
         }};
     }
     while let Some(batch) = stream.next().await.transpose()? {
+        // An empty batch adds nothing to sort, and a chunk of no rows has no key
+        // range.
+        if batch.num_rows() == 0 {
+            continue;
+        }
         let bytes = chunk_charge(
             get_record_batch_memory_size(&batch),
             batch.num_rows(),
@@ -1435,6 +1479,73 @@ mod tests {
         let expected = collect(oracle(source, &columns), Arc::clone(&ctx)).await;
         assert_eq!(actual.num_rows(), 2 * 3 * 50_000);
         assert_eq!(actual, expected);
+    }
+
+    // Regression: an empty batch once became a chunk of no rows, whose key range
+    // read the first row of an empty sort order and panicked.
+    #[tokio::test]
+    async fn empty_batches_before_and_after_a_written_run_are_skipped() {
+        let data = partitions(2, 40_000, 23);
+        let empty = RecordBatch::new_empty(schema());
+        let (first, second) = (data[0][0].clone(), data[0][1].clone());
+        let partitions = vec![
+            vec![empty.clone()],
+            // Each 640 KB batch fills a 256 KiB chunk: the first is written as a
+            // run, and an empty batch follows both it and the batch left in
+            // memory.
+            vec![first, empty.clone(), second, empty],
+        ];
+        let input: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&partitions, schema(), None).expect("memory source");
+        let columns = ["key".to_string(), "payload".to_string()];
+        let ordering =
+            crate::stream_utils::build_lex_ordering(&schema(), &columns).expect("ordering");
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(1024 * 1024 * 1024, 1.0)
+            .build_arc()
+            .expect("runtime");
+        let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+        let config = RunsConfig {
+            max_chunk_bytes: Some(MIN_CHUNK_BYTES),
+            ..RunsConfig::default()
+        };
+        let actual = collect(
+            sort_in_runs_with(Arc::clone(&input), ordering, &ctx, config),
+            Arc::clone(&ctx),
+        )
+        .await;
+        let expected = collect(oracle(input, &columns), Arc::new(TaskContext::default())).await;
+        assert_eq!(actual.num_rows(), 2 * 40_000);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn offset_bytes_counts_what_each_32_bit_offset_level_spans() {
+        use arrow::array::{BooleanArray, ListArray, StringArray};
+        use arrow::buffer::OffsetBuffer;
+        // A list's offsets count child elements, whatever their width: 1,000
+        // booleans take 125 bytes but span 1,000 offsets.
+        let flags = Arc::new(Field::new("item", DataType::Boolean, false));
+        let lists = ListArray::new(
+            Arc::clone(&flags),
+            OffsetBuffer::from_lengths([600, 400]),
+            Arc::new(BooleanArray::from(vec![true; 1_000])),
+            None,
+        );
+        assert_eq!(offset_bytes(&lists), 1_000);
+        assert_eq!(offset_bytes(&lists.slice(1, 1)), 400);
+        // Strings inside a list span their own offsets: 10 elements of 30 bytes.
+        let words = Arc::new(Field::new("item", DataType::Utf8, false));
+        let nested = ListArray::new(
+            words,
+            OffsetBuffer::from_lengths([4, 6]),
+            Arc::new(StringArray::from(vec!["x".repeat(30); 10])),
+            None,
+        );
+        assert_eq!(offset_bytes(&nested), 300);
+        assert_eq!(offset_bytes(&nested.slice(0, 1)), 120);
+        assert_eq!(offset_bytes(&StringArray::from(vec!["ab", "cde"])), 5);
+        assert_eq!(offset_bytes(&Int64Array::from(vec![1, 2, 3])), 0);
     }
 
     /// Six batches of 1,000 rows, each with 8 KB of string payload, keyed by
