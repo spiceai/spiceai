@@ -416,6 +416,32 @@ mod tests {
     }
 
     #[test]
+    fn numbers_that_do_not_fit_int64_are_inferred_as_float() {
+        let item = HashMap::from([
+            ("big".to_string(), av_number("9223372036854775808")),
+            (
+                "mixed_set".to_string(),
+                AttributeValue::Ns(vec!["1".to_string(), "2.5".to_string()]),
+            ),
+        ]);
+
+        let schema =
+            infer_arrow_schema_from_rows(&[item], "2006-01-02T15:04:05Z07:00").expect("schema");
+
+        assert_eq!(
+            schema.field_with_name("big").expect("big").data_type(),
+            &DataType::Float64
+        );
+        assert_eq!(
+            schema
+                .field_with_name("mixed_set")
+                .expect("mixed_set")
+                .data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Float64, true)))
+        );
+    }
+
+    #[test]
     fn test_list_types() {
         let mut item = HashMap::new();
         item.insert("empty_list".to_string(), AttributeValue::L(vec![]));

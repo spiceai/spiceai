@@ -1191,6 +1191,37 @@ mod tests {
     }
 
     #[test]
+    fn number_that_does_not_fit_integer_column_is_an_error() {
+        for value in ["12.345", "9223372036854775808"] {
+            let schema = create_test_schema(vec![Field::new("price", DataType::Int64, true)]);
+            let item = HashMap::from([("price".to_string(), AttributeValue::N(value.to_string()))]);
+
+            let err = dynamodb_items_to_arrow(&[item], schema, "2006-01-02T15:04:05.000Z07:00")
+                .expect_err("value does not fit Int64");
+            let msg = err.to_string();
+            assert!(msg.contains("'price'") && msg.contains(value), "{msg}");
+        }
+    }
+
+    #[test]
+    fn fractional_number_in_integer_list_is_an_error() {
+        let schema = create_test_schema(vec![Field::new(
+            "scores",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        )]);
+        let item = HashMap::from([(
+            "scores".to_string(),
+            AttributeValue::Ns(vec!["1".to_string(), "2.5".to_string()]),
+        )]);
+
+        let err = dynamodb_items_to_arrow(&[item], schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect_err("2.5 does not fit Int64");
+        let msg = err.to_string();
+        assert!(msg.contains("'scores'") && msg.contains("2.5"), "{msg}");
+    }
+
+    #[test]
     fn test_null_type() {
         let schema = create_test_schema(vec![Field::new("null_field", DataType::Null, true)]);
 
