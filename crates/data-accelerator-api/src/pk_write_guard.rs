@@ -254,15 +254,18 @@ fn sink_is_sqlite_closed_channel_lie(error: &DataFusionError) -> bool {
 }
 
 fn prefer_stored_guard_error(slot: &GuardErrorSlot, sink: DataFusionError) -> DataFusionError {
-    if !sink_is_sqlite_closed_channel_lie(&sink) {
-        return sink;
-    }
     let stored = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match stored.as_ref() {
-        Some(snapshot) => restore_guard_error(snapshot),
-        None => sink,
+        // A NULL or uniqueness error the guard raised stays permanent even if
+        // the sink marked the stream `Err` retriable (`DuckDB` does that for
+        // every non-SQL/Plan/Schema error). A retriable stream snapshot is
+        // restored only for SQLite's closed-channel lie (#14757).
+        Some(snapshot) if !snapshot.retriable || sink_is_sqlite_closed_channel_lie(&sink) => {
+            restore_guard_error(snapshot)
+        }
+        _ => sink,
     }
 }
 
@@ -1128,6 +1131,35 @@ mod tests {
         assert!(
             !is_retriable_error(&error),
             "an in-batch duplicate must stay permanent, got: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("uniqueness"),
+            "the uniqueness error must be reported, got: {message}"
+        );
+    }
+
+    #[test]
+    fn prefer_guard_error_keeps_uniqueness_permanent_when_sink_marks_it_retriable() {
+        use datafusion_table_providers::util::retriable_error::{
+            check_and_mark_retriable_error, is_retriable_error,
+        };
+        use std::sync::Mutex;
+
+        let uniqueness = super::uniqueness_error(&schema(), &[0]);
+        let slot = Arc::new(Mutex::new(None));
+        super::remember_constraint_error(&slot, &uniqueness);
+        let marked = check_and_mark_retriable_error(datafusion::error::DataFusionError::Execution(
+            uniqueness.to_string(),
+        ));
+        assert!(
+            is_retriable_error(&marked),
+            "the DuckDB sink marks a non-SQL stream error retriable"
+        );
+        let error = super::prefer_stored_guard_error(&slot, marked);
+        assert!(
+            !is_retriable_error(&error),
+            "an in-batch duplicate must stay permanent after the sink marks it, got: {error}"
         );
         let message = error.to_string();
         assert!(
