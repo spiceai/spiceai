@@ -364,6 +364,7 @@ impl SpiceJsonFormat {
 
         if is_soda {
             let soda = SodaReader::from_vec(raw_buf, self.options.soda_metadata)?;
+            take_soda_rows(&soda, take_while);
             let schema = if let Some(separator) = &self.options.flatten_json {
                 unnest_struct_schema(soda.schema(), separator)
             } else {
@@ -412,6 +413,7 @@ impl SpiceJsonFormat {
 
         if is_soda {
             let soda = SodaReader::from_vec(raw_buf, self.options.soda_metadata)?;
+            take_soda_rows(&soda, take_while);
             let schema = soda.schema().clone();
             return Ok(if let Some(separator) = &self.options.flatten_json {
                 unnest_struct_schema(&schema, separator)
@@ -751,6 +753,16 @@ impl DataSource for NonRepartitionedFileScanConfig {
 
 /// UTF-8 BOM prefix (`\xEF\xBB\xBF`).
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// Offers each SODA `data` row to `take_while`, so a SODA source counts its
+/// records like other JSON input and an empty `data` array counts as none.
+fn take_soda_rows(soda: &SodaReader, take_while: &mut dyn FnMut() -> bool) {
+    for _ in 0..soda.row_count() {
+        if !take_while() {
+            break;
+        }
+    }
+}
 
 /// Infer a JSON schema from all bytes in `buf`, dispatching by [`Format`].
 ///

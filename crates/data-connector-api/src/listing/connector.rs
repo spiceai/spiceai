@@ -3045,6 +3045,48 @@ mod tests {
         )
     }
 
+    /// `(event_id, "user.name")` for every row of a flattened JSON listing,
+    /// ordered by `event_id`.
+    async fn json_user_names(
+        provider: Arc<dyn TableProvider>,
+        refresh: bool,
+    ) -> Vec<(i64, Option<String>)> {
+        let mut config = datafusion::prelude::SessionConfig::new();
+        if refresh {
+            data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        }
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let batches = ctx
+            .sql(r#"SELECT event_id, "user.name" FROM events ORDER BY event_id"#)
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let ids = arrow::compute::cast(batch.column(0), &DataType::Int64).expect("event_id");
+            let ids = ids
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("event_id as Int64");
+            let names = arrow::compute::cast(batch.column(1), &DataType::Utf8).expect("user.name");
+            let names = names
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("user.name as Utf8");
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    ids.value(row),
+                    (!names.is_null(row)).then(|| names.value(row).to_string()),
+                ));
+            }
+        }
+        rows
+    }
+
     #[tokio::test]
     async fn create_listing_table_binds_csv_columns_by_header_name() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3552,6 +3594,11 @@ mod tests {
             .create_listing_table(&dataset, &url, &extension, file_format)
             .await
             .expect("listing table");
+        assert_eq!(
+            json_user_names(Arc::clone(&provider), false).await,
+            vec![(1, Some("a".to_string())), (2, Some("b".to_string()))],
+            "user.name reads the flattened child while the parent is an object"
+        );
 
         write_events_ndjson(
             &path,
@@ -3561,9 +3608,19 @@ mod tests {
             ],
         );
         assert_eq!(
+            json_user_names(Arc::clone(&provider), false).await,
+            vec![(1, None), (2, None)],
+            "a flattened null parent is NULL for user.name on a federated read"
+        );
+        assert_eq!(
             csv_listing_sums(Arc::clone(&provider), false).await,
             (Some(300), Some(30)),
-            "a flattened null parent is NULL for user.name on a federated read"
+            "registered columns keep their values on a federated read"
+        );
+        assert_eq!(
+            json_user_names(Arc::clone(&provider), true).await,
+            vec![(1, None), (2, None)],
+            "user becoming null in every record is NULL for user.name on refresh"
         );
         assert_eq!(
             csv_listing_sums(provider, true).await,

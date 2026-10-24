@@ -749,6 +749,46 @@ mod tests {
             .expect("write json pointer document");
     }
 
+    /// Writes a SODA response whose `meta.view.columns` are `columns` and whose
+    /// `data` rows hold each object's value for those columns.
+    fn write_soda(path: &Path, columns: &[&str], objects: &[&str]) {
+        let data: Vec<serde_json::Value> = objects
+            .iter()
+            .map(|object| {
+                let object: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(object).expect("JSON object");
+                serde_json::Value::Array(
+                    columns
+                        .iter()
+                        .map(|c| object.get(*c).cloned().unwrap_or_default())
+                        .collect(),
+                )
+            })
+            .collect();
+        let columns: Vec<serde_json::Value> = columns
+            .iter()
+            .map(|c| serde_json::json!({ "fieldName": c, "dataTypeName": "number" }))
+            .collect();
+        let doc = serde_json::json!({ "meta": { "view": { "columns": columns } }, "data": data });
+        std::fs::write(path, doc.to_string()).expect("write SODA response");
+    }
+
+    /// Writes `objects` as a SODA response with one column per key they use.
+    fn write_soda_doc(path: &Path, objects: &[&str]) {
+        let mut columns: Vec<String> = Vec::new();
+        for object in objects {
+            let object: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(object).expect("JSON object");
+            for key in object.keys() {
+                if !columns.contains(key) {
+                    columns.push(key.clone());
+                }
+            }
+        }
+        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+        write_soda(path, &columns, objects);
+    }
+
     fn guarded_spice_json_table(dir: &Path, columns: &[&str], format: SpiceJsonFormat) -> Guarded {
         let schema = registered_schema(columns);
         let format: Arc<dyn FileFormat> = Arc::new(format);
@@ -1195,6 +1235,22 @@ mod tests {
         );
         json_empty_source_clears("json_pointer", table, &path, |p| {
             write_json_pointer_doc(p, &[]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn soda_refresh_of_an_empty_source_clears() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("base.json");
+        write_soda_doc(&path, JSON_BASELINE);
+        let table = guarded_spice_json_table(
+            dir.path(),
+            &["id", "amount_cents"],
+            SpiceJsonFormat::default().with_format(Format::Soda),
+        );
+        json_empty_source_clears("file_format soda", table, &path, |p| {
+            write_soda(p, &["id", "amount_cents"], &[]);
         })
         .await;
     }
@@ -1648,6 +1704,26 @@ mod tests {
                 .with_format(Format::Auto)
                 .with_json_pointer("/data".to_string()),
             write_json_pointer_doc,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn soda_refresh_scan_fails_when_a_registered_column_is_renamed() {
+        spice_json_rename_case(
+            "file_format soda",
+            SpiceJsonFormat::default().with_format(Format::Soda),
+            write_soda_doc,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auto_soda_refresh_scan_fails_when_a_registered_column_is_renamed() {
+        spice_json_rename_case(
+            "auto-detected soda",
+            SpiceJsonFormat::default().with_format(Format::Auto),
+            write_soda_doc,
         )
         .await;
     }
