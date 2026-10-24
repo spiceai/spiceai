@@ -1557,6 +1557,46 @@ mod store_reads {
         ));
     }
 
+    /// A git-stored file lists its tree oid and downloads with `x-linked-etag`.
+    /// If-Match of the listed generation must still read the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_accepts_if_match_of_the_listed_content_id() {
+        let mock = Mock::start().await;
+        let bytes = Bytes::from_static(b"id,name\n1,one\n");
+        mock.commit("r/etag", C1, vec![("a.csv", text("id,name\n1,one\n"))]);
+        let (store, _) = registered(&mock, "r/etag");
+        let location = path("r/etag", "a.csv");
+        let listed = store.head(&location).await.expect("the file's description");
+        let listed_etag = listed.e_tag.expect("a listing e_tag");
+
+        let matched = store
+            .get_opts(
+                &location,
+                object_store::GetOptions {
+                    if_match: Some(listed_etag),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("If-Match of the listed generation");
+        assert_eq!(matched.bytes().await.expect("bytes"), bytes);
+
+        let error = store
+            .get_opts(
+                &location,
+                object_store::GetOptions {
+                    if_match: Some("not-the-listed-generation".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a different generation");
+        assert!(
+            matches!(error, object_store::Error::Precondition { .. }),
+            "{error}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_download_cut_off_part_way_resumes_where_it_stopped() {
         let mock = Mock::start().await;
