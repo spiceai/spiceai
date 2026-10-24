@@ -83,7 +83,7 @@
           "AI"
         ],
         "summary": "Create Chat Completion",
-        "description": "Creates a model response for the given chat conversation.",
+        "description": "Creates a model response for the given chat conversation.\n\nWhen a model writes text and calls a Spice tool in the same step, the message carries that\ntext, a blank line, then the answer the tool results produce, whether or not it is streamed.\nThere is no blank line when either side already has whitespace where they meet, or when the\nrequest sets `logprobs`, so that `content` is exactly the text its log probabilities cover. A\nresponse that is not streamed and has a `json_object` or `json_schema` `response_format`\ncarries only the answer.",
         "operationId": "post_chat_completions",
         "requestBody": {
           "description": "Create a chat completion request using a language model.",
@@ -287,7 +287,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "example": "\nfrom,name,replication_enabled,acceleration_enabled,status,error,error_message\npostgres:syncs,daily_journal_accelerated,false,true,Ready,,\ndatabricks:hive_metastore.default.messages,messages_accelerated,false,true,Error,dataset.auth,Unable to authenticate with datasource credentials\npostgres:aidemo_messages,general,false,false,Initializing,,\n"
+                "example": "\nfrom,name,replication_enabled,acceleration_enabled,status,error,error_message,last_refresh,next_refresh,properties.search,properties.vector_search\npostgres:syncs,daily_journal_accelerated,false,true,Ready,,,,,unsupported,unsupported\ndatabricks:hive_metastore.default.messages,messages_accelerated,false,true,Error,dataset.auth,Unable to authenticate with datasource credentials,,,unsupported,unsupported\npostgres:aidemo_messages,general,false,false,Initializing,,,,,unsupported,unsupported\n"
               }
             }
           },
@@ -298,7 +298,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "example": "An unexpected error occurred while processing datasets"
+                "example": "Failed to format the dataset list as CSV"
               }
             }
           }
@@ -584,7 +584,7 @@
             "description": "The model provider denied access"
           },
           "404": {
-            "description": "No model with this name"
+            "description": "No model with this name, or the model failed to load or is still loading"
           },
           "429": {
             "description": "Rate limited"
@@ -677,6 +677,61 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/logs": {
+      "post": {
+        "tags": [
+          "Datasets"
+        ],
+        "summary": "Ingest OTLP logs over HTTP",
+        "description": "OpenTelemetry Protocol (OTLP/HTTP) logs receiver. Accepts protobuf or JSON\n`ExportLogsServiceRequest` bodies, optionally gzip-compressed, and stores every log record\nin the datasets with `otlp_logs: all`, like the gRPC receiver on the Flight port.",
+        "operationId": "post_otlp_logs",
+        "requestBody": {
+          "description": "OTLP ExportLogsServiceRequest",
+          "content": {
+            "application/json": {
+              "schema": {}
+            },
+            "application/x-protobuf": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Every log record was stored"
+          },
+          "400": {
+            "description": "Invalid body"
+          },
+          "401": {
+            "description": "Missing or invalid API key"
+          },
+          "403": {
+            "description": "Write access required"
+          },
+          "413": {
+            "description": "Body too large"
+          },
+          "415": {
+            "description": "Unsupported Content-Type or Content-Encoding"
+          },
+          "501": {
+            "description": "No dataset stores OpenTelemetry logs (`otlp_logs: all`)"
+          },
+          "503": {
+            "description": "Failed to write to a logs dataset; retry the export"
           }
         }
       }
@@ -802,6 +857,221 @@
           },
           "404": {
             "description": "Unknown or already-terminated `Mcp-Session-Id`."
+          }
+        }
+      }
+    },
+    "/v1/messages": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Create a message",
+        "description": "Answers a conversation in the shape of the Anthropic Messages API, so Anthropic SDKs and\ntools work by pointing their base URL at Spice. `model` names any chat model in the\nSpicepod: a model with `from: anthropic` receives the request as sent, and any other model\nreceives it translated into a chat completion. The request and the response, streamed\n(`\"stream\": true`) or not, follow the Messages API reference:\n<https://docs.claude.com/en/api/messages>.",
+        "operationId": "post_messages",
+        "parameters": [
+          {
+            "name": "anthropic-version",
+            "in": "header",
+            "description": "The Messages API version. Accepted for compatibility; `2023-06-01` is the only version.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "anthropic-beta",
+            "in": "header",
+            "description": "Comma-separated beta features, forwarded to models with `from: anthropic`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "A Messages API request.",
+          "content": {
+            "application/json": {
+              "schema": {},
+              "example": {
+                "model": "claude",
+                "max_tokens": 1024,
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Hello!"
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The model's message, or with `\"stream\": true`, its stream of server-sent events",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "id": "msg_01XFDUDYJgAACzvnptvVoYEL",
+                  "type": "message",
+                  "role": "assistant",
+                  "model": "claude",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "Hello! How can I help you today?"
+                    }
+                  ],
+                  "stop_reason": "end_turn",
+                  "stop_sequence": null,
+                  "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 12
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request is invalid, or asks for something the model cannot serve",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "type": "error",
+                  "error": {
+                    "type": "invalid_request_error",
+                    "message": "model: Field required"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The model was not found",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "type": "error",
+                  "error": {
+                    "type": "not_found_error",
+                    "message": "model 'claude' not found"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model failed to load"
+          }
+        }
+      }
+    },
+    "/v1/messages/count_tokens": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Count tokens in a message",
+        "description": "Counts the input tokens of a Messages API request, as the model would be sent it, Spice's\nsystem prompt and tools included. Only a model with `from: anthropic` counts tokens: a count\nis specific to the model's tokenizer. The request and response follow the Messages API\nreference: <https://docs.claude.com/en/api/messages-count-tokens>.",
+        "operationId": "post_messages_count_tokens",
+        "requestBody": {
+          "description": "A Messages API request, without `max_tokens`.",
+          "content": {
+            "application/json": {
+              "schema": {},
+              "example": {
+                "model": "claude",
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Hello!"
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The input token count",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "input_tokens": 10
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request is invalid, or the model cannot count tokens"
+          },
+          "404": {
+            "description": "The model was not found"
+          }
+        }
+      }
+    },
+    "/v1/metrics": {
+      "post": {
+        "tags": [
+          "Datasets"
+        ],
+        "summary": "Ingest OTLP metrics over HTTP",
+        "description": "OpenTelemetry Protocol (OTLP/HTTP) metrics receiver. Accepts protobuf or JSON\n`ExportMetricsServiceRequest` bodies, optionally gzip-compressed, and stores them like the\ngRPC receiver on the Flight port.",
+        "operationId": "post_otlp_metrics",
+        "requestBody": {
+          "description": "OTLP ExportMetricsServiceRequest",
+          "content": {
+            "application/json": {
+              "schema": {}
+            },
+            "application/x-protobuf": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Export accepted, possibly with partial success"
+          },
+          "400": {
+            "description": "Invalid body, or every data point was rejected"
+          },
+          "401": {
+            "description": "Missing or invalid API key"
+          },
+          "403": {
+            "description": "Write access required"
+          },
+          "413": {
+            "description": "Body too large"
+          },
+          "415": {
+            "description": "Unsupported Content-Type or Content-Encoding"
+          },
+          "503": {
+            "description": "Failed to write to the metrics store; retry the export"
           }
         }
       }
@@ -1200,14 +1470,16 @@
           {
             "name": "namespace",
             "in": "path",
+            "description": "The namespace of the table.",
             "required": true,
             "schema": {
-              "$ref": "#/components/schemas/NamespacePath"
+              "type": "string"
             }
           },
           {
             "name": "table",
             "in": "path",
+            "description": "The name of the table.",
             "required": true,
             "schema": {
               "type": "string"
@@ -2125,6 +2397,14 @@
         "responses": {
           "200": {
             "description": "SQL query executed successfully",
+            "headers": {
+              "Server-Timing": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The time the server spent on the query, in milliseconds: `total;dur=<ms>` (W3C Server-Timing). Sent on every response whose body is complete before its head is sent — every format except the default streamed `application/json`, and every error. A streamed `application/json` body is not complete until it ends, so it sends the field as a trailer instead (declared by `Trailer: Server-Timing`) when the request allows trailers: HTTP/2, or `TE: trailers` on HTTP/1.1."
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2739,7 +3019,8 @@
             ],
             "description": "A path to a file."
           }
-        ]
+        ],
+        "description": "An annotation that applies to a span of output text."
       },
       "ApplyPatchCallOutputStatus": {
         "type": "string",
@@ -3279,15 +3560,13 @@
       },
       "ChatCompletionAllowedToolsChoice": {
         "type": "object",
+        "description": "`{\"type\": \"allowed_tools\", \"allowed_tools\": {\"mode\": ..., \"tools\": [...]}}`: one mode over\none tool list, as the Chat Completions API defines it.",
         "required": [
           "allowed_tools"
         ],
         "properties": {
           "allowed_tools": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ChatCompletionAllowedTools"
-            }
+            "$ref": "#/components/schemas/ChatCompletionAllowedTools"
           }
         }
       },
@@ -3304,7 +3583,7 @@
           },
           "voice": {
             "$ref": "#/components/schemas/ChatCompletionAudioVoice",
-            "description": "The voice the model uses to respond. Supported voices are\n`alloy`, `ash`, `ballad`, `coral`, `echo`, `fable`, `nova`, `onyx`, `sage`, and `shimmer`."
+            "description": "The voice the model uses to respond. Supported built-in voices are `alloy`, `ash`,\n`ballad`, `coral`, `echo`, `fable`, `nova`, `onyx`, `sage`, `shimmer`, `marin`, and `cedar`."
           }
         }
       },
@@ -4598,6 +4877,16 @@
             "$ref": "#/components/schemas/ClickButtonType",
             "description": "Indicates which mouse button was pressed during the click. One of `left`,\n`right`, `wheel`, `back`, or `forward`."
           },
+          "keys": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The keys being held while clicking."
+          },
           "x": {
             "type": "integer",
             "format": "int32",
@@ -4827,11 +5116,11 @@
               "string",
               "null"
             ],
-            "description": "Created by model/user identifier."
+            "description": "The identifier of the actor that created the item."
           },
           "encrypted_content": {
             "type": "string",
-            "description": "The encrypted content."
+            "description": "The encrypted content that was produced by compaction."
           },
           "id": {
             "type": "string",
@@ -4848,7 +5137,7 @@
         "properties": {
           "encrypted_content": {
             "type": "string",
-            "description": "The encrypted content."
+            "description": "The encrypted content of the compaction summary."
           },
           "id": {
             "type": [
@@ -5052,6 +5341,13 @@
           }
         }
       },
+      "CompoundType": {
+        "type": "string",
+        "enum": [
+          "and",
+          "or"
+        ]
+      },
       "ComputerAction": {
         "oneOf": [
           {
@@ -5103,7 +5399,7 @@
           {
             "allOf": [
               {
-                "$ref": "#/components/schemas/Drag",
+                "$ref": "#/components/schemas/DragParam",
                 "description": "A drag action."
               },
               {
@@ -5149,7 +5445,7 @@
           {
             "allOf": [
               {
-                "$ref": "#/components/schemas/Move",
+                "$ref": "#/components/schemas/MoveParam",
                 "description": "A mouse move action."
               },
               {
@@ -5187,7 +5483,7 @@
           {
             "allOf": [
               {
-                "$ref": "#/components/schemas/Scroll",
+                "$ref": "#/components/schemas/ScrollParam",
                 "description": "A scroll action."
               },
               {
@@ -5210,7 +5506,7 @@
           {
             "allOf": [
               {
-                "$ref": "#/components/schemas/Type",
+                "$ref": "#/components/schemas/TypeParam",
                 "description": "An action to type in text."
               },
               {
@@ -5293,6 +5589,16 @@
           }
         }
       },
+      "ComputerCallOutputStatus": {
+        "type": "string",
+        "description": "The status of a computer tool call output item returned by the API.",
+        "enum": [
+          "in_progress",
+          "completed",
+          "incomplete",
+          "failed"
+        ]
+      },
       "ComputerCallSafetyCheckParam": {
         "type": "object",
         "required": [
@@ -5362,11 +5668,14 @@
           "computer_screenshot"
         ]
       },
+      "ComputerTool": {
+        "type": "object",
+        "description": "A tool that controls a virtual computer. Learn more about the\n[computer tool](https://platform.openai.com/docs/guides/tools-computer-use)."
+      },
       "ComputerToolCall": {
         "type": "object",
         "description": "Output from a computer tool call.",
         "required": [
-          "action",
           "call_id",
           "id",
           "pending_safety_checks",
@@ -5374,7 +5683,24 @@
         ],
         "properties": {
           "action": {
-            "$ref": "#/components/schemas/ComputerAction"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComputerAction"
+              }
+            ]
+          },
+          "actions": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ComputerAction"
+            },
+            "description": "Flattened batched actions for `computer_use`. Each action includes a\n`type` discriminator and action-specific fields."
           },
           "call_id": {
             "type": "string",
@@ -5394,6 +5720,51 @@
           "status": {
             "$ref": "#/components/schemas/OutputStatus",
             "description": "The status of the item. One of `in_progress`, `completed`, or `incomplete`.\nPopulated when items are returned via API."
+          }
+        }
+      },
+      "ComputerToolCallOutputResource": {
+        "type": "object",
+        "description": "A computer tool call output item returned by the API.",
+        "required": [
+          "call_id",
+          "output",
+          "id",
+          "status"
+        ],
+        "properties": {
+          "acknowledged_safety_checks": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ComputerCallSafetyCheckParam"
+            },
+            "description": "The safety checks reported by the API that have been acknowledged by the developer."
+          },
+          "call_id": {
+            "type": "string",
+            "description": "The ID of the computer tool call that produced the output."
+          },
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The identifier of the actor that created the item."
+          },
+          "id": {
+            "type": "string",
+            "description": "The unique ID of the computer tool call output."
+          },
+          "output": {
+            "$ref": "#/components/schemas/ComputerScreenshotImage",
+            "description": "A computer screenshot image used with the computer use tool."
+          },
+          "status": {
+            "$ref": "#/components/schemas/ComputerCallOutputStatus",
+            "description": "The status of the item returned by the API."
           }
         }
       },
@@ -5445,6 +5816,43 @@
           }
         }
       },
+      "ContainerAutoParam": {
+        "type": "object",
+        "description": "Automatically creates a container for the request.",
+        "properties": {
+          "file_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "An optional list of uploaded file IDs to make available in the container."
+          },
+          "network_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContainerNetworkPolicy",
+                "description": "Network access policy for the container."
+              }
+            ]
+          },
+          "skills": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/SkillParam"
+            },
+            "description": "An optional list of skills to make available in the container."
+          }
+        }
+      },
       "ContainerFileCitationBody": {
         "type": "object",
         "required": [
@@ -5481,15 +5889,134 @@
           }
         }
       },
+      "ContainerNetworkPolicy": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Disable all outbound network access.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "disabled"
+                ]
+              }
+            }
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ContainerNetworkPolicyAllowlistDetails",
+                "description": "Allow access only to specified domains."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "allowlist"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Allow access only to specified domains."
+          }
+        ],
+        "description": "Network access policy for a container."
+      },
+      "ContainerNetworkPolicyAllowlistDetails": {
+        "type": "object",
+        "description": "Details for an allowlist network policy.",
+        "required": [
+          "allowed_domains"
+        ],
+        "properties": {
+          "allowed_domains": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "A list of allowed domains."
+          },
+          "domain_secrets": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ContainerNetworkPolicyDomainSecretParam"
+            },
+            "description": "Optional domain-scoped secrets for allowlisted domains."
+          }
+        }
+      },
+      "ContainerNetworkPolicyDomainSecretParam": {
+        "type": "object",
+        "description": "A domain-scoped secret injected for allowlisted domains.",
+        "required": [
+          "domain",
+          "name",
+          "value"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "The domain associated with the secret."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the secret to inject for the domain."
+          },
+          "value": {
+            "type": "string",
+            "description": "The secret value to inject for the domain."
+          }
+        }
+      },
+      "ContainerReferenceParam": {
+        "type": "object",
+        "description": "References a container created with the /v1/containers endpoint.",
+        "required": [
+          "container_id"
+        ],
+        "properties": {
+          "container_id": {
+            "type": "string",
+            "description": "The ID of the referenced container."
+          }
+        }
+      },
+      "ContainerReferenceResource": {
+        "type": "object",
+        "description": "A resource reference to a container by ID.",
+        "required": [
+          "container_id"
+        ],
+        "properties": {
+          "container_id": {
+            "type": "string",
+            "description": "The ID of the referenced container."
+          }
+        }
+      },
       "Conversation": {
         "type": "object",
+        "description": "The conversation that this response belonged to. Input items and output items from this\nresponse were automatically added to this conversation.",
         "required": [
           "id"
         ],
         "properties": {
           "id": {
             "type": "string",
-            "description": "The unique ID of the conversation."
+            "description": "The unique ID of the conversation that this response was associated with."
           }
         }
       },
@@ -5504,6 +6031,26 @@
             "description": "The conversation that this response belongs to."
           }
         ]
+      },
+      "CoordParam": {
+        "type": "object",
+        "description": "An x/y coordinate pair.",
+        "required": [
+          "x",
+          "y"
+        ],
+        "properties": {
+          "x": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The x-coordinate."
+          },
+          "y": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The y-coordinate."
+          }
+        }
       },
       "CreateChatCompletionRequest": {
         "type": "object",
@@ -5786,7 +6333,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "An integer between 0 and 20 specifying the number of most likely tokens to\nreturn at each token position, each with an associated log probability.\n`logprobs` must be set to `true` if this parameter is used.",
+            "description": "An integer between 0 and 20 specifying the number of most likely tokens to\nreturn at each token position, each with an associated log probability.\nIn some cases, the number of returned tokens may be fewer than requested.\n`logprobs` must be set to `true` if this parameter is used.",
             "minimum": 0
           },
           "top_p": {
@@ -6196,7 +6743,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "An integer between 0 and 20 specifying the number of most likely tokens to return at each\ntoken position, each with an associated log probability.",
+            "description": "An integer between 0 and 20 specifying the number of most likely tokens to return at each\ntoken position, each with an associated log probability. In some cases, the number of returned\ntokens may be fewer than requested.",
             "minimum": 0
           },
           "top_p": {
@@ -6290,6 +6837,13 @@
           "name": {
             "type": "string",
             "description": "The name of the custom tool being called."
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The namespace of the custom tool being called."
           }
         }
       },
@@ -6332,6 +6886,41 @@
           }
         ]
       },
+      "CustomToolCallOutputResource": {
+        "type": "object",
+        "description": "A custom tool call output item returned by the API.",
+        "required": [
+          "call_id",
+          "output",
+          "id",
+          "status"
+        ],
+        "properties": {
+          "call_id": {
+            "type": "string",
+            "description": "The call ID, used to map this custom tool call output to a custom tool call."
+          },
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The identifier of the actor that created the item."
+          },
+          "id": {
+            "type": "string",
+            "description": "The unique ID of the custom tool call output item."
+          },
+          "output": {
+            "$ref": "#/components/schemas/CustomToolCallOutputOutput",
+            "description": "The output from the custom tool call generated by your code.\nCan be a string or a list of output content."
+          },
+          "status": {
+            "$ref": "#/components/schemas/FunctionCallOutputStatusEnum",
+            "description": "The status of the item. One of `in_progress`, `completed`, or `incomplete`."
+          }
+        }
+      },
       "CustomToolChatCompletions": {
         "type": "object",
         "required": [
@@ -6350,6 +6939,13 @@
           "format"
         ],
         "properties": {
+          "defer_loading": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether this tool should be deferred and discovered via tool search."
+          },
           "description": {
             "type": [
               "string",
@@ -6973,7 +7569,7 @@
           },
           "model": {
             "type": "string",
-            "description": "The model that answered."
+            "description": "The model that answered, by the name the request used."
           },
           "usage": {
             "oneOf": [
@@ -7027,6 +7623,16 @@
           "y"
         ],
         "properties": {
+          "keys": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The keys being held while double clicking."
+          },
           "x": {
             "type": "integer",
             "format": "int32",
@@ -7039,39 +7645,29 @@
           }
         }
       },
-      "Drag": {
+      "DragParam": {
         "type": "object",
         "description": "A drag action.",
         "required": [
           "path"
         ],
         "properties": {
+          "keys": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The keys being held while dragging the mouse."
+          },
           "path": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/DragPoint"
+              "$ref": "#/components/schemas/CoordParam"
             },
-            "description": "The path of points the cursor drags through."
-          }
-        }
-      },
-      "DragPoint": {
-        "type": "object",
-        "description": "A point in 2D space.",
-        "required": [
-          "x",
-          "y"
-        ],
-        "properties": {
-          "x": {
-            "type": "integer",
-            "format": "int32",
-            "description": "The x-coordinate."
-          },
-          "y": {
-            "type": "integer",
-            "format": "int32",
-            "description": "The y-coordinate."
+            "description": "An array of coordinates representing the path of the drag action."
           }
         }
       },
@@ -7103,13 +7699,24 @@
             "$ref": "#/components/schemas/EasyInputContent",
             "description": "Text, image, or audio input to the model, used to generate a response.\nCan also contain previous assistant responses."
           },
+          "phase": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MessagePhase",
+                "description": "Labels an `assistant` message as intermediate commentary (`commentary`) or\nthe final answer (`final_answer`). Not used for user messages."
+              }
+            ]
+          },
           "role": {
             "$ref": "#/components/schemas/Role",
             "description": "The role of the message input. One of `user`, `assistant`, `system`, or `developer`."
           },
           "type": {
             "$ref": "#/components/schemas/MessageType",
-            "description": "The type of the message input. Always set to `message`."
+            "description": "The type of the message input. Defaults to `message` when omitted in JSON input."
           }
         }
       },
@@ -7214,7 +7821,7 @@
       },
       "ErrorObject": {
         "type": "object",
-        "description": "Error returned by the API when a request fails.",
+        "description": "An error that occurred while generating the response.",
         "required": [
           "code",
           "message"
@@ -7222,11 +7829,11 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "The error code for the response."
+            "description": "A machine-readable error code that was returned."
           },
           "message": {
             "type": "string",
-            "description": "A human-readable description of the error."
+            "description": "A human-readable description of the error that was returned."
           }
         }
       },
@@ -7253,6 +7860,14 @@
             "minimum": 0
           }
         }
+      },
+      "FileInputDetail": {
+        "type": "string",
+        "description": "The detail level of a file input sent to the model.",
+        "enum": [
+          "low",
+          "high"
+        ]
       },
       "FileObject": {
         "type": "object",
@@ -7527,6 +8142,24 @@
           }
         }
       },
+      "FunctionCallOutputStatusEnum": {
+        "type": "string",
+        "description": "The status of a function call output.",
+        "enum": [
+          "in_progress",
+          "completed",
+          "incomplete"
+        ]
+      },
+      "FunctionCallStatus": {
+        "type": "string",
+        "description": "The status of a function call.",
+        "enum": [
+          "in_progress",
+          "completed",
+          "incomplete"
+        ]
+      },
       "FunctionName": {
         "type": "object",
         "required": [
@@ -7661,15 +8294,120 @@
             ],
             "description": "The ID of the entity that created this tool call."
           },
+          "environment": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FunctionShellCallEnvironment",
+                "description": "The environment in which the shell commands were executed."
+              }
+            ]
+          },
           "id": {
             "type": "string",
             "description": "The unique ID of the function shell tool call. Populated when this item is returned via API."
           },
           "status": {
-            "$ref": "#/components/schemas/LocalShellCallStatus",
+            "$ref": "#/components/schemas/FunctionShellCallStatus",
             "description": "The status of the shell call. One of `in_progress`, `completed`, or `incomplete`."
           }
         }
+      },
+      "FunctionShellCallEnvironment": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A local computer environment.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "local"
+                ]
+              }
+            }
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ContainerReferenceResource",
+                "description": "A referenced container."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "container_reference"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "A referenced container."
+          }
+        ],
+        "description": "The environment for a shell call (response side)."
+      },
+      "FunctionShellCallItemEnvironment": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LocalEnvironmentParam",
+                "description": "Use a local computer environment."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "local"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Use a local computer environment."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ContainerReferenceParam",
+                "description": "Reference an existing container by ID."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "container_reference"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Reference an existing container by ID."
+          }
+        ],
+        "description": "The environment for a shell call item (request side)."
       },
       "FunctionShellCallItemParam": {
         "type": "object",
@@ -7686,6 +8424,17 @@
           "call_id": {
             "type": "string",
             "description": "The unique ID of the shell tool call generated by the model."
+          },
+          "environment": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FunctionShellCallItemEnvironment",
+                "description": "The environment to execute the shell commands in."
+              }
+            ]
           },
           "id": {
             "type": [
@@ -7718,10 +8467,11 @@
       },
       "FunctionShellCallOutput": {
         "type": "object",
-        "description": "The output of a shell tool call.",
+        "description": "The output of a shell tool call that was emitted.",
         "required": [
           "id",
           "call_id",
+          "status",
           "output"
         ],
         "properties": {
@@ -7733,7 +8483,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "The identifier of the actor that created the item."
           },
           "id": {
             "type": "string",
@@ -7754,6 +8505,10 @@
               "$ref": "#/components/schemas/FunctionShellCallOutputContent"
             },
             "description": "An array of shell call output contents"
+          },
+          "status": {
+            "$ref": "#/components/schemas/FunctionShellCallOutputStatusEnum",
+            "description": "The status of the shell call output. One of `in_progress`, `completed`, or `incomplete`."
           }
         }
       },
@@ -7774,18 +8529,21 @@
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "description": "The identifier of the actor that created the item."
               },
               "stderr": {
-                "type": "string"
+                "type": "string",
+                "description": "The standard error output that was captured."
               },
               "stdout": {
-                "type": "string"
+                "type": "string",
+                "description": "The standard output that was captured."
               }
             }
           }
         ],
-        "description": "The content of a shell call output."
+        "description": "The content of a shell tool call output that was emitted."
       },
       "FunctionShellCallOutputContentParam": {
         "type": "object",
@@ -7955,12 +8713,128 @@
         ],
         "description": "The exit or timeout outcome associated with this chunk."
       },
+      "FunctionShellCallOutputStatusEnum": {
+        "type": "string",
+        "description": "Status values reported for function shell tool call outputs.",
+        "enum": [
+          "in_progress",
+          "completed",
+          "incomplete"
+        ]
+      },
+      "FunctionShellCallStatus": {
+        "type": "string",
+        "description": "Status values reported for function shell tool calls.",
+        "enum": [
+          "in_progress",
+          "completed",
+          "incomplete"
+        ]
+      },
+      "FunctionShellEnvironment": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ContainerAutoParam",
+                "description": "Automatically creates a container for this request."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "container_auto"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Automatically creates a container for this request."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LocalEnvironmentParam",
+                "description": "Use a local computer environment."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "local"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Use a local computer environment."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ContainerReferenceParam",
+                "description": "Reference an existing container by ID."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "container_reference"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Reference an existing container by ID."
+          }
+        ],
+        "description": "The execution environment for a shell tool — container or local."
+      },
+      "FunctionShellToolParam": {
+        "type": "object",
+        "description": "Parameters for the shell function tool.",
+        "properties": {
+          "environment": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FunctionShellEnvironment",
+                "description": "The execution environment for the shell tool."
+              }
+            ]
+          }
+        }
+      },
       "FunctionTool": {
         "type": "object",
         "required": [
           "name"
         ],
         "properties": {
+          "defer_loading": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether this function is deferred and loaded via tool search."
+          },
           "description": {
             "type": [
               "string",
@@ -8011,6 +8885,13 @@
             "type": "string",
             "description": "The name of the function to run."
           },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The namespace of the function to run."
+          },
           "status": {
             "oneOf": [
               {
@@ -8021,6 +8902,78 @@
                 "description": "The status of the item. One of `in_progress`, `completed`, or `incomplete`.\nPopulated when items are returned via API."
               }
             ]
+          }
+        }
+      },
+      "FunctionToolCallOutputResource": {
+        "type": "object",
+        "description": "A function tool call output item returned by the API.",
+        "required": [
+          "call_id",
+          "output",
+          "id",
+          "status"
+        ],
+        "properties": {
+          "call_id": {
+            "type": "string",
+            "description": "The unique ID of the function tool call generated by the model."
+          },
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The identifier of the actor that created the item."
+          },
+          "id": {
+            "type": "string",
+            "description": "The unique ID of the function tool call output."
+          },
+          "output": {
+            "$ref": "#/components/schemas/FunctionCallOutput",
+            "description": "Text, image, or file output of the function tool call."
+          },
+          "status": {
+            "$ref": "#/components/schemas/FunctionCallOutputStatusEnum",
+            "description": "The status of the item. One of `in_progress`, `completed`, or `incomplete`."
+          }
+        }
+      },
+      "FunctionToolParam": {
+        "type": "object",
+        "description": "A function tool that can be used within a namespace or with tool search.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "defer_loading": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether this function should be deferred and discovered via tool search."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A description of the function."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the function."
+          },
+          "parameters": {
+            "description": "A JSON schema object describing the parameters of the function."
+          },
+          "strict": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether to enforce strict parameter validation."
           }
         }
       },
@@ -8145,13 +9098,34 @@
         "enum": [
           "auto",
           "low",
-          "high"
+          "high",
+          "original"
+        ]
+      },
+      "ImageGenActionEnum": {
+        "type": "string",
+        "description": "Whether to generate a new image or edit an existing image.",
+        "enum": [
+          "generate",
+          "edit",
+          "auto"
         ]
       },
       "ImageGenTool": {
         "type": "object",
         "description": "Image generation tool definition.",
         "properties": {
+          "action": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImageGenActionEnum",
+                "description": "Whether to generate a new image or edit an existing image. Default: `auto`."
+              }
+            ]
+          },
           "background": {
             "oneOf": [
               {
@@ -8250,7 +9224,7 @@
               },
               {
                 "$ref": "#/components/schemas/ImageGenToolSize",
-                "description": "The size of the generated image. One of `1024x1024`, `1024x1536`,\n`1536x1024`, or `auto`. Default: `auto`."
+                "description": "The size of the generated images. For `gpt-image-2` and\n`gpt-image-2-2026-04-21`, arbitrary resolutions are supported as\n`WIDTHxHEIGHT` strings, for example `1536x864`. Width and height\nmust both be divisible by 16 and the requested aspect ratio must be\nbetween 1:3 and 3:1. Resolutions above `2560x1440` are experimental,\nand the maximum supported resolution is `3840x2160`. The requested\nsize must also satisfy the model's current pixel and edge limits.\nThe standard sizes `1024x1024`, `1536x1024`, and `1024x1536` are\nsupported by the GPT image models; `auto` is supported for models\nthat allow automatic sizing. For `dall-e-2`, use one of `256x256`,\n`512x512`, or `1024x1024`. For `dall-e-3`, use one of `1024x1024`,\n`1792x1024`, or `1024x1792`."
               }
             ]
           }
@@ -8341,12 +9315,42 @@
         ]
       },
       "ImageGenToolSize": {
-        "type": "string",
-        "enum": [
-          "auto",
-          "1024x1024",
-          "1024x1536",
-          "1536x1024"
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "auto"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "1024x1024"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "1024x1536"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "1536x1024"
+            ]
+          },
+          {
+            "type": "object",
+            "required": [
+              "other"
+            ],
+            "properties": {
+              "other": {
+                "type": "string"
+              }
+            }
+          }
         ]
       },
       "ImageUrl": {
@@ -8395,6 +9399,47 @@
           "reason": {
             "type": "string",
             "description": "The reason why the response is incomplete."
+          }
+        }
+      },
+      "InlineSkillParam": {
+        "type": "object",
+        "description": "An inline skill definition.",
+        "required": [
+          "name",
+          "description",
+          "source"
+        ],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "The description of the skill."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the skill."
+          },
+          "source": {
+            "$ref": "#/components/schemas/InlineSkillSourceParam",
+            "description": "The inline source for the skill."
+          }
+        }
+      },
+      "InlineSkillSourceParam": {
+        "type": "object",
+        "description": "An inline skill source (base64-encoded zip).",
+        "required": [
+          "media_type",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "string",
+            "description": "The base64-encoded skill data."
+          },
+          "media_type": {
+            "type": "string",
+            "description": "The media type. Always `\"application/zip\"`."
           }
         }
       },
@@ -8506,6 +9551,17 @@
       "InputFileContent": {
         "type": "object",
         "properties": {
+          "detail": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FileInputDetail",
+                "description": "The detail level of the file to be sent to the model. Use `low` for the default rendering\nbehavior, or `high` to render the file at higher quality. Defaults to `low`."
+              }
+            ]
+          },
           "file_data": {
             "type": [
               "string",
@@ -8538,13 +9594,10 @@
       },
       "InputImageContent": {
         "type": "object",
-        "required": [
-          "detail"
-        ],
         "properties": {
           "detail": {
             "$ref": "#/components/schemas/ImageDetail",
-            "description": "The detail level of the image to be sent to the model. One of `high`, `low`, or `auto`.\nDefaults to `auto`."
+            "description": "The detail level of the image to be sent to the model. One of `high`, `low`, or `auto`.\nDefaults to `auto` when omitted in JSON input."
           },
           "file_id": {
             "type": [
@@ -8854,6 +9907,52 @@
               }
             ],
             "description": "The output of a function tool call."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ToolSearchCallItemParam",
+                "description": "A tool search call."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "tool_search_call"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "A tool search call."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ToolSearchOutputItemParam",
+                "description": "A tool search output."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "tool_search_output"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "A tool search output."
           },
           {
             "allOf": [
@@ -9347,14 +10446,21 @@
           }
         }
       },
-      "LocalShellCallStatus": {
-        "type": "string",
-        "description": "Status values reported for function shell tool calls.",
-        "enum": [
-          "in_progress",
-          "completed",
-          "incomplete"
-        ]
+      "LocalEnvironmentParam": {
+        "type": "object",
+        "description": "Uses a local computer environment.",
+        "properties": {
+          "skills": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/LocalSkillParam"
+            },
+            "description": "An optional list of local skills."
+          }
+        }
       },
       "LocalShellExecAction": {
         "type": "object",
@@ -9459,6 +10565,29 @@
                 "description": "The status of the item. One of `in_progress`, `completed`, or `incomplete`."
               }
             ]
+          }
+        }
+      },
+      "LocalSkillParam": {
+        "type": "object",
+        "description": "A local skill available in a local environment.",
+        "required": [
+          "name",
+          "description",
+          "path"
+        ],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "The description of the skill."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the skill."
+          },
+          "path": {
+            "type": "string",
+            "description": "The path to the directory containing the skill."
           }
         }
       },
@@ -9645,6 +10774,13 @@
                 "description": "Identifier for service connectors, like those available in ChatGPT. One of `server_url` or\n`connector_id` must be provided. Learn more about service connectors [here](https://platform.openai.com/docs/guides/tools-remote-mcp#connectors).\n\nCurrently supported `connector_id` values are:\n- Dropbox: `connector_dropbox`\n- Gmail: `connector_gmail`\n- Google Calendar: `connector_googlecalendar`\n- Google Drive: `connector_googledrive`\n- Microsoft Teams: `connector_microsoftteams`\n- Outlook Calendar: `connector_outlookcalendar`\n- Outlook Email: `connector_outlookemail`\n- SharePoint: `connector_sharepoint`"
               }
             ]
+          },
+          "defer_loading": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether this MCP tool is deferred and discovered via tool search."
           },
           "headers": {
             "description": "Optional HTTP headers to send to the MCP server. Use for authentication or other purposes."
@@ -9913,6 +11049,14 @@
         ],
         "description": "A message item used within the `Item` enum.\n\nBoth InputMessage and OutputMessage have `type: \"message\"`, so we use an untagged\nenum to distinguish them based on their structure:\n- OutputMessage: role=assistant, required id & status fields\n- InputMessage: role=user/system/developer, content is `Vec<ContentType>`, optional id/status\n\nNote: EasyInputMessage is NOT included here - it's a separate variant in `InputItem`,\nnot part of the structured `Item` enum."
       },
+      "MessagePhase": {
+        "type": "string",
+        "description": "Labels an `assistant` message as intermediate commentary or the final answer.\nFor models like `gpt-5.3-codex` and beyond, when sending follow-up requests, preserve and resend\nphase on all assistant messages — dropping it can degrade performance.",
+        "enum": [
+          "commentary",
+          "final_answer"
+        ]
+      },
       "MessageResponse": {
         "type": "object",
         "required": [
@@ -10041,7 +11185,7 @@
           }
         }
       },
-      "Move": {
+      "MoveParam": {
         "type": "object",
         "description": "A mouse move action.",
         "required": [
@@ -10049,6 +11193,16 @@
           "y"
         ],
         "properties": {
+          "keys": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The keys being held while moving the mouse."
+          },
           "x": {
             "type": "integer",
             "format": "int32",
@@ -10074,6 +11228,79 @@
             }
           }
         }
+      },
+      "NamespaceToolParam": {
+        "type": "object",
+        "description": "Groups function/custom tools under a shared namespace.",
+        "required": [
+          "name",
+          "description",
+          "tools"
+        ],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "A description of the namespace shown to the model."
+          },
+          "name": {
+            "type": "string",
+            "description": "The namespace name used in tool calls (for example, `crm`)."
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NamespaceToolParamTool"
+            },
+            "description": "The function/custom tools available inside this namespace."
+          }
+        }
+      },
+      "NamespaceToolParamTool": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FunctionToolParam"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "function"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CustomToolParam"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "custom"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "description": "A function or custom tool that belongs to a namespace."
       },
       "NamespacesResponse": {
         "type": "object",
@@ -10696,6 +11923,29 @@
           {
             "allOf": [
               {
+                "$ref": "#/components/schemas/FunctionToolCallOutputResource",
+                "description": "The output of a function tool call."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "function_call_output"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "The output of a function tool call."
+          },
+          {
+            "allOf": [
+              {
                 "$ref": "#/components/schemas/WebSearchToolCall",
                 "description": "The results of a web search tool call. See the\n[web search guide](https://platform.openai.com/docs/guides/tools-web-search)\nfor more information."
               },
@@ -10738,6 +11988,29 @@
               }
             ],
             "description": "A tool call to a computer use tool. See the\n[computer use guide](https://platform.openai.com/docs/guides/tools-computer-use)\nfor more information."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ComputerToolCallOutputResource",
+                "description": "The output of a computer tool call."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "computer_call_output"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "The output of a computer tool call."
           },
           {
             "allOf": [
@@ -11037,6 +12310,75 @@
               }
             ],
             "description": "A call to a custom tool created by the model."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CustomToolCallOutputResource",
+                "description": "The output of a custom tool call."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "custom_tool_call_output"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "The output of a custom tool call."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ToolSearchCall",
+                "description": "A tool search call."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "tool_search_call"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "A tool search call."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ToolSearchOutput",
+                "description": "A tool search output."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "tool_search_output"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "A tool search output."
           }
         ],
         "description": "Output item"
@@ -11061,6 +12403,17 @@
           "id": {
             "type": "string",
             "description": "The unique ID of the output message."
+          },
+          "phase": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MessagePhase",
+                "description": "Labels this assistant message as intermediate commentary (`commentary`) or\nthe final answer (`final_answer`)."
+              }
+            ]
           },
           "role": {
             "$ref": "#/components/schemas/AssistantRole",
@@ -11371,7 +12724,6 @@
         "type": "object",
         "description": "A reasoning item representing the model's chain of thought, including summary paragraphs.",
         "required": [
-          "id",
           "summary"
         ],
         "properties": {
@@ -11381,7 +12733,7 @@
               "null"
             ],
             "items": {
-              "$ref": "#/components/schemas/ReasoningTextContent"
+              "$ref": "#/components/schemas/ReasoningItemContent"
             },
             "description": "Reasoning text content."
           },
@@ -11393,7 +12745,10 @@
             "description": "The encrypted content of the reasoning item - populated when a response is generated with\n`reasoning.encrypted_content` in the `include` parameter."
           },
           "id": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "Unique identifier of the reasoning content."
           },
           "status": {
@@ -11415,6 +12770,32 @@
             "description": "Reasoning summary content."
           }
         }
+      },
+      "ReasoningItemContent": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReasoningTextContent"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "reasoning_text"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "description": "[ReasoningTextContent] used elsewhere which adds type,\nbut here in [ReasoningItem] content field we need type too hence an enum:"
       },
       "ReasoningSummary": {
         "type": "string",
@@ -11576,6 +12957,15 @@
                 "description": "Billing information for the response."
               }
             ]
+          },
+          "completed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix timestamp (in seconds) of when this Response was completed.\nOnly present when the status is `completed`.",
+            "minimum": 0
           },
           "conversation": {
             "oneOf": [
@@ -11881,7 +13271,8 @@
       "ResponseFormatJsonSchema": {
         "type": "object",
         "required": [
-          "name"
+          "name",
+          "schema"
         ],
         "properties": {
           "description": {
@@ -11941,9 +13332,6 @@
       "ResponseTextParam": {
         "type": "object",
         "description": "Configuration for text response format.",
-        "required": [
-          "format"
-        ],
         "properties": {
           "format": {
             "$ref": "#/components/schemas/TextResponseFormatConfiguration",
@@ -12045,7 +13433,7 @@
         },
         "additionalProperties": false
       },
-      "Scroll": {
+      "ScrollParam": {
         "type": "object",
         "description": "A scroll action.",
         "required": [
@@ -12055,6 +13443,16 @@
           "y"
         ],
         "properties": {
+          "keys": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The keys being held while scrolling."
+          },
           "scroll_x": {
             "type": "integer",
             "format": "int32",
@@ -12076,6 +13474,14 @@
             "description": "The y-coordinate where the scroll occurred."
           }
         }
+      },
+      "SearchContentType": {
+        "type": "string",
+        "description": "The type of content to search for.",
+        "enum": [
+          "text",
+          "image"
+        ]
       },
       "SearchRequestBaseJson": {
         "type": "object",
@@ -12191,6 +13597,77 @@
             "type": "string"
           }
         ]
+      },
+      "SkillParam": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SkillReferenceParam",
+                "description": "Reference a skill by ID."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "skill_reference"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Reference a skill by ID."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/InlineSkillParam",
+                "description": "Provide an inline skill definition."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "inline"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Provide an inline skill definition."
+          }
+        ],
+        "description": "A skill parameter — either a reference or inline definition."
+      },
+      "SkillReferenceParam": {
+        "type": "object",
+        "description": "A skill referenced by ID.",
+        "required": [
+          "skill_id"
+        ],
+        "properties": {
+          "skill_id": {
+            "type": "string",
+            "description": "The ID of the skill to reference."
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional specific version to use."
+          }
+        }
       },
       "SpicepodSummary": {
         "type": "object",
@@ -12312,25 +13789,12 @@
         "description": "Represents the status of a component (e.g. dataset, model, etc).\n\nThe `Error` variant optionally carries a human-readable error message describing\nwhat caused the component to enter the error state. Use [`ComponentStatus::error`]\nfor an error without a message, or [`ComponentStatus::error_with_message`] to\ninclude one.",
         "example": "Ready"
       },
-      "Summary": {
-        "type": "object",
-        "description": "A single summary text fragment from reasoning.",
-        "required": [
-          "text"
-        ],
-        "properties": {
-          "text": {
-            "type": "string",
-            "description": "A summary of the reasoning output from the model so far."
-          }
-        }
-      },
       "SummaryPart": {
         "oneOf": [
           {
             "allOf": [
               {
-                "$ref": "#/components/schemas/Summary"
+                "$ref": "#/components/schemas/SummaryTextContent"
               },
               {
                 "type": "object",
@@ -12349,6 +13813,18 @@
             ]
           }
         ]
+      },
+      "SummaryTextContent": {
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "A summary of the reasoning output from the model so far."
+          }
+        }
       },
       "TableIdentifier": {
         "type": "object",
@@ -12624,19 +14100,27 @@
             }
           },
           {
-            "type": "object",
-            "description": "A tool that allows the model to execute shell commands.",
-            "required": [
-              "type"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "shell"
-                ]
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FunctionShellToolParam",
+                "description": "A tool that allows the model to execute shell commands."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "shell"
+                    ]
+                  }
+                }
               }
-            }
+            ],
+            "description": "A tool that allows the model to execute shell commands."
           },
           {
             "allOf": [
@@ -12660,6 +14144,75 @@
               }
             ],
             "description": "A custom tool that processes input using a specified format. Learn more about   [custom\ntools](https://platform.openai.com/docs/guides/function-calling#custom-tools)"
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ComputerTool",
+                "description": "A tool that controls a virtual computer. Learn more about the\n[computer tool](https://platform.openai.com/docs/guides/tools-computer-use)."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "computer"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "A tool that controls a virtual computer. Learn more about the\n[computer tool](https://platform.openai.com/docs/guides/tools-computer-use)."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/NamespaceToolParam",
+                "description": "Groups function/custom tools under a shared namespace."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "namespace"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Groups function/custom tools under a shared namespace."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ToolSearchToolParam",
+                "description": "Hosted or BYOT tool search configuration for deferred tools."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "tool_search"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Hosted or BYOT tool search configuration for deferred tools."
           },
           {
             "allOf": [
@@ -13010,7 +14563,49 @@
               "type": {
                 "type": "string",
                 "enum": [
+                  "computer"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
                   "computer_use_preview"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "computer_use"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "web_search_preview_2025_03_11"
                 ]
               }
             }
@@ -13045,6 +14640,224 @@
           }
         ],
         "description": "The type of hosted tool the model should to use. Learn more about\n[built-in tools](https://platform.openai.com/docs/guides/tools)."
+      },
+      "ToolSearchCall": {
+        "type": "object",
+        "description": "A tool search call output item.",
+        "required": [
+          "id",
+          "execution",
+          "arguments",
+          "status"
+        ],
+        "properties": {
+          "arguments": {
+            "description": "Arguments used for the tool search call."
+          },
+          "call_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The unique ID of the tool search call generated by the model."
+          },
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The identifier of the actor that created the item."
+          },
+          "execution": {
+            "$ref": "#/components/schemas/ToolSearchExecutionType",
+            "description": "Whether tool search was executed by the server or by the client."
+          },
+          "id": {
+            "type": "string",
+            "description": "The unique ID of the tool search call item."
+          },
+          "status": {
+            "$ref": "#/components/schemas/FunctionCallStatus",
+            "description": "The status of the tool search call item."
+          }
+        }
+      },
+      "ToolSearchCallItemParam": {
+        "type": "object",
+        "description": "A tool search call input item.",
+        "properties": {
+          "arguments": {
+            "description": "The arguments supplied to the tool search call."
+          },
+          "call_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The unique ID of the tool search call generated by the model."
+          },
+          "execution": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ToolSearchExecutionType",
+                "description": "Whether tool search was executed by the server or by the client."
+              }
+            ]
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The unique ID of this tool search call."
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OutputStatus",
+                "description": "The status of the tool search call."
+              }
+            ]
+          }
+        }
+      },
+      "ToolSearchExecutionType": {
+        "type": "string",
+        "description": "Whether tool search was executed by the server or by the client.",
+        "enum": [
+          "server",
+          "client"
+        ]
+      },
+      "ToolSearchOutput": {
+        "type": "object",
+        "description": "A tool search output item.",
+        "required": [
+          "id",
+          "execution",
+          "tools",
+          "status"
+        ],
+        "properties": {
+          "call_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The unique ID of the tool search call generated by the model."
+          },
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The identifier of the actor that created the item."
+          },
+          "execution": {
+            "$ref": "#/components/schemas/ToolSearchExecutionType",
+            "description": "Whether tool search was executed by the server or by the client."
+          },
+          "id": {
+            "type": "string",
+            "description": "The unique ID of the tool search output item."
+          },
+          "status": {
+            "$ref": "#/components/schemas/FunctionCallOutputStatusEnum",
+            "description": "The status of the tool search output item."
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tool"
+            },
+            "description": "The loaded tool definitions returned by tool search."
+          }
+        }
+      },
+      "ToolSearchOutputItemParam": {
+        "type": "object",
+        "description": "A tool search output input item.",
+        "required": [
+          "tools"
+        ],
+        "properties": {
+          "call_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The unique ID of the tool search call generated by the model."
+          },
+          "execution": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ToolSearchExecutionType",
+                "description": "Whether tool search was executed by the server or by the client."
+              }
+            ]
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The unique ID of this tool search output."
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OutputStatus",
+                "description": "The status of the tool search output."
+              }
+            ]
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tool"
+            },
+            "description": "The loaded tool definitions returned by the tool search output."
+          }
+        }
+      },
+      "ToolSearchToolParam": {
+        "type": "object",
+        "description": "Hosted or BYOT tool search configuration for deferred tools.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Description shown to the model for a client-executed tool search tool."
+          },
+          "execution": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ToolSearchExecutionType",
+                "description": "Whether tool search is executed by the server or by the client."
+              }
+            ]
+          },
+          "parameters": {
+            "description": "Parameter schema for a client-executed tool search tool."
+          }
+        }
       },
       "TopLogProb": {
         "type": "object",
@@ -13109,7 +14922,7 @@
           "disabled"
         ]
       },
-      "Type": {
+      "TypeParam": {
         "type": "object",
         "description": "A typing (text entry) action.",
         "required": [
@@ -13247,12 +15060,12 @@
       },
       "WebSearchActionOpenPage": {
         "type": "object",
-        "required": [
-          "url"
-        ],
         "properties": {
           "url": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "The URL opened by the model."
           }
         }
@@ -13299,9 +15112,6 @@
       "WebSearchApproximateLocation": {
         "type": "object",
         "description": "Approximate user location for web search.",
-        "required": [
-          "type"
-        ],
         "properties": {
           "city": {
             "type": [
@@ -13333,7 +15143,7 @@
           },
           "type": {
             "$ref": "#/components/schemas/WebSearchApproximateLocationType",
-            "description": "The type of location approximation. Always `approximate`."
+            "description": "The type of location approximation. Defaults to `approximate` when omitted in JSON input."
           }
         }
       },
@@ -13428,6 +15238,16 @@
               }
             ]
           },
+          "search_content_types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/SearchContentType"
+            },
+            "description": "The types of content to search for."
+          },
           "search_context_size": {
             "oneOf": [
               {
@@ -13456,14 +15276,20 @@
         "type": "object",
         "description": "Web search tool call output.",
         "required": [
-          "action",
           "id",
           "status"
         ],
         "properties": {
           "action": {
-            "$ref": "#/components/schemas/WebSearchToolCallAction",
-            "description": "An object describing the specific action taken in this web search call. Includes\ndetails on how the model used the web (search, open_page, find)."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WebSearchToolCallAction",
+                "description": "An object describing the specific action taken in this web search call. Includes\ndetails on how the model used the web (search, open_page, find, find_in_page).\n\nThis is optional because `response.output_item.added` events can include\nin-progress web search calls before OpenAI has populated the action.\nSee <https://github.com/64bit/async-openai/issues/548>."
+              }
+            ]
           },
           "id": {
             "type": "string",
@@ -13545,6 +15371,29 @@
               }
             ],
             "description": "Action type \"find\": Searches for a pattern within a loaded page."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/WebSearchActionFind",
+                "description": "Action type \"find_in_page\": <https://platform.openai.com/docs/guides/tools-web-search#output-and-citations>"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "find_in_page"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Action type \"find_in_page\": <https://platform.openai.com/docs/guides/tools-web-search#output-and-citations>"
           }
         ]
       },
