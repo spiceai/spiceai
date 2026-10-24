@@ -499,7 +499,13 @@ pub(crate) fn bounded_sort_stream(
                     started: Instant::now(),
                     ended: false,
                 });
-                match util::stream_utils::sort_stream(input, &sort_columns, &task_ctx) {
+                let budget = super::compaction::maintenance_sort_budget(&task_ctx);
+                match util::stream_utils::sort_stream_with_budget(
+                    input,
+                    &sort_columns,
+                    &task_ctx,
+                    budget,
+                ) {
                     Ok(sorted) => {
                         state.current = Some(BoundedSortRun {
                             stream: sorted,
