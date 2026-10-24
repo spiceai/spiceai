@@ -31,10 +31,12 @@ limitations under the License.
 //! as `InvalidQuery` before the stream's error is read. The guard still
 //! streams (one batch at a time, like the sink's `mpsc::channel(1)`), records
 //! the first stream or uniqueness error, and prefers that over the sink's
-//! misleading message. An input-stream error is marked with
-//! [`check_and_mark_retriable_error`] before it is stored, matching the
-//! `DuckDB` and `SQLite` sinks; a NULL or uniqueness error the guard itself
-//! raises stays permanent.
+//! `Query is not read-only` lie (#14757) or over the sink wrapping this same
+//! guard error (`DuckDB` marks every non-SQL/Plan/Schema stream `Err`
+//! retriable). An independent storage failure stays the sink's error. An
+//! input-stream error is marked with [`check_and_mark_retriable_error`]
+//! before it is stored, matching the `DuckDB` and `SQLite` sinks; a NULL or
+//! uniqueness error the guard itself raises stays permanent.
 
 use std::{
     collections::HashSet,
@@ -253,16 +255,27 @@ fn sink_is_sqlite_closed_channel_lie(error: &DataFusionError) -> bool {
     error.to_string().contains("Query is not read-only")
 }
 
+/// The sink forwarded this same guard error (possibly after
+/// [`check_and_mark_retriable_error`]).
+fn sink_wraps_this_guard_error(sink: &DataFusionError, snapshot: &GuardErrorSnapshot) -> bool {
+    !snapshot.message.is_empty() && sink.to_string().contains(&snapshot.message)
+}
+
 fn prefer_stored_guard_error(slot: &GuardErrorSlot, sink: DataFusionError) -> DataFusionError {
     let stored = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match stored.as_ref() {
-        // A NULL or uniqueness error the guard raised stays permanent even if
-        // the sink marked the stream `Err` retriable (`DuckDB` does that for
-        // every non-SQL/Plan/Schema error). A retriable stream snapshot is
-        // restored only for SQLite's closed-channel lie (#14757).
-        Some(snapshot) if !snapshot.retriable || sink_is_sqlite_closed_channel_lie(&sink) => {
+        // Restore only SQLite's closed-channel lie (#14757) or the sink
+        // wrapping this same guard error (`DuckDB` marks every
+        // non-SQL/Plan/Schema stream `Err` retriable, including a NULL or
+        // uniqueness the guard raised). An independent storage failure stays
+        // the sink's error even when the guard later recorded a permanent
+        // snapshot.
+        Some(snapshot)
+            if sink_is_sqlite_closed_channel_lie(&sink)
+                || sink_wraps_this_guard_error(&sink, snapshot) =>
+        {
             restore_guard_error(snapshot)
         }
         _ => sink,
@@ -514,7 +527,8 @@ impl ExecutionPlan for PkWriteGuardExec {
 }
 
 /// Prefers the guard stream's first error over a sink that reports
-/// `Query is not read-only` after that stream failed (#14757).
+/// `Query is not read-only` after that stream failed (#14757), or that
+/// wrapped this same guard error. An independent sink failure is left alone.
 #[derive(Debug)]
 struct PreferGuardErrorExec {
     input: Arc<dyn ExecutionPlan>,
@@ -1265,5 +1279,54 @@ mod tests {
             !is_retriable_error(&error),
             "an unmarked storage failure must stay unmarked, got: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn prefer_guard_error_keeps_an_independent_sink_storage_error_over_a_permanent_snapshot()
+    {
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+        use datafusion_table_providers::util::retriable_error::is_retriable_error;
+        use datafusion_table_providers::util::test::MockExec;
+        use std::sync::Mutex;
+
+        let ctx = SessionContext::new();
+        let permanent = [
+            (
+                "null",
+                datafusion::error::DataFusionError::Execution(null_primary_key_message(
+                    &batch(&[(None, "nullpk")]),
+                    &[0],
+                )),
+            ),
+            ("uniqueness", super::uniqueness_error(&schema(), &[0])),
+        ];
+        for (label, stored) in permanent {
+            let slot = Arc::new(Mutex::new(None));
+            super::remember_constraint_error(&slot, &stored);
+            let input = Arc::new(MockExec::new(
+                vec![Err(datafusion::error::DataFusionError::Execution(
+                    "database or disk is full".to_string(),
+                ))],
+                schema(),
+            ));
+            let exec = super::PreferGuardErrorExec::new(input, slot);
+            let error = collect(Arc::new(exec), ctx.task_ctx())
+                .await
+                .expect_err("an independent sink storage error must still fail the write");
+            let message = error.to_string();
+            assert!(
+                message.contains("database or disk is full"),
+                "{label}: an independent storage failure must be reported, got: {message}"
+            );
+            assert!(
+                !message.contains("Primary key") && !message.contains("uniqueness"),
+                "{label}: a later permanent guard snapshot must not replace an independent sink failure, got: {message}"
+            );
+            assert!(
+                !is_retriable_error(&error),
+                "{label}: an unmarked storage failure must stay unmarked, got: {error}"
+            );
+        }
     }
 }
