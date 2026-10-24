@@ -31,7 +31,6 @@ futures = { workspace = true }
 google-genai = { path = "../google-genai" }
 governor.workspace = true
 
-hf-hub.workspace = true
 huggingface-hub = { path = "../huggingface-hub" }
 http.workspace = true
 insta = { workspace = true, features = ["filters"] }
@@ -76,6 +75,7 @@ token_provider = { path = "../token_provider" }
 model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "55fef28a3556895b20204634b788f7c836b610bc", optional = true } # branch: spiceai
 
 [dev-dependencies]
+hf-hub.workspace = true
 wiremock = "0.6"
 anyhow.workspace = true
 aws-credential-types.workspace = true

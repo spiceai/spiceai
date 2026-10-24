@@ -674,6 +674,86 @@ async fn a_component_spice_loads_once_says_to_restart() {
 }
 
 #[tokio::test]
+async fn open_paths_describes_only_the_files_named() {
+    // A component that reads one file of a repository looks at that file, and never lists a
+    // repository that may hold many. Warm, it costs one request: the answer that names the
+    // commit.
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    let open = |paths: &'static [&'static str]| {
+        let fixture = &fixture;
+        async move {
+            Snapshot::open_paths(
+                fixture.settings(&[]).await,
+                requester(),
+                RepoId::new(RepoType::Model, "o", "m").expect("a valid repository"),
+                None,
+                paths,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the snapshot opens: {e}"))
+        }
+    };
+    let requests = |fixture: &Fixture| -> Vec<String> {
+        fixture
+            .mock
+            .seen()
+            .into_iter()
+            .map(|seen| seen.path)
+            .collect()
+    };
+
+    let snapshot = open(&["tokenizer.json", "absent.json"]).await;
+    assert_eq!(snapshot.commit(), C1);
+    assert_eq!(
+        snapshot
+            .files()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tokenizer.json"]
+    );
+    let paths = snapshot
+        .download(&["tokenizer.json"])
+        .await
+        .unwrap_or_else(|e| panic!("the file downloads: {e}"));
+    assert_eq!(
+        std::fs::read_to_string(&paths[0]).expect("the file"),
+        "{\"version\":\"1.0\"}"
+    );
+    let cold = requests(&fixture);
+    assert!(
+        cold.iter()
+            .any(|path| path.starts_with("/o/m/resolve/main/tokenizer.json"))
+            && cold.iter().any(|path| path.contains("/paths-info/"))
+            && !cold.iter().any(|path| path.contains("/tree/")),
+        "{cold:#?}"
+    );
+    // A file the repository does not have is named when it is downloaded.
+    let error = snapshot
+        .download(&["absent.json"])
+        .await
+        .expect_err("the repository has no such file");
+    assert_eq!(
+        error.to_string(),
+        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the repo has no 'absent.json'. See: https://spiceai.org/docs/components/models/huggingface"
+    );
+
+    // Warm: one request names the commit, and the cached file is used as it is.
+    fixture.mock.clear_seen();
+    let warm = open(&["tokenizer.json"]).await;
+    let located = warm
+        .download(&["tokenizer.json"])
+        .await
+        .unwrap_or_else(|e| panic!("the cached file loads: {e}"));
+    assert_eq!(located, paths);
+    assert_eq!(
+        requests(&fixture),
+        vec!["/o/m/resolve/main/tokenizer.json".to_string()]
+    );
+}
+
+#[tokio::test]
 async fn a_missing_revision_does_not_fall_back_to_the_cache() {
     let fixture = Fixture::new().await;
     fixture.mock.commit(MODEL, C1, model_files());
