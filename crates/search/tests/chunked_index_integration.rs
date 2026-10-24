@@ -94,6 +94,7 @@ struct RecordingInner {
     search_column: String,
     write_calls: AtomicUsize,
     write_row_counts: std::sync::Mutex<Vec<usize>>,
+    truncate_calls: AtomicUsize,
 }
 
 impl RecordingInner {
@@ -102,6 +103,7 @@ impl RecordingInner {
             search_column: search_column.to_string(),
             write_calls: AtomicUsize::new(0),
             write_row_counts: std::sync::Mutex::new(Vec::new()),
+            truncate_calls: AtomicUsize::new(0),
         }
     }
 
@@ -117,6 +119,10 @@ impl Index for RecordingInner {
     }
     fn required_columns(&self) -> Vec<String> {
         vec![self.search_column.clone()]
+    }
+    async fn truncate(&self) -> datafusion::error::Result<()> {
+        self.truncate_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -390,4 +396,17 @@ async fn chunked_index_emits_bounded_intermediate_batches_to_inner() {
             .is_none(),
         "{CHUNKED_INDEX_CHUNK_KEY} must not leak out of the indexer"
     );
+}
+
+/// A CDC truncate reaches the chunked index, whose chunks all live in the inner index's own
+/// store. Without the forward the inner store keeps every chunk of a truncated table.
+#[tokio::test]
+async fn truncate_reaches_the_inner_index() {
+    let inner = Arc::new(RecordingInner::new("content"));
+    let chunked_index = ChunkedSearchIndex::new(
+        Arc::clone(&inner) as Arc<dyn SearchIndex>,
+        Arc::new(FixedCountChunker { n: 2 }) as Arc<dyn Chunker>,
+    );
+    chunked_index.truncate().await.expect("truncate");
+    assert_eq!(inner.truncate_calls.load(Ordering::SeqCst), 1);
 }
