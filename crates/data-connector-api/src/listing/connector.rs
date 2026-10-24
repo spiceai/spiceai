@@ -3176,6 +3176,69 @@ mod tests {
         );
     }
 
+    /// A federated (non-accelerated) directory dataset reads the files present at query
+    /// time: a file added or deleted after registration shows up in the next query.
+    #[tokio::test]
+    async fn federated_listing_table_sees_added_and_deleted_files() {
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        fn write_parquet(path: &std::path::Path, id: i64) {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arrow::array::Int64Array::from(vec![id]))],
+            )
+            .expect("valid batch");
+            let mut writer = ArrowWriter::try_new(
+                std::fs::File::create(path).expect("create parquet"),
+                schema,
+                None,
+            )
+            .expect("parquet writer");
+            writer.write(&batch).expect("write parquet");
+            writer.close().expect("close parquet");
+        }
+
+        async fn count_and_sum(ctx: &SessionContext) -> (i64, i64) {
+            let batches = ctx
+                .sql("SELECT COUNT(*) AS n, SUM(id) AS s FROM t")
+                .await
+                .expect("plan count/sum")
+                .collect()
+                .await
+                .expect("collect count/sum");
+            let col = |i: usize| {
+                batches[0]
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("Int64 column")
+                    .value(0)
+            };
+            (col(0), col(1))
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_parquet(&dir.path().join("a.parquet"), 1);
+        write_parquet(&dir.path().join("b.parquet"), 2);
+
+        // The default `RuntimeEnv`, like the runtime's query engine, has a list-files cache.
+        let ctx = SessionContext::new();
+        let table_url = format!("file://{}/", dir.path().display());
+        register_parquet_listing(&ctx, "t", &table_url, None).await;
+        assert_eq!(count_and_sum(&ctx).await, (2, 3));
+
+        write_parquet(&dir.path().join("c.parquet"), 3);
+        assert_eq!(count_and_sum(&ctx).await, (3, 6), "added file is read");
+
+        std::fs::remove_file(dir.path().join("a.parquet")).expect("delete a.parquet");
+        assert_eq!(
+            count_and_sum(&ctx).await,
+            (2, 5),
+            "deleted file is not read"
+        );
+    }
+
     fn write_orc_fixture(path: &std::path::Path, batch: &RecordBatch) {
         let mut out = Vec::new();
         let mut writer = orc_rust::arrow_writer::ArrowWriterBuilder::new(&mut out, batch.schema())
