@@ -9,6 +9,9 @@ statement error overflow
 SELECT SUM(big) FROM t;
 
 statement error overflow
+SELECT SUM(DISTINCT big) FROM t;
+
+statement error overflow
 SELECT big + 1 FROM t WHERE id = 1;
 
 statement error overflow
@@ -51,6 +54,11 @@ SELECT SUM(i) FROM t WHERE id IN (3, 4);
 
 query I
 SELECT SUM(big) FROM t WHERE id IN (3, 4);
+----
+3
+
+query I
+SELECT SUM(DISTINCT big) FROM t WHERE id IN (3, 4);
 ----
 3
 

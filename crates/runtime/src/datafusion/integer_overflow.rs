@@ -80,6 +80,12 @@ async fn built_session_errors_on_bigint_sum_and_add() {
         "built session SUM(BIGINT) must overflow, got {sum}"
     );
 
+    let distinct = query_error(&df.ctx, "SELECT SUM(DISTINCT big) FROM t").await;
+    assert!(
+        distinct.to_ascii_lowercase().contains("overflow"),
+        "built session SUM(DISTINCT BIGINT) must overflow, got {distinct}"
+    );
+
     let add = query_error(&df.ctx, "SELECT big + 1 FROM t WHERE id = 1").await;
     assert!(
         add.to_ascii_lowercase().contains("overflow"),
@@ -97,4 +103,19 @@ async fn built_session_errors_on_bigint_sum_and_add() {
     let value =
         arrow::util::display::array_value_to_string(safe[0].column(0), 0).expect("render safe SUM");
     assert_eq!(value, "3", "non-overflowing SUM(BIGINT) must stay 3");
+
+    let safe_distinct = df
+        .ctx
+        .sql("SELECT SUM(DISTINCT big) FROM t WHERE id IN (3, 4)")
+        .await
+        .expect("plan safe SUM(DISTINCT)")
+        .collect()
+        .await
+        .expect("run safe SUM(DISTINCT)");
+    let distinct_value = arrow::util::display::array_value_to_string(safe_distinct[0].column(0), 0)
+        .expect("render safe SUM(DISTINCT)");
+    assert_eq!(
+        distinct_value, "3",
+        "non-overflowing SUM(DISTINCT BIGINT) must stay 3"
+    );
 }

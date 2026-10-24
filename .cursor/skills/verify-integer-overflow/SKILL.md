@@ -16,8 +16,11 @@ On a built `spiced` from this branch, each of `t_fed`, `t_arrow`, and `t_cayenne
 1. Return an error whose text contains `overflow` for `SELECT SUM(big) FROM <table>` (never a number).
 2. Return an error whose text contains `overflow` for `SELECT big + 1 FROM <table> WHERE id = 1`.
 3. Return `3` for `SELECT SUM(big) FROM <table> WHERE id IN (3, 4)`.
+4. Return an error whose text contains `overflow` for `SELECT SUM(DISTINCT big) FROM <table>`.
+5. Return `3` for `SELECT SUM(DISTINCT big) FROM <table> WHERE id IN (3, 4)`.
+6. Return an error whose text contains `overflow` for window `SUM(DISTINCT big)` over `id IN (1, 3)`.
 
-On trunk, the same two overflow queries return a wrapped integer and no error.
+On trunk, the overflow queries return a wrapped integer and no error.
 
 ## Layout
 

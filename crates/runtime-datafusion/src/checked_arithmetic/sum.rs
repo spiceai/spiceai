@@ -22,8 +22,13 @@ limitations under the License.
 //! widens to `i128` / `u128`. Partial state is `Decimal128(38, 0)` so a
 //! partition whose running total does not fit in `Int64` can still cancel at
 //! merge; [`Accumulator::evaluate`] is the only narrowing point.
+//!
+//! `SUM(DISTINCT)` is covered too: `DataFusion`'s distinct accumulator wraps
+//! unique values with `add_wrapping`, so `{i64::MAX, 1}` becomes `i64::MIN`.
+//! Distinct state stays a list of unique keys; evaluate is the narrowing point.
 
-use std::mem::size_of_val;
+use std::collections::{HashMap, HashSet};
+use std::mem::{size_of, size_of_val};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, PrimitiveArray};
@@ -93,18 +98,27 @@ impl AggregateUDFImpl for CheckedSum {
     }
 
     fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        if args.is_distinct {
-            return self.inner.accumulator(args);
-        }
         match args.return_field.data_type() {
+            DataType::Int64 if args.is_distinct => Ok(Box::new(CheckedInt64DistinctSum::new())),
             DataType::Int64 => Ok(Box::new(CheckedInt64Sum::new())),
+            DataType::UInt64 if args.is_distinct => Ok(Box::new(CheckedUInt64DistinctSum::new())),
             DataType::UInt64 => Ok(Box::new(CheckedUInt64Sum::new())),
             _ => self.inner.accumulator(args),
         }
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        if !args.is_distinct && is_checked_sum_return_type(args.return_type()) {
+        if is_checked_sum_return_type(args.return_type()) {
+            if args.is_distinct {
+                return Ok(vec![
+                    Field::new_list(
+                        format_state_name(args.name, "sum distinct"),
+                        Field::new_list_field(args.return_type().clone(), true),
+                        false,
+                    )
+                    .into(),
+                ]);
+            }
             return Ok(vec![
                 Field::new(
                     format_state_name(args.name, "sum"),
@@ -118,7 +132,7 @@ impl AggregateUDFImpl for CheckedSum {
     }
 
     fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
-        if !args.is_distinct && is_checked_sum_return_type(args.return_field.data_type()) {
+        if is_checked_sum_return_type(args.return_field.data_type()) {
             return false;
         }
         self.inner.groups_accumulator_supported(args)
@@ -128,7 +142,7 @@ impl AggregateUDFImpl for CheckedSum {
         &self,
         args: AccumulatorArgs,
     ) -> Result<Box<dyn GroupsAccumulator>> {
-        if !args.is_distinct && is_checked_sum_return_type(args.return_field.data_type()) {
+        if is_checked_sum_return_type(args.return_field.data_type()) {
             return not_impl_err!(
                 "checked integer SUM does not provide a GroupsAccumulator; use the row accumulator"
             );
@@ -137,11 +151,14 @@ impl AggregateUDFImpl for CheckedSum {
     }
 
     fn create_sliding_accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        if args.is_distinct {
-            return self.inner.create_sliding_accumulator(args);
-        }
         match args.return_field.data_type() {
+            DataType::Int64 if args.is_distinct => {
+                Ok(Box::new(CheckedInt64SlidingDistinctSum::new()))
+            }
             DataType::Int64 => Ok(Box::new(CheckedInt64SlidingSum::new())),
+            DataType::UInt64 if args.is_distinct => {
+                Ok(Box::new(CheckedUInt64SlidingDistinctSum::new()))
+            }
             DataType::UInt64 => Ok(Box::new(CheckedUInt64SlidingSum::new())),
             _ => self.inner.create_sliding_accumulator(args),
         }
@@ -293,6 +310,84 @@ fn non_null_count(array: &dyn Array) -> Result<u64> {
             "SUM batch is larger than u64::MAX".to_string(),
         )
     })
+}
+
+fn list_state(values: &[ScalarValue], data_type: &DataType) -> Vec<ScalarValue> {
+    vec![ScalarValue::List(ScalarValue::new_list_nullable(
+        values, data_type,
+    ))]
+}
+
+fn int64_list_state(values: &HashSet<i64>) -> Vec<ScalarValue> {
+    let keys: Vec<ScalarValue> = values
+        .iter()
+        .copied()
+        .map(Some)
+        .map(ScalarValue::Int64)
+        .collect();
+    list_state(&keys, &DataType::Int64)
+}
+
+fn uint64_list_state(values: &HashSet<u64>) -> Vec<ScalarValue> {
+    let keys: Vec<ScalarValue> = values
+        .iter()
+        .copied()
+        .map(Some)
+        .map(ScalarValue::UInt64)
+        .collect();
+    list_state(&keys, &DataType::UInt64)
+}
+
+fn distinct_list_array(states: &[ArrayRef]) -> Result<&arrow::array::ListArray> {
+    let array = first_array(states)?;
+    array.as_list_opt::<i32>().ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(format!(
+            "checked SUM(DISTINCT) expected List state, got {}",
+            array.data_type()
+        ))
+    })
+}
+
+fn merge_int64_distinct(values: &mut HashSet<i64>, states: &[ArrayRef]) -> Result<()> {
+    for maybe_inner in distinct_list_array(states)?.iter().flatten() {
+        values.extend(int64_values(&maybe_inner)?.iter().flatten());
+    }
+    Ok(())
+}
+
+fn merge_uint64_distinct(values: &mut HashSet<u64>, states: &[ArrayRef]) -> Result<()> {
+    for maybe_inner in distinct_list_array(states)?.iter().flatten() {
+        values.extend(uint64_values(&maybe_inner)?.iter().flatten());
+    }
+    Ok(())
+}
+
+fn fold_distinct_i64(values: &HashSet<i64>) -> Result<ScalarValue> {
+    if values.is_empty() {
+        return Ok(ScalarValue::Int64(None));
+    }
+    let mut acc = 0_i128;
+    for value in values {
+        acc = acc
+            .checked_add(i128::from(*value))
+            .ok_or_else(int64_overflow)?;
+    }
+    let value = i64::try_from(acc).map_err(|_| int64_overflow())?;
+    Ok(ScalarValue::Int64(Some(value)))
+}
+
+fn fold_distinct_u64(values: &HashSet<u64>) -> Result<ScalarValue> {
+    if values.is_empty() {
+        return Ok(ScalarValue::UInt64(None));
+    }
+    let mut acc = 0_u128;
+    for value in values {
+        acc = acc
+            .checked_add(u128::from(*value))
+            .ok_or_else(uint64_overflow)?;
+    }
+    let value = u64::try_from(acc).map_err(|_| uint64_overflow())?;
+    Ok(ScalarValue::UInt64(Some(value)))
 }
 
 #[derive(Debug, Default)]
@@ -554,6 +649,306 @@ impl Accumulator for CheckedUInt64SlidingSum {
     }
 }
 
+#[derive(Debug, Default)]
+struct CheckedInt64DistinctSum {
+    values: HashSet<i64>,
+}
+
+impl CheckedInt64DistinctSum {
+    fn new() -> Self {
+        Self {
+            values: HashSet::new(),
+        }
+    }
+}
+
+impl Accumulator for CheckedInt64DistinctSum {
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        Ok(int64_list_state(&self.values))
+    }
+
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.values
+            .extend(int64_values(first_array(values)?)?.iter().flatten());
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        merge_int64_distinct(&mut self.values, states)
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        fold_distinct_i64(&self.values)
+    }
+
+    fn size(&self) -> usize {
+        size_of_val(self) + self.values.capacity() * size_of::<i64>()
+    }
+}
+
+#[derive(Debug, Default)]
+struct CheckedUInt64DistinctSum {
+    values: HashSet<u64>,
+}
+
+impl CheckedUInt64DistinctSum {
+    fn new() -> Self {
+        Self {
+            values: HashSet::new(),
+        }
+    }
+}
+
+impl Accumulator for CheckedUInt64DistinctSum {
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        Ok(uint64_list_state(&self.values))
+    }
+
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.values
+            .extend(uint64_values(first_array(values)?)?.iter().flatten());
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        merge_uint64_distinct(&mut self.values, states)
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        fold_distinct_u64(&self.values)
+    }
+
+    fn size(&self) -> usize {
+        size_of_val(self) + self.values.capacity() * size_of::<u64>()
+    }
+}
+
+#[derive(Debug, Default)]
+struct CheckedInt64SlidingDistinctSum {
+    counts: HashMap<i64, usize>,
+    sum: i128,
+}
+
+impl CheckedInt64SlidingDistinctSum {
+    fn new() -> Self {
+        Self {
+            counts: HashMap::new(),
+            sum: 0,
+        }
+    }
+
+    fn update_value(&mut self, value: i64) -> Result<()> {
+        match self.counts.entry(value) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.sum = self
+                    .sum
+                    .checked_add(i128::from(value))
+                    .ok_or_else(int64_overflow)?;
+                entry.insert(1);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn retract_value(&mut self, value: i64) -> Result<()> {
+        let std::collections::hash_map::Entry::Occupied(mut entry) = self.counts.entry(value)
+        else {
+            return Ok(());
+        };
+        let remaining = entry.get().saturating_sub(1);
+        if remaining == 0 {
+            self.sum = self
+                .sum
+                .checked_sub(i128::from(value))
+                .ok_or_else(int64_overflow)?;
+            entry.remove();
+        } else {
+            *entry.get_mut() = remaining;
+        }
+        Ok(())
+    }
+
+    fn apply_valid_values<F>(&mut self, array: &PrimitiveArray<Int64Type>, mut op: F) -> Result<()>
+    where
+        F: FnMut(&mut Self, i64) -> Result<()>,
+    {
+        if array.null_count() == 0 {
+            for &value in array.values() {
+                op(self, value)?;
+            }
+        } else {
+            for (idx, &value) in array.values().iter().enumerate() {
+                if array.is_valid(idx) {
+                    op(self, value)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Accumulator for CheckedInt64SlidingDistinctSum {
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        let keys: Vec<ScalarValue> = self
+            .counts
+            .keys()
+            .copied()
+            .map(Some)
+            .map(ScalarValue::Int64)
+            .collect();
+        Ok(list_state(&keys, &DataType::Int64))
+    }
+
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.apply_valid_values(int64_values(first_array(values)?)?, Self::update_value)
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        let mut keys = HashSet::new();
+        merge_int64_distinct(&mut keys, states)?;
+        for value in keys {
+            self.update_value(value)?;
+        }
+        Ok(())
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        if self.counts.is_empty() {
+            return Ok(ScalarValue::Int64(None));
+        }
+        let value = i64::try_from(self.sum).map_err(|_| int64_overflow())?;
+        Ok(ScalarValue::Int64(Some(value)))
+    }
+
+    fn size(&self) -> usize {
+        size_of_val(self) + self.counts.capacity() * size_of::<(i64, usize)>()
+    }
+
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.apply_valid_values(int64_values(first_array(values)?)?, Self::retract_value)
+    }
+
+    fn supports_retract_batch(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Default)]
+struct CheckedUInt64SlidingDistinctSum {
+    counts: HashMap<u64, usize>,
+    sum: u128,
+}
+
+impl CheckedUInt64SlidingDistinctSum {
+    fn new() -> Self {
+        Self {
+            counts: HashMap::new(),
+            sum: 0,
+        }
+    }
+
+    fn update_value(&mut self, value: u64) -> Result<()> {
+        match self.counts.entry(value) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.sum = self
+                    .sum
+                    .checked_add(u128::from(value))
+                    .ok_or_else(uint64_overflow)?;
+                entry.insert(1);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn retract_value(&mut self, value: u64) -> Result<()> {
+        let std::collections::hash_map::Entry::Occupied(mut entry) = self.counts.entry(value)
+        else {
+            return Ok(());
+        };
+        let remaining = entry.get().saturating_sub(1);
+        if remaining == 0 {
+            self.sum = self
+                .sum
+                .checked_sub(u128::from(value))
+                .ok_or_else(uint64_overflow)?;
+            entry.remove();
+        } else {
+            *entry.get_mut() = remaining;
+        }
+        Ok(())
+    }
+
+    fn apply_valid_values<F>(&mut self, array: &PrimitiveArray<UInt64Type>, mut op: F) -> Result<()>
+    where
+        F: FnMut(&mut Self, u64) -> Result<()>,
+    {
+        if array.null_count() == 0 {
+            for &value in array.values() {
+                op(self, value)?;
+            }
+        } else {
+            for (idx, &value) in array.values().iter().enumerate() {
+                if array.is_valid(idx) {
+                    op(self, value)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Accumulator for CheckedUInt64SlidingDistinctSum {
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        let keys: Vec<ScalarValue> = self
+            .counts
+            .keys()
+            .copied()
+            .map(Some)
+            .map(ScalarValue::UInt64)
+            .collect();
+        Ok(list_state(&keys, &DataType::UInt64))
+    }
+
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.apply_valid_values(uint64_values(first_array(values)?)?, Self::update_value)
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        let mut keys = HashSet::new();
+        merge_uint64_distinct(&mut keys, states)?;
+        for value in keys {
+            self.update_value(value)?;
+        }
+        Ok(())
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        if self.counts.is_empty() {
+            return Ok(ScalarValue::UInt64(None));
+        }
+        let value = u64::try_from(self.sum).map_err(|_| uint64_overflow())?;
+        Ok(ScalarValue::UInt64(Some(value)))
+    }
+
+    fn size(&self) -> usize {
+        size_of_val(self) + self.counts.capacity() * size_of::<(u64, usize)>()
+    }
+
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.apply_valid_values(uint64_values(first_array(values)?)?, Self::retract_value)
+    }
+
+    fn supports_retract_batch(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod state_tests {
     use super::*;
@@ -609,6 +1004,55 @@ mod state_tests {
         assert_eq!(
             merged.evaluate().expect("cancelled total"),
             ScalarValue::Int64(Some(i64::MAX))
+        );
+    }
+
+    #[test]
+    fn int64_distinct_duplicates_are_unique_and_max_plus_one_overflows() {
+        let mut acc = CheckedInt64DistinctSum::new();
+        acc.update_batch(&[int64_col(&[Some(i64::MAX), Some(i64::MAX)])])
+            .expect("two copies of MAX");
+        assert_eq!(
+            acc.evaluate().expect("DISTINCT of one value"),
+            ScalarValue::Int64(Some(i64::MAX))
+        );
+
+        let mut overflow = CheckedInt64DistinctSum::new();
+        overflow
+            .update_batch(&[int64_col(&[Some(i64::MAX), Some(1)])])
+            .expect("MAX and 1");
+        let error = overflow
+            .evaluate()
+            .expect_err("DISTINCT MAX+1 must overflow");
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("overflow"),
+            "distinct overflow, got {error}"
+        );
+    }
+
+    #[test]
+    fn int64_distinct_merge_unions_keys_then_overflows() {
+        let mut left = CheckedInt64DistinctSum::new();
+        left.update_batch(&[int64_col(&[Some(i64::MAX)])])
+            .expect("left MAX");
+        let mut right = CheckedInt64DistinctSum::new();
+        right
+            .update_batch(&[int64_col(&[Some(1)])])
+            .expect("right 1");
+
+        let mut merged = CheckedInt64DistinctSum::new();
+        let left_state = left.state().expect("left state");
+        let left_array = left_state[0].to_array().expect("left state array");
+        merged.merge_batch(&[left_array]).expect("merge left");
+        let right_state = right.state().expect("right state");
+        let right_array = right_state[0].to_array().expect("right state array");
+        merged.merge_batch(&[right_array]).expect("merge right");
+        let error = merged
+            .evaluate()
+            .expect_err("merged DISTINCT MAX+1 must overflow");
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("overflow"),
+            "merged distinct overflow, got {error}"
         );
     }
 }

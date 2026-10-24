@@ -96,4 +96,7 @@ for table in t_fed t_arrow t_cayenne; do
   sql "SELECT SUM(big) FROM ${table}"
   sql "SELECT big + 1 FROM ${table} WHERE id = 1"
   sql "SELECT SUM(big) FROM ${table} WHERE id IN (3, 4)"
+  sql "SELECT SUM(DISTINCT big) FROM ${table}"
+  sql "SELECT SUM(DISTINCT big) FROM ${table} WHERE id IN (3, 4)"
+  sql "SELECT SUM(DISTINCT big) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM ${table} WHERE id IN (1, 3)"
 done

@@ -28,7 +28,10 @@ use datafusion::prelude::SessionContext;
 
 use crate::analyzer_rule::AnalyzerRulesBuilder;
 use crate::checked_arithmetic::op::checked_op_udf;
-use crate::checked_arithmetic::{CheckedIntegerOverflow, register_checked_arithmetic};
+use crate::checked_arithmetic::{
+    CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME, CheckedIntegerOverflow,
+    register_checked_arithmetic,
+};
 use crate::session_config::get_df_default_config;
 
 const SLT: &str = include_str!("integer_overflow.slt");
@@ -201,6 +204,43 @@ fn checked_ops_are_registered_for_plus_minus_multiply_only() {
     assert!(checked_op_udf(Operator::Minus).is_some());
     assert!(checked_op_udf(Operator::Multiply).is_some());
     assert!(checked_op_udf(Operator::Divide).is_none());
+    assert_eq!(
+        checked_op_udf(Operator::Plus).expect("plus").name(),
+        CHECKED_ADD_UDF_NAME
+    );
+    assert_eq!(
+        checked_op_udf(Operator::Minus).expect("minus").name(),
+        CHECKED_SUB_UDF_NAME
+    );
+    assert_eq!(
+        checked_op_udf(Operator::Multiply).expect("mul").name(),
+        CHECKED_MUL_UDF_NAME
+    );
+}
+
+#[tokio::test]
+async fn checked_helpers_are_not_a_public_sql_operator_api() {
+    let ctx = checked_session();
+    let ok = ctx
+        .sql("SELECT __spice_checked_add(CAST(1 AS BIGINT), CAST(2 AS BIGINT))")
+        .await
+        .expect("plan internal helper")
+        .collect()
+        .await
+        .expect("run internal helper");
+    assert_eq!(render_rows(&ok), vec!["3".to_string()]);
+
+    let error = match ctx.sql("SELECT spice_checked_add(1, 2)").await {
+        Err(error) => error.to_string(),
+        Ok(df) => match df.collect().await {
+            Err(error) => error.to_string(),
+            Ok(batches) => panic!("public helper name must not plan, got {batches:?}"),
+        },
+    };
+    assert!(
+        error.to_ascii_lowercase().contains("spice_checked_add"),
+        "unknown public name should be refused, got {error}"
+    );
 }
 
 #[tokio::test]
@@ -494,6 +534,112 @@ async fn checked_bounded_window_sum_retracts_and_null_only_frame_is_null() {
     assert!(
         contains_overflow(&overflow),
         "bounded window MAX+1 must overflow, got {overflow}\nplan:\n{overflow_plan}"
+    );
+}
+
+#[tokio::test]
+async fn vanilla_datafusion_wraps_int64_sum_distinct() {
+    let ctx = vanilla_session();
+    let sum = ctx
+        .sql("SELECT SUM(DISTINCT big) FROM t")
+        .await
+        .expect("plan vanilla SUM(DISTINCT)")
+        .collect()
+        .await
+        .expect("run vanilla SUM(DISTINCT)");
+    // All four values are distinct, so this wraps the same way as SUM(big).
+    assert_eq!(render_rows(&sum), vec!["0".to_string()]);
+}
+
+#[tokio::test]
+async fn checked_sum_distinct_int64_overflow_window_and_sanity() {
+    let ctx = checked_session();
+
+    let overflow_sql = "SELECT SUM(DISTINCT big) FROM t";
+    let (overflow_plan, overflow) = plan_and_error(&ctx, overflow_sql).await;
+    assert_plan_ran(&overflow_plan, overflow_sql, &["AggregateExec"]);
+    assert!(
+        contains_overflow(&overflow),
+        "SUM(DISTINCT) overflow, got {overflow}\nplan:\n{overflow_plan}"
+    );
+
+    // A second non-distinct aggregate keeps `SUM(DISTINCT)` on the distinct
+    // accumulator (`single_distinct_to_groupby` only fires when every aggregate
+    // is DISTINCT on the same column).
+    let forced_sql = "SELECT SUM(DISTINCT big), COUNT(*) FROM t";
+    let (forced_plan, forced) = plan_and_error(&ctx, forced_sql).await;
+    assert_plan_ran(&forced_plan, forced_sql, &["AggregateExec", "DISTINCT"]);
+    assert!(
+        contains_overflow(&forced),
+        "SUM(DISTINCT)+COUNT overflow, got {forced}\nplan:\n{forced_plan}"
+    );
+
+    let safe_sql = "SELECT SUM(DISTINCT big) FROM t WHERE id IN (3, 4)";
+    let (safe_plan, safe) = plan_and_collect(&ctx, safe_sql).await;
+    assert_plan_ran(&safe_plan, safe_sql, &["AggregateExec"]);
+    assert_eq!(render_rows(&safe), vec!["3".to_string()]);
+
+    let dups = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(5), Some(5), Some(7)])),
+        ],
+    )
+    .expect("distinct-dup batch");
+    register_table(&ctx, "t_ddup", dups);
+    let dups_sql = "SELECT SUM(DISTINCT v) FROM t_ddup";
+    let (dups_plan, dups_rows) = plan_and_collect(&ctx, dups_sql).await;
+    assert_plan_ran(&dups_plan, dups_sql, &["AggregateExec"]);
+    assert_eq!(
+        render_rows(&dups_rows),
+        vec!["12".to_string()],
+        "two 5s and a 7 must sum as 12\nplan:\n{dups_plan}"
+    );
+
+    register_int64_partitions(&ctx, "t_ddist", &[&[Some(i64::MAX)], &[Some(1)]]);
+    let merge_sql = "SELECT SUM(DISTINCT big) FROM t_ddist";
+    let (merge_plan, merge) = plan_and_error(&ctx, merge_sql).await;
+    assert_plan_ran(
+        &merge_plan,
+        merge_sql,
+        &["AggregateExec", "mode=Final", "mode=Partial"],
+    );
+    assert!(
+        contains_overflow(&merge),
+        "two-partition DISTINCT MAX+1 must overflow, got {merge}\nplan:\n{merge_plan}"
+    );
+
+    let window_sql = "SELECT SUM(DISTINCT big) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t WHERE id IN (1, 3)";
+    let (window_plan, window) = plan_and_error(&ctx, window_sql).await;
+    assert_plan_ran(&window_plan, window_sql, &["Window", "DISTINCT"]);
+    assert!(
+        contains_overflow(&window),
+        "window SUM(DISTINCT) MAX+1 must overflow, got {window}\nplan:\n{window_plan}"
+    );
+
+    let win_ok = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(5), Some(5), Some(7)])),
+        ],
+    )
+    .expect("window distinct-ok batch");
+    register_table(&ctx, "t_dwin_ok", win_ok);
+    let win_ok_sql = "SELECT SUM(DISTINCT v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t_dwin_ok";
+    let (win_ok_plan, win_ok_rows) = plan_and_collect(&ctx, win_ok_sql).await;
+    assert_plan_ran(&win_ok_plan, win_ok_sql, &["Window"]);
+    assert_eq!(
+        render_rows(&win_ok_rows),
+        vec!["5".to_string(), "5".to_string(), "12".to_string()],
+        "window SUM(DISTINCT) must keep the first 5 and add 7 once\nplan:\n{win_ok_plan}"
     );
 }
 
