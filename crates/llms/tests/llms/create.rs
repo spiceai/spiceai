@@ -133,7 +133,7 @@ pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError
     create_hf_model(
         model_id,
         None,
-        None,
+        &[],
         llms::hf::HubParams {
             token: token.as_ref(),
             token_in_spicepod: true,

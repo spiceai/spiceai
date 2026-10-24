@@ -176,6 +176,12 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     )
     .register(ctx);
 
+    // Places the remaining async calls (`ai`, async user functions). Runs after the
+    // decision rule, which places decision calls itself.
+    ctx.add_optimizer_rule(Arc::new(
+        runtime_datafusion_udfs::async_placement::AsyncCallPlacement,
+    ));
+
     in_tracing_context_async(register_user_functions(runtime, ctx)).await;
 }
 
