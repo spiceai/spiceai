@@ -23,7 +23,7 @@ use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
-use futures::future::try_join_all;
+use futures::future::{join_all, try_join_all};
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_datafusion::IcebergTableProvider;
 use tokio::sync::Semaphore;
@@ -32,6 +32,12 @@ use crate::RefreshableCatalogProvider;
 use crate::iceberg::catalog::Error;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// A namespace's loaded tables, and the tables that failed to load.
+struct NamespaceTables {
+    tables: HashMap<String, Arc<dyn TableProvider>>,
+    failed: Vec<(TableIdent, Error)>,
+}
 
 /// A hook that wraps each Iceberg table provider as it is loaded from the
 /// catalog, given its `(schema_name, table_name)`. The runtime injects this so
@@ -97,6 +103,7 @@ impl IcebergCatalogProvider {
             root_namespace.as_ref(),
             selector,
             table_wrapper.as_ref(),
+            &HashMap::new(),
         )
         .await?;
 
@@ -122,14 +129,20 @@ impl IcebergCatalogProvider {
     }
 
     /// Load all schemas (namespaces) from the Iceberg catalog.
+    ///
+    /// A table that fails to load is skipped with a warning, or keeps its
+    /// provider from `previous` (the schemas being refreshed) if it had one,
+    /// so one bad table does not take down the rest of the catalog. If no table
+    /// loads at all, the first failure is returned.
     async fn load_schemas(
         client: Arc<dyn Catalog>,
         root_namespace: Option<&NamespaceIdent>,
         selector: &TableSelector,
         table_wrapper: Option<&CatalogTableWrapper>,
+        previous: &HashMap<String, Arc<dyn SchemaProvider>>,
     ) -> Result<HashMap<String, Arc<dyn SchemaProvider>>> {
-        // Create the semaphore first, so we can use it in the closures below
-        let load_semaphore = Arc::new(Semaphore::new(10));
+        // Limits concurrent table loads across all namespaces.
+        let load_semaphore = Semaphore::new(10);
 
         // Keep each child namespace as a full `NamespaceIdent`. A REST catalog
         // returns children of `root_namespace` as multi-level identifiers (e.g.
@@ -159,27 +172,53 @@ impl IcebergCatalogProvider {
                 },
             };
 
-        let providers = try_join_all(child_namespaces.iter().map(|namespace| {
-            let semaphore_clone = Arc::clone(&load_semaphore);
-            IcebergSchemaProvider::try_new(
-                Arc::clone(&client),
-                namespace.clone(),
-                semaphore_clone,
+        let mut loaded = try_join_all(child_namespaces.iter().map(|namespace| {
+            IcebergSchemaProvider::load_tables(
+                &client,
+                namespace,
+                &load_semaphore,
                 selector,
-                table_wrapper.cloned(),
+                table_wrapper,
             )
         }))
         .await?;
 
-        let schemas: HashMap<String, Arc<dyn SchemaProvider>> = child_namespaces
-            .iter()
-            .map(schema_name_for_namespace)
-            .zip(providers)
-            .map(|(name, provider)| {
-                let provider = Arc::new(provider) as Arc<dyn SchemaProvider>;
-                (name, provider)
-            })
-            .collect();
+        // When nothing loads, the cause is the catalog or its storage, not one table.
+        if loaded.iter().all(|namespace| namespace.tables.is_empty())
+            && let Some((_, e)) = loaded
+                .iter_mut()
+                .find_map(|namespace| namespace.failed.pop())
+        {
+            return Err(e);
+        }
+
+        let mut schemas = HashMap::new();
+        for (namespace, NamespaceTables { mut tables, failed }) in
+            child_namespaces.into_iter().zip(loaded)
+        {
+            let name = schema_name_for_namespace(&namespace);
+            let previous = previous.get(&name);
+            for (table, e) in failed {
+                if let Some(schema) = previous
+                    && let Ok(Some(provider)) = schema.table(table.name()).await
+                {
+                    tracing::warn!(
+                        "Failed to reload Iceberg table '{table}'; it keeps its previously loaded definition. {e}"
+                    );
+                    tables.insert(table.name().to_string(), provider);
+                } else {
+                    tracing::warn!(
+                        "Skipping Iceberg table '{table}': it failed to load and is unavailable until it does. The catalog's other tables are not affected. {e}"
+                    );
+                }
+            }
+            let provider = Arc::new(IcebergSchemaProvider {
+                catalog: Arc::clone(&client),
+                namespace,
+                tables: RwLock::new(tables),
+            }) as Arc<dyn SchemaProvider>;
+            schemas.insert(name, provider);
+        }
 
         Ok(schemas)
     }
@@ -209,11 +248,17 @@ impl CatalogProvider for IcebergCatalogProvider {
 #[async_trait]
 impl RefreshableCatalogProvider for IcebergCatalogProvider {
     async fn refresh(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let previous = self
+            .schemas
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let new_schemas = Self::load_schemas(
             Arc::clone(&self.catalog),
             self.root_namespace.as_ref(),
             &self.selector,
             self.table_wrapper.as_ref(),
+            &previous,
         )
         .await?;
 
@@ -245,42 +290,6 @@ pub struct IcebergSchemaProvider {
 }
 
 impl IcebergSchemaProvider {
-    /// Asynchronously tries to construct a new [`IcebergSchemaProvider`]
-    /// using the given client to fetch and initialize table providers for
-    /// the provided namespace in the Iceberg [`Catalog`].
-    ///
-    /// This method retrieves a list of table names
-    /// attempts to create a table provider for each table name, and
-    /// collects these providers into a `HashMap`.
-    ///
-    /// # Arguments
-    /// * `client` - The Iceberg catalog client
-    /// * `namespace` - The namespace containing the tables
-    /// * `load_semaphore` - Semaphore to limit concurrent table loads
-    /// * `selector` - Which discovered tables the catalog registers
-    pub(crate) async fn try_new(
-        client: Arc<dyn Catalog>,
-        namespace: NamespaceIdent,
-        load_semaphore: Arc<Semaphore>,
-        selector: &TableSelector,
-        table_wrapper: Option<CatalogTableWrapper>,
-    ) -> Result<Self> {
-        let tables = Self::load_tables(
-            Arc::clone(&client),
-            &namespace,
-            load_semaphore,
-            selector,
-            table_wrapper.as_ref(),
-        )
-        .await?;
-
-        Ok(IcebergSchemaProvider {
-            catalog: client,
-            namespace,
-            tables: RwLock::new(tables),
-        })
-    }
-
     /// Synchronously look up a cached table provider by name.
     ///
     /// Tables are loaded eagerly at construction (and on catalog refresh), so
@@ -312,14 +321,15 @@ impl IcebergSchemaProvider {
         &self.namespace
     }
 
-    /// Load all tables from the Iceberg catalog for this namespace.
+    /// Load all tables from the Iceberg catalog for this namespace, returning
+    /// the loaded tables and the tables that failed to load.
     async fn load_tables(
-        client: Arc<dyn Catalog>,
+        client: &Arc<dyn Catalog>,
         namespace: &NamespaceIdent,
-        load_semaphore: Arc<Semaphore>,
+        load_semaphore: &Semaphore,
         selector: &TableSelector,
         table_wrapper: Option<&CatalogTableWrapper>,
-    ) -> Result<HashMap<String, Arc<dyn TableProvider>>> {
+    ) -> Result<NamespaceTables> {
         let table_names: Vec<_> = client
             .list_tables(namespace)
             .await
@@ -330,47 +340,33 @@ impl IcebergSchemaProvider {
             .filter(|table| selector.selects(&table.to_string()))
             .collect();
 
-        // Transform each load_table call to return Result<(TableIdent, Option<Arc<dyn TableProvider>>)>
-        let table_futures: Vec<_> = table_names
-            .iter()
-            .map(|name| {
-                let client_clone = Arc::clone(&client);
-                let name_clone = Arc::new(name.clone());
-                let semaphore_clone = Arc::clone(&load_semaphore);
-                let wrapper_clone = table_wrapper.cloned();
-                async move {
-                    // Map the inner Result to include the table name
-                    Self::load_table(
-                        client_clone,
-                        Arc::clone(&name_clone),
-                        semaphore_clone,
-                        wrapper_clone,
-                    )
-                    .await
-                    .map(|opt_provider| (name_clone, opt_provider))
-                }
-            })
-            .collect();
+        let table_results = join_all(
+            table_names
+                .iter()
+                .map(|name| Self::load_table(client, name, load_semaphore, table_wrapper)),
+        )
+        .await;
 
-        // Execute all futures in parallel, short-circuiting on first error
-        let table_results = try_join_all(table_futures).await?;
-
-        // Filter out None values, only keeping successful loads
         let mut tables = HashMap::new();
-        for (name, opt_provider) in table_results {
-            if let Some(provider) = opt_provider {
-                tables.insert(name.name().to_string(), provider);
+        let mut failed = Vec::new();
+        for (name, result) in table_names.into_iter().zip(table_results) {
+            match result {
+                Ok(Some(provider)) => {
+                    tables.insert(name.name().to_string(), provider);
+                }
+                Ok(None) => {}
+                Err(e) => failed.push((name, e)),
             }
         }
 
-        Ok(tables)
+        Ok(NamespaceTables { tables, failed })
     }
 
     async fn load_table(
-        catalog: Arc<dyn Catalog>,
-        table_name: Arc<TableIdent>,
-        semaphore: Arc<Semaphore>,
-        table_wrapper: Option<CatalogTableWrapper>,
+        catalog: &Arc<dyn Catalog>,
+        table_name: &TableIdent,
+        semaphore: &Semaphore,
+        table_wrapper: Option<&CatalogTableWrapper>,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
         // Acquire a permit from the semaphore to limit concurrent table loads
         let _permit = semaphore
@@ -378,9 +374,9 @@ impl IcebergSchemaProvider {
             .await
             .map_err(|e| Error::SemaphoreError { source: e })?;
 
-        match catalog.load_table(&table_name).await {
+        match catalog.load_table(table_name).await {
             Ok(_) => match IcebergTableProvider::try_new(
-                Arc::clone(&catalog),
+                Arc::clone(catalog),
                 table_name.namespace().clone(),
                 table_name.name().to_string(),
             )
@@ -392,7 +388,7 @@ impl IcebergSchemaProvider {
                     // Access control is handled by the SQL validator, not here.
                     let inner: Arc<dyn TableProvider> = Arc::new(provider);
                     let deletion_provider = crate::iceberg::delete::IcebergDeletionProvider::new(
-                        Arc::clone(&catalog),
+                        Arc::clone(catalog),
                         table_name.namespace().clone(),
                         table_name.name().to_string(),
                         Arc::clone(&inner),
@@ -406,7 +402,7 @@ impl IcebergSchemaProvider {
                     // recipe's `catalog.schema.table` reference resolves back to
                     // this provider on a remote executor. In a single-node
                     // session the wrapper is a transparent pass-through.
-                    let adapted = match &table_wrapper {
+                    let adapted = match table_wrapper {
                         Some(wrap) => {
                             let schema_name = table_name.namespace().as_ref().join(".");
                             wrap(&schema_name, table_name.name(), adapted)
@@ -609,6 +605,7 @@ mod tests {
             Some(&root),
             &TableSelector::new(None, None),
             None,
+            &HashMap::new(),
         )
         .await
         .expect("nested child namespace loads");
@@ -887,6 +884,156 @@ mod tests {
             .await,
             vec![1],
             "a scan pinned to a snapshot must read that snapshot, not the current one"
+        );
+    }
+
+    /// Writes `ns.<table>` with one row under `warehouse`, laid out the way a
+    /// Hadoop catalog reads it: `<warehouse>/ns/<table>/{metadata,data}`.
+    async fn write_hadoop_table(warehouse: &std::path::Path, table: &str) {
+        use iceberg::io::LocalFsStorageFactory;
+
+        let catalog = MemoryCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    format!("file://{}", warehouse.display()),
+                )]),
+            )
+            .await
+            .expect("memory catalog loads");
+        let namespace = NamespaceIdent::new("ns".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("namespace is created");
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("schema builds");
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name(table.to_string())
+                    .schema(schema)
+                    .build(),
+            )
+            .await
+            .expect("table is created");
+        let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+        let ident = TableIdent::new(namespace, table.to_string());
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider_for(&catalog, &ident).await))
+            .expect("provider registers");
+        ctx.sql("INSERT INTO t VALUES (1)")
+            .await
+            .expect("append plans")
+            .collect()
+            .await
+            .expect("append commits");
+    }
+
+    /// Points `ns.<table>`'s version hint at a metadata version that does not exist.
+    fn break_hadoop_table(warehouse: &std::path::Path, table: &str) {
+        std::fs::write(
+            warehouse
+                .join("ns")
+                .join(table)
+                .join("metadata")
+                .join("version-hint.text"),
+            "9",
+        )
+        .expect("version hint is written");
+    }
+
+    async fn hadoop_catalog(warehouse: &std::path::Path) -> Arc<dyn Catalog> {
+        use crate::iceberg::catalog::hadoop::HadoopCatalogBuilder;
+
+        let mut config = opendal::services::FsConfig::default();
+        config.root = Some(warehouse.display().to_string());
+        let operator = opendal::Operator::new(opendal::Configurator::into_builder(config))
+            .expect("fs operator builds");
+        let warehouse_url =
+            url::Url::from_directory_path(warehouse).expect("warehouse is an absolute path");
+        let catalog = HadoopCatalogBuilder::default()
+            .with_warehouse_root(warehouse_url.to_string())
+            .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
+            .with_operator(operator)
+            .build()
+            .await
+            .expect("hadoop catalog builds");
+        Arc::new(catalog)
+    }
+
+    async fn load_hadoop_catalog(warehouse: &std::path::Path) -> Result<IcebergCatalogProvider> {
+        IcebergCatalogProvider::try_new(
+            hadoop_catalog(warehouse).await,
+            None,
+            &TableSelector::select_all(),
+            None,
+        )
+        .await
+    }
+
+    fn table_names(provider: &IcebergCatalogProvider) -> Vec<String> {
+        let mut names = provider
+            .schema("ns")
+            .expect("schema 'ns' is registered")
+            .table_names();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn a_table_that_fails_to_load_does_not_take_down_the_catalog() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        write_hadoop_table(warehouse.path(), "good").await;
+        write_hadoop_table(warehouse.path(), "bad").await;
+        break_hadoop_table(warehouse.path(), "bad");
+
+        let provider = load_hadoop_catalog(warehouse.path())
+            .await
+            .expect("the catalog loads despite one bad table");
+
+        assert_eq!(table_names(&provider), vec!["good".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_table_that_fails_on_refresh_keeps_its_previous_definition() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        write_hadoop_table(warehouse.path(), "good").await;
+        write_hadoop_table(warehouse.path(), "bad").await;
+
+        let provider = load_hadoop_catalog(warehouse.path())
+            .await
+            .expect("the catalog loads");
+        assert_eq!(table_names(&provider), vec!["bad", "good"]);
+
+        break_hadoop_table(warehouse.path(), "bad");
+        write_hadoop_table(warehouse.path(), "added").await;
+        provider
+            .refresh()
+            .await
+            .expect("the refresh succeeds despite one bad table");
+
+        assert_eq!(table_names(&provider), vec!["added", "bad", "good"]);
+    }
+
+    #[tokio::test]
+    async fn a_catalog_whose_every_table_fails_to_load_fails() {
+        let warehouse = tempfile::tempdir().expect("tempdir");
+        write_hadoop_table(warehouse.path(), "bad").await;
+        break_hadoop_table(warehouse.path(), "bad");
+
+        let result = load_hadoop_catalog(warehouse.path()).await;
+
+        assert!(
+            matches!(result, Err(Error::DataInvalid { .. })),
+            "{result:?}"
         );
     }
 }
