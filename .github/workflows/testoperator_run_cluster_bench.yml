@@ -652,8 +652,7 @@ jobs:
           PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq '.[].url')"
           if [ -n "${PR_URL}" ]; then
             echo "PR already exists -> ${PR_URL}"
-            # GitHub holds the pull_request runs of a push made with GITHUB_TOKEN
-            # until someone approves them; release them so the PR reports its checks.
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
             bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
             exit 0
           fi

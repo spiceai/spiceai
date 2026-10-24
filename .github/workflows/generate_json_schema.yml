@@ -91,8 +91,7 @@ jobs:
             git -c credential.helper='' -c credential.interactive=false \
               push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:schema/${GITHUB_RUN_ID}
             gh pr create --title "Update spicepod.schema.json" --body "Updated Spicepod Schema" --base trunk --head schema/${GITHUB_RUN_ID}
-            # GitHub holds the pull_request runs of a PR opened with GITHUB_TOKEN
-            # until someone approves them; release them so the PR reports its checks.
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
             bash .github/scripts/approve_bot_pr_runs.sh "schema/${GITHUB_RUN_ID}" "$(git rev-parse HEAD)"
           else
             echo "No changes detected"

@@ -132,8 +132,7 @@ jobs:
                 --base trunk \
                 --head "$branch"
             fi
-            # GitHub holds the pull_request runs of a push made with GITHUB_TOKEN
-            # until someone approves them; release them so the PR reports its checks.
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
             bash .github/scripts/approve_bot_pr_runs.sh "$branch" "$(git rev-parse HEAD)"
           fi
 

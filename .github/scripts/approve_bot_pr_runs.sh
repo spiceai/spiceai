@@ -26,7 +26,7 @@
 #   .github/scripts/approve_bot_pr_runs.sh <branch> <head-sha>
 #
 # Reads GH_TOKEN (needs the `actions: write` scope) and GITHUB_REPOSITORY.
-# APPROVE_WAIT_SECONDS (default 90) bounds the wait and APPROVE_POLL_SECONDS
+# APPROVE_WAIT_SECONDS (default 60) bounds the wait and APPROVE_POLL_SECONDS
 # (default 5) sets the poll interval. Needs only `gh`, which every caller
 # already uses to open the PR.
 #
@@ -43,10 +43,10 @@ fi
 branch="$1"
 head_sha="$2"
 repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
-wait_seconds="${APPROVE_WAIT_SECONDS:-90}"
+wait_seconds="${APPROVE_WAIT_SECONDS:-60}"
 poll_seconds="${APPROVE_POLL_SECONDS:-5}"
 # Polls with no new run, once the first one has appeared, before the set counts as settled.
-settle_polls=3
+settle_polls=2
 
 # The values are spliced into the jq filter below as string literals (`gh --jq`
 # takes no variables), so refuse anything that could break out of the quotes.

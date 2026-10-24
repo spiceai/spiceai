@@ -94,7 +94,7 @@ reset() {
 
 run_subject() {
   STUB_WORK_DIR="$work_dir" GITHUB_REPOSITORY="$REPO" \
-    APPROVE_WAIT_SECONDS="${WAIT:-3}" APPROVE_POLL_SECONDS=0 \
+    APPROVE_WAIT_SECONDS="${WAIT:-3}" APPROVE_POLL_SECONDS=0.05 \
     PATH="$stub_dir:$PATH" bash "$subject" "$@" 2>&1
 }
 
