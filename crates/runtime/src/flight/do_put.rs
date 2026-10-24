@@ -226,29 +226,34 @@ pub(crate) async fn handle(
         )));
     }
 
+    let table = datafusion.get_table(&path).await;
+    let accelerated = table.as_deref().and_then(|table| {
+        spice_table::find_layer::<AcceleratedTable>(table, spice_table::LayerWalk::Read)
+    });
+
     // The forwarding below assigns partition values apart from the assignments that reads
     // of an accelerated dataset use, so a write that goes only to the acceleration is
     // refused, as it is for SQL.
-    if let Some(table) = datafusion.get_table(&path).await
-        && let Some(refusal) = spice_table::find_layer::<AcceleratedTable>(
-            table.as_ref(),
-            spice_table::LayerWalk::Read,
-        )
-        .and_then(|accelerated| accelerated.scheduler_write_refusal("DoPut"))
+    if let Some(refusal) =
+        accelerated.and_then(|accelerated| accelerated.scheduler_write_refusal("DoPut"))
     {
         return Err(Status::failed_precondition(refusal));
     }
 
-    // Fast path: for scheduler -> executor Cayenne writes, split by partition
-    // and forward to each executor.
-    if let Some(executor_registry) = datafusion.executor_registry()
+    let on_scheduler = matches!(
+        datafusion.cluster_config.effective_role(),
+        Some(ClusterRole::Scheduler)
+    );
+
+    // Fast path: a scheduler splits by partition and forwards to each executor the
+    // writes it forwards for an INSERT, to Cayenne catalog and dual-write tables.
+    if on_scheduler
+        && let Some(executor_registry) = datafusion.executor_registry()
+        && crate::datafusion::planner::is_distributed_insert_table(&datafusion.ctx.state(), &path)
+            .await
         && let Some(partition_expression) = datafusion.get_table_partition_expr(&path).await.map_err(|e| Status::internal(format!(
             "Failed to resolve partition expression for table `{path}` in distributed Cayenne write via Flight: {e}"
         )))?
-        && matches!(
-            datafusion.cluster_config.effective_role(),
-            Some(ClusterRole::Scheduler)
-        )
     {
         if !executor_registry.has_flight_sql_clients().await {
             return Err(Status::unavailable(
@@ -280,14 +285,10 @@ pub(crate) async fn handle(
         return response.map_err(Into::into);
     }
 
-    // In distributed mode, the scheduler must NEVER write data locally.
-    // Writes should always be forwarded to executors via the partitioned write path above.
-    // If we reached this point on the scheduler, the table is either not partitioned
-    // or partition resolution failed — reject the write to prevent silent data misrouting.
-    if matches!(
-        datafusion.cluster_config.effective_role(),
-        Some(ClusterRole::Scheduler)
-    ) {
+    // A scheduler writes no data locally: a write it does not forward above is refused
+    // to prevent silent data misrouting, unless it goes to a write-through dataset's
+    // source, as an INSERT's does.
+    if on_scheduler && !accelerated.is_some_and(AcceleratedTable::is_write_through) {
         return Err(Status::failed_precondition(format!(
             "Cannot write data to table `{path}` on the scheduler. Ensure the table has a partition expression configured for distributed writes.",
         )));

@@ -17,6 +17,7 @@ limitations under the License.
 use self::append_cursor::AppendCursorStore;
 use super::refresh::Refresh;
 use super::refresh::get_timestamp;
+use super::refresh_completion::RefreshRequestId;
 use super::sink::AccelerationSink;
 use super::synchronized_table::SynchronizedTable;
 use crate::accelerated::caching::CacheRefreshHelper;
@@ -277,6 +278,8 @@ pub struct RefreshTaskBuilder {
     /// Per-dataset `cdc_*` parameter overrides drawn from
     /// `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    /// Requests to reload a change stream's served partitions.
+    reload_requests: Option<tokio::sync::mpsc::Receiver<RefreshRequestId>>,
     /// The cache keys a write is pending for, shared with the caching scan and
     /// its batched writer. `RefreshMode::Caching`'s periodic stale-row refresh
     /// replaces the entries it refreshes, so it has to claim each key for the
@@ -321,6 +324,7 @@ impl RefreshTaskBuilder {
             engine_type_rewrites: &[],
             snapshot_refresh_state: None,
             cdc_param_overrides: None,
+            reload_requests: None,
             in_flight_revalidations: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -473,6 +477,17 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Provide the requests that reload a change stream's served partitions;
+    /// see [`crate::accelerated::AcceleratedTable::trigger_reload`].
+    #[must_use]
+    pub fn with_reload_requests(
+        mut self,
+        reload_requests: Option<tokio::sync::mpsc::Receiver<RefreshRequestId>>,
+    ) -> RefreshTaskBuilder {
+        self.reload_requests = reload_requests;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> RefreshTask {
         let semaphore = self
@@ -540,6 +555,7 @@ impl RefreshTaskBuilder {
             change_sink: tokio::sync::OnceCell::new_with(self.change_sink),
             cache_write_sender: self.cache_write_sender,
             cdc_param_overrides: self.cdc_param_overrides,
+            reload_requests: parking_lot::Mutex::new(self.reload_requests),
             in_flight_revalidations: self.in_flight_revalidations,
             append_cursor_store: self.append_cursor_store,
             last_append_fallback: parking_lot::Mutex::new(None),
@@ -629,6 +645,10 @@ pub struct RefreshTask {
     cache_write_sender: Option<super::caching::CacheWriteSender>,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    /// Requests to reload a change stream's served partitions, taken by the
+    /// change stream when it starts.
+    pub(crate) reload_requests:
+        parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<RefreshRequestId>>>,
     in_flight_revalidations: super::caching::InFlightRevalidations,
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<AppendCursorStore>,
@@ -782,6 +802,11 @@ impl RefreshTask {
     /// Returns an error if the source cannot be queried, the refresh SQL fails to
     /// plan or execute, or the resulting data cannot be written to the accelerator.
     pub async fn run(&self, refresh: Refresh) -> super::Result<RefreshOutcome> {
+        // Wait for a source not reached yet before taking a refresh slot: the wait lasts
+        // as long as the source is down, and an accelerated view's source is the tables
+        // it reads, whose own refreshes need a slot.
+        let _ = self.federated.try_wait_table_provider().await;
+
         // Limit parallel refreshes via a semaphore
         let _permit = self.semaphore.acquire().await;
 
@@ -1205,11 +1230,15 @@ impl RefreshTask {
             oneshot::channel::<RefreshStat>();
 
         let resource_monitor = self.resource_monitor.clone();
+        // A source that stops sending mid-stream fails the refresh instead of
+        // holding it, and every refresh queued behind it, for ever.
+        let source =
+            super::source_stall::with_stall_timeout(data_update.data, dataset_name.to_string());
         let observed_record_batch_stream = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             stream::unfold(
                 (
-                    data_update.data,
+                    source,
                     RefreshStat::default(),
                     dataset_name.to_string(),
                     self.dataset_metric_labels.clone(),
@@ -2171,6 +2200,25 @@ impl RefreshTask {
                     .keep_serving_loaded_snapshot(&error, loaded_id, dataset_metrics_label_sets)
                     .await);
             }
+            Ok(SnapshotPoll {
+                outcome:
+                    SnapshotPollOutcome::DownloadFailed {
+                        published_id,
+                        loaded_id,
+                        cause,
+                        ..
+                    },
+                ..
+            }) => {
+                let error = super::Error::SnapshotDownloadFailed {
+                    location: state.manager.snapshot_location().to_string(),
+                    published_id,
+                    cause,
+                };
+                return Ok(self
+                    .keep_serving_loaded_snapshot(&error, loaded_id, dataset_metrics_label_sets)
+                    .await);
+            }
             Err(e) => {
                 let schema_mismatch = mismatch_detail
                     .lock()
@@ -2703,6 +2751,9 @@ impl RefreshTask {
         state
             .config_mut()
             .set_extension(RequestContext::current(AsyncMarker::new().await));
+        // A file dataset whose source files lost a registered column fails this scan
+        // instead of loading NULLs over the accelerated data.
+        data_components::file_schema_drift::mark_acceleration_refresh(state.config_mut());
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             tracing::error!("Unable to register JSON functions: {e}");
@@ -3278,7 +3329,10 @@ impl RefreshTask {
     fn is_view_acceleration(&self) -> bool {
         match &*self.federated {
             FederatedTable::Immediate(provider) => provider.table_type() == TableType::View,
-            FederatedTable::Deferred(_) => false,
+            // A view served from its existing acceleration has no plan to ask yet.
+            FederatedTable::Deferred(_) => {
+                self.federated_source.as_deref() == Some(super::VIEW_FEDERATED_SOURCE)
+            }
         }
     }
 
@@ -4023,6 +4077,9 @@ pub fn refresh_error_reason(error: &super::Error) -> &'static str {
         }
         super::Error::SnapshotOlderThanLoaded { .. } => {
             metrics::REFRESH_ERROR_REASON_SNAPSHOT_OLDER_THAN_LOADED
+        }
+        super::Error::SnapshotDownloadFailed { .. } => {
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_DOWNLOAD_FAILED
         }
         _ if error_chain_matches(error, looks_like_generation_change) => {
             metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
@@ -4882,6 +4939,21 @@ mod tests {
             older.to_string(),
             "The snapshot published at 's3://bucket/snapshots/' (id 0) is older than the loaded snapshot (id 3), so it was not loaded. Publish a newer snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
         );
+
+        let download_failed = super::super::Error::SnapshotDownloadFailed {
+            location: "s3://bucket/snapshots/".to_string(),
+            published_id: 4,
+            cause: "Snapshot s3://bucket/snapshots/a.db checksum mismatch. expected=00 actual=ff"
+                .to_string(),
+        };
+        assert_eq!(
+            refresh_error_reason(&download_failed),
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_DOWNLOAD_FAILED
+        );
+        assert_eq!(
+            download_failed.to_string(),
+            "The snapshot published at 's3://bucket/snapshots/' (id 4) could not be loaded, so it is tried again at the next poll. Cause: Snapshot s3://bucket/snapshots/a.db checksum mismatch. expected=00 actual=ff. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+        );
     }
 
     /// Snapshot refreshes carry `mode="snapshot"`, as source refreshes carry `mode="full"`.
@@ -4984,6 +5056,54 @@ mod tests {
         )
         .await;
         assert_eq!(refresh.state().config().target_partitions(), cores);
+    }
+
+    /// File datasets fail a refresh scan, rather than loading NULLs, when their source
+    /// files lost a registered column; they tell a refresh scan apart by this marker.
+    #[tokio::test]
+    async fn refresh_session_is_marked_as_acceleration_refresh() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let refresh = RefreshTask::create_refresh_df_context(
+            source,
+            &TableReference::bare("drift_marked_refresh"),
+            &accelerator,
+            false,
+            Handle::current(),
+        )
+        .await;
+        assert!(data_components::file_schema_drift::is_acceleration_refresh(
+            &refresh.state()
+        ));
+        assert!(
+            !data_components::file_schema_drift::is_acceleration_refresh(
+                &SessionContext::new().state()
+            ),
+            "an ordinary query session must not be treated as a refresh"
+        );
+    }
+
+    /// The missing-column refresh error is permanent: retrying cannot bring the column back,
+    /// and the refresh must not write NULLs over the loaded data.
+    #[test]
+    fn missing_column_refresh_error_is_permanent() {
+        let err = retry_from_df_error(DataFusionError::Plan(
+            "Dataset 'base': registered column 'amount_cents' missing from every source file scanned".to_string(),
+        ));
+        assert!(
+            matches!(
+                err,
+                RetryError::Permanent(super::super::Error::FailedToRefreshDataset { .. })
+            ),
+            "{err:?}"
+        );
     }
 
     #[derive(Debug)]
@@ -5189,6 +5309,71 @@ mod tests {
             probe_acceleration_contents(&empty_batches, &dataset_name).await,
             AccelerationContents::Empty
         );
+    }
+
+    /// A source that sends a batch and then goes silent, as a connection the network
+    /// stopped carrying does, fails the refresh once the stall timeout passes: retried,
+    /// and counted on the attempt. Without the timeout the write waits for ever and
+    /// nothing is counted.
+    #[tokio::test(start_paused = true)]
+    async fn a_source_silent_mid_refresh_fails_retriably() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("federated mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(federated_table));
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("source_stalled_refresh"),
+            federated,
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("batch should be created");
+        let sent = futures::stream::iter(vec![Ok(batch)]).chain(futures::stream::pending());
+        let update_stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), sent));
+        let update = StreamingDataUpdate::new(update_stream, UpdateType::Overwrite);
+
+        let timeout = super::super::source_stall::SOURCE_STALL_TIMEOUT;
+        let started = tokio::time::Instant::now();
+        let Err(error) = tokio::time::timeout(
+            timeout * 2,
+            task.write_streaming_data_update(None, update, None, None),
+        )
+        .await
+        .expect("a refresh whose source went silent must not wait for ever") else {
+            panic!("a source silent mid-refresh must fail the refresh");
+        };
+        assert!(
+            matches!(&error, RetryError::Transient { .. }),
+            "a stalled source is retried on a new connection: {error:?}"
+        );
+        let counted = attempt_refresh_error(&error).expect("counted on the attempt");
+        assert_eq!(
+            refresh_error_reason(counted),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+        assert!(
+            counted
+                .to_string()
+                .contains("The source of dataset 'source_stalled_refresh' stopped sending data"),
+            "{counted}"
+        );
+        assert_eq!(started.elapsed(), timeout, "fails at the stall timeout");
     }
 
     #[tokio::test]

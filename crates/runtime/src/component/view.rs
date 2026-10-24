@@ -117,6 +117,33 @@ impl View {
 
         false
     }
+
+    /// The schema this view's acceleration was checkpointed with, when the view can
+    /// be served from that acceleration before the tables it reads have loaded, as an
+    /// accelerated dataset is served before its source answers.
+    ///
+    /// Only `mode: file` qualifies (`file_create` starts empty by design), and not a
+    /// view with embedding or full-text search columns, whose indexes wrap the view's
+    /// own plan. A checkpoint that does not record the acceleration's primary key
+    /// (written by an earlier version) does not count either.
+    pub(crate) async fn existing_acceleration_schema(&self) -> Option<arrow_schema::SchemaRef> {
+        let acceleration = self.acceleration.as_ref().filter(|a| a.enabled)?;
+        if !matches!(acceleration.mode, acceleration::Mode::File)
+            || self.has_embeddings()
+            || self.has_full_text_column()
+        {
+            return None;
+        }
+        let schema = crate::dataconnector::sink::recorded_acceleration_checkpoint_schema(
+            self,
+            self.runtime.accelerator_engine_registry(),
+        )
+        .await?;
+        runtime_table::accelerated::checkpoint_primary_key::records_acceleration_primary_key(
+            &schema,
+        )
+        .then_some(schema)
+    }
 }
 
 impl AccelerationSource for View {

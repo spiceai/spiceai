@@ -11,6 +11,7 @@ autotests = false
 
 [dependencies]
 cpu-budget = { path = "../cpu-budget" }
+http-body-limit = { path = "../http-body-limit" }
 podswatcher = { path = "../podswatcher" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
 adbc_core = { workspace = true, optional = true }
@@ -43,6 +44,7 @@ base64.workspace = true
 flate2 = "1.1"
 byte-unit.workspace = true
 bytes.workspace = true
+ctor.workspace = true
 cache = { path = "../cache" }
 chrono.workspace = true
 chunking = { path = "../chunking" }
@@ -144,7 +146,7 @@ prost.workspace = true
 rand.workspace = true
 rayon = { workspace = true }
 regex.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 rmcp = { workspace = true, optional = true, features = [
     "client",
     "server",
@@ -198,7 +200,7 @@ search = { path = "../search", default-features = false, features = [
     "text_search",
 ], optional = false }
 secrecy.workspace = true
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive", "rc"] }
 blake3 = { workspace = true, optional = true }
 serde_json.workspace = true
 snafu.workspace = true
@@ -227,6 +229,7 @@ tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 turso-shared = { workspace = true }
 twox-hash.workspace = true
+typetag = "0.2.22"
 url.workspace = true
 util = { path = "../util", features = ["datafusion", "http"] }
 utoipa = { workspace = true, features = ["axum_extras"], optional = true }

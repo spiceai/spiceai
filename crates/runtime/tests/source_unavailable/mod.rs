@@ -620,6 +620,7 @@ mod served_from_acceleration {
     use spicepod::{
         acceleration::{Acceleration, Mode, RefreshMode},
         component::dataset::{Dataset as SpicepodDataset, ReadyState},
+        component::view::View,
         param::Params,
         semantic::Column,
     };
@@ -737,9 +738,15 @@ mod served_from_acceleration {
     }
 
     async fn start(dataset: SpicepodDataset) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
-        let app = AppBuilder::new("source_unavailable")
-            .with_dataset(dataset)
-            .build();
+        start_app(
+            AppBuilder::new("source_unavailable")
+                .with_dataset(dataset)
+                .build(),
+        )
+        .await
+    }
+
+    async fn start_app(app: app::App) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
         configure_test_datafusion();
         let rt = Arc::new(Runtime::builder().with_app(app).build().await);
         let loader = tokio::spawn({
@@ -828,7 +835,15 @@ mod served_from_acceleration {
         rt: &Arc<Runtime>,
         table: &str,
     ) -> Result<(i64, i64), String> {
-        let sql = format!("SELECT CAST(SUM(v) AS BIGINT) AS s, COUNT(*) AS n FROM {table}");
+        query_column_sum_and_count(rt, table, "v").await
+    }
+
+    async fn query_column_sum_and_count(
+        rt: &Arc<Runtime>,
+        table: &str,
+        column: &str,
+    ) -> Result<(i64, i64), String> {
+        let sql = format!("SELECT CAST(SUM({column}) AS BIGINT) AS s, COUNT(*) AS n FROM {table}");
         let batches = run_query(rt, &sql).await.map_err(|err| err.to_string())?;
         let batch = batches.first().ok_or("no batches")?;
         let sum = batch
@@ -948,6 +963,551 @@ mod served_from_acceleration {
             ),
             "the Error clears once the source is reached ({:?})",
             dataset_status(&rt, "orders")
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// `orders_view` reading `orders` with `sql`, accelerated in the `DuckDB` file
+    /// `duckdb_file` and refreshed every second.
+    fn accelerated_orders_view(duckdb_file: &Path, sql: &str) -> View {
+        let mut view = View::new("orders_view".to_string());
+        view.sql = Some(sql.to_string());
+        view.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("duckdb".to_string()),
+            mode: Mode::File,
+            refresh_check_interval: Some("1s".to_string()),
+            params: Some(Params::from_string_map(HashMap::from([(
+                "duckdb_file".to_string(),
+                duckdb_file.to_string_lossy().to_string(),
+            )]))),
+            ..Default::default()
+        });
+        view
+    }
+
+    /// `orders` federated from `prefix`, and [`accelerated_orders_view`].
+    fn federated_orders_and_accelerated_view(
+        prefix: &str,
+        duckdb_file: &Path,
+        sql: &str,
+    ) -> app::App {
+        AppBuilder::new("source_unavailable")
+            .with_dataset(SpicepodDataset::new(format!("{prefix}://orders"), "orders"))
+            .with_view(accelerated_orders_view(duckdb_file, sql))
+            .build()
+    }
+
+    /// Builds `orders_view`'s acceleration from the source (three rows, `v = 1`) with
+    /// `app`, and stops the runtime once the view answers from it.
+    async fn seed_view(
+        source: &Arc<UnreachableSource>,
+        app: app::App,
+    ) -> Result<(), anyhow::Error> {
+        source.bring_up();
+        let (rt, loader) = start_app(app).await;
+        let seeded = wait_until_true(Duration::from_secs(30), || async {
+            query_table_sum_and_count(&rt, "orders_view").await == Ok((3, 3))
+        })
+        .await;
+        let observed = query_table_sum_and_count(&rt, "orders_view").await;
+        stop(rt, loader).await;
+        anyhow::ensure!(seeded, "seeding the view's acceleration, got {observed:?}");
+        Ok(())
+    }
+
+    fn view_status(rt: &Runtime) -> Option<ComponentStatus> {
+        rt.status().get_component_status("view:orders_view")
+    }
+
+    /// An accelerated view whose source is down at startup is served from its
+    /// existing acceleration, as an accelerated dataset is, instead of staying
+    /// unregistered until the dataset it reads loads; once the source is back the
+    /// refresh brings the view up to date.
+    #[tokio::test]
+    async fn an_accelerated_view_is_served_while_the_dataset_it_reads_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("view-served-while-down").await?;
+        let source = &fixture.source;
+        let app = || {
+            federated_orders_and_accelerated_view(
+                source.prefix,
+                &fixture.dir.path().join("orders_view.duckdb"),
+                "SELECT id, v FROM orders",
+            )
+        };
+        let view_sum_and_count =
+            |rt: Arc<Runtime>| async move { query_table_sum_and_count(&rt, "orders_view").await };
+
+        source.bring_up();
+        let (rt, loader) = start_app(app()).await;
+        let seeded = wait_until_true(Duration::from_secs(30), || async {
+            view_sum_and_count(Arc::clone(&rt)).await == Ok((3, 3))
+                && view_status(&rt) == Some(ComponentStatus::Ready)
+        })
+        .await;
+        let observed = view_sum_and_count(Arc::clone(&rt)).await;
+        stop(rt, loader).await;
+        anyhow::ensure!(seeded, "seeding the view's acceleration, got {observed:?}");
+
+        source.take_down();
+        source.set_value(2);
+        let (rt, loader) = start_app(app()).await;
+        let served = wait_until_true(Duration::from_secs(10), || async {
+            view_sum_and_count(Arc::clone(&rt)).await == Ok((3, 3))
+        })
+        .await;
+        assert!(
+            served,
+            "the view must be served from its existing acceleration, got {:?} ({:?})",
+            view_sum_and_count(Arc::clone(&rt)).await,
+            view_status(&rt)
+        );
+        assert_eq!(
+            view_status(&rt),
+            Some(ComponentStatus::Ready),
+            "a view served from its acceleration is ready"
+        );
+
+        source.bring_up();
+        let refreshed = wait_until_true(Duration::from_secs(60), || async {
+            view_sum_and_count(Arc::clone(&rt)).await == Ok((6, 3))
+        })
+        .await;
+        assert!(
+            refreshed,
+            "the refresh must bring the view up to date once its source is back, got {:?} ({:?})",
+            view_sum_and_count(Arc::clone(&rt)).await,
+            view_status(&rt)
+        );
+        // Refreshed every second, the view is `Refreshing` part of the time.
+        let ready = wait_until_true(Duration::from_secs(10), || async {
+            view_status(&rt) == Some(ComponentStatus::Ready)
+        })
+        .await;
+        assert!(ready, "the view reports Ready ({:?})", view_status(&rt));
+        assert_eq!(
+            dataset_status(&rt, "orders_view"),
+            None,
+            "the view's refreshes report its status as a view's, not a dataset's"
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// A view redefined since its acceleration was built takes its new definition,
+    /// as it does when it waits for what it reads: its plan no longer matches the
+    /// acceleration, so it is registered again from that definition.
+    #[tokio::test]
+    async fn a_redefined_view_is_rebuilt_from_its_new_definition() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("view-redefined").await?;
+        let source = &fixture.source;
+        let file = fixture.dir.path().join("orders_view.duckdb");
+        source.bring_up();
+
+        let (rt, loader) = start_app(federated_orders_and_accelerated_view(
+            source.prefix,
+            &file,
+            "SELECT id, v FROM orders",
+        ))
+        .await;
+        let seeded = wait_until_true(Duration::from_secs(30), || async {
+            query_table_sum_and_count(&rt, "orders_view").await == Ok((3, 3))
+        })
+        .await;
+        let observed = query_table_sum_and_count(&rt, "orders_view").await;
+        stop(rt, loader).await;
+        anyhow::ensure!(seeded, "seeding the view's acceleration, got {observed:?}");
+
+        let (rt, loader) = start_app(federated_orders_and_accelerated_view(
+            source.prefix,
+            &file,
+            "SELECT id, v, v * 10 AS w FROM orders",
+        ))
+        .await;
+        let redefined = wait_until_true(Duration::from_secs(30), || async {
+            query_column_sum_and_count(&rt, "orders_view", "w").await == Ok((30, 3))
+        })
+        .await;
+        assert!(
+            redefined,
+            "the view must answer from its new definition, got {:?} ({:?})",
+            query_column_sum_and_count(&rt, "orders_view", "w").await,
+            view_status(&rt)
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// A view named `name` with `sql`.
+    fn view(name: &str, sql: &str) -> View {
+        let mut view = View::new(name.to_string());
+        view.sql = Some(sql.to_string());
+        view
+    }
+
+    /// Views reading a view redefined while its source was down plan again against
+    /// its new definition once it is rebuilt, rather than keep the columns it was
+    /// served with: one reading it by its qualified name, and one reading it only
+    /// in a subquery, which could not plan against the columns it was served with.
+    /// Two other readers that read each other in a cycle hold neither up.
+    #[tokio::test]
+    async fn views_reading_a_redefined_view_take_its_new_columns() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("view-redefined-readers").await?;
+        let source = &fixture.source;
+        let file = fixture.dir.path().join("orders_view.duckdb");
+        let app = |sql: &str| {
+            let mut app = federated_orders_and_accelerated_view(source.prefix, &file, sql);
+            app.views
+                .push(view("qualified", "SELECT * FROM public.orders_view"));
+            app.views.push(view(
+                "in_subquery",
+                "SELECT (SELECT CAST(SUM(w) AS BIGINT) FROM orders_view) AS s",
+            ));
+            app.views.push(view(
+                "cycle_a",
+                "SELECT o.id FROM orders_view o JOIN cycle_b b ON o.id = b.id",
+            ));
+            app.views.push(view("cycle_b", "SELECT id FROM cycle_a"));
+            app
+        };
+        seed_view(source, app("SELECT id, v FROM orders")).await?;
+
+        source.take_down();
+        let (rt, loader) = start_app(app("SELECT id, v, v * 10 AS w FROM orders")).await;
+        let served = wait_until_true(Duration::from_secs(10), || async {
+            query_table_sum_and_count(&rt, "qualified").await == Ok((3, 3))
+        })
+        .await;
+        assert!(
+            served,
+            "the view reading the served view must answer while the source is down, got {:?}",
+            query_table_sum_and_count(&rt, "qualified").await
+        );
+
+        source.bring_up();
+        let rebuilt = wait_until_true(Duration::from_secs(30), || async {
+            query_column_sum_and_count(&rt, "qualified", "w").await == Ok((30, 3))
+        })
+        .await;
+        assert!(
+            rebuilt,
+            "the view reading the redefined view must answer its new column, got {:?}",
+            query_column_sum_and_count(&rt, "qualified", "w").await
+        );
+        let registered = wait_until_true(Duration::from_secs(30), || async {
+            subquery_sum(&rt).await == Ok(30)
+        })
+        .await;
+        assert!(
+            registered,
+            "the view reading the redefined view in a subquery must be registered, got {:?}",
+            subquery_sum(&rt).await
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// `in_subquery`'s `s`, or why the query failed.
+    async fn subquery_sum(rt: &Arc<Runtime>) -> Result<i64, String> {
+        let batches = run_query(rt, "SELECT s FROM in_subquery")
+            .await
+            .map_err(|err| err.to_string())?;
+        let batch = batches.first().ok_or("no batches")?;
+        let sum = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("s is not Int64")?;
+        Ok(sum.value(0))
+    }
+
+    /// A view reading a redefined view, removed by a Spicepod change while it waits to
+    /// be registered again, stays removed.
+    #[tokio::test]
+    async fn a_view_removed_while_registered_again_stays_removed() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("view-reader-removed").await?;
+        let source = &fixture.source;
+        let extras = UnreachableSource::new("view-reader-removed-extras", 1);
+        extras.register().await;
+        let file = fixture.dir.path().join("orders_view.duckdb");
+        let app = |sql: &str, with_reader: bool| {
+            let mut app = federated_orders_and_accelerated_view(source.prefix, &file, sql);
+            app.datasets.push(SpicepodDataset::new(
+                format!("{}://extras", extras.prefix),
+                "extras",
+            ));
+            if with_reader {
+                app.views.push(view(
+                    "reader",
+                    "SELECT o.id, o.v, e.v AS extra FROM orders_view o JOIN extras e ON o.id = e.id",
+                ));
+            }
+            app
+        };
+        extras.bring_up();
+        seed_view(source, app("SELECT id, v FROM orders", true)).await?;
+
+        source.take_down();
+        extras.take_down();
+        let redefined = "SELECT id, v, v * 10 AS w FROM orders";
+        let (rt, loader) = start_app(app(redefined, true)).await;
+        source.bring_up();
+        let rebuilt = wait_until_true(Duration::from_secs(30), || async {
+            query_column_sum_and_count(&rt, "orders_view", "w").await == Ok((30, 3))
+        })
+        .await;
+        assert!(
+            rebuilt,
+            "the redefined view must be rebuilt, got {:?}",
+            query_column_sum_and_count(&rt, "orders_view", "w").await
+        );
+
+        assert!(
+            Arc::clone(&rt)
+                .apply_app(Arc::new(app(redefined, false)))
+                .await
+        );
+        extras.bring_up();
+        let extras_back = wait_until_true(Duration::from_secs(30), || async {
+            query_table_sum_and_count(&rt, "extras").await == Ok((3, 3))
+        })
+        .await;
+        assert!(extras_back, "the second source must answer again");
+        let resurrected = wait_until_true(Duration::from_secs(10), || async {
+            query_table_sum_and_count(&rt, "reader").await.is_ok()
+        })
+        .await;
+        assert!(!resurrected, "the removed view must stay removed");
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// A reader of a redefined view that waits, to be registered again, for another
+    /// dataset it reads holds up no reader on another branch, and a Spicepod change
+    /// that removes it while it waits stops it.
+    #[tokio::test]
+    async fn a_reader_waiting_for_another_input_holds_up_no_other_reader()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("view-reader-waits").await?;
+        let source = &fixture.source;
+        let extras = UnreachableSource::new("view-reader-waits-extras", 1);
+        extras.read_lazily();
+        extras.register().await;
+        let file = fixture.dir.path().join("orders_view.duckdb");
+        let mut extras_dataset = dataset(
+            extras.prefix,
+            &fixture.dir.path().join("extras.duckdb"),
+            ReadyState::OnLoad,
+        );
+        extras_dataset.from = format!("{}://extras", extras.prefix);
+        extras_dataset.name = "extras".to_string();
+        let app = |sql: &str, with_waiting: bool| {
+            let mut app = federated_orders_and_accelerated_view(source.prefix, &file, sql);
+            app.datasets.push(extras_dataset.clone());
+            if with_waiting {
+                app.views.push(view(
+                    "waiting",
+                    "SELECT o.id, o.v, e.v AS extra FROM orders_view o JOIN extras e ON o.id = e.id",
+                ));
+            }
+            app.views
+                .push(view("intermediate", "SELECT * FROM orders_view"));
+            app.views
+                .push(view("downstream", "SELECT * FROM intermediate"));
+            app
+        };
+
+        extras.bring_up();
+        source.bring_up();
+        let (rt, loader) = start_app(app("SELECT id, v FROM orders", true)).await;
+        let seeded = wait_until_true(Duration::from_secs(30), || async {
+            query_table_sum_and_count(&rt, "orders_view").await == Ok((3, 3))
+                && query_table_sum_and_count(&rt, "extras").await == Ok((3, 3))
+        })
+        .await;
+        stop(rt, loader).await;
+        anyhow::ensure!(seeded, "seeding both accelerations");
+
+        source.take_down();
+        let redefined = "SELECT id, v, v * 10 AS w FROM orders";
+        let (rt, loader) = start_app(app(redefined, true)).await;
+        let bound = wait_until_true(Duration::from_secs(10), || async {
+            query_table_sum_and_count(&rt, "downstream").await == Ok((3, 3))
+                && query_table_sum_and_count(&rt, "waiting").await == Ok((3, 3))
+        })
+        .await;
+        assert!(
+            bound,
+            "the readers must answer from the served view, got {:?} and {:?}",
+            query_table_sum_and_count(&rt, "downstream").await,
+            query_table_sum_and_count(&rt, "waiting").await
+        );
+
+        extras.set_scans_failing(true);
+        let extras_failing = wait_until_true(Duration::from_secs(30), || async {
+            matches!(
+                dataset_status(&rt, "extras"),
+                Some(ComponentStatus::Error(_))
+            )
+        })
+        .await;
+        assert!(
+            extras_failing,
+            "extras must report its failing refresh, got {:?}",
+            dataset_status(&rt, "extras")
+        );
+
+        source.bring_up();
+        let rebuilt = wait_until_true(Duration::from_secs(30), || async {
+            query_column_sum_and_count(&rt, "downstream", "w").await == Ok((30, 3))
+        })
+        .await;
+        assert!(
+            rebuilt,
+            "the other branch must take the new column while `waiting` waits, got {:?}",
+            query_column_sum_and_count(&rt, "downstream", "w").await
+        );
+
+        assert!(
+            Arc::clone(&rt)
+                .apply_app(Arc::new(app(redefined, false)))
+                .await
+        );
+        extras.set_scans_failing(false);
+        let extras_back = wait_until_true(Duration::from_secs(30), || async {
+            dataset_status(&rt, "extras") == Some(ComponentStatus::Ready)
+        })
+        .await;
+        assert!(extras_back, "extras must be ready again");
+        let resurrected = wait_until_true(Duration::from_secs(10), || async {
+            query_table_sum_and_count(&rt, "waiting").await.is_ok()
+        })
+        .await;
+        assert!(!resurrected, "the removed reader must stay removed");
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// A view removed by a Spicepod change while it was served, redefined, from its
+    /// acceleration stays removed once the source returns.
+    #[tokio::test]
+    async fn a_view_removed_while_served_redefined_stays_removed() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("view-redefined-removed").await?;
+        let source = &fixture.source;
+        let file = fixture.dir.path().join("orders_view.duckdb");
+        seed_view(
+            source,
+            federated_orders_and_accelerated_view(source.prefix, &file, "SELECT id, v FROM orders"),
+        )
+        .await?;
+
+        source.take_down();
+        let (rt, loader) = start_app(federated_orders_and_accelerated_view(
+            source.prefix,
+            &file,
+            "SELECT id, v, v * 10 AS w FROM orders",
+        ))
+        .await;
+        let served = wait_until_true(Duration::from_secs(10), || async {
+            query_table_sum_and_count(&rt, "orders_view").await == Ok((3, 3))
+        })
+        .await;
+        assert!(
+            served,
+            "the view must be served from its existing acceleration, got {:?}",
+            query_table_sum_and_count(&rt, "orders_view").await
+        );
+
+        let without_view = AppBuilder::new("source_unavailable")
+            .with_dataset(SpicepodDataset::new(
+                format!("{}://orders", source.prefix),
+                "orders",
+            ))
+            .build();
+        assert!(Arc::clone(&rt).apply_app(Arc::new(without_view)).await);
+        assert!(
+            query_table_sum_and_count(&rt, "orders_view").await.is_err(),
+            "the removed view must not answer"
+        );
+
+        source.bring_up();
+        let source_back = wait_until_true(Duration::from_secs(30), || async {
+            query_table_sum_and_count(&rt, "orders").await == Ok((3, 3))
+        })
+        .await;
+        assert!(source_back, "the source must answer again");
+        let resurrected = wait_until_true(Duration::from_secs(10), || async {
+            query_table_sum_and_count(&rt, "orders_view").await.is_ok()
+        })
+        .await;
+        assert!(
+            !resurrected,
+            "the removed view must stay removed once its source is back"
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// With one load at a time, an accelerated view served from its acceleration does
+    /// not take the load slot while it waits for the dataset it reads, whose own load
+    /// needs that slot.
+    #[tokio::test]
+    async fn a_served_view_waiting_for_what_it_reads_leaves_it_a_load_slot()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("view-load-slot").await?;
+        let source = &fixture.source;
+        let file = fixture.dir.path().join("orders_view.duckdb");
+        let app = || {
+            let mut orders = SpicepodDataset::new(format!("{}://orders", source.prefix), "orders");
+            orders.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("arrow".to_string()),
+                mode: Mode::Memory,
+                ..Default::default()
+            });
+            AppBuilder::new("source_unavailable")
+                .with_dataset(orders)
+                .with_view(accelerated_orders_view(&file, "SELECT id, v FROM orders"))
+                .with_runtime(SpicepodRuntime {
+                    dataset_load_parallelism: Some(1),
+                    ..Default::default()
+                })
+                .build()
+        };
+        seed_view(source, app()).await?;
+
+        source.take_down();
+        source.set_value(2);
+        let (rt, loader) = start_app(app()).await;
+        let served = wait_until_true(Duration::from_secs(10), || async {
+            query_table_sum_and_count(&rt, "orders_view").await == Ok((3, 3))
+        })
+        .await;
+        assert!(
+            served,
+            "the view must be served from its existing acceleration, got {:?}",
+            query_table_sum_and_count(&rt, "orders_view").await
+        );
+
+        source.bring_up();
+        let refreshed = wait_until_true(Duration::from_secs(30), || async {
+            query_table_sum_and_count(&rt, "orders_view").await == Ok((6, 3))
+        })
+        .await;
+        assert!(
+            refreshed,
+            "the dataset must load and the view refresh from it, got {:?} (orders: {:?})",
+            query_table_sum_and_count(&rt, "orders_view").await,
+            query_sum_and_count(&rt).await
         );
         stop(rt, loader).await;
         Ok(())
@@ -2331,5 +2891,207 @@ mod served_from_acceleration {
         );
         stop(rt, loader).await;
         Ok(())
+    }
+}
+
+/// `append` datasets with a `time_column` and acceleration snapshots enabled.
+// Cayenne does not build on Windows.
+#[cfg(all(feature = "snapshots", not(windows)))]
+mod served_with_snapshots_enabled {
+    use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+
+    use app::AppBuilder;
+    use arrow::array::Int64Array;
+    use runtime::{Runtime, status::ComponentStatus};
+    use spicepod::{
+        acceleration::{Acceleration, Mode, RefreshMode, SnapshotBehavior},
+        component::{
+            dataset::{Dataset as SpicepodDataset, TimeFormat},
+            snapshot::{BootstrapOnFailureBehavior, Snapshots},
+        },
+        param::Params,
+    };
+    use tempfile::TempDir;
+
+    use super::{UnreachableSource, dataset_status};
+    use crate::{
+        configure_test_datafusion, init_tracing,
+        utils::{run_query, wait_until_true},
+    };
+
+    fn app(prefix: &str, dir: &Path) -> app::App {
+        let mut dataset = SpicepodDataset::new(format!("{prefix}://orders"), "orders");
+        dataset.time_column = Some("id".to_string());
+        dataset.time_format = Some(TimeFormat::UnixSeconds);
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: Mode::File,
+            primary_key: Some("id".to_string()),
+            refresh_mode: Some(RefreshMode::Append),
+            refresh_check_interval: Some("1s".to_string()),
+            snapshots: SnapshotBehavior::Enabled,
+            params: Some(Params::from_string_map(HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    dir.join("data").display().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    dir.join("metadata").display().to_string(),
+                ),
+            ]))),
+            ..Default::default()
+        });
+        AppBuilder::new("source_unavailable")
+            .with_dataset(dataset)
+            .with_snapshots(Snapshots {
+                enabled: true,
+                location: Some(format!("file://{}/", dir.join("snapshots").display())),
+                bootstrap_on_failure_behavior: BootstrapOnFailureBehavior::Fallback,
+                params: None,
+            })
+            .build()
+    }
+
+    async fn start(app: app::App) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
+        configure_test_datafusion();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let loader = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.load_components().await }
+        });
+        (rt, loader)
+    }
+
+    async fn stop(rt: Arc<Runtime>, loader: tokio::task::JoinHandle<()>) {
+        rt.shutdown().await;
+        loader.abort();
+    }
+
+    /// `COUNT(*)` of `orders`, or why the query failed.
+    async fn count(rt: &Arc<Runtime>) -> Result<i64, String> {
+        let batches = run_query(rt, "SELECT COUNT(*) AS n FROM orders")
+            .await
+            .map_err(|err| err.to_string())?;
+        batches
+            .first()
+            .and_then(|batch| batch.column(0).as_any().downcast_ref::<Int64Array>())
+            .map(|counts| counts.value(0))
+            .ok_or_else(|| "COUNT(*) is not Int64".to_string())
+    }
+
+    /// Whether a Cayenne snapshot archive was published under `dir`.
+    fn has_snapshot(dir: &Path) -> bool {
+        std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    has_snapshot(&path)
+                } else {
+                    path.extension().is_some_and(|ext| ext == "cayenne")
+                }
+            })
+        })
+    }
+
+    /// Loads the three source rows and stops once a snapshot of them is published, which
+    /// also checkpoints the acceleration.
+    async fn seed(source: &Arc<UnreachableSource>, dir: &Path) -> Result<(), anyhow::Error> {
+        source.bring_up();
+        let (rt, loader) = start(app(source.prefix, dir)).await;
+        let seeded = wait_until_true(Duration::from_secs(60), || async {
+            count(&rt).await == Ok(3) && has_snapshot(&dir.join("snapshots"))
+        })
+        .await;
+        let observed = (count(&rt).await, dataset_status(&rt, "orders"));
+        stop(rt, loader).await;
+        anyhow::ensure!(
+            seeded,
+            "seeding the acceleration and its snapshot, got {observed:?}"
+        );
+        Ok(())
+    }
+
+    /// Restarts with the source down, asserts the acceleration is served and the runtime
+    /// is ready, then that the dataset reports `Error` until the source is back.
+    async fn assert_served_while_source_is_down(
+        source: &Arc<UnreachableSource>,
+        dir: &Path,
+    ) -> Result<(), anyhow::Error> {
+        source.take_down();
+        let (rt, loader) = start(app(source.prefix, dir)).await;
+        let served = wait_until_true(Duration::from_secs(30), || async {
+            count(&rt).await == Ok(3) && rt.status().is_ready()
+        })
+        .await;
+        assert!(
+            served,
+            "queries must be answered from the acceleration and the runtime must be ready, got {:?}, ready={} ({:?})",
+            count(&rt).await,
+            rt.status().is_ready(),
+            dataset_status(&rt, "orders")
+        );
+
+        let reports_error = wait_until_true(Duration::from_secs(30), || async {
+            matches!(
+                dataset_status(&rt, "orders"),
+                Some(ComponentStatus::Error(message))
+                    if message
+                        .as_deref()
+                        .is_some_and(|message| message.contains("Serving data from the existing acceleration"))
+            )
+        })
+        .await;
+        assert!(
+            reports_error,
+            "a source that cannot be reached sets Error, saying the dataset is still served ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        assert!(
+            rt.status().is_ready(),
+            "a served dataset in Error stays ready"
+        );
+
+        source.bring_up();
+        let reached = wait_until_true(Duration::from_secs(30), || async {
+            dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
+        })
+        .await;
+        assert!(
+            reached,
+            "the dataset must report Ready once its source is reached ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        assert_eq!(count(&rt).await, Ok(3));
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// An acceleration reopened from disk is served while its source is down.
+    #[tokio::test]
+    async fn a_reopened_append_acceleration_is_served_while_its_source_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let source = UnreachableSource::new("append-snapshots-reopened", 1);
+        source.register().await;
+        let dir = TempDir::new()?;
+        seed(&source, dir.path()).await?;
+        assert_served_while_source_is_down(&source, dir.path()).await
+    }
+
+    /// An acceleration restored from a snapshot is served while its source is down: with
+    /// nothing on disk and the source down, the rows can only come from the snapshot.
+    #[tokio::test]
+    async fn a_restored_append_acceleration_is_served_while_its_source_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let source = UnreachableSource::new("append-snapshots-restored", 1);
+        source.register().await;
+        let dir = TempDir::new()?;
+        seed(&source, dir.path()).await?;
+        std::fs::remove_dir_all(dir.path().join("data"))?;
+        std::fs::remove_dir_all(dir.path().join("metadata"))?;
+        assert_served_while_source_is_down(&source, dir.path()).await
     }
 }

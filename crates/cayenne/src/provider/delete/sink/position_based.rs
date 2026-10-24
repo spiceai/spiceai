@@ -26,7 +26,7 @@ limitations under the License.
 #![expect(deprecated)]
 
 use super::super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
-use super::CayenneDeletionSink;
+use super::{CayenneDeletionSink, PreparedDeletionCache, PreparedDeletionPublish};
 use crate::provider::Error;
 use crate::provider::deletion_strategy::PositionDeletionVector;
 use crate::provider::utils::convert_to_u64_box;
@@ -44,7 +44,6 @@ use futures::StreamExt;
 use object_store::ObjectStore;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use object_store::path::Path as ObjectStorePath;
 use std::sync::{Arc, LazyLock};
@@ -55,32 +54,6 @@ use vortex::layout::layouts::row_idx::row_idx;
 use vortex_datafusion::DefaultExpressionConvertor;
 use vortex_datafusion::ExpressionConvertor;
 use vortex_session::VortexSession;
-
-struct PositionDeleteCleanup(Vec<PathBuf>);
-
-impl Drop for PositionDeleteCleanup {
-    fn drop(&mut self) {
-        let paths = std::mem::take(&mut self.0);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                crate::provider::delete::cleanup_uncommitted_delete_paths(&paths).await;
-            });
-        } else {
-            std::thread::spawn(move || {
-                for path in paths {
-                    match std::fs::remove_file(path) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => tracing::warn!(
-                            %error,
-                            "Failed to clean uncommitted deletion-vector file"
-                        ),
-                    }
-                }
-            });
-        }
-    }
-}
 
 static MAX_CONCURRENT_FILE_SCANS: LazyLock<usize> =
     LazyLock::new(|| cpu_budget::cpu_budget().cayenne_max_concurrent_file_scans());
@@ -107,6 +80,29 @@ impl CayenneDeletionSink {
         ctx: &SessionContext,
         tables: &[Arc<ListingTable>],
     ) -> crate::provider::Result<u64> {
+        let row_ids = self.scan_filtered_rows_position_based(ctx, tables).await?;
+        self.persist_position_based_deletions(row_ids).await
+    }
+
+    /// [`Self::delete_filtered_rows_position_based`] up to its catalog commit: the
+    /// deletion vectors are written, and the caller commits them (alongside its
+    /// inline-data rewrite) and then publishes them. `None` when no row matched.
+    pub(super) async fn prepare_delete_filtered_rows_position_based(
+        &self,
+        ctx: &SessionContext,
+        tables: &[Arc<ListingTable>],
+    ) -> crate::provider::Result<Option<PreparedDeletionPublish>> {
+        let row_ids = self.scan_filtered_rows_position_based(ctx, tables).await?;
+        self.prepare_position_based_deletions(row_ids).await
+    }
+
+    /// The file-local positions of the rows the filter matches in `tables`, per
+    /// data file, leaving out rows a deletion vector already hides.
+    async fn scan_filtered_rows_position_based(
+        &self,
+        ctx: &SessionContext,
+        tables: &[Arc<ListingTable>],
+    ) -> crate::provider::Result<HashMap<String, Vec<u64>>> {
         let table_name = &self.table_metadata.table_name;
 
         if self.filters.is_empty() {
@@ -221,7 +217,7 @@ impl CayenneDeletionSink {
 
         if per_file_row_ids.is_empty() {
             tracing::debug!("No new deletions to persist");
-            return Ok(0);
+            return Ok(per_file_row_ids);
         }
 
         let total_new_deletions: usize = per_file_row_ids.values().map(std::vec::Vec::len).sum();
@@ -232,8 +228,7 @@ impl CayenneDeletionSink {
             "Position-based delete: persisting deletions"
         );
 
-        self.persist_position_based_deletions(per_file_row_ids)
-            .await
+        Ok(per_file_row_ids)
     }
 
     /// Delete rows by hash-probing key columns against a set of matched keys.
@@ -787,7 +782,9 @@ impl CayenneDeletionSink {
     ///
     /// 1. Merges new positions with existing deletions from the cache
     /// 2. Writes a combined deletion vector per source file
-    /// 3. Updates the in-memory cache
+    /// 3. Commits it to the catalog — on a table with no primary key, in place of
+    ///    the file's earlier vectors, whose files it then removes
+    /// 4. Updates the in-memory cache
     ///
     /// The deletion vector file contains ALL deleted positions (existing + new),
     /// enabling the scan to skip all deleted rows in a single lookup.
@@ -803,10 +800,53 @@ impl CayenneDeletionSink {
         &self,
         row_ids: HashMap<String, Vec<u64>>,
     ) -> crate::provider::Result<u64> {
+        let Some(mut prepared) = self.prepare_position_based_deletions(row_ids).await? else {
+            return Ok(0);
+        };
+        let replaced = if prepared.replaces_earlier_deletion_vectors() {
+            self.position_deletion_vectors_replaced_by(prepared.delete_files())
+                .await?
+        } else {
+            Vec::new()
+        };
+        let delete_files = prepared.delete_files().to_vec();
+        if replaced.is_empty() {
+            self.catalog.add_delete_files(delete_files).await?;
+        } else {
+            self.catalog
+                .commit_delete_files_with_inlined_rewrite(
+                    delete_files,
+                    &self.table_metadata.table_id,
+                    Vec::new(),
+                    Vec::new(),
+                    replaced
+                        .iter()
+                        .map(|row| row.delete_file_id.clone())
+                        .collect(),
+                )
+                .await?;
+        }
+        prepared.mark_catalog_committed();
+        let deleted = prepared.deleted_count();
+        prepared.publish()?;
+        self.remove_replaced_deletion_vector_files(replaced);
+        Ok(deleted)
+    }
+
+    /// Write one deletion vector per data file in `row_ids`, holding the
+    /// positions the file already had deleted plus the new ones, and stage them
+    /// for a catalog commit. `None` when `row_ids` adds no new deletion.
+    ///
+    /// The written files are removed if the returned publish is dropped before
+    /// [`PreparedDeletionPublish::mark_catalog_committed`].
+    pub(super) async fn prepare_position_based_deletions(
+        &self,
+        row_ids: HashMap<String, Vec<u64>>,
+    ) -> crate::provider::Result<Option<PreparedDeletionPublish>> {
         let table_name = &self.table_metadata.table_name;
 
         if row_ids.is_empty() {
-            return Ok(0);
+            return Ok(None);
         }
 
         // The per-file position-delete cache. For PK-less tables this is the
@@ -897,56 +937,41 @@ impl CayenneDeletionSink {
         }
 
         if specs.is_empty() {
-            return Ok(0);
+            return Ok(None);
         }
 
         let results = writer.write(specs).await?;
-        for result in &results {
-            if matches!(&result.identifiers, DeletionIdentifier::KeyBased(_)) {
-                for written in &results {
-                    Self::cleanup_uncommitted_delete_file(&written.delete_file.path).await;
-                }
-                return Err(Error::Internal {
-                    table: table_name.clone(),
-                    message: "Unexpected key-based deletion in position-based sink".to_string(),
-                });
-            }
-        }
         let delete_files = results
-            .into_iter()
-            .map(|result| result.delete_file)
-            .collect::<Vec<_>>();
-        let cleanup_paths = delete_files
             .iter()
-            .map(|delete_file| delete_file.path.clone())
+            .map(|result| result.delete_file.clone())
             .collect::<Vec<_>>();
-        let mut cleanup_guard =
-            PositionDeleteCleanup(cleanup_paths.iter().map(PathBuf::from).collect());
-        if let Err(error) = self.catalog.add_delete_files(delete_files).await {
-            super::super::cleanup_uncommitted_delete_paths(&cleanup_guard.0).await;
-            cleanup_guard.0.clear();
-            return Err(error.into());
+        // Armed from here, so every exit below removes the files just written.
+        let prepared = PreparedDeletionPublish {
+            strategy: self.pk_deletion_strategy.clone(),
+            table_memory: Arc::clone(&self.table_memory),
+            delete_files,
+            publish: PreparedDeletionCache::Positions {
+                vectors: cache_updates,
+            },
+            deleted_count: convert_to_u64_box(new_deletion_count, "new deletion count").map_err(
+                |e| Error::Internal {
+                    table: table_name.clone(),
+                    message: e.to_string(),
+                },
+            )?,
+            cleanup_armed: true,
+            scan_input_version: self.scan_input_version.as_ref().map(Arc::clone),
+        };
+        if results
+            .iter()
+            .any(|result| matches!(&result.identifiers, DeletionIdentifier::KeyBased(_)))
+        {
+            return Err(Error::Internal {
+                table: table_name.clone(),
+                message: "Unexpected key-based deletion in position-based sink".to_string(),
+            });
         }
-        cleanup_guard.0.clear();
-
-        // Build a fresh snapshot. Cloning the outer HashMap now only clones
-        // small (String, Arc<PositionDeletionVector>) entries — unchanged files
-        // share their bitmap/access-plan data with the previous snapshot through
-        // the inner Arc. Then overlay the cache_updates entries for files that
-        // changed in THIS commit. The pre-inner-Arc revision unconditionally
-        // cloned every file's full bitmap on every commit, turning the write into
-        // O(total deleted rows across all files) per call.
-        let mut updated_map = (*cached_deleted_row_ids.load_full()).clone();
-        updated_map.extend(cache_updates);
-        cached_deleted_row_ids.store(Arc::new(updated_map));
-        self.refresh_deletion_memory_accounting();
-        self.notify_scan_input_change();
-
-        // Return count of NEW deletions
-        convert_to_u64_box(new_deletion_count, "new deletion count").map_err(|e| Error::Internal {
-            table: table_name.clone(),
-            message: e.to_string(),
-        })
+        Ok(Some(prepared))
     }
 }
 

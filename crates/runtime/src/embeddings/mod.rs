@@ -49,7 +49,8 @@ mod rrf_vector_search_tests {
     use datafusion_expr::lit;
     use tokio::sync::RwLock;
 
-    use llms::model2vec::Model2Vec;
+    use llms::hf::HubParams;
+    use llms::model2vec::{Model2Vec, Model2VecOptions};
     use runtime_datafusion_udfs::embed;
     use runtime_request_context::{Protocol, RequestContext};
     use runtime_search::embeddings::EmbeddingModelStore;
@@ -67,23 +68,29 @@ mod rrf_vector_search_tests {
     static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
         LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
-    /// Shared embedding model — a single `LazyLock` prevents concurrent
-    /// `Model2Vec::from_params` calls from contending on the `HuggingFace`
-    /// file lock when tests run in parallel.
-    static TEST_EMBEDDING_MODEL: LazyLock<Arc<Model2Vec>> = LazyLock::new(|| {
-        Arc::new(
-            Model2Vec::from_params(
-                "minishlab/potion-base-2M",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("Must make embedding model"),
+    /// Shared embedding model: one load, so tests running in parallel do not each
+    /// download it and wait on the Hugging Face cache's file locks.
+    static TEST_EMBEDDING_MODEL: tokio::sync::OnceCell<Arc<Model2Vec>> =
+        tokio::sync::OnceCell::const_new();
+
+    async fn test_embedding_model() -> Arc<Model2Vec> {
+        Arc::clone(
+            TEST_EMBEDDING_MODEL
+                .get_or_init(|| async {
+                    Arc::new(
+                        Model2Vec::load(
+                            "test_model",
+                            "minishlab/potion-base-2M",
+                            HubParams::default(),
+                            Model2VecOptions::default(),
+                        )
+                        .await
+                        .expect("Must make embedding model"),
+                    )
+                })
+                .await,
         )
-    });
+    }
 
     macro_rules! extract_column {
         ($batches:expr, $column_name:expr, $array_cast_fn:ident, $nth:expr) => {
@@ -125,8 +132,7 @@ mod rrf_vector_search_tests {
 
         let embedding_models: Arc<RwLock<EmbeddingModelStore>> =
             Arc::new(RwLock::new(HashMap::new()));
-        let embedding_model: Arc<dyn llms::embeddings::Embed> =
-            Arc::clone(&TEST_EMBEDDING_MODEL) as _;
+        let embedding_model: Arc<dyn llms::embeddings::Embed> = test_embedding_model().await;
         embedding_models
             .write()
             .await
