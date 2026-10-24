@@ -21,6 +21,7 @@ use runtime_parameters::{ParameterSpec, Parameters};
 
 mod connector;
 mod infer;
+mod parquet_nan;
 pub use connector::{
     ListingTableConnector, ListingTableTemplate, ObjectVersionType, build_table_parquet_options,
     file_matches_extension, object_store_timeout_message,

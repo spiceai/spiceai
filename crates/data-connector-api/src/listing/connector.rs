@@ -33,9 +33,10 @@ use datafusion::catalog::Session;
 use datafusion::common::{Constraints, DFSchema, GetExt, Result as DFResult, ScalarValue};
 use datafusion::config::{ConfigField, TableParquetOptions};
 use datafusion::datasource::TableProvider;
+#[cfg(test)]
+use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::{
     FileFormat, csv::CsvFormat, file_compression_type::FileCompressionType, json::JsonFormat,
-    parquet::ParquetFormat,
 };
 use datafusion::datasource::listing::{
     ListingFileFilter, ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
@@ -75,6 +76,7 @@ use data_components::object::{
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ExposedParamLookup, Parameters};
 
+use super::parquet_nan::listing_parquet_format;
 use super::{
     DelimitedFormat, ParsedFileExtension, detect_file_extension_from_path,
     detect_file_extension_from_url_or_path, parse_file_extension_param,
@@ -1098,9 +1100,7 @@ pub trait ListingTableConnector: DataConnector {
                 ),
             )),
             (Some("parquet"), _) | (None, Some("parquet"))=> Ok((
-                Some(Arc::new(
-                    ParquetFormat::default().with_options(self.get_table_parquet_options(dataset).await?),
-                )),
+                Some(listing_parquet_format(self.get_table_parquet_options(dataset).await?)),
                 listing_extension(
                     configured_extension.as_ref(),
                     path_extension.as_ref(),
@@ -1177,9 +1177,7 @@ pub trait ListingTableConnector: DataConnector {
                         }
                     },
                     Some("parquet") => Ok((
-                        Some(Arc::new(
-                            ParquetFormat::default().with_options(self.get_table_parquet_options(dataset).await?),
-                        )),
+                        Some(listing_parquet_format(self.get_table_parquet_options(dataset).await?)),
                         listing_extension(
                             configured_extension.as_ref(),
                             path_extension.as_ref(),
@@ -3975,6 +3973,182 @@ mod tests {
         arrow::util::pretty::pretty_format_batches(&batches)
             .expect("format rows")
             .to_string()
+    }
+
+    async fn float_cell(ctx: &SessionContext, sql: &str) -> f64 {
+        use arrow::array::Float64Array;
+
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("plan sql")
+            .collect()
+            .await
+            .expect("collect rows");
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("float column")
+            .value(0)
+    }
+
+    /// Same `id`/`f` layout as the reporter's `tricky.parquet`: NaN at 2 and 12,
+    /// +inf at 3, -inf at 4, NULL at 7 and 16.
+    fn write_tricky_parquet(path: &std::path::Path) {
+        use arrow::array::{Decimal128Array, Float64Array, Int64Array};
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Int64, true),
+            Field::new("amt", DataType::Decimal128(10, 2), true),
+            Field::new("f", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(1..=20)),
+                Arc::new(Int64Array::from_iter_values(0..20)),
+                Arc::new(
+                    Decimal128Array::from_iter_values((0..20).map(|i| i * 100))
+                        .with_precision_and_scale(10, 2)
+                        .expect("decimal scale"),
+                ),
+                Arc::new(Float64Array::from(vec![
+                    Some(1.5),
+                    Some(f64::NAN),
+                    Some(f64::INFINITY),
+                    Some(f64::NEG_INFINITY),
+                    Some(-0.0),
+                    Some(0.0),
+                    None,
+                    Some(1e308),
+                    Some(-1e-308),
+                    Some(2.5),
+                    Some(3.5),
+                    Some(f64::NAN),
+                    Some(0.1),
+                    Some(0.2),
+                    Some(0.300_000_000_000_000_04),
+                    None,
+                    Some(1.0),
+                    Some(1.0),
+                    Some(-2.5),
+                    Some(100.0),
+                ])),
+            ],
+        )
+        .expect("valid batch");
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(path).expect("create parquet"),
+            file_schema,
+            None,
+        )
+        .expect("parquet writer");
+        writer.write(&batch).expect("write parquet");
+        writer.close().expect("close parquet");
+    }
+
+    async fn register_tricky_listing(table_url: &str) -> SessionContext {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "parquet".to_string());
+        let (connector, dataset) = setup_connector(table_url.to_string(), params);
+        let url = Url::parse(table_url).expect("table url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("parquet listing format")
+        else {
+            panic!("expected a parquet file format");
+        };
+        assert!(
+            file_format
+                .as_ref()
+                .is::<crate::listing::parquet_nan::NanSafeParquetFormat>(),
+            "the production listing path must wrap Parquet so float stats cannot be trusted"
+        );
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("create_listing_table production path");
+        let ctx = SessionContext::new();
+        ctx.register_table("t", provider)
+            .expect("register listing table");
+        ctx
+    }
+
+    async fn assert_tricky_float_answers(ctx: &SessionContext) {
+        let max_float = float_cell(ctx, "SELECT MAX(f) AS mx FROM t").await;
+        assert!(
+            max_float.is_nan(),
+            "MAX(f) must be NaN, not the parquet stat (inf); got {max_float}"
+        );
+        let max_non_null = float_cell(ctx, "SELECT MAX(f) AS mx FROM t WHERE f IS NOT NULL").await;
+        assert!(
+            max_non_null.is_nan(),
+            "MAX(f) WHERE f IS NOT NULL must be NaN; got {max_non_null}"
+        );
+        assert_eq!(
+            pretty_rows(
+                ctx,
+                "SELECT COUNT(*) AS n FROM t WHERE f = CAST('NaN' AS DOUBLE)"
+            )
+            .await,
+            ["+---+", "| n |", "+---+", "| 2 |", "+---+"].join("\n"),
+            "f = NaN must not prune the file"
+        );
+        assert_eq!(
+            pretty_rows(
+                ctx,
+                "SELECT id FROM t WHERE f > CAST('inf' AS DOUBLE) ORDER BY id"
+            )
+            .await,
+            ["+----+", "| id |", "+----+", "| 2  |", "| 12 |", "+----+",].join("\n"),
+            "f > inf matches NaN under DataFusion total order"
+        );
+        let min_float = float_cell(ctx, "SELECT MIN(f) AS mn FROM t").await;
+        assert!(
+            min_float.is_infinite() && min_float.is_sign_negative(),
+            "MIN(f) must stay -inf; got {min_float}"
+        );
+    }
+
+    async fn assert_non_float_max_keeps_stats_shortcut(ctx: &SessionContext) {
+        let int_max_plan = physical_plan_with_statistics(ctx, "SELECT MAX(k) FROM t").await;
+        assert!(
+            int_max_plan.contains("PlaceholderRowExec"),
+            "integer MAX must keep the stats shortcut:\n{int_max_plan}"
+        );
+        let decimal_max_plan = physical_plan_with_statistics(ctx, "SELECT MAX(amt) FROM t").await;
+        assert!(
+            decimal_max_plan.contains("PlaceholderRowExec"),
+            "decimal MAX must keep the stats shortcut:\n{decimal_max_plan}"
+        );
+        let float_max_plan = physical_plan_with_statistics(ctx, "SELECT MAX(f) FROM t").await;
+        assert!(
+            !float_max_plan.contains("PlaceholderRowExec"),
+            "float MAX must not fold parquet min/max that omitted NaN:\n{float_max_plan}"
+        );
+        assert_eq!(
+            pretty_rows(ctx, "SELECT MAX(k) AS mx FROM t").await,
+            ["+----+", "| mx |", "+----+", "| 19 |", "+----+"].join("\n")
+        );
+    }
+
+    /// Parquet writers omit `NaN` from float min/max. The listing `FileFormat`
+    /// must not answer `MAX(f)` from those stats or prune `f = NaN` / `f > inf`.
+    /// Integer and decimal `MAX` still use the statistics shortcut.
+    ///
+    /// Regression test for the federated parquet path of the same class as
+    /// spiceai/spiceai#14719.
+    #[tokio::test]
+    async fn listing_parquet_nan_stats_do_not_answer_max_or_prune() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_tricky_parquet(&dir.path().join("tricky.parquet"));
+        let ctx = register_tricky_listing(&format!("file://{}/", dir.path().display())).await;
+        assert_tricky_float_answers(&ctx).await;
+        assert_non_float_max_keeps_stats_shortcut(&ctx).await;
     }
 
     /// Regression test for Glue TPC-H plans that switched every `HashJoinExec`
