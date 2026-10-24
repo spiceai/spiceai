@@ -379,6 +379,26 @@ async fn checked_multiparts_int64_sum_cancels_and_overflows_on_merge() {
         contains_overflow(&overflow),
         "two-partition MAX+MAX must overflow, got {overflow}\nplan:\n{overflow_plan}"
     );
+
+    // A partition whose running total exceeds i64 must still merge. The final
+    // total MAX+MAX+(-MAX) is representable.
+    register_int64_partitions(
+        &ctx,
+        "t_partial_ovf_cancel",
+        &[&[Some(i64::MAX), Some(i64::MAX)], &[Some(-i64::MAX)]],
+    );
+    let cancel_overflow_sql = "SELECT SUM(big) FROM t_partial_ovf_cancel";
+    let (cancel_overflow_plan, cancel_overflow) = plan_and_collect(&ctx, cancel_overflow_sql).await;
+    assert_plan_ran(
+        &cancel_overflow_plan,
+        cancel_overflow_sql,
+        &["AggregateExec", "mode=Final", "mode=Partial"],
+    );
+    assert_eq!(
+        render_rows(&cancel_overflow),
+        vec![i64::MAX.to_string()],
+        "MAX+MAX and -MAX across partitions must cancel to MAX\nplan:\n{cancel_overflow_plan}"
+    );
 }
 
 #[tokio::test]

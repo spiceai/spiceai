@@ -19,23 +19,32 @@ limitations under the License.
 //! The built-in accumulator uses wrapping `arrow::compute::sum` and
 //! `add_wrapping`. A wrapping SIMD total cannot be checked after the fact:
 //! `[i64::MAX, i64::MAX, 2]` wraps twice and lands on zero. This accumulator
-//! widens to `i128` / `u128` and converts back.
+//! widens to `i128` / `u128`. Partial state is `Decimal128(38, 0)` so a
+//! partition whose running total does not fit in `Int64` can still cancel at
+//! merge; [`Accumulator::evaluate`] is the only narrowing point.
 
 use std::mem::size_of_val;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, PrimitiveArray};
-use arrow::datatypes::{DataType, FieldRef, Int64Type, UInt64Type};
+use arrow::datatypes::{
+    DECIMAL128_MAX_PRECISION, DataType, Decimal128Type, Field, FieldRef, Int64Type, UInt64Type,
+};
 use datafusion::common::{Result, ScalarValue, exec_err, not_impl_err};
 use datafusion::functions_aggregate::sum::sum_udaf;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
-use datafusion::logical_expr::utils::AggregateOrderSensitivity;
+use datafusion::logical_expr::utils::{AggregateOrderSensitivity, format_state_name};
 use datafusion::logical_expr::{
     Accumulator, AggregateUDF, AggregateUDFImpl, Documentation, GroupsAccumulator, ReversedUDAF,
     SetMonotonicity, Signature, StatisticsArgs,
 };
 
 use super::is_checked_sum_return_type;
+
+/// Wide enough for any pair of `i64`/`u64` totals that can still cancel to a
+/// representable `SUM` result. `DECIMAL128_MAX_PRECISION` is 38.
+const CHECKED_SUM_STATE_PRECISION: u8 = DECIMAL128_MAX_PRECISION;
+const CHECKED_SUM_STATE_SCALE: i8 = 0;
 
 /// Registry `sum` that checks `Int64` / `UInt64` totals and otherwise delegates.
 #[derive(Debug)]
@@ -95,6 +104,16 @@ impl AggregateUDFImpl for CheckedSum {
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        if !args.is_distinct && is_checked_sum_return_type(args.return_type()) {
+            return Ok(vec![
+                Field::new(
+                    format_state_name(args.name, "sum"),
+                    checked_sum_state_type(),
+                    true,
+                )
+                .into(),
+            ]);
+        }
         self.inner.state_fields(args)
     }
 
@@ -180,6 +199,14 @@ fn uint64_overflow() -> datafusion::error::DataFusionError {
     )
 }
 
+fn checked_sum_state_type() -> DataType {
+    DataType::Decimal128(CHECKED_SUM_STATE_PRECISION, CHECKED_SUM_STATE_SCALE)
+}
+
+fn widened_state(sum: Option<i128>) -> ScalarValue {
+    ScalarValue::Decimal128(sum, CHECKED_SUM_STATE_PRECISION, CHECKED_SUM_STATE_SCALE)
+}
+
 fn first_array(values: &[ArrayRef]) -> Result<&ArrayRef> {
     values.first().ok_or_else(|| {
         datafusion::error::DataFusionError::Internal("SUM expected one input column".to_string())
@@ -206,6 +233,58 @@ fn uint64_values(array: &ArrayRef) -> Result<&PrimitiveArray<UInt64Type>> {
             array.data_type()
         )
     }
+}
+
+fn decimal128_values(array: &ArrayRef) -> Result<&PrimitiveArray<Decimal128Type>> {
+    if let Some(values) = array.as_primitive_opt::<Decimal128Type>() {
+        Ok(values)
+    } else {
+        exec_err!(
+            "checked SUM expected Decimal128(38, 0) partial state, got {}",
+            array.data_type()
+        )
+    }
+}
+
+fn fold_decimal128_i128(mut acc: i128, array: &ArrayRef) -> Result<i128> {
+    for value in decimal128_values(array)?.iter().flatten() {
+        acc = acc.checked_add(value).ok_or_else(int64_overflow)?;
+    }
+    Ok(acc)
+}
+
+fn merge_optional_i128(sum: &mut Option<i128>, array: &ArrayRef) -> Result<()> {
+    let values = decimal128_values(array)?;
+    if values.null_count() == values.len() {
+        return Ok(());
+    }
+    *sum = Some(fold_decimal128_i128(sum.unwrap_or(0), array)?);
+    Ok(())
+}
+
+fn fold_decimal128_u128(mut acc: u128, array: &ArrayRef) -> Result<u128> {
+    for value in decimal128_values(array)?.iter().flatten() {
+        let value = u128::try_from(value).map_err(|_| uint64_overflow())?;
+        acc = acc.checked_add(value).ok_or_else(uint64_overflow)?;
+    }
+    Ok(acc)
+}
+
+fn merge_optional_u128(sum: &mut Option<u128>, array: &ArrayRef) -> Result<()> {
+    let values = decimal128_values(array)?;
+    if values.null_count() == values.len() {
+        return Ok(());
+    }
+    *sum = Some(fold_decimal128_u128(sum.unwrap_or(0), array)?);
+    Ok(())
+}
+
+fn u128_to_widened_state(sum: Option<u128>) -> Result<ScalarValue> {
+    let widened = match sum {
+        None => None,
+        Some(sum) => Some(i128::try_from(sum).map_err(|_| uint64_overflow())?),
+    };
+    Ok(widened_state(widened))
 }
 
 fn non_null_count(array: &dyn Array) -> Result<u64> {
@@ -244,7 +323,7 @@ impl CheckedInt64Sum {
 
 impl Accumulator for CheckedInt64Sum {
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        Ok(vec![self.evaluate()?])
+        Ok(vec![widened_state(self.sum)])
     }
 
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
@@ -252,7 +331,7 @@ impl Accumulator for CheckedInt64Sum {
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        self.add_array(first_array(states)?)
+        merge_optional_i128(&mut self.sum, first_array(states)?)
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
@@ -298,7 +377,7 @@ impl CheckedUInt64Sum {
 
 impl Accumulator for CheckedUInt64Sum {
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        Ok(vec![self.evaluate()?])
+        Ok(vec![u128_to_widened_state(self.sum)?])
     }
 
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
@@ -306,7 +385,7 @@ impl Accumulator for CheckedUInt64Sum {
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        self.add_array(first_array(states)?)
+        merge_optional_u128(&mut self.sum, first_array(states)?)
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
@@ -350,7 +429,7 @@ impl CheckedInt64SlidingSum {
 
 impl Accumulator for CheckedInt64SlidingSum {
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        Ok(vec![self.evaluate()?, self.count.into()])
+        Ok(vec![widened_state(Some(self.sum)), self.count.into()])
     }
 
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
@@ -358,15 +437,9 @@ impl Accumulator for CheckedInt64SlidingSum {
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        // Partial state is `(sum, count)`. Add the sums; take the counts
-        // from the second column so we do not double-count non-nulls.
-        let values = int64_values(first_array(states)?)?;
-        for value in values.iter().flatten() {
-            self.sum = self
-                .sum
-                .checked_add(i128::from(value))
-                .ok_or_else(int64_overflow)?;
-        }
+        // Partial state is `(sum, count)`. Add the widened sums; take the
+        // counts from the second column so we do not double-count non-nulls.
+        self.sum = fold_decimal128_i128(self.sum, first_array(states)?)?;
         if let Some(extra) = states
             .get(1)
             .and_then(|counts| arrow::compute::sum(counts.as_primitive::<UInt64Type>()))
@@ -431,7 +504,10 @@ impl CheckedUInt64SlidingSum {
 
 impl Accumulator for CheckedUInt64SlidingSum {
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        Ok(vec![self.evaluate()?, self.count.into()])
+        Ok(vec![
+            u128_to_widened_state(Some(self.sum))?,
+            self.count.into(),
+        ])
     }
 
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
@@ -439,13 +515,7 @@ impl Accumulator for CheckedUInt64SlidingSum {
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        let values = uint64_values(first_array(states)?)?;
-        for value in values.iter().flatten() {
-            self.sum = self
-                .sum
-                .checked_add(u128::from(value))
-                .ok_or_else(uint64_overflow)?;
-        }
+        self.sum = fold_decimal128_u128(self.sum, first_array(states)?)?;
         if let Some(extra) = states
             .get(1)
             .and_then(|counts| arrow::compute::sum(counts.as_primitive::<UInt64Type>()))
@@ -481,5 +551,64 @@ impl Accumulator for CheckedUInt64SlidingSum {
 
     fn supports_retract_batch(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+
+    fn int64_col(values: &[Option<i64>]) -> ArrayRef {
+        Arc::new(Int64Array::from(values.to_vec()))
+    }
+
+    #[test]
+    fn int64_partial_state_is_decimal128_and_evaluate_narrows() {
+        let mut acc = CheckedInt64Sum::new();
+        acc.update_batch(&[int64_col(&[Some(i64::MAX), Some(i64::MAX)])])
+            .expect("update MAX+MAX");
+        assert_eq!(
+            acc.state().expect("widened state"),
+            vec![ScalarValue::Decimal128(
+                Some(
+                    i128::from(i64::MAX)
+                        .checked_add(i128::from(i64::MAX))
+                        .expect("2*MAX fits i128")
+                ),
+                CHECKED_SUM_STATE_PRECISION,
+                CHECKED_SUM_STATE_SCALE,
+            )]
+        );
+        let error = acc
+            .evaluate()
+            .expect_err("MAX+MAX must overflow at evaluate");
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("overflow"),
+            "evaluate overflow, got {error}"
+        );
+    }
+
+    #[test]
+    fn int64_merge_cancels_partials_that_overflow_i64() {
+        let mut left = CheckedInt64Sum::new();
+        left.update_batch(&[int64_col(&[Some(i64::MAX), Some(i64::MAX)])])
+            .expect("left MAX+MAX");
+        let mut right = CheckedInt64Sum::new();
+        right
+            .update_batch(&[int64_col(&[Some(-i64::MAX)])])
+            .expect("right -MAX");
+
+        let mut merged = CheckedInt64Sum::new();
+        let left_state = left.state().expect("left state");
+        let left_array = left_state[0].to_array().expect("left state array");
+        merged.merge_batch(&[left_array]).expect("merge left");
+        let right_state = right.state().expect("right state");
+        let right_array = right_state[0].to_array().expect("right state array");
+        merged.merge_batch(&[right_array]).expect("merge right");
+        assert_eq!(
+            merged.evaluate().expect("cancelled total"),
+            ScalarValue::Int64(Some(i64::MAX))
+        );
     }
 }
