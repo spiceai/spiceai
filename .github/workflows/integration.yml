@@ -487,11 +487,19 @@ jobs:
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
         run: |
-          if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(/^github::/)'
-          else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(spiceai_integration_test) - test(/^github::/)'
-          fi
+          # A/B probe: the metrics scenario as on trunk (_unfixed) and as fixed, 3 pairs at
+          # once for load, 5 rounds, no retries. Not for merge.
+          for round in 1 2 3 4 5; do
+            for copy in 1 2 3; do
+              INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst --retries 0 --no-fail-fast -E 'binary_id(=runtime::integration) & test(/^snapshot_source::counts_the_polls/)' > "ab-${round}-${copy}.log" 2>&1 &
+            done
+            wait
+            grep -hE '^ +(PASS|FAIL|TIMEOUT) \[' ab-${round}-*.log || true
+          done
+          echo "=== tally"
+          grep -hE '^ +(PASS|FAIL|TIMEOUT) \[' ab-*.log | awk '{print $1, $NF}' | sort | uniq -c
+          echo "=== failure messages"
+          grep -hE "^Error: |should serve" ab-*.log | sort | uniq -c || true
 
       - name: Configure apt mirrors for the retention OOM test
         if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'

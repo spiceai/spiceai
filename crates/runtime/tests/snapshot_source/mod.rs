@@ -1600,7 +1600,23 @@ async fn counts_the_polls_that_cannot_advance_to_the_published_snapshot() -> Res
     test_request_context()
         .scope(async {
             let (rustfs, container) = start_rustfs(METRICS).await?;
-            let result = metrics_scenario(rustfs, &container, &modules).await;
+            let result = metrics_scenario(rustfs, &container, &modules, true).await;
+            remove_local_copies(&[&modules]);
+            container.remove().await?;
+            result
+        })
+        .await
+}
+
+#[tokio::test]
+async fn counts_the_polls_that_cannot_advance_to_the_published_snapshot_unfixed() -> Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
+    LazyLock::force(&PROMETHEUS);
+    let modules = unique("modules");
+    test_request_context()
+        .scope(async {
+            let (rustfs, container) = start_rustfs(METRICS).await?;
+            let result = metrics_scenario(rustfs, &container, &modules, false).await;
             remove_local_copies(&[&modules]);
             container.remove().await?;
             result
@@ -1613,6 +1629,7 @@ async fn metrics_scenario(
     rustfs: Rustfs,
     container: &RunningContainer,
     modules: &str,
+    follow: bool,
 ) -> Result<()> {
     let snapshot_mode = [("dataset", modules), ("mode", "snapshot")];
     let with_reason = |reason| [snapshot_mode[0], snapshot_mode[1], ("reason", reason)];
@@ -1652,6 +1669,14 @@ async fn metrics_scenario(
     // snapshot id says when the new rows have been published.
     std::fs::write(dir.path().join("modules.csv"), GROWN_CSV)?;
     wait_for_rows(&writer, modules, 5).await?;
+    if !follow {
+        let published = writer_snapshot_id(rustfs, &prefix, modules)
+            .await?
+            .context("the writer published snapshot 0")?;
+        wait_for_writer_snapshot(rustfs, &prefix, modules, published + 1).await?;
+        replicate_snapshots(rustfs, &prefix).await?;
+        wait_for_rows(&reader, modules, 5).await?;
+    }
     let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         replicate_snapshots(rustfs, &prefix).await?;
