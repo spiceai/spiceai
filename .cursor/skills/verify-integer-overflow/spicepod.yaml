@@ -1,0 +1,17 @@
+version: v1
+kind: Spicepod
+name: integer-overflow
+datasets:
+  - from: file:data/overflow.parquet
+    name: t_fed
+  - from: file:data/overflow.parquet
+    name: t_arrow
+    acceleration:
+      enabled: true
+      engine: arrow
+  - from: file:data/overflow.parquet
+    name: t_cayenne
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: memory
