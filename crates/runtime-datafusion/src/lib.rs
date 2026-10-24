@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub mod analyzer_rule;
+pub mod checked_arithmetic;
 pub mod composed_catalog;
 pub mod config;
 pub mod dependent_tables;

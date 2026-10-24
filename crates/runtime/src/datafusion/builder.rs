@@ -1276,6 +1276,11 @@ impl DataFusionBuilder {
                 panic!("Unable to register Spark aggregate function `{name}`: {e}");
             }
         }
+        if let Err(e) =
+            runtime_datafusion::checked_arithmetic::register_checked_arithmetic(&mut state)
+        {
+            panic!("Unable to register checked integer arithmetic: {e}");
+        }
         for udwf in datafusion_spark::all_default_window_functions() {
             if kept_out(
                 "window",
@@ -4358,6 +4363,7 @@ mod tests {
                 "resolve_grouping_function",
                 "type_coercion",
                 "exact_float_literal_decimal_cast",
+                "checked_integer_overflow",
                 "spice_ddl_rewrite",
             ],
             "Analyzer rule list or ordering has changed"
