@@ -44,7 +44,12 @@ use datafusion_pruning::{FilePruner, build_pruning_predicate};
 use super::column_stats::ColumnStatsAccumulator;
 
 /// Build a physical conjunction from data-column scan filters for file/segment pruning.
-pub(crate) fn build_listing_pruning_predicate(
+///
+/// # Errors
+///
+/// Returns an error if a filter cannot be planned as a physical expression
+/// against `schema`.
+pub fn build_listing_pruning_predicate(
     schema: &SchemaRef,
     filters: &[Expr],
 ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
@@ -161,8 +166,128 @@ pub(crate) fn tombstone_exclusion_filter(
     )))
 }
 
+/// For each container, whether its statistics leave the predicate able to match:
+/// `false` only where they prove no row matches, as [`should_prune_statistics`]
+/// decides one container at a time.
+///
+/// Builds the pruning predicate once and evaluates every container in one pass,
+/// where calling [`should_prune_statistics`] per container rebuilds it and copies
+/// each container's statistics. A scan prunes every in-memory segment and inline
+/// entry this way, so the per-container cost is paid per query.
+pub fn statistics_may_match(
+    stats: &[&Arc<Statistics>],
+    schema: &SchemaRef,
+    predicate: &Arc<dyn PhysicalExpr>,
+) -> Vec<bool> {
+    let mut may_match = vec![true; stats.len()];
+    let known: Vec<usize> = (0..stats.len())
+        .filter(|&i| !stats[i].column_statistics.is_empty())
+        .collect();
+    if known.is_empty() {
+        return may_match;
+    }
+    let Some(pruning_predicate) =
+        build_pruning_predicate(Arc::clone(predicate), schema, &Count::default())
+    else {
+        return may_match;
+    };
+    let prunable = TypedPrunableStatistics::new(
+        known.iter().map(|&i| Arc::clone(stats[i])).collect(),
+        schema,
+    );
+    match pruning_predicate.prune(&prunable) {
+        Ok(values) => {
+            for (&i, matched) in known.iter().zip(values) {
+                may_match[i] = matched;
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "Ignoring error building pruning predicate for in-memory segments"
+            );
+        }
+    }
+    may_match
+}
+
+/// [`PrunableStatistics`] with each min/max array built at the schema's column
+/// type. `PrunableStatistics` infers the array type from the first container's
+/// value, so a first container without an exact bound makes the array fail to
+/// build and no container is pruned by that column; a typed null keeps the others
+/// prunable.
+struct TypedPrunableStatistics {
+    inner: PrunableStatistics,
+    statistics: Vec<Arc<Statistics>>,
+    schema: SchemaRef,
+}
+
+impl TypedPrunableStatistics {
+    fn new(statistics: Vec<Arc<Statistics>>, schema: &SchemaRef) -> Self {
+        Self {
+            inner: PrunableStatistics::new(statistics.clone(), Arc::clone(schema)),
+            statistics,
+            schema: Arc::clone(schema),
+        }
+    }
+
+    fn exact_bounds(
+        &self,
+        column: &datafusion_common::Column,
+        bound: impl Fn(
+            &datafusion_common::ColumnStatistics,
+        ) -> &datafusion_common::stats::Precision<ScalarValue>,
+    ) -> Option<arrow::array::ArrayRef> {
+        let (statistics, schema) = (&self.statistics, &self.schema);
+        let index = schema.index_of(column.name()).ok()?;
+        let null = ScalarValue::try_from(schema.field(index).data_type()).ok()?;
+        let mut has_value = false;
+        let values = statistics.iter().map(|container| {
+            match container.column_statistics.get(index).map(&bound) {
+                Some(datafusion_common::stats::Precision::Exact(value)) => {
+                    has_value = true;
+                    value.clone()
+                }
+                _ => null.clone(),
+            }
+        });
+        let array = ScalarValue::iter_to_array(values).ok()?;
+        has_value.then_some(array)
+    }
+}
+
+impl datafusion_common::pruning::PruningStatistics for TypedPrunableStatistics {
+    fn min_values(&self, column: &datafusion_common::Column) -> Option<arrow::array::ArrayRef> {
+        self.exact_bounds(column, |stat| &stat.min_value)
+    }
+
+    fn max_values(&self, column: &datafusion_common::Column) -> Option<arrow::array::ArrayRef> {
+        self.exact_bounds(column, |stat| &stat.max_value)
+    }
+
+    fn num_containers(&self) -> usize {
+        self.inner.num_containers()
+    }
+
+    fn null_counts(&self, column: &datafusion_common::Column) -> Option<arrow::array::ArrayRef> {
+        self.inner.null_counts(column)
+    }
+
+    fn row_counts(&self) -> Option<arrow::array::ArrayRef> {
+        self.inner.row_counts()
+    }
+
+    fn contained(
+        &self,
+        column: &datafusion_common::Column,
+        values: &std::collections::HashSet<ScalarValue>,
+    ) -> Option<arrow::array::BooleanArray> {
+        self.inner.contained(column, values)
+    }
+}
+
 /// Returns `true` when container statistics prove the predicate cannot match any row.
-pub(crate) fn should_prune_statistics(
+pub fn should_prune_statistics(
     stats: &Statistics,
     schema: &SchemaRef,
     predicate: &Arc<dyn PhysicalExpr>,
@@ -192,10 +317,7 @@ pub(crate) fn should_prune_statistics(
 
 /// Compute exact min, max, and null-count statistics for one or more in-memory batches.
 #[must_use]
-pub(crate) fn statistics_from_record_batches(
-    schema: &SchemaRef,
-    batches: &[RecordBatch],
-) -> Statistics {
+pub fn statistics_from_record_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Statistics {
     let num_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     let column_statistics = (0..schema.fields().len())
         .map(|col_idx| {
@@ -347,6 +469,75 @@ mod tests {
         assert!(
             should_prune_statistics(&stats, &schema, &predicate),
             "segment [1,3] must be pruned for id = 99"
+        );
+    }
+
+    /// Batched pruning decides every container exactly as pruning it alone does,
+    /// across seeded random segments (including ones with no statistics) and a
+    /// spread of predicate shapes.
+    #[test]
+    fn batched_pruning_matches_per_container_pruning() {
+        let schema = test_schema();
+        let mut seed: u64 = 0x5eed_1234_abcd_0001;
+        let mut next = move |bound: i64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            i64::try_from((seed >> 33) % u64::try_from(bound).expect("positive bound"))
+                .expect("fits i64")
+        };
+        let mut stats: Vec<Arc<Statistics>> = Vec::new();
+        for _ in 0..200 {
+            match next(10) {
+                0 => stats.push(Arc::new(Statistics {
+                    num_rows: datafusion_common::stats::Precision::Absent,
+                    total_byte_size: datafusion_common::stats::Precision::Absent,
+                    column_statistics: Vec::new(),
+                })),
+                1 => stats.push(Arc::new(Statistics::new_unknown(&schema))),
+                _ => {
+                    let start = next(1_000);
+                    let len = 1 + next(50);
+                    let ids: Vec<i64> = (start..start + len).collect();
+                    let values: Vec<Option<i64>> = ids
+                        .iter()
+                        .map(|_| (next(4) != 0).then(|| next(500)))
+                        .collect();
+                    stats.push(Arc::new(statistics_from_record_batches(
+                        &schema,
+                        &[batch(&ids, &values)],
+                    )));
+                }
+            }
+        }
+        let refs: Vec<&Arc<Statistics>> = stats.iter().collect();
+        let predicates = vec![
+            col("id").eq(lit(500_i64)),
+            col("id").eq(lit(5_000_i64)),
+            col("id").between(lit(100_i64), lit(140_i64)),
+            col("id").gt(lit(900_i64)).or(col("value").lt(lit(10_i64))),
+            col("value").is_null(),
+            col("id").in_list(vec![lit(3_i64), lit(333_i64), lit(777_i64)], false),
+            col("id").gt_eq(lit(0_i64)),
+        ];
+        let mut pruned = 0usize;
+        for filter in predicates {
+            let predicate = build_listing_pruning_predicate(&schema, std::slice::from_ref(&filter))
+                .expect("predicate")
+                .expect("some");
+            let batched = statistics_may_match(&refs, &schema, &predicate);
+            for (index, container) in stats.iter().enumerate() {
+                let alone = !should_prune_statistics(container, &schema, &predicate);
+                assert_eq!(
+                    batched[index],
+                    alone,
+                    "container {index} decided differently for {filter}: {container:?}; batched over {} containers",
+                    refs.len()
+                );
+                pruned += usize::from(!alone);
+            }
+        }
+        assert!(
+            pruned > 0,
+            "the predicates must prune some containers, or nothing was compared"
         );
     }
 
