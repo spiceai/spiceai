@@ -43,10 +43,10 @@ spicepod:
     - { from: 's3://${sources.lake.bucket}/t/', name: s3_bad_secret, params: { $merge: '${sources.lake.params}', file_format: parquet, s3_secret: wrong } }
     - { from: 's3://no-such-bucket/t/', name: s3_bad_bucket, params: { $merge: '${sources.lake.params}', file_format: parquet } }
     - { from: 's3://${sources.lake.bucket}/no_such_prefix/', name: s3_bad_prefix, params: { $merge: '${sources.lake.params}', file_format: parquet } }
-    - { from: 'mongodb:t', name: mg_healthy, params: { mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false' } }
+    - { from: 'mongodb:t', name: mg_healthy, params: { mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false' } }
     - { from: 'mongodb:t', name: mg_bad_host, params: { mongodb_connection_string: 'mongodb://no-such-host.invalid:27017/x?tls=false' } }
-    - { from: 'mongodb:t', name: mg_bad_password, params: { mongodb_connection_string: 'mongodb://u:wrong@localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&tls=false' } }
-    - { from: 'mongodb:no_such_collection', name: mg_bad_table, params: { mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false' } }
+    - { from: 'mongodb:t', name: mg_bad_password, params: { mongodb_connection_string: 'mongodb://u:wrong@127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&tls=false' } }
+    - { from: 'mongodb:no_such_collection', name: mg_bad_table, params: { mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false' } }
     - { from: 'kafka:no_such_host_topic', name: kf_bad_host, params: { kafka_bootstrap_servers: 'no-such-host.invalid:9092', kafka_security_protocol: PLAINTEXT }, acceleration: { enabled: true, engine: cayenne, refresh_mode: append } }
 
 steps:

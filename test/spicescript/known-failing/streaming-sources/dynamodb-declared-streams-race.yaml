@@ -28,7 +28,7 @@ spicepod:
         dynamodb_aws_auth: key
         dynamodb_aws_access_key_id: test
         dynamodb_aws_secret_access_key: test
-        endpoint_url: http://localhost:${sources.ddb.port.4566}
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
       columns:
         - { name: id, type: text }
         - { name: name, type: text }
@@ -40,7 +40,7 @@ spicepod:
         dynamodb_aws_auth: key
         dynamodb_aws_access_key_id: test
         dynamodb_aws_secret_access_key: test
-        endpoint_url: http://localhost:${sources.ddb.port.4566}
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
       columns:
         - { name: id, type: text }
         - { name: name, type: text }
@@ -52,7 +52,7 @@ spicepod:
         dynamodb_aws_auth: key
         dynamodb_aws_access_key_id: test
         dynamodb_aws_secret_access_key: test
-        endpoint_url: http://localhost:${sources.ddb.port.4566}
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
       columns:
         - { name: id, type: text }
         - { name: name, type: text }
@@ -64,7 +64,7 @@ spicepod:
         dynamodb_aws_auth: key
         dynamodb_aws_access_key_id: test
         dynamodb_aws_secret_access_key: test
-        endpoint_url: http://localhost:${sources.ddb.port.4566}
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
       columns:
         - { name: id, type: text }
         - { name: name, type: text }
@@ -76,7 +76,7 @@ spicepod:
         dynamodb_aws_auth: key
         dynamodb_aws_access_key_id: test
         dynamodb_aws_secret_access_key: test
-        endpoint_url: http://localhost:${sources.ddb.port.4566}
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
       columns:
         - { name: id, type: text }
         - { name: name, type: text }
@@ -88,7 +88,7 @@ spicepod:
         dynamodb_aws_auth: key
         dynamodb_aws_access_key_id: test
         dynamodb_aws_secret_access_key: test
-        endpoint_url: http://localhost:${sources.ddb.port.4566}
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
       columns:
         - { name: id, type: text }
         - { name: name, type: text }
@@ -100,7 +100,7 @@ spicepod:
         dynamodb_aws_auth: key
         dynamodb_aws_access_key_id: test
         dynamodb_aws_secret_access_key: test
-        endpoint_url: http://localhost:${sources.ddb.port.4566}
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
       columns:
         - { name: id, type: text }
         - { name: name, type: text }
@@ -112,7 +112,7 @@ spicepod:
         dynamodb_aws_auth: key
         dynamodb_aws_access_key_id: test
         dynamodb_aws_secret_access_key: test
-        endpoint_url: http://localhost:${sources.ddb.port.4566}
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
       columns:
         - { name: id, type: text }
         - { name: name, type: text }

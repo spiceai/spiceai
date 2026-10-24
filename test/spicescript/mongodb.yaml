@@ -32,7 +32,7 @@ spicepod:
     - from: mongodb:t
       name: t
       params:
-        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
         change_stream_batch_max_duration: 100ms
         change_stream_max_await_time: 100ms
 

@@ -31,7 +31,7 @@ spicepod:
         dynamodb_aws_auth: key
         dynamodb_aws_access_key_id: test
         dynamodb_aws_secret_access_key: test
-        endpoint_url: http://localhost:${sources.ddb.port.4566}
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
         unnest_depth: '1'
         time_format: 2006-01-02T15:04:05.000Z07:00
     - from: dynamodb:t_${sources.ddb.namespace}

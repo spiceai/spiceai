@@ -28,7 +28,7 @@ spicepod:
   datasets:
     - { from: 'clickhouse:no_such_table', name: ch_bad_table, params: '${sources.ch.params}' }
     - { from: 'clickhouse:no_such_table', name: ch_bad_table_acc, params: '${sources.ch.params}', acceleration: { enabled: true, engine: cayenne } }
-    - { from: 'kafka:no_such_topic', name: kf_bad_topic, params: { kafka_bootstrap_servers: 'localhost:${sources.kafka.port.19092}', kafka_security_protocol: PLAINTEXT }, acceleration: { enabled: true, engine: cayenne, refresh_mode: append } }
+    - { from: 'kafka:no_such_topic', name: kf_bad_topic, params: { kafka_bootstrap_servers: '127.0.0.1:${sources.kafka.port.19092}', kafka_security_protocol: PLAINTEXT }, acceleration: { enabled: true, engine: cayenne, refresh_mode: append } }
     - { from: 's3://${sources.lake.bucket}/t/', name: s3_bad_secret, params: { $merge: '${sources.lake.params}', file_format: parquet, s3_secret: wrong } }
     - { from: 'mongodb:t', name: mg_bad_host, params: { mongodb_connection_string: 'mongodb://no-such-host.invalid:27017/x?tls=false' } }
 

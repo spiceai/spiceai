@@ -27,20 +27,20 @@ spicepod:
     - from: mongodb:missing
       name: missing
       params:
-        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
         change_stream_batch_max_duration: 100ms
         change_stream_max_await_time: 100ms
     - from: mongodb:empty
       name: empty
       params:
-        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
         change_stream_batch_max_duration: 100ms
         change_stream_max_await_time: 100ms
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: _id }
     - from: mongodb:dm
       name: declared_missing
       params:
-        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
         change_stream_batch_max_duration: 100ms
         change_stream_max_await_time: 100ms
       columns:
@@ -50,7 +50,7 @@ spicepod:
     - from: mongodb:nested
       name: nested
       params:
-        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
         change_stream_batch_max_duration: 100ms
         change_stream_max_await_time: 100ms
       columns:
@@ -60,7 +60,7 @@ spicepod:
     - from: mongodb:widen
       name: widen
       params:
-        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
         change_stream_batch_max_duration: 100ms
         change_stream_max_await_time: 100ms
       on_schema_change: sync_all_columns
@@ -68,20 +68,20 @@ spicepod:
     - from: mongodb:missing2
       name: missing_cdc
       params:
-        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
         change_stream_batch_max_duration: 100ms
         change_stream_max_await_time: 100ms
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: _id }
     - from: mongodb:empty2
       name: empty_fed
       params:
-        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
         change_stream_batch_max_duration: 100ms
         change_stream_max_await_time: 100ms
     - from: mongodb:de
       name: declared_empty
       params:
-        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
         change_stream_batch_max_duration: 100ms
         change_stream_max_await_time: 100ms
       columns:
@@ -91,7 +91,7 @@ spicepod:
     - from: mongodb:dec
       name: declared_empty_cdc
       params:
-        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
         change_stream_batch_max_duration: 100ms
         change_stream_max_await_time: 100ms
       columns:
@@ -102,7 +102,7 @@ spicepod:
     - from: mongodb:dd
       name: declared_docs
       params:
-        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
         change_stream_batch_max_duration: 100ms
         change_stream_max_await_time: 100ms
       columns:
@@ -112,7 +112,7 @@ spicepod:
     - from: mongodb:ddc
       name: declared_docs_cdc
       params:
-        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
         change_stream_batch_max_duration: 100ms
         change_stream_max_await_time: 100ms
       columns:
@@ -123,7 +123,7 @@ spicepod:
     - from: mongodb:dmc
       name: declared_missing_cdc
       params:
-        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
         change_stream_batch_max_duration: 100ms
         change_stream_max_await_time: 100ms
       columns:

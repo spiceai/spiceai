@@ -23,13 +23,13 @@ spicepod:
     - from: kafka:parts_${sources.kafka.namespace}
       name: parts
       params:
-        kafka_bootstrap_servers: localhost:${sources.kafka.port.19092}
+        kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
         kafka_security_protocol: PLAINTEXT
       acceleration: { enabled: true, engine: cayenne, refresh_mode: append }
     - from: kafka:docs_${sources.kafka.namespace}
       name: docs
       params:
-        kafka_bootstrap_servers: localhost:${sources.kafka.port.19092}
+        kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
         kafka_security_protocol: PLAINTEXT
       acceleration: { enabled: true, engine: cayenne, refresh_mode: append }
       columns:

@@ -26,7 +26,7 @@ spicepod:
     - from: kafka:orders_${sources.kafka.namespace}
       name: orders
       params: &sasl
-        kafka_bootstrap_servers: localhost:${sources.kafka.port.19092}
+        kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
         kafka_security_protocol: SASL_PLAINTEXT
         kafka_sasl_mechanism: SCRAM-SHA-256
         kafka_sasl_username: kafka
@@ -53,7 +53,7 @@ spicepod:
     - from: kafka:orders_${sources.kafka.namespace}
       name: no_sasl
       params:
-        kafka_bootstrap_servers: localhost:${sources.kafka.port.19092}
+        kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
         kafka_security_protocol: PLAINTEXT
       acceleration: *append
 
