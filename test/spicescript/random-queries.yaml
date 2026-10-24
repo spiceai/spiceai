@@ -1,0 +1,93 @@
+name: random-queries
+description: >
+  Random queries over nested subqueries (filters, groupings, DISTINCT,
+  ORDER BY … LIMIT on a unique key, joins, UNION ALL) under outer queries that
+  read some, none or all of their columns answer through Spice as PostgreSQL
+  answers them over the same rows: federated to PostgreSQL and MySQL, and
+  accelerated into each engine.
+
+sources:
+  backend: { kind: '${matrix.backend}' }
+  ref: { kind: postgres }
+
+matrix:
+  backend: [postgres, mysql]
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+  duckdb: duckdb-file
+  sqlite: sqlite-file
+  arrow: arrow
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: query-coverage
+  datasets:
+    - from: '${matrix.backend}:t'
+      name: t
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:u'
+      name: u
+      params: ${sources.backend.params}
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  compare-variants: false
+
+steps:
+  - generate:
+      backend:
+        table: t
+        rows: 400
+        seed: 31
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: i, int: [-50, 50], nulls: 0.1 }
+          - { name: big, bigint: [0, 10000000000] }
+          - { name: d, decimal: { range: [-100, 100], scale: 2 } }
+          - { name: f, float: [0, 50] }
+          - { name: s, choice: [apple, Apple, APPLE, banana, "O'Brien", naïve, '', under_score, b], nulls: 0.1 }
+          - { name: dt, date: ['2024-01-01', '2024-12-31'] }
+          - { name: ts, timestamp: ['2024-01-01', '2024-12-31'] }
+          - { name: b, bool: 0.33 }
+    mirror: ref
+  - generate:
+      backend:
+        table: u
+        rows: 150
+        seed: 32
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: t_id, int: [1, 440] }
+          - { name: label, choice: [red, blue, green] }
+    mirror: ref
+  - start: {}
+  # `avoid` keeps clear of known defects so a run can find others
+  # (known-failing/sql-unparser/random-queries-known.yaml runs the same queries without):
+  # `not`: `(NOT x) IS NULL` loses its parentheses when unparsed;
+  # `unread-groups`: a grouping none of whose aggregates is read loses its
+  # aggregation when unparsed; `nested-union`: DuckDB before 1.5 loses rows of
+  # a nested UNION ALL; `join-key-dependency`: DataFusion drops GROUP BY keys
+  # over a DISTINCT of a join; `set-operation-nulls`: INTERSECT/EXCEPT are sent
+  # without NULL-safe comparison; `case-widening`: a CASE whose first branch
+  # is narrower fails where DataFusion runs; `unsigned-rank`: -rank() fails.
+  # MySQL's BOOLEAN reaches Spice as Int8, so `b` is left out there; federated
+  # MySQL compares text with its own collation and drops NULLS LAST
+  # (known-failing/federation-mysql/query-coverage-known.yaml), so that place is left out.
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 1, queries: 300, depth: 2, oracle: ref, avoid: [not, unread-groups, nested-union, join-key-dependency, set-operation-nulls, case-widening, unsigned-rank] }
+    when: { backend: postgres }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 2, queries: 300, depth: 3, oracle: ref, avoid: [not, unread-groups, nested-union, join-key-dependency, set-operation-nulls, case-widening, unsigned-rank] }
+    when: { backend: postgres }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 3, queries: 300, depth: 3, oracle: ref, avoid: [not, unread-groups, nested-union, join-key-dependency, set-operation-nulls, case-widening, unsigned-rank] }
+    when: { backend: postgres }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 1, queries: 300, depth: 2, oracle: ref, avoid: [not, unread-groups, nested-union, join-key-dependency, set-operation-nulls, case-widening, unsigned-rank], skip-columns: [b] }
+    when: { backend: mysql }
+    except: federated
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 2, queries: 300, depth: 3, oracle: ref, avoid: [not, unread-groups, nested-union, join-key-dependency, set-operation-nulls, case-widening, unsigned-rank], skip-columns: [b] }
+    when: { backend: mysql }
+    except: federated

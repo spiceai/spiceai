@@ -1,0 +1,211 @@
+name: http-caching-keys
+description: >
+  More of Cayenne's `refresh_mode: caching` over an HTTP API: entries keyed by
+  query string and by method (a GET and a POST to one path are different
+  requests, checked against the same dataset unaccelerated), several
+  projections of one entry, error responses cached only when the dataset
+  says to store them, a filter on the response that leaves an entry no rows,
+  entries kept apart per API key, a zero TTL that asks the origin every time
+  and falls back to the stored entry only when the origin fails, and
+  declared primary keys that a response can satisfy.
+
+sources:
+  api: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-caching-keys
+  runtime:
+    caching: { sql_results: { enabled: false } }
+    auth:
+      api-key:
+        enabled: true
+        keys: [one:rw, two:rw]
+  datasets:
+    - from: ${sources.api.url}/v1
+      name: q
+      params: &api { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: &cache { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 1h } }
+    - from: ${sources.api.url}/v1
+      name: stored
+      params: { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0', on_error_response: store }
+      acceleration: *cache
+    - from: ${sources.api.url}/v1
+      name: cached
+      params: &body { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, request_body_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: *cache
+    - from: ${sources.api.url}/v1
+      name: direct
+      params: *body
+    - from: ${sources.api.url}/v1
+      name: zero
+      params: *api
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 0s, caching_stale_if_error: 1h } }
+    - from: ${sources.api.url}/v1
+      name: zero_strict
+      params: *api
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 0s } }
+    - from: ${sources.api.url}/v1
+      name: pk_body
+      params: *api
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, primary_key: '(request_path,content)', params: { caching_ttl: 2s } }
+
+defaults:
+  cluster-partition-by: { '*': request_path }
+  api-key: one
+
+steps:
+  - source-exec:
+      api:
+        - "{ path: /v1/people, query: q=michael, headers: { content-type: application/json }, body: '[{\"name\": \"Michael\"}]' }"
+        - "{ path: /v1/people, query: q=jennifer, headers: { content-type: application/json }, body: '[{\"name\": \"Jennifer\"}]' }"
+        - "{ path: /v1/people, query: 'q=michael&page=1', headers: { content-type: application/json }, body: '[{\"name\": \"Michael\", \"page\": 1}]' }"
+        - "{ path: /v1/people, query: 'page=1&q=michael', headers: { content-type: application/json }, body: '[{\"name\": \"Michael\", \"page\": 1}]' }"
+  - start: {}
+
+  # One entry per query string, each served from its own entry afterwards.
+  - query: SELECT content FROM q WHERE request_path = '/people' AND request_query = 'q=michael'
+    expect: { rows: [['{"name":"Michael"}']] }
+  - query: SELECT content FROM q WHERE request_path = '/people' AND request_query = 'q=jennifer'
+    expect: { rows: [['{"name":"Jennifer"}']] }
+  - query: SELECT request_query, content FROM q WHERE request_path = '/people' AND request_query = 'q=michael'
+    expect: { rows: [[q=michael, '{"name":"Michael"}']] }
+  - query: SELECT request_query FROM q WHERE request_path = '/people' AND request_query = 'q=jennifer'
+    expect: { rows: [[q=jennifer]] }
+  - query: SELECT count(*) AS n FROM q WHERE request_path = '/people' AND request_query = 'q=michael'
+    expect: { rows: [['1']] }
+  - source-query: { api: log /v1/people }
+    expect: { rows: [[GET, /v1/people?q=michael, ''], [GET, /v1/people?q=jennifer, '']] }
+  # Parameters in either order answer.
+  - query: SELECT content FROM q WHERE request_path = '/people' AND request_query = 'q=michael&page=1'
+    expect: { rows: [['{"name":"Michael","page":1}']] }
+  - query: SELECT content FROM q WHERE request_path = '/people' AND request_query = 'page=1&q=michael'
+    expect: { rows: [['{"name":"Michael","page":1}']] }
+
+  # A filter on the response that leaves no rows answers nothing, and the
+  # entry still holds one copy of the response.
+  - source-exec: { api: "{ path: /v1/pf, headers: { content-type: application/json }, body: '[{\"k\": \"match-me\"}]' }" }
+  - query: SELECT content FROM q WHERE request_path = '/pf'
+    expect: { rows: [['{"k":"match-me"}']] }
+  - query: SELECT content FROM q WHERE request_path = '/pf' AND content LIKE '%nope-XYZ%'
+    expect: { rows: [] }
+    expect-empty: true
+  - query: SELECT content FROM q WHERE request_path = '/pf'
+    expect: { rows: [['{"k":"match-me"}']] }
+  - sleep: 2s
+  - query: SELECT content FROM q WHERE request_path = '/pf'
+    expect: { rows: [['{"k":"match-me"}']] }
+
+  # An error response fails the query and is not cached, unless the dataset
+  # stores error responses: then it is an answer like any other.
+  - source-exec: { api: "{ path: /v1/missing, status: 404, headers: { content-type: application/json }, body: '{\"error\": \"not found\"}' }" }
+  - query: SELECT content FROM q WHERE request_path = '/missing'
+    expect-error: '404'
+  - query: SELECT content FROM q WHERE request_path = '/missing'
+    expect-error: '404'
+  - source-query: { api: count /v1/missing }
+    expect: { rows: [['2']] }
+  - query: SELECT response_status, content FROM stored WHERE request_path = '/missing'
+    expect: { rows: [['404', '{"error":"not found"}']] }
+  - query: SELECT response_status, content FROM stored WHERE request_path = '/missing'
+    expect: { rows: [['404', '{"error":"not found"}']] }
+  - source-query: { api: count /v1/missing }
+    expect: { rows: [['3']] }
+
+  # A GET and a POST to one path are different requests: the cached dataset
+  # answers each as the unaccelerated one does, in either order.
+  - source-exec:
+      api:
+        - "{ path: /v1/items, method: GET, headers: { content-type: application/json }, body: '[{\"from\": \"get-response\"}]' }"
+        - "{ path: /v1/items, method: POST, headers: { content-type: application/json }, body: '[{\"from\": \"post-response\"}]' }"
+  - query: SELECT content FROM direct WHERE request_path = '/items' AND request_query = ''
+    id: direct-get
+    expect: { rows: [['{"from":"get-response"}']] }
+  - query: SELECT content FROM direct WHERE request_path = '/items' AND request_query = '' AND request_body = ''
+    id: direct-post
+    expect: { rows: [['{"from":"post-response"}']] }
+  - query: SELECT content FROM cached WHERE request_path = '/items' AND request_query = ''
+    expect: { same-as: direct-get }
+  - query: SELECT content FROM cached WHERE request_path = '/items' AND request_query = '' AND request_body = ''
+    expect: { same-as: direct-post }
+  - query: SELECT content FROM cached WHERE request_path = '/items' AND request_query = ''
+    expect: { same-as: direct-get }
+  - query: SELECT content FROM cached WHERE request_path = '/items' AND request_body = 'x'
+    expect: { rows: [['{"from":"post-response"}']] }
+  - query: SELECT content FROM cached WHERE request_path = '/items' AND request_query = ''
+    expect: { same-as: direct-get }
+
+  # Each API key has its own entries: the second key fetches its own answer,
+  # and neither sees the other's.
+  - source-exec:
+      api:
+        - "{ path: /v1/who, headers: { content-type: application/json }, body: '[{\"served\": 2}]' }"
+        - "{ path: /v1/who, headers: { content-type: application/json }, body: '[{\"served\": 1}]', times: 1 }"
+  - query: SELECT content FROM q WHERE request_path = '/who'
+    expect: { rows: [['{"served":1}']] }
+  - query: SELECT content FROM q WHERE request_path = '/who'
+    expect: { rows: [['{"served":1}']] }
+  - query: SELECT content FROM q WHERE request_path = '/who'
+    api-key: two
+    expect: { rows: [['{"served":2}']] }
+  - query: SELECT content FROM q WHERE request_path = '/who'
+    api-key: two
+    expect: { rows: [['{"served":2}']] }
+  - query: SELECT content FROM q WHERE request_path = '/who'
+    expect: { rows: [['{"served":1}']] }
+  - source-query: { api: count /v1/who }
+    expect: { rows: [['2']] }
+  - query: SELECT column_name FROM information_schema.columns WHERE table_name = 'q' ORDER BY column_name
+    expect:
+      rows: [[_fetched_at], [content], [request_body], [request_headers], [request_path], [request_query], [response_headers], [response_status]]
+
+  # (A primary key over the request, contradicted by a response of several
+  # rows, caches one of them and serves it as the whole answer:
+  # known-failing/caching-http/http-caching-request-key.yaml.)
+  - source-exec: { api: "{ path: /v1/three, headers: { content-type: application/json }, body: '[{\"n\": 1}, {\"n\": 2}, {\"n\": 3}]' }" }
+  # A key that includes the response is unique per row: all three are cached,
+  # and a refreshed entry holds only what the response now returns.
+  - query: SELECT content FROM pk_body WHERE request_path = '/three' ORDER BY content
+    expect: { rows: [['{"n":1}'], ['{"n":2}'], ['{"n":3}']] }
+  - query: SELECT count(*) AS n FROM pk_body
+    expect: { rows: [['3']] }
+    eventually: 10s
+  - query: SELECT content FROM pk_body WHERE request_path = '/three' ORDER BY content
+    expect: { rows: [['{"n":1}'], ['{"n":2}'], ['{"n":3}']] }
+  - source-query: { api: count /v1/three }
+    expect: { rows: [['1']] }
+  - source-exec: { api: "{ path: /v1/three, headers: { content-type: application/json }, body: '[{\"n\": 1}, {\"n\": 2}]' }" }
+  - sleep: 3s
+  - query: SELECT content FROM pk_body WHERE request_path = '/three' ORDER BY content
+    expect: { rows: [['{"n":1}'], ['{"n":2}']] }
+  - query: SELECT count(*) AS n FROM pk_body
+    expect: { rows: [['2']] }
+    eventually: 10s
+
+  # A zero TTL asks the origin on every lookup; when the origin fails, the
+  # stored entry answers inside the stale-if-error window, and without one
+  # the failure reaches the client.
+  - source-exec: { api: "{ path: /v1/z, headers: { content-type: application/json }, body: '[{\"z\": 1}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/z'
+    expect: { rows: [['{"z":1}']] }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/z'
+    expect: { rows: [['{"z":1}']] }
+  - source-exec: { api: "{ path: /v1/z, headers: { content-type: application/json }, body: '[{\"z\": 2}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/z'
+    expect: { rows: [['{"z":2}']] }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/z'
+    expect: { rows: [['{"z":2}']] }
+  - source-query: { api: count /v1/z }
+    expect: { rows: [['4']] }
+  - sleep: 2s
+  - source-exec: { api: "{ path: /v1/z, status: 503, body: down }" }
+  - query: SELECT content FROM zero WHERE request_path = '/z'
+    expect: { rows: [['{"z":2}']] }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/z'
+    expect-error: true
+  - source-exec: { api: "{ path: /v1/z, headers: { content-type: application/json }, body: '[{\"z\": 3}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/z'
+    expect: { rows: [['{"z":3}']] }
+  - query: SELECT content FROM zero_strict WHERE request_path = '/z'
+    expect: { rows: [['{"z":3}']] }

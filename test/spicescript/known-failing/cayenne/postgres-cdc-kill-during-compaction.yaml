@@ -1,0 +1,81 @@
+name: postgres-cdc-kill-during-compaction
+description: >
+  spiced killed while Cayenne is compacting a CDC-fed table loses and
+  duplicates nothing: after a restart the table equals the source, and
+  compaction commits again. Each run kills at the first moment a compaction
+  holds a permit, after a different amount of change. Waits for compaction
+  keep writing new data rather than waiting for time, since compaction needs
+  new data to trigger.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  run: [1, 2, 3, 4, 5]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-kill-during-compaction
+  datasets:
+    - from: postgres:public.orders
+      name: orders
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: o_id
+        params:
+          # Flush often and compact as soon as two files exist, so a
+          # compaction is running most of the time the workload runs.
+          cayenne_cdc_mem_tier_max_age_ms: '200'
+          cayenne_compaction_trigger_files: '2'
+          cayenne_compaction_background_interval_ms: '200'
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE orders (o_id bigint PRIMARY KEY, v integer NOT NULL, grp integer NOT NULL, note text);
+        INSERT INTO orders SELECT i, i % 1000, i % 97, 'note ' || i FROM generate_series(1, 1000000) AS i;
+  - start: {}
+  - query: SELECT count(*), sum(v), sum(grp) FROM orders
+    eventually: 120s
+
+  # A different amount of change per run moves where the kill lands.
+  - source-exec:
+      src: |
+        UPDATE orders SET v = v + ${matrix.run} WHERE o_id % 7 = ${matrix.run};
+        DELETE FROM orders WHERE o_id % 101 = ${matrix.run};
+        UPDATE orders SET note = NULL WHERE o_id % 13 = ${matrix.run};
+        INSERT INTO orders SELECT i, 1, 1, NULL FROM generate_series(2000000, 2000000 + ${matrix.run} * 20000) AS i;
+  - wait-metric:
+      name: cayenne_compaction_permits_available
+      below: { metric: cayenne_compaction_permits_total }
+      drive: { src: "UPDATE orders SET v = v + 1 WHERE o_id % 50 = ${round} % 50", every: 1s, rounds: 60 }
+  - kill-spiced: { signal: STOP-then-KILL }
+
+  # More change while it is down.
+  - source-exec:
+      src: UPDATE orders SET grp = grp + 1 WHERE o_id % 11 = 0
+  - start: {}
+  - query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders
+    eventually: 120s
+  - query: SELECT * FROM orders WHERE o_id % 997 = 0
+    eventually: 30s
+  - query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp
+    eventually: 30s
+
+  # Compaction still works afterwards: given enough new data it commits,
+  # however long that takes (after a kill the dataset may first be rebuilt).
+  - wait-metric:
+      name: cayenne_compaction_outcome_total
+      labels: { outcome: committed }
+      increases: true
+      drive: { src: "UPDATE orders SET v = v + 1 WHERE o_id % 50 = ${round} % 50", every: 2s, rounds: 60 }
+  - query: SELECT count(*), sum(v), sum(grp) FROM orders
+    eventually: 60s

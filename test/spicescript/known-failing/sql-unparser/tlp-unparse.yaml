@@ -1,0 +1,77 @@
+# Known failing: `(NOT x) IS NULL` is unparsed without its parentheses, so the
+# source filters different rows, wherever SQL is unparsed for execution; and
+# nested IS predicates are a syntax error on MySQL. TLP over random
+# predicates without avoiding NOT. Federated to ClickHouse it breaks even with
+# NOT avoided. Move up a level once it passes.
+name: tlp-unparse
+description: >
+  Ternary logic partitioning over random predicates: for each predicate p the
+  rows of a table equal those WHERE p, WHERE NOT (p) and WHERE (p) IS NULL
+  together, its count, sum, min and max equal the parts', and each partition
+  answers as PostgreSQL answers it over the same rows; federated to each
+  backend and accelerated into each engine.
+
+sources:
+  backend: { kind: '${matrix.backend}' }
+  ref: { kind: postgres }
+
+matrix:
+  backend: [postgres, mysql, clickhouse]
+
+variants:
+  federated: {}
+  duckdb: duckdb-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: tlp-unparse
+  datasets:
+    - from: '${matrix.backend}:t'
+      name: t
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:u'
+      name: u
+      params: ${sources.backend.params}
+
+defaults:
+  expect: { oracle: ref }
+  # Each answer is checked against the reference; the variants' answers to
+  # one another add nothing but a second report of the same mismatch.
+  compare-variants: false
+
+steps:
+  - generate:
+      backend:
+        table: t
+        rows: 400
+        seed: 31
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: i, int: [-50, 50], nulls: 0.1 }
+          - { name: big, bigint: [0, 10000000000] }
+          - { name: d, decimal: { range: [-100, 100], scale: 2 } }
+          - { name: f, float: [0, 50] }
+          - { name: s, choice: [apple, Apple, APPLE, banana, "O'Brien", naïve, '', under_score, b], nulls: 0.1 }
+          - { name: dt, date: ['2024-01-01', '2024-12-31'] }
+          - { name: ts, timestamp: ['2024-01-01', '2024-12-31'] }
+          - { name: b, bool: 0.33 }
+    mirror: ref
+  - generate:
+      backend:
+        table: u
+        rows: 150
+        seed: 32
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: t_id, int: [1, 440] }
+          - { name: label, choice: [red, blue, green] }
+    mirror: ref
+  - start: {}
+  - tlp: { table: t, seed: 1, queries: 200, depth: 3, oracle: ref, skip-columns: [b] }
+    when: { backend: [postgres, mysql] }
+  - tlp: { table: t, seed: 1, queries: 200, depth: 3, oracle: ref, avoid: [not] }
+    when: { backend: clickhouse }
+    only: federated

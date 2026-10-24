@@ -1,0 +1,59 @@
+# Known failing (no issue filed yet): a write-back write that Spice has
+# acknowledged but not yet delivered is lost when the acceleration is rebuilt
+# from the source (here because the replication slot is gone at restart):
+# Spice serves the value from before the write, and the write never reaches
+# PostgreSQL once it accepts writes again.
+name: postgres-write-back-pending-across-rebuild
+description: >
+  A write-back write still pending delivery survives a restart in which the
+  acceleration is rebuilt from the source: Spice keeps serving it, and it
+  reaches PostgreSQL once PostgreSQL accepts it.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-write-back-pending-across-rebuild
+  datasets:
+    - from: postgres:public.accounts
+      name: accounts
+      params: ${sources.src.params}
+      access: read_write
+      replication: { enabled: true }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, write_mode: write_back, primary_key: id }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE accounts (id bigint PRIMARY KEY, balance numeric(12, 2) NOT NULL);
+        INSERT INTO accounts SELECT g, g * 10 FROM generate_series(1, 50) g;
+        CREATE TABLE accounts_gate (open boolean NOT NULL);
+        INSERT INTO accounts_gate VALUES (false);
+        CREATE FUNCTION accounts_gate() RETURNS trigger AS $$
+        BEGIN
+          IF NOT (SELECT open FROM accounts_gate) THEN RAISE EXCEPTION 'accounts is closed for delivery'; END IF;
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER accounts_gate_trigger BEFORE INSERT OR UPDATE ON accounts
+          FOR EACH ROW EXECUTE FUNCTION accounts_gate();
+  - start: {}
+  - query: SELECT sum(balance) AS total FROM accounts
+    expect: { rows: [['12750.00']] }
+    eventually: 60s
+  # Acknowledged, and held at the source by the gate.
+  - spice-exec: "BEGIN; UPDATE accounts SET balance = balance + 1000 WHERE id <= 5; COMMIT;"
+  - wait-metric: { name: dataset_acceleration_write_back_pending_keys, labels: { dataset: accounts }, above: 0, timeout: 30s }
+  - stop: {}
+  - source-exec: { src: "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'spice_accounts%'" }
+  - start: {}
+  - assert-log: { contains: "Dataset accounts: rebuilt the acceleration from the source" }
+    eventually: 30s
+  - query: SELECT sum(balance) AS total FROM accounts
+    expect: { rows: [['17750.00']] }
+  - source-exec: { src: "UPDATE accounts_gate SET open = true" }
+  - source-query: { src: "SELECT sum(balance) FROM accounts" }
+    expect: { rows: [['17750.00']] }
+    eventually: 60s

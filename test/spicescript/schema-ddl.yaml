@@ -1,0 +1,108 @@
+name: schema-ddl
+description: >
+  After a column is dropped, renamed or retyped at the source, a full refresh
+  fails naming the column while the rows held stay served; on the next start
+  a full-refresh acceleration with `on_schema_change: drop_and_recreate`
+  rebuilds and answers as the source does (not before the restart); under `block`, `append_new_columns` and
+  `sync_all_columns`, which evolve only additions and lossless widenings, it
+  keeps serving the rows it holds in their original shape (the dataset's
+  status is in known-failing/schema-evolution/schema-frozen-status.yaml). Once the table is
+  dropped, every mode keeps serving its last rows and reports the error.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  engine: [duckdb, cayenne]
+
+variants:
+  block: {}
+  append-new-columns: { datasets: { cham: { on_schema_change: append_new_columns } } }
+  sync-all-columns: { datasets: { cham: { on_schema_change: sync_all_columns } } }
+  drop-and-recreate: { datasets: { cham: { on_schema_change: drop_and_recreate } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: schema-ddl
+  datasets:
+    - from: postgres:public.chameleon
+      name: cham
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: full }
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE chameleon (id int PRIMARY KEY, town text, age int);
+        INSERT INTO chameleon VALUES (1, 'a', 10), (2, 'b', 20), (3, NULL, NULL);
+  - start: {}
+  - query: SELECT * FROM cham
+    oracle-sql: SELECT * FROM chameleon
+    id: original
+
+  # Live, a refresh after an incompatible change fails, naming the column, in
+  # every mode, and the rows held stay served.
+  - source-exec: { src: "ALTER TABLE chameleon DROP COLUMN age; INSERT INTO chameleon VALUES (4, 'd')" }
+  - refresh: { dataset: cham, expect-error: true }
+  - assert-status: { dataset: cham, status: Error, message-contains: age }
+  - query: SELECT * FROM cham
+    expect: { same-as: original }
+
+  # Each change is taken up on the next start: drop_and_recreate rebuilds from
+  # the source; the other modes keep the original shape.
+  - restart: {}
+  - refresh: { dataset: cham, wait: false }
+  - query: SELECT * FROM cham
+    oracle-sql: SELECT * FROM chameleon
+    eventually: 30s
+    only: drop-and-recreate
+  - query: SELECT * FROM cham
+    expect: { same-as: original }
+    consistently: 3s
+    except: drop-and-recreate
+
+  - source-exec: { src: "ALTER TABLE chameleon RENAME COLUMN town TO city" }
+  - restart: {}
+  - refresh: { dataset: cham, wait: false }
+  - query: SELECT * FROM cham
+    oracle-sql: SELECT * FROM chameleon
+    eventually: 30s
+    only: drop-and-recreate
+  - query: SELECT * FROM cham
+    expect: { same-as: original }
+    consistently: 3s
+    except: drop-and-recreate
+
+  - source-exec: { src: "ALTER TABLE chameleon ALTER COLUMN id TYPE text USING 'k' || id" }
+  - restart: {}
+  - refresh: { dataset: cham, wait: false }
+  - query: SELECT * FROM cham
+    oracle-sql: SELECT * FROM chameleon
+    eventually: 30s
+    only: drop-and-recreate
+    id: last-recreated
+  - query: SELECT * FROM cham
+    expect: { same-as: original }
+    consistently: 3s
+    except: drop-and-recreate
+
+  # The table goes away: the last rows stay served, and the error is reported.
+  - source-exec: { src: "DROP TABLE chameleon" }
+  - restart: { ready: false }
+  - assert-status: { dataset: cham, status: Error, message-contains: chameleon }
+    eventually: 30s
+  - query: SELECT * FROM cham
+    expect: { same-as: original }
+    eventually: 30s
+    except: drop-and-recreate
+  - query: SELECT * FROM cham
+    expect: { same-as: last-recreated }
+    eventually: 30s
+    only: drop-and-recreate

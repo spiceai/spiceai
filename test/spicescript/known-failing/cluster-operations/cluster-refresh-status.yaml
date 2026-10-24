@@ -1,0 +1,34 @@
+# Known failing (no issue filed yet): on a cluster, a refresh requested from
+# the scheduler runs (the next query sees the change), but the scheduler's
+# dataset status never records it: `last_refresh` stays as it was, so nothing
+# can tell when the refresh finished.
+name: cluster-refresh-status
+description: >
+  On a cluster scheduler with one executor, a refresh requested through the
+  API is reported finished in the dataset's status, and the acceleration
+  then serves the source's changes.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-refresh-status
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, primary_key: id }
+
+defaults:
+  cluster: { executors: 1 }
+  expect: { oracle: src }
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 50) i" }
+  - start: {}
+  - query: SELECT id, v FROM t
+  - source-exec: { src: "UPDATE t SET v = 'changed' WHERE id <= 5; INSERT INTO t VALUES (51, 'new')" }
+  - refresh: t
+  - query: SELECT id, v FROM t

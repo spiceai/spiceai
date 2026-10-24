@@ -1,0 +1,64 @@
+name: cluster-literals
+description: >
+  Known failing, on a cluster only. The SQL sent to executors writes typed
+  literals bare, so the executor reads them as other types: a REAL literal
+  (`r = 0.1`) is read as a double and matches nothing, an infinity is
+  written `inf` and read as a column name, and a 38-digit decimal is read
+  as Decimal128(38, 15) and overflows. On one spiced all of these answer as
+  PostgreSQL does (postgres-literals.yaml).
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-literals
+  datasets:
+    - from: postgres:public.e
+      name: e
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file }
+
+defaults:
+  cluster: { executors: 1 }
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE e (
+          id int PRIMARY KEY, f float8, r float4, d numeric(38, 10), n numeric(38, 0),
+          i8 bigint, i4 int, i2 smallint, s text COLLATE "C", bin bytea, tz timestamptz, ts timestamp, dt date);
+        INSERT INTO e VALUES
+          (1, 'NaN', 'NaN', 0, 0, 9223372036854775807, 2147483647, 32767, '', '\x00',
+           '2024-03-10 01:30:00-08', '1970-01-01 00:00:00', '1970-01-01'),
+          (2, 'Infinity', 'Infinity', 9999999999999999999999999999.9999999999,
+           99999999999999999999999999999999999999, 0, 1, 1, ' ', '\x',
+           '2024-03-10 03:30:00-07', '2024-03-10 02:30:00', '2024-03-10'),
+          (3, '-Infinity', '-Infinity', -9999999999999999999999999999.9999999999,
+           -99999999999999999999999999999999999999, -9223372036854775808, -2147483648, -32768,
+           '日本語', '\x00ff00', '1969-12-31 23:59:59.999999+00', '1970-01-01 00:00:00.000001', '1969-12-31'),
+          (4, '-0', '-0', 0.0000000001, 1, -1, -1, -1, '😀 emoji', '\xdeadbeef',
+           '2024-11-03 01:30:00-07', '2024-11-03 01:30:00.5', '2024-11-03'),
+          (5, '0', '0', -0.0000000001, -1, 1, 0, 0, 'naïve', '\x0a0d',
+           '2024-11-03 01:30:00-08', '2000-02-29 12:00:00.000001', '2000-02-29'),
+          (6, 1e308, 3.4e38, 12345678901234567890.1234567890, 12345678901234567890123456789012345678,
+           9223372036854775807, 2147483647, 100, e'tab\there', '\x7f',
+           '1900-01-01 00:00:00+00', '1999-12-31 23:59:59', '1900-01-01'),
+          (7, 5e-324, 1e-45, 0.5, 5, 7, 7, 7, e'line\nbreak', '\x80',
+           '2038-01-19 03:14:08+00', '2038-01-19 03:14:08', '2038-01-19'),
+          (8, 2.2250738585072014e-308, 1.17549435e-38, 1.5, 15, 8, 8, 8, repeat('xyz', 4000), decode(repeat('ab', 5000), 'hex'),
+           '2100-12-31 23:59:59.999999+00', '2100-12-31 23:59:59.999999', '2100-12-31'),
+          (9, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+          (10, 0.30000000000000004, 0.1, 2.5, 25, 10, 10, 10, e'a''b"c\\d_e', '\x5c',
+           '2024-06-30 23:59:59+14', '2024-06-30 23:59:59', '2024-06-30'),
+          (11, 'NaN', 1, 2.5, 25, 11, 11, 11, 'naïve', '\x00',
+           '2024-03-10 10:00:00+00', '2024-03-10 10:00:00', '2024-03-10');
+  - start: {}
+  - query: SELECT id FROM e WHERE r = CAST('0.1' AS REAL) ORDER BY id
+  - query: SELECT id FROM e WHERE r <> CAST('0.1' AS REAL) ORDER BY id
+  - query: SELECT id FROM e WHERE f = CAST('Infinity' AS DOUBLE PRECISION) ORDER BY id
+  - query: SELECT id FROM e WHERE d = CAST('9999999999999999999999999999.9999999999' AS DECIMAL(38, 10)) ORDER BY id
+  - query: SELECT id FROM e WHERE n = CAST('25' AS DECIMAL(38, 0)) ORDER BY id

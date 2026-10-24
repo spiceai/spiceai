@@ -1,0 +1,58 @@
+name: readiness-mixed
+description: >
+  Datasets with different ready_state settings in one runtime each follow
+  their own: while their slow first loads run, the on_registration dataset
+  answers from the source and the on_load one refuses, naming the dataset,
+  and the runtime is not ready; once both have loaded, both serve the
+  source's rows and the runtime is ready.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  cayenne: {}
+  duckdb: { datasets: { '*': { acceleration: { engine: duckdb } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: readiness-mixed
+  datasets:
+    - from: postgres:public.slow_t
+      name: early
+      params: ${sources.src.params}
+      ready_state: on_registration
+      acceleration: { enabled: true, engine: cayenne, mode: file }
+    - from: postgres:public.slow_t
+      name: late
+      params: ${sources.src.params}
+      ready_state: on_load
+      acceleration: { enabled: true, engine: cayenne, mode: file }
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text);
+        INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 50) i;
+        CREATE VIEW slow_t AS SELECT t.* FROM t, (SELECT pg_sleep(30)) s;
+  - start: { ready: false }
+  - assert-status: { dataset: late, ready: false }
+  # Registration itself can take a moment on a busy machine.
+  - query: SELECT count(*) FROM late
+    expect-error: Acceleration not ready; loading initial data for late
+    eventually: 20s
+  - query: SELECT * FROM early
+    oracle-sql: SELECT * FROM t
+    eventually: 10s
+  - assert-status: { dataset: late, status: Ready, ready: true }
+    eventually: 90s
+  - query: SELECT * FROM late
+    oracle-sql: SELECT * FROM t
+  - query: SELECT * FROM early
+    oracle-sql: SELECT * FROM t

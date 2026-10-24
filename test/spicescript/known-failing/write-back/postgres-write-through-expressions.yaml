@@ -1,0 +1,59 @@
+# Known failing: An UPDATE through a write-through Postgres dataset that computes an integer,
+# smallint, numeric or timestamp column from its own value is rejected
+# (`Expression not supported CAST(…)`), because the SQL sent to the source
+# cannot express the cast.
+# Move this script to test/spicescript/ once it passes.
+name: postgres-write-through-expressions
+description: >
+  An UPDATE through a write-through Postgres dataset may compute each column
+  from its own value, for every common column type, and the source then holds
+  exactly the computed values.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-write-through-expressions
+  datasets:
+    - from: postgres:public.t
+      name: t
+      access: read_write
+      params: ${sources.src.params}
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (
+          id   integer PRIMARY KEY,
+          i4   integer,
+          i8   bigint,
+          i2   smallint,
+          num  numeric(12, 2),
+          f4   real,
+          f8   double precision,
+          txt  text,
+          ts   timestamp,
+          tstz timestamptz
+        );
+        INSERT INTO t VALUES (1, 10, 100, 5, 1.25, 1.5, 2.5, 'a', TIMESTAMP '2025-01-01 00:00:00', TIMESTAMPTZ '2025-01-01 00:00:00+00');
+  - start: {}
+  - query: SELECT * FROM t
+
+  - spice-exec: UPDATE t SET i8 = i8 + 1 WHERE id = 1
+  - spice-exec: UPDATE t SET i4 = i4 + 1 WHERE id = 1
+  - spice-exec: UPDATE t SET i2 = i2 + 1 WHERE id = 1
+  - spice-exec: UPDATE t SET num = num + 10 WHERE id = 1
+  - spice-exec: UPDATE t SET f4 = f4 * 2 WHERE id = 1
+  - spice-exec: UPDATE t SET f8 = f8 * 2 WHERE id = 1
+  - spice-exec: UPDATE t SET txt = txt || 'b' WHERE id = 1
+  - spice-exec: UPDATE t SET ts = ts + INTERVAL '1 day' WHERE id = 1
+  - spice-exec: UPDATE t SET tstz = tstz + INTERVAL '1 day' WHERE id = 1
+
+  - query: SELECT * FROM t
+    expect:
+      rows: [["1", "11", "101", "6", "11.25", "3.0", "5.0", "ab", "2025-01-02T00:00:00", "2025-01-02T00:00:00Z"]]

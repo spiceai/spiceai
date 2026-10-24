@@ -1,0 +1,334 @@
+name: cayenne-catalog-dml
+description: >
+  A Cayenne catalog on a cluster scheduler, with one executor, takes CREATE SCHEMA, CREATE
+  TABLE (with PARTITION BY, primary keys and IF NOT EXISTS), INSERT (an insert
+  on an existing primary key replaces the row), UPDATE, DELETE (with and
+  without WHERE, on partition and other columns), MERGE INTO (composite keys,
+  partition keys that differ from the join key, duplicate source keys
+  refused) and DROP TABLE, and after every statement each table holds what a
+  PostgreSQL mirror running the same statements holds.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-catalog-dml
+  runtime:
+    state:
+      location: file://${instance.dir}/state
+  catalogs:
+    - from: cayenne
+      name: cat
+      access: read_write_create
+      params:
+        cayenne_data_dir: ${instance.dir}/cayenne/data
+        cayenne_metadata_dir: ${instance.dir}/cayenne/metadata
+
+defaults:
+  expect: { oracle: src }
+  spiced-args: [--role, scheduler, --node-advertise-address, 127.0.0.1,
+    --node-bind-address, '127.0.0.1:${instance.port}',
+    --node-mtls-ca-certificate-file, '${script.dir}/../cluster-pki/ca.crt',
+    --node-mtls-certificate-file, '${script.dir}/../cluster-pki/scheduler.crt',
+    --node-mtls-key-file, '${script.dir}/../cluster-pki/scheduler.key']
+  # The scheduler creates a table only while an executor is connected.
+  executor-args: [--role, executor, --scheduler-address, 'https://127.0.0.1:${instance.port}',
+    --node-advertise-address, 127.0.0.1, --node-bind-address, '127.0.0.1:${instance.executor_port}',
+    --node-mtls-ca-certificate-file, '${script.dir}/../cluster-pki/ca.crt',
+    --node-mtls-certificate-file, '${script.dir}/../cluster-pki/executor.crt',
+    --node-mtls-key-file, '${script.dir}/../cluster-pki/executor.key']
+
+steps:
+  - start: {}
+
+  # Lifecycle: create, insert, delete, insert again.
+  - spice-exec: 'CREATE SCHEMA cat.myschema'
+  - source-exec: { src: 'CREATE SCHEMA myschema' }
+  - spice-exec: 'CREATE TABLE cat.myschema.users (id BIGINT NOT NULL, name VARCHAR NOT NULL, email VARCHAR, age BIGINT, PRIMARY KEY (id)) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE myschema.users (id BIGINT NOT NULL, name VARCHAR NOT NULL, email VARCHAR, age BIGINT, PRIMARY KEY (id))' }
+  - query: SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'cat' AND table_name = 'users'
+    expect: { rows: [[myschema, users]] }
+  - query: SELECT count(*) AS n FROM cat.myschema.users
+    oracle-sql: SELECT count(*) AS n FROM myschema.users
+  - spice-exec: 'INSERT INTO cat.myschema.users VALUES (1, ''Alice'', ''alice@example.com'', 30), (2, ''Bob'', ''bob@example.com'', 25), (3, ''Charlie'', ''charlie@example.com'', 35), (4, ''Diana'', ''diana@example.com'', 28), (5, ''Eve'', NULL, 22)'
+  - source-exec: { src: 'INSERT INTO myschema.users VALUES (1, ''Alice'', ''alice@example.com'', 30), (2, ''Bob'', ''bob@example.com'', 25), (3, ''Charlie'', ''charlie@example.com'', 35), (4, ''Diana'', ''diana@example.com'', 28), (5, ''Eve'', NULL, 22)' }
+  - query: SELECT id, name, email, age FROM cat.myschema.users
+    oracle-sql: SELECT id, name, email, age FROM myschema.users
+  - spice-exec: 'INSERT INTO cat.myschema.users VALUES (6, ''Frank'', ''frank@example.com'', 40), (7, ''Grace'', ''grace@example.com'', 33)'
+  - source-exec: { src: 'INSERT INTO myschema.users VALUES (6, ''Frank'', ''frank@example.com'', 40), (7, ''Grace'', ''grace@example.com'', 33)' }
+  - spice-exec: 'DELETE FROM cat.myschema.users WHERE id = 3'
+  - source-exec: { src: 'DELETE FROM myschema.users WHERE id = 3' }
+  - query: SELECT id, name, email, age FROM cat.myschema.users
+    oracle-sql: SELECT id, name, email, age FROM myschema.users
+  - spice-exec: 'DELETE FROM cat.myschema.users WHERE age < 26'
+  - source-exec: { src: 'DELETE FROM myschema.users WHERE age < 26' }
+  - query: SELECT id, name, email, age FROM cat.myschema.users
+    oracle-sql: SELECT id, name, email, age FROM myschema.users
+  - spice-exec: 'INSERT INTO cat.myschema.users VALUES (8, ''Heidi'', ''heidi@example.com'', 29), (9, ''Ivan'', NULL, NULL)'
+  - source-exec: { src: 'INSERT INTO myschema.users VALUES (8, ''Heidi'', ''heidi@example.com'', 29), (9, ''Ivan'', NULL, NULL)' }
+  - query: SELECT avg(age) AS a, max(age) AS hi, min(age) AS lo, sum(age) AS s, count(*) AS n, count(email) AS e FROM cat.myschema.users
+    oracle-sql: SELECT avg(age) AS a, max(age) AS hi, min(age) AS lo, sum(age) AS s, count(*) AS n, count(email) AS e FROM myschema.users
+  - query: SELECT id, name FROM cat.myschema.users WHERE email IS NULL
+    oracle-sql: SELECT id, name FROM myschema.users WHERE email IS NULL
+  - spice-exec: 'DELETE FROM cat.myschema.users WHERE true'
+  - source-exec: { src: 'DELETE FROM myschema.users WHERE true' }
+  - query: SELECT count(*) AS n FROM cat.myschema.users
+    oracle-sql: SELECT count(*) AS n FROM myschema.users
+  - spice-exec: 'INSERT INTO cat.myschema.users VALUES (100, ''Zara'', ''zara@example.com'', 45)'
+  - source-exec: { src: 'INSERT INTO myschema.users VALUES (100, ''Zara'', ''zara@example.com'', 45)' }
+  - query: SELECT id, name, email, age FROM cat.myschema.users
+    oracle-sql: SELECT id, name, email, age FROM myschema.users
+  # CREATE TABLE IF NOT EXISTS leaves an existing table and its rows alone.
+  - spice-exec: 'CREATE SCHEMA cat.s1'
+  - source-exec: { src: 'CREATE SCHEMA s1' }
+  - spice-exec: 'CREATE TABLE cat.s1.t1 (id BIGINT NOT NULL, val BIGINT) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE s1.t1 (id BIGINT NOT NULL, val BIGINT)' }
+  - spice-exec: 'INSERT INTO cat.s1.t1 VALUES (1, 100)'
+  - source-exec: { src: 'INSERT INTO s1.t1 VALUES (1, 100)' }
+  - spice-exec: 'CREATE TABLE IF NOT EXISTS cat.s1.t1 (id BIGINT NOT NULL, val BIGINT) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE IF NOT EXISTS s1.t1 (id BIGINT NOT NULL, val BIGINT)' }
+  - query: SELECT id, val FROM cat.s1.t1
+    oracle-sql: SELECT id, val FROM s1.t1
+  # Several tables, joined.
+  - spice-exec: 'CREATE SCHEMA cat.store'
+  - source-exec: { src: 'CREATE SCHEMA store' }
+  - spice-exec: 'CREATE TABLE cat.store.products (product_id BIGINT NOT NULL, name VARCHAR NOT NULL, price DOUBLE NOT NULL) PARTITION BY product_id'
+  - source-exec: { src: 'CREATE TABLE store.products (product_id BIGINT NOT NULL, name VARCHAR NOT NULL, price DOUBLE PRECISION NOT NULL)' }
+  - spice-exec: 'CREATE TABLE cat.store.orders (order_id BIGINT NOT NULL, product_id BIGINT NOT NULL, quantity BIGINT NOT NULL) PARTITION BY order_id'
+  - source-exec: { src: 'CREATE TABLE store.orders (order_id BIGINT NOT NULL, product_id BIGINT NOT NULL, quantity BIGINT NOT NULL)' }
+  - spice-exec: 'INSERT INTO cat.store.products VALUES (1, ''Widget'', 9.99), (2, ''Gadget'', 19.99), (3, ''Gizmo'', 14.50)'
+  - source-exec: { src: 'INSERT INTO store.products VALUES (1, ''Widget'', 9.99), (2, ''Gadget'', 19.99), (3, ''Gizmo'', 14.50)' }
+  - spice-exec: 'INSERT INTO cat.store.orders VALUES (100, 1, 5), (101, 2, 2), (102, 1, 3), (103, 3, 1)'
+  - source-exec: { src: 'INSERT INTO store.orders VALUES (100, 1, 5), (101, 2, 2), (102, 1, 3), (103, 3, 1)' }
+  - query: SELECT p.name, sum(o.quantity) AS total_qty FROM cat.store.orders o JOIN cat.store.products p ON o.product_id = p.product_id GROUP BY p.name
+    oracle-sql: SELECT p.name, sum(o.quantity) AS total_qty FROM store.orders o JOIN store.products p ON o.product_id = p.product_id GROUP BY p.name
+  - spice-exec: 'DELETE FROM cat.store.orders WHERE order_id = 100'
+  - source-exec: { src: 'DELETE FROM store.orders WHERE order_id = 100' }
+  - query: SELECT p.name, sum(o.quantity) AS total_qty FROM cat.store.orders o JOIN cat.store.products p ON o.product_id = p.product_id GROUP BY p.name
+    oracle-sql: SELECT p.name, sum(o.quantity) AS total_qty FROM store.orders o JOIN store.products p ON o.product_id = p.product_id GROUP BY p.name
+  # DROP TABLE, then the same name created again.
+  - spice-exec: 'CREATE SCHEMA cat.ns'
+  - source-exec: { src: 'CREATE SCHEMA ns' }
+  - spice-exec: 'CREATE TABLE cat.ns.ephemeral (id BIGINT NOT NULL) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE ns.ephemeral (id BIGINT NOT NULL)' }
+  - spice-exec: 'INSERT INTO cat.ns.ephemeral VALUES (1), (2)'
+  - source-exec: { src: 'INSERT INTO ns.ephemeral VALUES (1), (2)' }
+  - spice-exec: 'DROP TABLE cat.ns.ephemeral'
+  - source-exec: { src: 'DROP TABLE ns.ephemeral' }
+  - query: SELECT * FROM cat.ns.ephemeral
+    expect-error: true
+  - spice-exec: 'DROP TABLE IF EXISTS cat.ns.ephemeral'
+  # Recreating a dropped table: known-failing/cluster-operations/cayenne-catalog-recreate.yaml.
+  # An INSERT on an existing primary key replaces the row (ON CONFLICT DO UPDATE in PostgreSQL).
+  - spice-exec: 'CREATE SCHEMA cat.pk'
+  - source-exec: { src: 'CREATE SCHEMA pk' }
+  - spice-exec: 'CREATE TABLE cat.pk.users (id BIGINT NOT NULL, name VARCHAR NOT NULL, email VARCHAR, PRIMARY KEY (id)) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE pk.users (id BIGINT NOT NULL, name VARCHAR NOT NULL, email VARCHAR, PRIMARY KEY (id))' }
+  - spice-exec: 'INSERT INTO cat.pk.users VALUES (1, ''Alice'', ''alice@example.com''), (2, ''Bob'', ''bob@example.com''), (3, ''Charlie'', ''charlie@example.com'')'
+  - source-exec: { src: 'INSERT INTO pk.users VALUES (1, ''Alice'', ''alice@example.com''), (2, ''Bob'', ''bob@example.com''), (3, ''Charlie'', ''charlie@example.com'')' }
+  - spice-exec: 'INSERT INTO cat.pk.users VALUES (2, ''Bob Updated'', ''bob_new@example.com''), (4, ''Diana'', ''diana@example.com'')'
+  - source-exec: { src: 'INSERT INTO pk.users VALUES (2, ''Bob Updated'', ''bob_new@example.com''), (4, ''Diana'', ''diana@example.com'') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email' }
+  - query: SELECT id, name, email FROM cat.pk.users
+    oracle-sql: SELECT id, name, email FROM pk.users
+  - spice-exec: 'INSERT INTO cat.pk.users VALUES (1, ''Alice V2'', ''alice_v2@example.com''), (3, ''Charlie V2'', ''charlie_v2@example.com'')'
+  - source-exec: { src: 'INSERT INTO pk.users VALUES (1, ''Alice V2'', ''alice_v2@example.com''), (3, ''Charlie V2'', ''charlie_v2@example.com'') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email' }
+  - query: SELECT id, name, email FROM cat.pk.users
+    oracle-sql: SELECT id, name, email FROM pk.users
+  - spice-exec: 'DELETE FROM cat.pk.users WHERE id = 2'
+  - source-exec: { src: 'DELETE FROM pk.users WHERE id = 2' }
+  - query: SELECT id, name, email FROM cat.pk.users
+    oracle-sql: SELECT id, name, email FROM pk.users
+  # Tables of one name in two schemas are separate.
+  - spice-exec: 'CREATE SCHEMA cat.finance'
+  - source-exec: { src: 'CREATE SCHEMA finance' }
+  - spice-exec: 'CREATE SCHEMA cat.hr'
+  - source-exec: { src: 'CREATE SCHEMA hr' }
+  - spice-exec: 'CREATE TABLE cat.finance.records (id BIGINT NOT NULL, amount DOUBLE) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE finance.records (id BIGINT NOT NULL, amount DOUBLE PRECISION)' }
+  - spice-exec: 'CREATE TABLE cat.hr.records (id BIGINT NOT NULL, employee VARCHAR) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE hr.records (id BIGINT NOT NULL, employee VARCHAR)' }
+  - spice-exec: 'INSERT INTO cat.finance.records VALUES (1, 1000.50), (2, 2500.75)'
+  - source-exec: { src: 'INSERT INTO finance.records VALUES (1, 1000.50), (2, 2500.75)' }
+  - spice-exec: 'INSERT INTO cat.hr.records VALUES (1, ''Alice''), (2, ''Bob'')'
+  - source-exec: { src: 'INSERT INTO hr.records VALUES (1, ''Alice''), (2, ''Bob'')' }
+  - spice-exec: 'DELETE FROM cat.finance.records WHERE id = 1'
+  - source-exec: { src: 'DELETE FROM finance.records WHERE id = 1' }
+  - query: SELECT id, amount FROM cat.finance.records
+    oracle-sql: SELECT id, amount FROM finance.records
+  - query: SELECT id, employee FROM cat.hr.records
+    oracle-sql: SELECT id, employee FROM hr.records
+  # MERGE INTO: matched rows updated, unmatched source rows ignored.
+  - spice-exec: 'CREATE SCHEMA cat.m'
+  - source-exec: { src: 'CREATE SCHEMA m' }
+  - spice-exec: 'CREATE TABLE cat.m.inventory (id BIGINT NOT NULL, name VARCHAR NOT NULL, qty BIGINT NOT NULL) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE m.inventory (id BIGINT NOT NULL, name VARCHAR NOT NULL, qty BIGINT NOT NULL)' }
+  - spice-exec: 'CREATE TABLE cat.m.updates (id BIGINT NOT NULL, name VARCHAR NOT NULL, qty BIGINT NOT NULL) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE m.updates (id BIGINT NOT NULL, name VARCHAR NOT NULL, qty BIGINT NOT NULL)' }
+  - spice-exec: 'INSERT INTO cat.m.inventory VALUES (1, ''apple'', 10), (2, ''banana'', 20), (3, ''cherry'', 30)'
+  - source-exec: { src: 'INSERT INTO m.inventory VALUES (1, ''apple'', 10), (2, ''banana'', 20), (3, ''cherry'', 30)' }
+  - spice-exec: 'INSERT INTO cat.m.updates VALUES (1, ''apple'', 50), (3, ''cherry'', 100)'
+  - source-exec: { src: 'INSERT INTO m.updates VALUES (1, ''apple'', 50), (3, ''cherry'', 100)' }
+  - spice-exec: 'MERGE INTO cat.m.inventory AS t USING cat.m.updates AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET qty = s.qty'
+  - source-exec: { src: 'MERGE INTO m.inventory AS t USING m.updates AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET qty = s.qty' }
+  - query: SELECT id, name, qty FROM cat.m.inventory
+    oracle-sql: SELECT id, name, qty FROM m.inventory
+  - spice-exec: 'MERGE INTO cat.m.inventory AS t USING cat.m.updates AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET qty = s.qty + t.qty'
+  - source-exec: { src: 'MERGE INTO m.inventory AS t USING m.updates AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET qty = s.qty + t.qty' }
+  - query: SELECT id, name, qty FROM cat.m.inventory
+    oracle-sql: SELECT id, name, qty FROM m.inventory
+  - spice-exec: 'MERGE INTO cat.m.inventory AS t USING cat.m.updates AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET qty = s.qty, name = s.name'
+  - source-exec: { src: 'MERGE INTO m.inventory AS t USING m.updates AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET qty = s.qty, name = s.name' }
+  - query: SELECT id, name, qty FROM cat.m.inventory
+    oracle-sql: SELECT id, name, qty FROM m.inventory
+  - spice-exec: 'MERGE INTO cat.m.inventory USING cat.m.updates ON inventory.id = updates.id WHEN MATCHED THEN UPDATE SET qty = updates.qty + 1'
+  - source-exec: { src: 'MERGE INTO m.inventory USING m.updates ON inventory.id = updates.id WHEN MATCHED THEN UPDATE SET qty = updates.qty + 1' }
+  - query: SELECT id, name, qty FROM cat.m.inventory
+    oracle-sql: SELECT id, name, qty FROM m.inventory
+  - spice-exec: 'DELETE FROM cat.m.updates WHERE id IN (1, 3)'
+  - source-exec: { src: 'DELETE FROM m.updates WHERE id IN (1, 3)' }
+  - spice-exec: 'INSERT INTO cat.m.updates VALUES (99, ''ghost'', 999)'
+  - source-exec: { src: 'INSERT INTO m.updates VALUES (99, ''ghost'', 999)' }
+  - spice-exec: 'MERGE INTO cat.m.inventory AS t USING cat.m.updates AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET qty = s.qty'
+  - source-exec: { src: 'MERGE INTO m.inventory AS t USING m.updates AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET qty = s.qty' }
+  - query: SELECT id, name, qty FROM cat.m.inventory
+    oracle-sql: SELECT id, name, qty FROM m.inventory
+  # MERGE on a key other than the partition key.
+  - spice-exec: 'CREATE SCHEMA cat.mp'
+  - source-exec: { src: 'CREATE SCHEMA mp' }
+  - spice-exec: 'CREATE TABLE cat.mp.stock (sku VARCHAR NOT NULL, region VARCHAR NOT NULL, qty BIGINT NOT NULL) PARTITION BY region'
+  - source-exec: { src: 'CREATE TABLE mp.stock (sku VARCHAR NOT NULL, region VARCHAR NOT NULL, qty BIGINT NOT NULL)' }
+  - spice-exec: 'CREATE TABLE cat.mp.inbound (sku VARCHAR NOT NULL, region VARCHAR NOT NULL, qty BIGINT NOT NULL) PARTITION BY region'
+  - source-exec: { src: 'CREATE TABLE mp.inbound (sku VARCHAR NOT NULL, region VARCHAR NOT NULL, qty BIGINT NOT NULL)' }
+  - spice-exec: 'INSERT INTO cat.mp.stock VALUES (''A'', ''US'', 10), (''B'', ''US'', 20), (''A'', ''EU'', 30), (''C'', ''EU'', 40)'
+  - source-exec: { src: 'INSERT INTO mp.stock VALUES (''A'', ''US'', 10), (''B'', ''US'', 20), (''A'', ''EU'', 30), (''C'', ''EU'', 40)' }
+  - spice-exec: 'INSERT INTO cat.mp.inbound VALUES (''A'', ''US'', 100), (''A'', ''EU'', 200)'
+  - source-exec: { src: 'INSERT INTO mp.inbound VALUES (''A'', ''US'', 100), (''A'', ''EU'', 200)' }
+  - spice-exec: 'MERGE INTO cat.mp.stock AS t USING cat.mp.inbound AS s ON t.sku = s.sku AND t.region = s.region WHEN MATCHED THEN UPDATE SET qty = s.qty'
+  - source-exec: { src: 'MERGE INTO mp.stock AS t USING mp.inbound AS s ON t.sku = s.sku AND t.region = s.region WHEN MATCHED THEN UPDATE SET qty = s.qty' }
+  - query: SELECT sku, region, qty FROM cat.mp.stock
+    oracle-sql: SELECT sku, region, qty FROM mp.stock
+  # MERGE on a three-column key, partitioned by one of them.
+  - spice-exec: 'CREATE SCHEMA cat.mc'
+  - source-exec: { src: 'CREATE SCHEMA mc' }
+  - spice-exec: 'CREATE TABLE cat.mc.metrics (sensor_id BIGINT NOT NULL, year BIGINT NOT NULL, month BIGINT NOT NULL, reading DOUBLE NOT NULL) PARTITION BY month'
+  - source-exec: { src: 'CREATE TABLE mc.metrics (sensor_id BIGINT NOT NULL, year BIGINT NOT NULL, month BIGINT NOT NULL, reading DOUBLE PRECISION NOT NULL)' }
+  - spice-exec: 'CREATE TABLE cat.mc.corrections (sensor_id BIGINT NOT NULL, year BIGINT NOT NULL, month BIGINT NOT NULL, reading DOUBLE NOT NULL) PARTITION BY month'
+  - source-exec: { src: 'CREATE TABLE mc.corrections (sensor_id BIGINT NOT NULL, year BIGINT NOT NULL, month BIGINT NOT NULL, reading DOUBLE PRECISION NOT NULL)' }
+  - spice-exec: 'INSERT INTO cat.mc.metrics VALUES (1, 2025, 1, 10.0), (2, 2025, 1, 20.0), (1, 2025, 2, 30.0), (3, 2025, 2, 40.0)'
+  - source-exec: { src: 'INSERT INTO mc.metrics VALUES (1, 2025, 1, 10.0), (2, 2025, 1, 20.0), (1, 2025, 2, 30.0), (3, 2025, 2, 40.0)' }
+  - spice-exec: 'INSERT INTO cat.mc.corrections VALUES (1, 2025, 1, 11.5), (2, 2025, 1, 22.5), (1, 2025, 2, 33.5)'
+  - source-exec: { src: 'INSERT INTO mc.corrections VALUES (1, 2025, 1, 11.5), (2, 2025, 1, 22.5), (1, 2025, 2, 33.5)' }
+  - spice-exec: 'MERGE INTO cat.mc.metrics AS t USING cat.mc.corrections AS s ON t.sensor_id = s.sensor_id AND t.year = s.year AND t.month = s.month WHEN MATCHED THEN UPDATE SET reading = s.reading'
+  - source-exec: { src: 'MERGE INTO mc.metrics AS t USING mc.corrections AS s ON t.sensor_id = s.sensor_id AND t.year = s.year AND t.month = s.month WHEN MATCHED THEN UPDATE SET reading = s.reading' }
+  - query: SELECT sensor_id, year, month, reading FROM cat.mc.metrics
+    oracle-sql: SELECT sensor_id, year, month, reading FROM mc.metrics
+  # A composite MERGE key matches pairs, not a cross product.
+  - spice-exec: 'CREATE SCHEMA cat.xp'
+  - source-exec: { src: 'CREATE SCHEMA xp' }
+  - spice-exec: 'CREATE TABLE cat.xp.inventory (region VARCHAR NOT NULL, sku VARCHAR NOT NULL, qty BIGINT NOT NULL) PARTITION BY region'
+  - source-exec: { src: 'CREATE TABLE xp.inventory (region VARCHAR NOT NULL, sku VARCHAR NOT NULL, qty BIGINT NOT NULL)' }
+  - spice-exec: 'CREATE TABLE cat.xp.updates (region VARCHAR NOT NULL, sku VARCHAR NOT NULL, qty BIGINT NOT NULL) PARTITION BY region'
+  - source-exec: { src: 'CREATE TABLE xp.updates (region VARCHAR NOT NULL, sku VARCHAR NOT NULL, qty BIGINT NOT NULL)' }
+  - spice-exec: 'INSERT INTO cat.xp.inventory VALUES (''US'', ''A'', 10), (''US'', ''B'', 20), (''EU'', ''A'', 30), (''EU'', ''B'', 40)'
+  - source-exec: { src: 'INSERT INTO xp.inventory VALUES (''US'', ''A'', 10), (''US'', ''B'', 20), (''EU'', ''A'', 30), (''EU'', ''B'', 40)' }
+  - spice-exec: 'INSERT INTO cat.xp.updates VALUES (''US'', ''A'', 99), (''EU'', ''B'', 88)'
+  - source-exec: { src: 'INSERT INTO xp.updates VALUES (''US'', ''A'', 99), (''EU'', ''B'', 88)' }
+  - spice-exec: 'MERGE INTO cat.xp.inventory AS t USING cat.xp.updates AS s ON t.region = s.region AND t.sku = s.sku WHEN MATCHED THEN UPDATE SET qty = s.qty'
+  - source-exec: { src: 'MERGE INTO xp.inventory AS t USING xp.updates AS s ON t.region = s.region AND t.sku = s.sku WHEN MATCHED THEN UPDATE SET qty = s.qty' }
+  - query: SELECT region, sku, qty FROM cat.xp.inventory
+    oracle-sql: SELECT region, sku, qty FROM xp.inventory
+  # A MERGE with two source rows for one target row is refused, as in PostgreSQL, and changes nothing.
+  - spice-exec: 'CREATE SCHEMA cat.dk'
+  - source-exec: { src: 'CREATE SCHEMA dk' }
+  - spice-exec: 'CREATE TABLE cat.dk.target (id BIGINT NOT NULL, val BIGINT NOT NULL) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE dk.target (id BIGINT NOT NULL, val BIGINT NOT NULL)' }
+  - spice-exec: 'CREATE TABLE cat.dk.source (id BIGINT NOT NULL, val BIGINT NOT NULL) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE dk.source (id BIGINT NOT NULL, val BIGINT NOT NULL)' }
+  - spice-exec: 'INSERT INTO cat.dk.target VALUES (1, 100)'
+  - source-exec: { src: 'INSERT INTO dk.target VALUES (1, 100)' }
+  - spice-exec: 'INSERT INTO cat.dk.source VALUES (1, 200), (1, 300)'
+  - source-exec: { src: 'INSERT INTO dk.source VALUES (1, 200), (1, 300)' }
+  - spice-exec: 'MERGE INTO cat.dk.target AS t USING cat.dk.source AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET val = s.val'
+    expect-error: true
+  - query: SELECT id, val FROM cat.dk.target
+    oracle-sql: SELECT id, val FROM dk.target
+  # UPDATE by key, by predicate, to NULL, several columns, and matching nothing.
+  - spice-exec: 'CREATE SCHEMA cat.u'
+  - source-exec: { src: 'CREATE SCHEMA u' }
+  - spice-exec: 'CREATE TABLE cat.u.users (id BIGINT NOT NULL, name VARCHAR NOT NULL, email VARCHAR, age BIGINT, PRIMARY KEY (id)) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE u.users (id BIGINT NOT NULL, name VARCHAR NOT NULL, email VARCHAR, age BIGINT, PRIMARY KEY (id))' }
+  - spice-exec: 'INSERT INTO cat.u.users VALUES (1, ''Alice'', ''alice@example.com'', 30), (2, ''Bob'', ''bob@example.com'', 25), (3, ''Charlie'', ''charlie@example.com'', 35), (4, ''Diana'', ''diana@example.com'', 28), (5, ''Eve'', ''eve@example.com'', 22)'
+  - source-exec: { src: 'INSERT INTO u.users VALUES (1, ''Alice'', ''alice@example.com'', 30), (2, ''Bob'', ''bob@example.com'', 25), (3, ''Charlie'', ''charlie@example.com'', 35), (4, ''Diana'', ''diana@example.com'', 28), (5, ''Eve'', ''eve@example.com'', 22)' }
+  - spice-exec: 'UPDATE cat.u.users SET age = 31 WHERE id = 1'
+  - source-exec: { src: 'UPDATE u.users SET age = 31 WHERE id = 1' }
+  - query: SELECT id, name, email, age FROM cat.u.users
+    oracle-sql: SELECT id, name, email, age FROM u.users
+  - spice-exec: 'UPDATE cat.u.users SET age = age + 10 WHERE age > 30'
+  - source-exec: { src: 'UPDATE u.users SET age = age + 10 WHERE age > 30' }
+  - query: SELECT id, name, email, age FROM cat.u.users
+    oracle-sql: SELECT id, name, email, age FROM u.users
+  - spice-exec: 'UPDATE cat.u.users SET email = NULL WHERE id = 4'
+  - source-exec: { src: 'UPDATE u.users SET email = NULL WHERE id = 4' }
+  - query: SELECT id, name, email, age FROM cat.u.users
+    oracle-sql: SELECT id, name, email, age FROM u.users
+  - spice-exec: 'UPDATE cat.u.users SET name = ''Bobby'', age = 99 WHERE id = 2'
+  - source-exec: { src: 'UPDATE u.users SET name = ''Bobby'', age = 99 WHERE id = 2' }
+  - query: SELECT id, name, email, age FROM cat.u.users
+    oracle-sql: SELECT id, name, email, age FROM u.users
+  - spice-exec: 'UPDATE cat.u.users SET age = 0 WHERE id = 9999'
+  - source-exec: { src: 'UPDATE u.users SET age = 0 WHERE id = 9999' }
+  - query: SELECT id, name, email, age FROM cat.u.users
+    oracle-sql: SELECT id, name, email, age FROM u.users
+  # UPDATE and DELETE without WHERE.
+  - spice-exec: 'CREATE SCHEMA cat.nw'
+  - source-exec: { src: 'CREATE SCHEMA nw' }
+  - spice-exec: 'CREATE TABLE cat.nw.t (id BIGINT NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (id)) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE nw.t (id BIGINT NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (id))' }
+  - spice-exec: 'INSERT INTO cat.nw.t VALUES (1, 10), (2, 20), (3, 30)'
+  - source-exec: { src: 'INSERT INTO nw.t VALUES (1, 10), (2, 20), (3, 30)' }
+  - spice-exec: 'UPDATE cat.nw.t SET v = 99'
+  - source-exec: { src: 'UPDATE nw.t SET v = 99' }
+  - query: SELECT id, v FROM cat.nw.t
+    oracle-sql: SELECT id, v FROM nw.t
+  - spice-exec: 'DELETE FROM cat.nw.t'
+  - source-exec: { src: 'DELETE FROM nw.t' }
+  - query: SELECT count(*) AS n FROM cat.nw.t
+    oracle-sql: SELECT count(*) AS n FROM nw.t
+  # UPDATE and DELETE filtering on a column other than the partition key, then on the partition key.
+  - spice-exec: 'CREATE SCHEMA cat.np'
+  - source-exec: { src: 'CREATE SCHEMA np' }
+  - spice-exec: 'CREATE TABLE cat.np.inv (region VARCHAR NOT NULL, sku VARCHAR NOT NULL, qty BIGINT NOT NULL) PARTITION BY region'
+  - source-exec: { src: 'CREATE TABLE np.inv (region VARCHAR NOT NULL, sku VARCHAR NOT NULL, qty BIGINT NOT NULL)' }
+  - spice-exec: 'INSERT INTO cat.np.inv VALUES (''US'', ''A'', 10), (''US'', ''B'', 20), (''EU'', ''A'', 30), (''EU'', ''B'', 40)'
+  - source-exec: { src: 'INSERT INTO np.inv VALUES (''US'', ''A'', 10), (''US'', ''B'', 20), (''EU'', ''A'', 30), (''EU'', ''B'', 40)' }
+  - spice-exec: 'UPDATE cat.np.inv SET qty = qty + 1 WHERE sku = ''A'''
+  - source-exec: { src: 'UPDATE np.inv SET qty = qty + 1 WHERE sku = ''A''' }
+  - query: SELECT region, sku, qty FROM cat.np.inv
+    oracle-sql: SELECT region, sku, qty FROM np.inv
+  - spice-exec: 'DELETE FROM cat.np.inv WHERE sku = ''B'''
+  - source-exec: { src: 'DELETE FROM np.inv WHERE sku = ''B''' }
+  - query: SELECT region, sku, qty FROM cat.np.inv
+    oracle-sql: SELECT region, sku, qty FROM np.inv
+  - spice-exec: 'CREATE TABLE cat.np.events (region VARCHAR NOT NULL, id BIGINT NOT NULL, payload VARCHAR) PARTITION BY region'
+  - source-exec: { src: 'CREATE TABLE np.events (region VARCHAR NOT NULL, id BIGINT NOT NULL, payload VARCHAR)' }
+  - spice-exec: 'INSERT INTO cat.np.events VALUES (''US'', 1, ''a''), (''US'', 2, ''b''), (''EU'', 3, ''c''), (''EU'', 4, ''d''), (''APAC'', 5, ''e'')'
+  - source-exec: { src: 'INSERT INTO np.events VALUES (''US'', 1, ''a''), (''US'', 2, ''b''), (''EU'', 3, ''c''), (''EU'', 4, ''d''), (''APAC'', 5, ''e'')' }
+  - spice-exec: 'UPDATE cat.np.events SET payload = ''X'' WHERE region = ''US'''
+  - source-exec: { src: 'UPDATE np.events SET payload = ''X'' WHERE region = ''US''' }
+  - query: SELECT region, id, payload FROM cat.np.events
+    oracle-sql: SELECT region, id, payload FROM np.events
+  - spice-exec: 'DELETE FROM cat.np.events WHERE region = ''EU'''
+  - source-exec: { src: 'DELETE FROM np.events WHERE region = ''EU''' }
+  - query: SELECT region, id, payload FROM cat.np.events
+    oracle-sql: SELECT region, id, payload FROM np.events
+  # Quoted identifiers, a composite primary key and PARTITION BY (bucket(N, col)).
+  - spice-exec: 'CREATE SCHEMA cat.bench'
+  - source-exec: { src: 'CREATE SCHEMA bench' }
+  - spice-exec: 'CREATE TABLE IF NOT EXISTS cat.bench."customer" ("c_custkey" BIGINT, "c_name" TEXT, "c_nationkey" BIGINT, "c_acctbal" DECIMAL(15, 2), "__created_at" TIMESTAMP, PRIMARY KEY ("c_custkey", "c_nationkey")) PARTITION BY (bucket(5, c_nationkey))'
+  - source-exec: { src: 'CREATE TABLE IF NOT EXISTS bench."customer" ("c_custkey" BIGINT, "c_name" TEXT, "c_nationkey" BIGINT, "c_acctbal" DECIMAL(15, 2), "__created_at" TIMESTAMP, PRIMARY KEY ("c_custkey", "c_nationkey"))' }
+  - spice-exec: 'INSERT INTO cat.bench.customer VALUES (1, ''a'', 3, 10.50, TIMESTAMP ''2024-01-01 00:00:00''), (2, ''b'', 7, -1.25, NULL), (1, ''c'', 7, 0.00, TIMESTAMP ''2024-02-01 00:00:00'')'
+  - source-exec: { src: 'INSERT INTO bench.customer VALUES (1, ''a'', 3, 10.50, TIMESTAMP ''2024-01-01 00:00:00''), (2, ''b'', 7, -1.25, NULL), (1, ''c'', 7, 0.00, TIMESTAMP ''2024-02-01 00:00:00'')' }
+  - query: SELECT c_custkey, c_name, c_nationkey, c_acctbal, __created_at FROM cat.bench.customer
+    oracle-sql: SELECT c_custkey, c_name, c_nationkey, c_acctbal, __created_at FROM bench.customer

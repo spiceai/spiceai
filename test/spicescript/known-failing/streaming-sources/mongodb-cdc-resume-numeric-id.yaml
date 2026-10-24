@@ -1,0 +1,54 @@
+name: mongodb-cdc-resume-numeric-id
+description: >
+  A MongoDB collection whose _id is a NumberLong, followed by change streams
+  into Cayenne, resumes after a clean restart from the token it persisted:
+  spiced becomes ready again and applies the changes made after the restart.
+  (A resume token for a numeric key carries _typeBits, which MongoDB refuses
+  in the token Spice resumes with: "Bad resume token: _typeBits of wrong
+  type".)
+
+sources:
+  mongo:
+    kind: docker
+    image: docker.io/library/mongo:8.0
+    ports: [27017]
+    command: [mongod, --replSet, rs0, --bind_ip_all]
+    ready: >-
+      mongosh --quiet --eval "try { rs.status(); db.hello().isWritablePrimary ? 1 : 0 } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}); 0 }" | grep -qx 1
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mongodb-cdc-resume-numeric-id
+  datasets:
+    - from: mongodb:t
+      name: t
+      params:
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        change_stream_batch_max_duration: 100ms
+        change_stream_max_await_time: 100ms
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: _id }
+
+steps:
+  - source-exec:
+      mongo: >-
+        mongosh --quiet ${sources.mongo.namespace} --eval "
+          db.t.insertMany([{ _id: NumberLong(1), v: 'a' }, { _id: NumberLong(2), v: 'b' }]);"
+  - start: {}
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['2']] }
+    eventually: 60s
+  # A change after the initial load, so a resume token is persisted.
+  - source-exec:
+      mongo: >-
+        mongosh --quiet ${sources.mongo.namespace} --eval "db.t.insertOne({ _id: NumberLong(3), v: 'c' });"
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['3']] }
+    eventually: 60s
+  - restart: {}
+  - source-exec:
+      mongo: >-
+        mongosh --quiet ${sources.mongo.namespace} --eval "db.t.insertOne({ _id: NumberLong(4), v: 'd' });"
+  - query: SELECT _id, v FROM t ORDER BY _id
+    expect: { rows: [['1', 'a'], ['2', 'b'], ['3', 'c'], ['4', 'd']] }
+    eventually: 60s

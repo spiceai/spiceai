@@ -1,0 +1,57 @@
+name: cluster-http-caching
+description: >
+  Known failing, on a cluster only (the same steps pass on one spiced:
+  http-caching-keys.yaml). A Cayenne `refresh_mode: caching` dataset keeps
+  each API key's entries apart: on a cluster the second key is answered
+  from the entry the first key's request stored, without asking the origin
+  — one principal is served another's response. A zero `caching_ttl`,
+  which asks the origin on every lookup, keeps answering the first stored
+  response.
+
+sources:
+  api: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-http-caching
+  runtime:
+    caching: { sql_results: { enabled: false } }
+    auth:
+      api-key:
+        enabled: true
+        keys: [one:rw, two:rw]
+  datasets:
+    - from: ${sources.api.url}/v1
+      name: q
+      params: &api { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 1h } }
+    - from: ${sources.api.url}/v1
+      name: zero
+      params: *api
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, params: { caching_ttl: 0s } }
+
+defaults:
+  cluster: { executors: 1 }
+  cluster-partition-by: { '*': request_path }
+  api-key: one
+
+steps:
+  - source-exec:
+      api:
+        - "{ path: /v1/who, headers: { content-type: application/json }, body: '[{\"served\": 2}]' }"
+        - "{ path: /v1/who, headers: { content-type: application/json }, body: '[{\"served\": 1}]', times: 1 }"
+        - "{ path: /v1/z, headers: { content-type: application/json }, body: '[{\"z\": 1}]' }"
+  - start: {}
+  - query: SELECT content FROM q WHERE request_path = '/who'
+    expect: { rows: [['{"served":1}']] }
+  - query: SELECT content FROM q WHERE request_path = '/who'
+    api-key: two
+    expect: { rows: [['{"served":2}']] }
+  - source-query: { api: count /v1/who }
+    expect: { rows: [['2']] }
+  - query: SELECT content FROM zero WHERE request_path = '/z'
+    expect: { rows: [['{"z":1}']] }
+  - source-exec: { api: "{ path: /v1/z, headers: { content-type: application/json }, body: '[{\"z\": 2}]' }" }
+  - query: SELECT content FROM zero WHERE request_path = '/z'
+    expect: { rows: [['{"z":2}']] }

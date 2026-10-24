@@ -1,0 +1,27 @@
+# Known failing (no issue filed yet): on a cluster, an aggregate over a
+# subquery with ORDER BY … LIMIT pushes `SELECT COUNT(1) FROM t` to the
+# executors, dropping the limit (400 instead of 7).
+name: cluster-aggregate-over-limit
+description: >
+  On a cluster, an aggregate over a subquery with ORDER BY … LIMIT counts the
+  limited rows: the partial aggregate sent to executors keeps the limit.
+
+sources:
+  src: { kind: postgres }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-aggregate-over-limit
+  datasets:
+    - { from: 'postgres:public.t', name: t, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file, primary_key: id } }
+defaults:
+  cluster: { executors: 1 }
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v int); INSERT INTO t SELECT i, i FROM generate_series(1, 400) i" }
+  - start: {}
+  - query: SELECT count(*) AS n FROM (SELECT id FROM t ORDER BY id LIMIT 7) g
+    expect: { rows: [['7']] }
+  - query: SELECT id FROM t ORDER BY id LIMIT 7
+    expect: { rows: [['1'],['2'],['3'],['4'],['5'],['6'],['7']] }
+  - explain: SELECT count(*) AS n FROM (SELECT id FROM t ORDER BY id LIMIT 7) g
+    omits: ['PartialAggregationFlightSqlExec sql=SELECT COUNT(1) AS "__agg_0" FROM t']

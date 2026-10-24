@@ -1,0 +1,63 @@
+# Known failing (no issue filed yet): a refresh_mode: snapshot reader whose
+# own source table does not exist bootstraps from the first snapshot but never
+# loads a newer one ("cannot connect to its source because of its
+# configuration, so it … will not refresh"), though snapshot refreshes are
+# documented as never querying the source. Needs a spiced built with the
+# snapshots feature.
+name: snapshots-reader-without-source
+description: >
+  A reader with refresh_mode: snapshot follows a writer through the snapshot
+  store alone, without its own source's table: it bootstraps from the
+  writer's first snapshot and then serves each newer one.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  writer:
+    datasets: { t: { acceleration: { refresh_mode: full, snapshots: create_only } } }
+  reader:
+    datasets: { t: { acceleration: { refresh_mode: snapshot, snapshots: bootstrap_only, refresh_check_interval: 1s } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshots-reader-without-source
+  snapshots:
+    enabled: true
+    location: file://${instance.dir}/../shared-snapshots/
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file }
+
+defaults:
+  # The variants work together, so they run side by side.
+  run-variants: side-by-side
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text);
+        INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 200) i;
+    only: writer
+  - start: { ready: false }
+  - query: SELECT count(*) AS n, sum(id) AS s FROM t
+    expect: { rows: [['200', '20100']] }
+    eventually: 60s
+    only: writer
+  - query: SELECT count(*) AS n, sum(id) AS s FROM t
+    expect: { rows: [['200', '20100']] }
+    eventually: 60s
+    only: reader
+
+  - source-exec: { src: "DELETE FROM t WHERE id > 100; UPDATE t SET v = 'new' WHERE id <= 10" }
+    only: writer
+  - refresh: t
+    only: writer
+  - query: SELECT count(*) AS n, sum(id) AS s, count(*) FILTER (WHERE v = 'new') AS changed FROM t
+    expect: { rows: [['100', '5050', '10']] }
+    eventually: 60s
+    only: reader

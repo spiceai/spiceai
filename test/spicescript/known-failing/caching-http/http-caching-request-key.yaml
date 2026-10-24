@@ -1,0 +1,44 @@
+name: http-caching-request-key
+description: >
+  Known failing. A caching acceleration whose primary key is the request
+  columns says one row per request; a response of three rows contradicts it.
+  The write should be refused, leaving nothing cached, so the next lookup
+  asks the origin again and answers all three rows. On Cayenne one of the
+  three rows is cached, and every later lookup answers that one row from the
+  cache without asking the origin. DuckDB is the comparison.
+
+sources:
+  api: { kind: mock-http }
+
+variants:
+  cayenne: {}
+  duckdb: { datasets: { t: { acceleration: { engine: duckdb } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-caching-request-key
+  runtime:
+    caching: { sql_results: { enabled: false } }
+  datasets:
+    - from: ${sources.api.url}/v1
+      name: t
+      params: { file_format: json, allowed_request_paths: '/*', request_query_filters: enabled, max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: caching, primary_key: '(request_query,request_path)', params: { caching_ttl: 1h } }
+
+defaults:
+  compare-variants: false
+
+steps:
+  - source-exec: { api: "{ path: /v1/three, headers: { content-type: application/json }, body: '[{\"n\": 1}, {\"n\": 2}, {\"n\": 3}]' }" }
+  - start: {}
+  - query: SELECT content FROM t WHERE request_path = '/three' ORDER BY content
+    expect: { rows: [['{"n":1}'], ['{"n":2}'], ['{"n":3}']] }
+  - sleep: 2s
+  # Nothing cached: a partial entry would be served as the whole answer.
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['0']] }
+  - query: SELECT content FROM t WHERE request_path = '/three' ORDER BY content
+    expect: { rows: [['{"n":1}'], ['{"n":2}'], ['{"n":3}']] }
+  - source-query: { api: count /v1/three }
+    expect: { rows: [['2']] }

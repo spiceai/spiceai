@@ -1,0 +1,74 @@
+name: schema-add-column
+description: >
+  A column added at the source is handled by each on_schema_change mode as
+  documented: block keeps serving the registered columns and keeps up with
+  their data, while append_new_columns and sync_all_columns serve the new
+  column with its values; the dataset stays ready throughout and across a
+  restart. Under full refresh the new column is checked after a restart; what
+  full refresh does before one, and block's refresh after one, are in
+  known-failing/schema-evolution/schema-add-column-full-refresh.yaml.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  refresh_mode: [full, changes]
+
+variants:
+  block: {}
+  append-new-columns: { datasets: { t: { on_schema_change: append_new_columns } } }
+  sync-all-columns: { datasets: { t: { on_schema_change: sync_all_columns } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: schema-add-column
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: '${matrix.refresh_mode}', primary_key: id }
+
+defaults:
+  expect: { oracle: src }
+  # Each mode answers with its own columns.
+  compare-variants: false
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id integer PRIMARY KEY, v integer, s text); INSERT INTO t SELECT i, i, 's' || i FROM generate_series(1, 100) i" }
+  - start: {}
+  - query: SELECT * FROM t
+    eventually: 30s
+
+  - source-exec:
+      src:
+        - ALTER TABLE t ADD COLUMN extra text
+        - UPDATE t SET extra = 'e' || id, v = v + 1000
+        - INSERT INTO t VALUES (101, 101, 's101', 'e101')
+  - refresh: t
+    when: { refresh_mode: full }
+  - query: SELECT * FROM t
+    oracle-sql: SELECT id, v, s FROM t
+    eventually: 30s
+    only: block
+  # Under full refresh the new column is adopted only after a restart
+  # (known-failing/schema-evolution/schema-add-column-full-refresh.yaml).
+  - query: SELECT * FROM t
+    eventually: 30s
+    only: [append-new-columns, sync-all-columns]
+    when: { refresh_mode: changes }
+  - assert-status: { dataset: t, status: Ready, ready: true }
+
+  - restart: {}
+  - refresh: t
+    when: { refresh_mode: full }
+    only: [append-new-columns, sync-all-columns]
+  - query: SELECT * FROM t
+    oracle-sql: SELECT id, v, s FROM t
+    eventually: 30s
+    only: block
+    when: { refresh_mode: changes }
+  - query: SELECT * FROM t
+    eventually: 30s
+    only: [append-new-columns, sync-all-columns]
+  - assert-status: { dataset: t, status: Ready, ready: true }

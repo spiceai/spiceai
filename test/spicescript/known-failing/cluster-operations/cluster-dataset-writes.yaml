@@ -1,0 +1,80 @@
+# Known failing (no issue filed yet): on a cluster, INSERT INTO a write-mode
+# Cayenne acceleration is acknowledged but the rows never appear in queries.
+name: cluster-dataset-writes
+description: >
+  On a cluster scheduler with one executor, SQL writes to a Cayenne
+  acceleration (`access: read_write`, `write_mode: acceleration`) leave it
+  holding what PostgreSQL holds after the same writes.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  policy: [upsert]
+  layout: [plain]
+  mode: [file]
+
+variants:
+  upsert: { when: { policy: upsert, layout: plain }, datasets: { ev: { acceleration: { primary_key: id, on_conflict: { id: upsert } } } } }
+  upsert-partitioned: { when: { policy: upsert, layout: partitioned }, datasets: { ev: { acceleration: { primary_key: id, on_conflict: { id: upsert }, partition_by: [region] } } } }
+  drop: { when: { policy: drop, layout: plain }, datasets: { ev: { acceleration: { primary_key: id, on_conflict: { id: drop } } } } }
+  drop-partitioned: { when: { policy: drop, layout: partitioned }, datasets: { ev: { acceleration: { primary_key: id, on_conflict: { id: drop }, partition_by: [region] } } } }
+  keep: { when: { policy: keep, layout: plain }, datasets: { ev: { acceleration: { primary_key: id } } } }
+  keep-partitioned: { when: { policy: keep, layout: partitioned }, datasets: { ev: { acceleration: { primary_key: id, partition_by: [region] } } } }
+  none: { when: { policy: none, layout: plain }, datasets: {} }
+  none-partitioned: { when: { policy: none, layout: partitioned }, datasets: { ev: { acceleration: { partition_by: [region] } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-dataset-writes
+  datasets:
+    - from: postgres:public.src
+      name: ev
+      params: ${sources.src.params}
+      access: read_write
+      acceleration: { enabled: true, engine: cayenne, mode: '${matrix.mode}', refresh_mode: full, write_mode: acceleration }
+
+defaults:
+  cluster: { executors: 1 }
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE src (id bigint, region text NOT NULL, name text, v bigint, f double precision, ts timestamp);
+        INSERT INTO src VALUES (1, 'us', 'alpha', 100, 1.5, '2024-01-01 00:00:00'), (2, 'us', 'beta', 200, 2.5, '2024-01-02 00:00:00'),
+          (3, 'eu', 'gamma', 300, NULL, '2024-01-03 00:00:00'), (4, 'eu', 'delta', NULL, 4.5, NULL), (5, 'asia', NULL, 500, 5.5, '2024-01-05 00:00:00');
+  - source-exec:
+      src: CREATE TABLE model (id bigint, region text NOT NULL, name text, v bigint, f double precision, ts timestamp); INSERT INTO model SELECT * FROM src;
+    when: { policy: none }
+  - source-exec:
+      src: CREATE TABLE model (id bigint PRIMARY KEY, region text NOT NULL, name text, v bigint, f double precision, ts timestamp); INSERT INTO model SELECT * FROM src;
+    when: { policy: [upsert, drop, keep] }
+  - start: {}
+  - query: SELECT id, region, name, v, f, ts FROM ev
+    oracle-sql: SELECT id, region, name, v, f, ts FROM model
+  # An existing key and a new one.
+  - spice-exec: 'INSERT INTO ev VALUES (2, ''us'', ''beta_updated'', 999, 9.5, ''2024-02-02 00:00:00''), (6, ''eu'', ''epsilon'', 600, 6.5, ''2024-02-06 00:00:00'')'
+  - source-exec: { src: 'INSERT INTO model VALUES (2, ''us'', ''beta_updated'', 999, 9.5, ''2024-02-02 00:00:00'') ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts; INSERT INTO model VALUES (6, ''eu'', ''epsilon'', 600, 6.5, ''2024-02-06 00:00:00'') ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts' }
+    when: { policy: upsert }
+  - source-exec: { src: 'INSERT INTO model VALUES (2, ''us'', ''beta_updated'', 999, 9.5, ''2024-02-02 00:00:00'') ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts; INSERT INTO model VALUES (6, ''eu'', ''epsilon'', 600, 6.5, ''2024-02-06 00:00:00'') ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts' }
+    when: { policy: drop }
+  - source-exec: { src: 'INSERT INTO model VALUES (2, ''us'', ''beta_updated'', 999, 9.5, ''2024-02-02 00:00:00'') ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts; INSERT INTO model VALUES (6, ''eu'', ''epsilon'', 600, 6.5, ''2024-02-06 00:00:00'') ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts' }
+    when: { policy: keep }
+  - source-exec: { src: 'INSERT INTO model VALUES (2, ''us'', ''beta_updated'', 999, 9.5, ''2024-02-02 00:00:00''); INSERT INTO model VALUES (6, ''eu'', ''epsilon'', 600, 6.5, ''2024-02-06 00:00:00'')' }
+    when: { policy: none }
+  - query: SELECT id, region, name, v, f, ts FROM ev
+    oracle-sql: SELECT id, region, name, v, f, ts FROM model
+  # A key repeated within one statement.
+  - spice-exec: 'INSERT INTO ev VALUES (7, ''us'', ''first'', 1, 1.0, NULL), (7, ''us'', ''second'', 2, 2.0, NULL), (8, ''asia'', ''only'', 8, 8.0, NULL)'
+  - source-exec: { src: 'INSERT INTO model VALUES (7, ''us'', ''first'', 1, 1.0, NULL) ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts; INSERT INTO model VALUES (7, ''us'', ''second'', 2, 2.0, NULL) ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts; INSERT INTO model VALUES (8, ''asia'', ''only'', 8, 8.0, NULL) ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts' }
+    when: { policy: upsert }
+  - source-exec: { src: 'INSERT INTO model VALUES (7, ''us'', ''first'', 1, 1.0, NULL) ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts; INSERT INTO model VALUES (7, ''us'', ''second'', 2, 2.0, NULL) ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts; INSERT INTO model VALUES (8, ''asia'', ''only'', 8, 8.0, NULL) ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts' }
+    when: { policy: drop }
+  - source-exec: { src: 'INSERT INTO model VALUES (7, ''us'', ''first'', 1, 1.0, NULL) ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts; INSERT INTO model VALUES (7, ''us'', ''second'', 2, 2.0, NULL) ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts; INSERT INTO model VALUES (8, ''asia'', ''only'', 8, 8.0, NULL) ON CONFLICT (id) DO UPDATE SET region = EXCLUDED.region, name = EXCLUDED.name, v = EXCLUDED.v, f = EXCLUDED.f, ts = EXCLUDED.ts' }
+    when: { policy: keep }
+  - source-exec: { src: 'INSERT INTO model VALUES (7, ''us'', ''first'', 1, 1.0, NULL); INSERT INTO model VALUES (7, ''us'', ''second'', 2, 2.0, NULL); INSERT INTO model VALUES (8, ''asia'', ''only'', 8, 8.0, NULL)' }
+    when: { policy: none }
+  - query: SELECT id, region, name, v, f, ts FROM ev
+    oracle-sql: SELECT id, region, name, v, f, ts FROM model

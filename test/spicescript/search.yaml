@@ -1,0 +1,105 @@
+name: search
+description: >
+  Full-text and vector search answer correctly on every acceleration engine:
+  text_search returns exactly the rows containing the term, ranked by how often
+  it occurs (bodies are the same length), multi-term searches match any term,
+  and vector_search ranks as an exact cosine ranking over the stored
+  embeddings does. Both follow the source after a refresh that adds and
+  removes documents.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  cayenne: {}
+  duckdb: { datasets: { docs: { acceleration: { engine: duckdb } } } }
+  arrow: { datasets: { docs: { acceleration: { engine: arrow, mode: memory } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: search
+  embeddings:
+    - from: model2vec:minishlab/potion-base-2M
+      name: potion
+  datasets:
+    - from: postgres:public.docs
+      name: docs
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+      columns:
+        - name: body
+          full_text_search: { enabled: true, row_id: [id] }
+          embeddings: [{ from: potion, row_id: [id] }]
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  # The variants rank alike but DuckDB's _score differs; each place is checked
+  # against its own oracle instead.
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: { file: seed/search-postgres.sql }
+  - start: { ready-timeout: 300s }
+
+  # Full-text search: the matching rows, ranked by term frequency.
+  - query: SELECT id FROM text_search(docs, 'fox')
+    oracle-sql: SELECT id FROM docs WHERE fox > 0 AND body IS NOT NULL
+  - query: SELECT id FROM text_search(docs, 'fox') ORDER BY _score DESC, id LIMIT 20
+    oracle-sql: SELECT id FROM docs WHERE fox > 0 AND body IS NOT NULL ORDER BY fox DESC, id LIMIT 20
+  - query: SELECT id FROM text_search(docs, 'dog') ORDER BY _score DESC, id LIMIT 20
+    oracle-sql: SELECT id FROM docs WHERE dog > 0 AND body IS NOT NULL ORDER BY dog DESC, id LIMIT 20
+  - query: SELECT id FROM text_search(docs, 'fox dog')
+    oracle-sql: SELECT id FROM docs WHERE (fox > 0 OR dog > 0) AND body IS NOT NULL
+  - query: SELECT id FROM text_search(docs, 'FOX')
+    oracle-sql: SELECT id FROM docs WHERE fox > 0 AND body IS NOT NULL
+  - query: SELECT id FROM text_search(docs, 'unicorn')
+    oracle-sql: SELECT id FROM docs WHERE false
+    expect-empty: true
+  - query: SELECT d.id, d.fox FROM text_search(docs, 'fox') s JOIN docs d ON s.id = d.id WHERE d.dog = 0
+    oracle-sql: SELECT id, fox FROM docs WHERE fox > 0 AND dog = 0 AND body IS NOT NULL
+
+  # Vector search: the same ranking as exact cosine over the stored embeddings.
+  - query: >-
+      SELECT id FROM docs WHERE body_embedding IS NOT NULL
+      ORDER BY cosine_distance(body_embedding, embed('fox fox fox', 'potion')), id LIMIT 10
+    id: exact
+    expect: {}
+  - query: SELECT id FROM vector_search(docs, 'fox fox fox') ORDER BY _score DESC, id LIMIT 10
+    expect: { same-as: exact }
+  - query: >-
+      SELECT v.id, round(v._score, 4) AS s FROM vector_search(docs, 'fox fox fox') v ORDER BY v._score DESC, v.id LIMIT 10
+    id: scores
+    expect: {}
+  # DuckDB scores differently (known-failing/duckdb/vector-search-score-duckdb.yaml).
+  - query: >-
+      SELECT id, round(1 - cosine_distance(body_embedding, embed('fox fox fox', 'potion')), 4) AS s FROM docs
+      WHERE body_embedding IS NOT NULL ORDER BY s DESC, id LIMIT 10
+    expect: { same-as: scores }
+    except: duckdb
+  - query: SELECT count(*) AS n FROM vector_search(docs, 'dog')
+    oracle-sql: SELECT count(*) FROM docs WHERE body IS NOT NULL
+
+  # The indexes follow the source: a new document is found, a deleted one is not.
+  - source-exec:
+      src: |
+        INSERT INTO docs VALUES (500, 'fox fox fox fox fox fox fox fox fox fox fox fox', 12, 0);
+        DELETE FROM docs WHERE id IN (4, 9);
+  - refresh: docs
+  # Worded differently from the queries above: an identical text is answered
+  # from before the refresh (known-failing/search/text-search-stale-after-refresh.yaml).
+  - query: SELECT s.id FROM text_search(docs, 'fox') s ORDER BY s._score DESC, s.id LIMIT 20
+    oracle-sql: SELECT id FROM docs WHERE fox > 0 AND body IS NOT NULL ORDER BY fox DESC, id LIMIT 20
+    eventually: 30s
+  - query: SELECT s.id FROM text_search(docs, 'fox') s
+    oracle-sql: SELECT id FROM docs WHERE fox > 0 AND body IS NOT NULL
+    eventually: 30s
+  - query: SELECT count(*) AS n FROM vector_search(docs, 'dog')
+    oracle-sql: SELECT count(*) FROM docs WHERE body IS NOT NULL
+    eventually: 30s
+  - query: SELECT id FROM vector_search(docs, 'fox fox fox fox fox fox fox fox fox fox fox fox') ORDER BY _score DESC, id LIMIT 1
+    expect: { rows: [['500']] }
+    eventually: 30s

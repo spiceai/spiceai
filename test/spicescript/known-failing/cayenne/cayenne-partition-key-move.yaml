@@ -1,0 +1,41 @@
+# Known failing: in a partitioned Cayenne table with a primary key, a key that
+# moves to another partition keeps its old row too: through an INSERT, and
+# through change capture of a source UPDATE to the partition column.
+name: cayenne-partition-key-move
+description: >
+  A row whose partition column changes (written directly, or updated at the
+  source and replicated) is in its new partition only, once per key.
+sources:
+  src: { kind: postgres }
+variants:
+  write: {}
+  cdc: { datasets: { ev: { access: read, acceleration: { refresh_mode: changes, write_mode: null } } } }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: probe
+  datasets:
+    - from: postgres:public.ev
+      name: ev
+      params: ${sources.src.params}
+      access: read_write
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        write_mode: acceleration
+        primary_key: id
+        partition_by: [region]
+defaults:
+  compare-variants: false
+steps:
+  - source-exec:
+      src: CREATE TABLE ev (id bigint PRIMARY KEY, region text NOT NULL, v int); INSERT INTO ev VALUES (1, 'us', 1), (2, 'us', 2), (3, 'eu', 3);
+  - start: {}
+  - spice-exec: INSERT INTO ev VALUES (1, 'eu', 10)
+    only: write
+  - source-exec: { src: "UPDATE ev SET region = 'eu', v = 10 WHERE id = 1" }
+  - query: SELECT id, region, v FROM ev ORDER BY id, region
+    expect: { rows: [['1', 'eu', '10'], ['2', 'us', '2'], ['3', 'eu', '3']] }
+    eventually: 30s

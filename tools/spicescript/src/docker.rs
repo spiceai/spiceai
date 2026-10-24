@@ -25,11 +25,14 @@ use anyhow::{Context, Result, bail};
 use bollard::{
     Docker,
     container::{
-        Config, CreateContainerOptions, InspectContainerOptions, RemoveContainerOptions,
-        StartContainerOptions, StopContainerOptions,
+        Config, CreateContainerOptions, InspectContainerOptions, NetworkingConfig,
+        RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
     },
     image::CreateImageOptions,
-    secret::{ContainerStateStatusEnum, HealthConfig, HealthStatusEnum, HostConfig, PortBinding},
+    secret::{
+        ContainerStateStatusEnum, EndpointSettings, HealthConfig, HealthStatusEnum, HostConfig,
+        PortBinding,
+    },
 };
 use futures::StreamExt;
 
@@ -156,21 +159,58 @@ impl Container {
                 }),
             )
             .await;
-        let created = docker
-            .create_container(
-                Some(CreateContainerOptions {
-                    name: spec.name.as_str(),
-                    platform: None,
-                }),
-                config,
-            )
-            .await
-            .with_context(|| format!("Failed to create container {}", spec.name))?;
-        crate::cleanup::track_container(&created.id, &spec.name, spec.network.as_deref());
+        let (created_id, name) = create_or_adopt(
+            CREATE_ATTEMPTS,
+            CREATE_RETRY_PAUSE,
+            &spec.name,
+            |name| {
+                let docker = &docker;
+                let mut config = config.clone();
+                // Under another name, keep the original as an alias on the
+                // container's network, so its peers still find it by it.
+                if name != spec.name
+                    && let Some(network) = spec.network.as_deref().filter(|n| *n != "host")
+                {
+                    config.networking_config = Some(NetworkingConfig {
+                        endpoints_config: HashMap::from([(
+                            network.to_string(),
+                            EndpointSettings {
+                                aliases: Some(vec![spec.name.clone()]),
+                                ..Default::default()
+                            },
+                        )]),
+                    });
+                }
+                async move {
+                    docker
+                        .create_container(
+                            Some(CreateContainerOptions {
+                                name: name.as_str(),
+                                platform: None,
+                            }),
+                            config,
+                        )
+                        .await
+                        .map(|created| created.id)
+                }
+            },
+            |holder| {
+                let docker = &docker;
+                async move {
+                    docker
+                        .inspect_container(&holder, None)
+                        .await
+                        .map(|found| found.id.unwrap_or(holder))
+                }
+            },
+        )
+        .await
+        .with_context(|| format!("Failed to create container {}", spec.name))?;
+        crate::cleanup::track_container(&created_id, &name, spec.network.as_deref());
         let container = Self {
             docker,
-            id: created.id,
-            name: spec.name,
+            id: created_id,
+            name,
             ports,
             network: spec.network,
         };
@@ -192,7 +232,9 @@ impl Container {
             .start_container(&self.id, None::<StartContainerOptions<String>>)
             .await
             .with_context(|| format!("Failed to start container {}", self.name))?;
-        self.wait_healthy(Duration::from_mins(2)).await
+        // A database container on a CI runner busy with other jobs can take
+        // over two minutes to become healthy.
+        self.wait_healthy(Duration::from_mins(5)).await
     }
 
     pub async fn stop(&self) -> Result<()> {
@@ -406,6 +448,114 @@ async fn pull_if_missing(docker: &Docker, image: &str) -> Result<()> {
     Ok(())
 }
 
+/// How many times creating a container is tried when Docker does not answer
+/// in time. A daemon busy with many containers at once (several runs on one
+/// host) can take longer than the client's request timeout, and creating the
+/// container again usually succeeds.
+const CREATE_ATTEMPTS: u32 = 5;
+
+/// How long to wait before trying again after Docker did not answer in time,
+/// and between lookups of a container a timed-out attempt created.
+const CREATE_RETRY_PAUSE: Duration = Duration::from_secs(2);
+
+/// How many times to look up a container a timed-out attempt created before
+/// creating under another name (about 20 s at [`CREATE_RETRY_PAUSE`]).
+const ADOPT_LOOKUPS: u32 = 10;
+
+/// Runs `create` (with the name to create under) until it succeeds, fails
+/// other than by Docker not answering in time, or has been tried `attempts`
+/// times, pausing `pause` before each retry; returns the container's id and
+/// name. Once an attempt has timed out, a name conflict (409) means that
+/// attempt's container was created after all, with this name and
+/// configuration: `adopt` looks up the container the conflict names, again
+/// after `pause` while Docker does not know it yet, and its id is used. If it
+/// never turns up, Docker is holding the name for a container it cannot
+/// find, and the next attempt creates under a fresh name (`what-r2`, …).
+/// Each retry is reported in the script's output, naming `what`.
+async fn create_or_adopt<C, CF, A, AF>(
+    attempts: u32,
+    pause: Duration,
+    what: &str,
+    mut create: C,
+    mut adopt: A,
+) -> Result<(String, String), bollard::errors::Error>
+where
+    C: FnMut(String) -> CF,
+    CF: std::future::Future<Output = Result<String, bollard::errors::Error>>,
+    A: FnMut(String) -> AF,
+    AF: std::future::Future<Output = Result<String, bollard::errors::Error>>,
+{
+    let mut tried = 1;
+    let mut timed_out = false;
+    let mut name = what.to_string();
+    loop {
+        let conflict = match create(name.clone()).await {
+            Ok(id) => return Ok((id, name)),
+            Err(bollard::errors::Error::RequestTimeoutError) if tried < attempts => {
+                timed_out = true;
+                crate::runner::emit(&format!(
+                    "   Docker did not answer in time creating {name}; trying again ({tried} of {attempts} attempts made)"
+                ));
+                tried += 1;
+                tokio::time::sleep(pause).await;
+                continue;
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                message,
+            }) if timed_out => message,
+            Err(other) => return Err(other),
+        };
+        // The conflict names the container holding the name; look it up by
+        // that id, retrying while Docker is still registering it.
+        let holder = conflict_holder(&conflict).unwrap_or_else(|| name.clone());
+        let mut looked = 1;
+        let missing = loop {
+            match adopt(holder.clone()).await {
+                Ok(id) => {
+                    crate::runner::emit(&format!(
+                        "   a timed-out attempt had created {name}; using that container"
+                    ));
+                    return Ok((id, name));
+                }
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    message,
+                }) => {
+                    if looked >= ADOPT_LOOKUPS {
+                        break message;
+                    }
+                    looked += 1;
+                    tokio::time::sleep(pause).await;
+                }
+                Err(other) => return Err(other),
+            }
+        };
+        if tried >= attempts {
+            return Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                message: missing,
+            });
+        }
+        tried += 1;
+        let fresh = format!("{what}-r{tried}");
+        crate::runner::emit(&format!(
+            "   Docker holds the name {name} for a container it cannot find; creating {fresh} instead ({} of {attempts} attempts made)",
+            tried - 1
+        ));
+        name = fresh;
+        tokio::time::sleep(pause).await;
+    }
+}
+
+/// The id of the container a 409 name conflict says holds the name:
+/// `… is already in use by container "<id>". …`.
+fn conflict_holder(message: &str) -> Option<String> {
+    let (_, rest) = message.split_once("in use by container \"")?;
+    let id = rest.split('"').next()?;
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_string())
+}
+
 /// A host port that is free now. Another process could take it before Docker
 /// binds it; the window is small and a collision fails loudly at create time.
 /// A free local port that no other instance of this run has been given. The
@@ -476,5 +626,163 @@ mod port_tests {
             );
             assert!(seen.insert(port), "port {port} was given out twice");
         }
+    }
+}
+
+#[cfg(test)]
+mod create_retry_tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    use bollard::errors::Error;
+
+    use super::{conflict_holder, create_or_adopt};
+
+    const HOLDER: &str = "7cd4ae6e9028774521e285a3aca8c021b11b04882a842cdd56dfffe3a3814318";
+
+    fn conflict() -> Error {
+        Error::DockerResponseServerError {
+            status_code: 409,
+            // As Docker words it.
+            message: format!(
+                "Conflict. The container name \"/c\" is already in use by container \"{HOLDER}\". You have to remove (or rename) that container to be able to reuse that name."
+            ),
+        }
+    }
+
+    fn not_found() -> Error {
+        Error::DockerResponseServerError {
+            status_code: 404,
+            message: "No such container".into(),
+        }
+    }
+
+    fn pair(id: &str, name: &str) -> (String, String) {
+        (id.to_string(), name.to_string())
+    }
+
+    #[test]
+    fn reads_the_holder_from_a_name_conflict() {
+        let Err(Error::DockerResponseServerError { message, .. }) = Err::<(), _>(conflict()) else {
+            unreachable!("built above");
+        };
+        assert_eq!(conflict_holder(&message).as_deref(), Some(HOLDER));
+        assert_eq!(conflict_holder("Conflict."), None);
+    }
+
+    #[tokio::test]
+    async fn retries_a_timeout_and_adopts_or_renames_the_container_it_created() {
+        let no_pause = Duration::ZERO;
+
+        // Two timeouts, then success: three attempts, under the one name.
+        let calls = AtomicU32::new(0);
+        let got = create_or_adopt(
+            3,
+            no_pause,
+            "c",
+            |_| async {
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 | 1 => Err(Error::RequestTimeoutError),
+                    _ => Ok("new".to_string()),
+                }
+            },
+            |_| async { Err(not_found()) },
+        )
+        .await;
+        assert_eq!(got.ok(), Some(pair("new", "c")));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // A timeout, then a conflict: the container the conflict names is
+        // looked up by its id (twice, as Docker registers it) and adopted.
+        let calls = AtomicU32::new(0);
+        let looked_up = Mutex::new(Vec::new());
+        let got = create_or_adopt(
+            3,
+            no_pause,
+            "c",
+            |_| async {
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Err(Error::RequestTimeoutError),
+                    _ => Err(conflict()),
+                }
+            },
+            |holder| {
+                let mut seen = looked_up.lock().expect("lock");
+                seen.push(holder.clone());
+                let found = seen.len() > 1;
+                async move { if found { Ok(holder) } else { Err(not_found()) } }
+            },
+        )
+        .await;
+        assert_eq!(got.ok(), Some(pair(HOLDER, "c")));
+        assert_eq!(
+            *looked_up.lock().expect("lock"),
+            vec![HOLDER.to_string(); 2]
+        );
+
+        // The holder never turns up: the next attempt creates under a fresh
+        // name, which succeeds.
+        let names = Mutex::new(Vec::new());
+        let got = create_or_adopt(
+            3,
+            no_pause,
+            "c",
+            |name| {
+                let mut tried = names.lock().expect("lock");
+                tried.push(name);
+                let result = match tried.len() {
+                    1 => Err(Error::RequestTimeoutError),
+                    2 => Err(conflict()),
+                    _ => Ok("new".to_string()),
+                };
+                async move { result }
+            },
+            |_| async { Err(not_found()) },
+        )
+        .await;
+        assert_eq!(got.ok(), Some(pair("new", "c-r3")));
+        assert_eq!(*names.lock().expect("lock"), ["c", "c", "c-r3"]);
+
+        // Timeouts every time: gives up after the allowed attempts.
+        let calls = AtomicU32::new(0);
+        let got = create_or_adopt(
+            3,
+            no_pause,
+            "c",
+            |_| async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(Error::RequestTimeoutError)
+            },
+            |_| async { Err(not_found()) },
+        )
+        .await;
+        assert!(matches!(got, Err(Error::RequestTimeoutError)), "{got:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // A conflict with no timeout before it is returned at once.
+        let calls = AtomicU32::new(0);
+        let got = create_or_adopt(
+            3,
+            no_pause,
+            "c",
+            |_| async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(conflict())
+            },
+            |_| async { Ok("adopted".to_string()) },
+        )
+        .await;
+        assert!(
+            matches!(
+                got,
+                Err(Error::DockerResponseServerError {
+                    status_code: 409,
+                    ..
+                })
+            ),
+            "{got:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

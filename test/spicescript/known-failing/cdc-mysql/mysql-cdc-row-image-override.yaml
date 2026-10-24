@@ -1,0 +1,63 @@
+# Known failing: One writer session with binlog_row_image=MINIMAL stops replication for the
+# table, and a restart does not recover it.
+# Move this script to test/spicescript/ once it passes.
+name: mysql-cdc-row-image-override
+description: >
+  Spice requires binlog_row_image=FULL and checks it at startup, but one writer
+  session can still override it. A partial row image must never be applied as
+  if it were complete: the acceleration either matches the source or the
+  dataset reports the problem, and other changes keep flowing once the
+  override stops.
+
+sources:
+  src: { kind: mysql }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-cdc-row-image-override
+  datasets:
+    - from: mysql:docs
+      name: docs
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE docs (id INT PRIMARY KEY, version INT NOT NULL, note VARCHAR(32), body TEXT);
+        INSERT INTO docs VALUES (1, 1, 'a', REPEAT('x', 3000)), (2, 1, 'b', 'short'), (3, 1, 'c', NULL);
+  - start: {}
+  - query: SELECT * FROM docs
+    eventually: 30s
+
+  # One session writes with a minimal image: only the key and the changed column.
+  - source-exec:
+      src: |
+        SET SESSION binlog_row_image = 'MINIMAL';
+        UPDATE docs SET version = 2 WHERE id = 1;
+  - query: SELECT * FROM docs
+    eventually: 20s
+  - assert-status: { dataset: docs }
+
+  # Later writes from ordinary sessions.
+  - source-exec:
+      src:
+        - UPDATE docs SET note = 'later' WHERE id = 2
+        - INSERT INTO docs VALUES (4, 1, 'd', 'new')
+  - query: SELECT * FROM docs
+    eventually: 20s
+  - assert-status: { dataset: docs }
+
+  - restart: {}
+  - query: SELECT * FROM docs
+    eventually: 30s
+  - assert-status: { dataset: docs }

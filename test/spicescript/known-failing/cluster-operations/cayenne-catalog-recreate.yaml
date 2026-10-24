@@ -1,0 +1,81 @@
+# Known failing (no issue filed yet): in a cluster, a Cayenne catalog table
+# recreated under a dropped table's name still serves the dropped table's rows
+# and schema, and the identical CREATE TABLE text is refused the second time.
+# Needs a `spiced` built with the `spicebench` feature.
+name: cayenne-catalog-recreate
+description: >
+  A Cayenne catalog table dropped and created again under the same name, on a
+  cluster scheduler with one executor, starts empty and takes the new schema;
+  the identical CREATE TABLE statement can be run again after the DROP.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-catalog-dml
+  runtime:
+    state:
+      location: file://${instance.dir}/state
+  catalogs:
+    - from: cayenne
+      name: cat
+      access: read_write_create
+      params:
+        cayenne_data_dir: ${instance.dir}/cayenne/data
+        cayenne_metadata_dir: ${instance.dir}/cayenne/metadata
+
+defaults:
+  expect: { oracle: src }
+  spiced-args: [--role, scheduler, --node-advertise-address, 127.0.0.1,
+    --node-bind-address, '127.0.0.1:${instance.port}',
+    --node-mtls-ca-certificate-file, '${script.dir}/../cluster-pki/ca.crt',
+    --node-mtls-certificate-file, '${script.dir}/../cluster-pki/scheduler.crt',
+    --node-mtls-key-file, '${script.dir}/../cluster-pki/scheduler.key']
+  # The scheduler creates a table only while an executor is connected.
+  executor-args: [--role, executor, --scheduler-address, 'https://127.0.0.1:${instance.port}',
+    --node-advertise-address, 127.0.0.1, --node-bind-address, '127.0.0.1:${instance.executor_port}',
+    --node-mtls-ca-certificate-file, '${script.dir}/../cluster-pki/ca.crt',
+    --node-mtls-certificate-file, '${script.dir}/../cluster-pki/executor.crt',
+    --node-mtls-key-file, '${script.dir}/../cluster-pki/executor.key']
+
+steps:
+  - start: {}
+  - spice-exec: 'CREATE SCHEMA cat.ns'
+  - source-exec: { src: 'CREATE SCHEMA ns' }
+
+  # The same schema: the new table starts empty.
+  - spice-exec: 'CREATE TABLE cat.ns.same (id BIGINT NOT NULL) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE ns.same (id BIGINT NOT NULL)' }
+  - spice-exec: 'INSERT INTO cat.ns.same VALUES (1), (2)'
+  - source-exec: { src: 'INSERT INTO ns.same VALUES (1), (2)' }
+  - spice-exec: 'DROP TABLE cat.ns.same'
+  - source-exec: { src: 'DROP TABLE ns.same' }
+  # One extra space, so this statement is not the earlier one's text.
+  - spice-exec: 'CREATE TABLE  cat.ns.same (id BIGINT NOT NULL) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE ns.same (id BIGINT NOT NULL)' }
+  - query: SELECT count(*) AS n FROM cat.ns.same
+    expect: { rows: [['0']] }
+  - spice-exec: 'INSERT INTO cat.ns.same VALUES (3)'
+  - source-exec: { src: 'INSERT INTO ns.same VALUES (3)' }
+  - query: SELECT id FROM cat.ns.same
+    oracle-sql: SELECT id FROM ns.same
+
+  # Another schema: the new table takes it.
+  - spice-exec: 'CREATE TABLE cat.ns.other (id BIGINT NOT NULL) PARTITION BY id'
+  - spice-exec: 'INSERT INTO cat.ns.other VALUES (1)'
+  - spice-exec: 'DROP TABLE cat.ns.other'
+  - spice-exec: 'CREATE TABLE cat.ns.other (id BIGINT NOT NULL, val VARCHAR) PARTITION BY id'
+  - source-exec: { src: 'CREATE TABLE ns.other (id BIGINT NOT NULL, val VARCHAR)' }
+  - spice-exec: 'INSERT INTO cat.ns.other VALUES (10, ''new'')'
+  - source-exec: { src: 'INSERT INTO ns.other VALUES (10, ''new'')' }
+  - query: SELECT id, val FROM cat.ns.other
+    oracle-sql: SELECT id, val FROM ns.other
+
+  # The identical CREATE TABLE text, again after a DROP.
+  - spice-exec: 'CREATE TABLE cat.ns.again (id BIGINT NOT NULL) PARTITION BY id'
+  - spice-exec: 'DROP TABLE cat.ns.again'
+  - spice-exec: 'CREATE TABLE cat.ns.again (id BIGINT NOT NULL) PARTITION BY id'
+  - query: SELECT count(*) AS n FROM cat.ns.again
+    expect: { rows: [['0']] }

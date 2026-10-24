@@ -1,0 +1,102 @@
+name: duplicate-keys
+description: >
+  A source without a key can hold several copies of a key the dataset declares
+  as its primary key. Each engine and on_conflict behavior serves a defined
+  copy, or refuses the load, and never serves two rows for one key. Cayenne
+  keeps the last copy whatever on_conflict says; DuckDB keeps the first copy
+  for drop and the last for upsert_dedup_by_row_id, and refuses duplicates
+  that differ for upsert and upsert_dedup.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  engine: [cayenne, duckdb]
+
+variants:
+  drop: { datasets: { t: { acceleration: { on_conflict: { id: drop } } } } }
+  upsert: { datasets: { t: { acceleration: { on_conflict: { id: upsert } } } } }
+  upsert-dedup: { datasets: { t: { acceleration: { on_conflict: { id: upsert_dedup } } } } }
+  upsert-dedup-by-row-id: { datasets: { t: { acceleration: { on_conflict: { id: upsert_dedup_by_row_id } } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: duplicate-keys
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: '${matrix.engine}'
+        mode: file
+        refresh_mode: full
+        primary_key: id
+        refresh_retry_max_attempts: 1
+
+defaults:
+  expect: { oracle: src }
+  # Variants are expected to differ; each is checked against its own answer.
+  compare-variants: false
+
+steps:
+  # Keys 1-3 are unique, 4 has two identical copies, 5 two different copies
+  # (seq 1, then 2), and the later refresh adds 6 with two different copies.
+  - source-exec:
+      src: |
+        CREATE TABLE t (id integer, seq integer, v text);
+        INSERT INTO t VALUES (1,1,'a'), (2,1,'b'), (3,1,'c'), (4,1,'same'), (4,1,'same'), (5,1,'first'), (5,2,'second');
+
+  - start: {}
+    when: { engine: cayenne }
+  - start: {}
+    when: { engine: duckdb }
+    only: [drop, upsert-dedup-by-row-id]
+  - start: { ready: false }
+    when: { engine: duckdb }
+    only: [upsert, upsert-dedup]
+
+  # The last copy of each key (highest seq).
+  - query: SELECT id, seq, v FROM t
+    oracle-sql: SELECT DISTINCT ON (id) id, seq, v FROM t ORDER BY id, seq DESC
+    when: { engine: cayenne }
+  - query: SELECT id, seq, v FROM t
+    oracle-sql: SELECT DISTINCT ON (id) id, seq, v FROM t ORDER BY id, seq DESC
+    when: { engine: duckdb }
+    only: upsert-dedup-by-row-id
+  # The first copy of each key.
+  - query: SELECT id, seq, v FROM t
+    oracle-sql: SELECT DISTINCT ON (id) id, seq, v FROM t ORDER BY id, seq ASC
+    when: { engine: duckdb }
+    only: drop
+  - assert-status:
+      dataset: t
+      status: Error
+      message-contains: violates uniqueness constraint
+    eventually: 30s
+    when: { engine: duckdb }
+    only: [upsert, upsert-dedup]
+
+  # A change at the source and a new duplicated key, through a second refresh.
+  - source-exec:
+      src: "UPDATE t SET v = 'changed' WHERE id = 1; INSERT INTO t VALUES (6,1,'f'), (6,2,'g')"
+  - refresh: t
+    when: { engine: cayenne }
+  - refresh: t
+    when: { engine: duckdb }
+    only: [drop, upsert-dedup-by-row-id]
+  - query: SELECT id, seq, v FROM t
+    oracle-sql: SELECT DISTINCT ON (id) id, seq, v FROM t ORDER BY id, seq DESC
+    when: { engine: cayenne }
+  - query: SELECT id, seq, v FROM t
+    oracle-sql: SELECT DISTINCT ON (id) id, seq, v FROM t ORDER BY id, seq DESC
+    when: { engine: duckdb }
+    only: upsert-dedup-by-row-id
+  - query: SELECT id, seq, v FROM t
+    oracle-sql: SELECT DISTINCT ON (id) id, seq, v FROM t ORDER BY id, seq ASC
+    when: { engine: duckdb }
+    only: drop
+  - query: SELECT count(*) - count(DISTINCT id) FROM t
+    expect: { rows: [["0"]] }
+    when: { engine: cayenne }

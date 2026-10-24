@@ -1,0 +1,43 @@
+name: clickhouse-decimals
+description: >
+  ClickHouse decimals are served, federated and accelerated, as ClickHouse
+  answers. Today a Decimal(38, 10) column makes every query of its table
+  fail with `Unsupported column type "Decimal(38, 10)"`, and a negative
+  decimal whose digits are fewer than its scale (-0.05 in Decimal(18, 6)) is
+  read as '0.0-50000' and fails the whole query ("Failed to parse decimal
+  string as BigInteger"); either way an acceleration of the table never
+  loads.
+
+sources:
+  src: { kind: clickhouse }
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: clickhouse-decimals
+  datasets:
+    - { from: 'clickhouse:wide', name: wide, params: '${sources.src.params}' }
+    - { from: 'clickhouse:neg', name: neg, params: '${sources.src.params}' }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE wide (id Int32, d Nullable(Decimal(38, 10))) ENGINE = MergeTree ORDER BY id;
+        INSERT INTO wide VALUES (1, -9999999999999999999999999999.9999999999), (2, 2.5), (3, NULL);
+        CREATE TABLE neg (id Int32, d Nullable(Decimal(18, 6))) ENGINE = MergeTree ORDER BY id;
+        INSERT INTO neg VALUES (1, -0.5), (2, -0.05), (3, -0.012345), (4, -0.000001), (5, -0.1), (6, NULL);
+  - start: { ready: false }
+  - query: SELECT id, d FROM wide ORDER BY id
+    eventually: 30s
+  - query: SELECT id FROM wide WHERE d > 0 ORDER BY id
+  - query: SELECT id, d FROM neg ORDER BY id
+    eventually: 30s
+  - query: SELECT id FROM neg WHERE d < -0.01 ORDER BY id

@@ -1,0 +1,45 @@
+name: append-iso-offset
+description: >
+  Known failing: silent, permanent row loss. Append refresh with an ISO 8601
+  text time column compares the text with the stored maximum as strings, so
+  a value written with a non-UTC offset is ordered by its local digits, not
+  by its instant: '2031-05-01T06:00:00-05:00' (11:00 UTC, the newest row)
+  sorts before the stored '…T10:00:05' and is never loaded. Values in UTC,
+  with or without fractional seconds, load, and a refresh with nothing new
+  adds nothing.
+sources:
+  src: { kind: postgres }
+variants:
+  zulu: {}
+  keyed: { datasets: { events: { acceleration: { primary_key: id, on_conflict: { id: upsert } } } } }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: append-iso-offset
+  datasets:
+    - from: postgres:public.events
+      name: events
+      params: ${sources.src.params}
+      time_column: iso
+      time_format: ISO8601
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: append }
+defaults:
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE events (id int PRIMARY KEY, iso text NOT NULL);
+        INSERT INTO events VALUES (1, '2031-05-01T10:00:00Z'), (2, '2031-05-01T10:00:05Z');
+  - start: {}
+  - query: SELECT * FROM events
+  # Nothing new.
+  - refresh: events
+  - query: SELECT * FROM events
+  - refresh: events
+  - query: SELECT count(*) AS n FROM events
+  # Newer, written with fractional seconds and with an offset.
+  - source-exec: { src: "INSERT INTO events VALUES (3, '2031-05-01T10:00:06.5Z'), (4, '2031-05-01T06:00:00-05:00'), (5, '2031-05-01T10:00:07+00:00')" }
+  - refresh: events
+  - query: SELECT * FROM events
