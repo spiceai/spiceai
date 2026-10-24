@@ -765,6 +765,9 @@ jobs:
             PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
             if [[ -n "${PR_URL}" ]]; then
               echo "PR already exists -> ${PR_URL}"
+              # GitHub holds the pull_request runs of a push made with GITHUB_TOKEN
+              # until someone approves them; release them so the PR reports its checks.
+              bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
               exit 0
             else
               BODY=$(cat <<EOF
@@ -783,6 +786,7 @@ jobs:
               if [ "${{ github.ref_name }}" = "trunk" ]; then
                 gh pr merge --squash --auto ${BRANCH_NAME}
               fi
+              bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
             fi
           fi
         env:

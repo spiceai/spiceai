@@ -10,6 +10,8 @@ jobs:
     permissions:
       pull-requests: write
       contents: write
+      # Approves the PR's held pull_request runs.
+      actions: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -48,6 +50,9 @@ jobs:
             git -c credential.helper='' -c credential.interactive=false \
               push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:acknowledgements/${GITHUB_RUN_ID}
             gh pr create --title "Update acknowledgements" --body "Updated OSS acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}
+            # GitHub holds the pull_request runs of a PR opened with GITHUB_TOKEN
+            # until someone approves them; release them so the PR reports its checks.
+            bash .github/scripts/approve_bot_pr_runs.sh "acknowledgements/${GITHUB_RUN_ID}" "$(git rev-parse HEAD)"
           else
             echo "No changes detected"
           fi

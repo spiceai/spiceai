@@ -72,6 +72,9 @@ runs:
         PR_URL="$(gh pr create --title "${PR_TITLE}" --body "${BODY}" --base "${BASE_BRANCH}" --head "${BRANCH_NAME}" --label kind/bug)"
         echo "Created snapshot update PR -> ${PR_URL}"
         gh pr merge --squash --auto "${BRANCH_NAME}" || echo "Auto-merge not available for this branch; PR created and requires manual merge."
+        # GitHub holds the pull_request runs of a PR opened with GITHUB_TOKEN until
+        # someone approves them; release them so the PR reports its checks.
+        bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
 
         # Close any earlier open snapshot-update PR this job opened against the same
         # base with the same title: the one above supersedes it. Matching the base keeps

@@ -185,6 +185,9 @@ permissions:
   contents: write
   packages: read
   pull-requests: write
+  # `actions: write` approves the PR's held pull_request runs
+  # (.github/scripts/approve_bot_pr_runs.sh).
+  actions: write
   # `compute: ec2` assumes the sandbox benchmark role over OIDC.
   id-token: write
 
@@ -649,6 +652,9 @@ jobs:
           PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq '.[].url')"
           if [ -n "${PR_URL}" ]; then
             echo "PR already exists -> ${PR_URL}"
+            # GitHub holds the pull_request runs of a push made with GITHUB_TOKEN
+            # until someone approves them; release them so the PR reports its checks.
+            bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
             exit 0
           fi
 
@@ -746,3 +752,4 @@ jobs:
             --base "${{ github.ref_name }}" \
             --head "${BRANCH_NAME}" \
             --label area/ci
+          bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
