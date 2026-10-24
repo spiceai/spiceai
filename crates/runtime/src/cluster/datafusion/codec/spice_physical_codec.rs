@@ -1163,7 +1163,7 @@ mod tests {
         writer.close().expect("close");
 
         let runtime = Arc::new(Runtime::builder().build().await);
-        let scheduler = runtime.datafusion().ctx.clone();
+        let scheduler = Arc::clone(&runtime.datafusion().ctx);
         scheduler
             .register_parquet(
                 "t",
