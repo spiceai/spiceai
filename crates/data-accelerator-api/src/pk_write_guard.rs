@@ -59,13 +59,23 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
-use datafusion_table_providers::util::constraints::Error as ConstraintError;
+use datafusion_table_providers::util::{
+    constraints::Error as ConstraintError,
+    retriable_error::{check_and_mark_retriable_error, is_retriable_error},
+};
 use futures::StreamExt;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
 
-/// The first error the guard stream saw. `SQLite`'s sink may replace it with
-/// `Query is not read-only` (#14757); [`PreferGuardErrorExec`] puts it back.
-type GuardErrorSlot = Arc<Mutex<Option<String>>>;
+/// The first error the guard stream saw, plus whether refresh may retry it.
+/// `SQLite`'s sink may replace it with `Query is not read-only` (#14757);
+/// [`PreferGuardErrorExec`] puts this back.
+#[derive(Debug)]
+struct GuardErrorSnapshot {
+    message: String,
+    retriable: bool,
+}
+
+type GuardErrorSlot = Arc<Mutex<Option<GuardErrorSnapshot>>>;
 
 /// Layers [`PkWriteGuard`] over `provider` when `constraints` name a primary
 /// key. `nan` is how the engine below stores a NaN in a key column.
@@ -199,17 +209,28 @@ fn remember_guard_error(slot: &GuardErrorSlot, error: &DataFusionError) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if stored.is_none() {
-        *stored = Some(error.to_string());
+        *stored = Some(GuardErrorSnapshot {
+            message: error.to_string(),
+            retriable: is_retriable_error(error),
+        });
+    }
+}
+
+fn restore_guard_error(snapshot: &GuardErrorSnapshot) -> DataFusionError {
+    let error = DataFusionError::Execution(snapshot.message.clone());
+    if snapshot.retriable {
+        check_and_mark_retriable_error(error)
+    } else {
+        error
     }
 }
 
 fn prefer_stored_guard_error(slot: &GuardErrorSlot, sink: DataFusionError) -> DataFusionError {
     let stored = slot
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    match stored {
-        Some(message) => DataFusionError::Execution(message),
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match stored.as_ref() {
+        Some(snapshot) => restore_guard_error(snapshot),
         None => sink,
     }
 }
@@ -950,9 +971,10 @@ mod tests {
         use datafusion_table_providers::util::test::MockExec;
         use std::sync::Mutex;
 
-        let slot = Arc::new(Mutex::new(Some(
-            "Incoming data violates uniqueness constraint on column(s): id".to_string(),
-        )));
+        let slot = Arc::new(Mutex::new(Some(super::GuardErrorSnapshot {
+            message: "Incoming data violates uniqueness constraint on column(s): id".to_string(),
+            retriable: false,
+        })));
         let input = Arc::new(MockExec::new(
             vec![Err(datafusion::error::DataFusionError::Execution(
                 "Query is not read-only".to_string(),
@@ -971,6 +993,86 @@ mod tests {
         assert!(
             !message.contains("Query is not read-only"),
             "the sink's mis-report must not win, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefer_guard_error_keeps_a_retriable_stream_error() {
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+        use datafusion_table_providers::util::retriable_error::{
+            check_and_mark_retriable_error, is_retriable_error,
+        };
+        use datafusion_table_providers::util::test::MockExec;
+        use std::sync::Mutex;
+
+        let source = check_and_mark_retriable_error(datafusion::error::DataFusionError::Execution(
+            "source stalled".to_string(),
+        ));
+        assert!(
+            is_retriable_error(&source),
+            "the fixture must be a retriable stream error"
+        );
+        let slot = Arc::new(Mutex::new(None));
+        super::remember_guard_error(&slot, &source);
+        let input = Arc::new(MockExec::new(
+            vec![Err(datafusion::error::DataFusionError::Execution(
+                "Query is not read-only".to_string(),
+            ))],
+            schema(),
+        ));
+        let exec = super::PreferGuardErrorExec::new(input, slot);
+        let error = collect(Arc::new(exec), SessionContext::new().task_ctx())
+            .await
+            .expect_err("the sink's read-only message must yield to the guard");
+        assert!(
+            is_retriable_error(&error),
+            "a source-stall error must stay retriable, got: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("source stalled"),
+            "the stream error must be reported, got: {message}"
+        );
+        assert!(
+            !message.contains("Query is not read-only"),
+            "the sink's mis-report must not win, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefer_guard_error_keeps_uniqueness_permanent() {
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+        use datafusion_table_providers::util::retriable_error::is_retriable_error;
+        use datafusion_table_providers::util::test::MockExec;
+        use std::sync::Mutex;
+
+        let uniqueness = super::uniqueness_error(&schema(), &[0]);
+        assert!(
+            !is_retriable_error(&uniqueness),
+            "an in-batch duplicate must stay a permanent error"
+        );
+        let slot = Arc::new(Mutex::new(None));
+        super::remember_guard_error(&slot, &uniqueness);
+        let input = Arc::new(MockExec::new(
+            vec![Err(datafusion::error::DataFusionError::Execution(
+                "Query is not read-only".to_string(),
+            ))],
+            schema(),
+        ));
+        let exec = super::PreferGuardErrorExec::new(input, slot);
+        let error = collect(Arc::new(exec), SessionContext::new().task_ctx())
+            .await
+            .expect_err("the sink's read-only message must yield to the guard");
+        assert!(
+            !is_retriable_error(&error),
+            "an in-batch duplicate must stay permanent, got: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("uniqueness"),
+            "the uniqueness error must be reported, got: {message}"
         );
     }
 }
