@@ -14,6 +14,14 @@ if [[ -z "${SPICED}" || ! -x "${SPICED}" ]]; then
   exit 1
 fi
 
+# Resolve before `cd "${ROOT}"`. A relative path such as `target/debug/spiced`
+# would otherwise miss after the chdir (exit 127).
+if resolved="$(realpath "${SPICED}" 2>/dev/null)"; then
+  SPICED="${resolved}"
+else
+  SPICED="$(cd "$(dirname -- "${SPICED}")" && pwd)/$(basename -- "${SPICED}")"
+fi
+
 mkdir -p "${ROOT}/data"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cp "${SCRIPT_DIR}/../spicepod.yaml" "${ROOT}/spicepod.yaml"

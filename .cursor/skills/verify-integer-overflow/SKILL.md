@@ -36,6 +36,9 @@ export SPICED=/workspace/target/debug/spiced
 /workspace/.cursor/skills/verify-integer-overflow/scripts/verify.sh /tmp/integer-overflow-verify
 ```
 
+`SPICED` may be relative (`target/debug/spiced`); the script resolves it to an
+absolute path before `cd` into the spicepod directory.
+
 Do not kill an unrelated `spiced`. The script records its own PID and stops only that process.
 
 ## Trunk vs branch
