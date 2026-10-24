@@ -27,6 +27,7 @@ mod op;
 mod sum;
 
 pub use analyzer::CheckedIntegerOverflow;
+pub use op::{CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME};
 pub use sum::CheckedSum;
 
 use std::sync::Arc;

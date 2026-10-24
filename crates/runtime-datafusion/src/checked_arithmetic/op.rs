@@ -30,9 +30,16 @@ use datafusion::logical_expr::{
 
 use super::is_integer_arith_type;
 
-const ADD_NAME: &str = "spice_checked_add";
-const SUB_NAME: &str = "spice_checked_sub";
-const MUL_NAME: &str = "spice_checked_mul";
+/// Rewrite targets for integer `+` / `-` / `*`. Not a documented SQL API:
+/// queries keep writing the operators. The `__spice_` prefix matches other
+/// analyzer-only helpers (`__spice_json_get_is_null`).
+pub const CHECKED_ADD_UDF_NAME: &str = "__spice_checked_add";
+pub const CHECKED_SUB_UDF_NAME: &str = "__spice_checked_sub";
+pub const CHECKED_MUL_UDF_NAME: &str = "__spice_checked_mul";
+
+runtime_udfs_api::register_spice_function!(CHECKED_ADD_SPICE_FUNCTION, CHECKED_ADD_UDF_NAME);
+runtime_udfs_api::register_spice_function!(CHECKED_SUB_SPICE_FUNCTION, CHECKED_SUB_UDF_NAME);
+runtime_udfs_api::register_spice_function!(CHECKED_MUL_SPICE_FUNCTION, CHECKED_MUL_UDF_NAME);
 
 #[must_use]
 pub(crate) fn checked_add_udf() -> Arc<ScalarUDF> {
@@ -120,11 +127,11 @@ impl CheckedIntegerOp {
 impl ScalarUDFImpl for CheckedIntegerOp {
     fn name(&self) -> &'static str {
         if self.op == Operator::Minus {
-            SUB_NAME
+            CHECKED_SUB_UDF_NAME
         } else if self.op == Operator::Multiply {
-            MUL_NAME
+            CHECKED_MUL_UDF_NAME
         } else {
-            ADD_NAME
+            CHECKED_ADD_UDF_NAME
         }
     }
 
