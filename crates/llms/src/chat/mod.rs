@@ -38,6 +38,8 @@ use async_openai::types::chat::{
 };
 
 #[cfg(feature = "local_llm")]
+pub mod engine;
+#[cfg(feature = "local_llm")]
 pub mod hf_files;
 #[cfg(feature = "local_llm")]
 pub mod mistral;
@@ -358,7 +360,9 @@ use crate::hf::HubParams;
 /// the cache's snapshot directory: it never downloads anything itself.
 /// `model_type` is the type of model, if needed to be explicit. Often this can
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
-/// `from_gguf` is a path to a GGUF file within the huggingface model repo. If provided, the model will be loaded from this GGUF. This is useful for loading quantized models.
+/// `gguf_files` are the GGUF files within the huggingface model repo to load the model from,
+///    in the order the model lists them: every shard, and any MTP draft head. A registered
+///    engine that serves them gets them all; mistral.rs loads the first.
 /// `hub` is the model's `hf_token` and `hf_endpoint`.
 /// `distributed` optionally runs the model tensor-parallel across multiple nodes.
 /// `reasoning` names the model and its `reasoning_effort` default for the load-time check.
@@ -366,18 +370,39 @@ use crate::hf::HubParams;
 pub async fn create_hf_model(
     model_id: &str,
     model_type: Option<&str>,
-    from_gguf: Option<&str>,
+    gguf_files: &[PathBuf],
     hub: HubParams<'_>,
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
     reasoning: ReasoningDefault<'_>,
 ) -> Result<Arc<dyn Chat>> {
-    let dir = hf_files::download_model(model_id, from_gguf, hub, reasoning.model_name)
+    let gguf = gguf_files
+        .iter()
+        .map(|file| {
+            file.to_str().ok_or_else(|| Error::FailedToLoadModel {
+                source: format!("the GGUF path '{}' is not valid UTF-8", file.display()).into(),
+            })
+        })
+        .collect::<Result<Vec<&str>>>()?;
+    let dir = hf_files::download_model(model_id, &gguf, hub, reasoning.model_name)
         .await
         .map_err(|error| Error::FailedToDownloadModel {
             configuration: error.is_configuration_error(),
             source: Box::new(error),
         })?;
+    if distributed.is_none()
+        && let Some(engine) = engine::engine_for(gguf_files)
+    {
+        let weights: Vec<PathBuf> = gguf_files.iter().map(|file| dir.join(file)).collect();
+        let template_file = hf_files::chat_template_file(&dir).await;
+        let options = LocalModelOptions {
+            chat_template_literal,
+            chat_template_file: template_file.as_deref(),
+            reasoning,
+            ..LocalModelOptions::default()
+        };
+        return (engine.load)(&weights, options).await;
+    }
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the
     // pipeline. The returned guard keeps the temp file alive for the model.
@@ -394,7 +419,7 @@ pub async fn create_hf_model(
     mistral::MistralLlama::from_snapshot(
         &dir,
         model_type,
-        from_gguf,
+        gguf.first().copied(),
         chat_template_literal,
         ring_config,
         reasoning,
@@ -413,6 +438,9 @@ pub async fn create_hf_model(
 pub struct LocalModelOptions<'a> {
     /// Overrides the chat template; ignored for GGUF when the file carries its own.
     pub chat_template_literal: Option<&'a str>,
+    /// The model's `tokenizer_config.json`, or a `.jinja` file, whose chat template wins over a
+    /// GGUF's own, as it does on the mistral.rs engine.
+    pub chat_template_file: Option<&'a Path>,
     /// Sequence-length budget for layer placement and KV-cache sizing.
     pub context_length: Option<usize>,
     /// Attention implementation to request from the engine.
@@ -441,6 +469,18 @@ pub async fn create_local_model(
     distributed: Option<DistributedConfig>,
     options: LocalModelOptions<'_>,
 ) -> Result<Arc<dyn Chat>> {
+    // A single-node model goes to a registered engine that serves its weights; a ring model
+    // stays on mistral.rs, whose tensor-parallel backend no other engine has a counterpart for.
+    if distributed.is_none() {
+        let weights = model_weights.iter().map(PathBuf::from).collect::<Vec<_>>();
+        if let Some(engine) = engine::engine_for(&weights) {
+            let options = LocalModelOptions {
+                chat_template_file: tokenizer_config.map(Path::new),
+                ..options
+            };
+            return (engine.load)(&weights, options).await;
+        }
+    }
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the
     // pipeline. The returned guard keeps the temp file alive for the model.
