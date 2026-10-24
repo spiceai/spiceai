@@ -409,9 +409,7 @@ jobs:
 
       - name: Pull database images
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        # The script retries a registry 5xx or a dropped connection, which would
-        # otherwise fail the partition (and remove a merge-queue entry) for a
-        # reason unrelated to the change.
+        # docker_pull.sh retries a registry 5xx or a dropped connection.
         shell: bash
         run: |
           set -euo pipefail

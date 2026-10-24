@@ -33,7 +33,6 @@ DENIED = (
     "Error response from daemon: pull access denied for private/image, repository does not exist "
     "or may require 'docker login': denied: requested access to the resource is denied"
 )
-# A digest that starts with "500" must not read as an HTTP 500.
 UNKNOWN_DIGEST = (
     "Error response from daemon: manifest for postgres@sha256:500a1b2c not found: manifest unknown"
 )
@@ -70,16 +69,13 @@ class DockerPullTest(unittest.TestCase):
             calls = calls_file.read_text().splitlines()
         return proc, calls
 
-    def test_retries_a_bad_gateway_then_succeeds(self):
-        proc, calls = self.run_pull([(1, BAD_GATEWAY), (0, PULLED)], ["mongo:9.0"])
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(calls, ["pull mongo:9.0", "pull mongo:9.0"])
-        self.assertIn("attempt 1 of 4", proc.stdout)
-
-    def test_retries_a_tls_handshake_timeout(self):
-        proc, calls = self.run_pull([(1, TLS_TIMEOUT), (0, PULLED)], ["mysql:9.7"])
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(len(calls), 2)
+    def test_retries_a_registry_or_network_error_then_succeeds(self):
+        for message in (BAD_GATEWAY, TLS_TIMEOUT):
+            with self.subTest(message=message):
+                proc, calls = self.run_pull([(1, message), (0, PULLED)], ["mongo:9.0"])
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(calls, ["pull mongo:9.0", "pull mongo:9.0"])
+                self.assertIn("attempt 1 of 4", proc.stdout)
 
     def test_gives_up_after_the_attempt_budget(self):
         proc, calls = self.run_pull(
@@ -89,28 +85,26 @@ class DockerPullTest(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertIn("failed 3 times with a registry or network error", proc.stdout)
 
-    def test_does_not_retry_an_unknown_tag(self):
-        proc, calls = self.run_pull([(1, UNKNOWN_TAG), (0, PULLED)], ["postgres:99"])
-        self.assertEqual(proc.returncode, 1)
-        self.assertEqual(calls, ["pull postgres:99"])
-        self.assertIn("manifest unknown", proc.stdout)
-        self.assertIn("was not retried", proc.stdout)
-
-    def test_does_not_retry_a_denied_pull(self):
-        proc, calls = self.run_pull([(1, DENIED), (0, PULLED)], ["private/image"])
-        self.assertEqual(proc.returncode, 1)
-        self.assertEqual(len(calls), 1)
-
-    def test_a_digest_starting_with_500_is_not_a_server_error(self):
-        proc, calls = self.run_pull([(1, UNKNOWN_DIGEST), (0, PULLED)], ["postgres@sha256:500a1b2c"])
-        self.assertEqual(proc.returncode, 1)
-        self.assertEqual(len(calls), 1)
+    def test_does_not_retry_other_errors(self):
+        # An unknown tag, a denied pull, and a digest that starts with "500", which
+        # must not read as an HTTP 500.
+        for message, image in (
+            (UNKNOWN_TAG, "postgres:99"),
+            (DENIED, "private/image"),
+            (UNKNOWN_DIGEST, "postgres@sha256:500a1b2c"),
+        ):
+            with self.subTest(image=image):
+                proc, calls = self.run_pull([(1, message), (0, PULLED)], [image])
+                self.assertEqual(proc.returncode, 1)
+                self.assertEqual(calls, [f"pull {image}"])
+                self.assertIn(message, proc.stdout)
+                self.assertIn("was not retried", proc.stdout)
 
     def test_keeps_the_docker_exit_code(self):
         proc, _ = self.run_pull([(125, UNKNOWN_TAG)], ["postgres:99"])
         self.assertEqual(proc.returncode, 125)
 
-    def test_pulls_every_image_and_stops_at_the_first_real_failure(self):
+    def test_stops_at_the_first_real_failure(self):
         proc, calls = self.run_pull(
             [(0, PULLED), (1, UNKNOWN_TAG), (0, PULLED)], ["mysql:9.7", "postgres:99", "mongo:9.0"]
         )

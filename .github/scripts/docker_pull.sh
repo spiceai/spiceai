@@ -14,14 +14,12 @@ set -euo pipefail
 
 attempts="${DOCKER_PULL_ATTEMPTS:-4}"
 first_delay="${DOCKER_PULL_DELAY_SECONDS:-10}"
-for value in "$attempts" "$first_delay"; do
-  if ! [[ "$value" =~ ^[0-9]+$ ]]; then
-    echo "::error::DOCKER_PULL_ATTEMPTS and DOCKER_PULL_DELAY_SECONDS must be whole numbers, got '$value'."
-    exit 2
-  fi
-done
-if [ "$attempts" -lt 1 ]; then
-  echo "::error::DOCKER_PULL_ATTEMPTS must be at least 1."
+if ! [[ "$attempts" =~ ^[1-9][0-9]*$ ]]; then
+  echo "::error::DOCKER_PULL_ATTEMPTS must be a whole number of at least 1, got '$attempts'."
+  exit 2
+fi
+if ! [[ "$first_delay" =~ ^[0-9]+$ ]]; then
+  echo "::error::DOCKER_PULL_DELAY_SECONDS must be a whole number, got '$first_delay'."
   exit 2
 fi
 if [ "$#" -eq 0 ]; then
@@ -33,15 +31,17 @@ fi
 # request: an HTTP 5xx status, a timeout, or a connection the peer dropped.
 transient='(: |status code |status )5[0-9][0-9]([^0-9]|$)|Bad Gateway|Service Unavailable|Gateway Time-?out|TLS handshake timeout|i/o timeout|connection reset by peer|connection refused|unexpected EOF|context deadline exceeded|net/http: request canceled'
 
+log="$(mktemp)"
+trap 'rm -f "$log"' EXIT
+
 for image in "$@"; do
   delay="$first_delay"
-  attempt=1
-  while :; do
+  for ((attempt = 1; ; attempt++)); do
+    # Stream the pull to the job log as it runs, and keep a copy to classify a failure.
     status=0
-    output="$(docker pull "$image" 2>&1)" || status=$?
-    printf '%s\n' "$output"
+    docker pull "$image" 2>&1 | tee "$log" || status="${PIPESTATUS[0]}"
     [ "$status" -eq 0 ] && break
-    if ! grep -Eq "$transient" <<<"$output"; then
+    if ! grep -Eq "$transient" "$log"; then
       echo "::error::docker pull $image failed (exit $status), and the error is not a registry or network failure, so it was not retried."
       exit "$status"
     fi
@@ -52,6 +52,5 @@ for image in "$@"; do
     echo "::warning::docker pull $image failed with a registry or network error (attempt $attempt of $attempts); retrying in ${delay}s."
     sleep "$delay"
     delay=$((delay * 2))
-    attempt=$((attempt + 1))
   done
 done
