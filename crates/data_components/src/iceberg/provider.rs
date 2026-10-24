@@ -988,6 +988,31 @@ mod tests {
         names
     }
 
+    /// The `id`s `SELECT id FROM wh.ns.<table>` returns with the catalog
+    /// registered as `wh`, the way a query reads a catalog table.
+    async fn ids_in(provider: &Arc<IcebergCatalogProvider>, table: &str) -> Vec<i64> {
+        let ctx = SessionContext::new();
+        ctx.register_catalog("wh", Arc::clone(provider) as Arc<dyn CatalogProvider>);
+        let batches = ctx
+            .sql(&format!("SELECT id FROM wh.ns.{table}"))
+            .await
+            .expect("query plans")
+            .collect()
+            .await
+            .expect("query executes");
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .iter()
+                    .map(|id| id.expect("id is not null"))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn a_table_that_fails_to_load_does_not_take_down_the_catalog() {
         let warehouse = tempfile::tempdir().expect("tempdir");
@@ -995,11 +1020,14 @@ mod tests {
         write_hadoop_table(warehouse.path(), "bad").await;
         break_hadoop_table(warehouse.path(), "bad");
 
-        let provider = load_hadoop_catalog(warehouse.path())
-            .await
-            .expect("the catalog loads despite one bad table");
+        let provider = Arc::new(
+            load_hadoop_catalog(warehouse.path())
+                .await
+                .expect("the catalog loads despite one bad table"),
+        );
 
         assert_eq!(table_names(&provider), vec!["good".to_string()]);
+        assert_eq!(ids_in(&provider, "good").await, vec![1]);
     }
 
     #[tokio::test]
@@ -1008,9 +1036,11 @@ mod tests {
         write_hadoop_table(warehouse.path(), "good").await;
         write_hadoop_table(warehouse.path(), "bad").await;
 
-        let provider = load_hadoop_catalog(warehouse.path())
-            .await
-            .expect("the catalog loads");
+        let provider = Arc::new(
+            load_hadoop_catalog(warehouse.path())
+                .await
+                .expect("the catalog loads"),
+        );
         assert_eq!(table_names(&provider), vec!["bad", "good"]);
 
         break_hadoop_table(warehouse.path(), "bad");
@@ -1021,6 +1051,8 @@ mod tests {
             .expect("the refresh succeeds despite one bad table");
 
         assert_eq!(table_names(&provider), vec!["added", "bad", "good"]);
+        assert_eq!(ids_in(&provider, "good").await, vec![1]);
+        assert_eq!(ids_in(&provider, "added").await, vec![1]);
     }
 
     #[tokio::test]
