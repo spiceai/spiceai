@@ -320,6 +320,10 @@ A run fails on:
   out of `known-failing/`;
 - an entry with no group.
 
+When a run fails before its steps (a source or instance that did not start),
+its listed checks may never have run: they are reported in one line as not
+run, not as fixed. Fix the setup failure; don't re-record from that run.
+
 `--record-failures` writes the ledger from a run, keeping the group and
 `may-pass` of entries that are still there. A new entry's group is the
 generated query's defect labels, else its `known-failing/<group>/`

@@ -17,8 +17,8 @@ limitations under the License.
 //! Guards that a static-embedding model is resolved out of the shared Hugging
 //! Face cache when `HF_HUB_CACHE` names one.
 //!
-//! It needs a process of its own because it sets a process-wide environment
-//! variable, and `std::env::set_var` is only sound while no other thread is
+//! It needs a process of its own because it sets process-wide environment
+//! variables, and `std::env::set_var` is only sound while no other thread is
 //! touching the environment (see `crate::require_process_per_test`).
 //!
 //! Selected in the `nextest` gate (see `NEXTEST_FILTER` in the Makefile), like
@@ -27,7 +27,8 @@ limitations under the License.
 use std::io::Write;
 use std::path::Path;
 
-use llms::model2vec::Model2Vec;
+use llms::hf::HubParams;
+use llms::model2vec::{Model2Vec, Model2VecOptions};
 use tokenizers::Tokenizer;
 use tokenizers::models::wordpiece::WordPiece;
 
@@ -92,48 +93,96 @@ fn write_static_model(dir: &Path) {
 /// A model already in the shared cache must be read from it, not fetched again.
 ///
 /// `HF_HUB_CACHE` is how a deployment points every model at one warm directory —
-/// a mounted volume, an image layer, a sidecar's download. Only a Spice patch to
-/// the `spiceai/model2vec-rs` fork reads it: upstream builds the client with
-/// `Api::new()`, which takes the default cache under the home directory and
-/// ignores the variable entirely. Losing the patch therefore does not fail
-/// loudly; it re-downloads a model that was already on disk, on every start, for
-/// every replica — and where there is no egress, or the model is gated, it does
-/// not come back at all.
+/// a mounted volume, an image layer, a sidecar's download — and `HF_HUB_OFFLINE`
+/// is how it runs where there is no egress. Spice downloads a `model2vec` model
+/// itself, into the layout `huggingface_hub` uses, and hands `model2vec-rs` the
+/// snapshot directory. Ignoring the variable would re-download the model on every
+/// start, for every replica — and where there is no egress, or the model is
+/// gated, it would not come back at all.
 ///
 /// Asserted with a repo id that exists only in the cache, so the load can only
-/// succeed by looking there. The passing path is offline — hf-hub returns a
-/// cached file without a request — and only the failing path reaches the network,
-/// where the id resolves to nothing (measured: `status code 401`).
-#[test]
-fn a_cached_model_is_read_from_the_directory_hf_hub_cache_names() {
+/// succeed by looking there; offline, it never asks the Hub.
+#[tokio::test]
+async fn a_cached_model_is_read_from_the_directory_hf_hub_cache_names() {
     crate::require_process_per_test(
-        "this test sets the process-wide `HF_HUB_CACHE` environment variable",
+        "this test sets the process-wide `HF_HUB_CACHE` and `HF_HUB_OFFLINE` environment variables",
     );
     let cache = tempfile::tempdir().expect("creates a cache directory");
+    write_static_model(&offline_snapshot(cache.path()));
 
-    // hf-hub's on-disk layout: `refs/<revision>` holds the commit hash, and the
-    // files live under `snapshots/<commit hash>/`.
-    let repo_dir = cache
-        .path()
-        .join(format!("models--{}", REPO_ID.replace('/', "--")));
-    let commit = "0000000000000000000000000000000000000000";
-    let snapshot = repo_dir.join("snapshots").join(commit);
-    std::fs::create_dir_all(&snapshot).expect("creates the snapshot directory");
-    std::fs::create_dir_all(repo_dir.join("refs")).expect("creates the refs directory");
-    std::fs::write(repo_dir.join("refs").join("main"), commit).expect("writes the ref");
-    write_static_model(&snapshot);
-
-    // SAFETY: `require_process_per_test` above has established that this test
-    // runs in a process of its own, so no other thread is reading or writing the
-    // environment while this runs.
-    unsafe {
-        std::env::set_var("HF_HUB_CACHE", cache.path());
-    }
-
-    Model2Vec::from_params(REPO_ID, None, None, None, None, None, None).unwrap_or_else(|e| {
+    Model2Vec::load(
+        "test",
+        REPO_ID,
+        HubParams::default(),
+        Model2VecOptions::default(),
+    )
+    .await
+    .unwrap_or_else(|e| {
         panic!(
             "a model already present under HF_HUB_CACHE must be loaded from there; ignoring the \
              variable re-downloads it on every start, and fails outright with no egress: {e}"
         )
     });
+}
+
+/// A model in a folder of its repository loads however `subfolder` writes the folder.
+///
+/// A sentence-transformers export keeps its static embedding in `0_StaticEmbedding/`.
+/// Spice downloads that folder's files, then hands `model2vec-rs` the snapshot directory
+/// and the subfolder, which it joins onto the directory. A leading `/` must not make that
+/// join an absolute path outside the snapshot, after the download found the files.
+///
+/// The repository's root holds no model, so a load succeeds only by reading the folder.
+#[tokio::test]
+async fn a_model_in_a_subfolder_loads_however_the_subfolder_is_written() {
+    crate::require_process_per_test(
+        "this test sets the process-wide `HF_HUB_CACHE` and `HF_HUB_OFFLINE` environment variables",
+    );
+    let cache = tempfile::tempdir().expect("creates a cache directory");
+    let folder = offline_snapshot(cache.path()).join("0_StaticEmbedding");
+    std::fs::create_dir_all(&folder).expect("creates the model's folder");
+    write_static_model(&folder);
+
+    for subfolder in [
+        "0_StaticEmbedding",
+        "0_StaticEmbedding/",
+        "/0_StaticEmbedding/",
+    ] {
+        Model2Vec::load(
+            "test",
+            REPO_ID,
+            HubParams::default(),
+            Model2VecOptions {
+                subfolder: Some(subfolder.to_string()),
+                ..Model2VecOptions::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the model in subfolder '{subfolder}' must load: {e}"));
+    }
+}
+
+/// Lays out an empty snapshot of [`REPO_ID`] at `main` in the Hugging Face cache `cache`,
+/// points `HF_HUB_CACHE` at it and sets `HF_HUB_OFFLINE`, and returns the snapshot directory.
+///
+/// Call it only after `require_process_per_test`, which establishes that no other thread
+/// reads or writes the environment.
+fn offline_snapshot(cache: &Path) -> std::path::PathBuf {
+    // `huggingface_hub`'s on-disk layout: `refs/<revision>` holds the commit hash, and
+    // the files live under `snapshots/<commit hash>/`.
+    let repo_dir = cache.join(format!("models--{}", REPO_ID.replace('/', "--")));
+    let commit = "0000000000000000000000000000000000000000";
+    let snapshot = repo_dir.join("snapshots").join(commit);
+    std::fs::create_dir_all(&snapshot).expect("creates the snapshot directory");
+    std::fs::create_dir_all(repo_dir.join("refs")).expect("creates the refs directory");
+    std::fs::write(repo_dir.join("refs").join("main"), commit).expect("writes the ref");
+
+    // SAFETY: the caller has established, through `require_process_per_test`, that this
+    // test runs in a process of its own, so no other thread is reading or writing the
+    // environment while this runs.
+    unsafe {
+        std::env::set_var("HF_HUB_CACHE", cache);
+        std::env::set_var("HF_HUB_OFFLINE", "1");
+    }
+    snapshot
 }
