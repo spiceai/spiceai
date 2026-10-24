@@ -731,38 +731,6 @@
     {
       "run": "ducklake-coverage[source=ducklake]",
       "who": "federated",
-      "key": "query: SELECT t.id, u.label FROM t LEFT JOIN u ON t.id = u.t_id WHERE t.id < 60",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Ambiguous reference to column name \\\"id\\\" (use: \\\"t.id\\\" or \\\"u.id\\\")\": code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Erro",
-      "group": "files-and-lakes"
-    },
-    {
-      "run": "ducklake-coverage[source=ducklake]",
-      "who": "federated",
-      "key": "query: SELECT t.id, u.id AS uid, u.label FROM u RIGHT JOIN t ON t.id = u.t_id WHERE t.id < 40",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Ambiguous reference to column name \\\"id\\\" (use: \\\"u.id\\\" or \\\"t.id\\\")\": code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Erro",
-      "group": "files-and-lakes"
-    },
-    {
-      "run": "ducklake-coverage[source=ducklake]",
-      "who": "federated",
-      "key": "query: SELECT t.id, u.id AS uid FROM t FULL OUTER JOIN u ON t.id = u.t_id WHERE coalesce(t.id, 0) < 30 OR u.id < 10",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Ambiguous reference to column name \\\"id\\\" (use: \\\"t.id\\\" or \\\"u.id\\\")\": code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Erro",
-      "group": "files-and-lakes"
-    },
-    {
-      "run": "ducklake-coverage[source=ducklake]",
-      "who": "federated",
-      "key": "query: SELECT t.id, u.label FROM t JOIN u ON t.id = u.t_id AND u.label <> 'blue' WHERE t.b",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Ambiguous reference to column name \\\"id\\\" (use: \\\"t.id\\\" or \\\"u.id\\\")\": code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Erro",
-      "group": "files-and-lakes"
-    },
-    {
-      "run": "ducklake-coverage[source=ducklake]",
-      "who": "federated",
       "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
@@ -1101,14 +1069,6 @@
     {
       "run": "edge-values",
       "who": "sqlite",
-      "key": "query: SELECT sum(i8) FROM e WHERE id IN (1, 6)",
-      "kind": "error",
-      "signature": "the query succeeded, but the script expected an error:",
-      "group": "sqlite"
-    },
-    {
-      "run": "edge-values",
-      "who": "sqlite",
       "key": "query: SELECT id, reverse(s) AS rev FROM e WHERE id IN (3, 4, 5, 10)",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: reverse in SELECT `e`.`id`, reverse(`e`.`s`) AS `rev` FROM `e` WHERE `e`.`id` IN (3, 4, 5, 10) at offset 17\\\")\": code: 'Client specified ",
@@ -1433,7 +1393,7 @@
       "who": "sqlite",
       "key": "query: SELECT id, dt + INTERVAL '1 day' AS next_day, ts - INTERVAL '2 hours' AS earlier FROM t WHERE id < 30",
       "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325000\\\"\", actual: \"\\\"2024-10-24 00:00:00.000000000\\\"\" }",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325000\\\"\", actual: \"\\\"2024-10-24 02:51:51.000000000\\\"\" }",
       "group": "sqlite"
     },
     {
@@ -1513,7 +1473,7 @@
       "who": "sqlite",
       "key": "query: SELECT id, dt + INTERVAL '1 day' AS next_day, ts - INTERVAL '2 hours' AS earlier FROM t WHERE id < 30 #2",
       "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325000\\\"\", actual: \"\\\"2024-10-24 00:00:00.000000000\\\"\" }",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325000\\\"\", actual: \"\\\"2024-10-24 02:51:51.000000000\\\"\" }",
       "group": "sqlite"
     },
     {
@@ -1689,7 +1649,7 @@
       "who": "sqlite",
       "key": "query: SELECT id, dt + INTERVAL '1 day' AS next_day, ts - INTERVAL '2 hours' AS earlier FROM t WHERE id < 30",
       "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325000\\\"\", actual: \"\\\"2024-10-24 00:00:00.000000000\\\"\" }",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325000\\\"\", actual: \"\\\"2024-10-24 02:51:51.000000000\\\"\" }",
       "group": "sqlite"
     },
     {
@@ -1769,7 +1729,7 @@
       "who": "sqlite",
       "key": "query: SELECT id, dt + INTERVAL '1 day' AS next_day, ts - INTERVAL '2 hours' AS earlier FROM t WHERE id < 30 #2",
       "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325000\\\"\", actual: \"\\\"2024-10-24 00:00:00.000000000\\\"\" }",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325000\\\"\", actual: \"\\\"2024-10-24 02:51:51.000000000\\\"\" }",
       "group": "sqlite"
     },
     {
@@ -3142,7 +3102,7 @@
       "who": "sqlite",
       "key": "query: SELECT id, dt + INTERVAL '1 day' AS next_day, ts - INTERVAL '2 hours' AS earlier FROM t WHERE id < 30",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325000\\\"\", actual: \"\\\"2024-10-24 00:00:00.000000000\\\"\" }",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325000\\\"\", actual: \"\\\"2024-10-24 02:51:51.000000000\\\"\" }",
       "group": "sqlite"
     },
     {
@@ -3574,7 +3534,7 @@
       "who": "sqlite",
       "key": "query: SELECT id, dt + INTERVAL '1 day' AS next_day, ts - INTERVAL '2 hours' AS earlier FROM t WHERE id < 30",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325\\\"\", actual: \"\\\"2024-10-24 00:00:00.000000\\\"\" }",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325\\\"\", actual: \"\\\"2024-10-24 02:51:51.000000\\\"\" }",
       "group": "sqlite"
     },
     {
@@ -4116,14 +4076,6 @@
     {
       "run": "surface",
       "who": "sqlite",
-      "key": "query: SELECT id, tz + INTERVAL '1 day' AS next_day, tz - INTERVAL '90 minutes' AS before FROM ev WHERE id < 40",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"next_day\", row_number: 1, expected: \"\\\"2024-03-10 13:37:00.000000000\\\"\", actual: \"\\\"2024-03-10 00:00:00.000000000\\\"\" }",
-      "group": "sqlite"
-    },
-    {
-      "run": "surface",
-      "who": "sqlite",
       "key": "query: SELECT id, ts - TIMESTAMP '2000-01-01 00:00:00' < INTERVAL '30 days' AS early FROM ev WHERE id < 40",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: DataMismatch { column: \"early\", row_number: 4, expected: \"\\\"false\\\"\", actual: \"\\\"true\\\"\" }",
@@ -4349,8 +4301,8 @@
       "run": "surface",
       "who": "sqlite",
       "key": "query: SELECT id, count(*) OVER (ORDER BY dt RANGE BETWEEN INTERVAL '10 days' PRECEDING AND CURRENT ROW) AS c FROM ev",
-      "kind": "empty",
-      "signature": "Spice returned no rows, expected 240",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"Failed to convert query result to Arrow: Failed to read the next row: frame starting offset must be a non-negative number\\\")\": code: 'Client specified an i",
       "group": "sqlite"
     },
     {

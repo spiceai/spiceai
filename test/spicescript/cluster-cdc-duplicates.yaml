@@ -1,12 +1,9 @@
 name: cluster-cdc-duplicates
 description: >
-  Known failing: wrong results, on a cluster of two executors. A CDC
-  (`refresh_mode: changes`) Cayenne dataset answers every row twice: each
-  executor creates its own replication slot, builds its acceleration from
-  the whole source table and applies every change, and a query reads both.
-  Count 200 for 100 rows; updates reach both copies. One executor answers
-  correctly; a full-refresh dataset on the same cluster is right.
-
+  On a cluster of two executors, a CDC (`refresh_mode: changes`) Cayenne
+  dataset answers each row once, as the source does, before and after
+  updates and inserts: each executor keeps to its own partitions rather
+  than building and applying the whole table.
 sources:
   src: { kind: postgres }
 

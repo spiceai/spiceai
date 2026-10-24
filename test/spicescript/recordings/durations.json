@@ -10,6 +10,7 @@
   "clickhouse-literals": 8,
   "clickhouse-types-acceleration": 5,
   "cluster-aggregate-over-limit": 48,
+  "cluster-cdc-duplicates": 19,
   "cluster-chaos": 206,
   "cluster-executors": 71,
   "cluster-scheduler-failover-empty": 98,

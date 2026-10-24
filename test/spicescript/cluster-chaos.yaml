@@ -7,8 +7,8 @@ description: >
   (partitions rebalanced), the scheduler restarted, and the scheduler killed
   and started again. Afterwards every query answers as PostgreSQL does.
   (Losing an executor answers empty:
-  known-failing/cluster-operations/cluster-executor-loss-cayenne.yaml; CDC on two executors
-  answers every row twice: known-failing/cluster-operations/cluster-cdc-duplicates.yaml.)
+  known-failing/cluster-operations/cluster-executor-loss-cayenne.yaml. CDC on
+  two executors: cluster-cdc-duplicates.yaml.)
 
 sources:
   src: { kind: postgres }

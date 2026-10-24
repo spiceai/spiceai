@@ -463,7 +463,7 @@
       "who": "none-partitioned",
       "key": "query: SELECT id, region, name, v, f, ts FROM ev #9",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 11, actual: 17 }",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 11, actual: 15 }",
       "group": "cayenne"
     },
     {
@@ -471,7 +471,7 @@
       "who": "none-partitioned",
       "key": "query: SELECT id, region, name, v, f, ts FROM ev #10",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 11, actual: 17 }",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 11, actual: 15 }",
       "group": "cayenne"
     },
     {
@@ -479,7 +479,7 @@
       "who": "none-partitioned",
       "key": "query: SELECT id, region, name, v, f, ts FROM ev #11",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1011, actual: 1020 }",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1011, actual: 1018 }",
       "group": "cayenne"
     },
     {
@@ -487,7 +487,7 @@
       "who": "none-partitioned",
       "key": "query: SELECT count(*) AS n, sum(id) AS s, count(DISTINCT region) AS r FROM ev",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1011\\\"\", actual: \"\\\"1020\\\"\" }",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1011\\\"\", actual: \"\\\"1018\\\"\" }",
       "group": "cayenne"
     },
     {
@@ -495,7 +495,7 @@
       "who": "none-partitioned",
       "key": "query: SELECT id, region, name, v, f, ts FROM ev #12",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1014, actual: 1023 }",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1014, actual: 1021 }",
       "group": "cayenne"
     },
     {
@@ -511,7 +511,7 @@
       "who": "none-partitioned",
       "key": "query: SELECT id, region, name, v, f, ts FROM ev #13",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 514, actual: 1023 }",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 514, actual: 1021 }",
       "group": "cayenne"
     },
     {
@@ -527,7 +527,7 @@
       "who": "none-partitioned",
       "key": "query: SELECT count(*) AS n FROM ev",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"1023\\\"\" }",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"1021\\\"\" }",
       "group": "cayenne"
     },
     {
@@ -535,7 +535,7 @@
       "who": "none-partitioned",
       "key": "query: SELECT id, region, name, v, f, ts FROM ev #14",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1, actual: 1024 }",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1, actual: 1022 }",
       "group": "cayenne"
     },
     {

@@ -156,13 +156,16 @@ steps:
     expect: { rows: [[ffffffff-0000-0000-0000-000000000001, '1', null, '1.5', 'true', null]] }
     eventually: 30s
 
-  # A wrong password, or a client without SASL, is refused.
+  # A wrong password, or a client without SASL, is refused. The connector
+  # waits through broker connection errors for up to 20 s before reporting
+  # one, so the client without SASL shows its error after that.
   - http: { path: '/v1/datasets?status=true' }
     expect:
       status: 200
       body-matches:
         - '"name":"wrong_password"[^}]*"status":"Error","error":\{"category":"dataset","type":"auth"'
         - '"name":"no_sasl"[^}]*"status":"Error"'
+    eventually: 45s
   - query: SELECT count(*) FROM wrong_password
     expect-error: true
   - query: SELECT count(*) FROM no_sasl

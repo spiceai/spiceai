@@ -1,5 +1,4 @@
 {
-  "cluster-cdc-duplicates": 124,
   "cluster-cdc-ready": 20,
   "cluster-dataset-writes": 24,
   "cluster-executor-loss-cayenne": 25,
