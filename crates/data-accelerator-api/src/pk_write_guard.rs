@@ -31,7 +31,10 @@ limitations under the License.
 //! as `InvalidQuery` before the stream's error is read. The guard still
 //! streams (one batch at a time, like the sink's `mpsc::channel(1)`), records
 //! the first stream or uniqueness error, and prefers that over the sink's
-//! misleading message.
+//! misleading message. An input-stream error is marked with
+//! [`check_and_mark_retriable_error`] before it is stored, matching the
+//! `DuckDB` and `SQLite` sinks; a NULL or uniqueness error the guard itself
+//! raises stays permanent.
 
 use std::{
     collections::HashSet,
@@ -204,16 +207,30 @@ fn uniqueness_error(schema: &Schema, indices: &[usize]) -> DataFusionError {
     ))
 }
 
-fn remember_guard_error(slot: &GuardErrorSlot, error: &DataFusionError) {
+fn store_guard_error(slot: &GuardErrorSlot, error: &DataFusionError, retriable: bool) {
     let mut stored = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if stored.is_none() {
         *stored = Some(GuardErrorSnapshot {
             message: error.to_string(),
-            retriable: is_retriable_error(error),
+            retriable,
         });
     }
+}
+
+/// Marks `error` the way the `DuckDB` and `SQLite` sinks do, records it, and
+/// returns the marked error so the stream and the slot agree.
+fn remember_input_stream_error(slot: &GuardErrorSlot, error: DataFusionError) -> DataFusionError {
+    let error = check_and_mark_retriable_error(error);
+    store_guard_error(slot, &error, is_retriable_error(&error));
+    error
+}
+
+/// Records a NULL or uniqueness error the guard itself raised. Those stay
+/// permanent even though they are not SQL/Plan/Schema.
+fn remember_constraint_error(slot: &GuardErrorSlot, error: &DataFusionError) {
+    store_guard_error(slot, error, false);
 }
 
 fn restore_guard_error(snapshot: &GuardErrorSnapshot) -> DataFusionError {
@@ -462,12 +479,11 @@ impl ExecutionPlan for PkWriteGuardExec {
                 let batch = match item {
                     Ok(batch) => batch,
                     Err(error) => {
-                        remember_guard_error(&slot, &error);
-                        return Err(error);
+                        return Err(remember_input_stream_error(&slot, error));
                     }
                 };
                 if let Err(error) = seen.admit(&batch) {
-                    remember_guard_error(&slot, &error);
+                    remember_constraint_error(&slot, &error);
                     return Err(error);
                 }
                 if tx.send(Ok(batch)).await.is_err() {
@@ -1014,7 +1030,7 @@ mod tests {
             "the fixture must be a retriable stream error"
         );
         let slot = Arc::new(Mutex::new(None));
-        super::remember_guard_error(&slot, &source);
+        let _ = super::remember_input_stream_error(&slot, source);
         let input = Arc::new(MockExec::new(
             vec![Err(datafusion::error::DataFusionError::Execution(
                 "Query is not read-only".to_string(),
@@ -1054,7 +1070,7 @@ mod tests {
             "an in-batch duplicate must stay a permanent error"
         );
         let slot = Arc::new(Mutex::new(None));
-        super::remember_guard_error(&slot, &uniqueness);
+        super::remember_constraint_error(&slot, &uniqueness);
         let input = Arc::new(MockExec::new(
             vec![Err(datafusion::error::DataFusionError::Execution(
                 "Query is not read-only".to_string(),
@@ -1073,6 +1089,68 @@ mod tests {
         assert!(
             message.contains("uniqueness"),
             "the uniqueness error must be reported, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unmarked_upstream_execution_error_stays_retriable() {
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+        use datafusion_table_providers::util::retriable_error::is_retriable_error;
+        use datafusion_table_providers::util::test::MockExec;
+        use std::sync::Mutex;
+
+        let unmarked =
+            datafusion::error::DataFusionError::Execution("connection reset by peer".to_string());
+        assert!(
+            !is_retriable_error(&unmarked),
+            "the fixture must be unmarked, as a Flight or connection drop arrives"
+        );
+
+        let slot = Arc::new(Mutex::new(None));
+        let guard = super::PkWriteGuardExec::new(
+            Arc::new(MockExec::new(vec![Err(unmarked)], schema())),
+            Arc::from(vec![vec![0]]),
+            NanKey::Value,
+            Arc::clone(&slot),
+        );
+        let ctx = SessionContext::new();
+        let forwarded = collect(Arc::new(guard), ctx.task_ctx())
+            .await
+            .expect_err("the unmarked stream error must fail the guard");
+        assert!(
+            is_retriable_error(&forwarded),
+            "the forwarded stream error must be marked retriable, got: {forwarded}"
+        );
+        assert!(
+            forwarded.to_string().contains("connection reset by peer"),
+            "the stream error must be reported, got: {forwarded}"
+        );
+
+        let prefer = super::PreferGuardErrorExec::new(
+            Arc::new(MockExec::new(
+                vec![Err(datafusion::error::DataFusionError::Execution(
+                    "Query is not read-only".to_string(),
+                ))],
+                schema(),
+            )),
+            slot,
+        );
+        let preferred = collect(Arc::new(prefer), ctx.task_ctx())
+            .await
+            .expect_err("the sink's read-only message must yield to the guard");
+        assert!(
+            is_retriable_error(&preferred),
+            "PreferGuardErrorExec must not make an unmarked source drop permanent, got: {preferred}"
+        );
+        let message = preferred.to_string();
+        assert!(
+            message.contains("connection reset by peer"),
+            "the stream error must be reported, got: {message}"
+        );
+        assert!(
+            !message.contains("Query is not read-only"),
+            "the sink's mis-report must not win, got: {message}"
         );
     }
 }
