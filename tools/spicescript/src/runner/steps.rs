@@ -347,7 +347,7 @@ pub(super) async fn run_instance_step(
                 .await?;
         }
         Action::Query(q) => {
-            let answer = run_query(script, instance, q, &step.key, sources).await?;
+            let answer = run_query(script, instance, q, step.corpus, sources).await?;
             if q.show
                 && let Some(answer) = &answer
             {

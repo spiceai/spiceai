@@ -321,6 +321,10 @@ pub struct Step {
     pub except: Vec<String>,
     /// Run the step only in matrix combinations with these values.
     pub when: Map<String, Value>,
+    /// For a query from a `corpus`, the position of that corpus in the
+    /// script's steps: its queries share one `eventually` limit, counted from
+    /// when the first of them starts, rather than taking one each.
+    pub corpus: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -903,7 +907,15 @@ impl Script {
             let context = || format!("step {}", i + 1);
             read_sql_files(&mut step, base).with_context(context)?;
             if let Some(corpus) = step.get("corpus") {
-                expanded.extend(expand_corpus(corpus, &step, base).with_context(context)?);
+                expanded.extend(
+                    expand_corpus(corpus, &step, base)
+                        .with_context(context)?
+                        .into_iter()
+                        .map(|query| Step {
+                            corpus: Some(i),
+                            ..query
+                        }),
+                );
             } else {
                 expanded.push(parse_step(0, step).with_context(context)?);
             }
@@ -2012,6 +2024,7 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
         only,
         except,
         when,
+        corpus: None,
     })
 }
 
@@ -2257,6 +2270,25 @@ steps:
                 signal: KillSignal::StopThenKill
             }
         ));
+    }
+
+    #[test]
+    fn a_corpus_marks_its_queries_with_its_position() {
+        let suite = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/spicescript");
+        let script = Script::parse_in(
+            "name: c\nspicepod: {}\nsteps:\n  - start: {}\n  - corpus: corpus/layout.sql\n    eventually: 30s\n  - query: SELECT 1\n  - corpus: corpus/layout.sql\n",
+            &suite,
+            &SharedVariants::default(),
+        )
+        .expect("script parses");
+        let corpora: Vec<Option<usize>> = script.steps.iter().map(|s| s.corpus).collect();
+        let first = corpora.iter().filter(|c| **c == Some(1)).count();
+        let second = corpora.iter().filter(|c| **c == Some(3)).count();
+        assert!(first > 1, "{corpora:?}");
+        assert_eq!(first, second, "{corpora:?}");
+        assert_eq!(corpora[0], None, "start");
+        assert_eq!(corpora[1 + first], None, "the query between the corpora");
+        assert_eq!(corpora.len(), 2 + 2 * first);
     }
 
     #[test]

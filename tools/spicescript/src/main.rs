@@ -228,11 +228,6 @@ async fn run(cli: Cli) -> Result<bool> {
         work_dir,
         keep: cli.keep,
         spice_cli: cli.spice,
-        ledger: if cli.record_failures {
-            None
-        } else {
-            Some(std::sync::Arc::new(ledger::Ledger::load(&scripts)?))
-        },
     };
     let mut ledger = ledger::Ledger::load(&scripts)?;
     let mut passed = 0;

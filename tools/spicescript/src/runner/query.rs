@@ -17,6 +17,7 @@ limitations under the License.
 //! `query` and `explain` steps: running a query, checking its answer, the
 //! SQL it sends to its source, and that HTTP gives the same answer.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -104,7 +105,7 @@ pub(super) async fn run_query(
     script: &Script,
     instance: &mut Instance,
     q: &QueryStep,
-    key: &str,
+    corpus: Option<usize>,
     sources: &Sources,
 ) -> Result<Option<Vec<RecordBatch>>> {
     let expect = q.expect.as_ref().or(script.defaults.expect.as_ref());
@@ -115,7 +116,7 @@ pub(super) async fn run_query(
             .map_or(Timing::Once, Timing::Eventually),
         t => t,
     };
-    let started = Instant::now();
+    let started = retry_since(timing, corpus, &mut instance.corpus_started, Instant::now());
     let mut attempts = 0usize;
     loop {
         attempts += 1;
@@ -135,15 +136,10 @@ pub(super) async fn run_query(
         match (timing, attempt) {
             (Timing::Once, result) => return result,
             (Timing::Eventually(_), Ok(answer)) => return Ok(answer),
-            (Timing::Eventually(limit), Err(e)) => {
-                let e = e.context(format!(
+            (Timing::Eventually(limit), Err(e)) if started.elapsed() >= max_wait(limit) => {
+                return Err(e.context(format!(
                     "still failing after {attempts} attempts over {limit:?}"
-                ));
-                if started.elapsed() >= max_wait(limit) || instance.fails_as_listed(script, key, &e)
-                {
-                    return Err(e);
-                }
-                tokio::time::sleep(POLL).await;
+                )));
             }
             (Timing::Consistently(_), Err(e)) => {
                 return Err(e.context(format!(
@@ -156,6 +152,22 @@ pub(super) async fn run_query(
             }
             _ => tokio::time::sleep(POLL).await,
         }
+    }
+}
+
+/// When a query's `eventually` limit started: for a query from a corpus, when
+/// this instance began that corpus's first query, so the corpus waits out one
+/// limit rather than one per query and a query reached after the limit gets a
+/// single attempt; otherwise `now`.
+pub(super) fn retry_since(
+    timing: Timing,
+    corpus: Option<usize>,
+    corpus_started: &mut BTreeMap<usize, Instant>,
+    now: Instant,
+) -> Instant {
+    match (timing, corpus) {
+        (Timing::Eventually(_), Some(corpus)) => *corpus_started.entry(corpus).or_insert(now),
+        _ => now,
     }
 }
 
