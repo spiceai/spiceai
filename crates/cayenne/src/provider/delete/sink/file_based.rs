@@ -90,9 +90,6 @@ struct DeletionCheckScanResult {
 pub struct FileBasedDeletionSink {
     /// Main listing table to enumerate files and collect per-file statistics.
     listing_table: Arc<ArcSwap<ListingTable>>,
-    /// Protected snapshot listing tables keyed by snapshot ID (PK-based strategies only).
-    /// `None` for position-based tables.
-    protected_snapshot_tables: Option<Vec<(String, Arc<ListingTable>)>>,
     /// The retention filter expression (e.g., `event_time < literal`).
     filter: Expr,
     /// Table name for logging.
@@ -130,8 +127,6 @@ impl FileBasedDeletionSink {
     /// # Arguments
     ///
     /// * `listing_table` - Main listing table for the current snapshot.
-    /// * `protected_snapshot_tables` - Protected snapshot listing tables keyed
-    ///   by snapshot ID. `None` for position-based tables.
     /// * `filter` - Retention filter expression.
     /// * `table_name` - Table name for logging.
     /// * `catalog` - Metadata catalog for clearing snapshot sequence records.
@@ -144,7 +139,6 @@ impl FileBasedDeletionSink {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         listing_table: Arc<ArcSwap<ListingTable>>,
-        protected_snapshot_tables: Option<Vec<(String, Arc<ListingTable>)>>,
         filter: Expr,
         table_name: String,
         catalog: Arc<dyn MetadataCatalog>,
@@ -158,7 +152,6 @@ impl FileBasedDeletionSink {
     ) -> Self {
         Self {
             listing_table,
-            protected_snapshot_tables,
             filter,
             table_name,
             catalog,
@@ -391,11 +384,24 @@ impl FileBasedDeletionSink {
             }
         }
 
-        // 2. Discover and delete eligible files from protected snapshot tables
+        // 2. Discover and delete eligible files from protected snapshot tables.
+        // Resolve listings here, inside `write_lock`, so a snapshot published
+        // after plan build is not invisible to this delete (#14217).
         let mut emptied_snapshot_ids = Vec::new();
+        let protected_snapshot_tables = if self.provider.is_position_based() {
+            None
+        } else {
+            Some(
+                self.provider
+                    .build_protected_snapshot_listing_tables()?
+                    .into_iter()
+                    .map(|(snapshot_id, _, table)| (snapshot_id, table))
+                    .collect::<Vec<_>>(),
+            )
+        };
 
         for (idx, (snapshot_id, snapshot_table)) in
-            self.protected_snapshot_tables.iter().flatten().enumerate()
+            protected_snapshot_tables.iter().flatten().enumerate()
         {
             let scan_result = self
                 .retention_eligible_files(&ctx, snapshot_table, &col_name, &threshold)
@@ -447,8 +453,17 @@ impl DeletionSink for FileBasedDeletionSink {
         _context: Arc<TaskContext>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Acquire write lock to prevent racing with concurrent inserts or catalog refreshes.
-        let _write_guard = self.write_lock.lock().await;
+        let _write_guard = if crate::provider::write_lock_held::is_held() {
+            None
+        } else {
+            Some(self.write_lock.lock().await)
+        };
         self.provider.ensure_publication_outcome_known()?;
+        // Materialize pending inline rows in THIS hold so retention sees the
+        // same files the later listing scan will delete (#14217).
+        self.provider
+            .checkpoint_inlined_data_if_present_for_delete()
+            .await?;
         // Acquire the listing fence in write mode so new scan plan-builds
         // cannot resolve a file listing while we are physically unlinking
         // files. In-flight scans that already released their read fence
