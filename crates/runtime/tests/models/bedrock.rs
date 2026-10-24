@@ -456,8 +456,8 @@ pub(crate) mod chat {
 
     const MODEL_NAME: &str = "nova-lite";
 
-    fn create_nova_lite_model() -> Model {
-        let mut model = Model::new("bedrock:us.amazon.nova-lite-v1:0", MODEL_NAME);
+    pub(crate) fn create_nova_lite_model(name: &str) -> Model {
+        let mut model = Model::new("bedrock:us.amazon.nova-lite-v1:0", name);
         model
             .params
             .insert("aws_region".to_string(), "us-east-1".into());
@@ -518,7 +518,7 @@ pub(crate) mod chat {
                 }
 
                 let app = AppBuilder::new("bedrock_ai_if")
-                    .with_model(create_nova_lite_model())
+                    .with_model(create_nova_lite_model(MODEL_NAME))
                     .build();
                 let rt = Arc::new(Runtime::builder().with_app(app).build().await);
                 tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
