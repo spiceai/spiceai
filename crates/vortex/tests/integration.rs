@@ -27,6 +27,11 @@ limitations under the License.
 //! under plain `cargo test` that call fails the test before it changes anything
 //! its neighbours would see.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 mod disabled_segment_cache;
 mod footer_cache_reuse;
 mod process_segment_cache;

@@ -7043,6 +7043,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
     }
 }
 
-#[cfg(all(test, feature = "snapshots", feature = "duckdb"))]
+#[cfg(test)]
+#[cfg(all(feature = "snapshots", feature = "duckdb"))]
 #[path = "dataset_snapshot_bootstrap_tests.rs"]
 mod snapshot_bootstrap_tests;
