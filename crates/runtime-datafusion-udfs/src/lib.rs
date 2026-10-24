@@ -24,6 +24,7 @@ pub mod alias;
 /// structured error when it is not registered).
 pub static EMBED_UDF_NAME: &str = "embed";
 pub mod assert;
+pub mod async_placement;
 pub mod bucket;
 pub mod cosine_distance;
 pub mod digest_many;
