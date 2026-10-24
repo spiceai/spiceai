@@ -61,10 +61,7 @@ impl FromStr for ChatBackend {
         match s.trim().to_ascii_lowercase().as_str() {
             "disabled" => Ok(Self::ChatCompletions),
             "enabled" => Ok(Self::Responses),
-            other => Err(format!(
-                "must be one of: {}. Found {other}",
-                Self::VALUES.join(", ")
-            )),
+            _ => Err(format!("must be one of: {}", Self::VALUES.join(", "))),
         }
     }
 }
@@ -320,16 +317,10 @@ mod chat_backend_tests {
 
     #[test]
     fn rejects_values_outside_the_spec() {
-        for (raw, expected) in [
-            // Unlike the other model params, a blank value is not read as unset.
-            ("", "must be one of: enabled, disabled. Found "),
-            ("legacy", "must be one of: enabled, disabled. Found legacy"),
-            ("true", "must be one of: enabled, disabled. Found true"),
-            ("false", "must be one of: enabled, disabled. Found false"),
-        ] {
+        for raw in ["", "legacy", "true", "false"] {
             assert_eq!(
                 raw.parse::<ChatBackend>(),
-                Err(expected.to_string()),
+                Err("must be one of: enabled, disabled".to_string()),
                 "{raw:?} should be rejected"
             );
         }
