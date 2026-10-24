@@ -40,6 +40,8 @@ members = [
     "crates/hash-index",
     "crates/huggingface-hub",
     "crates/key-index",
+    "crates/llama-cpp",
+    "crates/llms-llamacpp",
     "crates/llms",
     "crates/chat-api",
     "crates/embed-api",
