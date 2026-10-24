@@ -39,6 +39,7 @@ pub mod resilience;
 pub mod rows;
 pub mod setup;
 pub mod shared;
+mod value_domain;
 
 use std::sync::Arc;
 
@@ -51,6 +52,88 @@ use crate::cdc::{ChangeEnvelope, ChangesStream, NoOpCommitter, StreamError};
 pub use config::{BinlogPosition, CursorType, ReplicationParams, derive_server_id, process_nonce};
 pub use gtid::GtidSet;
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
+pub use value_domain::source_retype_keeps_every_value;
+
+/// A source `ALTER` that changed a replicated column's type in a way the change
+/// stream does not follow, so the stream stops at it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetypeRefusal {
+    /// The dataset column.
+    pub column: String,
+    /// The source `COLUMN_TYPE` before the `ALTER`.
+    pub from: String,
+    /// The source `COLUMN_TYPE` after it.
+    pub to: String,
+    pub reason: RetypeRefusalReason,
+}
+
+impl RetypeRefusal {
+    #[must_use]
+    pub fn new(
+        column: impl Into<String>,
+        from: impl Into<String>,
+        to: impl Into<String>,
+        reason: RetypeRefusalReason,
+    ) -> Self {
+        Self {
+            column: column.into(),
+            from: from.into(),
+            to: to.into(),
+            reason,
+        }
+    }
+}
+
+/// Why the change stream does not follow a [`RetypeRefusal`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetypeRefusalReason {
+    /// The new type does not hold every value of the old one, so the source
+    /// rewrote stored values in place, with no row change for any of them.
+    SourceRewroteValues,
+    /// An integer column became a `DECIMAL` with a scale, and the dataset keeps
+    /// the integer type, which cannot store a fractional value.
+    FractionIntoInteger,
+    /// The dataset keeps the column `Float32` while the source is no longer
+    /// `FLOAT`, which would round the new values.
+    StaysFloat32,
+    /// The dataset keeps the column an unsigned integer while the source
+    /// became a `DECIMAL`, whose values the change stream cannot read into it.
+    DecimalIntoUnsignedInteger,
+}
+
+/// The cause clause of the dataset error a [`RetypeRefusal`] stops the stream
+/// with.
+impl std::fmt::Display for RetypeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            column,
+            from,
+            to,
+            reason,
+        } = self;
+        write!(f, "column '{column}' changed from `{from}` to `{to}`")?;
+        match reason {
+            RetypeRefusalReason::SourceRewroteValues => write!(
+                f,
+                ", which does not hold every `{from}` value, and MySQL rewrites such values in \
+                 place without sending row changes, so the dataset may hold values the source no \
+                 longer has"
+            ),
+            RetypeRefusalReason::FractionIntoInteger => f.write_str(
+                ", and the dataset keeps the column's integer type, which cannot store a \
+                 fractional value",
+            ),
+            RetypeRefusalReason::StaysFloat32 => f.write_str(
+                ", and the dataset keeps the column's `Float32` type, which would round the new \
+                 values",
+            ),
+            RetypeRefusalReason::DecimalIntoUnsignedInteger => f.write_str(
+                ", and the dataset keeps the column's unsigned integer type, which the change \
+                 stream cannot read a decimal value into",
+            ),
+        }
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -121,6 +204,9 @@ pub enum Error {
 
     #[snafu(display("Schema mismatch: {message}"))]
     SchemaMismatch { message: String },
+
+    #[snafu(display("{refusal}"))]
+    RetypeNotFollowed { refusal: RetypeRefusal },
 
     #[snafu(display("Failed to build the ready-signal change batch: {message}"))]
     BuildReadySignal { message: String },

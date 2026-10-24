@@ -35,6 +35,7 @@ pub mod replication;
 pub mod replication_e2e;
 pub mod replication_shared;
 pub mod replication_type_change;
+mod retype_domain;
 mod schema_inference;
 
 use super::*;

@@ -38,7 +38,7 @@ use mysql_async::prelude::Queryable;
 use runtime::Runtime;
 use runtime::status::ComponentStatus;
 use spicepod::acceleration::{Acceleration, OnConflictBehavior, RefreshMode};
-use spicepod::component::dataset::{Dataset, OnSchemaChange};
+use spicepod::component::dataset::OnSchemaChange;
 use spicepod::param::Params;
 
 use crate::mysql::common;
@@ -117,19 +117,32 @@ async fn start(
     )
     .await?;
 
-    let params = HashMap::from([
-        ("mysql_host".to_string(), "localhost".to_string()),
-        ("mysql_tcp_port".to_string(), port.to_string()),
-        ("mysql_user".to_string(), "root".to_string()),
-        (
-            "mysql_pass".to_string(),
-            common::MYSQL_ROOT_PASSWORD.to_string(),
-        ),
-        ("mysql_db".to_string(), "mysqldb".to_string()),
-        ("mysql_sslmode".to_string(), "disabled".to_string()),
-    ]);
-    let mut dataset = Dataset::new(format!("mysql:mysqldb.{table}"), table.to_string());
-    dataset.params = Some(Params::from_string_map(params));
+    let rt = start_runtime(port, table, engine, policy, accel_dir).await?;
+    wait_for(
+        &rt,
+        &format!("SELECT id, CAST(k AS BIGINT) AS k FROM {table} ORDER BY id"),
+        "+----+----+\n\
+         | id | k  |\n\
+         +----+----+\n\
+         | 1  | 10 |\n\
+         | 2  | 20 |\n\
+         | 3  | 30 |\n\
+         +----+----+",
+    )
+    .await?;
+    Ok((pool, rt))
+}
+
+/// Start a runtime replicating the existing `mysqldb.<table>` into `engine`
+/// under `policy`.
+async fn start_runtime(
+    port: u16,
+    table: &str,
+    engine: &str,
+    policy: OnSchemaChange,
+    accel_dir: &std::path::Path,
+) -> Result<Arc<Runtime>, anyhow::Error> {
+    let mut dataset = common::make_mysql_dataset(&format!("mysqldb.{table}"), table, port, false);
     dataset.on_schema_change = policy;
     let accel_params = if engine == "cayenne" {
         Some(Params::from_string_map(HashMap::from([
@@ -176,19 +189,7 @@ async fn start(
         () = Arc::clone(&rt).load_components() => {}
     }
     runtime_ready_check(&rt).await;
-    wait_for(
-        &rt,
-        &format!("SELECT id, CAST(k AS BIGINT) AS k FROM {table} ORDER BY id"),
-        "+----+----+\n\
-         | id | k  |\n\
-         +----+----+\n\
-         | 1  | 10 |\n\
-         | 2  | 20 |\n\
-         | 3  | 30 |\n\
-         +----+----+",
-    )
-    .await?;
-    Ok((pool, rt))
+    Ok(rt)
 }
 
 /// Cayenne evolves the table live under `sync_all_columns`, so the changes
@@ -355,6 +356,28 @@ async fn wait_for_stream_error(rt: &Runtime, table: &str) -> Result<String, anyh
     }
 }
 
+/// The status a dataset named after `table` reports when the source ran
+/// `statement` and the stream stopped at it for `cause`.
+fn stop_message(table: &str, statement: &str, cause: &str) -> String {
+    format!(
+        "External error: Dataset '{table}' stopped applying changes from MySQL table \
+         'mysqldb.{table}', so it keeps serving the rows it held before the source ran \
+         '{statement}'. Cause: {cause}. To re-load the dataset with the new column type, remove \
+         the dataset's acceleration data and restart Spice. See: \
+         https://spiceai.org/docs/components/data-connectors/mysql"
+    )
+}
+
+/// The cause [`stop_message`] gives when `column` changed from `BIGINT` to
+/// `DOUBLE`, a type that does not hold every `BIGINT` value.
+fn bigint_to_double_cause(column: &str) -> String {
+    format!(
+        "column '{column}' changed from `bigint` to `double`, which does not hold every `bigint` \
+         value, and MySQL rewrites such values in place without sending row changes, so the \
+         dataset may hold values the source no longer has"
+    )
+}
+
 /// Assert `table` never gains row `id` within the bound the other changes in
 /// this file arrive within: the stream stopped at the `ALTER`.
 async fn assert_never_applied(rt: &Runtime, table: &str, id: i64) -> Result<(), anyhow::Error> {
@@ -407,14 +430,11 @@ async fn mysql_cayenne_integer_to_decimal_stops_the_stream() -> Result<(), anyho
             let message = wait_for_stream_error(&rt, table).await?;
             assert_eq!(
                 message,
-                format!(
-                    "External error: ALTER TABLE on source table mysqldb.{table} (statement: \
-                     ALTER TABLE {table} MODIFY k DECIMAL(12,2)) cannot be adopted mid-stream: \
-                     Schema mismatch: column 'k' changed type from `int` to `decimal(12,2)` and \
-                     the acceleration cannot change an integer column to a decimal with a \
-                     fractional part, so a fractional value would fail to apply. Update the \
-                     dataset schema to match the new table definition, or re-bootstrap by \
-                     setting `mysql_replication_invalid_checkpoint_behavior: restart`."
+                stop_message(
+                    table,
+                    &format!("ALTER TABLE {table} MODIFY k DECIMAL(12,2)"),
+                    "column 'k' changed from `int` to `decimal(12,2)`, and the dataset keeps the \
+                     column's integer type, which cannot store a fractional value"
                 )
             );
             exec(&pool, &format!("INSERT INTO {table} VALUES (4, 7)")).await?;
@@ -492,16 +512,285 @@ async fn mysql_cayenne_block_float_to_double_stops_the_stream() -> Result<(), an
             let message = wait_for_stream_error(&rt, table).await?;
             assert_eq!(
                 message,
-                format!(
-                    "External error: ALTER TABLE on source table mysqldb.{table} (statement: \
-                     ALTER TABLE {table} MODIFY k DOUBLE) cannot be adopted mid-stream: Schema \
-                     mismatch: column 'k' changed type from `float` to `double` and the column \
-                     stays `Float32`, which would round the new values. Update the dataset \
-                     schema to match the new table definition, or re-bootstrap by setting \
-                     `mysql_replication_invalid_checkpoint_behavior: restart`."
+                stop_message(
+                    table,
+                    &format!("ALTER TABLE {table} MODIFY k DOUBLE"),
+                    "column 'k' changed from `float` to `double`, and the dataset keeps the \
+                     column's `Float32` type, which would round the new values"
                 )
             );
             exec(&pool, &format!("INSERT INTO {table} VALUES (4, 16777217)")).await?;
+            assert_never_applied(&rt, table, 4).await
+        })
+        .await
+}
+
+/// Regression test: every `DECIMAL(18,0)` value is a `BIGINT`, so `MySQL`
+/// rewrites no stored value and the stream keeps applying changes into the
+/// registered decimal type, under either policy. No Arrow widening turns a
+/// decimal into an integer, which once made the stream refuse this `ALTER`.
+async fn zero_scale_decimal_to_bigint_keeps_applying(
+    table: &str,
+    policy: OnSchemaChange,
+) -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+    test_request_context()
+        .scope(async {
+            let container = common::start_mysql_docker_container().await?;
+            let port = container.host_port(3306)?;
+            let dir = tempfile::tempdir()?;
+            let (pool, rt) =
+                start(port, table, "DECIMAL(18,0)", "cayenne", policy, dir.path()).await?;
+            exec(
+                &pool,
+                &format!("UPDATE {table} SET k = 999999999999999999 WHERE id = 1"),
+            )
+            .await?;
+            exec(&pool, &format!("ALTER TABLE {table} MODIFY k BIGINT")).await?;
+            exec(&pool, &format!("INSERT INTO {table} VALUES (4, 7)")).await?;
+            wait_for(
+                &rt,
+                &format!("SELECT id, k, arrow_typeof(k) AS t FROM {table} ORDER BY id"),
+                "+----+--------------------+-------------------+\n\
+                 | id | k                  | t                 |\n\
+                 +----+--------------------+-------------------+\n\
+                 | 1  | 999999999999999999 | Decimal128(18, 0) |\n\
+                 | 2  | 20                 | Decimal128(18, 0) |\n\
+                 | 3  | 30                 | Decimal128(18, 0) |\n\
+                 | 4  | 7                  | Decimal128(18, 0) |\n\
+                 +----+--------------------+-------------------+",
+            )
+            .await
+        })
+        .await
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_cayenne_block_zero_scale_decimal_to_bigint_keeps_applying()
+-> Result<(), anyhow::Error> {
+    zero_scale_decimal_to_bigint_keeps_applying("type_change_dec18_block", OnSchemaChange::Block)
+        .await
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_cayenne_sync_all_columns_zero_scale_decimal_to_bigint_keeps_applying()
+-> Result<(), anyhow::Error> {
+    zero_scale_decimal_to_bigint_keeps_applying(
+        "type_change_dec18_sync",
+        OnSchemaChange::SyncAllColumns,
+    )
+    .await
+}
+
+/// A key column retyped to a type that does not hold every old key stops the
+/// stream at the `ALTER`: `MySQL` rewrote the key `9007199254740993` to
+/// `9007199254740992` in place, so a later change matched by the rewritten key
+/// would miss the row the acceleration holds.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_cayenne_lossy_key_retype_stops_the_stream() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+    test_request_context()
+        .scope(async {
+            let container = common::start_mysql_docker_container().await?;
+            let port = container.host_port(3306)?;
+            let dir = tempfile::tempdir()?;
+            let table = "type_change_lossy_key";
+            let (pool, rt) = start(
+                port,
+                table,
+                "INT",
+                "cayenne",
+                OnSchemaChange::SyncAllColumns,
+                dir.path(),
+            )
+            .await?;
+            exec(
+                &pool,
+                &format!("INSERT INTO {table} VALUES (9007199254740993, 40)"),
+            )
+            .await?;
+            wait_for(
+                &rt,
+                &format!("SELECT id, k FROM {table} WHERE k = 40"),
+                "+------------------+----+\n\
+                 | id               | k  |\n\
+                 +------------------+----+\n\
+                 | 9007199254740993 | 40 |\n\
+                 +------------------+----+",
+            )
+            .await?;
+            exec(&pool, &format!("ALTER TABLE {table} MODIFY id DOUBLE")).await?;
+            let message = wait_for_stream_error(&rt, table).await?;
+            assert_eq!(
+                message,
+                stop_message(
+                    table,
+                    &format!("ALTER TABLE {table} MODIFY id DOUBLE"),
+                    &bigint_to_double_cause("id")
+                )
+            );
+            exec(&pool, &format!("INSERT INTO {table} VALUES (4, 4)")).await?;
+            assert_never_applied(&rt, table, 4).await
+        })
+        .await
+}
+
+/// A non-key column retyped to a type that does not hold every old value stops
+/// the stream at the `ALTER`. Following the fix the error names re-loads the
+/// dataset with the new column type, and it then matches the source, including
+/// the value `MySQL` rewrote and a change the stream refused before the re-load.
+async fn lossy_retype_stops_and_the_named_fix_reloads(
+    table: &str,
+    policy: OnSchemaChange,
+) -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+    test_request_context()
+        .scope(async {
+            let container = common::start_mysql_docker_container().await?;
+            let port = container.host_port(3306)?;
+            let dir = tempfile::tempdir()?;
+            let (pool, rt) = start(port, table, "BIGINT", "cayenne", policy, dir.path()).await?;
+            exec(
+                &pool,
+                &format!("UPDATE {table} SET k = 9007199254740993 WHERE id = 1"),
+            )
+            .await?;
+            wait_for(
+                &rt,
+                &format!("SELECT id, k FROM {table} WHERE id = 1"),
+                "+----+------------------+\n\
+                 | id | k                |\n\
+                 +----+------------------+\n\
+                 | 1  | 9007199254740993 |\n\
+                 +----+------------------+",
+            )
+            .await?;
+
+            exec(&pool, &format!("ALTER TABLE {table} MODIFY k DOUBLE")).await?;
+            let message = wait_for_stream_error(&rt, table).await?;
+            assert_eq!(
+                message,
+                stop_message(
+                    table,
+                    &format!("ALTER TABLE {table} MODIFY k DOUBLE"),
+                    &bigint_to_double_cause("k")
+                )
+            );
+            exec(&pool, &format!("INSERT INTO {table} VALUES (4, 50.5)")).await?;
+            assert_never_applied(&rt, table, 4).await?;
+            rt.shutdown().await;
+            drop(rt);
+
+            // The fix the error names: remove the acceleration data, then restart.
+            tokio::fs::remove_dir_all(dir.path()).await?;
+            tokio::fs::create_dir(dir.path()).await?;
+            let rt = start_runtime(port, table, "cayenne", policy, dir.path()).await?;
+            let query = format!("SELECT id, k, arrow_typeof(k) AS t FROM {table} ORDER BY id");
+            wait_for(
+                &rt,
+                &query,
+                "+----+--------------------+---------+\n\
+                 | id | k                  | t       |\n\
+                 +----+--------------------+---------+\n\
+                 | 1  | 9007199254740992.0 | Float64 |\n\
+                 | 2  | 20.0               | Float64 |\n\
+                 | 3  | 30.0               | Float64 |\n\
+                 | 4  | 50.5               | Float64 |\n\
+                 +----+--------------------+---------+",
+            )
+            .await?;
+
+            // The re-loaded dataset applies changes again.
+            exec(&pool, &format!("INSERT INTO {table} VALUES (5, 2.5)")).await?;
+            wait_for(
+                &rt,
+                &query,
+                "+----+--------------------+---------+\n\
+                 | id | k                  | t       |\n\
+                 +----+--------------------+---------+\n\
+                 | 1  | 9007199254740992.0 | Float64 |\n\
+                 | 2  | 20.0               | Float64 |\n\
+                 | 3  | 30.0               | Float64 |\n\
+                 | 4  | 50.5               | Float64 |\n\
+                 | 5  | 2.5                | Float64 |\n\
+                 +----+--------------------+---------+",
+            )
+            .await?;
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_cayenne_block_lossy_retype_stops_and_the_named_fix_reloads()
+-> Result<(), anyhow::Error> {
+    lossy_retype_stops_and_the_named_fix_reloads(
+        "type_change_lossy_reload_block",
+        OnSchemaChange::Block,
+    )
+    .await
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_cayenne_sync_all_columns_lossy_retype_stops_and_the_named_fix_reloads()
+-> Result<(), anyhow::Error> {
+    lossy_retype_stops_and_the_named_fix_reloads(
+        "type_change_lossy_reload_sync",
+        OnSchemaChange::SyncAllColumns,
+    )
+    .await
+}
+
+/// Regression test: an unsigned integer column whose source becomes a
+/// `DECIMAL` stops the stream at the `ALTER`. The column keeps its unsigned
+/// type, and the binlog sends a decimal as text, which the unsigned decode
+/// reads as `BIT` bytes: `42` was once stored as `13362`.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_cayenne_unsigned_integer_to_decimal_stops_the_stream() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+    test_request_context()
+        .scope(async {
+            let container = common::start_mysql_docker_container().await?;
+            let port = container.host_port(3306)?;
+            let dir = tempfile::tempdir()?;
+            let table = "type_change_unsigned_decimal";
+            let (pool, rt) = start(
+                port,
+                table,
+                "INT UNSIGNED",
+                "cayenne",
+                OnSchemaChange::SyncAllColumns,
+                dir.path(),
+            )
+            .await?;
+            exec(
+                &pool,
+                &format!("ALTER TABLE {table} MODIFY k DECIMAL(10,0)"),
+            )
+            .await?;
+            let message = wait_for_stream_error(&rt, table).await?;
+            assert_eq!(
+                message,
+                stop_message(
+                    table,
+                    &format!("ALTER TABLE {table} MODIFY k DECIMAL(10,0)"),
+                    "column 'k' changed from `int unsigned` to `decimal(10,0)`, and the dataset \
+                     keeps the column's unsigned integer type, which the change stream cannot \
+                     read a decimal value into"
+                )
+            );
+            exec(&pool, &format!("INSERT INTO {table} VALUES (4, 42)")).await?;
             assert_never_applied(&rt, table, 4).await
         })
         .await

@@ -57,14 +57,16 @@ use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, Value};
 use mysql_common::io::ParseBuf;
 
 use super::ColumnTypeChanges;
-use super::SchemaMismatchSnafu;
 use super::changes::MemberLayout;
 use super::config::{BinlogPosition, ReplicationParams};
 use super::gtid::GtidSet;
 use super::metrics::MetricsCollector;
 use super::rows::{TransactionBuffer, normalize_binlog_value};
 use super::setup::TableLayout;
-use super::{Error, Result};
+use super::{
+    Error, Result, RetypeNotFollowedSnafu, RetypeRefusal, RetypeRefusalReason,
+    source_retype_keeps_every_value,
+};
 use crate::cdc::{ChangeEnvelope, StreamError, build_heartbeat_envelope};
 
 /// Binlog events start at offset 4 (after the magic header); positions below
@@ -670,8 +672,8 @@ pub(super) async fn adopt_current_layout(
     }
 
     let column_map = layout.column_map(schema, database, table)?;
-    if let Some(message) = lossy_retype(schema, old_layout, &layout, &column_map) {
-        return SchemaMismatchSnafu { message }.fail();
+    if let Some(refusal) = lossy_retype(schema, old_layout, &layout, &column_map) {
+        return RetypeNotFollowedSnafu { refusal }.fail();
     }
     let widened_schema = match column_type_changes {
         ColumnTypeChanges::Keep => None,
@@ -679,13 +681,13 @@ pub(super) async fn adopt_current_layout(
             widen_to_source_types(schema, &layout, &column_map, primary_keys)
         }
     };
-    if let Some(message) = unfollowable_retype(
+    if let Some(refusal) = unfollowable_retype(
         widened_schema.as_ref().unwrap_or(schema),
         old_layout,
         &layout,
         &column_map,
     ) {
-        return SchemaMismatchSnafu { message }.fail();
+        return RetypeNotFollowedSnafu { refusal }.fail();
     }
     let pk_source_indexes = compute_pk_source_indexes(schema, primary_keys, &column_map);
 
@@ -755,7 +757,7 @@ fn numeric_arrow_type(column_type: &str) -> Option<DataType> {
 
 /// `(precision, scale)` of a `decimal(p[,s])` column type. `MySQL` always
 /// reports both in `COLUMN_TYPE`; a bare `decimal` is `decimal(10,0)`.
-fn decimal_precision_and_scale(column_type: &str) -> Option<(u8, i8)> {
+pub(super) fn decimal_precision_and_scale(column_type: &str) -> Option<(u8, i8)> {
     let Some(open) = column_type.find('(') else {
         return Some((10, 0));
     };
@@ -768,7 +770,7 @@ fn decimal_precision_and_scale(column_type: &str) -> Option<(u8, i8)> {
 
 /// The lowercase type name a `COLUMN_TYPE` starts with (`int` for
 /// `int(11) unsigned`).
-fn type_base_name(column_type: &str) -> String {
+pub(super) fn type_base_name(column_type: &str) -> String {
     column_type
         .chars()
         .take_while(char::is_ascii_alphabetic)
@@ -786,14 +788,17 @@ fn type_base_name(column_type: &str) -> String {
 /// later change can repair a row it does not touch; on a key column, a change
 /// matched by a rewritten key misses the row the acceleration holds.
 ///
-/// The old and new types are both the source's, so a dataset whose `columns`
-/// declare their own types is judged by what the `ALTER` did to the source.
+/// The old and new types are both the source's, and are compared by the values
+/// each holds ([`source_retype_keeps_every_value`]), never by the Arrow types
+/// they map to: a dataset whose `columns` declare their own types is judged by
+/// what the `ALTER` did to the source, and `DECIMAL(18,0)` to `BIGINT` loses
+/// nothing though no Arrow widening turns a decimal into an integer.
 fn lossy_retype(
     schema: &SchemaRef,
     old_layout: &TableLayout,
     layout: &TableLayout,
     column_map: &[usize],
-) -> Option<String> {
+) -> Option<RetypeRefusal> {
     schema
         .fields()
         .iter()
@@ -801,17 +806,14 @@ fn lossy_retype(
         .find_map(|(field, &source_index)| {
             let column = layout.columns.get(source_index)?;
             let old_column = old_layout.columns.iter().find(|c| c.name == column.name)?;
-            let from = numeric_arrow_type(&old_column.column_type)?;
-            let to = numeric_arrow_type(&column.column_type)?;
-            let holds_every_value =
-                to == from || is_widening_cast(&from, &to) || integer_fits_decimal(&from, &to);
-            (!holds_every_value).then(|| {
-                format!(
-                    "column '{}' changed type from `{}` to `{}`, which cannot hold every value \
-                     exactly, so the source rewrote stored values the acceleration still holds",
+            (source_retype_keeps_every_value(&old_column.column_type, &column.column_type)
+                == Some(false))
+            .then(|| {
+                RetypeRefusal::new(
                     field.name(),
-                    old_column.column_type,
-                    column.column_type
+                    &old_column.column_type,
+                    &column.column_type,
+                    RetypeRefusalReason::SourceRewroteValues,
                 )
             })
         })
@@ -829,12 +831,15 @@ fn lossy_retype(
 /// - A column still built as `Float32` (under `block`, or a primary key under
 ///   `sync_all_columns`) whose source is no longer `FLOAT` would have its new
 ///   values rounded to `f32` with nothing to say so.
+/// - A column still built as an unsigned integer whose source becomes a
+///   `DECIMAL` receives each value as decimal text, which the unsigned decode
+///   reads as the raw bytes of a `BIT` value: `42` would be stored as `13362`.
 fn unfollowable_retype(
     schema: &SchemaRef,
     old_layout: &TableLayout,
     layout: &TableLayout,
     column_map: &[usize],
-) -> Option<String> {
+) -> Option<RetypeRefusal> {
     schema
         .fields()
         .iter()
@@ -852,39 +857,23 @@ fn unfollowable_retype(
                     to,
                     DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale) if scale > 0
                 ) {
-                "the acceleration cannot change an integer column to a decimal with a fractional \
-                 part, so a fractional value would fail to apply"
+                RetypeRefusalReason::FractionIntoInteger
             } else if *field.data_type() == DataType::Float32 {
-                "the column stays `Float32`, which would round the new values"
+                RetypeRefusalReason::StaysFloat32
+            } else if field.data_type().is_unsigned_integer()
+                && matches!(to, DataType::Decimal128(..) | DataType::Decimal256(..))
+            {
+                RetypeRefusalReason::DecimalIntoUnsignedInteger
             } else {
                 return None;
             };
-            Some(format!(
-                "column '{}' changed type from `{}` to `{}` and {reason}",
+            Some(RetypeRefusal::new(
                 field.name(),
-                old_column.column_type,
-                column.column_type
+                &old_column.column_type,
+                &column.column_type,
+                reason,
             ))
         })
-}
-
-/// Whether every value of integer type `from` is a `DECIMAL` of type `to`:
-/// its integer digits (`p - s`) cover the integer type's widest value.
-fn integer_fits_decimal(from: &DataType, to: &DataType) -> bool {
-    let digits: i16 = match from {
-        DataType::Int8 | DataType::UInt8 => 3,
-        DataType::Int16 | DataType::UInt16 => 5,
-        DataType::Int32 | DataType::UInt32 => 10,
-        DataType::Int64 => 19,
-        DataType::UInt64 => 20,
-        _ => return false,
-    };
-    match to {
-        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
-            i16::from(*precision) - i16::from(*scale) >= digits
-        }
-        _ => false,
-    }
 }
 
 /// `schema` with each column whose source type is now a lossless widening of
@@ -1693,28 +1682,53 @@ mod tests {
         let retyped = |id: &str, k: &str| {
             lossy_retype(&schema, &old, &layout_of(&[("id", id), ("k", k)]), &[0, 1])
         };
+        let rewrote = RetypeRefusalReason::SourceRewroteValues;
         assert_eq!(
             retyped("bigint", "double"),
-            Some(
-                "column 'k' changed type from `bigint` to `double`, which cannot hold every value \
-                 exactly, so the source rewrote stored values the acceleration still holds"
-                    .to_string()
-            )
+            Some(RetypeRefusal::new("k", "bigint", "double", rewrote))
         );
         assert_eq!(
             retyped("double", "bigint"),
-            Some(
-                "column 'id' changed type from `bigint` to `double`, which cannot hold every value \
-                 exactly, so the source rewrote stored values the acceleration still holds"
-                    .to_string()
-            )
+            Some(RetypeRefusal::new("id", "bigint", "double", rewrote))
         );
         // `DECIMAL(18,0)` holds 18 integer digits; a `BIGINT` can have 19.
-        assert!(retyped("bigint", "decimal(18,0)").is_some());
+        assert_eq!(
+            retyped("bigint", "decimal(18,0)"),
+            Some(RetypeRefusal::new("k", "bigint", "decimal(18,0)", rewrote))
+        );
         // Types that hold every old value, and non-numeric types, are followed.
         assert_eq!(retyped("bigint", "decimal(19,0)"), None);
         assert_eq!(retyped("bigint", "bigint"), None);
         assert_eq!(retyped("bigint", "varchar(40)"), None);
+    }
+
+    /// Regression test for a lossless `ALTER` the stream refused: every
+    /// `DECIMAL(18,0)` value is a `BIGINT`, though no Arrow widening turns a
+    /// decimal into an integer.
+    #[test]
+    fn a_zero_scale_decimal_retyped_to_an_integer_that_holds_it_is_followed() {
+        let schema = schema_of(&[("id", DataType::Int64), ("k", DataType::Decimal128(18, 0))]);
+        let old = layout_of(&[("id", "bigint"), ("k", "decimal(18,0)")]);
+        let retyped = |k: &str| {
+            let layout = layout_of(&[("id", "bigint"), ("k", k)]);
+            (
+                lossy_retype(&schema, &old, &layout, &[0, 1]),
+                unfollowable_retype(&schema, &old, &layout, &[0, 1]),
+            )
+        };
+        assert_eq!(retyped("bigint"), (None, None));
+        assert_eq!(
+            retyped("bigint unsigned"),
+            (
+                Some(RetypeRefusal::new(
+                    "k",
+                    "decimal(18,0)",
+                    "bigint unsigned",
+                    RetypeRefusalReason::SourceRewroteValues
+                )),
+                None
+            )
+        );
     }
 
     #[test]
@@ -1731,21 +1745,22 @@ mod tests {
         ]);
         assert_eq!(
             refused(&registered, "decimal(12,2)", "float"),
-            Some(
-                "column 'k' changed type from `int` to `decimal(12,2)` and the acceleration \
-                 cannot change an integer column to a decimal with a fractional part, so a \
-                 fractional value would fail to apply"
-                    .to_string()
-            )
+            Some(RetypeRefusal::new(
+                "k",
+                "int",
+                "decimal(12,2)",
+                RetypeRefusalReason::FractionIntoInteger
+            ))
         );
         // `block` keeps the registered `Float32`.
         assert_eq!(
             refused(&registered, "int", "double"),
-            Some(
-                "column 'f' changed type from `float` to `double` and the column stays \
-                 `Float32`, which would round the new values"
-                    .to_string()
-            )
+            Some(RetypeRefusal::new(
+                "f",
+                "float",
+                "double",
+                RetypeRefusalReason::StaysFloat32
+            ))
         );
         // `sync_all_columns` widens a non-key `FLOAT` to `Float64`, which follows,
         // but keeps a primary key's type.
@@ -1767,6 +1782,29 @@ mod tests {
         assert_eq!(refused(&registered, "decimal(10,0)", "float"), None);
         assert_eq!(refused(&registered, "bigint", "float"), None);
         assert_eq!(refused(&registered, "int", "float"), None);
+
+        // An unsigned integer column reads decimal text as `BIT` bytes, so a
+        // `DECIMAL` source is refused at any scale; a signed one parses it.
+        let unsigned_old = layout_of(&[("id", "bigint"), ("k", "int unsigned")]);
+        let unsigned = schema_of(&[("id", DataType::Int64), ("k", DataType::UInt32)]);
+        let unsigned_retype = |k: &str| {
+            unfollowable_retype(
+                &unsigned,
+                &unsigned_old,
+                &layout_of(&[("id", "bigint"), ("k", k)]),
+                &[0, 1],
+            )
+        };
+        assert_eq!(
+            unsigned_retype("decimal(10,0)"),
+            Some(RetypeRefusal::new(
+                "k",
+                "int unsigned",
+                "decimal(10,0)",
+                RetypeRefusalReason::DecimalIntoUnsignedInteger
+            ))
+        );
+        assert_eq!(unsigned_retype("bigint"), None);
     }
 
     #[test]
