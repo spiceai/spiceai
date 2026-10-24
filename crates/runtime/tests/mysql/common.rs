@@ -200,3 +200,44 @@ pub fn get_mysql_conn(port: u16) -> Result<mysql_async::Pool, anyhow::Error> {
 
     Ok(mysql_async::Pool::new(opts))
 }
+
+/// The `net_write_timeout` in force on another session, read back from the
+/// server rather than inferred from the statement Spice sent.
+///
+/// `Ok(None)` when `performance_schema` cannot answer — the instrumentation is
+/// on by default but can be built out or turned off, and a suite that fails for
+/// that reason would be reporting on the image rather than on the runtime.
+pub async fn session_net_write_timeout(
+    pool: &mysql_async::Pool,
+    processlist_id: u64,
+) -> Result<Option<u64>, anyhow::Error> {
+    let mut conn = pool.get_conn().await?;
+    let sql = format!(
+        "SELECT v.VARIABLE_VALUE FROM performance_schema.variables_by_thread v \
+         JOIN performance_schema.threads t ON t.THREAD_ID = v.THREAD_ID \
+         WHERE t.PROCESSLIST_ID = {processlist_id} \
+           AND v.VARIABLE_NAME = 'net_write_timeout'"
+    );
+    let value: Option<String> = match conn.query_first(sql.as_str()).await {
+        Ok(value) => value,
+        Err(e) => {
+            // Said out loud: a silent `None` here would turn a caller's assertion
+            // into one that can never fail.
+            eprintln!("performance_schema could not answer `{sql}`: {e}");
+            return Ok(None);
+        }
+    };
+    // No row is "cannot answer" — the session is not instrumented. A row whose
+    // value is not a number is a different thing entirely, and folding it into
+    // the same `None` would let a caller pass without ever reading the session
+    // it exists to read.
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let seconds = value.parse::<u64>().map_err(|e| {
+        anyhow::anyhow!(
+            "performance_schema reported net_write_timeout = `{value}`, which is not a number: {e}"
+        )
+    })?;
+    Ok(Some(seconds))
+}

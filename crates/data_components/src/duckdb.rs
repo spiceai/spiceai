@@ -19,7 +19,92 @@ use async_trait::async_trait;
 use datafusion::{common::TableReference, datasource::TableProvider};
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use parking_lot::Mutex;
+use std::fs::{File, OpenOptions, create_dir_all};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Serializes extension installs between the connections of this process.
+static EXTENSION_INSTALL: Mutex<()> = Mutex::new(());
+
+/// Installs and loads a `DuckDB` extension, one caller at a time on this host.
+///
+/// `INSTALL` downloads the extension to a temporary file, deletes the installed
+/// copy, and moves the new one into place. Two connections installing the same
+/// extension into an empty extension directory therefore delete each other's
+/// files: one `INSTALL` fails with `Could not remove file`, or a `LOAD` finds the
+/// file it was about to open already gone. A lock held across both statements,
+/// in this process and through an advisory lock on a file in the extension
+/// directory, which every process installing into it shares, keeps one caller's
+/// install and load from overlapping another's.
+///
+/// # Errors
+///
+/// Returns a `duckdb::Error` if `INSTALL` or `LOAD` fails.
+pub fn install_and_load_extension(
+    conn: &duckdb::Connection,
+    extension: &'static str,
+) -> Result<(), duckdb::Error> {
+    let _guard = EXTENSION_INSTALL.lock();
+    let _directory_lock = extension_directory(conn).and_then(|dir| lock_extension_directory(&dir));
+    conn.execute(&format!("INSTALL {extension}"), [])?;
+    conn.execute(&format!("LOAD {extension}"), [])?;
+    Ok(())
+}
+
+/// The directory `INSTALL` writes into, resolved as `DuckDB` resolves it: the
+/// `extension_directory` setting, else `.duckdb/extensions` under the
+/// `home_directory` setting or the user's home directory.
+fn extension_directory(conn: &duckdb::Connection) -> Option<PathBuf> {
+    let setting = |name: &str| -> Option<String> {
+        conn.query_row("SELECT current_setting(?)", [name], |row| row.get(0))
+            .ok()
+            .filter(|value: &String| !value.is_empty())
+    };
+    let home = || {
+        setting("home_directory")
+            .map(PathBuf::from)
+            .or_else(util::home_dir::home_dir)
+    };
+    match setting("extension_directory") {
+        // `DuckDB` expands a leading `~` by concatenation, whatever separator follows it.
+        Some(dir) => match dir.strip_prefix('~') {
+            Some(rest) => home().map(|home| {
+                let mut expanded = home.into_os_string();
+                expanded.push(rest);
+                PathBuf::from(expanded)
+            }),
+            None => Some(PathBuf::from(dir)),
+        },
+        None => home().map(|home| home.join(".duckdb").join("extensions")),
+    }
+}
+
+/// Takes the install lock for `dir`, released when the returned file is dropped.
+///
+/// Returns `None` when the lock file cannot be created or locked, for example in
+/// a read-only extension directory; installs are then serialized only within this
+/// process.
+fn lock_extension_directory(dir: &Path) -> Option<File> {
+    let path = dir.join("spice-install.lock");
+    create_dir_all(dir)
+        .and_then(|()| {
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+        })
+        .or_else(|_| File::open(&path))
+        .and_then(|file| file.lock().map(|()| file))
+        .inspect_err(|e| {
+            tracing::debug!(
+                "Could not lock {} to serialize DuckDB extension installs across processes: {e}",
+                path.display()
+            );
+        })
+        .ok()
+}
 
 #[async_trait]
 impl Read for DuckDBTableFactory {

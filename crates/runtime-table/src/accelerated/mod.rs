@@ -142,6 +142,16 @@ pub enum Error {
         loaded_id: u64,
     },
 
+    /// `refresh_mode: snapshot`: a newer snapshot is published but could not be loaded.
+    #[snafu(display(
+        "The snapshot published at '{location}' (id {published_id}) could not be loaded, so it is tried again at the next poll. Cause: {cause}. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+    ))]
+    SnapshotDownloadFailed {
+        location: String,
+        published_id: u64,
+        cause: String,
+    },
+
     #[snafu(display(
         "Failed to scan the dataset from the data connector: {}. Ensure the dataset configuration is valid, and try again.",
         format_datafusion_error(source)

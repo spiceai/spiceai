@@ -97,7 +97,9 @@ const EXPLICIT_SCHEMA_CACHE_MAX: usize = 32;
 /// registry that hangs mid-connect or mid-body-read cannot stall ingest even if
 /// the builder fell back to a client without configured timeouts.
 static REGISTRY_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
-    reqwest::Client::builder()
+    // Schemas are read through `http_body_limit`, which decodes them while refusing
+    // decompression amplification.
+    http_body_limit::decode_manually(reqwest::Client::builder())
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .build()
@@ -223,6 +225,12 @@ async fn fetch_schema(registry_url: &str, schema_id: u32) -> Result<Arc<AvroSche
         if !status.is_success() {
             return Ok(Err(format!("HTTP {status}")));
         }
+        let response =
+            match http_body_limit::buffer(response, http_body_limit::Limit::METADATA).await {
+                Ok(response) => response,
+                Err(http_body_limit::Error::Read { source }) => return Err(source),
+                Err(refused) => return Ok(Err(refused.to_string())),
+            };
         Ok::<_, reqwest::Error>(Ok(response.json::<serde_json::Value>().await?))
     };
 

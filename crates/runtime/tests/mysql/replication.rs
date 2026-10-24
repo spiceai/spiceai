@@ -692,3 +692,119 @@ async fn bootstrap_streams_on_mysql_8_0() -> Result<(), anyhow::Error> {
     let port = container.host_port(3306)?;
     bootstrap_and_stream_once(port, 200_401).await
 }
+
+/// Rows in the source table of
+/// [`snapshot_survives_a_writer_stall_past_the_sources_net_write_timeout`]:
+/// ~100 MB of result set, far more than the socket buffers between the server
+/// and the reader can hold, so a stalled reader leaves the server blocked on
+/// its write with `net_write_timeout` running.
+const STALL_TABLE_ROWS: i32 = 400_000;
+
+/// What the source's `net_write_timeout` is lowered to for the stall test, so a
+/// stall of seconds does what a multi-minute writer exclusion does at the 60s
+/// server default.
+const STALL_SOURCE_NET_WRITE_TIMEOUT_SECS: u32 = 2;
+
+/// How long the stall test stops taking snapshot rows. Time is what is under
+/// test here: it has to outlast [`STALL_SOURCE_NET_WRITE_TIMEOUT_SECS`] once the
+/// buffers have filled.
+const SNAPSHOT_STALL: Duration = Duration::from_secs(15);
+
+/// The snapshot session's `net_write_timeout` floor
+/// (`SNAPSHOT_NET_WRITE_TIMEOUT_SECS` in `mysql_replication::bootstrap`).
+const SNAPSHOT_NET_WRITE_TIMEOUT_FLOOR_SECS: u64 = 1200;
+
+/// A snapshot whose consumer stalls past the source's `net_write_timeout` must
+/// still deliver every row exactly once, rather than failing with `bytes
+/// remaining on stream` (see `SNAPSHOT_NET_WRITE_TIMEOUT_SECS` for why the
+/// consumer stalls).
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_survives_a_writer_stall_past_the_sources_net_write_timeout()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
+    let pool = common::get_mysql_conn(port)?;
+    let mut conn = pool.get_conn().await?;
+    // New sessions, the snapshot's included, inherit the global value.
+    conn.query_drop(format!(
+        "SET GLOBAL net_write_timeout = {STALL_SOURCE_NET_WRITE_TIMEOUT_SECS}"
+    ))
+    .await?;
+    conn.query_drop("CREATE TABLE stall_rows (id INT PRIMARY KEY, name TEXT NOT NULL)")
+        .await?;
+    conn.query_drop(format!(
+        "SET SESSION cte_max_recursion_depth = {STALL_TABLE_ROWS}"
+    ))
+    .await?;
+    conn.query_drop(format!(
+        "INSERT INTO stall_rows \
+         WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < {STALL_TABLE_ROWS}) \
+         SELECT n, REPEAT('x', 255) FROM seq"
+    ))
+    .await?;
+
+    let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
+    let mut stream = start_replication_stream(ReplicationStreamInput {
+        dataset_name: "stall_rows".into(),
+        table: "stall_rows".into(),
+        ..stream_input(port, 200_501, store as Arc<dyn PositionStore>)
+    });
+
+    let envelope = next_envelope(&mut stream, "truncate barrier").await?;
+    assert_eq!(ops_of(&envelope), vec!["t"]);
+    envelope.commit().await?;
+    let envelope = next_change_envelope(&mut stream, "first snapshot batch").await?;
+    let mut ids = ids_of(&envelope);
+    envelope.commit().await?;
+
+    // Stop taking rows, as the apply loop does while the table's writers are
+    // excluded.
+    tokio::time::sleep(SNAPSHOT_STALL).await;
+
+    // The server is now blocked writing the rest of the result set to the
+    // snapshot session, which has to carry the floor rather than the 2s it
+    // inherited. Asserted once the snapshot has drained, so a stream that died
+    // fails on its own error.
+    let snapshot_session: Option<u64> = conn
+        .query_first(
+            "SELECT id FROM information_schema.processlist \
+             WHERE id <> CONNECTION_ID() \
+             AND info LIKE 'SELECT %FROM `mysqldb`.`stall_rows`'",
+        )
+        .await?;
+    drop(conn);
+    let snapshot_session_timeout = match snapshot_session {
+        Some(id) => common::session_net_write_timeout(&pool, id).await?,
+        None => None,
+    };
+
+    // The rest of the snapshot, up to the zero-row boundary that follows it.
+    loop {
+        let envelope = next_envelope(&mut stream, "the rest of the snapshot").await?;
+        if num_rows(&envelope) == 0 {
+            envelope.commit().await?;
+            break;
+        }
+        assert!(
+            ops_of(&envelope).iter().all(|op| op == "c"),
+            "a snapshot batch carries only creates"
+        );
+        ids.extend(ids_of(&envelope));
+        envelope.commit().await?;
+    }
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        (1..=STALL_TABLE_ROWS).collect::<Vec<_>>(),
+        "every source row must arrive exactly once"
+    );
+    assert_eq!(
+        snapshot_session_timeout,
+        Some(SNAPSHOT_NET_WRITE_TIMEOUT_FLOOR_SECS),
+        "while stalled, the snapshot session must still have been reading stall_rows, with its net_write_timeout raised to the floor"
+    );
+
+    pool.disconnect().await?;
+    Ok(())
+}
