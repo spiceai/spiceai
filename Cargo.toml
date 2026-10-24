@@ -40,6 +40,8 @@ members = [
     "crates/hash-index",
     "crates/huggingface-hub",
     "crates/key-index",
+    "crates/llama-cpp",
+    "crates/llms-llamacpp",
     "crates/llms",
     "crates/chat-api",
     "crates/embed-api",
@@ -629,6 +631,12 @@ datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev 
 # consumer of `proc-macro-error2` in the tree. The fork keeps the same 0.32.1 API
 # and derive output. See vendor/mysql-common-derive/README.md.
 mysql-common-derive = { path = "vendor/mysql-common-derive" }
+
+# Local vendored fork of `tantivy-query-grammar` 0.26.0 (path: vendor/tantivy-query-grammar)
+# whose strict query parser returns a parse error, instead of panicking, on a `*` it reads as an
+# exists query with no field (`a *(b)`, `- *`): quickwit-oss/tantivy#3031. A full-text search
+# with such a query failed with a 500. See vendor/tantivy-query-grammar/README.md.
+tantivy-query-grammar = { path = "vendor/tantivy-query-grammar" }
 
 # Dependencies on crates.io `backoff` 0.4 resolve to the workspace crate.
 backoff = { path = "crates/backoff" }

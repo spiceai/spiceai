@@ -265,6 +265,11 @@ impl Failure {
             message: message.to_string(),
         }
     }
+
+    /// Whether this failure is outside any step; steps are numbered from 1.
+    pub fn is_outside_steps(&self) -> bool {
+        self.step == 0 && self.what == "setup"
+    }
 }
 
 impl std::fmt::Display for Failure {

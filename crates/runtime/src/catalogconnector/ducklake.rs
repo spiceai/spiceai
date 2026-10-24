@@ -28,7 +28,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
-use data_components::duckdb::with_utc_session_timezone;
+use data_components::duckdb::{install_and_load_extension, with_utc_session_timezone};
 use data_components::ducklake::provider::{DuckLakeCatalogProvider, DuckLakeFederation};
 use data_components::ducklake::{
     DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
@@ -267,19 +267,7 @@ impl CatalogConnector for DuckLakeCatalog {
                         message: "Failed to get underlying DuckDB connection".to_string(),
                     })?;
 
-                duckdb_wrapper
-                    .conn
-                    .execute("INSTALL ducklake", [])
-                    .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
-                    .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                        connector: PREFIX.to_string(),
-                        connector_component: connector_component_for_pool.clone(),
-                        source: Box::new(e),
-                    })?;
-
-                duckdb_wrapper
-                    .conn
-                    .execute("LOAD ducklake", [])
+                install_and_load_extension(&duckdb_wrapper.conn, "ducklake")
                     .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
                     .map_err(|e| super::Error::UnableToGetCatalogProvider {
                         connector: PREFIX.to_string(),

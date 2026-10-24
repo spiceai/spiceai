@@ -40,7 +40,7 @@ use object_store::ObjectStoreExt;
 use llms::embeddings::candle::{download_hf_file, tei::TeiEmbed};
 use llms::embeddings::{Embed, Error as EmbedError};
 #[cfg(feature = "models")]
-use llms::model2vec::Model2Vec;
+use llms::model2vec::{Model2Vec, Model2VecOptions};
 use llms::openai::DEFAULT_EMBEDDING_MODEL;
 use llms::openai::embed::OpenaiEmbed;
 use secrecy::{ExposeSecret, SecretString};
@@ -220,6 +220,8 @@ pub async fn try_to_embedding(
         }),
         #[cfg(feature = "models")]
         EmbeddingPrefix::Model2Vec => {
+            // Parsing loads an `hf_token` the Spicepod does not set from the secret stores.
+            let token_in_spicepod = params.contains_key("hf_token");
             let typed = embedding_params::model2vec::Model2VecEmbeddingParams::try_from_params(
                 &component_name,
                 params,
@@ -227,7 +229,14 @@ pub async fn try_to_embedding(
             )
             .await
             .map_err(params_err)?;
-            model2vec(model_id, &typed, embeddings_cache.clone())
+            model2vec(
+                &component.name,
+                model_id,
+                &typed,
+                token_in_spicepod,
+                embeddings_cache.clone(),
+            )
+            .await
         }
         #[cfg(not(feature = "models"))]
         EmbeddingPrefix::Model2Vec => Err(EmbedError::UnknownModelSource {
@@ -237,9 +246,11 @@ pub async fn try_to_embedding(
 }
 
 #[cfg(feature = "models")]
-fn model2vec(
+async fn model2vec(
+    name: &str,
     model_id: Option<String>,
     params: &embedding_params::model2vec::Model2VecEmbeddingParams,
+    token_in_spicepod: bool,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_id) = model_id else {
@@ -248,24 +259,24 @@ fn model2vec(
         });
     };
 
-    // `model2vec:` has no revision plumbing: `EmbeddingPrefix::Model2Vec` is a bare
-    // `strip_prefix`, so a trailing `:rev` stays glued to the model id, and
-    // `StaticModel::from_pretrained` takes no revision argument to hand it to. The id
-    // therefore reaches the Hub as part of the *repository name*, which 401s — a bare
-    // auth error for what is really an unsupported-configuration mistake (#12445).
+    // `model2vec:` takes no revision: `EmbeddingPrefix::Model2Vec` is a bare
+    // `strip_prefix`, so a trailing `:rev` stays glued to the model id, which then names
+    // a repository the Hub does not have — a bare not-found error for what is really an
+    // unsupported-configuration mistake (#12445).
     //
     // Say so instead. `pinned_revision` defers to the same regex the `huggingface:`
     // arm uses rather than splitting on the last ':', so the two agree about what a
     // revision is: only an `org/model:rev` shape has one, and a local path — the other
-    // thing `from_pretrained` accepts, including a Windows `C:/…` — passes through.
+    // thing `Model2Vec::load` accepts, including a Windows `C:/…` — passes through.
     //
-    // The `exists()` guard mirrors `from_pretrained`'s own precedence, which tries the
+    // The existence check mirrors `Model2Vec::load`'s own precedence, which tries the
     // id as a local path before treating it as a repo name. Without it, a directory
     // that happened to match the `org/model:rev` shape would be rejected here even
     // though the loader would have opened it — so this only ever rejects ids that
-    // really would have gone to the Hub and 401'd.
+    // really would have gone to the Hub.
+    let exists_locally = tokio::fs::try_exists(&model_id).await.unwrap_or(false);
     if let Some(revision) = pinned_revision(&model_id)
-        .filter(|_| !Path::new(&model_id).exists())
+        .filter(|_| !exists_locally)
         .map(ToString::to_string)
     {
         return Err(EmbedError::RevisionPinningUnsupported {
@@ -275,19 +286,28 @@ fn model2vec(
         });
     }
 
-    Model2Vec::from_params(
-        &model_id,
-        params.hf_token.as_ref().map(ExposeSecret::expose_secret),
-        params.normalize,
-        params.subfolder.as_deref(),
-        params.parallelism,
-        params.embed_max_token_length,
-        params.embed_custom_batch_size,
-    )
-    .map(|m| Arc::new(m.set_cache(embeddings_cache)) as Arc<dyn Embed>)
-    .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-        source: Box::new(e),
-    })
+    let hub = llms::hf::HubParams {
+        token: params.hf_token.as_ref(),
+        token_in_spicepod,
+        endpoint: params.hf_endpoint.as_deref(),
+    };
+    let options = Model2VecOptions {
+        normalize: params.normalize,
+        subfolder: params.subfolder.clone(),
+        parallelism: params.parallelism,
+        embed_max_token_length: params.embed_max_token_length,
+        embed_custom_batch_size: params.embed_custom_batch_size,
+    };
+    Model2Vec::load(name, &model_id, hub, options)
+        .await
+        .map(|m| Arc::new(m.set_cache(embeddings_cache)) as Arc<dyn Embed>)
+        .map_err(|e| match e {
+            // It names the model, the cause and the fix already.
+            EmbedError::FailedToDownloadModel { .. } => e,
+            e => EmbedError::FailedToInstantiateEmbeddingModel {
+                source: Box::new(e),
+            },
+        })
 }
 
 async fn google(
