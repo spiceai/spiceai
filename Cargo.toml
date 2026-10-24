@@ -503,14 +503,14 @@ flatbuffers = "25.2.10"
 # Vortex tagged releases publish version 0.1.0 in their Cargo.toml, not the actual release version,
 # so we specify git deps here directly. The [patch.crates-io] entries below exist to override
 # transitive vortex dependencies pulled in by other patched crates.
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "00732f6b72f024d43cb426e988ce54097987ab8a" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "00732f6b72f024d43cb426e988ce54097987ab8a" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
-vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "00732f6b72f024d43cb426e988ce54097987ab8a" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "dce56c6ea8b95eebb92633fd65ae6ea271ff1002" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "dce56c6ea8b95eebb92633fd65ae6ea271ff1002" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
+vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "dce56c6ea8b95eebb92633fd65ae6ea271ff1002" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-io = { git = "https://github.com/spiceai/vortex.git", rev = "00732f6b72f024d43cb426e988ce54097987ab8a", features = ["tokio"] } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "00732f6b72f024d43cb426e988ce54097987ab8a" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "00732f6b72f024d43cb426e988ce54097987ab8a" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "00732f6b72f024d43cb426e988ce54097987ab8a" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
+vortex-io = { git = "https://github.com/spiceai/vortex.git", rev = "dce56c6ea8b95eebb92633fd65ae6ea271ff1002", features = ["tokio"] } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "dce56c6ea8b95eebb92633fd65ae6ea271ff1002" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "dce56c6ea8b95eebb92633fd65ae6ea271ff1002" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "dce56c6ea8b95eebb92633fd65ae6ea271ff1002" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
 
 x509-certificate = "0.25.0"
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "4429f3956972c4c329ee406ac60b15ad6ae4a777" } # branch: trunk (arrow 59.3)
@@ -657,9 +657,9 @@ arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc33
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" } # branch: spiceai-59 (arrow 59.3.0)
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }      # branch: spiceai-59 (arrow 59.3.0)
 
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "00732f6b72f024d43cb426e988ce54097987ab8a" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "00732f6b72f024d43cb426e988ce54097987ab8a" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "dce56c6ea8b95eebb92633fd65ae6ea271ff1002" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "dce56c6ea8b95eebb92633fd65ae6ea271ff1002" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "00732f6b72f024d43cb426e988ce54097987ab8a" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "00732f6b72f024d43cb426e988ce54097987ab8a" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "00732f6b72f024d43cb426e988ce54097987ab8a" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "dce56c6ea8b95eebb92633fd65ae6ea271ff1002" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "dce56c6ea8b95eebb92633fd65ae6ea271ff1002" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "dce56c6ea8b95eebb92633fd65ae6ea271ff1002" } # branch: ben/varbin-byte-sized-chunks (spiceai-55 + byte-capped string blocks, TEMPORARY)
