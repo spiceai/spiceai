@@ -48,6 +48,8 @@ mod checkpoint_sqlite;
 mod checkpoint_turso;
 #[cfg(feature = "duckdb")]
 mod cron;
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+mod decimal_division;
 #[cfg(feature = "duckdb")]
 mod duckdb_builtin_pushdown;
 #[cfg(any(feature = "duckdb", feature = "sqlite"))]
