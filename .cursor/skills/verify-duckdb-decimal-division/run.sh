@@ -178,15 +178,43 @@ def has_rounded_price(text: str) -> bool:
     return "0.014286" in compact
 
 
-def integer_half_is_3(text: str) -> bool:
-    return '"half":3' in text.replace(" ", "")
+def require_half_3(name: str, text: str) -> None:
+    rows = require_rows(name, text)
+    if rows is None:
+        return
+    if rows != [{"half": 3}]:
+        failed.append(f"{name} integer n/2 was not exactly [{{\"half\":3}}]: {text}")
+
+
+def plans_from_explain(text: str) -> str:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    if isinstance(data, list):
+        parts = [
+            row["plan"]
+            for row in data
+            if isinstance(row, dict) and isinstance(row.get("plan"), str)
+        ]
+        if parts:
+            return "\n".join(parts)
+    return text
 
 
 def base_sql(text: str) -> str | None:
+    decoded = plans_from_explain(text)
     marker = "base_sql="
-    if marker not in text:
+    if marker not in decoded:
         return None
-    return text.split(marker, 1)[1].split("\n", 1)[0]
+    return decoded.split(marker, 1)[1].split("\n", 1)[0].strip()
+
+
+def require_base_sql(name: str, text: str) -> str | None:
+    pushed = base_sql(text)
+    if pushed is None:
+        failed.append(f"{name} EXPLAIN has no base_sql=: {text}")
+    return pushed
 
 
 fed = raw("t_fed")
@@ -204,10 +232,10 @@ explain_int_sqlite = raw("explain_int_sqlite")
 
 require_rows("t_fed", fed)
 require_rows("t_duckdb", duck)
-require_rows("t_duckdb_int", half)
 require_rows("t_sqlite", sqlite)
 sqlite_price_rows = require_rows("t_sqlite_price", sqlite_price)
-require_rows("t_sqlite_int", sqlite_half)
+require_half_3("t_duckdb_int", half)
+require_half_3("t_sqlite_int", sqlite_half)
 
 if duck != fed:
     failed.append(f"t_duckdb != t_fed\n  fed={fed}\n  duck={duck}")
@@ -221,16 +249,16 @@ if not has_truncating_price(duck):
     failed.append(f"price/7 did not truncate: {duck}")
 if has_rounded_price(duck):
     failed.append(f"price/7 rounded instead of truncating: {duck}")
-if not integer_half_is_3(half):
-    failed.append(f"integer n/2 was not 3: {half}")
-if "//" in explain_dec:
-    failed.append(f"decimal EXPLAIN still pushes //: {explain_dec}")
-if "amt" not in explain_dec:
-    failed.append(f"decimal EXPLAIN did not federate amt: {explain_dec}")
-if "//" not in explain_int:
-    failed.append(f"integer EXPLAIN lost //: {explain_int}")
-if "base_sql=" not in explain_dec:
-    failed.append(f"decimal EXPLAIN has no base_sql=: {explain_dec}")
+
+dec_sql = require_base_sql("explain_dec", explain_dec)
+if dec_sql is not None:
+    if "//" in dec_sql:
+        failed.append(f"decimal EXPLAIN still pushes //: {dec_sql}")
+    if "amt" not in dec_sql:
+        failed.append(f"decimal EXPLAIN did not federate amt: {dec_sql}")
+int_sql = require_base_sql("explain_int", explain_int)
+if int_sql is not None and "//" not in int_sql:
+    failed.append(f"integer EXPLAIN lost //: {int_sql}")
 
 # SQLite price/7: the dedicated id=1 query, and p7 in the full-row body.
 # Never require amt/3 digits here (lossy storage, #14662).
@@ -246,25 +274,19 @@ if sqlite_price_rows is not None:
         failed.append(f"SQLite price/7 response has no p7 field: {sqlite_price}")
 if has_rounded_price(sqlite):
     failed.append(f"SQLite full-row price/7 rounded instead of truncating: {sqlite}")
-if not integer_half_is_3(sqlite_half):
-    failed.append(f"SQLite integer n/2 was not 3: {sqlite_half}")
 
-# SQLite EXPLAIN: decimal / stays local (no //, and no amt with / in base_sql).
-# Integer / still federates; SQLite uses / not DuckDB's //.
-if "//" in explain_dec_sqlite:
-    failed.append(f"SQLite decimal EXPLAIN still pushes //: {explain_dec_sqlite}")
-if "base_sql=" not in explain_dec_sqlite:
-    failed.append(f"SQLite decimal EXPLAIN has no base_sql=: {explain_dec_sqlite}")
-else:
-    pushed = base_sql(explain_dec_sqlite) or ""
-    if "amt" in pushed and "/" in pushed:
-        failed.append(f"SQLite decimal / must stay local; pushed down: {pushed}")
-if "base_sql=" not in explain_int_sqlite:
-    failed.append(f"SQLite integer EXPLAIN has no base_sql=: {explain_int_sqlite}")
-elif "n" not in explain_int_sqlite:
-    failed.append(f"SQLite integer EXPLAIN did not federate n: {explain_int_sqlite}")
-elif "/" not in explain_int_sqlite and "//" not in explain_int_sqlite:
-    failed.append(f"SQLite integer EXPLAIN lost integer /: {explain_int_sqlite}")
+# SQLite EXPLAIN: only the decoded remote SQL. A local ProjectionExec `/`
+# must not satisfy the integer-pushdown check.
+sqlite_dec_sql = require_base_sql("explain_dec_sqlite", explain_dec_sqlite)
+if sqlite_dec_sql is not None:
+    if "//" in sqlite_dec_sql or ("amt" in sqlite_dec_sql and "/" in sqlite_dec_sql):
+        failed.append(f"SQLite decimal / must stay local; pushed down: {sqlite_dec_sql}")
+sqlite_int_sql = require_base_sql("explain_int_sqlite", explain_int_sqlite)
+if sqlite_int_sql is not None:
+    if "n" not in sqlite_int_sql:
+        failed.append(f"SQLite integer EXPLAIN did not federate n: {sqlite_int_sql}")
+    elif "/" not in sqlite_int_sql and "//" not in sqlite_int_sql:
+        failed.append(f"SQLite integer EXPLAIN lost integer /: {sqlite_int_sql}")
 
 if failed:
     print("VERIFY FAILED:")
