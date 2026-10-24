@@ -27,7 +27,7 @@ The helper `scripts/verify.sh` in this skill directory:
 2. Refuses to start if `http://${HTTP}/v1/ready` already responds, so a leftover
    instance cannot be queried as this `SPICED`.
 3. Starts `spiced --http 127.0.0.1:18490 --flight 127.0.0.1:18491` in that directory.
-4. Polls `GET /v1/ready` (bounded, no fixed sleep as the only wait).
+4. Polls `GET /v1/ready` (bounded loop; each request uses `--max-time 2`).
 5. Posts each SQL to `/v1/sql` and prints the body.
 
 ```bash

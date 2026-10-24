@@ -46,7 +46,9 @@ while (( SECONDS < deadline )); do
     tail -n 80 spiced.log >&2 || true
     exit 1
   fi
-  if last="$(curl -fsS "http://${HTTP}/v1/ready" 2>/dev/null || true)"; then
+  # Bound each probe so a server that accepts and never replies cannot
+  # stall the loop past `deadline`.
+  if last="$(curl -fsS --connect-timeout 1 --max-time 2 "http://${HTTP}/v1/ready" 2>/dev/null || true)"; then
     if [[ "${last}" == "ready" ]]; then
       ready="yes"
       break
@@ -58,7 +60,7 @@ done
 if [[ -z "${ready}" ]]; then
   echo "timed out waiting for /v1/ready; last body: ${last}" >&2
   echo "datasets:" >&2
-  curl -sS "http://${HTTP}/v1/datasets?status=true" >&2 || true
+  curl -sS --connect-timeout 1 --max-time 2 "http://${HTTP}/v1/datasets?status=true" >&2 || true
   echo "last 80 log lines:" >&2
   tail -n 80 spiced.log >&2 || true
   exit 1
@@ -74,7 +76,7 @@ sql() {
   echo ">> ${q}"
   local tmp status
   tmp="$(mktemp)"
-  status="$(curl -sS -o "${tmp}" -w '%{http_code}' -X POST "http://${HTTP}/v1/sql" --data "${q}" || true)"
+  status="$(curl -sS --connect-timeout 1 --max-time 30 -o "${tmp}" -w '%{http_code}' -X POST "http://${HTTP}/v1/sql" --data "${q}" || true)"
   echo "HTTP ${status}"
   cat "${tmp}"
   rm -f "${tmp}"
