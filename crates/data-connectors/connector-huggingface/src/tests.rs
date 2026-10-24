@@ -46,6 +46,7 @@ use crate::hub::{Hub, HubConfig};
 use crate::location::RepoId;
 use crate::store::{HuggingFaceStore, store_url};
 use crate::{HuggingFace, PARAMETERS};
+use huggingface_hub::settings::{Environment, Token, TokenScope, TokenSource};
 
 const C1: &str = "1111111111111111111111111111111111111111";
 const C2: &str = "2222222222222222222222222222222222222222";
@@ -658,13 +659,28 @@ fn text(content: &str) -> File {
 
 static COMPONENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// An `hf_token` the Spicepod sets.
+fn param_token(token: &str) -> Token {
+    Token::new(SecretString::from(token.to_string()), TokenSource::Param)
+}
+
 fn connector(mock: &Mock, token: Option<&str>, params: &[(&str, &str)]) -> HuggingFace {
+    connector_with(mock, token.map(param_token), TokenScope::Any, params)
+}
+
+fn connector_with(
+    mock: &Mock,
+    token: Option<Token>,
+    token_scope: TokenScope,
+    params: &[(&str, &str)],
+) -> HuggingFace {
     let endpoint = url::Url::parse(&mock.endpoint()).expect("the mock endpoint");
     let hub = Arc::new(
         Hub::new(
             HubConfig {
                 endpoint,
-                token: token.map(|token| SecretString::from(token.to_string())),
+                token,
+                token_scope,
             },
             tokio::runtime::Handle::current(),
         )
@@ -1125,11 +1141,12 @@ async fn each_token_reads_through_its_own_store() {
     let public = HubConfig {
         endpoint: url::Url::parse("https://huggingface.co").expect("a URL"),
         token: None,
+        token_scope: TokenScope::Any,
     };
     assert_eq!(store_url(&public, "a").as_str(), "hf://datasets/");
     assert_eq!(store_url(&public, "b").as_str(), "hf://datasets/");
     let with_token = |token: &str| HubConfig {
-        token: Some(SecretString::from(token.to_string())),
+        token: Some(param_token(token)),
         ..public.clone()
     };
     let one = store_url(&with_token("hf_one"), "one");
@@ -1141,6 +1158,7 @@ async fn each_token_reads_through_its_own_store() {
     let mirror = HubConfig {
         endpoint: url::Url::parse("https://hf-mirror.example").expect("a URL"),
         token: None,
+        token_scope: TokenScope::Spicepod,
     };
     assert_ne!(store_url(&mirror, "a"), store_url(&public, "a"));
     assert_ne!(store_url(&mirror, "a"), store_url(&mirror, "b"));
@@ -1381,7 +1399,7 @@ async fn registration_errors_name_the_dataset_and_the_fix() {
 
     assert_eq!(
         error("hf://datasets/o/missing").await,
-        "Cannot setup the dataset t (hf) with an invalid configuration. Hugging Face dataset 'o/missing' was not found or it is private: a private dataset needs `hf_token`. Check the owner and dataset name in `from`. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
+        "Cannot setup the dataset t (hf) with an invalid configuration. Hugging Face dataset 'o/missing' was not found or it is private: to read a private dataset, set `hf_token`, set `HF_TOKEN`, or run `hf auth login`. Check the owner and dataset name in `from`. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     );
     assert_eq!(
         error("hf://datasets/o/errors@nope").await,
@@ -1391,19 +1409,126 @@ async fn registration_errors_name_the_dataset_and_the_fix() {
     assert_eq!(
         error("hf://datasets/o/gated/a.parquet").await,
         format!(
-            "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated and no `hf_token` is set: accept its access conditions at {endpoint}/datasets/o/gated with the account `hf_token` belongs to. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
+            "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated and no token is set: accept its access conditions at {endpoint}/datasets/o/gated, then set `hf_token`, set `HF_TOKEN`, or run `hf auth login`. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
         )
     );
     // A gated folder: its tree is public, its files are not.
     assert_eq!(
         error("hf://datasets/o/gated/").await,
         format!(
-            "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated and no `hf_token` is set: accept its access conditions at {endpoint}/datasets/o/gated with the account `hf_token` belongs to. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
+            "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated and no token is set: accept its access conditions at {endpoint}/datasets/o/gated, then set `hf_token`, set `HF_TOKEN`, or run `hf auth login`. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
         )
     );
     assert_eq!(
         error("hf://datasets/o").await,
         "Cannot setup the dataset t (hf) with an invalid configuration. \"hf://datasets/o\" does not name a dataset repository. Use a location like 'hf://datasets/<owner>/<dataset>', for example 'hf://datasets/o/<dataset>'. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
+    );
+}
+
+/// An error about access names the token the Hub refused by where it came from, and tells a
+/// user who sent none each way to set one that reaches the endpoint.
+#[tokio::test(flavor = "multi_thread")]
+async fn access_errors_name_where_the_token_came_from() {
+    let private = Mock::start().await;
+    private.commit("o/private", C1, vec![("a.parquet", parquet(&rows(0..1)))]);
+    private.branch("o/private", "main", C1);
+    private.0.lock().token = Some(TOKEN.to_string());
+    let gated = Mock::start().await;
+    gated.commit("o/gated", C1, vec![("a.parquet", parquet(&rows(0..1)))]);
+    gated.branch("o/gated", "main", C1);
+    gated
+        .0
+        .lock()
+        .repos
+        .get_mut("o/gated")
+        .expect("the repo")
+        .gated = true;
+    let gated_url = format!("{}/datasets/o/gated", gated.endpoint());
+
+    let wrong = |source: TokenSource| {
+        Some(Token::new(
+            SecretString::from("hf_wrong".to_string()),
+            source,
+        ))
+    };
+    let env = || wrong(TokenSource::Env("HF_TOKEN"));
+    let file = || wrong(TokenSource::File("/tokens/hf".into()));
+    let secret = || wrong(TokenSource::Secret);
+    let error = |mock: &Mock, token: Option<Token>, token_scope: TokenScope| {
+        let connector = connector_with(mock, token, token_scope, &[]);
+        let from = if mock.endpoint() == gated.endpoint() {
+            "hf://datasets/o/gated/a.parquet"
+        } else {
+            "hf://datasets/o/private/a.parquet"
+        };
+        async move { registration_error(&connector, from).await }
+    };
+
+    assert_eq!(
+        error(&private, env(), TokenScope::Any).await,
+        format!(
+            "Insufficient permissions to access the dataset t (hf). The Hugging Face Hub rejected the token from `HF_TOKEN` for dataset 'o/private' (HTTP 401). Check that the token is valid and grants read access to the dataset, or set `hf_token`. See: {DOCS}"
+        )
+    );
+    assert_eq!(
+        error(&private, file(), TokenScope::Any).await,
+        format!(
+            "Insufficient permissions to access the dataset t (hf). The Hugging Face Hub rejected the token from '/tokens/hf' for dataset 'o/private' (HTTP 401), which may have expired. Run `hf auth login`, or set `hf_token`. See: {DOCS}"
+        )
+    );
+    assert_eq!(
+        error(&private, secret(), TokenScope::Any).await,
+        format!(
+            "Insufficient permissions to access the dataset t (hf). The Hugging Face Hub rejected the token from the `hf_token` secret for dataset 'o/private' (HTTP 401). Update the secret to a token that is valid and grants read access to the dataset. See: {DOCS}"
+        )
+    );
+    assert_eq!(
+        error(&gated, secret(), TokenScope::Any).await,
+        format!(
+            "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated: accept its access conditions at {gated_url} with the account the token from the `hf_token` secret belongs to. See: {DOCS}"
+        )
+    );
+    assert_eq!(
+        error(&private, None, TokenScope::Spicepod).await,
+        format!(
+            "Cannot setup the dataset t (hf) with an invalid configuration. Hugging Face dataset 'o/private' was not found or it is private: to read a private dataset, set `hf_token` (a token from `HF_TOKEN` or `hf auth login` goes only to the public Hub or `HF_ENDPOINT`). Check the owner and dataset name in `from`. See: {DOCS}"
+        )
+    );
+    assert_eq!(
+        error(&gated, env(), TokenScope::Any).await,
+        format!(
+            "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated: accept its access conditions at {gated_url} with the account the token from `HF_TOKEN` belongs to. See: {DOCS}"
+        )
+    );
+    assert_eq!(
+        error(&gated, None, TokenScope::Spicepod).await,
+        format!(
+            "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated and no token is set: accept its access conditions at {gated_url}, then set `hf_token` (a token from `HF_TOKEN` or `hf auth login` goes only to the public Hub or `HF_ENDPOINT`). See: {DOCS}"
+        )
+    );
+}
+
+/// A dataset the Hub keeps rate-limiting names both ways out, sending a token and reading the
+/// Hub less, and only the second once a token is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rate_limited_dataset_names_each_fix_that_applies() {
+    let mock = Mock::start().await;
+    mock.commit("o/busy", C1, vec![("a.parquet", parquet(&rows(0..1)))]);
+    mock.branch("o/busy", "main", C1);
+    mock.0.lock().faults.rate_limited = u32::MAX;
+    let from = "hf://datasets/o/busy/a.parquet";
+
+    assert_eq!(
+        registration_error(&connector(&mock, None, &[]), from).await,
+        format!(
+            "The dataset t (hf) has been rate limited. The Hugging Face Hub kept rate-limiting requests for dataset 'o/busy' (the limit resets in 0s). To raise the limit, set `hf_token`, set `HF_TOKEN`, or run `hf auth login`; to read the Hub less, accelerate the dataset so it is read once per refresh. See: {DOCS}"
+        )
+    );
+    assert_eq!(
+        registration_error(&connector(&mock, Some(TOKEN), &[]), from).await,
+        format!(
+            "The dataset t (hf) has been rate limited. The Hugging Face Hub kept rate-limiting requests for dataset 'o/busy' (the limit resets in 0s). To read the Hub less, accelerate the dataset so it is read once per refresh. See: {DOCS}"
+        )
     );
 }
 
@@ -1425,7 +1550,7 @@ async fn the_token_is_sent_to_the_hub_and_never_to_the_cdn() {
             .await
             .expect_err("no token")
             .to_string(),
-        "Cannot setup the dataset t (hf) with an invalid configuration. Hugging Face dataset 'o/private' was not found or it is private: a private dataset needs `hf_token`. Check the owner and dataset name in `from`. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
+        "Cannot setup the dataset t (hf) with an invalid configuration. Hugging Face dataset 'o/private' was not found or it is private: to read a private dataset, set `hf_token`, set `HF_TOKEN`, or run `hf auth login`. Check the owner and dataset name in `from`. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     );
 
     let wrong = connector(&mock, Some("hf_wrong"), &[]);
@@ -1794,15 +1919,201 @@ mod store_reads {
 fn hub_config_debug_redacts_the_token() {
     let config = HubConfig {
         endpoint: url::Url::parse("https://huggingface.co").expect("a URL"),
-        token: Some(SecretString::from("hf_secret_value".to_string())),
+        token: Some(param_token("hf_secret_value")),
+        token_scope: TokenScope::Any,
     };
     let debug = format!("{config:?}");
     assert!(!debug.contains("hf_secret_value"), "{debug}");
     assert!(debug.contains("[REDACTED]"), "{debug}");
 }
 
-#[test]
-fn endpoints_must_be_https_unless_loopback() {
+const DOCS: &str =
+    "https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md";
+
+/// An environment a test controls, with no home directory and so no token file.
+#[derive(Default)]
+struct Env(HashMap<&'static str, String>);
+
+impl Environment for Env {
+    fn var(&self, name: &str) -> Option<String> {
+        self.0.get(name).cloned()
+    }
+
+    fn home_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+/// A secret store holding `hf_token`, as the environment secret store does when `HF_TOKEN` is
+/// set.
+struct LoadsHfToken;
+
+#[async_trait::async_trait]
+impl runtime_secrets::SecretStore for LoadsHfToken {
+    async fn get_secret(&self, key: &str) -> runtime_secrets::AnyErrorResult<Option<SecretString>> {
+        Ok((key == "hf_token").then(|| SecretString::from("hf_loaded".to_string())))
+    }
+}
+
+/// The dataset's parameters, as the runtime builds them: the Spicepod's `params`, and secrets
+/// the Spicepod does not set loaded from `secrets`.
+async fn spicepod_params(params: &[(&str, &str)], secrets: runtime_secrets::Secrets) -> Parameters {
+    Parameters::try_new(
+        "connector hf",
+        params
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), SecretString::from((*value).to_string())))
+            .collect(),
+        "hf",
+        Arc::new(tokio::sync::RwLock::new(secrets)),
+        &PARAMETERS,
+    )
+    .await
+    .expect("valid parameters")
+}
+
+fn loads_hf_token() -> runtime_secrets::Secrets {
+    let mut secrets = runtime_secrets::Secrets::new();
+    secrets.register_store("env", Arc::new(LoadsHfToken));
+    secrets
+}
+
+/// What `access` resolves, as (endpoint, token, where the token came from, scope).
+async fn resolved(
+    params: &[(&str, &str)],
+    secrets: runtime_secrets::Secrets,
+    env: &Env,
+) -> (String, Option<String>, Option<TokenSource>, TokenScope) {
+    let access = crate::access(&spicepod_params(params, secrets).await, env)
+        .await
+        .expect("valid settings");
+    (
+        access.endpoint.to_string(),
+        access
+            .token
+            .as_ref()
+            .map(|token| secrecy::ExposeSecret::expose_secret(token.secret()).to_string()),
+        access.token.as_ref().map(|token| token.source().clone()),
+        access.token_scope,
+    )
+}
+
+/// A dataset resolves its endpoint and token as every Hugging Face component does, and a token
+/// the Spicepod does not set never goes to an `hf_endpoint` the Spicepod sets.
+#[tokio::test]
+async fn a_token_the_spicepod_does_not_set_never_goes_to_its_endpoint() {
+    let hub = "https://huggingface.co/".to_string();
+    let mirror = "https://hf-mirror.example/".to_string();
+    let none = Env::default;
+    let env = |pairs: &[(&'static str, &str)]| {
+        Env(pairs
+            .iter()
+            .map(|(name, value)| (*name, (*value).to_string()))
+            .collect())
+    };
+    let no_secrets = runtime_secrets::Secrets::new;
+    let loaded = || Some("hf_loaded".to_string());
+
+    // A token a secret store loads goes to the public Hub and `HF_ENDPOINT`...
+    assert_eq!(
+        resolved(&[], loads_hf_token(), &none()).await,
+        (
+            hub.clone(),
+            loaded(),
+            Some(TokenSource::Secret),
+            TokenScope::Any
+        )
+    );
+    assert_eq!(
+        resolved(
+            &[],
+            loads_hf_token(),
+            &env(&[("HF_ENDPOINT", "https://hf-mirror.example")])
+        )
+        .await,
+        (
+            mirror.clone(),
+            loaded(),
+            Some(TokenSource::Secret),
+            TokenScope::Any
+        )
+    );
+    // ...named after `HF_TOKEN` when that is where it came from, as the environment secret
+    // store reads it for `hf_token`.
+    assert_eq!(
+        resolved(&[], loads_hf_token(), &env(&[("HF_TOKEN", "hf_loaded")])).await,
+        (
+            hub.clone(),
+            loaded(),
+            Some(TokenSource::Env("HF_TOKEN")),
+            TokenScope::Any
+        )
+    );
+    // ...and never to the Spicepod's `hf_endpoint`.
+    assert_eq!(
+        resolved(
+            &[("hf_endpoint", "https://hf-mirror.example")],
+            loads_hf_token(),
+            &none()
+        )
+        .await,
+        (mirror.clone(), None, None, TokenScope::Spicepod)
+    );
+    // Nor does `HF_TOKEN` read from the environment.
+    assert_eq!(
+        resolved(
+            &[("hf_endpoint", "https://hf-mirror.example")],
+            no_secrets(),
+            &env(&[("HF_TOKEN", "hf_env")])
+        )
+        .await,
+        (mirror.clone(), None, None, TokenScope::Spicepod)
+    );
+    assert_eq!(
+        resolved(&[], no_secrets(), &env(&[("HF_TOKEN", "hf_env")])).await,
+        (
+            hub.clone(),
+            Some("hf_env".to_string()),
+            Some(TokenSource::Env("HF_TOKEN")),
+            TokenScope::Any
+        )
+    );
+    // An `hf_token` the Spicepod sets goes to its endpoint, whichever it is, ahead of any other.
+    assert_eq!(
+        resolved(
+            &[
+                ("hf_endpoint", "https://hf-mirror.example"),
+                ("hf_token", "hf_pod")
+            ],
+            loads_hf_token(),
+            &env(&[("HF_TOKEN", "hf_env")])
+        )
+        .await,
+        (
+            mirror.clone(),
+            Some("hf_pod".to_string()),
+            Some(TokenSource::Param),
+            TokenScope::Spicepod
+        )
+    );
+    assert_eq!(
+        resolved(
+            &[("hf_token", "hf_pod")],
+            no_secrets(),
+            &env(&[("HF_TOKEN", "hf_env")])
+        )
+        .await,
+        (
+            hub,
+            Some("hf_pod".to_string()),
+            Some(TokenSource::Param),
+            TokenScope::Any
+        )
+    );
+}
+
+#[tokio::test]
+async fn endpoints_must_be_https_unless_loopback() {
     for valid in [
         "https://huggingface.co",
         "https://hf-mirror.com/",
@@ -1810,7 +2121,17 @@ fn endpoints_must_be_https_unless_loopback() {
         "http://localhost:9000",
         "http://[::1]:80",
     ] {
-        assert!(crate::parse_endpoint(valid).is_ok(), "{valid}");
+        let (endpoint, ..) = resolved(
+            &[("hf_endpoint", valid)],
+            runtime_secrets::Secrets::new(),
+            &Env::default(),
+        )
+        .await;
+        assert_eq!(
+            endpoint,
+            url::Url::parse(valid).expect("a URL").to_string(),
+            "{valid}"
+        );
     }
     for invalid in [
         "http://huggingface.co",
@@ -1819,14 +2140,33 @@ fn endpoints_must_be_https_unless_loopback() {
         "https://user:pass@huggingface.co",
         "https://huggingface.co/?x=1",
     ] {
+        let params =
+            spicepod_params(&[("hf_endpoint", invalid)], runtime_secrets::Secrets::new()).await;
         assert_eq!(
-            crate::parse_endpoint(invalid)
+            crate::access(&params, &Env::default())
+                .await
                 .expect_err(invalid)
                 .to_string(),
             format!(
-                "`hf_endpoint` {invalid:?} is not a valid endpoint: use an https:// URL such as 'https://huggingface.co' (http:// is accepted only for a loopback address). See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
+                "`hf_endpoint` {invalid:?} is not a valid Hugging Face Hub endpoint: use an https:// URL such as 'https://huggingface.co' (http:// is accepted only for a loopback address). See: {DOCS}"
             ),
             "{invalid}"
         );
     }
+    let params = spicepod_params(&[], runtime_secrets::Secrets::new()).await;
+    assert_eq!(
+        crate::access(
+            &params,
+            &Env(HashMap::from([(
+                "HF_ENDPOINT",
+                "http://hf.example".to_string()
+            )]))
+        )
+        .await
+        .expect_err("an http endpoint")
+        .to_string(),
+        format!(
+            "`HF_ENDPOINT` \"http://hf.example\" is not a valid Hugging Face Hub endpoint: use an https:// URL such as 'https://huggingface.co' (http:// is accepted only for a loopback address). See: {DOCS}"
+        )
+    );
 }

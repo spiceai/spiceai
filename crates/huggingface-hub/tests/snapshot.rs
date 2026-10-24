@@ -915,6 +915,7 @@ async fn a_connection_failure_keeps_its_kind_through_the_revision_cache() {
             huggingface_hub::HubConfig {
                 endpoint: url::Url::parse(&format!("http://{closed}")).expect("a URL"),
                 token: None,
+                token_scope: huggingface_hub::settings::TokenScope::Any,
             },
             tokio::runtime::Handle::current(),
         )
