@@ -15,12 +15,14 @@
 pub(super) mod ec2_debezium;
 pub(super) mod ec2_mongodb;
 pub(super) mod ec2_postgres;
+pub(super) mod ec2_spiced_cluster;
 pub(super) mod spice_cloud;
 pub(super) mod spice_local;
 
 pub(super) use ec2_debezium::launch_ec2_debezium;
 pub(super) use ec2_mongodb::launch_mongodb_ec2;
 pub(super) use ec2_postgres::{launch_postgres_ec2, terminate_ec2_instance};
+pub(super) use ec2_spiced_cluster::{Ec2Cluster, provision_ec2_spiced_cluster};
 pub(super) use spice_cloud::provision_scp_app;
 pub(super) use spice_local::{
     provision_local_single_node, provision_local_spiced_cluster, teardown_local_run,

@@ -1972,6 +1972,7 @@ async fn create_scheduler_server(
         };
 
     let client_tls_config = rt.df.cluster_config.client_tls_config();
+    let use_tls = client_tls_config.is_some();
     let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> =
         client_tls_config.clone().map(|tls_config| {
             Arc::new(move |ep: Endpoint| {
@@ -2126,6 +2127,10 @@ async fn create_scheduler_server(
                 .with_target_partitions(target_partitions)
                 .with_option_extension(SpiceClusterConfig::default())
                 .with_option_extension(incoming_request_context)
+                // Task props carry this config to executors and replace their own
+                // `use_tls`, so it decides whether shuffle fetches between executors
+                // use cluster mTLS.
+                .with_ballista_use_tls(use_tls)
                 .with_ballista_shuffle_format(ballista_shuffle_format)
                 .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
 
@@ -2184,6 +2189,7 @@ async fn create_scheduler_server(
             .with_target_partitions(target_partitions)
             .with_option_extension(SpiceClusterConfig::default())
             .with_option_extension(SpiceRequestContextConfig::default())
+            .with_ballista_use_tls(use_tls)
             .with_ballista_shuffle_format(ballista_shuffle_format)
             .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
     });
