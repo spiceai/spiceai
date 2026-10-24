@@ -52,7 +52,8 @@ use crate::{
         builder::DatasetBuilder,
     },
     component::{
-        AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
+        AcceleratedComponent, component_accelerations, deprecated_acceleration_engines_warning,
+        deprecated_ready_state_warning, disabled_acceleration_warning,
     },
     dataaccelerator::{AccelerationSource, validate_snapshot_paths},
     dataconnector::{
@@ -298,6 +299,14 @@ impl Runtime {
                     &app.runtime,
                 )
             {
+                tracing::warn!("{warning}");
+            }
+            // Once for the whole Spicepod, not per component. A hot reload warns about
+            // the components it adds or changes (`Runtime::apply_app_diff`).
+            if let Some(warning) = deprecated_acceleration_engines_warning(component_accelerations(
+                &app.datasets,
+                &app.views,
+            )) {
                 tracing::warn!("{warning}");
             }
             if let Some(section) = app.snapshots.as_deref() {
