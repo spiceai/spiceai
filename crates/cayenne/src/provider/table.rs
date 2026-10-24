@@ -34682,9 +34682,16 @@ impl CayenneTableProvider {
         }
 
         let schema = Arc::clone(&self.table_metadata.schema);
+        let may_match = pruning_predicate.map(|predicate| {
+            let stats: Vec<&Arc<Statistics>> = view.iter().map(|entry| &entry.statistics).collect();
+            super::file_pruning::statistics_may_match(&stats, &schema, predicate)
+        });
 
         let mut batches = Vec::new();
-        for entry in view {
+        for (index, entry) in view.iter().enumerate() {
+            if may_match.as_ref().is_some_and(|keep| !keep[index]) {
+                continue;
+            }
             let visible = if let Some(removal) = removal {
                 self.apply_tombstone_removal_to_entry(entry, removal, captured)?
             } else if entry.batches.is_empty() {
@@ -34696,16 +34703,6 @@ impl CayenneTableProvider {
             };
 
             if visible.batches.is_empty() {
-                continue;
-            }
-
-            if let Some(predicate) = pruning_predicate
-                && super::file_pruning::should_prune_statistics(
-                    visible.statistics.as_ref(),
-                    &schema,
-                    predicate,
-                )
-            {
                 continue;
             }
 
@@ -34725,15 +34722,17 @@ impl CayenneTableProvider {
 
         let schema = Arc::clone(&self.table_metadata.schema);
         let inlined_deletions = Self::mem_tier_deletion_maps(snapshot);
+        let may_match = pruning_predicate.map(|predicate| {
+            let stats: Vec<&Arc<Statistics>> = snapshot
+                .segments
+                .iter()
+                .map(|segment| &segment.statistics)
+                .collect();
+            super::file_pruning::statistics_may_match(&stats, &schema, predicate)
+        });
         let mut visible_batches: Vec<RecordBatch> = Vec::new();
-        for segment in snapshot.segments.iter() {
-            if let Some(predicate) = pruning_predicate
-                && super::file_pruning::should_prune_statistics(
-                    segment.statistics.as_ref(),
-                    &schema,
-                    predicate,
-                )
-            {
+        for (index, segment) in snapshot.segments.iter().enumerate() {
+            if may_match.as_ref().is_some_and(|keep| !keep[index]) {
                 continue;
             }
 
@@ -37721,15 +37720,14 @@ impl CayenneTableProvider {
             return Ok(None);
         }
         let schema = Arc::clone(&self.table_metadata.schema);
+        let may_match = pruning_predicate.map(|predicate| {
+            let stats: Vec<&Arc<Statistics>> =
+                segments.iter().map(|segment| &segment.statistics).collect();
+            super::file_pruning::statistics_may_match(&stats, &schema, predicate)
+        });
         let mut visible_batches: Vec<RecordBatch> = Vec::new();
-        for segment in segments {
-            if let Some(predicate) = pruning_predicate
-                && super::file_pruning::should_prune_statistics(
-                    segment.statistics.as_ref(),
-                    &schema,
-                    predicate,
-                )
-            {
+        for (index, segment) in segments.iter().enumerate() {
+            if may_match.as_ref().is_some_and(|keep| !keep[index]) {
                 continue;
             }
             visible_batches.extend(segment.batches.iter().cloned());
