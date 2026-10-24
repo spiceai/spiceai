@@ -21,6 +21,7 @@ use ballista_core::serde::BallistaPhysicalExtensionCodec;
 #[cfg(not(windows))]
 use cayenne::provider::CayenneAccelerationExec;
 use data_components::http::provider::{HttpExec, HttpTableProvider};
+use data_connector_api::listing::NanSafeListingPhysicalCodec;
 use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result, TableReference, exec_err};
 use datafusion::execution::{FunctionRegistry, TaskContext};
@@ -88,6 +89,13 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
         ctx: &TaskContext,
         proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Strict magic prefix: try before Ballista so a tagged listing
+        // parquet scan cannot be misread as another extension node.
+        if let Ok(plan) = NanSafeListingPhysicalCodec.try_decode(buf, inputs, ctx, proto_converter)
+        {
+            return Ok(plan);
+        }
+
         if let Ok(plan) = self.inner.try_decode(buf, inputs, ctx, proto_converter) {
             return Ok(plan);
         }
@@ -1021,5 +1029,92 @@ mod tests {
             }
             other => panic!("expected an IcebergTableScan recipe node, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn listing_parquet_nan_safe_scan_round_trips_through_spice_codec() {
+        use data_connector_api::listing::{
+            is_nan_safe_listing_parquet_scan,
+            wrap_listing_parquet_scans_to_refuse_untrusted_float_filters,
+        };
+        use datafusion::arrow::array::{Float64Array, Int64Array};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::prelude::{ParquetReadOptions, SessionContext};
+        use datafusion_proto::physical_plan::AsExecutionPlan;
+        use datafusion_proto::protobuf::PhysicalPlanNode;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("multi_rg.parquet");
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("f", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    Some(4),
+                    Some(5),
+                    Some(6),
+                ])),
+                Arc::new(Float64Array::from(vec![
+                    Some(1.0),
+                    Some(2.0),
+                    Some(f64::INFINITY),
+                    Some(f64::NAN),
+                    Some(0.5),
+                    Some(1.5),
+                ])),
+            ],
+        )
+        .expect("batch");
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&path).expect("create parquet"),
+            Arc::clone(&file_schema),
+            None,
+        )
+        .expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let session = SessionContext::new();
+        session
+            .register_parquet(
+                "t",
+                path.to_str().expect("utf8 path"),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .expect("register parquet");
+        let planned = session
+            .sql("SELECT f FROM t")
+            .await
+            .expect("sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let wrapped = wrap_listing_parquet_scans_to_refuse_untrusted_float_filters(planned)
+            .expect("wrap listing parquet scan");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&wrapped),
+            "scheduler plan must be NaN-safe before encode"
+        );
+
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let codec = SpicePhysicalCodec::new(Arc::clone(&runtime)).expect("codec");
+        let proto = PhysicalPlanNode::try_from_physical_plan(Arc::clone(&wrapped), codec.as_ref())
+            .expect("NaN-safe listing parquet must serialize through SpicePhysicalCodec");
+        let task_ctx = runtime.datafusion().ctx.state().task_ctx();
+        let decoded = proto
+            .try_into_physical_plan(task_ctx.as_ref(), codec.as_ref())
+            .expect("NaN-safe listing parquet must decode through SpicePhysicalCodec");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&decoded),
+            "SpicePhysicalCodec decode must restore the NaN-safe source"
+        );
     }
 }

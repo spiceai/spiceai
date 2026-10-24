@@ -4270,6 +4270,178 @@ mod tests {
         );
     }
 
+    /// Cluster executors must serialize listing parquet and restore the
+    /// NaN-safe `FileSource` on decode. Emitting a bare `ParquetScan` would
+    /// encode, then lose float-filter refusal when `DataFusion` rebuilds
+    /// `ParquetSource`.
+    #[tokio::test]
+    async fn listing_parquet_scan_round_trips_through_physical_plan_proto() {
+        use crate::listing::{NanSafeListingPhysicalCodec, is_nan_safe_listing_parquet_scan};
+        use datafusion_proto::physical_plan::{AsExecutionPlan, DefaultPhysicalExtensionCodec};
+        use datafusion_proto::protobuf::PhysicalPlanNode;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_multi_rg_nan_after_inf_parquet(&dir.path().join("multi_rg.parquet"));
+        let ctx = register_tricky_listing(&format!("file://{}/", dir.path().display())).await;
+        let planned = ctx
+            .sql("SELECT f FROM t ORDER BY f DESC LIMIT 1")
+            .await
+            .expect("plan sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&planned),
+            "the scheduler plan must wrap parquet scans before encode"
+        );
+
+        // Encode before any collect. TopK mutates its DynamicFilter as it
+        // runs; serializing after that would snapshot `f > NaN` and the
+        // decoded heap would drop every row.
+        let default_codec = DefaultPhysicalExtensionCodec {};
+        let proto = PhysicalPlanNode::try_from_physical_plan(Arc::clone(&planned), &default_codec)
+            .expect("listing parquet scan must serialize for distributed execution");
+        assert!(
+            listing_scan_is_extension(&proto),
+            "encode must tag the scan so decode can restore the NaN-safe source:\n{proto:?}"
+        );
+        let default_decode = proto.try_into_physical_plan(ctx.task_ctx().as_ref(), &default_codec);
+        assert!(
+            default_decode.is_err(),
+            "DefaultPhysicalExtensionCodec must not decode the tagged scan as a bare ParquetSource"
+        );
+
+        let codec = NanSafeListingPhysicalCodec;
+        let decoded = proto
+            .try_into_physical_plan(ctx.task_ctx().as_ref(), &codec)
+            .expect("tagged listing parquet scan must decode");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&decoded),
+            "decode must restore the NaN-safe source"
+        );
+        let decoded_plan = datafusion::physical_plan::displayable(decoded.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            !decoded_plan.contains("predicate=DynamicFilter"),
+            "decoded float TopK must not carry a dynamic filter on the scan:\n{decoded_plan}"
+        );
+
+        let planned_top = collect_float_cell(Arc::clone(&planned), ctx.task_ctx()).await;
+        assert!(
+            planned_top.is_nan(),
+            "the live plan must return NaN; got {planned_top}"
+        );
+        // Collect the restored TopK once. A second collect of this same tree
+        // (the scan child, or TopK again) can come back empty: the decoded
+        // `ParquetSource` shares execution state with its parent.
+        let decoded_top = collect_float_cell(Arc::clone(&decoded), ctx.task_ctx()).await;
+        assert!(
+            decoded_top.is_nan(),
+            "the restored plan must return NaN; got {decoded_top}"
+        );
+
+        let scan_tree = proto
+            .try_into_physical_plan(ctx.task_ctx().as_ref(), &codec)
+            .expect("second decode of the tagged scan");
+        let scan = scan_tree
+            .children()
+            .into_iter()
+            .find(|child| {
+                child
+                    .as_ref()
+                    .downcast_ref::<datafusion::datasource::source::DataSourceExec>()
+                    .is_some()
+            })
+            .map(Arc::clone)
+            .expect("decoded TopK must still have a DataSourceExec");
+        let scan_rows = datafusion::physical_plan::collect(scan, ctx.task_ctx())
+            .await
+            .expect("collect freshly decoded scan");
+        let scan_n: usize = scan_rows.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            scan_n, 6,
+            "freshly decoded scan must read every row; batches={scan_rows:?}"
+        );
+
+        let int_plan = ctx
+            .sql("SELECT k FROM t ORDER BY k DESC LIMIT 1")
+            .await
+            .expect("plan int sql")
+            .create_physical_plan()
+            .await
+            .expect("int physical plan");
+        let int_proto = PhysicalPlanNode::try_from_physical_plan(int_plan, &codec)
+            .expect("integer listing parquet scan must serialize");
+        assert!(
+            listing_scan_is_extension(&int_proto),
+            "integer-only TopK must still tag the scan so decode keeps the wrapper:\n{int_proto:?}"
+        );
+        let int_decoded = int_proto
+            .try_into_physical_plan(ctx.task_ctx().as_ref(), &codec)
+            .expect("integer listing parquet scan must decode");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&int_decoded),
+            "integer listing parquet decode must restore the NaN-safe source"
+        );
+    }
+
+    async fn collect_float_cell(
+        plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        task_ctx: Arc<datafusion::execution::TaskContext>,
+    ) -> f64 {
+        use arrow::array::Float64Array;
+
+        let plan_text = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let batches = datafusion::physical_plan::collect(plan, task_ctx)
+            .await
+            .unwrap_or_else(|err| panic!("collect plan: {err}\n{plan_text}"));
+        assert!(
+            !batches.is_empty() && batches[0].num_rows() > 0,
+            "plan returned no rows:\n{plan_text}"
+        );
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("float column")
+            .value(0)
+    }
+
+    fn listing_scan_is_extension(proto: &datafusion_proto::protobuf::PhysicalPlanNode) -> bool {
+        use datafusion_proto::protobuf::physical_plan_node::PhysicalPlanType;
+        match proto.physical_plan_type.as_ref() {
+            Some(PhysicalPlanType::Extension(_)) => true,
+            Some(PhysicalPlanType::Sort(sort)) => sort
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            Some(PhysicalPlanType::Projection(projection)) => projection
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            Some(PhysicalPlanType::Merge(coalesce)) => coalesce
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            Some(PhysicalPlanType::CoalesceBatches(coalesce)) => coalesce
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            Some(PhysicalPlanType::GlobalLimit(limit)) => limit
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            Some(PhysicalPlanType::LocalLimit(limit)) => limit
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            _ => false,
+        }
+    }
+
     /// Regression test for Glue TPC-H plans that switched every `HashJoinExec`
     /// from `CollectLeft` to `Partitioned`. Glue lists Parquet and ORC tables
     /// with `file_extension: '*'`, and that format-selected listing scanned its

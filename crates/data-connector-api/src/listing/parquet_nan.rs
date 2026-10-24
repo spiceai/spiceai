@@ -29,7 +29,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{
     ColumnStatistics, Result, Statistics, internal_datafusion_err, stats::Precision,
 };
@@ -39,6 +39,7 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::{FileFormat, FileMeta};
 use datafusion::datasource::physical_plan::{FileScanConfig, FileSinkConfig, FileSource};
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::execution::TaskContext;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{
@@ -52,7 +53,71 @@ use datafusion_datasource::file_stream::FileOpener;
 use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_datasource::morsel::Morselizer;
 use datafusion_datasource::{PartitionedFile, TableSchema};
+use datafusion_proto::physical_plan::{
+    AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
+    PhysicalProtoConverterExtension,
+};
+use datafusion_proto::protobuf::{
+    PhysicalExtensionNode, PhysicalPlanNode, physical_plan_node::PhysicalPlanType,
+};
 use object_store::{ObjectMeta, ObjectStore};
+
+/// Prefix that keeps this payload from decoding as a bare `ParquetScan` or a
+/// `SpicePhysicalPlanNode`. Decode must restore [`NanSafeParquetSource`].
+const NAN_SAFE_LISTING_PARQUET_MAGIC: &[u8] = b"spice.nan_safe_listing_parquet.v1\0";
+
+/// Cluster physical-plan codec that restores [`NanSafeParquetSource`] after
+/// decode. [`NanSafeParquetSource::try_to_proto`] emits an `Extension` so
+/// `DataFusion` does not rebuild a bare `ParquetSource` from `ParquetScan`.
+#[derive(Debug, Default)]
+pub struct NanSafeListingPhysicalCodec;
+
+impl PhysicalExtensionCodec for NanSafeListingPhysicalCodec {
+    fn try_decode(
+        &self,
+        buf: &[u8],
+        inputs: &[Arc<dyn ExecutionPlan>],
+        ctx: &TaskContext,
+        _proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if !inputs.is_empty() {
+            return Err(internal_datafusion_err!(
+                "NaN-safe listing parquet scan is a leaf and must not have inputs"
+            ));
+        }
+        decode_nan_safe_listing_parquet_scan(buf, ctx)
+    }
+
+    fn try_encode(
+        &self,
+        _node: Arc<dyn ExecutionPlan>,
+        _buf: &mut Vec<u8>,
+        _proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<()> {
+        // Encode is `FileSource::try_to_proto` on [`NanSafeParquetSource`].
+        Err(internal_datafusion_err!(
+            "NaN-safe listing parquet scans serialize via FileSource::try_to_proto"
+        ))
+    }
+}
+
+/// Decode an extension payload produced by [`NanSafeParquetSource::try_to_proto`].
+///
+/// # Errors
+///
+/// Returns an error when `buf` is not a NaN-safe listing parquet payload, or
+/// when the inner `ParquetScan` cannot be rebuilt.
+pub fn decode_nan_safe_listing_parquet_scan(
+    buf: &[u8],
+    ctx: &TaskContext,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let rest = buf
+        .strip_prefix(NAN_SAFE_LISTING_PARQUET_MAGIC)
+        .ok_or_else(|| internal_datafusion_err!("not a NaN-safe listing parquet scan payload"))?;
+    let proto = PhysicalPlanNode::try_decode(rest)?;
+    let plan = proto.try_into_physical_plan(ctx, &DefaultPhysicalExtensionCodec {})?;
+    wrap_listing_parquet_scans_to_refuse_untrusted_float_filters(plan)
+}
 
 /// Listing-table `Parquet` reader that will not trust float min/max.
 #[derive(Debug)]
@@ -187,6 +252,65 @@ fn wrap_to_refuse_untrusted_float_filters(
     Ok(DataSourceExec::from_data_source(config))
 }
 
+/// Re-install [`NanSafeParquetSource`] on every parquet `DataSourceExec` in
+/// `plan`. Decode of a `ParquetScan` rebuilds a bare `ParquetSource`; calling
+/// this after decode keeps float-column filters from reaching the runtime
+/// pruner if a later optimizer re-runs pushdown.
+///
+/// # Errors
+///
+/// Returns an error when a parquet `DataSourceExec` cannot be rebuilt with
+/// [`NanSafeParquetSource`].
+pub fn wrap_listing_parquet_scans_to_refuse_untrusted_float_filters(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform(|node| {
+        Ok(match try_wrap_parquet_file_scan(Arc::clone(&node))? {
+            Some(wrapped) => Transformed::yes(wrapped),
+            None => Transformed::no(node),
+        })
+    })
+    .map(|transformed| transformed.data)
+}
+
+/// Whether every parquet file scan under `plan` is the NaN-safe wrapper.
+#[must_use]
+pub fn is_nan_safe_listing_parquet_scan(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let mut found = false;
+    let mut all_safe = true;
+    let walk = plan.apply(|node| {
+        if let Some(exec) = node.as_ref().downcast_ref::<DataSourceExec>()
+            && let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>()
+            && config.file_source().file_type() == "parquet"
+        {
+            found = true;
+            if !config.file_source().is::<NanSafeParquetSource>() {
+                all_safe = false;
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found && all_safe && walk.is_ok()
+}
+
+fn try_wrap_parquet_file_scan(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let Some(exec) = plan.as_ref().downcast_ref::<DataSourceExec>() else {
+        return Ok(None);
+    };
+    let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>() else {
+        return Ok(None);
+    };
+    if config.file_source().file_type() != "parquet" {
+        return Ok(None);
+    }
+    if config.file_source().is::<NanSafeParquetSource>() {
+        return Ok(None);
+    }
+    Ok(Some(wrap_to_refuse_untrusted_float_filters(plan)?))
+}
+
 /// [`FileSource`] decorator that forwards everything except float-column
 /// filter pushdown. `DataFusion`'s runtime `RowGroupPruner` ignores
 /// `pruning=false` and evaluates the attached predicate against footer
@@ -194,8 +318,6 @@ fn wrap_to_refuse_untrusted_float_filters(
 ///
 /// [`FileSource`] methods with a default body must be forwarded:
 /// inheriting a default compiles and then drops `inner`'s behavior.
-/// `try_to_proto` stays the default `Ok(None)` so a serialized scan is
-/// not a bare `ParquetSource` that would re-attach float filters.
 struct NanSafeParquetSource {
     inner: Arc<dyn FileSource>,
 }
@@ -397,6 +519,30 @@ impl FileSource for NanSafeParquetSource {
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
         self.inner.apply_expressions(f)
+    }
+
+    /// Encode as a tagged `Extension` around the inner `ParquetScan`.
+    ///
+    /// Emitting `ParquetScan` directly would serialize, but decode rebuilds a
+    /// bare `ParquetSource` and loses float-filter refusal. The tag is what
+    /// [`NanSafeListingPhysicalCodec`] and the Spice cluster codec match on
+    /// so they can wrap the rebuilt scan.
+    fn try_to_proto(
+        &self,
+        base: &FileScanConfig,
+        ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<PhysicalPlanNode>> {
+        let Some(inner) = self.inner.try_to_proto(base, ctx)? else {
+            return Ok(None);
+        };
+        let mut payload = Vec::from(NAN_SAFE_LISTING_PARQUET_MAGIC);
+        inner.try_encode(&mut payload)?;
+        Ok(Some(PhysicalPlanNode {
+            physical_plan_type: Some(PhysicalPlanType::Extension(PhysicalExtensionNode {
+                node: payload,
+                inputs: Vec::new(),
+            })),
+        }))
     }
 }
 
