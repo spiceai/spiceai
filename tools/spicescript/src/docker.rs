@@ -19,10 +19,7 @@ limitations under the License.
 //! chosen up front, so a container that is stopped and started again comes
 //! back at the same address and a running `spiced` can reconnect to it.
 
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use bollard::{
@@ -32,10 +29,7 @@ use bollard::{
         StartContainerOptions, StopContainerOptions,
     },
     image::CreateImageOptions,
-    secret::{
-        ContainerCreateResponse, ContainerStateStatusEnum, HealthConfig, HealthStatusEnum,
-        HostConfig, PortBinding,
-    },
+    secret::{ContainerStateStatusEnum, HealthConfig, HealthStatusEnum, HostConfig, PortBinding},
 };
 use futures::StreamExt;
 
@@ -75,8 +69,10 @@ impl Container {
             "not starting container {}: the run is shutting down",
             spec.name
         );
-        let docker = Docker::connect_with_local_defaults()
-            .context("Failed to connect to Docker; is it running?")?;
+        let docker = patient(
+            Docker::connect_with_local_defaults()
+                .context("Failed to connect to Docker; is it running?")?,
+        );
         docker
             .ping()
             .await
@@ -152,8 +148,27 @@ impl Container {
             }),
             ..Default::default()
         };
-        let created =
-            create_named(&docker, &spec.name, config, CREATE_ATTEMPTS, CONFLICT_WAIT).await?;
+        // A container left behind by an interrupted run would hold the name.
+        let _ = docker
+            .remove_container(
+                &spec.name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let created = docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: spec.name.as_str(),
+                    platform: None,
+                }),
+                config,
+            )
+            .await
+            .with_context(|| format!("Failed to create container {}", spec.name))?;
         crate::cleanup::track_container(&created.id, &spec.name, spec.network.as_deref());
         let container = Self {
             docker,
@@ -376,74 +391,16 @@ impl Drop for Container {
     }
 }
 
-/// How many times `start_on` asks Docker to create a container whose create
-/// request timed out. A daemon on a busy CI host can stall for a few minutes,
-/// past bollard's 120 s request timeout, and then recover.
-const CREATE_ATTEMPTS: u32 = 3;
+/// How long a request to Docker may take. bollard's default, 120 s, is
+/// shorter than the stalls a daemon on a busy CI host goes through, and a
+/// request it gives up on, such as a create, is still carried out by the
+/// daemon, so failing at 120 s only fails the script.
+const DOCKER_REQUEST_TIMEOUT: Duration = Duration::from_mins(10);
 
-/// How long a name conflict after a timed-out create is waited out. Docker
-/// reserves the name before it registers the container, so a create still
-/// in progress holds the name while a removal of it finds nothing.
-const CONFLICT_WAIT: Duration = Duration::from_mins(2);
-
-/// Creates a container named `name`, first removing any container holding
-/// the name, with its anonymous volumes: one left behind by an interrupted
-/// run, or one the daemon went on to create after an earlier attempt here
-/// timed out. A request timeout is tried again, up to `attempts` creates.
-/// After one, a name conflict means that create is still finishing, so it is
-/// retried every second for up to `conflict_wait`. Docker's other errors, and
-/// a conflict with no timeout before it, are not tried again.
-async fn create_named(
-    docker: &Docker,
-    name: &str,
-    config: Config<String>,
-    attempts: u32,
-    conflict_wait: Duration,
-) -> Result<ContainerCreateResponse> {
-    let mut attempt = 1;
-    // Set by the first timeout: until then a conflict is not this run's.
-    let mut conflict_deadline = None;
-    loop {
-        let _ = docker
-            .remove_container(
-                name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    v: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-        match docker
-            .create_container(
-                Some(CreateContainerOptions {
-                    name,
-                    platform: None,
-                }),
-                config.clone(),
-            )
-            .await
-        {
-            Err(bollard::errors::Error::RequestTimeoutError) if attempt < attempts => {
-                eprintln!(
-                    "Creating container {name} timed out (attempt {attempt} of {attempts}); trying again"
-                );
-                conflict_deadline.get_or_insert_with(|| Instant::now() + conflict_wait);
-                attempt += 1;
-            }
-            Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 409, ..
-            }) if conflict_deadline.is_some_and(|deadline| Instant::now() < deadline) => {
-                eprintln!(
-                    "Container {name} is still held, likely by the create that timed out; waiting for it"
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            result => {
-                return result.with_context(|| format!("Failed to create container {name}"));
-            }
-        }
-    }
+/// `docker` waiting out a stalled daemon instead of giving up at bollard's
+/// default request timeout.
+fn patient(docker: Docker) -> Docker {
+    docker.with_timeout(DOCKER_REQUEST_TIMEOUT)
 }
 
 async fn pull_if_missing(docker: &Docker, image: &str) -> Result<()> {
@@ -522,40 +479,25 @@ pub fn healthcheck(probe: &str) -> HealthConfig {
 }
 
 #[cfg(test)]
-mod create_tests {
-    use std::{sync::Arc, time::Duration};
+mod timeout_tests {
+    use std::time::Duration;
 
-    use bollard::{API_DEFAULT_VERSION, Docker, container::Config};
-    use parking_lot::Mutex;
+    use bollard::{
+        API_DEFAULT_VERSION, Docker,
+        container::{Config, CreateContainerOptions},
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
 
-    /// How the fake daemon answers one create request.
-    #[derive(Clone, Copy)]
-    enum Create {
-        /// Never answers, as a stalled daemon does.
-        Stall,
-        Created,
-        /// A 409: the name is taken.
-        Conflict,
-        Fail,
-    }
-
-    /// Serves the two Docker API calls `create_named` makes: each removal
-    /// answers 404, and the creates take the answers in `creates` in order.
-    /// Returns a client with a 1 s request timeout and the calls received.
-    async fn fake_daemon(creates: Vec<Create>) -> (Docker, Arc<Mutex<Vec<&'static str>>>) {
+    /// A Docker API that answers each create 2 s late, as a stalled daemon
+    /// does, through a client that would give up after 1 s.
+    async fn slow_daemon() -> Docker {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local address");
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let creates = Arc::new(Mutex::new(creates.into_iter()));
-        let seen = Arc::clone(&calls);
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let seen = Arc::clone(&seen);
-                let creates = Arc::clone(&creates);
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0; 4096];
@@ -565,130 +507,34 @@ mod create_tests {
                             Ok(n) => request.extend_from_slice(&buf[..n]),
                         }
                     }
-                    let head = String::from_utf8_lossy(&request);
-                    let path = head.split(' ').nth(1).unwrap_or_default();
-                    let (status, body) = if path.contains("/containers/create") {
-                        seen.lock().push("create");
-                        let next = creates.lock().next();
-                        match next {
-                            Some(Create::Stall) => {
-                                tokio::time::sleep(Duration::from_secs(30)).await;
-                                return;
-                            }
-                            Some(Create::Created) => {
-                                ("201 Created", r#"{"Id":"c1","Warnings":[]}"#)
-                            }
-                            Some(Create::Conflict) => {
-                                ("409 Conflict", r#"{"message":"name in use"}"#)
-                            }
-                            Some(Create::Fail) | None => {
-                                ("500 Internal Server Error", r#"{"message":"boom"}"#)
-                            }
-                        }
-                    } else {
-                        // Removal must take the container's anonymous volumes too.
-                        seen.lock().push(if path.contains("v=true") {
-                            "remove"
-                        } else {
-                            "remove keeping volumes"
-                        });
-                        ("404 Not Found", r#"{"message":"No such container"}"#)
-                    };
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let body = r#"{"Id":"c1","Warnings":[]}"#;
                     let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = socket.write_all(response.as_bytes()).await;
                 });
             }
         });
-        let docker = Docker::connect_with_http(&format!("http://{addr}"), 1, API_DEFAULT_VERSION)
-            .expect("client");
-        (docker, calls)
+        Docker::connect_with_http(&format!("http://{addr}"), 1, API_DEFAULT_VERSION)
+            .expect("client")
     }
 
-    const WAIT: Duration = Duration::from_secs(10);
-
     #[tokio::test]
-    async fn a_create_that_timed_out_is_tried_again_under_the_same_name() {
-        let (docker, calls) = fake_daemon(vec![Create::Stall, Create::Created]).await;
-        let created = super::create_named(&docker, "src", Config::default(), 3, WAIT)
+    async fn a_patient_client_waits_out_a_create_slower_than_its_default_timeout() {
+        let docker = super::patient(slow_daemon().await);
+        let created = docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: "src",
+                    platform: None,
+                }),
+                Config::<String>::default(),
+            )
             .await
-            .expect("the second create succeeds");
+            .expect("the create is answered within the patient timeout");
         assert_eq!(created.id, "c1");
-        assert_eq!(*calls.lock(), ["remove", "create", "remove", "create"]);
-    }
-
-    #[tokio::test]
-    async fn the_last_timed_out_attempt_fails_with_the_timeout() {
-        let (docker, calls) = fake_daemon(vec![Create::Stall, Create::Stall]).await;
-        let error = super::create_named(&docker, "src", Config::default(), 2, WAIT)
-            .await
-            .expect_err("every create timed out");
-        assert!(
-            matches!(
-                error.downcast_ref::<bollard::errors::Error>(),
-                Some(bollard::errors::Error::RequestTimeoutError)
-            ),
-            "{error:?}"
-        );
-        assert_eq!(*calls.lock(), ["remove", "create", "remove", "create"]);
-    }
-
-    #[tokio::test]
-    async fn a_name_held_by_the_timed_out_create_is_waited_for() {
-        // The timed-out create still holds the name through three more
-        // creates, more than the create attempts left, then lets it go.
-        let (docker, calls) = fake_daemon(vec![
-            Create::Stall,
-            Create::Conflict,
-            Create::Conflict,
-            Create::Conflict,
-            Create::Created,
-        ])
-        .await;
-        let created = super::create_named(&docker, "src", Config::default(), 2, WAIT)
-            .await
-            .expect("the create after the name is released succeeds");
-        assert_eq!(created.id, "c1");
-        assert_eq!(calls.lock().len(), 10, "{:?}", calls.lock());
-    }
-
-    #[tokio::test]
-    async fn a_name_held_past_the_wait_fails_with_the_conflict() {
-        let (docker, calls) = fake_daemon(
-            std::iter::once(Create::Stall)
-                .chain(std::iter::repeat_n(Create::Conflict, 20))
-                .collect(),
-        )
-        .await;
-        let error =
-            super::create_named(&docker, "src", Config::default(), 2, Duration::from_secs(2))
-                .await
-                .expect_err("the name stayed held");
-        assert!(format!("{error:#}").contains("name in use"), "{error:#}");
-        let creates = calls.lock().iter().filter(|c| **c == "create").count();
-        assert!((2..=5).contains(&creates), "{:?}", calls.lock());
-    }
-
-    #[tokio::test]
-    async fn a_conflict_without_a_timed_out_create_is_not_tried_again() {
-        let (docker, calls) = fake_daemon(vec![Create::Conflict, Create::Created]).await;
-        let error = super::create_named(&docker, "src", Config::default(), 3, WAIT)
-            .await
-            .expect_err("the name is taken");
-        assert!(format!("{error:#}").contains("name in use"), "{error:#}");
-        assert_eq!(*calls.lock(), ["remove", "create"]);
-    }
-
-    #[tokio::test]
-    async fn an_error_docker_returned_is_not_tried_again() {
-        let (docker, calls) = fake_daemon(vec![Create::Fail, Create::Created]).await;
-        let error = super::create_named(&docker, "src", Config::default(), 3, WAIT)
-            .await
-            .expect_err("Docker refused the create");
-        assert!(format!("{error:#}").contains("boom"), "{error:#}");
-        assert_eq!(*calls.lock(), ["remove", "create"]);
     }
 }
 
