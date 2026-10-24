@@ -14,9 +14,10 @@ sources:
     image: docker.io/library/mongo:8.0
     ports: [27017]
     command: [mongod, --replSet, rs0, --bind_ip_all]
-    # Initiates the replica set on the first probe; ready once it is primary.
+    # Initiates the replica set on the first probe; ready once it accepts
+    # writes (a new primary reports PRIMARY briefly before it does).
     ready: >-
-      mongosh --quiet --eval "try { rs.status().myState } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}); 0 }" | grep -qx 1
+      mongosh --quiet --eval "try { rs.status(); db.hello().isWritablePrimary ? 1 : 0 } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}); 0 }" | grep -qx 1
 
 spicepod:
   version: v1
