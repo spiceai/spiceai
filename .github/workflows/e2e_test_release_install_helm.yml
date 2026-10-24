@@ -69,12 +69,9 @@ jobs:
           echo "OS: $(uname -s)"
           echo "Arch: $(uname -m)"
 
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
       # Check the inputs and the image before installing anything, so a wrong input or an
       # unpublished image fails here, named, instead of minutes later in `helm install`.
-      - name: Determine chart version
+      - name: Check the inputs and the image
         id: chart-version
         shell: bash
         env:
@@ -103,9 +100,7 @@ jobs:
               exit 1
             fi
             echo "Using latest release version: $RELEASE_VERSION"
-            # remove prefix 'v' from RELEASE_VERSION. (i.e. v1.10.1 -> 1.10.1).
-            # Models are included in the default image as of v2.0.0; there is no
-            # longer a separate `-models` image tag.
+            # Image tags drop the release tag's 'v' prefix (v1.10.1 -> 1.10.1).
             IMAGE_TAG="${RELEASE_VERSION#v}"
             SOURCE=github-release
           else
@@ -140,6 +135,9 @@ jobs:
           echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
           echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
 
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       # Set up Docker
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -161,18 +159,12 @@ jobs:
           kind version
 
       # Install Helm
-      - name: Install Helm (latest)
-        if: steps.chart-version.outputs.helm_version == ''
-        run: |
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-          helm version
-
-      - name: Install Helm (specific version)
-        if: steps.chart-version.outputs.helm_version != ''
+      # An empty helm_version installs the latest release.
+      - name: Install Helm
         env:
           HELM_VERSION: ${{ steps.chart-version.outputs.helm_version }}
         run: |
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash -s -- --version "$HELM_VERSION"
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash -s -- ${HELM_VERSION:+--version "$HELM_VERSION"}
           helm version
 
       # Create kind cluster
