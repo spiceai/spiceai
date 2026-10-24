@@ -78,6 +78,8 @@ openapi = ["dep:utoipa", "runtime-acceleration/openapi"]
 [dev-dependencies]
 cpu-budget = { path = "../cpu-budget" }
 ctor.workspace = true
+datafusion-table-providers = { workspace = true, features = ["duckdb"] }
+duckdb.workspace = true
 insta.workspace = true
 object_store.workspace = true
 runtime-acceleration = { path = "../runtime-acceleration", features = ["test-support"] }

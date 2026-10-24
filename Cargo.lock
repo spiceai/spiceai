@@ -18687,6 +18687,7 @@ dependencies = [
  "datafusion-functions-json",
  "datafusion-optimizer-rules",
  "datafusion-table-providers",
+ "duckdb",
  "fundu",
  "futures",
  "insta",

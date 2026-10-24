@@ -794,6 +794,14 @@ impl<'a> DoomedSplit<'a> {
 /// fixed point makes every doomed entry lie either wholly below `X` or wholly at
 /// or above it — so no named entry, deferred or not, has a row the range reaches.
 ///
+/// Every comparison against `X` is made in whole milliseconds, and `floor` is
+/// rounded down to one. The `DuckDB` accelerator compares a naive timestamp
+/// column at millisecond precision (#13146), so a `ceiling` sharing a
+/// millisecond with a kept row reached that row, and an exact `floor` missed the
+/// oldest ranged entry, which was then never evicted. Keeping the range a whole
+/// millisecond clear of everything kept makes exact and millisecond-precision
+/// engines select the same rows; an entry in `X`'s millisecond is named instead.
+///
 /// The range-bucket is every doomed entry lying wholly below `X` (`newest < X`),
 /// and the returned [`DoomedSplit::range_ceiling`] is `max(newest)` over that
 /// bucket — a `floor <= _fetched_at <= ceiling` range that selects exactly those
@@ -811,14 +819,16 @@ impl<'a> DoomedSplit<'a> {
 ///
 /// Correctness this preserves:
 /// * **No entry is split.** After the fixed point every doomed entry is wholly
-///   below `X` (ranged) or has `oldest >= X` (named). So
-///   `floor = min(oldest of range-bucket)`,
-///   `ceiling = max(newest of range-bucket) < X <= oldest of every named entry`,
+///   below `X`'s millisecond (ranged) or has `oldest >= X` (named). So
+///   `floor <= min(oldest of range-bucket)`,
+///   `ceiling = max(newest of range-bucket)`, in a millisecond before `X <=
+///   oldest of every named entry`,
 ///   and the bounded range reaches no row of any named entry —
 ///   even one the cap defers to a later sweep — while the named entry's key
 ///   predicate takes all of its rows. No entry is left half-present.
-/// * **No survivor is touched.** Survivors have `oldest >= C >= X > ceiling`, so
-///   no survivor row is `<= ceiling`, and no survivor is named.
+/// * **No survivor is touched.** Survivors have `oldest >= C >= X`, a millisecond
+///   past `ceiling`, so no survivor row is `<= ceiling` even compared to the
+///   millisecond, and no survivor is named.
 /// * **Post-ranking older writes are protected.** HTTP may stamp `_fetched_at`
 ///   from an origin-provided `Date`, rather than the local write time. Bounding
 ///   below at the oldest ranged row means a response written after lock-free
@@ -870,7 +880,7 @@ fn partition_doomed<'a>(doomed: &[&'a EntryCost], survivors: &[&'a EntryCost]) -
     spanning.sort_unstable_by_key(|&(_, newest)| std::cmp::Reverse(newest));
     let mut upper = cutoff;
     for (oldest, newest) in spanning {
-        if newest >= upper {
+        if millis(newest) >= millis(upper) {
             upper = upper.min(oldest);
         } else {
             break;
@@ -880,13 +890,15 @@ fn partition_doomed<'a>(doomed: &[&'a EntryCost], survivors: &[&'a EntryCost]) -
     // Range-bucket vs name-bucket at X. An entry is rangeable only when both its
     // bounds are known and its whole extent lies below X; everything else is
     // named, which deletes it whole by key. The ceiling is the newest row the
-    // range must reach — `min(oldest)` and `max(newest)` over the range-bucket.
+    // range must reach — `min(oldest)`, rounded down to the millisecond, and
+    // `max(newest)` over the range-bucket.
     let mut range_floor: Option<i64> = None;
     let mut range_ceiling: Option<i64> = None;
     let mut named: Vec<&EntryCost> = Vec::new();
     for entry in doomed {
         match (entry.oldest, entry.newest) {
-            (Some(oldest), Some(newest)) if newest < upper => {
+            (Some(oldest), Some(newest)) if millis(newest) < millis(upper) => {
+                let oldest = oldest.saturating_sub(oldest.rem_euclid(NANOS_PER_MILLI));
                 range_floor = Some(range_floor.map_or(oldest, |floor| floor.min(oldest)));
                 range_ceiling = Some(range_ceiling.map_or(newest, |c| c.max(newest)));
             }
@@ -899,6 +911,14 @@ fn partition_doomed<'a>(doomed: &[&'a EntryCost], survivors: &[&'a EntryCost]) -
         range_ceiling,
         named,
     }
+}
+
+const NANOS_PER_MILLI: i64 = 1_000_000;
+
+/// The whole millisecond `nanos` falls in: the precision [`partition_doomed`]
+/// separates the range from everything kept at.
+fn millis(nanos: i64) -> i64 {
+    nanos.div_euclid(NANOS_PER_MILLI)
 }
 
 /// Chooses which entries to evict from `entries`, which must be ordered
@@ -1234,16 +1254,22 @@ mod tests {
         assert!(entry_key_columns(&schema).is_empty());
     }
 
+    /// `n` whole milliseconds, in nanoseconds: the unit the partition tests
+    /// express fetch times in, since [`partition_doomed`] separates at it.
+    fn ms(n: i64) -> i64 {
+        n * NANOS_PER_MILLI
+    }
+
     /// An entry for tests that never resolve a key — only `partition_doomed`'s
     /// range/name split, never `named_paths`/`doomed_paths`. The `(batch, row)`
-    /// pointer is never dereferenced by those tests.
+    /// pointer is never dereferenced by those tests. Times are in milliseconds.
     fn cost(oldest: Option<i64>, newest: Option<i64>) -> EntryCost {
         EntryCost {
             key: EntryKey { batch: 0, row: 0 },
             rows: 1,
             bytes: 1,
-            oldest,
-            newest,
+            oldest: oldest.map(ms),
+            newest: newest.map(ms),
             matches_configured: false,
         }
     }
@@ -1259,8 +1285,8 @@ mod tests {
         let s: Vec<&EntryCost> = survivors.iter().collect();
 
         let split = partition_doomed(&d, &s);
-        assert_eq!(split.range_floor, Some(5));
-        assert_eq!(split.range_ceiling, Some(20));
+        assert_eq!(split.range_floor, Some(ms(5)));
+        assert_eq!(split.range_ceiling, Some(ms(20)));
         assert!(split.named.is_empty(), "a clean separation names nothing");
     }
 
@@ -1278,17 +1304,21 @@ mod tests {
         let split = partition_doomed(&d, &s);
         let floor = split.range_floor.expect("range");
         let ceiling = split.range_ceiling.expect("range");
-        assert_eq!(floor, 10, "the floor is the oldest row the ranking saw");
-        assert_eq!(ceiling, 20, "the ceiling is the newest row the ranking saw");
+        assert_eq!(floor, ms(10), "the floor is the oldest row the ranking saw");
+        assert_eq!(
+            ceiling,
+            ms(20),
+            "the ceiling is the newest row the ranking saw"
+        );
         assert!(split.named.is_empty(), "a clean separation names nothing");
 
-        let oldest_survivor_row = 30;
+        let oldest_survivor_row = ms(30);
         assert!(
             ceiling < oldest_survivor_row,
             "the range must stop below anything kept: {ceiling} !< {oldest_survivor_row}"
         );
 
-        let post_ranking_origin_timestamp = 5;
+        let post_ranking_origin_timestamp = ms(5);
         assert!(
             post_ranking_origin_timestamp < floor,
             "a post-ranking row with an older origin timestamp must fall below the range"
@@ -1367,12 +1397,38 @@ mod tests {
         let d: Vec<&EntryCost> = doomed.iter().collect();
 
         let split = partition_doomed(&d, &[]);
-        assert_eq!(split.range_floor, Some(1));
-        assert_eq!(split.range_ceiling, Some(4));
+        assert_eq!(split.range_floor, Some(ms(1)));
+        assert_eq!(split.range_ceiling, Some(ms(4)));
         assert!(
             split.named.is_empty(),
             "with no survivors the whole set is ranged"
         );
+    }
+
+    #[test]
+    fn an_entry_in_the_cutoffs_millisecond_is_named_and_the_floor_is_a_whole_millisecond() {
+        // The newest doomed entry and the survivor differ only below the
+        // millisecond, which an engine comparing at the millisecond cannot see:
+        // a range reaching that entry would also reach the survivor, so it is
+        // named.
+        let at = |oldest: i64| EntryCost {
+            key: EntryKey { batch: 0, row: 0 },
+            rows: 1,
+            bytes: 1,
+            oldest: Some(oldest),
+            newest: Some(oldest),
+            matches_configured: false,
+        };
+        let survivors = [at(ms(30) + 700_000)];
+        let doomed = [at(ms(30) + 200_000), at(ms(10) + 838_000)];
+        let d: Vec<&EntryCost> = doomed.iter().collect();
+        let s: Vec<&EntryCost> = survivors.iter().collect();
+
+        let split = partition_doomed(&d, &s);
+        assert_eq!(split.range_floor, Some(ms(10)));
+        assert_eq!(split.range_ceiling, Some(ms(10) + 838_000));
+        assert_eq!(split.named.len(), 1);
+        assert_eq!(split.named[0].oldest, Some(ms(30) + 200_000));
     }
 
     /// The key columns `named_cost`/`ranked` build their `RecordBatch` under.
@@ -1408,7 +1464,7 @@ mod tests {
     /// One entry costed at `(oldest, newest)` and named by its request path, so a
     /// partition test can tell which entries the range covers from which it
     /// names. `b` must outlive the returned `EntryCost` — call `b.build()` only
-    /// once every entry has been pushed.
+    /// once every entry has been pushed. Times are in milliseconds.
     fn named_cost(
         b: &mut KeyBatchBuilder,
         path: &str,
@@ -1422,8 +1478,8 @@ mod tests {
             },
             rows: 1,
             bytes: 1,
-            oldest,
-            newest,
+            oldest: oldest.map(ms),
+            newest: newest.map(ms),
             matches_configured: false,
         }
     }
@@ -1461,10 +1517,10 @@ mod tests {
         let s: Vec<&EntryCost> = survivors.iter().collect();
 
         let split = partition_doomed(&d, &s);
-        assert_eq!(split.range_floor, Some(998));
+        assert_eq!(split.range_floor, Some(ms(998)));
         assert_eq!(
             split.range_ceiling,
-            Some(999),
+            Some(ms(999)),
             "the two cleanly-older entries go in one range whose ceiling is below the tie"
         );
         assert_eq!(
@@ -1490,10 +1546,10 @@ mod tests {
         let s: Vec<&EntryCost> = survivors.iter().collect();
 
         let split = partition_doomed(&d, &s);
-        assert_eq!(split.range_floor, Some(1));
+        assert_eq!(split.range_floor, Some(ms(1)));
         assert_eq!(
             split.range_ceiling,
-            Some(2),
+            Some(ms(2)),
             "the cleanly-older entry is ranged; the ceiling sits below the straddler's oldest row"
         );
         assert_eq!(
@@ -1518,10 +1574,10 @@ mod tests {
         let d: Vec<&EntryCost> = doomed.iter().collect();
 
         let split = partition_doomed(&d, &[]);
-        assert_eq!(split.range_floor, Some(1));
+        assert_eq!(split.range_floor, Some(ms(1)));
         assert_eq!(
             split.range_ceiling,
-            Some(4),
+            Some(ms(4)),
             "the timestamped entries are ranged"
         );
         assert_eq!(
@@ -1637,14 +1693,14 @@ mod tests {
         let s: Vec<&EntryCost> = survivors.iter().collect();
         let split = partition_doomed(&doomed, &s);
 
-        assert_eq!(split.range_floor, Some(24));
+        assert_eq!(split.range_floor, Some(ms(24)));
         assert_eq!(
             split.range_ceiling,
-            Some(26),
+            Some(ms(26)),
             "the three older buckets range in one predicate"
         );
         assert!(
-            split.named.iter().all(|e| e.oldest == Some(27)),
+            split.named.iter().all(|e| e.oldest == Some(ms(27))),
             "only the boundary-tie overflow is named, not the older bulk"
         );
         assert_eq!(split.named.len(), overflow);
@@ -2661,6 +2717,111 @@ mod tests {
             remaining(&accelerator).await,
             vec![("/middle".to_string(), None), ("/newest".to_string(), None)]
         );
+    }
+
+    /// As [`cache_table_at`], but held in an in-memory `DuckDB` table, so the
+    /// sweep's predicate is rendered and run by the `DuckDB` delete path. Kept
+    /// here rather than in `accelerator-duckdb` because the sweep's delete path
+    /// is crate-private.
+    async fn duckdb_cache_table_at(
+        entries: &[(String, i64)],
+    ) -> (Arc<dyn TableProvider>, Arc<FederatedTable>) {
+        use data_accelerator_api::AcceleratorExternalTableBuilder;
+        use datafusion::catalog::TableProviderFactory;
+        use datafusion::dataframe::DataFrameWriteOptions;
+        use datafusion_table_providers::duckdb::DuckDBTableProviderFactory;
+        use runtime_acceleration::Engine;
+
+        let ctx = SessionContext::new();
+        let cmd = AcceleratorExternalTableBuilder::new(
+            TableReference::bare("http_cache"),
+            Arc::new(http_cache_schema()),
+            Engine::DuckDB,
+        )
+        .build()
+        .expect("external table");
+        let accelerator = DuckDBTableProviderFactory::new(duckdb::AccessMode::ReadWrite)
+            .create(&ctx.state(), &cmd)
+            .await
+            .expect("duckdb table");
+
+        ctx.register_table("http_cache", Arc::clone(&accelerator))
+            .expect("register");
+        let (rows, _) = cache_table_at(entries);
+        ctx.read_table(rows)
+            .expect("read")
+            .write_table("http_cache", DataFrameWriteOptions::new())
+            .await
+            .expect("insert");
+
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+        (accelerator, federated)
+    }
+
+    /// A whole millisecond a few minutes ago, so a test can place fetch times
+    /// at chosen sub-millisecond offsets from it.
+    fn whole_milli_ago() -> i64 {
+        ms(millis(nanos_ago(Duration::from_mins(5))))
+    }
+
+    #[tokio::test]
+    async fn the_item_budget_evicts_the_oldest_entry_from_a_duckdb_accelerator() {
+        // Clock-stamped fetch times carry sub-millisecond digits.
+        let base = whole_milli_ago() + 838_000;
+        let second = 1_000_000_000_i64;
+        let entries: Vec<(String, i64)> = (1..=5_i64)
+            .map(|i| (format!("/e{i}"), base + i * second))
+            .collect();
+        let (accelerator, federated) = duckdb_cache_table_at(&entries).await;
+
+        let deleted = sweep(
+            &accelerator,
+            &federated,
+            CacheLimits {
+                max_items: Some(3),
+                ..no_expiry()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            remaining(&accelerator).await,
+            vec![
+                ("/e3".to_string(), None),
+                ("/e4".to_string(), None),
+                ("/e5".to_string(), None),
+            ]
+        );
+        assert_eq!(deleted, 2);
+    }
+
+    #[tokio::test]
+    async fn a_survivor_in_the_doomed_entrys_millisecond_is_kept_by_a_duckdb_accelerator() {
+        // The survivor was fetched later than the newest doomed entry but
+        // within the same millisecond.
+        let base = whole_milli_ago();
+        let entries = vec![
+            ("/older".to_string(), base - 1_000_000_000 + 838_000),
+            ("/old".to_string(), base + 200_000),
+            ("/new".to_string(), base + 700_000),
+        ];
+        let (accelerator, federated) = duckdb_cache_table_at(&entries).await;
+
+        let deleted = sweep(
+            &accelerator,
+            &federated,
+            CacheLimits {
+                max_items: Some(1),
+                ..no_expiry()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            remaining(&accelerator).await,
+            vec![("/new".to_string(), None)]
+        );
+        assert_eq!(deleted, 2);
     }
 
     #[tokio::test]
