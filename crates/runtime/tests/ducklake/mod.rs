@@ -21,6 +21,7 @@ use crate::utils::{register_test_connectors, runtime_ready_check, test_request_c
 use crate::{configure_test_datafusion, init_tracing};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
+use data_components::duckdb::install_and_load_extension;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
@@ -49,9 +50,7 @@ async fn explain_plan(rt: &Runtime, sql: &str) -> String {
 /// and the lake at `metadata_path` attached under `alias`.
 fn attach_ducklake(alias: &str, metadata_path: &str, data_path: &str) -> duckdb::Connection {
     let db = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
-    db.execute("INSTALL ducklake", [])
-        .expect("install ducklake");
-    db.execute("LOAD ducklake", []).expect("load ducklake");
+    install_and_load_extension(&db, "ducklake").expect("install and load ducklake");
 
     let escaped_metadata = metadata_path.replace('\'', "''");
     let escaped_data = data_path.replace('\'', "''");

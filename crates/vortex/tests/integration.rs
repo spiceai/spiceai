@@ -28,6 +28,7 @@ limitations under the License.
 //! its neighbours would see.
 
 mod disabled_segment_cache;
+mod footer_cache_reuse;
 mod process_segment_cache;
 
 /// Fails the calling test unless it runs in a process of its own.
