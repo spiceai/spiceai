@@ -175,7 +175,8 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let Some((pool, table_definition)) = duckdb_writer_context(&accelerator_provider) else {
         return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-            "DuckDB vector engine for table {tbl} requires a DuckDB accelerator provider."
+            "Table '{tbl}' cannot use the DuckDB vector engine: {}",
+            crate::embeddings::connector::duckdb_vector_engine_without_duckdb_message()
         )));
     };
 

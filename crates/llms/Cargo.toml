@@ -52,8 +52,8 @@ tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "d99170d287d6a94c1b1ff0c1622904c8bff704f0", optional = true } # branch: spiceai (spiceai/mistral.rs#49: DeepSeek-V4.1 and GLM-5.3 decode speedups on #48)
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "d99170d287d6a94c1b1ff0c1622904c8bff704f0", package = "mistralrs-core", optional = true } # branch: spiceai (spiceai/mistral.rs#49: DeepSeek-V4.1 and GLM-5.3 decode speedups on #48)
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "aa8e8d43949970b91fb42a2243b4f60f810d9bbd", optional = true } # branch: spiceai (spiceai/mistral.rs#52: the exported tool-call parser, on #49 and #50)
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "aa8e8d43949970b91fb42a2243b4f60f810d9bbd", package = "mistralrs-core", optional = true } # branch: spiceai (spiceai/mistral.rs#52: the exported tool-call parser, on #49 and #50)
 rand.workspace = true
 
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", features = [
@@ -69,6 +69,7 @@ cudarc = { version = "0.19", optional = true, features = [
 ] }
 either = "1.15.0"
 indexmap.workspace = true
+linkme.workspace = true
 tempfile.workspace = true
 token_provider = { path = "../token_provider" }
 

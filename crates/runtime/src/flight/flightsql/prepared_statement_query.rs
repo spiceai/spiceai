@@ -36,14 +36,13 @@ use datafusion::sql::sqlparser::{
     parser::{Parser, ParserError},
 };
 use futures::StreamExt;
-use postcard::{from_bytes, to_stdvec};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio_stream::adapters::Peekable;
 use tonic::{Request, Response, Status, Streaming};
 
-use super::DecodableSchema;
+use super::{DecodableSchema, prepared_statement_handle};
 use crate::{
     datafusion::{
         query::{run_transaction, schema_statement, transaction_statements},
@@ -188,10 +187,12 @@ fn rewrite_sql_with_type_casts(sql: &str, schema: &SchemaRef) -> String {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PreparedStatement {
     pub(super) query: String,
+    #[serde(with = "serde_bytes")]
     pub(super) parameters: Vec<u8>,
     /// Parameter schema - stores the Arrow schema of bound parameters from `DoPut`
     /// This schema provides type information for each parameter (e.g., Int64, Utf8, etc.)
     /// and is used to create a properly typed logical plan during execution
+    #[serde(with = "serde_bytes")]
     pub(super) parameter_schema: Option<Vec<u8>>,
 }
 
@@ -254,7 +255,7 @@ pub(crate) async fn do_action_create_prepared_statement(
         parameter_schema: None,
     };
 
-    let handle = to_stdvec(&stmt).map_err(error_to_status)?;
+    let handle = prepared_statement_handle::seal(&stmt)?;
 
     Ok(sql::ActionCreatePreparedStatementResult {
         prepared_statement_handle: handle.into(),
@@ -278,7 +279,7 @@ pub(crate) async fn get_flight_info(
         query: sql,
         parameters,
         parameter_schema,
-    } = from_bytes(&handle.prepared_statement_handle).map_err(error_to_status)?;
+    } = prepared_statement_handle::open(&handle.prepared_statement_handle)?;
 
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
@@ -367,7 +368,7 @@ pub(crate) async fn do_get(
         query: sql,
         parameters,
         parameter_schema,
-    } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
+    } = prepared_statement_handle::open(&query.prepared_statement_handle)?;
 
     tracing::debug!(
         "do_get: Query: {}, Parameters length: {}",
@@ -498,11 +499,10 @@ pub(crate) async fn do_put_query(
         bytes
     };
 
-    let mut stmt: PreparedStatement =
-        from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
+    let mut stmt = prepared_statement_handle::open(&query.prepared_statement_handle)?;
     stmt.parameters = parameters;
     stmt.parameter_schema = Some(schema_bytes);
-    let handle = to_stdvec(&stmt).map_err(error_to_status)?;
+    let handle = prepared_statement_handle::seal(&stmt)?;
 
     let result = DoPutPreparedStatementResult {
         prepared_statement_handle: Some(handle.into()),
@@ -707,6 +707,7 @@ mod tests {
     use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use postcard::{from_bytes, to_stdvec};
     use std::sync::Arc;
 
     /// Helper to encode a `RecordBatch` into Arrow IPC format for parameters

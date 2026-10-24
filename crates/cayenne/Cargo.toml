@@ -290,6 +290,10 @@ name = "inline_memtable_read_overhead"
 
 [[bench]]
 harness = false
+name = "segment_statistics_pruning"
+
+[[bench]]
+harness = false
 name = "inline_upsert_rewrite_overhead"
 
 [[bench]]
