@@ -1647,18 +1647,25 @@ async fn metrics_scenario(
     assert_eq!(rows(&reader, modules).await?.len(), 3);
 
     // Load a second snapshot, so a rollback to snapshot 0 is older than the loaded one.
+    // Copied continuously, as replication copies them, the reader follows the writer: a
+    // writer publishes a snapshot of unchanged data on every refresh, so no single
+    // snapshot id says when the new rows have been published.
     std::fs::write(dir.path().join("modules.csv"), GROWN_CSV)?;
     wait_for_rows(&writer, modules, 5).await?;
-    // A full refresh publishes a snapshot after every refresh, so snapshots of the 3
-    // rows can follow snapshot 0 before the writer reads the grown file. The refresh
-    // loop publishes each snapshot before its next refresh starts, so the first one
-    // published after the writer serves 5 rows holds them.
-    let published = writer_snapshot_id(rustfs, &prefix, modules)
-        .await?
-        .context("the writer published snapshot 0")?;
-    wait_for_writer_snapshot(rustfs, &prefix, modules, published + 1).await?;
-    replicate_snapshots(rustfs, &prefix).await?;
-    wait_for_rows(&reader, modules, 5).await?;
+    let deadline = Instant::now() + Duration::from_mins(1);
+    loop {
+        replicate_snapshots(rustfs, &prefix).await?;
+        let served = rows(&reader, modules).await?.len();
+        if served == 5 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "the reader should follow the writer to 5 rows, served {served}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     writer.shutdown().await;
     // Polls that find nothing newer are skipped fetches.
     wait_for_a_skipped_fetch(&snapshot_mode, Duration::from_secs(30)).await?;
