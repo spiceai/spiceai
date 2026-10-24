@@ -103,26 +103,9 @@ fn infer_dynamodb_type(
             }
         }
         AttributeValue::Ss(_) => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-        AttributeValue::N(n) => {
-            // Determine if it's an integer or float based on the string representation
-            if n.contains('.') || n.contains('e') || n.contains('E') {
-                DataType::Float64
-            } else {
-                DataType::Int64
-            }
-        }
+        AttributeValue::N(n) => number_type(std::slice::from_ref(n)),
         AttributeValue::Ns(numbers) => {
-            // Determine the type based on the first number in the set
-            let inner_type = if let Some(first) = numbers.first() {
-                if first.contains('.') || first.contains('e') || first.contains('E') {
-                    DataType::Float64
-                } else {
-                    DataType::Int64
-                }
-            } else {
-                DataType::Int64 // Default to Int64 for empty sets
-            };
-            DataType::List(Arc::new(Field::new("item", inner_type, true)))
+            DataType::List(Arc::new(Field::new("item", number_type(numbers), true)))
         }
         AttributeValue::B(_) => DataType::Binary,
         AttributeValue::Bs(_) => {
@@ -140,6 +123,15 @@ fn infer_dynamodb_type(
         AttributeValue::Null(_) => DataType::Null,
         _ => return Err(Error::UnknownType),
     })
+}
+
+/// `Int64` when every number is an integer that fits it, otherwise `Float64`.
+fn number_type(numbers: &[String]) -> DataType {
+    if numbers.iter().all(|n| n.parse::<i64>().is_ok()) {
+        DataType::Int64
+    } else {
+        DataType::Float64
+    }
 }
 
 fn infer_struct_type(

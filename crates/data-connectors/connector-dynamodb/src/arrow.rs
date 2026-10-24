@@ -19,7 +19,9 @@ use arrow::array::{
     BinaryBuilder, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, ListBuilder,
     NullBuilder, RecordBatch, StringBuilder, TimestampMillisecondBuilder,
 };
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::datatypes::{
+    ArrowPrimitiveType, DataType, Field, Float64Type, Int64Type, SchemaRef, TimeUnit,
+};
 use arrow_array::builder::ArrayBuilder;
 use aws_sdk_dynamodb::types::AttributeValue;
 use chrono::NaiveDate;
@@ -67,19 +69,32 @@ pub fn append_item_to_struct_builder(
         let value = item.get(field_name);
         let field_builder = struct_builder.field_builder_array(idx);
 
-        append_value_to_builder(field_builder, value, field.data_type(), time_format)?;
+        append_value_to_builder(field_builder, value, field, time_format)?;
     }
 
     Ok(())
 }
 
+/// Parses a `DynamoDB` number into a numeric column. A value that does not fit is
+/// an error: storing NULL instead would silently lose it.
+fn parse_number<T: ArrowPrimitiveType>(n: &str, column: &str) -> Result<T::Native, Error>
+where
+    T::Native: std::str::FromStr,
+{
+    n.parse().map_err(|_| Error::NumberDoesNotFitColumn {
+        column: column.to_string(),
+        value: n.to_string(),
+        data_type: T::DATA_TYPE,
+    })
+}
+
 fn append_value_to_builder(
     builder: &mut dyn ArrayBuilder,
     value: Option<&AttributeValue>,
-    data_type: &DataType,
+    field: &Field,
     time_format: &str,
 ) -> Result<(), Error> {
-    match data_type {
+    match field.data_type() {
         DataType::Boolean => {
             let b = builder
                 .as_any_mut()
@@ -107,11 +122,7 @@ fn append_value_to_builder(
                 })?;
             match value {
                 Some(AttributeValue::N(n)) => {
-                    if let Ok(i) = n.parse::<i64>() {
-                        b.append_value(i);
-                    } else {
-                        b.append_null();
-                    }
+                    b.append_value(parse_number::<Int64Type>(n, field.name())?);
                 }
                 _ => b.append_null(),
             }
@@ -128,11 +139,7 @@ fn append_value_to_builder(
                 })?;
             match value {
                 Some(AttributeValue::N(n)) => {
-                    if let Ok(f) = n.parse::<f64>() {
-                        b.append_value(f);
-                    } else {
-                        b.append_null();
-                    }
+                    b.append_value(parse_number::<Float64Type>(n, field.name())?);
                 }
                 _ => b.append_null(),
             }
@@ -176,7 +183,7 @@ fn append_value_to_builder(
                 _ => b.append_null(),
             }
         }
-        DataType::List(field) => match field.data_type() {
+        DataType::List(item_field) => match item_field.data_type() {
             DataType::Utf8 => {
                 let b = builder
                     .as_any_mut()
@@ -250,11 +257,8 @@ fn append_value_to_builder(
                         for item in list {
                             match item {
                                 AttributeValue::N(n) => {
-                                    if let Ok(i) = n.parse::<i64>() {
-                                        values_builder.append_value(i);
-                                    } else {
-                                        values_builder.append_null();
-                                    }
+                                    values_builder
+                                        .append_value(parse_number::<Int64Type>(n, field.name())?);
                                 }
                                 _ => values_builder.append_null(),
                             }
@@ -263,11 +267,8 @@ fn append_value_to_builder(
                     }
                     Some(AttributeValue::Ns(list)) => {
                         for item in list {
-                            if let Ok(i) = item.parse::<i64>() {
-                                values_builder.append_value(i);
-                            } else {
-                                values_builder.append_null();
-                            }
+                            values_builder
+                                .append_value(parse_number::<Int64Type>(item, field.name())?);
                         }
                         b.append(true);
                     }
@@ -331,11 +332,8 @@ fn append_value_to_builder(
                 match value {
                     Some(AttributeValue::Ns(number_set)) => {
                         for n in number_set {
-                            if let Ok(val) = n.parse::<f64>() {
-                                values_builder.append_value(val);
-                            } else {
-                                values_builder.append_null();
-                            }
+                            values_builder
+                                .append_value(parse_number::<Float64Type>(n, field.name())?);
                         }
                         b.append(true);
                     }
@@ -344,7 +342,7 @@ fn append_value_to_builder(
             }
             _ => {
                 return Err(Error::UnsupportedType {
-                    unsupported_type_name: data_type.to_string(),
+                    unsupported_type_name: field.data_type().to_string(),
                 });
             }
         },
@@ -361,13 +359,13 @@ fn append_value_to_builder(
             match value {
                 Some(AttributeValue::M(map)) => {
                     b.append(true);
-                    for (idx, field) in fields.iter().enumerate() {
-                        let nested_value = map.get(field.name());
+                    for (idx, nested_field) in fields.iter().enumerate() {
+                        let nested_value = map.get(nested_field.name());
                         let nested_builder = b.field_builder_array(idx);
                         append_value_to_builder(
                             nested_builder,
                             nested_value,
-                            field.data_type(),
+                            nested_field,
                             time_format,
                         )?;
                     }
@@ -379,12 +377,7 @@ fn append_value_to_builder(
                     for idx in 0..fields.len() {
                         let nested_builder = b.field_builder_array(idx);
                         let nested_field = &fields[idx];
-                        append_value_to_builder(
-                            nested_builder,
-                            None,
-                            nested_field.data_type(),
-                            time_format,
-                        )?;
+                        append_value_to_builder(nested_builder, None, nested_field, time_format)?;
                     }
                 }
                 _ => {
@@ -458,7 +451,7 @@ fn append_value_to_builder(
         }
         _ => {
             return Err(Error::UnsupportedType {
-                unsupported_type_name: data_type.to_string(),
+                unsupported_type_name: field.data_type().to_string(),
             });
         }
     }
@@ -1133,38 +1126,16 @@ mod tests {
 
     #[test]
     fn test_invalid_number_parsing() {
-        let schema = create_test_schema(vec![
-            Field::new("int_field", DataType::Int64, true),
-            Field::new("float_field", DataType::Float64, true),
-        ]);
+        for data_type in [DataType::Int64, DataType::Float64] {
+            let schema = create_test_schema(vec![Field::new("num", data_type, true)]);
+            let item = HashMap::from([(
+                "num".to_string(),
+                AttributeValue::N("not_a_number".to_string()),
+            )]);
 
-        let mut item = HashMap::new();
-        item.insert(
-            "int_field".to_string(),
-            AttributeValue::N("not_a_number".to_string()),
-        );
-        item.insert(
-            "float_field".to_string(),
-            AttributeValue::N("invalid".to_string()),
-        );
-
-        let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
-            .expect("record_batch");
-
-        let int_array = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("array");
-        assert!(int_array.is_null(0));
-
-        let float_array = result
-            .column(1)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("array");
-        assert!(float_array.is_null(0));
+            dynamodb_items_to_arrow(&[item], schema, "2006-01-02T15:04:05.000Z07:00")
+                .expect_err("invalid number is an error, not NULL");
+        }
     }
 
     #[test]
