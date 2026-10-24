@@ -65,6 +65,7 @@ use {
 use crate::accelerated::RegisteredAcceleratedTable;
 use crate::{
     ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
+    listing::fresh_listing::FreshListingLayer,
     listing::infer::{infer_partitions_with_types_from_files, infer_partitions_with_types_prefix},
 };
 use app::App;
@@ -129,7 +130,7 @@ impl ListingTableTemplate {
     /// Builds the dataset's table over `table_path`: a [`ListingTable`] with a
     /// file-statistics cache that selects its data files with [`FormatSelectedDataFiles`] for a
     /// format-selected listing, wrapped for `location` pruning when the dataset has a
-    /// `_location` column.
+    /// `_location` column, and listing its files on every scan.
     ///
     /// # Errors
     ///
@@ -170,6 +171,7 @@ impl ListingTableTemplate {
         table: Arc<ListingTable>,
         table_path: ListingTableUrl,
     ) -> Arc<dyn TableProvider> {
+        let fresh_listing = FreshListingLayer::new(&table_path);
         let table: Arc<dyn TableProvider> = if has_location_metadata(table.options()) {
             Arc::new(LocationPruningListingTable::new(
                 table,
@@ -181,6 +183,7 @@ impl ListingTableTemplate {
         } else {
             table
         };
+        let table = fresh_listing.over(table);
         match self.schema_drift_guard() {
             Some(guard) => FileSchemaDriftLayer::over(table, guard),
             None => table,

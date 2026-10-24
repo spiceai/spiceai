@@ -20,6 +20,7 @@ use url::{Url, form_urlencoded};
 use runtime_parameters::{ParameterSpec, Parameters};
 
 mod connector;
+mod fresh_listing;
 mod infer;
 pub use connector::{
     ListingTableConnector, ListingTableTemplate, ObjectVersionType, build_table_parquet_options,
