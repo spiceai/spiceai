@@ -880,6 +880,31 @@ pub trait MetadataCatalog: Send + Sync {
         cold_files: &[ColdTierFile],
     ) -> CatalogResult<()>;
 
+    /// Graduate the warm content a promotion read to the cold tier, while keeping
+    /// whatever was written after the promotion captured its input.
+    ///
+    /// In ONE transaction, and only if the table still points at
+    /// `replaced_snapshot_id` ([`CatalogError::SnapshotReplaced`] otherwise):
+    /// replace the cold manifest with `cold_files`, drop the delete files and insert
+    /// records at or below `cutoff` and the sequence rows of the protected snapshots
+    /// named in `folded_protected_snapshot_ids` ([`CatalogError::ProtectedSnapshotsReplaced`]
+    /// if one is no longer registered), clear the table and per-file statistics and the
+    /// persisted key index, and repoint `current_snapshot_id` to `new_snapshot_id`.
+    ///
+    /// Unlike [`Self::commit_overwrite_to_cold`] it does not clear the inline corpus
+    /// or the protected snapshots outside the folded set: the caller proved that
+    /// nothing but appends landed since its capture, and those appends stay visible
+    /// in the new warm snapshot and in the protected snapshots it did not fold.
+    async fn commit_cold_promotion(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+        cutoff: i64,
+        folded_protected_snapshot_ids: &[String],
+        cold_files: &[ColdTierFile],
+    ) -> CatalogResult<()>;
+
     /// Upsert the persisted primary-key existence index (a bloom checkpoint),
     /// tagged with the snapshot id it covers. Stored in the metastore so it is
     /// captured by metastore snapshots — letting both a restart and a new node

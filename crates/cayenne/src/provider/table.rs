@@ -2613,6 +2613,14 @@ pub struct CayenneTableProvider {
     /// first fire.
     #[cfg(test)]
     pub(crate) test_rewrite_post_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only hook run by an off-lock cold promotion after it releases `write_lock`,
+    /// before it builds its plan from the captured view. Consumed on first fire.
+    #[cfg(test)]
+    pub(crate) test_cold_promotion_post_capture_hook:
+        Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only hook after the first carry, before writers are held off.
+    #[cfg(test)]
+    pub(crate) test_cold_promotion_post_carry_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -3314,6 +3322,12 @@ pub struct CayenneTableProvider {
     /// every `cold_tier_gc_interval_ms` regardless of the (finer) promotion tick
     /// cadence. `None` until the first sweep.
     cold_gc_last_run: Arc<ParkingMutex<Option<Instant>>>,
+    /// Set when a cold promotion that encoded without holding `write_lock` found
+    /// the table changed beyond appends and discarded its output, so the next
+    /// promotion holds `write_lock` throughout and is certain to commit rather than
+    /// repeat the same loss against a table that keeps changing. Cleared by the
+    /// promotion it forces. See [`Self::promote_warm_to_cold`].
+    cold_promotion_locked_next: Arc<AtomicBool>,
     /// `DataFusion` table constraints advertising the primary key (unverified),
     /// so runtime features gated on `TableProvider::constraints()` — e.g.
     /// append-mode refresh's primary-key dedup path — can see it. `None` when
@@ -3381,6 +3395,51 @@ pub(crate) enum RewriteScope {
         cutoff: i64,
         folded: std::collections::HashSet<String>,
     },
+}
+
+/// What a cold promotion that encodes without holding `write_lock` captured while it
+/// held it, and what must still be true when it commits.
+///
+/// The promotion reads the current snapshot's files and the protected snapshots in
+/// its scan view. Its commit retires exactly those, so everything else the warm tier
+/// holds when it commits stays: a file appended to the snapshot is carried into the
+/// new warm snapshot, and a protected snapshot the scan did not read stays
+/// registered. Any other change since the capture — a delete or replacement of a row,
+/// a different snapshot, schema or in-memory tier, a read file that is gone — is not
+/// one the commit can fold in exactly, so the promotion discards its output.
+///
+/// A table takes this path only while it holds no tombstone, insert record, position
+/// delete, inline row or in-memory CDC tier row, so the clear its commit makes of the
+/// deletion state removes nothing that was not folded into the cold files.
+struct ColdPromotionCapture {
+    /// The current snapshot the scan read; its directory takes the appends.
+    snapshot_id: String,
+    /// Forced file removal or schema evolution invalidates the captured scan.
+    structural_version: u64,
+    /// The stored schema the cold files were written under.
+    schema: SchemaRef,
+    /// Names of the files of `snapshot_id` the scan reads.
+    scanned_files: HashSet<String>,
+    /// The protected snapshots the scan reads.
+    folded: HashSet<String>,
+    /// The sequence high-water at capture: every row the scan reads is at or below it.
+    cutoff: i64,
+}
+
+/// A file appended to the captured snapshot during a promotion, linked into the new
+/// warm snapshot.
+struct CarriedWarmFile {
+    name: String,
+    /// Its footer row count, `None` when the footer does not give an exact one.
+    rows: Option<i64>,
+}
+
+/// The outcome of [`CayenneTableProvider::reconcile_cold_promotion`].
+enum ColdPromotionReconcile {
+    /// Writers are held off and the carried files are linked: the commit may proceed.
+    Ready(PositionRewriteGuards),
+    /// The table changed in a way the commit cannot fold in; the promotion is discarded.
+    Changed(&'static str),
 }
 
 /// Builder for constructing a `CayenneTableProvider` with optional configuration.
@@ -10475,6 +10534,10 @@ impl CayenneTableProvider {
             test_rewrite_capture_probe: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_rewrite_post_capture_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_cold_promotion_post_capture_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_cold_promotion_post_carry_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -10649,6 +10712,7 @@ impl CayenneTableProvider {
             background_cold_tier_promoter: Arc::new(std::sync::OnceLock::new()),
             cold_gc_orphaned_first_seen: Arc::new(ParkingMutex::new(HashMap::new())),
             cold_gc_last_run: Arc::new(ParkingMutex::new(None)),
+            cold_promotion_locked_next: Arc::new(AtomicBool::new(false)),
             pk_constraints,
         };
 
@@ -12938,6 +13002,14 @@ impl CayenneTableProvider {
             test_rewrite_capture_probe: Arc::clone(&self.test_rewrite_capture_probe),
             #[cfg(test)]
             test_rewrite_post_capture_hook: Arc::clone(&self.test_rewrite_post_capture_hook),
+            #[cfg(test)]
+            test_cold_promotion_post_capture_hook: Arc::clone(
+                &self.test_cold_promotion_post_capture_hook,
+            ),
+            #[cfg(test)]
+            test_cold_promotion_post_carry_hook: Arc::clone(
+                &self.test_cold_promotion_post_carry_hook,
+            ),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
@@ -13047,6 +13119,7 @@ impl CayenneTableProvider {
             background_cold_tier_promoter: Arc::clone(&self.background_cold_tier_promoter),
             cold_gc_orphaned_first_seen: Arc::clone(&self.cold_gc_orphaned_first_seen),
             cold_gc_last_run: Arc::clone(&self.cold_gc_last_run),
+            cold_promotion_locked_next: Arc::clone(&self.cold_promotion_locked_next),
             pk_constraints: self.pk_constraints.clone(),
         }
     }
@@ -26062,8 +26135,7 @@ impl CayenneTableProvider {
                     table = self.table_metadata.table_name.as_str(),
                     %error,
                     new_snapshot_id = new_snapshot_id.as_str(),
-                    "Failed to populate snapshot manifest before compaction commit; \
-                     scan falls back to directory listing"
+                    "Failed to populate snapshot manifest before compaction commit; scan falls back to directory listing"
                 );
                 None
             }
@@ -27059,8 +27131,11 @@ impl CayenneTableProvider {
     /// Returns an error if flushing the mem/inline tiers, the canonical visible
     /// read, the cold object-store write, or the atomic catalog commit fails.
     ///
-    /// Holds `compaction_lock` for the whole graduation, then `write_lock` for
-    /// capture→write→commit. The compaction lock is the primary protection against
+    /// Holds `compaction_lock` for the whole graduation. It takes `write_lock` for the
+    /// capture and the commit; between them a table that holds no deletion state
+    /// encodes without holding writers off, and its commit carries the files appended
+    /// meanwhile (see [`ColdPromotionCapture`]). Any other table holds `write_lock` from
+    /// capture to commit. The compaction lock is the primary protection against
     /// promotion-vs-compaction interleavings: it serializes promotion against
     /// current-snapshot rewrites, protected-snapshot merges, and seq-prefix bakes.
     /// The full rewrite's snapshot-id publish check remains only as a
@@ -27230,6 +27305,297 @@ impl CayenneTableProvider {
         ))
     }
 
+    /// Capture the inputs of a cold promotion that will encode without holding
+    /// `write_lock`, or `None` when the table must hold writers off for the whole
+    /// promotion. The caller holds `write_lock` and took `scan_view` under it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete files cannot be listed.
+    async fn capture_cold_promotion(
+        &self,
+        scan_view: &ScanView,
+        cutoff: i64,
+    ) -> Result<Option<ColdPromotionCapture>> {
+        let raw = &scan_view.raw;
+        // The commit retires only snapshot files and protected snapshots, so a view
+        // that also reads inline rows or the RAM tier cannot be committed off-lock.
+        let reads_only_files = raw.inlined_view.is_empty()
+            && scan_view.visible_segments.is_empty()
+            && raw.mem_tier_shards.iter().all(|shard| shard.is_empty());
+        if !reads_only_files || self.cached_inlined_row_count() != 0 {
+            return Ok(None);
+        }
+        let scanned_files = raw
+            .warm_files
+            .files
+            .iter()
+            .filter_map(|file| file.object_meta.location.filename().map(str::to_string))
+            .collect();
+        let capture = ColdPromotionCapture {
+            snapshot_id: raw.current_snapshot_id.clone(),
+            structural_version: scan_view.structural_version,
+            schema: self.table_schema(),
+            scanned_files,
+            folded: raw.protected_map.keys().cloned().collect(),
+            cutoff,
+        };
+        if self.cold_promotion_inputs_changed(&capture).is_some() {
+            return Ok(None);
+        }
+        let delete_files = self
+            .catalog
+            .get_table_delete_files(&self.table_metadata.table_id)
+            .await?;
+        Ok(delete_files.is_empty().then_some(capture))
+    }
+
+    /// Why `capture` no longer describes the table, if it does not: something other
+    /// than an append landed since it was taken. Synchronous, so it can be judged
+    /// under `listing_fence`.
+    fn cold_promotion_inputs_changed(
+        &self,
+        capture: &ColdPromotionCapture,
+    ) -> Option<&'static str> {
+        if self
+            .structural_version
+            .read_validated(|| ())
+            .is_none_or(|(version, ())| version != capture.structural_version)
+        {
+            return Some("files were removed or the schema changed during the data move");
+        }
+        if self.get_current_snapshot_id() != capture.snapshot_id {
+            return Some("the table's data was replaced during the data move");
+        }
+        if self.table_schema() != capture.schema {
+            return Some("the table's schema changed during the data move");
+        }
+        if !self.mem_tier.is_empty() {
+            return Some("rows entered the in-memory tier during the data move");
+        }
+        let deletions = self.pk_deletion_snapshot();
+        if self.has_rows_hidden_from_file_statistics()
+            || deletions.delete_len() != 0
+            || deletions.insert_len() != 0
+        {
+            return Some("rows were deleted or replaced during the data move");
+        }
+        let protected = self.protected_snapshot_ids();
+        if !capture.folded.iter().all(|id| protected.contains(id)) {
+            return Some("a protected snapshot the data move read was merged during it");
+        }
+        None
+    }
+
+    /// Link the files appended to the captured snapshot since the last call into
+    /// `new_snapshot_id`, recording each in `carried` with its footer row count.
+    /// Returns `false` when a file the scan read or a previously carried file is no
+    /// longer in the snapshot: committing could restore rows removed in the meantime.
+    async fn carry_appended_warm_files(
+        &self,
+        capture: &ColdPromotionCapture,
+        new_snapshot_id: &str,
+        state: &dyn Session,
+        carried: &mut Vec<CarriedWarmFile>,
+    ) -> Result<bool> {
+        let listed = self
+            .list_snapshot_files_with_sizes(&capture.snapshot_id)
+            .await?;
+        let present: HashSet<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
+        if capture
+            .scanned_files
+            .iter()
+            .any(|name| !present.contains(name.as_str()))
+            || carried
+                .iter()
+                .any(|file| !present.contains(file.name.as_str()))
+        {
+            return Ok(false);
+        }
+        let already: HashSet<&str> = carried.iter().map(|file| file.name.as_str()).collect();
+        // An empty file is a write in progress, which the scan's listing skips as well.
+        let fresh: Vec<&str> = listed
+            .iter()
+            .filter(|(name, size)| {
+                *size > 0
+                    && !capture.scanned_files.contains(name)
+                    && !already.contains(name.as_str())
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if fresh.is_empty() {
+            return Ok(true);
+        }
+        self.link_or_copy_snapshot_files(&capture.snapshot_id, new_snapshot_id, &fresh)
+            .await?;
+        // The links are directory entries of the new snapshot, so they are durable
+        // before the catalog points at it, as encoded files are.
+        if !self.table_metadata.path.starts_with("s3://") {
+            Self::sync_snapshot_dir(&self.snapshot_dir_path_for(new_snapshot_id))
+                .await
+                .map_err(|source| Error::Catalog { source })?;
+        }
+        let mut linked = Vec::with_capacity(fresh.len());
+        for name in fresh {
+            let rows = self.warm_file_row_count(state, new_snapshot_id, name).await;
+            linked.push(CarriedWarmFile {
+                name: name.to_string(),
+                rows,
+            });
+        }
+        carried.extend(linked);
+        Ok(true)
+    }
+
+    /// The exact row count of `file_name` in the warm snapshot `snapshot_id`, from its
+    /// footer. `None` when it cannot be read or the footer holds no exact count.
+    async fn warm_file_row_count(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+        file_name: &str,
+    ) -> Option<i64> {
+        let url = ListingTableUrl::parse(Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            snapshot_id,
+        ))
+        .ok()?;
+        let store = state.runtime_env().object_store(&url).ok()?;
+        let meta = store
+            .head(&url.prefix().clone().join(file_name))
+            .await
+            .ok()?;
+        let file_stats = self
+            .context
+            .file_format()
+            .infer_stats(state, &store, self.table_schema(), &meta)
+            .await
+            .ok()?;
+        file_stats
+            .num_rows
+            .get_value()
+            .and_then(|rows| i64::try_from(*rows).ok())
+    }
+
+    /// Hold writers off and bring the captured promotion up to date with the table:
+    /// wait out in-flight staged writes, flush inline rows a small append left in the
+    /// metastore, check that nothing but appends has landed since `capture`, and link
+    /// the files appended since the last [`Self::carry_appended_warm_files`].
+    ///
+    /// Writers are held off by `write_lock` and `visibility_lock`, the pair every
+    /// append publishes under, so nothing but a background inline flush, which
+    /// publishes a protected snapshot under `listing_fence` alone, can change what is
+    /// checked here before the caller commits. The caller checks that once more under
+    /// the fence it commits under.
+    async fn reconcile_cold_promotion(
+        &self,
+        capture: &ColdPromotionCapture,
+        new_snapshot_id: &str,
+        state: &dyn Session,
+        carried: &mut Vec<CarriedWarmFile>,
+    ) -> Result<ColdPromotionReconcile> {
+        let deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
+        let write = loop {
+            if Instant::now() >= deadline
+                || !self
+                    .drain_inflight_staged_writes(
+                        deadline.saturating_duration_since(Instant::now()),
+                    )
+                    .await
+            {
+                return Ok(ColdPromotionReconcile::Changed(
+                    "in-flight staged writes did not drain before the data move committed",
+                ));
+            }
+            let write = self.write_lock_arc().lock_owned().await;
+            if !self.has_inflight_staging_appends() {
+                break write;
+            }
+            // An append reserved between the wait and the lock; let it publish.
+            drop(write);
+        };
+        // Small appends left in the metastore as inline rows are visible there, and
+        // the commit does not clear them: flush them to files, which then stay.
+        if self.cached_inlined_row_count() > 0 {
+            self.checkpoint_inlined_data().await?;
+        }
+        let visibility = self.visibility_lock_arc().lock_owned().await;
+        let guards = PositionRewriteGuards {
+            _write: write,
+            _visibility: visibility,
+        };
+        if !self.maintenance_still_admitted() {
+            return Ok(ColdPromotionReconcile::Changed(
+                "the table's maintenance was closed during the data move",
+            ));
+        }
+        if self.cached_inlined_row_count() != 0 {
+            return Ok(ColdPromotionReconcile::Changed(
+                "inline rows could not be flushed before the data move committed",
+            ));
+        }
+        if let Some(reason) = self.cold_promotion_inputs_changed(capture) {
+            return Ok(ColdPromotionReconcile::Changed(reason));
+        }
+        if !self
+            .catalog
+            .get_table_delete_files(&self.table_metadata.table_id)
+            .await?
+            .is_empty()
+        {
+            return Ok(ColdPromotionReconcile::Changed(
+                "rows were deleted or replaced during the data move",
+            ));
+        }
+        if !self
+            .carry_appended_warm_files(capture, new_snapshot_id, state, carried)
+            .await?
+        {
+            return Ok(ColdPromotionReconcile::Changed(
+                "a file the data move read was removed from the warm tier",
+            ));
+        }
+        Ok(ColdPromotionReconcile::Ready(guards))
+    }
+
+    /// Record that a cold promotion discarded its output because the table changed
+    /// beyond appends while it encoded. The warm tier is intact and the uploaded
+    /// objects are left to the cold GC; the next promotion holds writers off, so it
+    /// commits however the table is written.
+    fn discard_cold_promotion(&self, reason: &str) {
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            reason,
+            "Discarding the data move to the datalake; the next move holds writers off until it commits"
+        );
+        maintenance_metrics::track_compaction(
+            self.table_metadata.table_name.as_str(),
+            CompactionKind::Datalake,
+            CompactionOutcome::AbortedConcurrentChange,
+        );
+        self.cold_promotion_locked_next
+            .store(true, Ordering::Release);
+    }
+
+    /// The in-memory visibility flip of a cold promotion that kept the warm content
+    /// it did not read. CALLER MUST HOLD `listing_fence.write()`. Like
+    /// [`Self::publish_overwrite_snapshot_fenced`], but the protected snapshots outside
+    /// `folded` stay registered: their rows were not part of the promotion.
+    fn publish_cold_promotion_fenced(
+        &self,
+        new_snapshot_id: &str,
+        new_listing_table: Arc<ListingTable>,
+        folded: &HashSet<String>,
+    ) {
+        self.update_current_snapshot_id(new_snapshot_id);
+        self.clear_deletion_caches_retaining_unfolded_snapshots(folded);
+        self.invalidate_inlined_cache();
+        self.mark_maintained_aggregates_stale();
+        self.listing_table.store(new_listing_table);
+    }
+
     async fn promote_warm_to_cold_inner(&self) -> Result<bool> {
         // Committed/failed belong to the tracked wrapper (which counts only
         // `Ok(true) | Err`); every non-committed exit below reports itself, so a
@@ -27326,8 +27692,11 @@ impl CayenneTableProvider {
             "Moving warm-tier data to the datalake (Hilbert clustered)"
         );
 
-        // Exclude writers for the whole graduation (mirrors begin_overwrite).
-        let _write_guard = self.write_lock_arc().lock_owned().await;
+        // Exclude writers while the input is captured. A table that holds no deletion
+        // state, in-memory tier or inline rows releases them once the capture is taken
+        // and encodes without holding writers off (see [`ColdPromotionCapture`]); any
+        // other table keeps them out for the whole graduation, as `begin_overwrite` does.
+        let mut write_guard = Some(self.write_lock_arc().lock_owned().await);
 
         // Drain in-flight pipelined Stage-B publishes before capturing the
         // visible set.
@@ -27396,6 +27765,7 @@ impl CayenneTableProvider {
         // files' across promotions. Watch `datalake_rewrite_selectivity`; if it
         // ratchets up, the counter-measure is a recluster policy (full rewrite
         // past a dirty-fraction threshold).
+        let no_tombstones = partition.tombstones == 0 && partition.dirty.is_empty();
         let (dirty_cold, clean_cold) = (Arc::new(partition.dirty), partition.clean);
 
         // Canonical visible read (all tiers, all deletes applied, single-version
@@ -27415,10 +27785,35 @@ impl CayenneTableProvider {
                 super::cold_partition::ColdScanFiles(Arc::clone(&dirty_cold)),
             )),
         );
-        let (plan, _generation_before) = self.rewrite_scan_plan(&ctx).await?;
+        let (scan_view, _generation_before) = self.rewrite_scan_view(&ctx).await?;
+        // The previous promotion discarded its output because the table changed beyond
+        // appends: this one holds writers off throughout, so it commits.
+        let hold_writers_off = self
+            .cold_promotion_locked_next
+            .swap(false, Ordering::AcqRel);
+        let capture = if no_tombstones && !hold_writers_off {
+            self.capture_cold_promotion(&scan_view, max_sequence)
+                .await?
+        } else {
+            None
+        };
+        if capture.is_some() {
+            drop(write_guard.take());
+        }
+        #[cfg(test)]
+        {
+            let hook = self.test_cold_promotion_post_capture_hook.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+        let plan = self
+            .plan_scan_from_view(&ctx.state(), None, &[], None, scan_view)
+            .await?;
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
+            writers_held_off = capture.is_none(),
             "Planned the cross-tier read stream for the data move"
         );
 
@@ -27487,10 +27882,76 @@ impl CayenneTableProvider {
         let mut cold_files = cold_files;
         cold_files.extend(clean_cold);
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        if !self.table_metadata.path.starts_with("s3://") {
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        if !is_s3 {
             let dir = self.snapshot_dir_path_for(&new_snapshot_id);
             Self::ensure_snapshot_dir_exists(&dir).await?;
         }
+        // The files appended to the captured snapshot while the data was encoded stay
+        // in the warm tier: they are carried into the new warm snapshot. The first
+        // pass links what has landed so far without holding writers off, so the held
+        // pass below carries only what lands after it.
+        let mut carried_warm_files: Vec<CarriedWarmFile> = Vec::new();
+        let state = ctx.state();
+        let _held_guards = if let Some(capture) = capture.as_ref() {
+            #[cfg(test)]
+            self.run_test_pre_rewrite_commit_hook().await;
+            match self
+                .carry_appended_warm_files(
+                    capture,
+                    &new_snapshot_id,
+                    &state,
+                    &mut carried_warm_files,
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                        .await;
+                    self.discard_cold_promotion(
+                        "a file the data move read was removed from the warm tier",
+                    );
+                    return Ok(false);
+                }
+                Err(error) => {
+                    self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                        .await;
+                    return Err(error);
+                }
+            }
+            #[cfg(test)]
+            {
+                let hook = self.test_cold_promotion_post_carry_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
+            }
+            match self
+                .reconcile_cold_promotion(
+                    capture,
+                    &new_snapshot_id,
+                    &state,
+                    &mut carried_warm_files,
+                )
+                .await
+            {
+                Ok(ColdPromotionReconcile::Ready(guards)) => Some(guards),
+                Ok(ColdPromotionReconcile::Changed(reason)) => {
+                    self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                        .await;
+                    self.discard_cold_promotion(reason);
+                    return Ok(false);
+                }
+                Err(error) => {
+                    self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                        .await;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         // A cold promotion has TWO visibility publication points: the metastore
         // commit (the cold manifest a scan's capture resolves) and the in-memory
         // snapshot flip (the warm snapshot id it captures). Publishing them at
@@ -27502,10 +27963,36 @@ impl CayenneTableProvider {
         // visibility flip. The hold is BOUNDED: the commit's write-conflict
         // retry loop is capped at DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS (4)
         // short transactions with ~10ms-base Fibonacci backoff (worst case
-        // tens of ms of sleep), and conflicts are rare here — promotion
-        // already serializes with this table's writers via `write_lock`.
+        // tens of ms of sleep), and conflicts are rare here — the commit runs
+        // with this table's writers excluded via `write_lock`.
         // Briefly blocked scans beat the double-count.
         let new_listing_table = self.build_overwrite_listing_table(&new_snapshot_id)?;
+        if !carried_warm_files.is_empty() {
+            // The new warm snapshot holds the carried files, so its manifest is
+            // authored before the commit makes it current. `min = 0` is the
+            // conservative tag (always eligible for a seq-prefix bake); a manifest
+            // failure leaves the scan on the directory listing.
+            let high_water = self.sequence_high_water().await;
+            if let Err(error) = self
+                .upsert_snapshot_manifest_from_listing(
+                    &new_snapshot_id,
+                    ManifestSequenceTag::Uniform {
+                        min: 0,
+                        max: high_water,
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to populate snapshot manifest before compaction commit; \
+                     scan falls back to directory listing"
+                );
+            }
+        }
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
@@ -27527,19 +28014,107 @@ impl CayenneTableProvider {
         // authoritative count; if it never lands, staying inexact is the right
         // resting state anyway.
         self.table_statistics.write().count_exact = false;
+        // Whether the commit left protected snapshots the scan did not read, whose
+        // rows the re-baseline below cannot count.
+        let mut kept_unread_protected = false;
         {
-            let _fence = self.listing_fence.write().await;
-            self.catalog
-                .commit_overwrite_to_cold(
-                    &self.table_metadata.table_id,
+            let fence = self.listing_fence.write().await;
+            if let Some(capture) = capture.as_ref() {
+                // A background inline flush publishes a protected snapshot under the
+                // fence without `write_lock`, so what the held checks saw is judged
+                // once more here, where nothing can change it before the commit.
+                if let Some(reason) = self.cold_promotion_inputs_changed(capture) {
+                    drop(fence);
+                    self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                        .await;
+                    self.discard_cold_promotion(reason);
+                    return Ok(false);
+                }
+                kept_unread_protected = self.protected_snapshot_ids().len() > capture.folded.len();
+                let folded_ids: Vec<String> = capture.folded.iter().cloned().collect();
+                if let Err(error) = self
+                    .catalog
+                    .commit_cold_promotion(
+                        &self.table_metadata.table_id,
+                        &capture.snapshot_id,
+                        &new_snapshot_id,
+                        capture.cutoff,
+                        &folded_ids,
+                        &cold_files,
+                    )
+                    .await
+                {
+                    if matches!(
+                        error,
+                        CatalogError::SnapshotReplaced { .. }
+                            | CatalogError::ProtectedSnapshotsReplaced { .. }
+                    ) {
+                        drop(fence);
+                        self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                            .await;
+                        self.discard_cold_promotion(
+                            "the metastore moved to another warm snapshot during the data move",
+                        );
+                        return Ok(false);
+                    }
+                    // A failed COMMIT response is not evidence of a rollback.
+                    // Read the authoritative snapshot pointer before deleting
+                    // files that may already be serving as the new warm tier.
+                    match self
+                        .catalog
+                        .get_table(&self.table_metadata.table_name)
+                        .await
+                    {
+                        Ok(table)
+                            if table.table_id == self.table_metadata.table_id
+                                && table.current_snapshot_id == new_snapshot_id => {}
+                        Ok(table)
+                            if table.table_id == self.table_metadata.table_id
+                                && table.current_snapshot_id == capture.snapshot_id =>
+                        {
+                            drop(fence);
+                            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                                .await;
+                            return Err(Error::Catalog { source: error });
+                        }
+                        _ => {
+                            self.publication_outcome_unknown
+                                .store(true, Ordering::Release);
+                            drop(fence);
+                            return Err(Error::IncompleteWrite {
+                                table: self.table_metadata.table_name.clone(),
+                                message: format!(
+                                    "the datalake data move's commit failed ({error}), and its outcome could not be confirmed. Its files are kept, and the table must be reloaded from its catalog. Restart Spice to reload it"
+                                ),
+                            });
+                        }
+                    }
+                }
+                self.publish_cold_promotion_fenced(
                     &new_snapshot_id,
-                    &cold_files,
-                )
-                .await?;
-            // Cold graduation's content is the registered cold files; the overwrite
-            // clear drops the warm tier's inline corpus with nothing to replace it,
-            // so there are no inline rows to republish.
-            self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table, None, None);
+                    new_listing_table,
+                    &capture.folded,
+                );
+                self.new_files_since_last_compaction
+                    .store(carried_warm_files.len(), Ordering::Release);
+            } else {
+                self.catalog
+                    .commit_overwrite_to_cold(
+                        &self.table_metadata.table_id,
+                        &new_snapshot_id,
+                        &cold_files,
+                    )
+                    .await?;
+                // Cold graduation's content is the registered cold files; the overwrite
+                // clear drops the warm tier's inline corpus with nothing to replace it,
+                // so there are no inline rows to republish.
+                self.publish_overwrite_snapshot_fenced(
+                    &new_snapshot_id,
+                    new_listing_table,
+                    None,
+                    None,
+                );
+            }
             // The third publication step, under the same fence: hand the manifest
             // this commit just wrote to the scan path as the cold half of the new
             // snapshot. Every subsequent capture then resolves both halves with no
@@ -27571,11 +28146,20 @@ impl CayenneTableProvider {
         // undercount as exact. An overflowing total reads as unknown like any other
         // unreadable count. (Unreachable for a real table — it needs more live rows
         // than `i64::MAX` — but the exactness claim should not rest on that.)
+        //
+        // A promotion that left appended files in the warm tier counts them too: their
+        // footers were read as they were carried. A protected snapshot the scan did not
+        // read is left uncounted, so it reads as an unknown count.
         let mut live_rows: Option<i64> = Some(0);
-        let mut counts_known = true;
+        let mut counts_known = !kept_unread_protected;
         for file in cold_files.iter() {
             live_rows = live_rows.and_then(|sum| sum.checked_add(file.row_count.max(0)));
             counts_known &= file.row_count > 0;
+        }
+        for file in &carried_warm_files {
+            let rows = file.rows.unwrap_or(0);
+            live_rows = live_rows.and_then(|sum| sum.checked_add(rows.max(0)));
+            counts_known &= rows > 0;
         }
         let counts_known = counts_known && live_rows.is_some();
         let live_rows = live_rows.unwrap_or(0);
@@ -27594,7 +28178,11 @@ impl CayenneTableProvider {
             self.taint_persisted_row_count_exactness().await;
         }
 
-        if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
+        // The prune drops every other snapshot's manifest rows, which would include
+        // a kept protected snapshot's; its scans then list its directory instead.
+        if !kept_unread_protected
+            && let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await
+        {
             tracing::warn!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -43125,6 +43713,18 @@ impl TableProvider for CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let ensure_known = || {
+            if self.publication_outcome_unknown.load(Ordering::Acquire) {
+                return Err(datafusion_common::DataFusionError::External(Box::new(
+                    Error::IncompleteWrite {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "an earlier write could not confirm whether it committed, so queries are refused until the table is reloaded from its catalog. Restart Spice to reload it".to_string(),
+                    },
+                )));
+            }
+            Ok(())
+        };
+        ensure_known()?;
         let reuse = self.prepare_scan(state, filters).await?;
         // Obtain the scan-view bundle from the demand cache. See
         // [`Self::scan_view_at_current_input`]. The KDI merge + visible mem-tier
@@ -43139,6 +43739,9 @@ impl TableProvider for CayenneTableProvider {
         // The fields are cloned out (cheap `Arc` / short-`String` / `im`-HAMT clones)
         // so downstream plan-build owns them exactly as when it captured inline.
         let scan_view = self.scan_view_at_current_input(reuse).await?;
+        // A failed catalog commit may have become uncertain while this capture
+        // waited for its listing fence. Its saved view cannot be published then.
+        ensure_known()?;
         #[cfg(test)]
         {
             let hook = self.test_post_scan_view_selection_hook.lock().take();
@@ -82878,6 +83481,8 @@ mod tests {
     mod append_only_compaction;
 
     mod auto_deletion_mode;
+
+    mod cold_promotion_off_lock;
 
     mod first_load_pk_filter;
 
