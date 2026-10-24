@@ -378,9 +378,11 @@ impl Drop for Container {
 const CREATE_ATTEMPTS: u32 = 3;
 
 /// Creates a container named `name`, first removing any container holding
-/// the name: one left behind by an interrupted run, or one the daemon went on
-/// to create after an earlier attempt here timed out. Only a request timeout
-/// is tried again; Docker's own errors (a conflict, a missing image) are not.
+/// the name, with its anonymous volumes: one left behind by an interrupted
+/// run, or one the daemon went on to create after an earlier attempt here
+/// timed out. Only a request timeout is tried again, plus a name conflict
+/// after one: that timed-out create can finish after the removal that
+/// preceded the next attempt. Docker's other errors are not tried again.
 async fn create_named(
     docker: &Docker,
     name: &str,
@@ -388,12 +390,14 @@ async fn create_named(
     attempts: u32,
 ) -> Result<ContainerCreateResponse> {
     let mut attempt = 1;
+    let mut timed_out = false;
     loop {
         let _ = docker
             .remove_container(
                 name,
                 Some(RemoveContainerOptions {
                     force: true,
+                    v: true,
                     ..Default::default()
                 }),
             )
@@ -411,6 +415,15 @@ async fn create_named(
             Err(bollard::errors::Error::RequestTimeoutError) if attempt < attempts => {
                 eprintln!(
                     "Creating container {name} timed out (attempt {attempt} of {attempts}); trying again"
+                );
+                timed_out = true;
+                attempt += 1;
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409, ..
+            }) if timed_out && attempt < attempts => {
+                eprintln!(
+                    "Container {name} already exists, likely from the create that timed out (attempt {attempt} of {attempts}); trying again"
                 );
                 attempt += 1;
             }
@@ -513,6 +526,8 @@ mod create_tests {
         /// Never answers, as a stalled daemon does.
         Stall,
         Created,
+        /// A 409: the name is taken.
+        Conflict,
         Fail,
     }
 
@@ -551,12 +566,20 @@ mod create_tests {
                             Some(Create::Created) => {
                                 ("201 Created", r#"{"Id":"c1","Warnings":[]}"#)
                             }
+                            Some(Create::Conflict) => {
+                                ("409 Conflict", r#"{"message":"name in use"}"#)
+                            }
                             Some(Create::Fail) | None => {
                                 ("500 Internal Server Error", r#"{"message":"boom"}"#)
                             }
                         }
                     } else {
-                        seen.lock().push("remove");
+                        // Removal must take the container's anonymous volumes too.
+                        seen.lock().push(if path.contains("v=true") {
+                            "remove"
+                        } else {
+                            "remove keeping volumes"
+                        });
                         ("404 Not Found", r#"{"message":"No such container"}"#)
                     };
                     let response = format!(
@@ -596,6 +619,32 @@ mod create_tests {
             "{error:?}"
         );
         assert_eq!(*calls.lock(), ["remove", "create", "remove", "create"]);
+    }
+
+    #[tokio::test]
+    async fn a_conflict_after_a_timed_out_create_is_tried_again() {
+        // The timed-out create finished after the second removal, so the
+        // second create finds the name taken.
+        let (docker, calls) =
+            fake_daemon(vec![Create::Stall, Create::Conflict, Create::Created]).await;
+        let created = super::create_named(&docker, "src", Config::default(), 3)
+            .await
+            .expect("the third create succeeds");
+        assert_eq!(created.id, "c1");
+        assert_eq!(
+            *calls.lock(),
+            ["remove", "create", "remove", "create", "remove", "create"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conflict_without_a_timed_out_create_is_not_tried_again() {
+        let (docker, calls) = fake_daemon(vec![Create::Conflict, Create::Created]).await;
+        let error = super::create_named(&docker, "src", Config::default(), 3)
+            .await
+            .expect_err("the name is taken");
+        assert!(format!("{error:#}").contains("name in use"), "{error:#}");
+        assert_eq!(*calls.lock(), ["remove", "create"]);
     }
 
     #[tokio::test]
