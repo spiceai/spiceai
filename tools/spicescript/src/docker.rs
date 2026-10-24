@@ -29,7 +29,10 @@ use bollard::{
         StartContainerOptions, StopContainerOptions,
     },
     image::CreateImageOptions,
-    secret::{ContainerStateStatusEnum, HealthConfig, HealthStatusEnum, HostConfig, PortBinding},
+    secret::{
+        ContainerCreateResponse, ContainerStateStatusEnum, HealthConfig, HealthStatusEnum,
+        HostConfig, PortBinding,
+    },
 };
 use futures::StreamExt;
 
@@ -146,26 +149,7 @@ impl Container {
             }),
             ..Default::default()
         };
-        // A container left behind by an interrupted run would hold the name.
-        let _ = docker
-            .remove_container(
-                &spec.name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-        let created = docker
-            .create_container(
-                Some(CreateContainerOptions {
-                    name: spec.name.as_str(),
-                    platform: None,
-                }),
-                config,
-            )
-            .await
-            .with_context(|| format!("Failed to create container {}", spec.name))?;
+        let created = create_named(&docker, &spec.name, config, CREATE_ATTEMPTS).await?;
         crate::cleanup::track_container(&created.id, &spec.name, spec.network.as_deref());
         let container = Self {
             docker,
@@ -388,6 +372,55 @@ impl Drop for Container {
     }
 }
 
+/// How many times `start_on` asks Docker to create a container whose create
+/// request timed out. A daemon on a busy CI host can stall for a few minutes,
+/// past bollard's 120 s request timeout, and then recover.
+const CREATE_ATTEMPTS: u32 = 3;
+
+/// Creates a container named `name`, first removing any container holding
+/// the name: one left behind by an interrupted run, or one the daemon went on
+/// to create after an earlier attempt here timed out. Only a request timeout
+/// is tried again; Docker's own errors (a conflict, a missing image) are not.
+async fn create_named(
+    docker: &Docker,
+    name: &str,
+    config: Config<String>,
+    attempts: u32,
+) -> Result<ContainerCreateResponse> {
+    let mut attempt = 1;
+    loop {
+        let _ = docker
+            .remove_container(
+                name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        match docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name,
+                    platform: None,
+                }),
+                config.clone(),
+            )
+            .await
+        {
+            Err(bollard::errors::Error::RequestTimeoutError) if attempt < attempts => {
+                eprintln!(
+                    "Creating container {name} timed out (attempt {attempt} of {attempts}); trying again"
+                );
+                attempt += 1;
+            }
+            result => {
+                return result.with_context(|| format!("Failed to create container {name}"));
+            }
+        }
+    }
+}
+
 async fn pull_if_missing(docker: &Docker, image: &str) -> Result<()> {
     if docker.inspect_image(image).await.is_ok() {
         return Ok(());
@@ -460,6 +493,119 @@ pub fn healthcheck(probe: &str) -> HealthConfig {
         retries: Some(120),
         start_period: Some(10_000_000_000),
         start_interval: Some(250_000_000),
+    }
+}
+
+#[cfg(test)]
+mod create_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use bollard::{API_DEFAULT_VERSION, Docker, container::Config};
+    use parking_lot::Mutex;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    /// How the fake daemon answers one create request.
+    #[derive(Clone, Copy)]
+    enum Create {
+        /// Never answers, as a stalled daemon does.
+        Stall,
+        Created,
+        Fail,
+    }
+
+    /// Serves the two Docker API calls `create_named` makes: each removal
+    /// answers 404, and the creates take the answers in `creates` in order.
+    /// Returns a client with a 1 s request timeout and the calls received.
+    async fn fake_daemon(creates: Vec<Create>) -> (Docker, Arc<Mutex<Vec<&'static str>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let creates = Arc::new(Mutex::new(creates.into_iter()));
+        let seen = Arc::clone(&calls);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                let creates = Arc::clone(&creates);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&request);
+                    let path = head.split(' ').nth(1).unwrap_or_default();
+                    let (status, body) = if path.contains("/containers/create") {
+                        seen.lock().push("create");
+                        let next = creates.lock().next();
+                        match next {
+                            Some(Create::Stall) => {
+                                tokio::time::sleep(Duration::from_secs(30)).await;
+                                return;
+                            }
+                            Some(Create::Created) => {
+                                ("201 Created", r#"{"Id":"c1","Warnings":[]}"#)
+                            }
+                            Some(Create::Fail) | None => {
+                                ("500 Internal Server Error", r#"{"message":"boom"}"#)
+                            }
+                        }
+                    } else {
+                        seen.lock().push("remove");
+                        ("404 Not Found", r#"{"message":"No such container"}"#)
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let docker = Docker::connect_with_http(&format!("http://{addr}"), 1, API_DEFAULT_VERSION)
+            .expect("client");
+        (docker, calls)
+    }
+
+    #[tokio::test]
+    async fn a_create_that_timed_out_is_tried_again_under_the_same_name() {
+        let (docker, calls) = fake_daemon(vec![Create::Stall, Create::Created]).await;
+        let created = super::create_named(&docker, "src", Config::default(), 3)
+            .await
+            .expect("the second create succeeds");
+        assert_eq!(created.id, "c1");
+        assert_eq!(*calls.lock(), ["remove", "create", "remove", "create"]);
+    }
+
+    #[tokio::test]
+    async fn the_last_timed_out_attempt_fails_with_the_timeout() {
+        let (docker, calls) = fake_daemon(vec![Create::Stall, Create::Stall]).await;
+        let error = super::create_named(&docker, "src", Config::default(), 2)
+            .await
+            .expect_err("every create timed out");
+        assert!(
+            matches!(
+                error.downcast_ref::<bollard::errors::Error>(),
+                Some(bollard::errors::Error::RequestTimeoutError)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(*calls.lock(), ["remove", "create", "remove", "create"]);
+    }
+
+    #[tokio::test]
+    async fn an_error_docker_returned_is_not_tried_again() {
+        let (docker, calls) = fake_daemon(vec![Create::Fail, Create::Created]).await;
+        let error = super::create_named(&docker, "src", Config::default(), 3)
+            .await
+            .expect_err("Docker refused the create");
+        assert!(format!("{error:#}").contains("boom"), "{error:#}");
+        assert_eq!(*calls.lock(), ["remove", "create"]);
     }
 }
 
