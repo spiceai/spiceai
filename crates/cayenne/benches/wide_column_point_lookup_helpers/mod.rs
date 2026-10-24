@@ -89,7 +89,14 @@ fn track(size: usize) {
             && !IN_BT.with(std::cell::Cell::get)
         {
             IN_BT.with(|g| g.set(true));
-            if BT_LEFT.fetch_sub(1, Ordering::Relaxed) > 0 {
+            // Take a credit only while one is left: two threads past the check above could
+            // otherwise both decrement the last one and wrap the count.
+            if BT_LEFT
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
                 let bt = std::backtrace::Backtrace::force_capture().to_string();
                 if let Ok(mut v) = BACKTRACES.lock() {
                     v.push((size, bt));
