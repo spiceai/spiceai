@@ -22,7 +22,8 @@ Against one parquet file (`amt DECIMAL(38,10)`, `price DECIMAL(10,2)`, `n INT`):
 2. id 5's `amt/3` contains `33333333333333333333` and not the `DOUBLE`
    garbage `33333333333333333440`.
 3. `price/7` truncates (`0.014285`, not `0.014286`).
-4. `SELECT n/2 FROM t_duckdb WHERE id = 1` is `3`.
+4. `SELECT n/2 FROM t_fed`, `t_duckdb`, and `t_sqlite` where `id = 1`
+   is exactly `[{"half":3}]`.
 5. `EXPLAIN` of the decimal query has no `//` in `base_sql`; the integer
    query still has `//`.
 
@@ -35,10 +36,10 @@ Needs a `spiced` with the `duckdb` (and optionally `sqlite`) feature, `curl`,
 and `python3` with `pyarrow` (`pip install 'numpy>=2' pyarrow`). The script
 starts `spiced` unless `REUSE=1`, writes each `/v1/sql` body under `WORKDIR`,
 and exits non-zero when `t_duckdb` disagrees with `t_fed`, `t_sqlite`
-`price/7` is not exactly `[{"id":1,"p7":0.014285}]`, integer `/` is not
-exactly `[{"half":3}]`, a result body is JSON `null`, or `EXPLAIN` still
-pushes decimal `/` as `//`. A launched `spiced` is killed on `EXIT`
-unless `KEEP=1`.
+`price/7` is not exactly `[{"id":1,"p7":0.014285}]`, `t_fed` / `t_duckdb`
+/ `t_sqlite` integer `/` is not exactly `[{"half":3}]`, a result body is
+JSON `null`, or `EXPLAIN` still pushes decimal `/` as `//`. A launched
+`spiced` is killed on `EXIT` unless `KEEP=1`.
 
 ```bash
 # from the repo root; writes a workdir under /tmp

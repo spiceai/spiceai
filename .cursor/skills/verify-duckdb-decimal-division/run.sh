@@ -231,6 +231,7 @@ def require_base_sql(name: str, text: str) -> str | None:
 fed = raw("t_fed")
 duck = raw("t_duckdb")
 half = raw("t_duckdb_int")
+fed_half = raw("t_fed_int")
 explain_dec = raw("explain_dec")
 explain_int = raw("explain_int")
 # SQLite: SKILL.md requires price/7, integer /, and the EXPLAIN guard.
@@ -245,6 +246,7 @@ require_rows("t_fed", fed)
 require_rows("t_duckdb", duck)
 require_rows("t_sqlite", sqlite)
 require_exact_rows("t_sqlite_price", sqlite_price, EXPECTED_SQLITE_PRICE, "price/7")
+require_exact_rows("t_fed_int", fed_half, EXPECTED_HALF, "integer n/2")
 require_exact_rows("t_duckdb_int", half, EXPECTED_HALF, "integer n/2")
 require_exact_rows("t_sqlite_int", sqlite_half, EXPECTED_HALF, "integer n/2")
 
