@@ -103,6 +103,7 @@ jobs:
               - 'test/source_versions.json'
               - 'crates/test-framework/src/source_versions.rs'
               - '.github/workflows/integration.yml'
+              - '.github/scripts/docker_pull.sh'
               - 'crates/data-connectors/connector-postgres/**'
               - 'crates/data-connectors/connector-postgres-common/**'
               - 'crates/data-connectors/connector-mysql/**'
@@ -408,12 +409,14 @@ jobs:
 
       - name: Pull database images
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        # docker_pull.sh retries a registry 5xx or a dropped connection.
+        shell: bash
         run: |
+          set -euo pipefail
           # Each source's default release line (the newest in test/source_versions.json).
-          for image in $(jq -r 'to_entries[] | select(.key != "description") | "\(.value.image):\(.value.versions[-1].version)"' test/source_versions.json); do
-            docker pull "${image}"
-          done
-          docker pull docker.io/gvenzl/oracle-free:latest
+          list="$(jq -r 'to_entries[] | select(.key != "description") | "\(.value.image):\(.value.versions[-1].version)"' test/source_versions.json)"
+          mapfile -t images <<<"${list}"
+          bash .github/scripts/docker_pull.sh "${images[@]}" docker.io/gvenzl/oracle-free:latest
 
       - name: Set up Spice.ai API Key
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -619,7 +622,7 @@ jobs:
         run: |
           set -euo pipefail
           image="$(jq -r --arg source "${SOURCE}" '.[$source].image' test/source_versions.json)"
-          docker pull "${image}:${VERSION}"
+          bash .github/scripts/docker_pull.sh "${image}:${VERSION}"
 
       - name: Run ${{ matrix.source }} ${{ matrix.version }} tests
         timeout-minutes: 45
