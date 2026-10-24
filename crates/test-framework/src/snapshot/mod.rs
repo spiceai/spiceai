@@ -14,13 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{panic, sync::Arc};
+use std::{
+    panic,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::{flight::query_to_batches, queries::Query, utils::sanitize_record_batches};
 use arrow::{
     array::{ArrayRef, AsArray, Float32Array, Float64Array, RecordBatch},
     datatypes::{DataType, Float32Type, Float64Type},
 };
+use insta::{TextSnapshotKind, internals::TextSnapshotContents};
 use spiceai::Client as SpiceClient;
 
 pub const CAYENNE_PATH_FILTER_PATTERN: &str =
@@ -77,6 +82,58 @@ const CAYENNE_SCAN_COUNTERS_FILTER_REPLACEMENT: &str =
 /// Queries temporarily excluded from explain-plan snapshot validation because their
 /// plans are not yet stable enough to snapshot deterministically.
 const EXPLAIN_SNAPSHOT_SKIP_LIST: &[&str] = &["chbench_q5"];
+
+/// Explain snapshots live in this directory, relative to this source file.
+const EXPLAIN_SNAPSHOT_PATH: &str = "snapshots/explain";
+
+/// The directory insta reads explain snapshots from, resolved against the same
+/// workspace root insta uses (`INSTA_WORKSPACE_ROOT` when set).
+fn explain_snapshot_dir() -> PathBuf {
+    let workspace = insta::_macro_support::get_cargo_workspace(
+        insta::_macro_support::Workspace::DetectWithCargo(env!("CARGO_MANIFEST_DIR")),
+    );
+    let source_dir = Path::new(file!()).parent().unwrap_or_else(|| Path::new(""));
+    workspace.join(source_dir).join(EXPLAIN_SNAPSHOT_PATH)
+}
+
+/// Returns the label of the approved alternate plan that `explain_plan` matches.
+///
+/// An approved alternate sits beside the snapshot as
+/// `<snapshot file stem>@<label>.snap`, in the same format. Add one only when the
+/// optimizer picks between equally valid plans at random, for example two CTEs
+/// that tie in the Cayenne CTE rule. A plan that matches neither the snapshot nor
+/// an alternate still fails.
+fn approved_alternate_plan(
+    dir: &Path,
+    snapshot_name: &str,
+    explain_plan: &str,
+) -> anyhow::Result<Option<String>> {
+    let prefix = format!("{}__{snapshot_name}@", module_path!().replace("::", "__"));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(None);
+    };
+    let plan = TextSnapshotContents::new(explain_plan.to_string(), TextSnapshotKind::File);
+    for entry in entries {
+        let path = entry?.path();
+        let Some(label) = path
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .and_then(|file_name| file_name.strip_prefix(&prefix))
+            .and_then(|rest| rest.strip_suffix(".snap"))
+        else {
+            continue;
+        };
+        let alternate = insta::Snapshot::from_file(&path)
+            .map_err(|e| anyhow::anyhow!("read alternate plan {}: {e}", path.display()))?;
+        if alternate
+            .as_text()
+            .is_some_and(|text| text.matches_latest(&plan))
+        {
+            return Ok(Some(label.to_string()));
+        }
+    }
+    Ok(None)
+}
 
 fn make_tmpdir_regex_pattern(tempdir: &str) -> String {
     format!(r"(?:{tempdir}|private/{tempdir})/[^/]*/(\.spice/)?data")
@@ -265,19 +322,26 @@ pub async fn record_explain_plan(
     // Sort PartitionedUnionExec children for deterministic snapshot comparison
     let explain_plan = sort_partitioned_union_children(&explain_plan_raw.to_string());
 
+    let snapshot_name = if (scale_factor - 1.0).abs() < f64::EPSILON {
+        format!("{name}_{query_name}_explain")
+    } else {
+        format!("{name}_{query_name}_explain_sf{scale_factor}")
+    };
+
+    if let Some(label) =
+        approved_alternate_plan(&explain_snapshot_dir(), &snapshot_name, &explain_plan)?
+    {
+        println!("Explain plan for '{query_name}' matches approved alternate '{label}'");
+        return Ok(());
+    }
+
     let mut assertion_err: Option<String> = None;
 
     insta::with_settings!({
         description => format!("Query: {query_name}"),
         omit_expression => true,
-        snapshot_path => "snapshots/explain",
+        snapshot_path => EXPLAIN_SNAPSHOT_PATH,
     }, {
-        let snapshot_name = if (scale_factor - 1.0).abs() < f64::EPSILON {
-            format!("{name}_{query_name}_explain")
-        } else {
-            format!("{name}_{query_name}_explain_sf{scale_factor}")
-        };
-
         let result = panic::catch_unwind(|| {
             insta::assert_snapshot!(snapshot_name, explain_plan);
         });
@@ -405,7 +469,31 @@ mod tests {
         datatypes::{DataType, Field, Schema},
     };
 
-    use super::{round_float_columns, round_to_significant_digits};
+    use super::{approved_alternate_plan, round_float_columns, round_to_significant_digits};
+
+    #[test]
+    fn approved_alternate_matches_only_its_snapshot_and_plan() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path()
+                .join("test_framework__snapshot__s_q31_explain@materialize_ws.snap"),
+            "---\nsource: crates/test-framework/src/snapshot/mod.rs\ndescription: \"Query: q31\"\n---\n| plan | ws |\n",
+        )?;
+
+        assert_eq!(
+            approved_alternate_plan(dir.path(), "s_q31_explain", "| plan | ws |")?,
+            Some("materialize_ws".to_string())
+        );
+        assert_eq!(
+            approved_alternate_plan(dir.path(), "s_q31_explain", "| plan | ss |")?,
+            None
+        );
+        assert_eq!(
+            approved_alternate_plan(dir.path(), "s_q31_explain_sf100", "| plan | ws |")?,
+            None
+        );
+        Ok(())
+    }
 
     /// The property the rounding exists for: the same aggregate computed with a
     /// different partial-sum combine order must render identically. Inputs are

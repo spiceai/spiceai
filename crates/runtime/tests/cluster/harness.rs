@@ -87,14 +87,14 @@ fn allocate_ports(n: usize) -> Vec<u16> {
 
 /// The three ports each cluster node needs.
 #[derive(Debug, Clone, Copy)]
-struct NodePorts {
+pub(crate) struct NodePorts {
     http: u16,
     flight: u16,
     cluster: u16,
 }
 
 impl NodePorts {
-    fn allocate() -> Self {
+    pub(crate) fn allocate() -> Self {
         let ports = allocate_ports(3);
         Self {
             http: ports[0],
@@ -103,19 +103,19 @@ impl NodePorts {
         }
     }
 
-    fn http_addr(self) -> SocketAddr {
+    pub(crate) fn http_addr(self) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.http))
     }
 
-    fn flight_addr(self) -> SocketAddr {
+    pub(crate) fn flight_addr(self) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.flight))
     }
 
-    fn cluster_addr(self) -> SocketAddr {
+    pub(crate) fn cluster_addr(self) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.cluster))
     }
 
-    fn cluster_advertise(self) -> String {
+    pub(crate) fn cluster_advertise(self) -> String {
         format!("127.0.0.1:{}", self.cluster)
     }
 }

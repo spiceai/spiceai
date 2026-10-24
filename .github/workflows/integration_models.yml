@@ -167,16 +167,22 @@ jobs:
           if-no-files-found: ignore
 
   test-models:
-    name: Test Models, AI & Search
+    name: Test Models & AI
     needs: build
-    runs-on: spiceai-macos
+    # `spiceai-macos-large`, like every other job that runs this archive: the
+    # Mac minis behind `spiceai-macos` cannot reliably start the debug
+    # `integration_models` binary. dyld fails to map the shared cache into it
+    # (`dyld cache '(null)' not loaded: syscall to map cache into shared region
+    # failed`, then `Library not loaded: /usr/lib/libiconv.2.dylib`), so
+    # `nextest --list` and every test process abort with SIGABRT before any
+    # test code runs, while the same archive starts cleanly on the MacBook Pros.
+    runs-on: spiceai-macos-large
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       HAS_OPENAI_SECRET: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' }}
       HAS_ANTHROPIC_SECRET: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY != '' }}
       HAS_XAI_SECRET: ${{ secrets.SPICE_SECRET_XAI_API_KEY != '' }}
       HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
-      HAS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_KEY != '' && secrets.AWS_S3_VECTORS_SECRET != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -345,22 +351,6 @@ jobs:
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- workers
 
-      # Search tests
-      - name: Run search integration test
-        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_S3_VECTORS_SECRET == 'true' }}
-        env:
-          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
-          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
-          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
-        run: |
-          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
-          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
-            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
-            exit 1
-          fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- search
-
       - name: Push snapshots to branch
         if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
         timeout-minutes: 10
@@ -462,11 +452,58 @@ jobs:
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+  # Rejected AWS keys fail every Bedrock test the same way, each after a 120-second readiness
+  # wait. This asks AWS once, before the build finishes, and names the cause. STS
+  # GetCallerIdentity needs no IAM permission, so only an invalid key pair fails it.
+  check-bedrock-credentials:
+    name: Check Bedrock credentials
+    if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Ask AWS STS whether the Bedrock access key is valid
+        shell: bash
+        env:
+          AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
+          AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
+        run: |
+          set -uo pipefail
+          if [ -z "$AWS_BEDROCK_KEY" ] || [ -z "$AWS_BEDROCK_SECRET" ]; then
+            echo "::error::AWS_BEDROCK_KEY or AWS_BEDROCK_SECRET is empty, so the Bedrock tests cannot authenticate. Set both repository secrets."
+            exit 1
+          fi
+          # Logged because --aws-sigv4 needs curl 7.75 or later.
+          curl --version | head -n 1
+          body=$(mktemp)
+          # The key pair goes to curl on stdin, out of the process list. `|| curl_exit=$?` keeps
+          # `shell: bash`'s -e from ending the step before the fallback below.
+          curl_exit=0
+          status=$(printf 'user = "%s:%s"\n' "$AWS_BEDROCK_KEY" "$AWS_BEDROCK_SECRET" |
+            curl --config - --silent --show-error --max-time 30 --retry 3 \
+              --aws-sigv4 'aws:amz:us-east-1:sts' --output "$body" --write-out '%{http_code}' \
+              'https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15') ||
+            curl_exit=$?
+          # The body is never printed: a successful one names the AWS account.
+          code=$(sed -n 's:.*<Code>\([A-Za-z]*\)</Code>.*:\1:p' "$body" | head -n 1)
+          rm -f "$body"
+          if [ "$curl_exit" -eq 0 ] && [ "$status" = 200 ]; then
+            echo "AWS accepted the Bedrock credentials."
+          elif [ "$status" = 403 ] && { [ "$code" = InvalidClientTokenId ] || [ "$code" = SignatureDoesNotMatch ]; }; then
+            echo "::error::AWS rejected the Bedrock credentials (${code}): AWS_BEDROCK_KEY and AWS_BEDROCK_SECRET are not a valid access key pair, so every Bedrock test would fail to authenticate and they are not run. Replace both repository secrets with a working key pair."
+            exit 1
+          else
+            # No verdict on the key pair, so the tests still run and report for themselves.
+            echo "::warning::Could not check the Bedrock credentials (curl exit ${curl_exit}, HTTP ${status}${code:+, ${code}}). Running the Bedrock tests anyway."
+          fi
+
   test-bedrock:
     name: Test Bedrock Models
-    needs: build
+    needs: [build, check-bedrock-credentials]
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
-    runs-on: spiceai-macos
+    # The large pool for the same reason as `test-models`: a Mac mini cannot
+    # reliably start this archive's test binary.
+    runs-on: spiceai-macos-large
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     steps:

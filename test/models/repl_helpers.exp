@@ -145,6 +145,30 @@ proc repl_stalled {context} {
     exit 1
 }
 
+# What both REPLs print when a request fails: a red `Error`, then the message
+# (`eprintln!("\x1b[31mError\x1b[0m {e}")` in bin/spice/src/commands/chat.rs and
+# search.rs), after which they return to the prompt. Without a branch for it a
+# failed turn reads as an answer, because the prompt comes back either way.
+# Match it with `-ex`, escape sequences included: an answer or a search result
+# that merely contains the word "Error" is not a failed request.
+set repl_error_marker "\x1b\[31mError\x1b\[0m "
+
+# Reports a REPL that printed a failed request, then fails the script. `context`
+# says what the script was waiting for.
+proc repl_errored {context} {
+    # Read the rest of the error line, so the message is in the log above this
+    # report rather than cut off at the marker.
+    set timeout 5
+    expect {
+        -re {[^\n]*\n} {}
+        eof {}
+        timeout {}
+    }
+
+    send_user "\n$context: the REPL reported a failed request (the Error line above).\n"
+    exit 1
+}
+
 # Fails the script if the spawned process has exited. Writing to the pty of an
 # exited process succeeds silently, so a REPL that crashes while sitting idle at
 # its prompt is invisible to `repl_send` alone; reading finds the eof. Output
