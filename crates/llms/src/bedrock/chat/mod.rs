@@ -18,6 +18,7 @@ pub mod guardrail;
 pub(super) mod util;
 
 use crate::bedrock::BedrockClient;
+use crate::bedrock::api_error;
 use crate::bedrock::chat::guardrail::GuardRail;
 use crate::bedrock::chat::util::{
     chat_choice_stream, convert_usage, extract_from_content_block, into_fallible_stream,
@@ -658,19 +659,19 @@ impl BedrockConverse {
                     Err(SdkError::ServiceError(e)) => {
                         match e.into_err() {
                             ConverseStreamOutputError::InternalServerException(e) => {
-                                Some(Err(to_api_error(format!("Bedrock internal server error: {e}"))))
+                                Some(Err(api_error::with_code(format!("Bedrock internal server error: {e}"), Some("InternalServerException"))))
                             }
                             ConverseStreamOutputError::ThrottlingException(e) => {
-                                Some(Err(to_api_error(format!("Bedrock rate limit exceeded: {e}"))))
+                                Some(Err(api_error::with_code(format!("Bedrock rate limit exceeded: {e}"), Some("ThrottlingException"))))
                             }
                             ConverseStreamOutputError::ValidationException(e) => {
-                                Some(Err(to_api_error(format!("Bedrock validation error: {e}"))))
+                                Some(Err(api_error::with_code(format!("Bedrock validation error: {e}"), Some("ValidationException"))))
                             }
                             ConverseStreamOutputError::ModelStreamErrorException(e) => {
-                                Some(Err(to_api_error(format!("Bedrock model stream error: {e}"))))
+                                Some(Err(api_error::with_code(format!("Bedrock model stream error: {e}"), Some("ModelStreamErrorException"))))
                             }
                             ee => {
-                                Some(Err(to_api_error(format!("Bedrock error: {ee}"))))
+                                Some(Err(api_error::with_code(format!("Bedrock error: {ee}"), aws_sdk_bedrockruntime::error::ProvideErrorMetadata::code(&ee))))
                             }
                         }
                     }
@@ -838,7 +839,7 @@ impl Chat for BedrockConverse {
             .client
             .do_converse_stream(input)
             .await
-            .map_err(|e| to_api_error(e.to_string()))?;
+            .map_err(|e| api_error::from_client_error(e.as_ref()))?;
         Ok(Self::process_stream(self.model_id.as_str(), output.stream))
     }
 
@@ -851,7 +852,7 @@ impl Chat for BedrockConverse {
             .client
             .do_converse(input)
             .await
-            .map_err(|e| to_api_error(e.to_string()))?;
+            .map_err(|e| api_error::from_client_error(e.as_ref()))?;
         self.convert_converse_output(output)
     }
 
