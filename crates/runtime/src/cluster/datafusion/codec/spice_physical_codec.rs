@@ -21,7 +21,9 @@ use ballista_core::serde::BallistaPhysicalExtensionCodec;
 #[cfg(not(windows))]
 use cayenne::provider::CayenneAccelerationExec;
 use data_components::http::provider::{HttpExec, HttpTableProvider};
-use data_connector_api::listing::NanSafeListingPhysicalCodec;
+use data_connector_api::listing::{
+    decode_nan_safe_listing_parquet_scan, is_nan_safe_listing_parquet_payload,
+};
 use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result, TableReference, exec_err};
 use datafusion::execution::{FunctionRegistry, TaskContext};
@@ -91,9 +93,16 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Strict magic prefix: try before Ballista so a tagged listing
         // parquet scan cannot be misread as another extension node.
-        if let Ok(plan) = NanSafeListingPhysicalCodec.try_decode(buf, inputs, ctx, proto_converter)
-        {
-            return Ok(plan);
+        // Pass this codec into the inner `ParquetScan` decode so a pushed
+        // Spice UDF resolves through `try_decode_udf`. Do not swallow a
+        // decode error: `if let Ok` would fall through and hide it.
+        if is_nan_safe_listing_parquet_payload(buf) {
+            if !inputs.is_empty() {
+                return exec_err!(
+                    "NaN-safe listing parquet scan is a leaf and must not have inputs"
+                );
+            }
+            return decode_nan_safe_listing_parquet_scan(buf, ctx, self, proto_converter);
         }
 
         if let Ok(plan) = self.inner.try_decode(buf, inputs, ctx, proto_converter) {
@@ -1115,6 +1124,117 @@ mod tests {
         assert!(
             is_nan_safe_listing_parquet_scan(&decoded),
             "SpicePhysicalCodec decode must restore the NaN-safe source"
+        );
+    }
+
+    /// Cluster executors use `BallistaFunctionRegistry::default()`, so Spice
+    /// UDFs are not on the `TaskContext`. Inner `ParquetScan` decode must use
+    /// `SpicePhysicalCodec::try_decode_udf`, not `DefaultPhysicalExtensionCodec`.
+    #[tokio::test]
+    async fn listing_parquet_spice_udf_predicate_round_trips_through_spice_codec_on_executor_task_ctx()
+     {
+        use data_connector_api::listing::{
+            is_nan_safe_listing_parquet_scan,
+            wrap_listing_parquet_scans_to_refuse_untrusted_float_filters,
+        };
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        use datafusion::execution::FunctionRegistry;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::{ParquetReadOptions, SessionContext};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("udf.parquet");
+        let file_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(Int64Array::from_iter_values(0..20))],
+        )
+        .expect("batch");
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&path).expect("create parquet"),
+            Arc::clone(&file_schema),
+            None,
+        )
+        .expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let scheduler = runtime.datafusion().ctx.clone();
+        scheduler
+            .register_parquet(
+                "t",
+                path.to_str().expect("utf8 path"),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .expect("register parquet");
+
+        let sql = "SELECT k FROM t WHERE bucket(10, k) = 0 ORDER BY k";
+        let planned = scheduler
+            .sql(sql)
+            .await
+            .expect("sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let wrapped = wrap_listing_parquet_scans_to_refuse_untrusted_float_filters(planned)
+            .expect("wrap listing parquet scan");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&wrapped),
+            "scheduler plan must be NaN-safe before encode"
+        );
+        let planned_text = displayable(wrapped.as_ref()).indent(true).to_string();
+        assert!(
+            planned_text.contains("bucket"),
+            "the plan must use the Spice bucket UDF:\n{planned_text}"
+        );
+        assert!(
+            planned_text.contains("predicate="),
+            "bucket must be pushed onto the parquet scan so inner ParquetScan decode sees it:\n{planned_text}"
+        );
+
+        let codec = SpicePhysicalCodec::new(Arc::clone(&runtime)).expect("codec");
+        let proto = PhysicalPlanNode::try_from_physical_plan(Arc::clone(&wrapped), codec.as_ref())
+            .expect("NaN-safe listing parquet must serialize");
+
+        let executor = SessionContext::new();
+        let executor_task_ctx = executor.task_ctx();
+        assert!(
+            executor_task_ctx.udf("bucket").is_err(),
+            "executor TaskContext must not preload Spice UDFs"
+        );
+
+        let decoded = proto
+            .try_into_physical_plan(executor_task_ctx.as_ref(), codec.as_ref())
+            .expect("pushed Spice UDF predicate must decode through SpicePhysicalCodec");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&decoded),
+            "SpicePhysicalCodec decode must restore the NaN-safe source"
+        );
+
+        let expected = scheduler
+            .sql(sql)
+            .await
+            .expect("scheduler sql")
+            .collect()
+            .await
+            .expect("scheduler collect");
+        let expected_text = pretty_format_batches(&expected)
+            .expect("format scheduler rows")
+            .to_string();
+        let got = collect(decoded, executor_task_ctx)
+            .await
+            .expect("execute decoded plan");
+        let got_text = pretty_format_batches(&got)
+            .expect("format decoded rows")
+            .to_string();
+        assert_eq!(
+            got_text, expected_text,
+            "decoded executor plan must return the scheduler rows"
         );
     }
 }

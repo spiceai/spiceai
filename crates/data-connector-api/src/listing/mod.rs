@@ -28,7 +28,8 @@ pub use connector::{
 };
 pub use parquet_nan::{
     NanSafeListingPhysicalCodec, decode_nan_safe_listing_parquet_scan,
-    is_nan_safe_listing_parquet_scan, wrap_listing_parquet_scans_to_refuse_untrusted_float_filters,
+    is_nan_safe_listing_parquet_payload, is_nan_safe_listing_parquet_scan,
+    wrap_listing_parquet_scans_to_refuse_untrusted_float_filters,
 };
 
 /// All [`super::DataConnectorFactory`] that create [`ListingTableConnector`]s should have at least these parameters returned from the associated [`super::DataConnectorFactory::parameters`].

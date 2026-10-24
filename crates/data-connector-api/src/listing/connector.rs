@@ -4386,6 +4386,140 @@ mod tests {
         );
     }
 
+    /// Cluster executors use a default function registry. A pushed Spice UDF
+    /// on the parquet scan must still decode via the active codec's
+    /// `try_decode_udf`, not `DefaultPhysicalExtensionCodec`.
+    #[tokio::test]
+    async fn listing_parquet_spice_udf_predicate_round_trips_on_executor_task_ctx() {
+        use crate::listing::{
+            decode_nan_safe_listing_parquet_scan, is_nan_safe_listing_parquet_scan,
+        };
+        use datafusion::common::{Result, internal_datafusion_err};
+        use datafusion::execution::{FunctionRegistry, TaskContext};
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion_expr::ScalarUDF;
+        use datafusion_proto::physical_plan::{
+            AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
+            PhysicalProtoConverterExtension,
+        };
+        use datafusion_proto::protobuf::PhysicalPlanNode;
+        use runtime_datafusion::udf::register_core_scalar_udfs;
+
+        struct SchedulerUdfCodec {
+            functions: SessionContext,
+        }
+
+        impl std::fmt::Debug for SchedulerUdfCodec {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("SchedulerUdfCodec").finish_non_exhaustive()
+            }
+        }
+
+        impl PhysicalExtensionCodec for SchedulerUdfCodec {
+            fn try_decode(
+                &self,
+                buf: &[u8],
+                inputs: &[Arc<dyn ExecutionPlan>],
+                ctx: &TaskContext,
+                proto_converter: &dyn PhysicalProtoConverterExtension,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                if !inputs.is_empty() {
+                    return Err(internal_datafusion_err!(
+                        "NaN-safe listing parquet scan is a leaf and must not have inputs"
+                    ));
+                }
+                decode_nan_safe_listing_parquet_scan(buf, ctx, self, proto_converter)
+            }
+
+            fn try_encode(
+                &self,
+                _node: Arc<dyn ExecutionPlan>,
+                _buf: &mut Vec<u8>,
+                _proto_converter: &dyn PhysicalProtoConverterExtension,
+            ) -> Result<()> {
+                Err(internal_datafusion_err!(
+                    "NaN-safe listing parquet scans serialize via FileSource::try_to_proto"
+                ))
+            }
+
+            fn try_decode_udf(&self, name: &str, _buf: &[u8]) -> Result<Arc<ScalarUDF>> {
+                self.functions.udf(name)
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_tricky_parquet(&dir.path().join("tricky.parquet"));
+        let scheduler = register_tricky_listing(&format!("file://{}/", dir.path().display())).await;
+        register_core_scalar_udfs(&scheduler);
+
+        let sql = "SELECT k FROM t WHERE bucket(10, k) = 0 ORDER BY k";
+        let planned = scheduler
+            .sql(sql)
+            .await
+            .expect("plan sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&planned),
+            "the scheduler plan must wrap parquet scans before encode"
+        );
+        let planned_text = datafusion::physical_plan::displayable(planned.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            planned_text.contains("bucket"),
+            "the plan must use the Spice bucket UDF:\n{planned_text}"
+        );
+        assert!(
+            planned_text.contains("predicate="),
+            "bucket must be pushed onto the parquet scan so inner ParquetScan decode sees it:\n{planned_text}"
+        );
+
+        let proto = PhysicalPlanNode::try_from_physical_plan(
+            Arc::clone(&planned),
+            &DefaultPhysicalExtensionCodec {},
+        )
+        .expect("listing parquet scan must serialize");
+        assert!(
+            listing_scan_is_extension(&proto),
+            "encode must tag the scan:\n{proto:?}"
+        );
+
+        let executor = SessionContext::new();
+        let executor_task_ctx = executor.task_ctx();
+        assert!(
+            executor_task_ctx.udf("bucket").is_err(),
+            "executor TaskContext must not preload Spice UDFs"
+        );
+
+        let codec = SchedulerUdfCodec {
+            functions: scheduler.clone(),
+        };
+        let decoded = proto
+            .try_into_physical_plan(executor_task_ctx.as_ref(), &codec)
+            .expect("pushed Spice UDF predicate must decode on an executor TaskContext");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&decoded),
+            "decode must restore the NaN-safe source"
+        );
+
+        let expected = pretty_rows(&scheduler, sql).await;
+        let decoded_batches = datafusion::physical_plan::collect(
+            Arc::clone(&decoded),
+            Arc::clone(&executor_task_ctx),
+        )
+        .await
+        .expect("execute decoded plan");
+        let got = arrow::util::pretty::pretty_format_batches(&decoded_batches)
+            .expect("format decoded rows")
+            .to_string();
+        assert_eq!(
+            got, expected,
+            "decoded executor plan must return the scheduler rows"
+        );
+    }
+
     async fn collect_float_cell(
         plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
         task_ctx: Arc<datafusion::execution::TaskContext>,
@@ -4435,6 +4569,10 @@ mod tests {
                 .as_ref()
                 .is_some_and(|input| listing_scan_is_extension(input)),
             Some(PhysicalPlanType::LocalLimit(limit)) => limit
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            Some(PhysicalPlanType::Filter(filter)) => filter
                 .input
                 .as_ref()
                 .is_some_and(|input| listing_scan_is_extension(input)),

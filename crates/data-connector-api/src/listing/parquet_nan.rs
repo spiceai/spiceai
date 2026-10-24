@@ -54,8 +54,7 @@ use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_datasource::morsel::Morselizer;
 use datafusion_datasource::{PartitionedFile, TableSchema};
 use datafusion_proto::physical_plan::{
-    AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
-    PhysicalProtoConverterExtension,
+    AsExecutionPlan, PhysicalExtensionCodec, PhysicalPlanNodeExt, PhysicalProtoConverterExtension,
 };
 use datafusion_proto::protobuf::{
     PhysicalExtensionNode, PhysicalPlanNode, physical_plan_node::PhysicalPlanType,
@@ -78,14 +77,14 @@ impl PhysicalExtensionCodec for NanSafeListingPhysicalCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
-        _proto_converter: &dyn PhysicalProtoConverterExtension,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if !inputs.is_empty() {
             return Err(internal_datafusion_err!(
                 "NaN-safe listing parquet scan is a leaf and must not have inputs"
             ));
         }
-        decode_nan_safe_listing_parquet_scan(buf, ctx)
+        decode_nan_safe_listing_parquet_scan(buf, ctx, self, proto_converter)
     }
 
     fn try_encode(
@@ -101,7 +100,17 @@ impl PhysicalExtensionCodec for NanSafeListingPhysicalCodec {
     }
 }
 
+/// Whether `buf` is a tagged NaN-safe listing parquet payload.
+#[must_use]
+pub fn is_nan_safe_listing_parquet_payload(buf: &[u8]) -> bool {
+    buf.starts_with(NAN_SAFE_LISTING_PARQUET_MAGIC)
+}
+
 /// Decode an extension payload produced by [`NanSafeParquetSource::try_to_proto`].
+///
+/// The inner `ParquetScan` is rebuilt with `codec` so a pushed Spice UDF
+/// resolves through [`PhysicalExtensionCodec::try_decode_udf`]. Cluster
+/// executors do not preload those UDFs on the `TaskContext`.
 ///
 /// # Errors
 ///
@@ -110,12 +119,14 @@ impl PhysicalExtensionCodec for NanSafeListingPhysicalCodec {
 pub fn decode_nan_safe_listing_parquet_scan(
     buf: &[u8],
     ctx: &TaskContext,
+    codec: &dyn PhysicalExtensionCodec,
+    proto_converter: &dyn PhysicalProtoConverterExtension,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let rest = buf
         .strip_prefix(NAN_SAFE_LISTING_PARQUET_MAGIC)
         .ok_or_else(|| internal_datafusion_err!("not a NaN-safe listing parquet scan payload"))?;
     let proto = PhysicalPlanNode::try_decode(rest)?;
-    let plan = proto.try_into_physical_plan(ctx, &DefaultPhysicalExtensionCodec {})?;
+    let plan = proto.try_into_physical_plan_with_converter(ctx, codec, proto_converter)?;
     wrap_listing_parquet_scans_to_refuse_untrusted_float_filters(plan)
 }
 
