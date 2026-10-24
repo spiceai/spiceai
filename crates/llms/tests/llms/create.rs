@@ -129,17 +129,22 @@ pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<dyn Chat>, 
 }
 
 pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError> {
+    let token = std::env::var("HF_TOKEN").ok().map(SecretString::from);
     create_hf_model(
         model_id,
         None,
+        &[],
+        llms::hf::HubParams {
+            token: token.as_ref(),
+            token_in_spicepod: true,
+            endpoint: None,
+        },
         None,
-        std::env::var("HF_TOKEN")
-            .ok()
-            .map(SecretString::from)
-            .as_ref(),
         None,
-        None,
-        llms::chat::ReasoningDefault::default(),
+        llms::chat::ReasoningDefault {
+            model_name: model_id,
+            effort: None,
+        },
     )
     .await
 }

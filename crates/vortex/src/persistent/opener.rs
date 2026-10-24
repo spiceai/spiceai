@@ -73,6 +73,8 @@ use crate::convert::schema::calculate_physical_schema;
 use crate::metrics::PARTITION_LABEL;
 use crate::metrics::PATH_LABEL;
 use crate::persistent::cache::CachedVortexMetadata;
+use crate::persistent::cache::cache_footer;
+use crate::persistent::cache::can_cache_footer_after_open;
 use crate::persistent::deferred_projection::DeferredProjectionReader;
 use crate::persistent::key_blocks;
 use crate::persistent::reader::VortexReaderFactory;
@@ -289,7 +291,8 @@ impl FileOpener for VortexOpener {
                 ));
             }
 
-            if let Some(file_metadata_cache) = file_metadata_cache
+            let mut footer_cached = false;
+            if let Some(file_metadata_cache) = file_metadata_cache.as_ref()
                 && let Some(entry) = file_metadata_cache.get(file.path())
                 && entry.is_valid_for(&file.object_meta)
                 && let Some(vortex_metadata) = entry
@@ -298,12 +301,34 @@ impl FileOpener for VortexOpener {
                     .downcast_ref::<CachedVortexMetadata>()
             {
                 open_opts = open_opts.with_footer(vortex_metadata.footer().clone());
+                footer_cached = true;
             }
 
             let vxf = open_opts
                 .open_read(reader)
                 .await
                 .map_err(|e| exec_datafusion_err!("Failed to open Vortex file {e}"))?;
+
+            // Keep the footer this open just read, under the listing's own
+            // metadata, so the next open of the same file (another split of
+            // this scan, or a later query) skips the footer read. A file whose
+            // listing carries the recorded size and epoch mtime (see
+            // `synthetic_object_meta`) is only ever rewritten under a new
+            // path, so the size-and-mtime validity check cannot serve a stale
+            // footer; a listing with real store mtimes invalidates on change.
+            // Preserve the uncached open when its initial read also supplies
+            // row data that a footer-only cache entry would leave out.
+            if !footer_cached
+                && let Some(file_metadata_cache) = file_metadata_cache.as_ref()
+                && can_cache_footer_after_open(vxf.footer(), file.object_meta.size)
+            {
+                cache_footer(
+                    file_metadata_cache,
+                    file.object_meta.clone(),
+                    Arc::new(CachedVortexMetadata::new(&vxf)),
+                    "open",
+                );
+            }
 
             // This is the expected arrow types of the actual columns in the file, which might have different types
             // from the unified logical schema or miss

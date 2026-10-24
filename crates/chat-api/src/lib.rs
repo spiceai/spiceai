@@ -88,12 +88,26 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// Downloading the model's files failed. The source names the file, the repository, the
+    /// cause and the fix, so it is the whole message.
+    #[snafu(display("{source}"))]
+    FailedToDownloadModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        /// Whether only a Spicepod change clears it (see [`Error::is_configuration_error`]).
+        configuration: bool,
+    },
+
     #[snafu(display(
         "Unsupported value for `model_type` parameter. {source}  Verify the `model_type` parameter, and try again"
     ))]
     UnsupportedModelType {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Architecture '{architecture}' in {file} is not supported by this Spice release. Upgrade Spice, or use a GGUF of a supported architecture: https://spiceai.org/docs/components/models#gguf-architectures"
+    ))]
+    UnsupportedArchitecture { architecture: String, file: String },
 
     #[snafu(display(
         "The specified model identifier '{model}' is not valid for the source '{model_source}'. Verify the model exists, and try again."
@@ -183,6 +197,7 @@ impl Error {
             | Self::LocalModelConfigNotFound { .. }
             | Self::LocalTokenizerNotFound { .. }
             | Self::UnsupportedModelType { .. }
+            | Self::UnsupportedArchitecture { .. }
             | Self::ModelNotProvided { .. }
             | Self::UnknownModelSource { .. }
             | Self::UnsupportedTaskForModel { .. }
@@ -193,6 +208,7 @@ impl Error {
             | Self::UnsafePickleWeight { .. }
             | Self::ModelParameterFailed { .. }
             | Self::ResponsesNotSupported { .. } => true,
+            Self::FailedToDownloadModel { configuration, .. } => *configuration,
             // A loader can wrap a configuration error, such as rejected pickle weights.
             Self::FailedToLoadModel { source } => source
                 .downcast_ref::<Self>()

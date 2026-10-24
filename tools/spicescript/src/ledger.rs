@@ -23,6 +23,8 @@ limitations under the License.
 //! lists with another signature has changed, one it does not list is new, a
 //! listed check that no longer fails has been fixed (or no longer ran), and
 //! an entry with no issue group is unassigned: each of these fails the run.
+//! A listed check of a run that failed outside its steps (a source or
+//! instance that did not start) is reported as possibly not run, not as fixed.
 //! Only `--record-failures` writes the ledger, so adding an expected failure
 //! is always a reviewed change to the file.
 
@@ -101,6 +103,10 @@ pub struct Verdict {
     pub new: Vec<Failure>,
     /// Entries whose check did not fail.
     pub gone: Vec<Entry>,
+    /// Entries whose check did not fail in a run, or an instance of one, that
+    /// failed outside its steps: they may never have run, which says nothing
+    /// about whether their bugs are fixed.
+    pub not_run: Vec<Entry>,
     pub unassigned: Vec<Entry>,
     /// A script in `known-failing/` that failed nothing and expects nothing.
     pub passes_in_known_failing: Option<String>,
@@ -135,6 +141,20 @@ impl Verdict {
                 entry.key,
                 entry.query.map(|q| format!(" query {q}")).unwrap_or_default(),
                 entry.group
+            ));
+        }
+        let mut not_run: BTreeMap<&str, usize> = BTreeMap::new();
+        for entry in &self.not_run {
+            *not_run.entry(&entry.run).or_default() += 1;
+        }
+        for (run, n) in not_run {
+            let failures = if n == 1 {
+                "expected failure"
+            } else {
+                "expected failures"
+            };
+            out.push(format!(
+                "{run}\n{n} {failures} did not show, but the run failed outside its steps (reported above), so their checks may not have run. Fix that failure; do not re-record the ledger from this run."
             ));
         }
         if let Some(script) = &self.passes_in_known_failing {
@@ -224,9 +244,23 @@ impl Ledger {
                 entries.len()
             ));
         }
+        // A run, or one instance of it, that failed outside its steps: starting
+        // a source or an instance, or waiting for slots.
+        let stopped: Vec<(&str, &str)> = failures
+            .iter()
+            .filter(|f| f.is_outside_steps())
+            .map(|f| (f.run.as_str(), f.who.as_str()))
+            .collect();
         for (entry, matched) in entries.iter().zip(matched) {
             if !matched && !entry.may_pass {
-                verdict.gone.push(entry.clone());
+                let stopped = stopped
+                    .iter()
+                    .any(|&(run, who)| run == entry.run && (who.is_empty() || who == entry.who));
+                if stopped {
+                    verdict.not_run.push(entry.clone());
+                } else {
+                    verdict.gone.push(entry.clone());
+                }
             }
             if entry.group.is_empty() || entry.group == UNASSIGNED {
                 verdict.unassigned.push(entry.clone());
@@ -769,6 +803,54 @@ mod tests {
                 .problems()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_run_that_stopped_at_setup_does_not_report_its_entries_fixed() {
+        let script = script_in("t/known-failing/g");
+        let ledger = ledger(&script, vec![entry("a", false), entry("b", false)]);
+        let setup = Failure {
+            step: 0,
+            key: "setup".into(),
+            what: "setup".into(),
+            message: "Failed to start source 'src' (postgres): Failed to connect to Docker".into(),
+            ..failure("")
+        };
+        let verdict = ledger.judge(&script, &[setup]);
+        let problems = verdict.problems();
+        assert!(
+            !problems.iter().any(|p| p.contains("no longer fails")),
+            "entries that never ran are not fixed: {problems:?}"
+        );
+        assert_eq!(
+            problems.len(),
+            2,
+            "the setup failure and one line for the run: {problems:?}"
+        );
+        assert!(problems[1].contains("2 expected failures"), "{problems:?}");
+
+        // One instance that never got its slots stops only that instance's checks.
+        let instance = Failure {
+            step: 0,
+            key: "setup".into(),
+            what: "setup".into(),
+            message: "slots closed".into(),
+            ..failure("a")
+        };
+        let verdict = ledger.judge(&script, &[instance]);
+        assert_eq!(
+            verdict
+                .gone
+                .iter()
+                .map(|e| e.who.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"],
+            "the other instance ran, so its passing check is still fixed"
+        );
+
+        // A failing step is not a stop: the checks after it ran.
+        let verdict = ledger.judge(&script, &[failure("a")]);
+        assert_eq!(verdict.gone.len(), 1);
     }
 
     #[test]

@@ -14,11 +14,8 @@ proc chat {message}  {
     repl_send "$message\r"
 
     expect {
-        " ERROR " {
-            # allow stream to complete
-            sleep 2
-            send_user "Error detected\n"
-            exit 1
+        -ex $::repl_error_marker {
+            repl_errored "Waiting for the response to \"$message\""
         }
         "chat> " {
             # end of model response
@@ -26,6 +23,24 @@ proc chat {message}  {
         -re {[^\n]*\n} {
             # Still streaming — restart the wait. Whole lines only, for the
             # reason given in repl_helpers.exp.
+            exp_continue
+        }
+        -re {^[^\n]*\r(?!\n)} {
+            # Spinner frames (`\r<frame> `) and the `\r  \r` that clears them.
+            # Drop them without restarting the wait: a request stuck behind
+            # the spinner is a stall, however many frames it draws.
+            exp_continue -continue_timer
+        }
+        -re {^[^\r\n\x1b]+(?=[^\r\n\x1b]{5})} {
+            # Answer text still arriving. The CLI prints each token as it
+            # comes, and this script asks for one sentence, so the answer may
+            # carry no newline until it is complete and the per-line branch
+            # above would never restart the wait. Consume all but the last five
+            # characters: with fewer than six left, a `chat> ` split across two
+            # reads is still whole for the prompt branch when its tail arrives.
+            # Never consume an escape character or anything after it, so an
+            # error line split across two reads stays whole for the
+            # repl_error_marker branch, which starts with one.
             exp_continue
         }
         eof {

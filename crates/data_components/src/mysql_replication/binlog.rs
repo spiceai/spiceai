@@ -154,39 +154,54 @@ fn pre_dump_session_statements(
                 rejection_warning: None,
             })
             .collect();
-    // `net_write_timeout` is a system variable, so it needs the `SESSION`
-    // form — the `SET @net_write_timeout` spelling the heartbeats use would
-    // define an unrelated user variable and leave the server default in place.
-    // Its value has to be an integer literal: `MySQL` 8.x answers a function
-    // expression there with `ER_WRONG_TYPE_FOR_VAR` (1232) and keeps the
-    // inherited value, so the floor is resolved against the value read from
-    // this connection rather than by a server-side `GREATEST`.
-    //
-    // Nothing is issued for a session already at or above the floor — there is
-    // nothing to raise — and nothing is issued when the inherited value could
-    // not be read, since assigning the floor blind is what would clamp an
-    // operator's higher setting down. [`open_binlog_stream`] warns in that case.
-    if inherited_net_write_timeout.is_some_and(|inherited| inherited < DUMP_NET_WRITE_TIMEOUT_SECS)
+    // [`open_binlog_stream`] warns when the inherited value could not be read.
+    if let Some(sql) =
+        net_write_timeout_floor_statement(inherited_net_write_timeout, DUMP_NET_WRITE_TIMEOUT_SECS)
     {
         statements.push(PreDumpStatement {
-            sql: format!("SET SESSION net_write_timeout = {DUMP_NET_WRITE_TIMEOUT_SECS}"),
+            sql,
             rejection_warning: Some(NET_WRITE_TIMEOUT_NOT_RAISED),
         });
     }
     statements
 }
 
-/// The `net_write_timeout`, in seconds, this dump connection has inherited.
+/// The statement that raises a session's `net_write_timeout` to `floor`, or
+/// `None` when nothing may be assigned to it.
+///
+/// `net_write_timeout` is a system variable, so it needs the `SESSION` form —
+/// the `SET @net_write_timeout` spelling the heartbeats use would define an
+/// unrelated user variable and leave the server default in place. Its value has
+/// to be an integer literal: `MySQL` 8.x answers a function expression there
+/// with `ER_WRONG_TYPE_FOR_VAR` (1232) and keeps the inherited value, so the
+/// floor is resolved against the value read from the connection rather than by
+/// a server-side `GREATEST`.
+///
+/// Nothing is issued for a session already at or above the floor — there is
+/// nothing to raise — and nothing is issued when the inherited value could not
+/// be read, since assigning the floor blind is what would clamp an operator's
+/// higher setting down.
+pub(super) fn net_write_timeout_floor_statement(
+    inherited_net_write_timeout: Option<u32>,
+    floor: u32,
+) -> Option<String> {
+    inherited_net_write_timeout
+        .is_some_and(|inherited| inherited < floor)
+        .then(|| format!("SET SESSION net_write_timeout = {floor}"))
+}
+
+/// The `net_write_timeout`, in seconds, this connection has inherited.
 ///
 /// Read on the connection because the floor cannot be resolved server-side: see
-/// [`pre_dump_session_statements`] for why the assignment has to be a literal.
+/// [`net_write_timeout_floor_statement`] for why the assignment has to be a
+/// literal.
 ///
 /// `Ok(None)` is a server that answered with SQL `NULL`, which is a different
 /// thing from a read that failed and leads to the same floor being skipped for a
 /// different reason — so the error is returned rather than flattened into the
 /// `None`, and the caller says which one happened. Typed as `Option<u32>`
 /// internally so a `NULL` answer decodes instead of panicking in `FromRow`.
-async fn inherited_net_write_timeout(
+pub(super) async fn inherited_net_write_timeout(
     conn: &mut Conn,
 ) -> std::result::Result<Option<u32>, mysql_async::Error> {
     Ok(

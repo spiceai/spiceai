@@ -434,27 +434,31 @@ async fn huggingface(
     };
 
     let model_type = params.model_type.as_deref();
-    let hf_token = params.hf_token.as_ref();
+    let hub = llms::hf::HubParams {
+        token: params.hf_token.as_ref(),
+        // A chat model's `hf_token` is never loaded from a secret store.
+        token_in_spicepod: true,
+        endpoint: params.hf_endpoint.as_deref(),
+    };
 
-    // For GGUF models, we require user specify via `.files[].path`
-    let gguf_path = component
+    // For GGUF models, we require user specify via `.files[].path`: the shards of a split
+    // GGUF, and an MTP draft head, are each listed.
+    let gguf_files = component
         .find_all_file_path(ModelFileType::Weights)
         .iter()
-        .find_map(|p| {
-            let path = PathBuf::from_str(p.as_str());
-            if let Ok(Some(ext)) = path.as_ref().map(|pp| pp.extension())
-                && ext.eq_ignore_ascii_case("gguf")
-            {
-                return PathBuf::from_str(p.as_str()).ok();
-            }
-            None
-        });
+        .filter_map(|p| {
+            let path = PathBuf::from_str(p.as_str()).ok()?;
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+                .then_some(path)
+        })
+        .collect::<Vec<_>>();
 
-    if let Some(ref path) = gguf_path {
+    if !gguf_files.is_empty() {
         tracing::debug!(
-            "For Huggingface model {}, the GGUF model {} will be downloaded and used.",
+            "For Huggingface model {}, the GGUF files {:?} will be downloaded and used.",
             component.name,
-            path.display()
+            gguf_files
         );
     }
 
@@ -471,8 +475,8 @@ async fn huggingface(
     llms::chat::create_hf_model(
         &id,
         model_type,
-        gguf_path,
-        hf_token,
+        &gguf_files,
+        hub,
         chat_template_literal,
         distributed,
         llms::chat::ReasoningDefault {
@@ -860,6 +864,7 @@ async fn file(
                 model_name: &component.name,
                 effort: default_reasoning_effort.as_ref(),
             },
+            ..llms::chat::LocalModelOptions::default()
         },
     )
     .await

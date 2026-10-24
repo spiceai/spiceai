@@ -21,9 +21,22 @@ limitations under the License.
 //!   files, and reads them, retrying transient failures and waiting out rate limits, and it
 //!   sends the token only to the Hub's own origin.
 //! - [`location`] holds repository ids and the `hf://` locations that name files in them.
+//! - [`settings`] resolves which Hub a component reads, with which token, and where its
+//!   downloads are cached, with the precedence `huggingface_hub` uses.
+//! - [`snapshot`] downloads the files a component loads into the Hub's cache, in the layout
+//!   [`cache`] describes, and [`download`] fetches each one: resumed after an interruption and
+//!   checked against the Hub's checksum.
 
+pub mod cache;
 pub mod client;
+pub mod download;
+mod error;
 pub mod location;
+pub mod settings;
+pub mod snapshot;
 
 pub use client::{Commit, EntryKind, Error, FileRead, Hub, HubConfig, Result, TreeEntry};
+pub use error::DownloadError;
 pub use location::{RepoId, RepoType};
+pub use settings::{ParamToken, Settings};
+pub use snapshot::{Requester, Snapshot};

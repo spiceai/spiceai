@@ -28,6 +28,9 @@ pub struct HuggingFaceRerankerParams {
     /// key name used by the other reranker providers.
     #[param(runtime, autoload_secret, alias = "api_key")]
     pub hf_token: Option<SecretString>,
+    /// The Hugging Face Hub endpoint to download the reranker from, to read through a mirror or proxy of the Hub. Defaults to `HF_ENDPOINT`, then `https://huggingface.co`.
+    #[param(runtime)]
+    pub hf_endpoint: Option<String>,
     /// The maximum sequence length for the `(query, document)` pair.
     #[param(runtime)]
     pub max_seq_length: Option<usize>,
