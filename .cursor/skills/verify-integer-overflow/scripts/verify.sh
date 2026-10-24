@@ -21,6 +21,16 @@ cp "${SCRIPT_DIR}/../spicepod.yaml" "${ROOT}/spicepod.yaml"
 "${PYTHON}" "${SCRIPT_DIR}/gen_overflow_parquet.py" "${ROOT}/data/overflow.parquet"
 
 cd "${ROOT}"
+
+# Refuse a leftover listener. This helper leaves its server running, so a
+# second trunk/branch run on the same HTTP bind would query that instance and
+# attribute the bodies to this SPICED.
+if existing="$(curl -fsS --max-time 1 "http://${HTTP}/v1/ready" 2>/dev/null)"; then
+  echo "HTTP ${HTTP} is already responding (body=${existing}); not starting ${SPICED}." >&2
+  echo "Stop that process or set HTTP and FLIGHT to free ports." >&2
+  exit 1
+fi
+
 rm -f spiced.log spiced.pid
 "${SPICED}" --http "${HTTP}" --flight "${FLIGHT}" --metrics 127.0.0.1:0 >spiced.log 2>&1 &
 echo $! >spiced.pid

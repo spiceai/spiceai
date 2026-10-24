@@ -16,13 +16,14 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch};
+use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::array_value_to_string;
 use datafusion::catalog::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::Operator;
 use datafusion::optimizer::AnalyzerRule;
+use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::SessionContext;
 
 use crate::analyzer_rule::AnalyzerRulesBuilder;
@@ -253,6 +254,227 @@ async fn checked_session_sum_of_empty_and_all_null_is_null() {
         .await
         .expect("run empty SUM");
     assert_eq!(render_rows(&empty), vec!["NULL".to_string()]);
+}
+
+fn register_table(ctx: &SessionContext, name: &str, batch: RecordBatch) {
+    let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).expect("mem table");
+    ctx.register_table(name, Arc::new(table))
+        .expect("register table");
+}
+
+fn register_int64_partitions(ctx: &SessionContext, name: &str, partitions: &[&[Option<i64>]]) {
+    let schema = Arc::new(Schema::new(vec![Field::new("big", DataType::Int64, true)]));
+    let batches = partitions
+        .iter()
+        .map(|values| {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(values.to_vec())) as ArrayRef],
+            )
+            .expect("partition batch");
+            vec![batch]
+        })
+        .collect();
+    let table = MemTable::try_new(schema, batches).expect("partitioned table");
+    ctx.register_table(name, Arc::new(table))
+        .expect("register partitioned table");
+}
+
+async fn plan_and_collect(ctx: &SessionContext, sql: &str) -> (String, Vec<RecordBatch>) {
+    let df = ctx.sql(sql).await.expect("plan sql");
+    let plan = df.create_physical_plan().await.expect("physical plan");
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .unwrap_or_else(|error| panic!("collect `{sql}`: {error}\nplan:\n{rendered}"));
+    (rendered, batches)
+}
+
+async fn plan_and_error(ctx: &SessionContext, sql: &str) -> (String, String) {
+    let df = ctx.sql(sql).await.expect("plan sql");
+    let plan = df.create_physical_plan().await.expect("physical plan");
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let error = match collect(plan, ctx.task_ctx()).await {
+        Err(error) => error.to_string(),
+        Ok(batches) => panic!("expected overflow for `{sql}`, got {batches:?}\nplan:\n{rendered}"),
+    };
+    (rendered, error)
+}
+
+fn assert_plan_ran(plan: &str, sql: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(
+            plan.contains(needle),
+            "plan for `{sql}` must contain `{needle}`, got:\n{plan}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn checked_group_by_int64_sum_errors_one_group_keeps_the_other() {
+    let ctx = checked_session();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Utf8, false),
+            Field::new("big", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec!["a", "a", "b", "b"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(i64::MAX),
+                Some(1),
+                Some(1),
+                Some(2),
+            ])),
+        ],
+    )
+    .expect("grouped batch");
+    register_table(&ctx, "t_grp", batch);
+
+    let overflow_sql = "SELECT g, SUM(big) FROM t_grp GROUP BY g";
+    let (overflow_plan, overflow) = plan_and_error(&ctx, overflow_sql).await;
+    assert_plan_ran(&overflow_plan, overflow_sql, &["AggregateExec", "gby="]);
+    assert!(
+        contains_overflow(&overflow),
+        "GROUP BY SUM overflow, got {overflow}\nplan:\n{overflow_plan}"
+    );
+
+    let safe_sql = "SELECT g, SUM(big) FROM t_grp WHERE g = 'b' GROUP BY g";
+    let (safe_plan, safe) = plan_and_collect(&ctx, safe_sql).await;
+    assert_plan_ran(&safe_plan, safe_sql, &["AggregateExec", "gby="]);
+    assert_eq!(render_rows(&safe), vec!["b 3".to_string()]);
+}
+
+#[tokio::test]
+async fn checked_multiparts_int64_sum_cancels_and_overflows_on_merge() {
+    let ctx = checked_session();
+    register_int64_partitions(&ctx, "t_cancel", &[&[Some(i64::MAX)], &[Some(i64::MIN)]]);
+    register_int64_partitions(&ctx, "t_merge_ovf", &[&[Some(i64::MAX)], &[Some(i64::MAX)]]);
+
+    let cancel_sql = "SELECT SUM(big) FROM t_cancel";
+    let (cancel_plan, cancel) = plan_and_collect(&ctx, cancel_sql).await;
+    assert_plan_ran(
+        &cancel_plan,
+        cancel_sql,
+        &["AggregateExec", "mode=Final", "mode=Partial"],
+    );
+    assert!(
+        cancel_plan.contains("partitions=2") || cancel_plan.matches("MemoryExec").count() >= 1,
+        "merge test must scan the two-partition table, got:\n{cancel_plan}"
+    );
+    assert_eq!(
+        render_rows(&cancel),
+        vec!["-1".to_string()],
+        "MAX + MIN across partitions is -1\nplan:\n{cancel_plan}"
+    );
+
+    let overflow_sql = "SELECT SUM(big) FROM t_merge_ovf";
+    let (overflow_plan, overflow) = plan_and_error(&ctx, overflow_sql).await;
+    assert_plan_ran(
+        &overflow_plan,
+        overflow_sql,
+        &["AggregateExec", "mode=Final", "mode=Partial"],
+    );
+    assert!(
+        contains_overflow(&overflow),
+        "two-partition MAX+MAX must overflow, got {overflow}\nplan:\n{overflow_plan}"
+    );
+}
+
+#[tokio::test]
+async fn checked_uint64_sum_and_window_overflow_at_boundary() {
+    let ctx = checked_session();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("u", DataType::UInt64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![Some(u64::MAX), Some(1), Some(2)])),
+        ],
+    )
+    .expect("uint64 batch");
+    register_table(&ctx, "t_u", batch);
+
+    let sum_sql = "SELECT SUM(u) FROM t_u";
+    let (sum_plan, sum) = plan_and_error(&ctx, sum_sql).await;
+    assert_plan_ran(&sum_plan, sum_sql, &["AggregateExec"]);
+    assert!(
+        contains_overflow(&sum),
+        "SUM(UInt64) overflow, got {sum}\nplan:\n{sum_plan}"
+    );
+
+    let safe_sql = "SELECT SUM(u) FROM t_u WHERE id IN (2, 3)";
+    let (safe_plan, safe) = plan_and_collect(&ctx, safe_sql).await;
+    assert_plan_ran(&safe_plan, safe_sql, &["AggregateExec"]);
+    assert_eq!(render_rows(&safe), vec!["3".to_string()]);
+
+    let window_sql =
+        "SELECT SUM(u) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t_u";
+    let (window_plan, window) = plan_and_error(&ctx, window_sql).await;
+    assert_plan_ran(&window_plan, window_sql, &["Window"]);
+    assert!(
+        contains_overflow(&window),
+        "UInt64 window SUM overflow, got {window}\nplan:\n{window_plan}"
+    );
+}
+
+#[tokio::test]
+async fn checked_bounded_window_sum_retracts_and_null_only_frame_is_null() {
+    let ctx = checked_session();
+    let slide = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(5), Some(7), Some(11)])),
+        ],
+    )
+    .expect("slide batch");
+    register_table(&ctx, "t_slide", slide);
+
+    let slide_sql =
+        "SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t_slide";
+    let (slide_plan, slide_rows) = plan_and_collect(&ctx, slide_sql).await;
+    assert_plan_ran(&slide_plan, slide_sql, &["Window", "ROWS"]);
+    assert_eq!(
+        render_rows(&slide_rows),
+        vec!["5".to_string(), "12".to_string(), "18".to_string()],
+        "ROWS 1 PRECEDING must retract the leaving value\nplan:\n{slide_plan}"
+    );
+
+    let nulls = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![None, None])),
+        ],
+    )
+    .expect("null window batch");
+    register_table(&ctx, "t_win_null", nulls);
+
+    let null_sql = "SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t_win_null";
+    let (null_plan, null_rows) = plan_and_collect(&ctx, null_sql).await;
+    assert_plan_ran(&null_plan, null_sql, &["Window"]);
+    assert_eq!(
+        render_rows(&null_rows),
+        vec!["NULL".to_string(), "NULL".to_string()],
+        "NULL-only frames must stay NULL\nplan:\n{null_plan}"
+    );
+
+    let overflow_sql = "SELECT SUM(big) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t WHERE id IN (1, 3)";
+    let (overflow_plan, overflow) = plan_and_error(&ctx, overflow_sql).await;
+    assert_plan_ran(&overflow_plan, overflow_sql, &["Window"]);
+    assert!(
+        contains_overflow(&overflow),
+        "bounded window MAX+1 must overflow, got {overflow}\nplan:\n{overflow_plan}"
+    );
 }
 
 async fn run_slt(ctx: &SessionContext, script: &str) {

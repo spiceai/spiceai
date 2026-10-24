@@ -24,9 +24,11 @@ On trunk, the same two overflow queries return a wrapped integer and no error.
 The helper `scripts/verify.sh` in this skill directory:
 
 1. Writes a 4-row parquet (`id`, `big`, `i`) next to a spicepod.
-2. Starts `spiced --http 127.0.0.1:18490 --flight 127.0.0.1:18491` in that directory.
-3. Polls `GET /v1/ready` (bounded, no fixed sleep as the only wait).
-4. Posts each SQL to `/v1/sql` and prints the body.
+2. Refuses to start if `http://${HTTP}/v1/ready` already responds, so a leftover
+   instance cannot be queried as this `SPICED`.
+3. Starts `spiced --http 127.0.0.1:18490 --flight 127.0.0.1:18491` in that directory.
+4. Polls `GET /v1/ready` (bounded, no fixed sleep as the only wait).
+5. Posts each SQL to `/v1/sql` and prints the body.
 
 ```bash
 # After `cargo build -p spiced --no-default-features` (file / arrow / cayenne are always linked)
