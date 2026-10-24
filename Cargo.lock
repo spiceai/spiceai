@@ -10311,6 +10311,7 @@ dependencies = [
  "futures",
  "hex",
  "moka",
+ "nix 0.30.1",
  "object_store 0.13.2",
  "parking_lot",
  "percent-encoding",
