@@ -4151,6 +4151,125 @@ mod tests {
         assert_non_float_max_keeps_stats_shortcut(&ctx).await;
     }
 
+    /// Two row groups: RG0 is finite + `inf` (footer max `inf`), RG1 holds `NaN`
+    /// (footer max omits it). `TopK` `ORDER BY f DESC LIMIT 1` attaches a dynamic
+    /// `f > threshold` after RG0; `DataFusion`'s runtime `RowGroupPruner` then
+    /// evaluates that against footer min/max and can skip RG1. The listing
+    /// wrapper must not let that happen.
+    fn write_multi_rg_nan_after_inf_parquet(path: &std::path::Path) {
+        use arrow::array::{Float64Array, Int64Array};
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+        use datafusion::parquet::file::statistics::Statistics as ParquetStatistics;
+
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("f", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    Some(4),
+                    Some(5),
+                    Some(6),
+                ])),
+                Arc::new(Float64Array::from(vec![
+                    Some(1.0),
+                    Some(2.0),
+                    Some(f64::INFINITY),
+                    Some(f64::NAN),
+                    Some(0.5),
+                    Some(1.5),
+                ])),
+            ],
+        )
+        .expect("valid batch");
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(path).expect("create parquet"),
+            file_schema,
+            Some(properties),
+        )
+        .expect("parquet writer");
+        writer.write(&batch).expect("write parquet");
+        writer.close().expect("close parquet");
+
+        let reader = SerializedFileReader::new(std::fs::File::open(path).expect("open parquet"))
+            .expect("read footer");
+        assert_eq!(
+            reader.num_row_groups(),
+            2,
+            "TopK row-group pruning needs NaN in a later row group"
+        );
+        let double_max = |rg: usize| -> f64 {
+            match reader.metadata().row_group(rg).column(1).statistics() {
+                Some(ParquetStatistics::Double(stats)) => {
+                    *stats.max_opt().expect("row group must publish a float max")
+                }
+                other => panic!("expected double stats on f, got {other:?}"),
+            }
+        };
+        assert!(
+            double_max(0).is_infinite() && double_max(0).is_sign_positive(),
+            "RG0 footer max must be inf so TopK's first threshold is inf"
+        );
+        let rg1_max = double_max(1);
+        assert!(
+            (rg1_max - 1.5).abs() < f64::EPSILON,
+            "RG1 footer max must omit NaN (the hole the runtime pruner would use); got {rg1_max}"
+        );
+    }
+
+    /// Regression for the Codex finding on spiceai/spiceai#15510: `pruning=false`
+    /// does not stop `DataFusion`'s runtime dynamic-filter `RowGroupPruner`.
+    #[tokio::test]
+    async fn listing_parquet_topk_dynamic_filter_does_not_skip_nan_row_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_multi_rg_nan_after_inf_parquet(&dir.path().join("multi_rg.parquet"));
+        let ctx = register_tricky_listing(&format!("file://{}/", dir.path().display())).await;
+
+        let topk_plan =
+            physical_plan_with_statistics(&ctx, "SELECT f FROM t ORDER BY f DESC LIMIT 1").await;
+        assert!(
+            topk_plan.contains("TopK"),
+            "the query must take the TopK path that attaches a dynamic filter:\n{topk_plan}"
+        );
+        assert!(
+            !topk_plan.contains("predicate=DynamicFilter"),
+            "float TopK must not attach a dynamic filter the runtime pruner would evaluate against footer min/max:\n{topk_plan}"
+        );
+
+        let top = float_cell(&ctx, "SELECT f FROM t ORDER BY f DESC LIMIT 1").await;
+        assert!(
+            top.is_nan(),
+            "ORDER BY f DESC LIMIT 1 must be NaN, not the inf from RG0; got {top}\nplan:\n{topk_plan}"
+        );
+
+        let max_float = float_cell(&ctx, "SELECT MAX(f) AS mx FROM t").await;
+        assert!(
+            max_float.is_nan(),
+            "MAX(f) must be NaN on the multi-row-group file; got {max_float}"
+        );
+
+        let int_topk_plan =
+            physical_plan_with_statistics(&ctx, "SELECT k FROM t ORDER BY k DESC LIMIT 1").await;
+        assert!(
+            int_topk_plan.contains("DynamicFilter"),
+            "integer TopK must still attach a dynamic filter so trusted stats can prune:\n{int_topk_plan}"
+        );
+        assert_eq!(
+            pretty_rows(&ctx, "SELECT k FROM t ORDER BY k DESC LIMIT 1").await,
+            ["+---+", "| k |", "+---+", "| 6 |", "+---+"].join("\n")
+        );
+    }
+
     /// Regression test for Glue TPC-H plans that switched every `HashJoinExec`
     /// from `CollectLeft` to `Partitioned`. Glue lists Parquet and ORC tables
     /// with `file_extension: '*'`, and that format-selected listing scanned its

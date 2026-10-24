@@ -23,20 +23,35 @@ limitations under the License.
 //! `ColumnIndex` carries `nan_counts` only in newer specs, so this path treats
 //! every `Float16`/`Float32`/`Float64` bound as untrusted.
 
+use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{ColumnStatistics, Result, Statistics, stats::Precision};
-use datafusion::config::TableParquetOptions;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::{
+    ColumnStatistics, Result, Statistics, internal_datafusion_err, stats::Precision,
+};
+use datafusion::config::{ConfigOptions, TableParquetOptions};
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::{FileFormat, FileMeta};
 use datafusion::datasource::physical_plan::{FileScanConfig, FileSinkConfig, FileSource};
-use datafusion::physical_expr::{LexOrdering, LexRequirement};
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion_datasource::TableSchema;
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::projection::ProjectionExprs;
+use datafusion::physical_expr::{
+    EquivalenceProperties, LexOrdering, LexRequirement, PhysicalExpr, PhysicalSortExpr,
+};
+use datafusion::physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan, SortOrderPushdownResult};
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+use datafusion_datasource::file_stream::FileOpener;
+use datafusion_datasource::metadata::MetadataColumn;
+use datafusion_datasource::morsel::Morselizer;
+use datafusion_datasource::{PartitionedFile, TableSchema};
 use object_store::{ObjectMeta, ObjectStore};
 
 /// Listing-table `Parquet` reader that will not trust float min/max.
@@ -48,12 +63,17 @@ pub(crate) struct NanSafeParquetFormat {
 impl NanSafeParquetFormat {
     #[must_use]
     pub(crate) fn from_options(mut options: TableParquetOptions) -> Self {
-        // Row-group, page and bloom pruning read Parquet min/max directly.
-        // Those bounds omit `NaN`, and the scan predicate is attached after
-        // `create_physical_plan` via `try_pushdown_filters`, so it cannot be
-        // inspected here. `pushdown_filters` stays on: the predicate is still
-        // applied as a row filter. Integer and decimal `MAX` still use
-        // sanitized listing statistics.
+        // Static row-group, page and bloom pruning read Parquet min/max
+        // directly. Those bounds omit `NaN`, and the scan predicate is
+        // attached after `create_physical_plan` via `try_pushdown_filters`,
+        // so it cannot be inspected here. `pushdown_filters` stays on: a
+        // predicate that *is* attached is still applied as a row filter.
+        // Integer and decimal `MAX` still use sanitized listing statistics.
+        //
+        // `pruning=false` does not stop `DataFusion`'s runtime dynamic-filter
+        // `RowGroupPruner` (it never consults that flag). Float-column
+        // filters are refused after plan creation so that pruner never
+        // sees them.
         options.global.pruning = false;
         options.global.enable_page_index = false;
         options.global.bloom_filter_on_read = false;
@@ -102,6 +122,281 @@ pub(crate) fn drop_untrusted_float_bounds(stats: Statistics, schema: &Schema) ->
     Statistics {
         column_statistics,
         ..stats
+    }
+}
+
+/// Whether `expr` names a `Float16`/`Float32`/`Float64` (or dict-of-float)
+/// column. Those columns' Parquet min/max omit `NaN`, so a predicate on them
+/// must not reach the runtime row-group pruner.
+fn expr_references_untrusted_float(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    let mut found = false;
+    let walk = expr.apply(|node| {
+        if let Some(column) = node.downcast_ref::<Column>()
+            && column_bounds_omit_nan(column, schema)
+        {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found || walk.is_err()
+}
+
+fn column_bounds_omit_nan(column: &Column, schema: &Schema) -> bool {
+    let data_type = schema
+        .field_with_name(column.name())
+        .ok()
+        .map(arrow_schema::Field::data_type)
+        .or_else(|| {
+            schema
+                .fields()
+                .get(column.index())
+                .map(|field| field.data_type())
+        });
+    match data_type {
+        Some(data_type) => float_bounds_omit_nan(data_type),
+        // Unknown column: do not attach. The pruner would have nothing sound
+        // to evaluate, and refusing is the conservative answer.
+        None => true,
+    }
+}
+
+/// `ParquetFormat::create_physical_plan` always returns a `DataSourceExec`
+/// over a `FileScanConfig`. Replace its `ParquetSource` with a wrapper that
+/// will not attach float-column filters.
+fn wrap_to_refuse_untrusted_float_filters(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let exec = plan.as_ref().downcast_ref::<DataSourceExec>().ok_or_else(|| {
+        internal_datafusion_err!(
+            "listing parquet scan must be a DataSourceExec so float filters are not attached for stats pruning"
+        )
+    })?;
+    let config = exec.data_source().downcast_ref::<FileScanConfig>().ok_or_else(|| {
+        internal_datafusion_err!(
+            "listing parquet scan must be a FileScanConfig so float filters are not attached for stats pruning"
+        )
+    })?;
+    if config.file_source().is::<NanSafeParquetSource>() {
+        return Ok(plan);
+    }
+    let wrapped = Arc::new(NanSafeParquetSource::new(Arc::clone(config.file_source())));
+    let config = FileScanConfigBuilder::from(config.clone())
+        .with_source(wrapped)
+        .build();
+    Ok(DataSourceExec::from_data_source(config))
+}
+
+/// [`FileSource`] decorator that forwards everything except float-column
+/// filter pushdown. `DataFusion`'s runtime `RowGroupPruner` ignores
+/// `pruning=false` and evaluates the attached predicate against footer
+/// min/max, which omit `NaN`.
+///
+/// [`FileSource`] methods with a default body must be forwarded:
+/// inheriting a default compiles and then drops `inner`'s behavior.
+/// `try_to_proto` stays the default `Ok(None)` so a serialized scan is
+/// not a bare `ParquetSource` that would re-attach float filters.
+struct NanSafeParquetSource {
+    inner: Arc<dyn FileSource>,
+}
+
+impl NanSafeParquetSource {
+    fn new(inner: Arc<dyn FileSource>) -> Self {
+        Self { inner }
+    }
+}
+
+impl FileSource for NanSafeParquetSource {
+    fn create_file_opener(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> Result<Arc<dyn FileOpener>> {
+        self.inner
+            .create_file_opener(object_store, base_config, partition)
+    }
+
+    fn create_morselizer(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> Result<Box<dyn Morselizer>> {
+        // Parquet errors out of `create_file_opener`. The trait default
+        // would call back into this source's opener, so forward.
+        self.inner
+            .create_morselizer(object_store, base_config, partition)
+    }
+
+    fn table_schema(&self) -> &TableSchema {
+        self.inner.table_schema()
+    }
+
+    fn with_metadata_cols(
+        &self,
+        metadata_cols: Vec<MetadataColumn>,
+    ) -> Option<Arc<dyn FileSource>> {
+        let inner = self.inner.with_metadata_cols(metadata_cols)?;
+        Some(Arc::new(Self::new(inner)))
+    }
+
+    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
+        Arc::new(Self::new(self.inner.with_batch_size(batch_size)))
+    }
+
+    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        self.inner.filter()
+    }
+
+    fn projection(&self) -> Option<&ProjectionExprs> {
+        self.inner.projection()
+    }
+
+    fn metrics(&self) -> &ExecutionPlanMetricsSet {
+        self.inner.metrics()
+    }
+
+    fn file_type(&self) -> &str {
+        self.inner.file_type()
+    }
+
+    fn fmt_extra(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+        self.inner.fmt_extra(t, f)
+    }
+
+    fn supports_repartitioning(&self) -> bool {
+        self.inner.supports_repartitioning()
+    }
+
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        repartition_file_min_size: usize,
+        output_ordering: Option<LexOrdering>,
+        config: &FileScanConfig,
+    ) -> Result<Option<FileScanConfig>> {
+        self.inner.repartitioned(
+            target_partitions,
+            repartition_file_min_size,
+            output_ordering,
+            config,
+        )
+    }
+
+    fn try_pushdown_filters(
+        &self,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn FileSource>>> {
+        let schema = self.inner.table_schema().table_schema();
+        let mut parent = vec![PushedDown::No; filters.len()];
+        let mut trusted = Vec::new();
+        let mut trusted_at = Vec::new();
+        for (idx, filter) in filters.iter().enumerate() {
+            if !expr_references_untrusted_float(filter, schema.as_ref()) {
+                trusted.push(Arc::clone(filter));
+                trusted_at.push(idx);
+            }
+        }
+        if trusted.is_empty() {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                parent,
+            ));
+        }
+        let result = self.inner.try_pushdown_filters(trusted, config)?;
+        for (offset, idx) in trusted_at.into_iter().enumerate() {
+            parent[idx] = result.filters[offset];
+        }
+        let updated_node = result
+            .updated_node
+            .map(|inner| Arc::new(Self::new(inner)) as Arc<dyn FileSource>);
+        Ok(FilterPushdownPropagation {
+            filters: parent,
+            updated_node,
+        })
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+        eq_properties: &EquivalenceProperties,
+    ) -> Result<SortOrderPushdownResult<Arc<dyn FileSource>>> {
+        Ok(match self.inner.try_pushdown_sort(order, eq_properties)? {
+            SortOrderPushdownResult::Exact { inner } => SortOrderPushdownResult::Exact {
+                inner: Arc::new(Self::new(inner)),
+            },
+            SortOrderPushdownResult::Inexact { inner } => SortOrderPushdownResult::Inexact {
+                inner: Arc::new(Self::new(inner)),
+            },
+            SortOrderPushdownResult::Unsupported => SortOrderPushdownResult::Unsupported,
+        })
+    }
+
+    fn try_reverse_output(
+        &self,
+        order: &[PhysicalSortExpr],
+        eq_properties: &EquivalenceProperties,
+    ) -> Result<SortOrderPushdownResult<Arc<dyn FileSource>>> {
+        // Keep in lockstep with `try_pushdown_sort`: the trait default
+        // would otherwise delegate here and drop `inner`'s sort pushdown.
+        #[expect(
+            deprecated,
+            reason = "FileSource::try_reverse_output is deprecated; forward until it is removed"
+        )]
+        let result = self.inner.try_reverse_output(order, eq_properties)?;
+        Ok(match result {
+            SortOrderPushdownResult::Exact { inner } => SortOrderPushdownResult::Exact {
+                inner: Arc::new(Self::new(inner)),
+            },
+            SortOrderPushdownResult::Inexact { inner } => SortOrderPushdownResult::Inexact {
+                inner: Arc::new(Self::new(inner)),
+            },
+            SortOrderPushdownResult::Unsupported => SortOrderPushdownResult::Unsupported,
+        })
+    }
+
+    fn reorder_files(&self, files: Vec<PartitionedFile>) -> Vec<PartitionedFile> {
+        self.inner.reorder_files(files)
+    }
+
+    fn try_pushdown_projection(
+        &self,
+        projection: &ProjectionExprs,
+    ) -> Result<Option<Arc<dyn FileSource>>> {
+        let Some(inner) = self.inner.try_pushdown_projection(projection)? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self::new(inner))))
+    }
+
+    #[expect(
+        deprecated,
+        reason = "SchemaAdapterFactory is deprecated upstream; forward to `inner` until it is removed"
+    )]
+    fn with_schema_adapter_factory(
+        &self,
+        factory: Arc<dyn datafusion_datasource::schema_adapter::SchemaAdapterFactory>,
+    ) -> Result<Arc<dyn FileSource>> {
+        let inner = self.inner.with_schema_adapter_factory(factory)?;
+        Ok(Arc::new(Self::new(inner)))
+    }
+
+    #[expect(
+        deprecated,
+        reason = "SchemaAdapterFactory is deprecated upstream; forward to `inner` until it is removed"
+    )]
+    fn schema_adapter_factory(
+        &self,
+    ) -> Option<Arc<dyn datafusion_datasource::schema_adapter::SchemaAdapterFactory>> {
+        self.inner.schema_adapter_factory()
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        self.inner.apply_expressions(f)
     }
 }
 
@@ -180,7 +475,11 @@ impl FileFormat for NanSafeParquetFormat {
         state: &dyn Session,
         conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.inner.create_physical_plan(state, conf).await
+        // `ParquetFormat::create_physical_plan` downcasts `file_source` to
+        // `ParquetSource` and replaces any wrapper, so the source that
+        // refuses float filters must be installed on the finished plan.
+        let plan = self.inner.create_physical_plan(state, conf).await?;
+        wrap_to_refuse_untrusted_float_filters(plan)
     }
 
     async fn create_writer_physical_plan(
@@ -287,6 +586,44 @@ mod tests {
         assert_eq!(sanitized.column_statistics[3].min_value, exact_decimal(100));
         assert_eq!(sanitized.column_statistics[3].max_value, exact_decimal(999));
         assert_eq!(sanitized.num_rows, Precision::Exact(8));
+    }
+
+    fn column_expr(name: &str, index: usize) -> Arc<dyn PhysicalExpr> {
+        Arc::new(Column::new(name, index))
+    }
+
+    #[test]
+    fn expr_references_untrusted_float_detects_float_and_unknown_columns() {
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new(
+                "g",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Float32)),
+                true,
+            ),
+            Field::new("amt", DataType::Decimal128(10, 2), true),
+        ]);
+        assert!(!expr_references_untrusted_float(
+            &column_expr("k", 0),
+            &schema
+        ));
+        assert!(!expr_references_untrusted_float(
+            &column_expr("amt", 3),
+            &schema
+        ));
+        assert!(expr_references_untrusted_float(
+            &column_expr("f", 1),
+            &schema
+        ));
+        assert!(expr_references_untrusted_float(
+            &column_expr("g", 2),
+            &schema
+        ));
+        assert!(
+            expr_references_untrusted_float(&column_expr("missing", 9), &schema),
+            "unknown columns must not be attached for stats pruning"
+        );
     }
 
     #[test]
