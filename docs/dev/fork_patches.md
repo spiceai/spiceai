@@ -136,7 +136,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [text-splitter](#text-splitter) | `58f9c21006e01e5e968c5de80a0398b3f5ec439a` | `spiceai` |
 | [tiberius](#dependency-only-forks) | `9ae93c65222b51b0579945ffce5cba053cb23cca` | `spiceai` |
 | [tokio-rusqlite](#rusqlite-and-tokio-rusqlite) | `b10df82e3bbc4f4700562a14a3a00714cbc2f0c7` | `spiceai` |
-| [vortex](#vortex) | `806e48da24401eab673ef88ea93863cf8b1035e7` | `spiceai-55` |
+| [vortex](#vortex) | `2b1f2ed92cd534638341c99a8377e3f416219921` | `spiceai-55` plus split I/O overlap (spiceai/vortex#107) |
 
 `spiceai/spice-rs` and `spiceai/spicebench` are also pinned as git dependencies but
 are not forks — they are Spice repositories with no upstream, so nothing can drop a
@@ -168,6 +168,11 @@ one new Spice commit, a review fixup. The merge is where a patch could have been
 overwritten, so every row below was re-audited against it; the rows for fork PRs
 #87 and #95 were carried at the previous pin too but had no row until now.
 
+The current pin descends from that audited `spiceai-55` revision and adds only
+the split I/O overlap patch (spiceai/vortex#107). Its diff does not delete any
+of the earlier patch paths; `ScanBuilder::with_absolute_concurrency` remains in
+place. The new row below records the added patch and its guards.
+
 Fork PR #33, which made the sink honour `target_file_size_mb`, is one of those
 vendored patches — it touches `vortex-datafusion` and nothing else — so it has no
 row here. Its behaviour is covered where the code lives, by
@@ -195,6 +200,7 @@ row here. Its behaviour is covered where the code lives, by
 | Avoid session lock re-entry in writer init (fork PR #29). The patched code is gone at this pin: upstream rewrote writer initialisation to read the session once, and vortex-data/vortex#8919 replaced the lock-backed session registry with a lock-free one. By reading the code, the re-entry this avoided no longer exists; no run confirms it | Deadlock in `vortex-file` writer initialisation — the write never completes and the refresh hangs | silent (hang) | **GAP** — the deadlock needs a writer waiting on the session lock *between* the two reads this patch collapses into one, so a test either wins the race and passes on unpatched code or hangs the suite. That is a timing test, not a guard; what would close it is making the re-entry unrepresentable rather than avoided by convention |
 | Unsupported pushdown node bubbles `TRUE` rather than erroring; empty `IN` list handled (fork PR #8) | A predicate Vortex cannot convert fails the scan instead of degrading to "keep the row" | silent | vendored: the pushdown conversion now lives in `crates/vortex/src/convert/exprs.rs`, guarded by `test_empty_in_list_conversion_produces_boolean_literal` and the `can_be_pushed_down` unsupported-operand cases |
 | Intra-file decode parallelism — sub-split large chunk spans (fork PR #62) | Scan throughput on large chunk spans drops to single-stream decode | silent (perf) | **GAP** — a perf-only row; see [Open gaps](#open-gaps) for why it is deliberately unguarded |
+| Remote split I/O overlap with bounded decode permits (fork PR #107) | Automatic remote scans again hold their limited split slots while waiting for segment bytes; shared array waiters can also keep permits idle | silent (perf) | `crates/vortex/src/persistent/opener.rs` calls `ScanBuilder::with_split_io_overlap`, so loss of the API fails the build. The fork's `vortex-layout::scan::split_gate::tests` guard permit handoff and queued wakeups; the cold-tier A/B benchmark in PR #15506 measures the end-to-end benefit |
 
 ## datafusion
 
