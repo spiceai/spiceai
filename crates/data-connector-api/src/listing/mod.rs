@@ -21,9 +21,15 @@ use runtime_parameters::{ParameterSpec, Parameters};
 
 mod connector;
 mod infer;
+mod parquet_nan;
 pub use connector::{
     ListingTableConnector, ListingTableTemplate, ObjectVersionType, build_table_parquet_options,
     file_matches_extension, object_store_timeout_message,
+};
+pub use parquet_nan::{
+    NanSafeListingPhysicalCodec, decode_nan_safe_listing_parquet_scan,
+    is_nan_safe_listing_parquet_payload, is_nan_safe_listing_parquet_scan,
+    wrap_listing_parquet_scans_to_refuse_untrusted_float_filters,
 };
 
 /// All [`super::DataConnectorFactory`] that create [`ListingTableConnector`]s should have at least these parameters returned from the associated [`super::DataConnectorFactory::parameters`].
