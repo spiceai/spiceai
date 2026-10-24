@@ -264,13 +264,18 @@ impl IcebergDataConnector {
 
         props.extend(new_props);
 
-        let catalog_client = get_rest_catalog(base_uri, props, storage_factory.clone())
-            .await
-            .map_err(|e| Error::UnableToGetReadProvider {
-                dataconnector: "iceberg".into(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            })?;
+        let catalog_client = get_rest_catalog(
+            base_uri,
+            props,
+            storage_factory.clone(),
+            format!("dataset '{}'", dataset.name),
+        )
+        .await
+        .map_err(|e| Error::UnableToGetReadProvider {
+            dataconnector: "iceberg".into(),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::new(e),
+        })?;
 
         let catalog_client: Arc<dyn Catalog> = Arc::new(catalog_client);
 

@@ -344,6 +344,10 @@ A run fails on:
   out of `known-failing/`;
 - an entry with no group.
 
+When a run fails before its steps (a source or instance that did not start),
+its listed checks may never have run: they are reported in one line as not
+run, not as fixed. Fix the setup failure; don't re-record from that run.
+
 A query retried with `eventually` stops at the first attempt that fails the
 way the ledger lists for it, instead of waiting out its limit to report the
 same failure. Any other failure keeps retrying, and so does a `may-pass`

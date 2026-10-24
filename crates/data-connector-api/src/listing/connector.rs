@@ -17,6 +17,7 @@ limitations under the License.
 use crate::federated::FederatedTableProvider;
 use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
+use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -109,6 +110,12 @@ pub struct ListingTableTemplate {
     object_store: Arc<dyn ObjectStore>,
     /// Listing extension from [`ListingTableConnector::get_file_format_and_extension`].
     extension: String,
+    /// The dataset name, for schema-drift messages.
+    dataset_name: String,
+    /// Whether scans are checked for registered columns missing from every scanned file
+    /// (see [`data_components::file_schema_drift`]). Off when `schema_source_path` names the
+    /// schema: its columns need not appear in the data files.
+    check_schema_drift: bool,
 }
 
 impl ListingTableTemplate {
@@ -163,7 +170,7 @@ impl ListingTableTemplate {
         table: Arc<ListingTable>,
         table_path: ListingTableUrl,
     ) -> Arc<dyn TableProvider> {
-        if has_location_metadata(table.options()) {
+        let table: Arc<dyn TableProvider> = if has_location_metadata(table.options()) {
             Arc::new(LocationPruningListingTable::new(
                 table,
                 Arc::clone(&self.object_store),
@@ -173,7 +180,25 @@ impl ListingTableTemplate {
             ))
         } else {
             table
+        };
+        match self.schema_drift_guard() {
+            Some(guard) => FileSchemaDriftLayer::over(table, guard),
+            None => table,
         }
+    }
+
+    /// The guard that checks this dataset's scans for registered columns missing from every
+    /// scanned file, or `None` when the check is off or the file format cannot be checked.
+    fn schema_drift_guard(&self) -> Option<FileSchemaDriftGuard> {
+        (self.check_schema_drift
+            && FileSchemaDriftGuard::supports_format(self.options.format.as_ref()))
+        .then(|| {
+            FileSchemaDriftGuard::new(
+                self.dataset_name.clone(),
+                Arc::clone(&self.schema),
+                Arc::clone(&self.options.format),
+            )
+        })
     }
 }
 
@@ -1572,6 +1597,10 @@ pub trait ListingTableConnector: DataConnector {
                 "Enabled single-file ETag/Version caching for {}",
                 dataset.name
             );
+            let cached_table = match template.schema_drift_guard() {
+                Some(guard) => cached_table.with_schema_drift_guard(guard),
+                None => cached_table,
+            };
             return Ok(Arc::new(cached_table));
         }
 
@@ -1788,6 +1817,10 @@ pub trait ListingTableConnector: DataConnector {
             schema: final_schema,
             object_store,
             extension: extension.to_string(),
+            dataset_name: dataset.name.to_string(),
+            // An `ORC` collection infers from the scan path and ignores `schema_source_path`.
+            check_schema_drift: (table_path.is_collection() && listing_extension_is_orc(extension))
+                || !dataset.params.contains_key("schema_source_path"),
         })
     }
 
@@ -5831,6 +5864,38 @@ mod tests {
         decoder
             .push_range(0..3, bytes::Bytes::from_static(b"abc"))
             .expect("a well-formed range is still accepted after a rejected one");
+    }
+
+    /// A footer whose Thrift list header declares more elements than the file could hold is
+    /// refused before anything is reserved for that count.
+    ///
+    /// Every footer list (`schema`, `row_groups`, `key_value_metadata`, `column_orders`) and
+    /// the offset index's `page_locations` decodes into a `Vec` sized from the element count
+    /// in that header, so an unreadable file of a few bytes can ask for room for `i32::MAX`
+    /// elements before a single one is read. That happens during schema inference at dataset
+    /// initialization, and again on every refresh of the dataset, and the process is killed
+    /// for it. A Spice patch to the `spiceai/arrow-rs` fork bounds the count by the bytes left
+    /// in the input ([spiceai/arrow-rs#32](https://github.com/spiceai/arrow-rs/pull/32)).
+    ///
+    /// Driven through `ParquetMetaDataReader::decode_metadata`, the public surface the footer
+    /// decode sits behind. The error has to name the declared count: an oversized footer is a
+    /// malformed file, and an error that does not say so reads like a truncated download.
+    #[test]
+    fn an_oversized_footer_list_length_is_a_parquet_error_and_not_an_allocation() {
+        use datafusion::parquet::file::metadata::ParquetMetaDataReader;
+
+        // Struct header, then field 2 (`schema`): a `list<SchemaElement>` declaring
+        // i32::MAX elements, with no element following it.
+        const FOOTER: &[u8] = &[0x29, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x00];
+
+        let error = ParquetMetaDataReader::decode_metadata(FOOTER)
+            .expect_err("no file holds as many schema elements as this footer declares");
+        let message = error.to_string();
+        assert!(
+            message.contains("Thrift list declares 2147483647 elements"),
+            "the error has to name the declared count, or an oversized footer is \
+             indistinguishable from a truncated one: {message}"
+        );
     }
 
     /// A Parquet page whose header declares more uncompressed bytes than its

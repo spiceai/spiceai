@@ -44,6 +44,9 @@ use tokio::sync::Mutex;
 
 // Mistral loads and initializes models sequentially, so Mutex is used to control LLMs initialization.
 // This also prevents unpredicted behavior when we are attempting to load the same model multiple times in parallel.
+// The mutex holds only within one process, so only under `cargo test`. nextest runs each test in its
+// own process; the `local-llm-tests` group in `.config/nextest.toml` loads one model at a time there.
+// A test that takes this lock must also be in that group.
 static LOCAL_LLM_INIT_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const HF_TEST_MODEL: &str = "meta-llama/Llama-3.2-3B-Instruct";

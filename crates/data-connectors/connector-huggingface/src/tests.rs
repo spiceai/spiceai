@@ -1696,7 +1696,7 @@ mod store_reads {
         mock.branch("r/limited", "main", C1);
         let (_, hub) = registered(&mock, "r/limited");
         mock.0.lock().faults.rate_limited = 2;
-        let repo = RepoId::new("r", "limited").expect("a valid repository");
+        let repo = RepoId::dataset("r", "limited").expect("a valid repository");
         let commit = hub
             .commit(&repo, "main")
             .await

@@ -114,9 +114,37 @@ pub enum Error {
         endpoint: String,
         dataset: String,
     },
+
+    #[snafu(display(
+        "Failed to read the response from {endpoint} for {dataset}: {source}. Ask the \
+        endpoint for an uncompressed response by adding `Accept-Encoding: identity` to \
+        `http_headers`, or request less data per call. \
+        See: https://spiceai.org/docs/components/data-connectors/https"
+    ))]
+    CompressionRatio {
+        endpoint: String,
+        dataset: String,
+        source: http_body_limit::Error,
+    },
+
+    #[snafu(display("Failed to read the response from {endpoint} for {dataset}: {source}"))]
+    ResponseDecode {
+        endpoint: String,
+        dataset: String,
+        source: http_body_limit::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// How a message refers to the dataset: by name when there is one, and by a phrase that
+/// still reads as a sentence when there is not.
+fn dataset_subject(dataset_name: Option<&str>) -> String {
+    dataset_name.map_or_else(
+        || "this dataset".to_string(),
+        |name| format!("dataset '{name}'"),
+    )
+}
 
 /// The part of a *configured* endpoint that is safe to put in an error or a log line:
 /// scheme, host and port, and nothing else.
@@ -320,6 +348,11 @@ impl From<Error> for DataFusionError {
             }
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
+            }
+            // `Plan`, so a refresh does not re-ask: the response will expand as far again.
+            err @ Error::CompressionRatio { .. } => DataFusionError::Plan(err.to_string()),
+            err @ Error::ResponseDecode { .. } => {
+                DataFusionError::External(Box::new(std::io::Error::other(err.to_string())))
             }
             Error::Pagination { message } => {
                 DataFusionError::External(Box::new(std::io::Error::other(message)))
@@ -942,10 +975,7 @@ impl HttpTableProvider {
     /// How a message refers to the dataset: by name when there is one, and by a phrase
     /// that still reads as a sentence when there is not.
     fn dataset_subject(&self) -> String {
-        self.dataset_name.as_ref().map_or_else(
-            || "this dataset".to_string(),
-            |name| format!("dataset '{name}'"),
-        )
+        dataset_subject(self.dataset_name.as_deref())
     }
 
     /// Set what a response the origin did not mark successful becomes: a failed
@@ -1959,6 +1989,7 @@ impl HttpTableProvider {
             path_label,
             attempt_started,
             self.auth.as_ref().map(|auth| auth.header_name()),
+            self.dataset_name.as_deref(),
         )
         .await?;
 
@@ -1984,6 +2015,7 @@ impl HttpTableProvider {
         path_label: &str,
         attempt_started: Instant,
         auth_header_name: Option<&HeaderName>,
+        dataset_name: Option<&str>,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
         let detected_format = Self::detect_file_format(&response, path_label);
         tracing::debug!(
@@ -2099,6 +2131,33 @@ impl HttpTableProvider {
         // truncated compressed body, so it is NOT a reliable "permanent" signal; this mirrors
         // the retriable-error classification in `graphql/mod.rs`, which groups
         // is_timeout/is_connect/is_body/is_decode together as transient.
+        //
+        // The client is built with `http_body_limit::decode_manually`, so a compressed body
+        // is decoded here and refused once it expands past a ratio real responses do not
+        // reach. That refusal is permanent: asking again gets the same body.
+        let response = http_body_limit::buffer(response, http_body_limit::Limit::CompressionRatio)
+            .io_wait()
+            .await
+            .map_err(|e| match e {
+                http_body_limit::Error::Read { source } => {
+                    RetryError::transient(Error::http_request(endpoint, source))
+                }
+                source @ http_body_limit::Error::Decode { .. } => {
+                    RetryError::transient(Error::ResponseDecode {
+                        endpoint: endpoint_label(endpoint),
+                        dataset: dataset_subject(dataset_name),
+                        source,
+                    })
+                }
+                source @ (http_body_limit::Error::CompressionRatio { .. }
+                | http_body_limit::Error::TooLarge { .. }) => {
+                    RetryError::Permanent(Error::CompressionRatio {
+                        endpoint: endpoint_label(endpoint),
+                        dataset: dataset_subject(dataset_name),
+                        source,
+                    })
+                }
+            })?;
         let content = response
             .text()
             .io_wait()

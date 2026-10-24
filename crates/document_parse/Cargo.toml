@@ -23,7 +23,7 @@ quick-xml = "0.38"
 sha2 = "0.10"
 snafu.workspace = true
 tar = "0.4"
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
 ureq = "2"
 zip = "7.2"
 

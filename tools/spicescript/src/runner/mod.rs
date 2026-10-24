@@ -336,12 +336,17 @@ impl Failure {
             run: run.to_string(),
             who: who.to_string(),
             step: 0,
-            key: crate::ledger::SETUP.into(),
-            what: crate::ledger::SETUP.into(),
+            key: "setup".into(),
+            what: "setup".into(),
             query: None,
             labels: Vec::new(),
             message: message.to_string(),
         }
+    }
+
+    /// Whether this failure is outside any step; steps are numbered from 1.
+    pub fn is_outside_steps(&self) -> bool {
+        self.step == 0 && self.what == "setup"
     }
 }
 
