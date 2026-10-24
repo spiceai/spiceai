@@ -2659,4 +2659,188 @@ mod tests {
         );
         Ok(())
     }
+
+    /// A `VortexReaderFactory` whose readers count the bytes they are asked for.
+    #[derive(Debug)]
+    struct CountingReaderFactory {
+        object_store: Arc<dyn ObjectStore>,
+        bytes: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[derive(Clone)]
+    struct CountingReadAt {
+        inner: crate::persistent::reader::VortexReader,
+        bytes: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl vortex::io::VortexReadAt for CountingReadAt {
+        fn uri(&self) -> Option<&Arc<str>> {
+            self.inner.uri()
+        }
+        fn coalesce_config(&self) -> Option<vortex::io::CoalesceConfig> {
+            self.inner.coalesce_config()
+        }
+        fn concurrency(&self) -> usize {
+            self.inner.concurrency()
+        }
+        fn size(&self) -> futures::future::BoxFuture<'static, vortex::error::VortexResult<u64>> {
+            self.inner.size()
+        }
+        fn read_at(
+            &self,
+            offset: u64,
+            length: usize,
+            alignment: vortex::buffer::Alignment,
+        ) -> futures::future::BoxFuture<
+            'static,
+            vortex::error::VortexResult<vortex::array::buffer::BufferHandle>,
+        > {
+            self.bytes
+                .fetch_add(length as u64, std::sync::atomic::Ordering::Relaxed);
+            self.inner.read_at(offset, length, alignment)
+        }
+    }
+
+    impl VortexReaderFactory for CountingReaderFactory {
+        fn create_reader(
+            &self,
+            path: &str,
+            session: &VortexSession,
+        ) -> DFResult<crate::persistent::reader::VortexReader> {
+            let inner = DefaultVortexReaderFactory::new(Arc::clone(&self.object_store))
+                .create_reader(path, session)?;
+            Ok(Arc::new(CountingReadAt {
+                inner,
+                bytes: Arc::clone(&self.bytes),
+            }))
+        }
+    }
+
+    /// The bytes a key-block point read of `key` asks for, from a file of 16,384 rows with
+    /// a ~3 KB string column written with `strategy`, and the payload it returns.
+    async fn point_read_bytes(
+        strategy: Option<vortex::file::WriteStrategyBuilder>,
+        key: i64,
+    ) -> anyhow::Result<(u64, Vec<String>)> {
+        use datafusion::arrow::array::{AsArray, Int64Array};
+
+        let rows = 16_384_usize;
+        let payload = |row: usize| {
+            use std::fmt::Write as _;
+
+            let mut p = format!("{{\"id\":{row},\"items\":[");
+            let mut x = u64::try_from(row).expect("row fits in u64") ^ 0x9e37_79b9_7f4a_7c15;
+            while p.len() < 3000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                write!(p, "{{\"sku\":\"SKU-{:08x}\",\"qty\":{}}},", x >> 32, x % 50)
+                    .expect("writing to a String cannot fail");
+            }
+            p
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("p", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    0..i64::try_from(rows).expect("row count fits in i64"),
+                )),
+                Arc::new(StringArray::from_iter_values((0..rows).map(payload))),
+            ],
+        )?;
+        let session = match strategy {
+            Some(strategy) => VortexSession::default().set(strategy),
+            None => VortexSession::default(),
+        };
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = "wide_point_read.vortex";
+        let array = session
+            .arrow()
+            .from_arrow_record_batch(batch.clone(), &schema)?;
+        let mut write =
+            ObjectStoreWrite::new(Arc::clone(&object_store), &Path::parse(path)?).await?;
+        let summary = session
+            .write_options()
+            .write(&mut write, array.to_array_stream())
+            .await?;
+        write.shutdown().await?;
+
+        let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let table_schema = TableSchema::from(Arc::clone(&schema));
+        let filter = logical2physical(&col("a").eq(lit(key)), table_schema.table_schema());
+        let mut opener = make_opener(Arc::clone(&object_store), table_schema, Some(filter));
+        opener.projection = ProjectionExprs::from_indices(&[1], &schema);
+        opener.key_column = Some(Arc::from("a"));
+        opener.vortex_reader_factory = Arc::new(CountingReaderFactory {
+            object_store,
+            bytes: Arc::clone(&bytes),
+        });
+        take_point_reads();
+        let batches = opener
+            .open(PartitionedFile::new(path.to_string(), summary.size()))?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(
+            take_point_reads(),
+            1,
+            "the lookup must take the key-block point read"
+        );
+        let mut values = Vec::new();
+        for batch in &batches {
+            let column = batch.column(0);
+            match column.as_string_view_opt() {
+                Some(view) => values.extend(view.iter().map(|v| v.expect("not null").to_string())),
+                None => values.extend(
+                    column
+                        .as_string::<i32>()
+                        .iter()
+                        .map(|v| v.expect("not null").to_string()),
+                ),
+            }
+        }
+        assert_eq!(
+            values,
+            vec![payload(usize::try_from(key).expect("key is a row index"))],
+            "the lookup must return its row"
+        );
+        Ok((bytes.load(std::sync::atomic::Ordering::Relaxed), values))
+    }
+
+    /// A point read of one row of a wide string column reads only the data block that holds
+    /// it once blocks are capped by bytes (spiceai/spiceai#15323). This needs both halves of
+    /// the fork's change: blocks over the cap are split, and a read of a row range skips the
+    /// split blocks the row selection excludes. Without either, the read asks for every
+    /// block of the 8,192-row range that holds the key.
+    #[tokio::test]
+    async fn a_point_read_of_a_wide_column_reads_one_capped_block() -> anyhow::Result<()> {
+        let key = 12_345;
+        let (default_bytes, _) = point_read_bytes(None, key).await?;
+        // The writer's default strategy with the cap: the default compressor restricted to
+        // the encodings the session permits, as the writer builds it.
+        let permitted: vortex::utils::aliases::hash_set::HashSet<vortex::array::ArrayId> = {
+            use vortex::editions::EditionSessionExt;
+            SESSION
+                .enabled_component_ids(vortex::editions::ComponentKind::Array)
+                .into_iter()
+                .collect()
+        };
+        let capped = vortex::file::WriteStrategyBuilder::default()
+            .with_btrblocks_builder(
+                vortex::compressor::BtrBlocksCompressorBuilder::default()
+                    .retain_allowed_encodings(&permitted),
+            )
+            .with_data_block_max_bytes(Some(4 << 20));
+        let (capped_bytes, _) = point_read_bytes(Some(capped), key).await?;
+        eprintln!("point read bytes: uncapped {default_bytes}, capped {capped_bytes}");
+        assert!(
+            capped_bytes * 4 < default_bytes,
+            "a capped point read asked for {capped_bytes} bytes, an uncapped one {default_bytes}"
+        );
+        Ok(())
+    }
 }

@@ -87,9 +87,21 @@ fn permitted_schemes(compressor: BtrBlocksCompressorBuilder) -> BtrBlocksCompres
     compressor.retain_allowed_encodings(&PERMITTED)
 }
 
+/// The most uncompressed bytes one data block of a string or binary column may reference.
+///
+/// A data block is the smallest unit Vortex reads, and without a cap a string column's block holds
+/// 8,192 rows whatever their width: about 12.5 MiB for ~3 KB JSON documents, all of which a
+/// one-row lookup reads and copies (spiceai/spiceai#15323). Over the cap a block is split into
+/// power-of-two row counts; encodings are still chosen once per 8,192 rows. At 4 MiB a ~3 KB/row
+/// column reads ~7.5x fewer bytes per lookup for ~7% more bytes on disk; a column whose blocks
+/// are under the cap (rows under 512 bytes) is written exactly as without it.
+const DATA_BLOCK_MAX_BYTES: u64 = 4 << 20;
+
 /// A write strategy that compresses with the permitted schemes of `compressor`.
 fn write_strategy(compressor: BtrBlocksCompressorBuilder) -> WriteStrategyBuilder {
-    WriteStrategyBuilder::default().with_btrblocks_builder(permitted_schemes(compressor))
+    WriteStrategyBuilder::default()
+        .with_btrblocks_builder(permitted_schemes(compressor))
+        .with_data_block_max_bytes(Some(DATA_BLOCK_MAX_BYTES))
 }
 
 /// Build a [`BtrBlocksCompressorBuilder`] restricted to exactly `schemes`.
@@ -119,23 +131,19 @@ use crate::metadata::{
 /// the session-level strategy the base `VortexFormat` carries, used by
 /// maintenance writes and by delta writes that resolve to a full level.
 ///
-/// `Btrblocks` returns `None`: the Vortex session default IS the `BtrBlocks`
-/// cascade, so no override is registered (byte-for-byte the pre-feature
-/// behavior). `Zstd` extends the default search with the Zstd string schemes
-/// (which the default deliberately excludes); the cascade then picks them per
-/// column when they win. This is what makes the previously-dormant
-/// `cayenne_compression_strategy=zstd` param real.
-pub(crate) fn full_strategy_builder_for(
-    strategy: &CompressionStrategy,
-) -> Option<WriteStrategyBuilder> {
+/// `Btrblocks` is the `BtrBlocks` cascade the Vortex writer defaults to, with
+/// [`DATA_BLOCK_MAX_BYTES`] applied. `Zstd` extends the default search with the
+/// Zstd string schemes (which the default deliberately excludes); the cascade then
+/// picks them per column when they win.
+pub(crate) fn full_strategy_builder_for(strategy: &CompressionStrategy) -> WriteStrategyBuilder {
     match strategy {
-        CompressionStrategy::Btrblocks => None,
+        CompressionStrategy::Btrblocks => write_strategy(BtrBlocksCompressorBuilder::default()),
         CompressionStrategy::Zstd => {
             // The default cascade deliberately excludes the Zstd string scheme;
             // add it so the per-column search can pick it when it wins.
-            let builder =
-                BtrBlocksCompressorBuilder::default().with_new_scheme(&string::ZstdScheme);
-            Some(write_strategy(builder))
+            write_strategy(
+                BtrBlocksCompressorBuilder::default().with_new_scheme(&string::ZstdScheme),
+            )
         }
     }
 }
@@ -424,18 +432,7 @@ mod tests {
     #[test]
     fn zstd_full_strategy_includes_zstd_string_schemes() {
         // Engagement at the mapping level: `zstd` must actually add the Zstd
-        // string scheme to the search (the default set excludes it), and
-        // `btrblocks` must register no override (session default = the
-        // pre-feature cascade).
-        assert!(
-            full_strategy_builder_for(&CompressionStrategy::Btrblocks).is_none(),
-            "btrblocks must use the session-default strategy (no override)"
-        );
-        assert!(
-            full_strategy_builder_for(&CompressionStrategy::Zstd).is_some(),
-            "zstd must register a full-tier strategy override"
-        );
-
+        // string scheme to the search (the default set excludes it).
         // The pinned Vortex builder no longer exposes its scheme list, so probe
         // membership through `with_new_scheme`, which panics iff a scheme with
         // the same `SchemeId` is already registered.
@@ -508,6 +505,138 @@ mod tests {
             rich_light * 2 < canonical,
             "level 3 must Zstd-encode strings: {rich_light} bytes vs {canonical} canonical"
         );
+    }
+
+    /// Writes `batch` through `session` and returns the file bytes and its segment count.
+    async fn write_file(
+        session: vortex_session::VortexSession,
+        batch: &arrow::array::RecordBatch,
+    ) -> (vortex::buffer::ByteBuffer, usize) {
+        use vortex::array::stream::ArrayStreamAdapter;
+        use vortex::arrow::ArrowSessionExt;
+        use vortex::buffer::ByteBufferMut;
+        use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
+
+        let schema = batch.schema();
+        let arrow = session.arrow();
+        let dtype = arrow
+            .from_arrow_schema(&schema)
+            .expect("schema converts to a Vortex dtype");
+        let chunk = arrow.from_arrow_record_batch(batch.clone(), &schema);
+        drop(arrow);
+        let stream = ArrayStreamAdapter::new(dtype, futures::stream::iter([chunk]));
+        let mut file = ByteBufferMut::empty();
+        session
+            .write_options()
+            .write(&mut file, stream)
+            .await
+            .expect("write the probe table");
+        let file = file.freeze();
+        let segments = session
+            .open_options()
+            .open_buffer(file.clone())
+            .expect("open the probe table")
+            .footer()
+            .segment_map()
+            .len();
+        (file, segments)
+    }
+
+    /// A table of `rows` rows: an integer key and a string column of `width`-byte values.
+    fn keyed_strings(rows: usize, width: usize) -> arrow::array::RecordBatch {
+        use std::fmt::Write as _;
+
+        let ids: Vec<i64> = (0..i64::try_from(rows).expect("row count fits in i64")).collect();
+        let values: Vec<String> = (0..rows)
+            .map(|i| {
+                let mut v = format!("{{\"id\":{i},\"body\":\"");
+                while v.len() < width {
+                    let token = (i * 31 + v.len()) % 977;
+                    write!(v, "item-{token:x}-").expect("writing to a String cannot fail");
+                }
+                v
+            })
+            .collect();
+        arrow::array::RecordBatch::try_from_iter([
+            (
+                "id",
+                std::sync::Arc::new(arrow::array::Int64Array::from(ids)) as arrow::array::ArrayRef,
+            ),
+            (
+                "s",
+                std::sync::Arc::new(arrow::array::StringArray::from(values))
+                    as arrow::array::ArrayRef,
+            ),
+        ])
+        .expect("build the probe batch")
+    }
+
+    /// Below the data block cap the full tier is the Vortex writer's own default, to the byte.
+    #[tokio::test]
+    async fn btrblocks_full_tier_matches_the_writer_default_below_the_cap() {
+        use vortex::VortexSessionDefault;
+        use vortex_session::VortexSession;
+
+        // 64-byte strings: an 8,192-row block references ~640 KiB, under the 4 MiB cap.
+        let batch = keyed_strings(20_000, 64);
+        let (default_file, _) = write_file(VortexSession::default(), &batch).await;
+        let (full_file, _) = write_file(
+            VortexSession::default()
+                .set(full_strategy_builder_for(&CompressionStrategy::Btrblocks)),
+            &batch,
+        )
+        .await;
+        assert_eq!(full_file.len(), default_file.len());
+        assert!(
+            full_file.as_slice() == default_file.as_slice(),
+            "the full tier must write the same bytes as the writer default"
+        );
+    }
+
+    /// Over the cap a string column's blocks are split, and the file reads back as written.
+    #[tokio::test]
+    async fn btrblocks_full_tier_splits_wide_string_blocks() {
+        use vortex::VortexSessionDefault;
+        use vortex::array::stream::ArrayStreamExt;
+        use vortex::arrow::ArrowSessionExt;
+        use vortex::file::OpenOptionsSessionExt;
+        use vortex_session::VortexSession;
+
+        // ~3 KB strings: an 8,192-row block references ~24 MiB, so a 4 MiB cap
+        // splits it into 1,024-row blocks.
+        let batch = keyed_strings(16_384, 3000);
+        let (default_file, default_segments) = write_file(VortexSession::default(), &batch).await;
+        let session = VortexSession::default()
+            .set(full_strategy_builder_for(&CompressionStrategy::Btrblocks));
+        let (full_file, full_segments) = write_file(session.clone(), &batch).await;
+        assert!(
+            full_segments >= default_segments + 12,
+            "a 4 MiB cap must split the two 8,192-row blocks of `s`: {full_segments} segments vs {default_segments}"
+        );
+        assert!(full_file.len() > default_file.len() / 2);
+
+        let read = session
+            .open_options()
+            .open_buffer(full_file)
+            .expect("open")
+            .scan()
+            .expect("scan")
+            .into_array_stream()
+            .expect("stream")
+            .read_all()
+            .await
+            .expect("read back");
+        let mut ctx = vortex::array::VortexSessionExecute::create_execution_ctx(&session);
+        let target =
+            arrow::datatypes::Field::new_struct("", batch.schema().fields().clone(), false);
+        let read = session
+            .arrow()
+            .execute_arrow(read, Some(&target), &mut ctx)
+            .expect("to arrow");
+        let read = arrow::array::RecordBatch::from(
+            arrow::array::AsArray::as_struct(read.as_ref()).clone(),
+        );
+        assert_eq!(read, batch);
     }
 
     /// One `Utf8` column of 8,192 distinct values that share long runs of text: no

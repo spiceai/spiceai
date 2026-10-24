@@ -406,12 +406,9 @@ impl CayenneContext {
         cold_target_file_size_mb: usize,
         shard: Option<WriteShardConfig>,
     ) -> Arc<VortexFormat> {
-        let mut session = VortexSession::default();
-        if let Some(full_strategy) =
-            super::delta_encoding::full_strategy_builder_for(&self.config.compression_strategy)
-        {
-            session = session.set(full_strategy);
-        }
+        let session = VortexSession::default().set(
+            super::delta_encoding::full_strategy_builder_for(&self.config.compression_strategy),
+        );
         let mut options = Self::vortex_table_options(&self.config);
         options.target_file_size_mb = cold_target_file_size_mb;
         // Write-only format: it never scans, so drop the read-path cache size and
@@ -1159,17 +1156,14 @@ impl CayenneContext {
         // Create a Vortex session with default encodings. The session's write
         // strategy is the table's FULL encoding tier: the BtrBlocks cascade by
         // default, optionally extended with the Zstd string scheme when
-        // `cayenne_compression_strategy=zstd` (this wiring is what makes that
-        // param real — see `delta_encoding::full_strategy_builder_for`).
+        // `cayenne_compression_strategy=zstd`, with string and binary data blocks
+        // capped (see `delta_encoding::full_strategy_builder_for`).
         // Maintenance writes and full-level delta writes inherit it; light
         // delta-encoding levels override it per write via
         // `write_format_with_strategy` (see `provider::delta_encoding`).
-        let mut vortex_session = VortexSession::default();
-        if let Some(full_strategy) =
-            super::delta_encoding::full_strategy_builder_for(&config.compression_strategy)
-        {
-            vortex_session = vortex_session.set(full_strategy);
-        }
+        let vortex_session = VortexSession::default().set(
+            super::delta_encoding::full_strategy_builder_for(&config.compression_strategy),
+        );
 
         // Cayenne opts into the shared cache: its data files carry a uuid7 write
         // id beneath a uuid7 snapshot directory, so a path is written once and
