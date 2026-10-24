@@ -251,7 +251,9 @@ top-level `ORDER BY … LIMIT`, with ties at the cutoff allowed and floats withi
 0.1%.
 
 - **Timing.** None checks once; `eventually: 30s` retries until it matches;
-  `consistently: 10s` must match on every attempt for the whole time.
+  `consistently: 10s` must match on every attempt for the whole time. On a
+  `corpus`, `eventually` is one limit for all its queries, counted from the
+  first: each retries until then, and one reached after it gets one attempt.
 - **Empty answers.** `expect-empty: true` is required for an empty answer.
 - **Errors.** `expect-error: true` or `"<text>"` expects a rejection.
 - **Prepared statements.** `parameters: [...]` runs the query as a Flight SQL
