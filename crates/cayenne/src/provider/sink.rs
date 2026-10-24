@@ -18,6 +18,7 @@ limitations under the License.
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -165,6 +166,8 @@ impl DataSink for CayenneDataSink {
         // other accelerators' sinks do. A segmented append removes the mark once it has
         // published a segment.
         let target_schema = Arc::clone(&self.schema);
+        let incoming_rows = Arc::new(AtomicU64::new(0));
+        let incoming_for_stream = Arc::clone(&incoming_rows);
         let normalized = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&target_schema),
             data.map(move |batch_result| {
@@ -173,6 +176,9 @@ impl DataSink for CayenneDataSink {
                     .and_then(|batch| {
                         arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema))
                             .map_err(Into::into)
+                    })
+                    .inspect(|batch| {
+                        incoming_for_stream.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
                     })
             }),
         ));
@@ -183,10 +189,11 @@ impl DataSink for CayenneDataSink {
         // checked before the memory-mode and streaming-publish branches below,
         // both of which publish immediately.
         if let Some(txn) = self.active_transaction(context) {
-            return self
+            let rows = self
                 .write_all_transaction(&txn, normalized, context)
                 .await
-                .map_err(Into::into);
+                .map_err(datafusion_common::DataFusionError::from)?;
+            return Ok(self.reported_rows(rows, &incoming_rows));
         }
 
         // Memory mode (`mode: memory`): all data lives in the RAM mem-tier, so
@@ -284,7 +291,7 @@ impl DataSink for CayenneDataSink {
             // Memory mode arms retention here — see the method's own doc for why nowhere
             // else can (#14045).
             self.table.arm_retention_after_memory_resident_write();
-            return Ok(rows);
+            return Ok(self.reported_rows(rows, &incoming_rows));
         }
 
         if self.overwrite == InsertOp::Append
@@ -293,14 +300,15 @@ impl DataSink for CayenneDataSink {
         {
             // Keep composed-provider effects while using the shared mutation,
             // memory-budget, checkpoint and publication machinery.
-            return self
+            let rows = self
                 .table
                 .write_cdc_append_stream(normalized, context)
                 .await
                 .map_err(datafusion_common::DataFusionError::from)?
                 .finish()
                 .await
-                .map_err(Into::into);
+                .map_err(datafusion_common::DataFusionError::from)?;
+            return Ok(self.reported_rows(rows, &incoming_rows));
         }
 
         if self.overwrite == InsertOp::Overwrite {
@@ -340,7 +348,7 @@ impl DataSink for CayenneDataSink {
                     );
                 }
             });
-            Ok(rows)
+            Ok(self.reported_rows(rows, &incoming_rows))
         } else if self.table.row_versions.is_some() {
             // Row versions order a key's copies only against the copies one write
             // holds, which is every copy only in a load into an empty table; any
@@ -360,9 +368,11 @@ impl DataSink for CayenneDataSink {
             // prepare→stage→publish write per segment, so rows on a long-lived
             // insert stream (e.g. ADBC bulk ingest) become queryable within
             // ~`interval` of arrival instead of only when the stream ends.
-            self.write_append_segmented(normalized, context, interval)
+            let rows = self
+                .write_append_segmented(normalized, context, interval)
                 .await
-                .map_err(Into::into)
+                .map_err(datafusion_common::DataFusionError::from)?;
+            Ok(self.reported_rows(rows, &incoming_rows))
         } else {
             // Append path: `write_all_append` uses the existing-staging helpers
             // that assume the caller already holds the write lock. When
@@ -370,14 +380,27 @@ impl DataSink for CayenneDataSink {
             // take it again (the mutex is not reentrant).
             let write_guard =
                 super::write_lock_held::acquire_or_share(&self.table.write_lock_arc()).await;
-            self.write_all_append(normalized, context, write_guard)
+            let rows = self
+                .write_all_append(normalized, context, write_guard)
                 .await
-                .map_err(Into::into)
+                .map_err(datafusion_common::DataFusionError::from)?;
+            Ok(self.reported_rows(rows, &incoming_rows))
         }
     }
 }
 
 impl CayenneDataSink {
+    /// Last-arrival-wins collapses a key a write repeats, but the statement
+    /// still processed every incoming row. An append reports that incoming
+    /// count; an overwrite keeps the rows it stored.
+    fn reported_rows(&self, written: u64, incoming: &AtomicU64) -> u64 {
+        if self.overwrite == InsertOp::Overwrite {
+            written
+        } else {
+            incoming.load(Ordering::Relaxed)
+        }
+    }
+
     /// Resolve the transaction active on this write's request
     /// context, if any.
     ///
@@ -919,6 +942,67 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Last-arrival-wins processes every incoming row, so a 2-row VALUES that
+    /// repeats a key reports count 2 — the statement's row count — not the 1
+    /// row that remains after collapse.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn append_reports_incoming_row_count_after_last_arrival_wins() {
+        for memory_mode in [true, false] {
+            let ctx = SessionContext::new();
+            let temp = tempfile::tempdir().expect("temp dir");
+            let metadata_dir = temp.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+            let catalog = Arc::new(
+                CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
+                    .expect("catalog"),
+            ) as Arc<dyn MetadataCatalog>;
+            catalog.init().await.expect("catalog init");
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Int64, false),
+            ]));
+            let config = VortexConfig {
+                memory_mode,
+                ..VortexConfig::default()
+            };
+            let context = CayenneContext::new(&config, ctx.runtime_env(), "dup_count");
+            let provider =
+                CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+                    .with_context(Arc::clone(&context))
+                    .create(CreateTableOptions {
+                        table_name: "dup_count".to_string(),
+                        schema: Arc::clone(&schema),
+                        primary_key: vec!["id".to_string()],
+                        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                            "id".to_string(),
+                        ]))),
+                        base_path: temp.path().join("data").display().to_string(),
+                        partition_column: None,
+                        vortex_config: config,
+                    })
+                    .await
+                    .expect("create table");
+            let written = append_rows(
+                &provider,
+                &context,
+                &schema,
+                &ctx,
+                vec![keyed_batch(&schema, &[(5001, 1), (5001, 2)])],
+            )
+            .await
+            .expect("last-arrival-wins accepts a repeated key");
+            assert_eq!(
+                written, 2,
+                "memory_mode={memory_mode}: a 2-row VALUES must report 2, not the 1 row kept"
+            );
+            assert_eq!(
+                keyed_rows(&ctx, &provider).await,
+                vec![(5001, 2)],
+                "memory_mode={memory_mode}: the last arrival remains"
+            );
         }
     }
 
