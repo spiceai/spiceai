@@ -34,9 +34,7 @@ permissions: {}
 jobs:
   test-approve-bot-pr-runs:
     name: Unit tests for approve_bot_pr_runs.sh
-    # GitHub-hosted on purpose: a sub-second check that must not queue behind
-    # the self-hosted pool.
-    runs-on: ubuntu-24.04
+    runs-on: spiceai-dev-runners
     timeout-minutes: 5
     # A checkout plus a local bash script against a stub `gh`, so the job reads
     # the repository and nothing else.
