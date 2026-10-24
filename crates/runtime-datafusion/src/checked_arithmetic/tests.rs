@@ -643,6 +643,70 @@ async fn checked_sum_distinct_int64_overflow_window_and_sanity() {
     );
 }
 
+#[tokio::test]
+async fn checked_bounded_window_sum_distinct_retracts_int64_and_uint64() {
+    let ctx = checked_session();
+    let expected = ["5", "5", "12", "7", "7", "NULL"].map(str::to_string);
+
+    let i64_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(5),
+                Some(5),
+                Some(7),
+                Some(7),
+                None,
+                None,
+            ])),
+        ],
+    )
+    .expect("int64 distinct-window batch");
+    register_table(&ctx, "t_dwin_i64", i64_batch);
+
+    let i64_sql = "SELECT SUM(DISTINCT v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t_dwin_i64";
+    let (i64_plan, i64_rows) = plan_and_collect(&ctx, i64_sql).await;
+    assert_plan_ran(&i64_plan, i64_sql, &["Window", "DISTINCT", "ROWS"]);
+    assert_eq!(
+        render_rows(&i64_rows),
+        expected,
+        "Int64 bounded SUM(DISTINCT) must keep a duplicate, drop the last occurrence, and NULL a NULL-only frame\nplan:\n{i64_plan}"
+    );
+
+    let u64_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::UInt64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![
+                Some(5),
+                Some(5),
+                Some(7),
+                Some(7),
+                None,
+                None,
+            ])),
+        ],
+    )
+    .expect("uint64 distinct-window batch");
+    register_table(&ctx, "t_dwin_u64", u64_batch);
+
+    let u64_sql = "SELECT SUM(DISTINCT v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t_dwin_u64";
+    let (u64_plan, u64_rows) = plan_and_collect(&ctx, u64_sql).await;
+    assert_plan_ran(&u64_plan, u64_sql, &["Window", "DISTINCT", "ROWS"]);
+    assert_eq!(
+        render_rows(&u64_rows),
+        expected,
+        "UInt64 bounded SUM(DISTINCT) must keep a duplicate, drop the last occurrence, and NULL a NULL-only frame\nplan:\n{u64_plan}"
+    );
+}
+
 async fn run_slt(ctx: &SessionContext, script: &str) {
     let mut lines = script.lines().peekable();
     while let Some(line) = lines.next() {

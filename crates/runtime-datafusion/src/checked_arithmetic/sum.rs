@@ -952,10 +952,14 @@ impl Accumulator for CheckedUInt64SlidingDistinctSum {
 #[cfg(test)]
 mod state_tests {
     use super::*;
-    use arrow::array::Int64Array;
+    use arrow::array::{Int64Array, UInt64Array};
 
     fn int64_col(values: &[Option<i64>]) -> ArrayRef {
         Arc::new(Int64Array::from(values.to_vec()))
+    }
+
+    fn uint64_col(values: &[Option<u64>]) -> ArrayRef {
+        Arc::new(UInt64Array::from(values.to_vec()))
     }
 
     #[test]
@@ -1053,6 +1057,109 @@ mod state_tests {
         assert!(
             error.to_string().to_ascii_lowercase().contains("overflow"),
             "merged distinct overflow, got {error}"
+        );
+    }
+
+    #[test]
+    fn int64_sliding_distinct_retract_batch_keeps_duplicates_then_nulls() {
+        let mut acc = CheckedInt64SlidingDistinctSum::new();
+        assert!(
+            acc.supports_retract_batch(),
+            "bounded DISTINCT windows require retract_batch"
+        );
+
+        acc.update_batch(&[int64_col(&[Some(5)])])
+            .expect("enter first 5");
+        assert_eq!(
+            acc.evaluate().expect("frame [5]"),
+            ScalarValue::Int64(Some(5))
+        );
+
+        acc.update_batch(&[int64_col(&[Some(5)])])
+            .expect("enter second 5");
+        assert_eq!(
+            acc.evaluate().expect("frame [5, 5]"),
+            ScalarValue::Int64(Some(5))
+        );
+
+        acc.retract_batch(&[int64_col(&[Some(5)])])
+            .expect("leave first 5");
+        acc.update_batch(&[int64_col(&[Some(7)])])
+            .expect("enter first 7");
+        assert_eq!(
+            acc.evaluate().expect("frame [5, 7]"),
+            ScalarValue::Int64(Some(12))
+        );
+
+        acc.retract_batch(&[int64_col(&[Some(5)])])
+            .expect("leave last 5");
+        acc.update_batch(&[int64_col(&[Some(7)])])
+            .expect("enter second 7");
+        assert_eq!(
+            acc.evaluate().expect("frame [7, 7]"),
+            ScalarValue::Int64(Some(7))
+        );
+
+        acc.retract_batch(&[int64_col(&[Some(7)])])
+            .expect("leave first 7");
+        acc.update_batch(&[int64_col(&[None])])
+            .expect("enter first NULL");
+        assert_eq!(
+            acc.evaluate().expect("frame [7, NULL]"),
+            ScalarValue::Int64(Some(7))
+        );
+
+        acc.retract_batch(&[int64_col(&[Some(7)])])
+            .expect("leave last 7");
+        acc.update_batch(&[int64_col(&[None])])
+            .expect("enter second NULL");
+        assert_eq!(
+            acc.evaluate().expect("NULL-only frame"),
+            ScalarValue::Int64(None)
+        );
+    }
+
+    #[test]
+    fn uint64_sliding_distinct_retract_batch_keeps_duplicates_then_nulls() {
+        let mut acc = CheckedUInt64SlidingDistinctSum::new();
+        assert!(
+            acc.supports_retract_batch(),
+            "bounded DISTINCT windows require retract_batch"
+        );
+
+        acc.update_batch(&[uint64_col(&[Some(5)])])
+            .expect("enter first 5");
+        acc.update_batch(&[uint64_col(&[Some(5)])])
+            .expect("enter second 5");
+        acc.retract_batch(&[uint64_col(&[Some(5)])])
+            .expect("leave first 5");
+        acc.update_batch(&[uint64_col(&[Some(7)])])
+            .expect("enter first 7");
+        assert_eq!(
+            acc.evaluate().expect("frame [5, 7]"),
+            ScalarValue::UInt64(Some(12))
+        );
+
+        acc.retract_batch(&[uint64_col(&[Some(5)])])
+            .expect("leave last 5");
+        acc.update_batch(&[uint64_col(&[Some(7)])])
+            .expect("enter second 7");
+        acc.retract_batch(&[uint64_col(&[Some(7)])])
+            .expect("leave first 7");
+        acc.update_batch(&[uint64_col(&[None])])
+            .expect("enter first NULL");
+        assert_eq!(
+            acc.evaluate().expect("frame [7, NULL]"),
+            ScalarValue::UInt64(Some(7))
+        );
+
+        acc.retract_batch(&[uint64_col(&[Some(7)])])
+            .expect("leave last 7");
+        acc.update_batch(&[uint64_col(&[None])])
+            .expect("enter second NULL");
+        assert_eq!(
+            acc.evaluate().expect("NULL-only frame"),
+            ScalarValue::UInt64(None)
         );
     }
 }
