@@ -43,7 +43,7 @@ use crate::{
     compare,
     script::{Action, RunVariants, Script, Step, Timing, VariantSpec},
     source::{self, Source},
-    spiced::Spiced,
+    spiced::{ContainerRun, Spiced},
     template,
 };
 
@@ -369,6 +369,10 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(45);
 /// are killed. Shutdown itself is checked by `stop` and `restart` steps, at
 /// `STOP_TIMEOUT`; at the end of a script it only costs time.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The image cluster executors run in under `defaults.cluster.containers`:
+/// a Linux `spiced` needs nothing beyond its base libraries.
+const EXECUTOR_IMAGE: &str = "ubuntu:26.04";
 
 /// The partition assignment interval a cluster runs with (see
 /// `make_cluster_ready`).
@@ -734,6 +738,12 @@ async fn create_instances(
             disable_results_cache_unless_configured(&mut spicepod);
             let cluster = (options.cluster || script.defaults.cluster.is_some())
                 && script.defaults.executor_args.is_none();
+            let containers = cluster
+                && script
+                    .defaults
+                    .cluster
+                    .as_ref()
+                    .is_some_and(|c| c.containers);
             if cluster {
                 if let Some(engine) = undistributed_engine(&spicepod) {
                     // A cluster accelerates only into Cayenne and Arrow.
@@ -742,6 +752,12 @@ async fn create_instances(
                 }
                 if let Some(reason) = unpartitionable_acceleration(&spicepod) {
                     say!("   skip {label:<20} {reason}");
+                    continue;
+                }
+                if containers && !cfg!(target_os = "linux") {
+                    // A container runs the binary under test, which must be
+                    // a Linux one, on the host's network.
+                    say!("   skip {label:<20} executors in containers run only on Linux");
                     continue;
                 }
                 make_cluster_ready(&mut spicepod, &dir, &script.defaults.cluster_partition_by);
@@ -761,7 +777,7 @@ async fn create_instances(
             let spare_count = script.defaults.cluster.as_ref().map_or(0, |c| c.spare);
             let cluster_args = if cluster {
                 Some(cluster_args(
-                    script,
+                    &crate::pki::cluster_pki(&options.work_dir)?,
                     &context,
                     executor_count + spare_count,
                 )?)
@@ -796,6 +812,22 @@ async fn create_instances(
                 let args = template::substitute(args, &context)?;
                 executor.set_extra_args(serde_json::from_value(args)?);
                 executor.set_api_key(script.defaults.api_key.clone())?;
+                if containers {
+                    let work_dir = std::path::absolute(&options.work_dir)?;
+                    let script_dir = std::path::absolute(&script.dir)?;
+                    executor.set_container(ContainerRun {
+                        image: EXECUTOR_IMAGE.to_string(),
+                        name: format!("spicescript-{}-{run_id}-{index}-{name}", std::process::id())
+                            .replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-"),
+                        volumes: vec![
+                            format!("{0}:{0}", work_dir.display()),
+                            format!("{0}:{0}:ro", script_dir.display()),
+                            // The cluster's TLS clients load the system's root
+                            // certificates, which the image has none of.
+                            "/etc/ssl/certs:/etc/ssl/certs:ro".to_string(),
+                        ],
+                    });
+                }
                 executors.push(executor);
             }
             let mut spiced = Spiced::new(first_binary, dir, env)?;

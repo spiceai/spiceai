@@ -2,6 +2,7 @@
   "append-kill": 7,
   "builtins": 4,
   "cayenne-upgrade": 4,
+  "cluster-shuffle": 33,
   "http-caching-columns": 6,
   "kafka-chaos": 21
 }
