@@ -488,41 +488,51 @@ async fn under_tool_choice_none_a_json_schema_reply_keeps_its_schema() {
 /// decode thread, waiting for room in that client's full buffer, sees the model stopping.
 #[tokio::test]
 async fn a_model_dropped_under_a_stalled_stream_stops_promptly() {
-    let model = qwen3().await;
-    let mut stream = model
-        .chat_stream(request(json!({
-            "model": "qwen3",
-            "messages": [{ "role": "user", "content": "Write a very long story about the sea." }],
-            "temperature": 0,
-            "reasoning_effort": "none",
-            "max_tokens": 4000,
-            "stream": true,
-        })))
-        .await
-        .expect("a stream");
-    stream
-        .next()
-        .await
-        .expect("a first chunk")
-        .expect("a chunk");
-    // The stream's buffer holds 64 tokens, which Qwen3-0.6B decodes in well under a second;
-    // the count drained below shows the buffer was full when the model was dropped.
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    let started = std::time::Instant::now();
-    drop(model);
-    let stopped = started.elapsed();
-    let mut buffered = 0;
-    while let Some(Ok(_)) = stream.next().await {
-        buffered += 1;
+    // The stream's buffer holds 64 tokens, and only the count drained after the drop shows it
+    // was full. Alone, Qwen3-0.6B decodes 64 tokens in well under a second, but this binary
+    // loads a model per test and runs them at once, and on a contended runner the buffer has
+    // held 48 chunks 3 s after the first. So an attempt whose buffer was not yet full is run
+    // again with twice the wait, until one shows the decode thread blocked on a full buffer.
+    let mut wait = std::time::Duration::from_secs(3);
+    loop {
+        let model = qwen3().await;
+        let mut stream = model
+            .chat_stream(request(json!({
+                "model": "qwen3",
+                "messages": [{ "role": "user", "content": "Write a very long story about the sea." }],
+                "temperature": 0,
+                "reasoning_effort": "none",
+                "max_tokens": 4000,
+                "stream": true,
+            })))
+            .await
+            .expect("a stream");
+        stream
+            .next()
+            .await
+            .expect("a first chunk")
+            .expect("a chunk");
+        tokio::time::sleep(wait).await;
+        let started = std::time::Instant::now();
+        drop(model);
+        let stopped = started.elapsed();
+        assert!(
+            stopped < std::time::Duration::from_secs(5),
+            "dropping the model took {stopped:?}"
+        );
+        let mut buffered = 0;
+        while let Some(Ok(_)) = stream.next().await {
+            buffered += 1;
+        }
+        if buffered >= 64 {
+            return;
+        }
+        assert!(
+            wait < std::time::Duration::from_secs(48),
+            "the buffer held {buffered} chunks {wait:?} after the first, so it never filled"
+        );
+        wait *= 2;
     }
-    assert!(
-        buffered >= 64,
-        "the buffer held {buffered} chunks, so it was not full"
-    );
-    assert!(
-        stopped < std::time::Duration::from_secs(5),
-        "dropping the model took {stopped:?}"
-    );
 }
 
 /// `frequency_penalty` and `presence_penalty` reach the sampler: at temperature 0, a reply
