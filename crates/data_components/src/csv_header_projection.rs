@@ -378,7 +378,7 @@ impl FileOpener for HeaderMappedOpener {
         Ok(Box::pin(async move {
             // CsvOpener reads with GetOptions::default() and cannot take an
             // if_match/version without a fork. Pinning the store injects the
-            // listed generation on both this header get_range and that opener
+            // listed generation on both this header read and that opener
             // get. An ETag pins with If-Match only; version is used only when
             // there is no ETag. Stores that list neither stay unwrapped.
             let store = pin_store_to_listed_generation(store, &partitioned_file.object_meta);
@@ -603,13 +603,27 @@ async fn read_csv_header(
     if meta.size == 0 {
         return Ok(Vec::new());
     }
+    let mut unranged: Option<UnrangedPrefix> = None;
     let mut end = meta.size.min(HEADER_PROBE_BYTES);
     loop {
-        let whole_object = end >= meta.size;
-        let prefix = store
-            .get_range(&meta.location, 0..end)
-            .await
-            .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?;
+        let (prefix, body_ended) = match unranged.as_mut() {
+            Some(body) => body.read_to(end).await?,
+            None => match store.get_range(&meta.location, 0..end).await {
+                Ok(prefix) => (prefix, false),
+                // An HTTP server that ignores `Range` answers 200, which
+                // object_store reports as `NotSupported`. `CsvOpener` reads
+                // such a file with an unranged GET, so read the header from
+                // one too, only as far as the probe needs.
+                Err(object_store::Error::NotSupported { .. }) => {
+                    unranged
+                        .insert(UnrangedPrefix::open(store, &meta.location).await?)
+                        .read_to(end)
+                        .await?
+                }
+                Err(e) => return Err(DataFusionError::ObjectStore(Box::new(e))),
+            },
+        };
+        let whole_object = body_ended || end >= meta.size;
         match header_from_prefix(prefix, options, compression, whole_object).await {
             Ok(Some(names)) => return Ok(names),
             Ok(None) if whole_object => return Ok(Vec::new()),
@@ -625,6 +639,43 @@ async fn read_csv_header(
                 end = next;
             }
         }
+    }
+}
+
+/// The body of one unranged GET, buffered only as far as the header probe has
+/// asked. Dropping it closes the response without reading the rest.
+struct UnrangedPrefix {
+    body: BoxStream<'static, object_store::Result<bytes::Bytes>>,
+    buffered: Vec<u8>,
+    ended: bool,
+}
+
+impl UnrangedPrefix {
+    async fn open(store: &Arc<dyn ObjectStore>, location: &ObjectStorePath) -> Result<Self> {
+        let body = store
+            .get_opts(location, GetOptions::default())
+            .await
+            .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?
+            .into_stream();
+        Ok(Self {
+            body,
+            buffered: Vec::new(),
+            ended: false,
+        })
+    }
+
+    /// Returns at least the first `end` bytes, or the whole body when it is
+    /// shorter, and whether the body has ended.
+    async fn read_to(&mut self, end: u64) -> Result<(bytes::Bytes, bool)> {
+        while !self.ended && (self.buffered.len() as u64) < end {
+            match self.body.next().await {
+                Some(chunk) => self.buffered.extend_from_slice(
+                    &chunk.map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?,
+                ),
+                None => self.ended = true,
+            }
+        }
+        Ok((bytes::Bytes::copy_from_slice(&self.buffered), self.ended))
     }
 }
 
@@ -804,7 +855,7 @@ mod tests {
     use std::fmt::Write;
     use std::path::Path;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn header_probe_len() -> usize {
         usize::try_from(HEADER_PROBE_BYTES).expect("header probe fits usize")
@@ -1609,5 +1660,162 @@ mod tests {
         let options = inner.last_options();
         assert_eq!(options.if_match, None);
         assert_eq!(options.version.as_deref(), Some("ver-1"));
+    }
+
+    /// Refuses every ranged `GET` the way `object_store`'s HTTP client does when
+    /// the server ignores `Range` and answers 200: `NotSupported`.
+    #[derive(Debug)]
+    struct RangeNotSupported {
+        inner: InMemory,
+        refused_ranges: AtomicUsize,
+    }
+
+    impl RangeNotSupported {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                refused_ranges: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl std::fmt::Display for RangeNotSupported {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RangeNotSupported")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RangeNotSupported {
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            if !options.head && options.range.is_some() {
+                self.refused_ranges.fetch_add(1, Ordering::SeqCst);
+                return Err(object_store::Error::NotSupported {
+                    source: format!("Range request not supported by {location}").into(),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn header_is_read_unranged_when_the_store_refuses_range_requests() {
+        // Leading blank lines push the reordered header across the 64 KiB cut,
+        // so the unranged read has to grow past the first probe as well.
+        let mut text = "\n".repeat(65_530);
+        text.push_str("event_id,amount_cents,region,user_id,ts\n");
+        text.push_str("1,100,us,10,t0\n2,200,eu,20,t1\n");
+        let prefix = text.as_bytes().get(..header_probe_len()).expect("prefix");
+        assert!(
+            !prefix
+                .windows(b"amount_cents".len())
+                .any(|w| w == b"amount_cents"),
+            "the 64 KiB probe must cut through the header"
+        );
+
+        let store = Arc::new(RangeNotSupported::new());
+        let location = ObjectPath::from("base.csv");
+        store
+            .put(&location, text.into_bytes().into())
+            .await
+            .expect("store csv");
+
+        let ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_collect_statistics(false));
+        let url = ObjectStoreUrl::parse("memory://csv-no-range").expect("store url");
+        ctx.runtime_env()
+            .register_object_store(url.as_ref(), Arc::clone(&store) as Arc<dyn ObjectStore>);
+        let table_url =
+            ListingTableUrl::parse("memory://csv-no-range/base.csv").expect("listing url");
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(ListingOptions::new(header_format()).with_file_extension(".csv"))
+            .with_schema(registered_schema());
+        ctx.register_table(
+            "base",
+            Arc::new(ListingTable::try_new(config).expect("listing table")),
+        )
+        .expect("register");
+
+        let batches = ctx
+            .sql("SELECT sum(amount_cents), sum(user_id) FROM base")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("a store without range support must still read the header");
+        let amounts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("amount_cents");
+        let users = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("user_id");
+        assert_eq!(
+            (
+                (!amounts.is_null(0)).then(|| amounts.value(0)),
+                (!users.is_null(0)).then(|| users.value(0)),
+            ),
+            (Some(300), Some(30)),
+            "values must follow the header names read without a range request"
+        );
+        assert_eq!(
+            store.refused_ranges.load(Ordering::SeqCst),
+            1,
+            "only the first header probe tries a range; the rest of the probe reads the unranged body"
+        );
     }
 }
