@@ -23,7 +23,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-
 use super::{CLUSTER_ASSIGNMENT_INTERVAL, Instance};
 
 /// Starts every executor of the instance that is not running, and waits for
