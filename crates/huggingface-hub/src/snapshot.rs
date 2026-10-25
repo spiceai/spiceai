@@ -58,6 +58,23 @@ pub struct Requester {
     pub name: String,
     /// The page an error links to.
     pub docs_url: &'static str,
+    /// Whether Spice loads the component again after a download fails for a reason other
+    /// than the Spicepod, as it does a model. An error's advice says that Spice retries, or
+    /// that a restart does.
+    pub retried: bool,
+}
+
+impl Requester {
+    /// `Model 'qwen'`: the requester at the start of a sentence.
+    #[must_use]
+    pub fn capitalized(&self) -> String {
+        let mut kind = self.kind.chars();
+        let first = kind
+            .next()
+            .map(|c| c.to_uppercase().collect::<String>())
+            .unwrap_or_default();
+        format!("{first}{} '{}'", kind.as_str(), self.name)
+    }
 }
 
 impl fmt::Display for Requester {
@@ -124,6 +141,36 @@ impl Snapshot {
         repo: RepoId,
         revision: Option<&str>,
     ) -> Result<Self, DownloadError> {
+        Self::open_listing(settings, requester, repo, revision, None).await
+    }
+
+    /// Resolves `revision` as [`Snapshot::open`] does, but looks only at `paths`, rather than
+    /// listing the repository: for a component that reads a few named files of a repository
+    /// that may hold many. The commit comes from the Hub's answer for the first path, and a
+    /// path already in the cache at that commit is used as it is, as `huggingface_hub` does,
+    /// so a warm load costs one request. A path the cache lacks is described, one request
+    /// each. A path the repository does not have is left out, and downloading it names it.
+    ///
+    /// # Errors
+    ///
+    /// See [`Snapshot::open`].
+    pub async fn open_paths(
+        settings: Settings,
+        requester: Requester,
+        repo: RepoId,
+        revision: Option<&str>,
+        paths: &[&str],
+    ) -> Result<Self, DownloadError> {
+        Self::open_listing(settings, requester, repo, revision, Some(paths)).await
+    }
+
+    async fn open_listing(
+        settings: Settings,
+        requester: Requester,
+        repo: RepoId,
+        revision: Option<&str>,
+        paths: Option<&[&str]>,
+    ) -> Result<Self, DownloadError> {
         let revision = revision
             .filter(|revision| !revision.is_empty())
             .unwrap_or(DEFAULT_REVISION)
@@ -146,7 +193,11 @@ impl Snapshot {
                 .ok_or_else(|| context.error(None, Cause::OfflineNoSnapshot))?;
             (commit, files, Source::OfflineCache)
         } else {
-            match from_hub(&hub, &cache, &repo, &revision).await {
+            let listed = match paths {
+                None => from_hub(&hub, &cache, &repo, &revision).await,
+                Some(paths) => paths_from_hub(&hub, &cache, &repo, &revision, paths).await,
+            };
+            match listed {
                 Ok((commit, files)) => (commit, files, Source::Hub),
                 Err(error) if falls_back(&error) => {
                     let Some((commit, files)) = from_cache(&cache, &repo, &revision).await else {
@@ -155,7 +206,7 @@ impl Snapshot {
                     let reason = crate::error::unreachable_reason(&error);
                     tracing::warn!(
                         "{} could not reach the Hugging Face Hub ({reason}), so it loads revision '{revision}' of '{repo}' from the cache at commit {}. Changes to '{revision}' are not seen until the Hub is reachable.",
-                        capitalized(&requester),
+                        requester.capitalized(),
                         short(&commit)
                     );
                     (commit, files, Source::CacheInOutage { reason })
@@ -296,7 +347,7 @@ impl Snapshot {
             if log {
                 tracing::info!(
                     "{} uses Hugging Face repo '{}' {}, already in the cache.",
-                    capitalized(&self.requester),
+                    self.requester.capitalized(),
                     self.repo,
                     self.at_commit()
                 );
@@ -382,7 +433,8 @@ impl Snapshot {
     }
 }
 
-/// Resolves `revision` on the Hub and lists every file at the commit.
+/// Resolves `revision` on the Hub and describes the files at the commit: `paths`, or every
+/// file when `None`.
 async fn from_hub(
     hub: &Arc<Hub>,
     cache: &HubCache,
@@ -411,6 +463,67 @@ async fn from_hub(
             )
         })
         .collect();
+    Ok((commit, files))
+}
+
+/// Resolves `revision` on the Hub and describes `paths` at the commit: a path the cache holds
+/// at the commit from the cache, any other from the Hub.
+async fn paths_from_hub(
+    hub: &Arc<Hub>,
+    cache: &HubCache,
+    repo: &RepoId,
+    revision: &str,
+    paths: &[&str],
+) -> Result<(String, BTreeMap<String, RepoFile>), client::Error> {
+    // A commit names itself; a branch or tag is resolved by the answer for the first path.
+    let resolved = if crate::client::is_commit_sha(revision) {
+        Some(revision.to_string())
+    } else if let Some(first) = paths.first() {
+        match hub.commit_of_file(repo, revision, first).await {
+            Ok(commit) => commit,
+            // The first path does not exist: the revision still has to be resolved.
+            Err(error) if error.is_entry_not_found() => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    let commit = match resolved {
+        Some(commit) => commit,
+        None => hub.commit(repo, revision).await?.sha,
+    };
+    if let Err(error) = cache.write_ref(repo, revision, &commit).await {
+        tracing::debug!(
+            "Failed to record that revision '{revision}' of Hugging Face {} '{repo}' is commit {commit} in the cache: {error}",
+            repo.kind()
+        );
+    }
+    let mut files = BTreeMap::new();
+    for &path in paths {
+        let cached = match relative_path(path) {
+            Some(relative) => tokio::fs::metadata(cache.snapshot_dir(repo, &commit).join(relative))
+                .await
+                .ok()
+                .filter(std::fs::Metadata::is_file),
+            None => None,
+        };
+        let file = match cached {
+            Some(metadata) => RepoFile {
+                path: path.to_string(),
+                size: metadata.len(),
+                entry: None,
+            },
+            None => match hub.entry(repo, &commit, path).await? {
+                Some(entry) if entry.kind == EntryKind::File => RepoFile {
+                    path: entry.path.clone(),
+                    size: entry.size,
+                    entry: Some(entry),
+                },
+                _ => continue,
+            },
+        };
+        files.insert(path.to_string(), file);
+    }
     Ok((commit, files))
 }
 
@@ -480,16 +593,6 @@ fn report_progress(
 /// The first seven digits of a commit, as the Hub shows it.
 fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
-}
-
-/// `Model 'qwen'`: the requester at the start of a sentence.
-fn capitalized(requester: &Requester) -> String {
-    let mut kind = requester.kind.chars();
-    let first = kind
-        .next()
-        .map(|c| c.to_uppercase().collect::<String>())
-        .unwrap_or_default();
-    format!("{first}{} '{}'", kind.as_str(), requester.name)
 }
 
 fn files_and_size(count: usize, bytes: u64) -> String {

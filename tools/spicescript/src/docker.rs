@@ -69,8 +69,10 @@ impl Container {
             "not starting container {}: the run is shutting down",
             spec.name
         );
-        let docker = Docker::connect_with_local_defaults()
-            .context("Failed to connect to Docker; is it running?")?;
+        let docker = patient(
+            Docker::connect_with_local_defaults()
+                .context("Failed to connect to Docker; is it running?")?,
+        );
         docker
             .ping()
             .await
@@ -152,6 +154,7 @@ impl Container {
                 &spec.name,
                 Some(RemoveContainerOptions {
                     force: true,
+                    v: true,
                     ..Default::default()
                 }),
             )
@@ -388,6 +391,18 @@ impl Drop for Container {
     }
 }
 
+/// How long a request to Docker may take. bollard's default, 120 s, is
+/// shorter than the stalls a daemon on a busy CI host goes through, and a
+/// request it gives up on, such as a create, is still carried out by the
+/// daemon, so failing at 120 s only fails the script.
+const DOCKER_REQUEST_TIMEOUT: Duration = Duration::from_mins(10);
+
+/// `docker` waiting out a stalled daemon instead of giving up at bollard's
+/// default request timeout.
+fn patient(docker: Docker) -> Docker {
+    docker.with_timeout(DOCKER_REQUEST_TIMEOUT)
+}
+
 async fn pull_if_missing(docker: &Docker, image: &str) -> Result<()> {
     if docker.inspect_image(image).await.is_ok() {
         return Ok(());
@@ -460,6 +475,66 @@ pub fn healthcheck(probe: &str) -> HealthConfig {
         retries: Some(120),
         start_period: Some(10_000_000_000),
         start_interval: Some(250_000_000),
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use std::time::Duration;
+
+    use bollard::{
+        API_DEFAULT_VERSION, Docker,
+        container::{Config, CreateContainerOptions},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    /// A Docker API that answers each create 2 s late, as a stalled daemon
+    /// does, through a client that would give up after 1 s.
+    async fn slow_daemon() -> Docker {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let body = r#"{"Id":"c1","Warnings":[]}"#;
+                    let response = format!(
+                        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        Docker::connect_with_http(&format!("http://{addr}"), 1, API_DEFAULT_VERSION)
+            .expect("client")
+    }
+
+    #[tokio::test]
+    async fn a_patient_client_waits_out_a_create_slower_than_its_default_timeout() {
+        let docker = super::patient(slow_daemon().await);
+        let created = docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: "src",
+                    platform: None,
+                }),
+                Config::<String>::default(),
+            )
+            .await
+            .expect("the create is answered within the patient timeout");
+        assert_eq!(created.id, "c1");
     }
 }
 

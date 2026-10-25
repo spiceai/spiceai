@@ -20,7 +20,7 @@ use arrow_schema::DataType;
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::ExprSchemable as _;
 use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction, WindowFunction};
-use datafusion::logical_expr::{Cast, Expr, TryCast};
+use datafusion::logical_expr::{Cast, Expr, Operator, TryCast};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 
@@ -291,13 +291,43 @@ pub fn duckdb_can_translate_window(call: &WindowFunction) -> bool {
 /// `DataFusion` does. `duckdb::cast_is_renderable` says which casts into text or
 /// binary are refused, and why; [`integer_cast_is_renderable`] refuses one from
 /// a fractional value into an integer, which `DuckDB` rounds where `DataFusion`
-/// truncates; and `duckdb::literal_is_renderable` refuses a binary literal,
-/// which the unparser spells in a form `DuckDB` reads as text.
+/// truncates; `duckdb::literal_is_renderable` refuses a binary literal,
+/// which the unparser spells in a form `DuckDB` reads as text; and
+/// [`divides_a_decimal`] refuses a `/` over a decimal, which `DuckDB` answers
+/// as a `DOUBLE`.
 #[must_use]
 pub fn duckdb_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
     duckdb::literal_is_renderable(expr)
         && duckdb::cast_is_renderable(expr, scope)
         && integer_cast_is_renderable(expr, scope)
+        && !divides_a_decimal(expr, scope)
+}
+
+/// Whether `expr` is a `/` whose operands `DuckDB` or `SQLite` would evaluate
+/// in floating point.
+///
+/// The `DuckDB` dialect unparses every `DataFusion` `Divide` as `//` so that
+/// integer `/` stays integer division (#3155). On a `DECIMAL`, both `//` and
+/// `/` answer a `DOUBLE` (~16 significant digits). Federation then casts that
+/// double back to a decimal, so digits past the mantissa look exact and are
+/// wrong. `SQLite` has no decimal type and computes `/` in `REAL`.
+///
+/// Either operand being a decimal is enough: `amt / 3` is decimal division
+/// after type coercion. An operand whose type cannot be read is refused rather
+/// than assumed integral, matching [`integer_cast_is_renderable`]. Integer and
+/// floating `/` are not this check's to refuse.
+#[must_use]
+pub(crate) fn divides_a_decimal(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let Expr::BinaryExpr(binary) = expr else {
+        return false;
+    };
+    if binary.op != Operator::Divide {
+        return false;
+    }
+    let scope = scope.unwrap_or_else(|| DFSchema::empty_ref());
+    [binary.left.as_ref(), binary.right.as_ref()]
+        .into_iter()
+        .any(|operand| operand_type(operand, scope).is_none_or(|data_type| data_type.is_decimal()))
 }
 
 /// Whether `PostgreSQL` evaluates this non-function expression node the way
@@ -865,6 +895,49 @@ mod tests {
             assert!(postgres_can_evaluate_expression(&expr, Some(&scope)));
             assert!(mysql_can_evaluate_expression(&expr, Some(&scope)));
         }
+    }
+
+    /// Decimal `/` stays local on `DuckDB`: the dialect unparses every
+    /// `Divide` as `//`, and `DuckDB` answers that as a `DOUBLE`. Integer `/`
+    /// and float `/` federate, including a qualified integer column resolved
+    /// against the scan's own schema.
+    #[test]
+    fn duckdb_declines_decimal_division() {
+        let scope = scope_of(&[
+            ("d", DataType::Decimal128(38, 10)),
+            ("n", DataType::Int64),
+            ("f", DataType::Float64),
+        ]);
+        for expr in [
+            col("d") / lit(3_i64),
+            col("n") / col("d"),
+            col("t.d") / lit(3_i64),
+        ] {
+            assert!(
+                !duckdb_can_evaluate_expression(&expr, Some(&scope)),
+                "{expr} must stay local"
+            );
+        }
+        for expr in [
+            col("n") / lit(2_i64),
+            col("t.n") / lit(2_i64),
+            col("f") / lit(2.0_f64),
+            lit(7_i64) / lit(2_i64),
+            col("d") + lit(1_i64),
+        ] {
+            assert!(
+                duckdb_can_evaluate_expression(&expr, Some(&scope)),
+                "{expr} must federate"
+            );
+        }
+        assert!(!duckdb_can_evaluate_expression(
+            &(col("d") / lit(3_i64)),
+            None
+        ));
+        assert!(duckdb_can_evaluate_expression(
+            &(lit(7_i64) / lit(2_i64)),
+            None
+        ));
     }
 
     /// The scan's own filter pushdown resolves against the scan's unqualified

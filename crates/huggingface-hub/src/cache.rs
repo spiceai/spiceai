@@ -37,7 +37,9 @@ use std::time::Duration;
 
 use crate::location::RepoId;
 
-/// Directories the cache creates are `0755`, files `0644`, whatever the process umask.
+/// Directories the cache creates under its root are `0755` and its files `0644`, whatever the
+/// process umask. The root, and any directory above it the cache creates, are `0755` narrowed
+/// by the umask, so the root's mode decides who else can read the cache.
 #[cfg(unix)]
 const DIR_MODE: u32 = 0o755;
 #[cfg(unix)]
@@ -129,6 +131,10 @@ impl HubCache {
         {
             return Ok(());
         }
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid_path(&path.display().to_string()))?;
+        self.ensure_dir(parent).await?;
         write_atomically(&path, commit.as_bytes()).await
     }
 
@@ -204,7 +210,7 @@ impl HubCache {
         let relative = relative_path(path).ok_or_else(|| invalid_path(path))?;
         let file = self.snapshot_dir(repo, commit).join(&relative);
         if let Some(parent) = file.parent() {
-            ensure_dir(parent).await?;
+            self.ensure_dir(parent).await?;
         }
         // `snapshots/<commit>/<path>` → `../../blobs/<etag>`, one more `..` per folder in
         // `path`.
@@ -239,17 +245,22 @@ impl HubCache {
             .join(repo_folder_name(repo))
             .join(format!("{etag}.lock"));
         if let Some(parent) = path.parent() {
-            ensure_dir(parent).await?;
+            self.ensure_dir(parent).await?;
         }
         let mut waited = false;
         loop {
             let open_path = path.clone();
             let file = tokio::task::spawn_blocking(move || {
-                std::fs::OpenOptions::new()
+                let file = file_options()
                     .create(true)
                     .truncate(false)
                     .write(true)
-                    .open(open_path)
+                    .open(open_path)?;
+                // A lock file another account created keeps the mode that account gave it.
+                match set_file_mode(&file) {
+                    Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(file),
+                    set => set.map(|()| file),
+                }
             })
             .await
             .map_err(io::Error::other)??;
@@ -275,6 +286,45 @@ impl HubCache {
                 Err(std::fs::TryLockError::Error(error)) => return Err(error),
             }
         }
+    }
+
+    /// Creates `dir` and any missing parents. Each one it creates under the root is `0755`,
+    /// whatever the umask; the root and the directories above it are `0755` narrowed by the
+    /// umask. A directory another process creates meanwhile keeps the mode that process gave it.
+    pub(crate) async fn ensure_dir(&self, dir: &Path) -> io::Result<()> {
+        if tokio::fs::metadata(dir).await.is_ok_and(|m| m.is_dir()) {
+            return Ok(());
+        }
+        let root = self.root.clone();
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            // Each missing directory is created on its own, outermost first, so every one this
+            // call creates under the root gets its mode, not just the last.
+            let missing: Vec<&Path> = dir
+                .ancestors()
+                .take_while(|ancestor| !ancestor.as_os_str().is_empty() && !ancestor.is_dir())
+                .collect();
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, DIR_MODE);
+            for ancestor in missing.into_iter().rev() {
+                match builder.create(ancestor) {
+                    Ok(()) if ancestor != root && ancestor.starts_with(&root) => {
+                        set_mode(ancestor, true)?;
+                    }
+                    Ok(()) => {}
+                    Err(error) => {
+                        // Another process may have created it meanwhile.
+                        if error.kind() != io::ErrorKind::AlreadyExists || !ancestor.is_dir() {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 }
 
@@ -327,22 +377,13 @@ fn invalid_path(path: &str) -> io::Error {
     )
 }
 
-/// Creates `dir` and any missing parents, each `0755`.
-pub(crate) async fn ensure_dir(dir: &Path) -> io::Result<()> {
-    if tokio::fs::metadata(dir).await.is_ok_and(|m| m.is_dir()) {
-        return Ok(());
-    }
-    let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, DIR_MODE);
-        builder.create(&dir)?;
-        set_mode(&dir, true)
-    })
-    .await
-    .map_err(io::Error::other)?
+/// Options that create a file no more open than `0644` before [`set_mode`] makes it exactly
+/// that, so no other account can write to it in between.
+pub(crate) fn file_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, FILE_MODE);
+    options
 }
 
 /// Makes `path` `0644` (or `0755` for a directory), whatever the umask it was created under.
@@ -360,19 +401,29 @@ pub(crate) fn set_mode(path: &Path, dir: bool) -> io::Result<()> {
     }
 }
 
-/// Writes `contents` to `path` through a temporary file renamed into place, so a reader never
-/// sees part of it.
+/// Makes the open `file` `0644`, whatever the umask it was created under.
+fn set_file_mode(file: &std::fs::File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(FILE_MODE))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
+/// Writes `contents` to `path`, in a directory that exists, through a temporary file renamed
+/// into place, so a reader never sees part of it.
 async fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid_path(&path.display().to_string()))?;
-    ensure_dir(parent).await?;
     let path = path.to_path_buf();
     let contents = contents.to_vec();
     tokio::task::spawn_blocking(move || {
         use std::io::Write;
         let temporary = temporary_sibling(&path);
-        let written = std::fs::OpenOptions::new()
+        let written = file_options()
             .write(true)
             .create_new(true)
             .open(&temporary)

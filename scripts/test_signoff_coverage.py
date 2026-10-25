@@ -321,7 +321,8 @@ inherits = "dev"
             words = shlex.split(line)
             if "cargo" in words and "--features" in words:
                 features.append(set(words[words.index("--features") + 1].split(",")))
-        self.assertEqual(len(features), 4, result.stdout)
+        # One clippy pass (`lint-rust`), `nextest`, and `verify-cli`.
+        self.assertEqual(len(features), 3, result.stdout)
         for selected in features:
             self.assertIn("cayenne/result-correctness-duckdb", selected)
             self.assertIn("rate-control", selected)

@@ -240,7 +240,7 @@ print-rust-gate-features:
 # large to load (dyld aborts before `main`, failing the whole run).
 # `runtime`'s `chat_tool_use` binary drives `/v1/chat/completions` through the
 # tool-use loop against an in-process mock of the Anthropic Messages API.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache)::/)) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use))
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
@@ -341,16 +341,42 @@ ifneq ($(strip $(PACKAGES)),)
 _LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
 _LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
 _FMT_FLAGS := $(_LINT_PKG_FLAGS)
-# Scoped runs rely on cargo's default target selection (the package's lib
-# and/or bins — the same set --lib --bins names): an explicit --lib is a fatal
-# `no library targets found` on bin-only packages (e.g. testoperator), which
-# breaks the targeted pre-lint that scripts/signoff derives for such branches.
-_LINT_TARGET_FLAGS :=
+# Scoped runs pass --lib only when a selected package has a library: it is a
+# fatal `no library targets found` when every selected package is bin-only
+# (e.g. testoperator alone), which would break the targeted pre-lint that
+# scripts/signoff derives for such branches. Recursive (`=`) so `cargo metadata`
+# runs only for the lint recipes, not for every target that reads PACKAGES. If
+# the metadata cannot be read, --lib is left out: --tests still lints each
+# library through its unit-test build, and the full workspace lint follows.
+_LINT_LIB_FLAG = $(shell cargo metadata --no-deps --format-version 1 2>/dev/null | $(PYTHON) -c 'import json, sys; wanted = set(sys.argv[1:]); packages = json.load(sys.stdin)["packages"]; lib_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}; print("--lib" if any(p["name"] in wanted and lib_kinds & set(t["kind"]) for p in packages for t in p["targets"]) else "")' $(PACKAGES) 2>/dev/null)
+_LINT_TARGET_FLAGS = $(_LINT_LIB_FLAG) --bins --tests
 else
 _LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract
 _FMT_FLAGS := --all
-_LINT_TARGET_FLAGS := --lib --bins
+_LINT_TARGET_FLAGS := --lib --bins --tests
 endif
+
+# One clippy pass over library, binary and test code: separate passes with
+# different flags each re-check every library, because the clippy arguments are
+# part of cargo's fingerprint. `expect_used` stays denied in test builds too;
+# `allow-expect-in-tests` (clippy.toml) exempts `#[test]` functions and
+# `#[cfg(test)]` modules, and an integration test crate whose helpers use
+# `expect` says so with a crate-level `#![expect(clippy::expect_used)]`.
+_CLIPPY_LINT_FLAGS := \
+	-Dwarnings \
+	-Dclippy::pedantic \
+	-Dclippy::unwrap_used \
+	-Dclippy::expect_used \
+	-Dclippy::clone_on_ref_ptr \
+	-Aclippy::module_name_repetitions \
+	-Aclippy::large_futures \
+	-Aclippy::too_many_lines \
+	-Dclippy::equatable_if_let \
+	-Dclippy::needless_collect \
+	-Dclippy::redundant_clone \
+	-Dclippy::todo \
+	-Dclippy::assertions_on_result_states \
+	-Dclippy::allow_attributes
 # Apply FEATURES if provided, otherwise default to hardcoded features only for workspace-wide linting
 ifneq ($(strip $(FEATURES)),)
 _FEATURES_FLAGS := --features $(FEATURES)
@@ -407,72 +433,12 @@ lint-rust:
 	## Nextest build-target generator (fast, no compile): it decides which test binaries `nextest` builds, so a parser regression would drop selected tests from the build
 	$(PYTHON) scripts/test_nextest_build_targets.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
-		-Dwarnings \
-		-Dclippy::pedantic \
-		-Dclippy::unwrap_used \
-		-Dclippy::expect_used \
-		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures \
-		-Aclippy::too_many_lines \
-		-Dclippy::equatable_if_let \
-		-Dclippy::needless_collect \
-		-Dclippy::redundant_clone \
-		-Dclippy::todo \
-		-Dclippy::assertions_on_result_states \
-		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --keep-going --tests $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
-		-Dwarnings \
-		-Dclippy::pedantic \
-		-Dclippy::unwrap_used \
-		-Aclippy::expect_used \
-		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures \
-		-Aclippy::too_many_lines \
-		-Dclippy::equatable_if_let \
-		-Dclippy::needless_collect \
-		-Dclippy::redundant_clone \
-		-Dclippy::todo \
-		-Dclippy::assertions_on_result_states \
-		-Dclippy::allow_attributes \
-		-Aunfulfilled_lint_expectations
+	cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- $(_CLIPPY_LINT_FLAGS)
 
 lint-rust-fix:
 	cargo fmt $(_FMT_FLAGS)
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) $(_LINT_TARGET_FLAGS) --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
-		-Dwarnings \
-		-Dclippy::pedantic \
-		-Dclippy::unwrap_used \
-		-Dclippy::expect_used \
-		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures \
-		-Aclippy::too_many_lines \
-		-Dclippy::equatable_if_let \
-		-Dclippy::needless_collect \
-		-Dclippy::redundant_clone \
-		-Dclippy::todo \
-		-Dclippy::assertions_on_result_states \
-		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --tests $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
-		-Dwarnings \
-		-Dclippy::pedantic \
-		-Dclippy::unwrap_used \
-		-Aclippy::expect_used \
-		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures \
-		-Aclippy::too_many_lines \
-		-Dclippy::equatable_if_let \
-		-Dclippy::needless_collect \
-		-Dclippy::redundant_clone \
-		-Dclippy::todo \
-		-Dclippy::assertions_on_result_states \
-		-Dclippy::allow_attributes \
-		-Aunfulfilled_lint_expectations
+	cargo clippy $(CARGO_PROFILE) $(_LINT_TARGET_FLAGS) --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- $(_CLIPPY_LINT_FLAGS)
 
 check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features

@@ -25,19 +25,20 @@ limitations under the License.
 //! every top-level JSON or Jinja file comes along, so a config the engine reads by name is
 //! there whichever it is.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use huggingface_hub::{DownloadError, RepoType, Requester, Settings, Snapshot};
+use huggingface_hub::{DownloadError, Requester, Snapshot};
 use regex::Regex;
 
-use super::HubParams;
+use crate::hf::HubParams;
 
-const SAFETENSOR_INDEX: &str = "model.safetensors.index.json";
+use crate::hf::SAFETENSORS_INDEX as SAFETENSOR_INDEX;
 const DOCS_URL: &str = "https://spiceai.org/docs/components/models/huggingface";
 
-/// Downloads the files mistral.rs loads the model `model_id` (`org/name[:revision]`) from, for
-/// the model named `name`, and returns the directory they are in.
+/// Downloads the files the model `model_id` (`org/name[:revision]`) loads from, for the model
+/// named `name`, and returns the directory they are in: the GGUF files `gguf` names, or the
+/// files mistral.rs loads when it names none.
 ///
 /// # Errors
 ///
@@ -45,7 +46,7 @@ const DOCS_URL: &str = "https://spiceai.org/docs/components/models/huggingface";
 /// needs, or a download fails.
 pub async fn download_model(
     model_id: &str,
-    gguf: Option<&str>,
+    gguf: &[&str],
     hub: HubParams<'_>,
     name: &str,
 ) -> Result<PathBuf, DownloadError> {
@@ -53,16 +54,13 @@ pub async fn download_model(
         kind: "model",
         name: name.to_string(),
         docs_url: DOCS_URL,
+        retried: true,
     };
     let (repo, revision) = match model_id.split_once(':') {
         Some((repo, revision)) => (repo, Some(revision).filter(|r| !r.is_empty())),
         None => (model_id, None),
     };
-    let repo = DownloadError::parse_repo(&requester, RepoType::Model, repo, revision)?;
-    let settings = Settings::resolve(hub.token.cloned(), hub.endpoint)
-        .await
-        .map_err(|source| DownloadError::settings(&requester, &repo, revision, source))?;
-    let snapshot = Snapshot::open(settings, requester, repo, revision).await?;
+    let snapshot = crate::hf::open_model(requester, repo, revision, hub).await?;
     download(&snapshot, gguf).await
 }
 
@@ -80,19 +78,17 @@ static SAFETENSORS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 static PICKLES: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"pytorch_model-\d{5}-of-\d{5}.((pth)|(pt)|(bin))\b").ok());
 
-/// Downloads what mistral.rs loads a model from: the weights named by `gguf`, or the repo's
-/// safetensors (or sharded pickle) weights, and the top-level configs. Returns the snapshot
-/// directory.
+/// Downloads what a model loads from: the GGUF files `gguf` names (every shard, and any MTP
+/// draft head), or, when it names none, the repo's safetensors (or sharded pickle) weights;
+/// and the top-level configs. Returns the snapshot directory.
 ///
 /// # Errors
 ///
 /// Returns an error if the repository lacks a file the engine needs, or a download fails.
-pub async fn download(snapshot: &Snapshot, gguf: Option<&str>) -> Result<PathBuf, DownloadError> {
+pub async fn download(snapshot: &Snapshot, gguf: &[&str]) -> Result<PathBuf, DownloadError> {
     let names: Vec<&str> = snapshot.files().map(|file| file.path.as_str()).collect();
     let mut paths = configs(&names);
-    if let Some(gguf) = gguf {
-        paths.push(gguf.to_string());
-    } else {
+    if gguf.is_empty() {
         for alternatives in [
             ["tokenizer.json", "tekken.json"],
             ["config.json", "params.json"],
@@ -105,19 +101,7 @@ pub async fn download(snapshot: &Snapshot, gguf: Option<&str>) -> Result<PathBuf
             }
         }
         let weights = match weights(&names) {
-            Some(Weights::Index) => {
-                let index = snapshot.fetch_quietly(&[SAFETENSOR_INDEX]).await?;
-                let index = index.first().cloned().unwrap_or_default();
-                let contents = tokio::fs::read_to_string(&index).await.map_err(|error| {
-                    DownloadError::unusable(
-                        snapshot,
-                        format!("'{SAFETENSOR_INDEX}' could not be read ({error})"),
-                    )
-                })?;
-                shards(&contents, |shard| names.contains(&shard)).map_err(|why| {
-                    DownloadError::unusable(snapshot, format!("'{SAFETENSOR_INDEX}' {why}"))
-                })?
-            }
+            Some(Weights::Index) => crate::hf::read_shards(snapshot).await?,
             Some(Weights::Files(files)) => files,
             None => {
                 return Err(DownloadError::missing(
@@ -127,6 +111,8 @@ pub async fn download(snapshot: &Snapshot, gguf: Option<&str>) -> Result<PathBuf
             }
         };
         paths.extend(weights);
+    } else {
+        paths.extend(gguf.iter().map(ToString::to_string));
     }
     paths.sort();
     paths.dedup();
@@ -148,6 +134,20 @@ fn configs(names: &[&str]) -> Vec<String> {
         })
         .map(ToString::to_string)
         .collect()
+}
+
+/// The file mistral.rs reads a downloaded repository's chat template from: its
+/// `chat_template.jinja`, else its `tokenizer_config.json`. Every top-level JSON and Jinja file
+/// of the repository is downloaded with the model, so a file missing from `dir` is missing from
+/// the repository.
+pub async fn chat_template_file(dir: &Path) -> Option<PathBuf> {
+    for name in ["chat_template.jinja", "tokenizer_config.json"] {
+        let path = dir.join(name);
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Where the weights mistral.rs loads are named.
@@ -194,30 +194,6 @@ fn weights(names: &[&str]) -> Option<Weights> {
     (!pickles.is_empty()).then_some(Weights::Files(pickles))
 }
 
-/// The shard files a safetensors index names, each of which `listed` must accept.
-fn shards(index: &str, listed: impl Fn(&str) -> bool) -> Result<Vec<String>, String> {
-    let index: serde_json::Value =
-        serde_json::from_str(index).map_err(|_| "is not valid JSON".to_string())?;
-    let map = index
-        .get("weight_map")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| "has no `weight_map`".to_string())?;
-    let mut shards: Vec<String> = map
-        .values()
-        .filter_map(serde_json::Value::as_str)
-        .map(ToString::to_string)
-        .collect();
-    shards.sort();
-    shards.dedup();
-    if shards.is_empty() {
-        return Err("names no weight files".to_string());
-    }
-    if let Some(missing) = shards.iter().find(|shard| !listed(shard)) {
-        return Err(format!("names '{missing}', which is not in the repo"));
-    }
-    Ok(shards)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +204,20 @@ mod tests {
 
     fn owned(names: &[&str]) -> Vec<String> {
         names.iter().map(ToString::to_string).collect()
+    }
+
+    /// As mistral.rs does, a repository's `chat_template.jinja` is read before its
+    /// `tokenizer_config.json`, and a repository with neither has no template file.
+    #[tokio::test]
+    async fn the_chat_template_file_is_the_jinja_file_before_tokenizer_config() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        assert_eq!(chat_template_file(dir.path()).await, None);
+        let config = dir.path().join("tokenizer_config.json");
+        std::fs::write(&config, "{}").expect("tokenizer_config.json writes");
+        assert_eq!(chat_template_file(dir.path()).await, Some(config));
+        let jinja = dir.path().join("chat_template.jinja");
+        std::fs::write(&jinja, "").expect("chat_template.jinja writes");
+        assert_eq!(chat_template_file(dir.path()).await, Some(jinja));
     }
 
     #[test]
@@ -295,30 +285,6 @@ mod tests {
                 "chat_template.jinja",
                 "generation_config.json"
             ])
-        );
-    }
-
-    #[test]
-    fn an_index_names_its_shards() {
-        let index = r#"{"metadata":{},"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors","c":"model-00001-of-00002.safetensors"}}"#;
-        assert_eq!(
-            shards(index, |_| true),
-            Ok(owned(&[
-                "model-00001-of-00002.safetensors",
-                "model-00002-of-00002.safetensors"
-            ]))
-        );
-        assert_eq!(
-            shards(index, |shard| shard != "model-00002-of-00002.safetensors"),
-            Err("names 'model-00002-of-00002.safetensors', which is not in the repo".to_string())
-        );
-        assert_eq!(
-            shards("{}", |_| true),
-            Err("has no `weight_map`".to_string())
-        );
-        assert_eq!(
-            shards(r#"{"weight_map":{}}"#, |_| true),
-            Err("names no weight files".to_string())
         );
     }
 }

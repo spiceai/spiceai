@@ -525,6 +525,13 @@ pub struct Acceleration {
 
     /// The acceleration engine. Defaults to `cayenne`, or to `arrow` on Windows, where
     /// Cayenne is not available.
+    ///
+    /// Every engine other than `cayenne` (`arrow`, `duckdb`, `sqlite`, `turso`, and
+    /// `postgres`) is deprecated in v2.4 and will be removed in v2.5; a Spicepod that uses
+    /// one logs a warning at startup and on hot reload. Set `engine: cayenne`, or leave
+    /// `engine` unset, then delete the old engine's acceleration files and snapshots. On
+    /// Windows, run Spice in Docker or WSL to use Cayenne. See
+    /// <https://spiceai.org/docs/components/data-accelerators/cayenne/migration>.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
 

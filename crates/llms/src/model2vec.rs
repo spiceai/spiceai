@@ -16,18 +16,36 @@ limitations under the License.
 
 use crate::embeddings::Embed;
 use crate::embeddings::Error::{
-    FailedToInstantiateEmbeddingModel, LocalModelPathDoesNotExist, UnsupportedEmbeddingInput,
+    FailedToDownloadModel, FailedToInstantiateEmbeddingModel, LocalModelPathDoesNotExist,
+    UnsupportedEmbeddingInput,
 };
+use crate::hf::HubParams;
 use async_openai::types::embeddings::EmbeddingInput;
 use async_trait::async_trait;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
+use huggingface_hub::{DownloadError, Requester};
 use model2vec_rs::model::StaticModel;
 use std::fmt::{Debug, Formatter};
 use std::io::{Error as IoError, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use util::home_dir::home_dir;
+
+const DOCS_URL: &str = "https://spiceai.org/docs/components/embeddings/model2vec";
+
+/// How a `model2vec` model is loaded and run.
+#[derive(Debug, Clone, Default)]
+pub struct Model2VecOptions {
+    /// Whether to normalize embeddings; the model's `config.json` decides when `None`.
+    pub normalize: Option<bool>,
+    /// The folder of the repository or directory that holds the model.
+    pub subfolder: Option<String>,
+    /// Spice-specific parallelism control: how many threads to embed on.
+    pub parallelism: Option<usize>,
+    pub embed_max_token_length: Option<usize>,
+    pub embed_custom_batch_size: Option<usize>,
+}
 
 /// A wrapper around the `model2vec` library for generating text embeddings.
 ///
@@ -54,51 +72,83 @@ pub struct Model2Vec {
 }
 
 impl Model2Vec {
-    /// Creates a new `Model2Vec` instance from the given parameters.
-    ///
-    /// # Arguments
-    /// * `name` - The name/identifier of the model
-    /// * `hf_token` - Optional Hugging Face authentication token
-    /// * `normalize` - Whether to normalize embeddings (defaults to model's setting)
-    /// * `subfolder` - When using a huggingface model, it may reside in a subfolder of the repo
-    /// * `parallelism` - Spice-specific parallelism control (how many threads to embed on)
-    /// * `embed_batch_size` - Batch size for embedding operations
-    /// * `embed_custom_batch_size` - Custom batch size override
+    /// Loads the `model2vec` model `model` for the embedding model `component`: a local
+    /// directory, or a Hugging Face repository (`org/name`) downloaded into the Hugging Face
+    /// cache first. The model is read on a blocking thread.
     ///
     /// # Errors
-    /// Returns an error if:
-    /// - The model cannot be loaded or initialized
-    /// - Invalid parameters are provided
-    /// - Network issues occur when downloading the model
-    /// - Authentication fails with the provided HF token
-    pub fn from_params(
-        name: &str,
-        hf_token: Option<&str>,
-        normalize: Option<bool>,
-        subfolder: Option<&str>,
-        parallelism: Option<usize>,
-        embed_max_token_length: Option<usize>,
-        embed_custom_batch_size: Option<usize>,
+    ///
+    /// Returns an error if a local directory does not exist, the download fails, or the model
+    /// cannot be loaded.
+    pub async fn load(
+        component: &str,
+        model: &str,
+        hub: HubParams<'_>,
+        mut options: Model2VecOptions,
     ) -> Result<Self, super::embeddings::Error> {
-        let name = if let Some(local_model_path) = local_model_path(name)? {
-            match local_model_path.try_exists() {
-                Ok(true) => local_model_path.to_string_lossy().into_owned(),
-                Ok(false) => {
-                    return Err(LocalModelPathDoesNotExist {
-                        path: name.to_string(),
-                    });
+        let (dir, name) = match local_model_path(model)? {
+            Some(path) => {
+                match tokio::fs::try_exists(&path).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(LocalModelPathDoesNotExist {
+                            path: model.to_string(),
+                        });
+                    }
+                    Err(source) => {
+                        return Err(FailedToInstantiateEmbeddingModel {
+                            source: source.into(),
+                        });
+                    }
                 }
-                Err(source) => {
-                    return Err(FailedToInstantiateEmbeddingModel {
-                        source: source.into(),
-                    });
-                }
+                let name = path.to_string_lossy().into_owned();
+                (path, name)
             }
-        } else {
-            name.to_string()
+            // `model2vec-rs` reads a relative directory that exists before it asks the Hub.
+            None if tokio::fs::try_exists(model).await.unwrap_or(false) => {
+                (PathBuf::from(model), model.to_string())
+            }
+            None => {
+                // `model2vec-rs` joins the folder onto the snapshot directory, where a leading
+                // `/` would make it an absolute path.
+                options.subfolder = repo_folder(options.subfolder.as_deref());
+                let requester = Requester {
+                    kind: "embedding model",
+                    name: component.to_string(),
+                    docs_url: DOCS_URL,
+                    // Spice loads an embedding model once.
+                    retried: false,
+                };
+                let dir = download(requester, model, hub, options.subfolder.as_deref())
+                    .await
+                    .map_err(|source| FailedToDownloadModel {
+                        source: Box::new(source),
+                    })?;
+                (dir, model.to_string())
+            }
         };
+        tokio::task::spawn_blocking(move || Self::from_dir(&dir, name, options))
+            .await
+            .map_err(|source| FailedToInstantiateEmbeddingModel {
+                source: Box::new(source),
+            })?
+    }
 
-        let model = StaticModel::from_pretrained(&name, hf_token, normalize, subfolder)
+    /// Loads the `model2vec` model in `dir`, or in its `options.subfolder`, as `name`. Reads
+    /// the files synchronously.
+    fn from_dir(
+        dir: &Path,
+        name: String,
+        options: Model2VecOptions,
+    ) -> Result<Self, super::embeddings::Error> {
+        let Model2VecOptions {
+            normalize,
+            subfolder,
+            parallelism,
+            embed_max_token_length,
+            embed_custom_batch_size,
+        } = options;
+        let model = StaticModel::from_pretrained(dir, None, normalize, subfolder.as_deref())
             .map_err(|e| FailedToInstantiateEmbeddingModel { source: e.into() })?;
 
         let model2vec = Self {
@@ -111,7 +161,7 @@ impl Model2Vec {
             cache: None,
         };
 
-        tracing::trace!("Model2Vec::from_params: {model2vec:?}");
+        tracing::trace!("Model2Vec::from_dir: {model2vec:?}");
 
         Ok(model2vec)
     }
@@ -124,6 +174,57 @@ impl Model2Vec {
         self.cache = cache;
         self
     }
+}
+
+/// `subfolder` as a folder of a repository, which has no leading or trailing `/`; `None` for
+/// the repository's root.
+fn repo_folder(subfolder: Option<&str>) -> Option<String> {
+    subfolder
+        .map(|folder| folder.trim_matches('/'))
+        .filter(|folder| !folder.is_empty())
+        .map(str::to_string)
+}
+
+/// The files `model2vec-rs` reads from a model in `folder` of a repository (see
+/// [`repo_folder`]): its tokenizer and its weights, and its `config.json` when the repository
+/// has one; `has` says whether the repository holds a path. When the repository lacks a file,
+/// what it lacks.
+fn model2vec_files(
+    folder: Option<&str>,
+    has: impl Fn(&str) -> bool,
+) -> Result<Vec<String>, String> {
+    let prefix = folder
+        .map(|folder| format!("{folder}/"))
+        .unwrap_or_default();
+    let mut paths = Vec::new();
+    for required in ["tokenizer.json", "model.safetensors"] {
+        let path = format!("{prefix}{required}");
+        if !has(&path) {
+            return Err(format!("'{path}'"));
+        }
+        paths.push(path);
+    }
+    let config = format!("{prefix}config.json");
+    if has(&config) {
+        paths.push(config);
+    }
+    Ok(paths)
+}
+
+/// Downloads the files [`model2vec_files`] names from the repository `repo` into the Hugging
+/// Face cache, and returns the snapshot directory that holds them.
+async fn download(
+    requester: Requester,
+    repo: &str,
+    hub: HubParams<'_>,
+    folder: Option<&str>,
+) -> Result<PathBuf, DownloadError> {
+    let snapshot = crate::hf::open_model(requester, repo, None, hub).await?;
+    let paths = model2vec_files(folder, |path| snapshot.file(path).is_some())
+        .map_err(|missing| DownloadError::missing(&snapshot, missing))?;
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    snapshot.download(&paths).await?;
+    Ok(snapshot.dir())
 }
 
 fn looks_like_local_model_path(name: &str) -> bool {
@@ -306,11 +407,25 @@ impl Embed for Model2Vec {
 mod tests {
     use crate::embeddings::Embed;
     use crate::embeddings::Error;
-    use crate::model2vec::Model2Vec;
+    use crate::hf::HubParams;
+    use crate::model2vec::{Model2Vec, Model2VecOptions};
     use async_openai::types::embeddings::EmbeddingInput;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{home_dir, local_model_path, looks_like_local_model_path};
+    use super::{
+        home_dir, local_model_path, looks_like_local_model_path, model2vec_files, repo_folder,
+    };
+
+    /// Loads `model`, a local directory in these tests, as the embedding model `test`.
+    async fn load(model: &str) -> Result<Model2Vec, Error> {
+        Model2Vec::load(
+            "test",
+            model,
+            HubParams::default(),
+            Model2VecOptions::default(),
+        )
+        .await
+    }
 
     /// A static-embedding model directory holding only the two files
     /// `model2vec-rs` actually reads — the tokenizer and the embedding tensor,
@@ -385,8 +500,8 @@ mod tests {
     /// optional and defaults `normalize` to true. Losing the patch is not a wrong
     /// answer, it is a model that will not load at all, and the error names a file
     /// the model was never supposed to have.
-    #[test]
-    fn a_local_model_loads_without_a_config_json() {
+    #[tokio::test]
+    async fn a_local_model_loads_without_a_config_json() {
         let dir = sentence_transformers_style_model_dir("embeddings");
         assert!(
             !dir.path().join("config.json").exists(),
@@ -403,7 +518,7 @@ mod tests {
             "this guard has to reach the local-directory branch, not the Hub"
         );
 
-        Model2Vec::from_params(name, None, None, None, None, None, None).unwrap_or_else(|e| {
+        load(name).await.unwrap_or_else(|e| {
             panic!(
                 "a static-embedding model directory without a config.json must load, since \
                  sentence-transformers models do not ship one: {e}"
@@ -425,8 +540,8 @@ mod tests {
     /// The control is the other test: it loads the same fixture under the
     /// upstream name, so this one failing means the fallback is gone rather than
     /// the fixture being malformed.
-    #[test]
-    fn a_local_model_loads_with_the_sentence_transformers_tensor_names() {
+    #[tokio::test]
+    async fn a_local_model_loads_with_the_sentence_transformers_tensor_names() {
         for tensor_key in ["embedding.weight", "0"] {
             let dir = sentence_transformers_style_model_dir(tensor_key);
             let name = dir
@@ -434,7 +549,7 @@ mod tests {
                 .to_str()
                 .expect("the fixture model path is UTF-8");
 
-            Model2Vec::from_params(name, None, None, None, None, None, None).unwrap_or_else(|e| {
+            load(name).await.unwrap_or_else(|e| {
                 panic!(
                     "a static-embedding model whose tensor is named `{tensor_key}` must load: \
                      upstream reads `embeddings` only, so without the fork's fallback chain \
@@ -442,6 +557,69 @@ mod tests {
                 )
             });
         }
+    }
+
+    /// The files `model2vec-rs` reads from a directory, as paths in the repository.
+    #[test]
+    fn model2vec_files_are_what_model2vec_rs_reads() {
+        let repo = |names: &'static [&'static str]| move |path: &str| names.contains(&path);
+        assert_eq!(
+            model2vec_files(
+                None,
+                repo(&[
+                    "config.json",
+                    "tokenizer.json",
+                    "model.safetensors",
+                    "README.md"
+                ])
+            ),
+            Ok(vec![
+                "tokenizer.json".to_string(),
+                "model.safetensors".to_string(),
+                "config.json".to_string(),
+            ])
+        );
+        // A sentence-transformers export has no `config.json`.
+        assert_eq!(
+            model2vec_files(None, repo(&["tokenizer.json", "model.safetensors"])),
+            Ok(vec![
+                "tokenizer.json".to_string(),
+                "model.safetensors".to_string(),
+            ])
+        );
+        // A model in a subfolder, however the folder is written.
+        for subfolder in [
+            "0_StaticEmbedding",
+            "0_StaticEmbedding/",
+            "/0_StaticEmbedding/",
+        ] {
+            assert_eq!(
+                model2vec_files(
+                    repo_folder(Some(subfolder)).as_deref(),
+                    repo(&[
+                        "tokenizer.json",
+                        "0_StaticEmbedding/tokenizer.json",
+                        "0_StaticEmbedding/model.safetensors",
+                    ])
+                ),
+                Ok(vec![
+                    "0_StaticEmbedding/tokenizer.json".to_string(),
+                    "0_StaticEmbedding/model.safetensors".to_string(),
+                ])
+            );
+        }
+        // What a repository lacks, worded to follow "the repo has no".
+        assert_eq!(
+            model2vec_files(
+                Some("0_StaticEmbedding"),
+                repo(&["tokenizer.json", "model.safetensors"])
+            ),
+            Err("'0_StaticEmbedding/tokenizer.json'".to_string())
+        );
+        assert_eq!(
+            model2vec_files(None, repo(&["tokenizer.json", "pytorch_model.bin"])),
+            Err("'model.safetensors'".to_string())
+        );
     }
 
     #[test]
@@ -454,8 +632,8 @@ mod tests {
         assert!(!looks_like_local_model_path("minishlab/potion-base-8M"));
     }
 
-    #[test]
-    fn missing_local_model_path_returns_specific_error() {
+    #[tokio::test]
+    async fn missing_local_model_path_returns_specific_error() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after Unix epoch")
@@ -469,7 +647,8 @@ mod tests {
         );
         let missing_path = missing_path.to_string_lossy().into_owned();
 
-        let err = Model2Vec::from_params(&missing_path, None, None, None, None, None, None)
+        let err = load(&missing_path)
+            .await
             .expect_err("missing local model path should fail before Hugging Face lookup");
 
         assert!(
@@ -512,16 +691,9 @@ mod tests {
     #[expect(dead_code)]
     async fn test_embed() {
         // This embedding is dim 256
-        let model = Model2Vec::from_params(
-            "minishlab/potion-base-8M",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("Must instantiate");
+        let model = load("minishlab/potion-base-8M")
+            .await
+            .expect("Must instantiate");
 
         let embed_sentence = model
             .embed(EmbeddingInput::String("hello world".to_string()))

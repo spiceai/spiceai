@@ -407,20 +407,7 @@ impl FullTextSearchFieldIndex {
         filters: &[Box<dyn Query>],
         limit: usize,
     ) -> Result<Vec<(Score, DocAddress)>> {
-        // Prefer Tantivy's full QueryParser so operators (AND/OR/NOT), phrases
-        // ("exact match"), field-scoped queries (title:foo) and boosts (term^2)
-        // are honored. Fall back to a bag-of-words OR clause for inputs the
-        // parser rejects (e.g. unbalanced quotes, lone special characters in
-        // conversational queries).
-        let parser = self.query_parser();
-        let text_query = match parser.parse_query(literal) {
-            Ok(parsed) => parsed,
-            Err(_) => parser
-                .build_query_from_user_input_ast(parse_query_literal(literal))
-                .context(InvalidTextSearchQuerySnafu {
-                    query: literal.to_string(),
-                })?,
-        };
+        let text_query = parse_user_query(&self.query_parser(), literal)?;
 
         // `Must`-combine each pushed-down SQL filter with the full-text clause so the top-K is
         // computed over the filtered document set (the filter is applied inside the index, not
@@ -485,6 +472,23 @@ impl FullTextSearchFieldIndex {
         decoder.serialize(hits)?;
 
         Ok(decoder)
+    }
+}
+
+/// Parse a user-provided full-text query.
+///
+/// Prefer Tantivy's full `QueryParser` so operators (AND/OR/NOT), phrases ("exact match"),
+/// field-scoped queries (title:foo) and boosts (term^2) are honored. Fall back to a bag-of-words
+/// OR clause for inputs the parser rejects (e.g. unbalanced quotes, lone special characters in
+/// conversational queries).
+fn parse_user_query(parser: &QueryParser, literal: &str) -> Result<Box<dyn Query>> {
+    match parser.parse_query(literal) {
+        Ok(parsed) => Ok(parsed),
+        Err(_) => parser
+            .build_query_from_user_input_ast(parse_query_literal(literal))
+            .context(InvalidTextSearchQuerySnafu {
+                query: literal.to_string(),
+            }),
     }
 }
 
@@ -654,7 +658,79 @@ pub fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::generation::text_search::parse_query_literal;
+    use crate::generation::text_search::{parse_query_literal, parse_user_query};
+    use tantivy::{
+        Index,
+        query::QueryParser,
+        schema::{Schema, TEXT},
+    };
+
+    fn text_parser() -> QueryParser {
+        let mut builder = Schema::builder();
+        let text = builder.add_text_field("text", TEXT);
+        QueryParser::for_index(&Index::create_in_ram(builder.build()), vec![text])
+    }
+
+    /// A `*` that Tantivy's grammar read as an exists query with no field panicked inside the
+    /// parser (quickwit-oss/tantivy#3031), failing the whole search request. Regression test for
+    /// the vendored `tantivy-query-grammar` fix.
+    #[test]
+    fn test_fieldless_star_does_not_panic() {
+        let parser = text_parser();
+        let mut queries = vec![
+            "- *".to_string(),
+            "+ *".to_string(),
+            "a - *".to_string(),
+            "/'/ *(".to_string(),
+            "text:[a' TO z] *(".to_string(),
+            "\"it's\" *(".to_string(),
+            "a \"\"**(".to_string(),
+            "(+ *)".to_string(),
+            "-  * b".to_string(),
+        ];
+        for prefix in ["", "a ", "(", "+", "-", "NOT ", "a AND ", "a\t", "\"x\" "] {
+            for end in [
+                '^', '`', ':', '{', '}', '"', '\'', '[', ']', '\\', '(', '\u{a0}', '\u{b}',
+                '\u{c}', '\u{3000}',
+            ] {
+                queries.push(format!("{prefix}*{end}b"));
+            }
+        }
+        for q in &queries {
+            parse_user_query(&parser, q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
+        }
+    }
+
+    /// Every query of up to four characters over the grammar's operator and delimiter characters,
+    /// plus whitespace the grammar's rules disagree on, parses without a panic.
+    #[test]
+    fn test_short_queries_never_panic() {
+        let parser = text_parser();
+        let alphabet: Vec<char> = "a* ()\"[]:^'{}\\+-/\u{a0}".chars().collect();
+        let mut digits = Vec::new();
+        loop {
+            let q: String = digits.iter().map(|&d| alphabet[d]).collect();
+            parse_user_query(&parser, &q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
+            // Advance `digits` as an odometer over `alphabet`, growing to four characters.
+            let mut pos = digits.len();
+            loop {
+                if pos == 0 {
+                    if digits.len() == 4 {
+                        return;
+                    }
+                    digits.fill(0);
+                    digits.push(0);
+                    break;
+                }
+                pos -= 1;
+                digits[pos] += 1;
+                if digits[pos] < alphabet.len() {
+                    break;
+                }
+                digits[pos] = 0;
+            }
+        }
+    }
 
     #[test]
     fn test_parse_query_literal() {

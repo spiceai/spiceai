@@ -510,7 +510,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' (optionally with 'partition_by') or 'cayenne' instead."
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
     ))]
     UnsupportedDistributedAccelerationEngine {
         dataset_name: String,
@@ -1390,6 +1390,7 @@ pub trait DatasetPlacement: std::fmt::Debug + Send + Sync {
 /// The verdict is point-in-time and does not survive into the side effect the
 /// caller then commits; closing that remaining window needs the side effect
 /// itself to carry a generation (#13746).
+#[derive(Clone)]
 pub struct TableInstance {
     table: TableReference,
     /// Held weakly on purpose. A `Weak` keeps the allocation open, so a dropped
@@ -1924,7 +1925,7 @@ impl DataFusion {
     /// action captured against the old one is about a table that is no longer
     /// there.
     #[must_use]
-    async fn table_instance_is_current(&self, instance: &TableInstance) -> bool {
+    pub(crate) async fn table_instance_is_current(&self, instance: &TableInstance) -> bool {
         let Some(captured) = instance.provider.as_ref() else {
             // Nothing resolved under the name when the instance was captured, so
             // there is no identity to compare against; the most the registry can
@@ -4163,6 +4164,7 @@ impl DataFusion {
         let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching)
             || (source.as_any().is::<SinkConnector>()
                 && !matches!(refresh_mode, RefreshMode::Snapshot));
+        let mut initial_status = None;
         if !initial_load_complete
             && let Ok(checkpoint) = dataset_checkpointer(
                 dataset,
@@ -4173,18 +4175,12 @@ impl DataFusion {
             .await
             && checkpoint.exists().await
         {
-            // For append refreshes that rely on a time column (i.e. file-based appends) that have
-            // snapshotting enabled, we delay readiness until the first refresh completes so that
-            // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
-            // Additionally, for CDC we let connector/stream to decide when dataset is ready.
+            // For CDC we let connector/stream to decide when dataset is ready.
             //
             // A dataset that reads snapshots (`file_format: snapshot`) is ready only once it
             // has restored a snapshot in this process: a copy left from an earlier run can be
             // arbitrarily old, or from a location the dataset no longer reads.
-            let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
-                && dataset.time_column.is_some()
-                && acceleration_settings.snapshot_behavior.bootstrap_enabled()
-                || matches!(refresh_mode, RefreshMode::Changes)
+            let delay_initial_ready = matches!(refresh_mode, RefreshMode::Changes)
                 || (dataset.is_snapshot_source()
                     && bootstrap_status.loaded_snapshot_id().is_none());
 
@@ -4200,13 +4196,16 @@ impl DataFusion {
                 // `Refreshing` itself when it starts.
                 let awaits_source = effective_ready_state == ReadyState::OnSchemaResolved
                     && source_table_provider.awaits_source();
-                let initial_status = if awaits_source {
+                //
+                // Reported when the refresher starts rather than here: the dataset's search
+                // indexes are rebuilt from the acceleration first, and it is not registered
+                // until they are, so reporting it ready now would let `/v1/ready` answer while
+                // queries against it still fail.
+                initial_status = Some(if awaits_source {
                     status::ComponentStatus::Initializing
                 } else {
                     status::ComponentStatus::Ready
-                };
-                self.runtime_status
-                    .update_dataset(&dataset.name, initial_status);
+                });
                 initial_load_complete = true;
             }
         }
@@ -4610,6 +4609,9 @@ impl DataFusion {
         }
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
+        if let Some(initial_status) = initial_status {
+            accelerated_table_builder.initial_status(initial_status);
+        }
 
         // Caching mode requires federation to be disabled so that queries go through
         // AcceleratedTable::scan to trigger the cache miss/hit logic
@@ -6666,7 +6668,11 @@ impl DataFusion {
                 secrets,
             )
             .await?;
-        source.mark_registered();
+        let instance = match &registration {
+            Some((instance, _)) => instance.clone(),
+            None => self.capture_table_instance(&view.name).await,
+        };
+        source.mark_registered(instance);
         Ok(registration)
     }
 
@@ -7571,16 +7577,20 @@ async fn build_snapshot_creation_config(
         return Ok(None);
     }
 
-    // A partitioned Cayenne dataset must not publish snapshots: its exported
-    // metastore slice omits the partition child tables, so the uploaded archive
-    // could not be restored, yet `create_snapshot` would still make it the
-    // store's `current-snapshot-id`. Same gate as `snapshot_before_recreate`.
-    if acceleration_settings.engine == Engine::Cayenne
-        && !acceleration_settings.partition_by.is_empty()
-    {
+    // The same rule `snapshot_before_recreate` applies, read from the one place
+    // that states it — rationale on `archive_would_be_unrestorable`. A copy per
+    // publish path is how the periodic path came to publish an archive the
+    // pre-recreation path already refused.
+    if engine_to_acceleration_engine(acceleration_settings.engine).is_some_and(|engine| {
+        data_accelerator_api::snapshots::archive_would_be_unrestorable(
+            &engine,
+            snapshot_engine_override.as_ref(),
+        )
+    }) {
         tracing::warn!(
             dataset = %dataset.name,
-            "Snapshot creation is disabled for this dataset: snapshots of a partitioned Cayenne acceleration are not yet supported, and an archive without the partitions' metadata could not be restored"
+            "Dataset '{}' will not publish snapshots: its Cayenne metastore catalog is unavailable, so an archive of it would carry no metastore slice and could not be restored. Check that this dataset's `cayenne_metadata_dir` and data directory are readable.",
+            dataset.name
         );
         return Ok(None);
     }
@@ -8616,6 +8626,60 @@ mod tests {
             assert!(result.expect("config should exist").is_none());
         }
 
+        /// A Cayenne dataset must not publish a snapshot the default engine
+        /// wrote: that archive carries the raw `cayenne.db` and no per-dataset
+        /// metastore slice, and publishing it makes an unrestorable archive the
+        /// store's `current-snapshot-id`. `snapshot_engine_for_source` returns
+        /// `None` on a catalog or data-directory failure, so the absent
+        /// override is the observable form of that failure here.
+        ///
+        /// Partitioned and unpartitioned alike: `snapshot_before_recreate`
+        /// draws no such distinction, and the slice is what makes either one
+        /// restorable.
+        #[tokio::test]
+        async fn cayenne_does_not_publish_without_its_snapshot_engine() {
+            for partition_by in [
+                vec![],
+                vec![spicepod::partitioning::PartitionedBy {
+                    name: "part_col".to_string(),
+                    expression: "part_col".to_string(),
+                }],
+            ] {
+                let dataset = create_test_dataset(None).await;
+                let acceleration = Acceleration {
+                    partition_by,
+                    ..create_acceleration_with_trigger(
+                        Some("file:///tmp".to_string()),
+                        Engine::Cayenne,
+                        Some(SnapshotsTrigger::RefreshComplete),
+                        None,
+                        &dataset.runtime().secrets(),
+                    )
+                };
+                let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+                let result = build_snapshot_creation_config(
+                    &dataset,
+                    &acceleration,
+                    RefreshMode::Full,
+                    AccelerationLayout::cayenne(
+                        temp_dir.path().join("metadata"),
+                        temp_dir.path().join("data"),
+                    ),
+                    None,
+                )
+                .await;
+
+                assert!(
+                    result
+                        .expect("an absent snapshot engine is not an error")
+                        .is_none(),
+                    "Cayenne must not publish through the default engine (partition_by={:?})",
+                    acceleration.partition_by
+                );
+            }
+        }
+
         #[tokio::test]
         async fn test_snapshot_refresh_mode_is_reader_only() {
             let dataset = create_test_dataset(None).await;
@@ -9022,6 +9086,12 @@ mod tests {
                     Err(Error::UnsupportedDistributedAccelerationEngine { .. })
                 ),
                 "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+            // The fix it names is the engine that stays: `arrow` is deprecated, and
+            // Cayenne partitions only in file mode.
+            assert_eq!(
+                result.expect_err("duckdb is rejected").to_string(),
+                "Failed to create an accelerated table for dataset my_dataset: the 'duckdb' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
             );
         }
 

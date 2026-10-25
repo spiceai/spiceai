@@ -156,7 +156,7 @@ jobs:
       # The dev runner image has python3 but no pip, which the bootstrap below needs.
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
@@ -379,6 +379,8 @@ jobs:
               --head "${BRANCH_NAME}" \
               --label kind/bug
           fi
+          # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
+          bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Never fall back to an interactive prompt; fail fast if auth is rejected.

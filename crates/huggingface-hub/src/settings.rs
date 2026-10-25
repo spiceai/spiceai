@@ -112,6 +112,26 @@ impl fmt::Display for TokenSource {
     }
 }
 
+/// A component's `hf_token`, and where Spice got it, which decides where it may be sent.
+#[derive(Debug, Clone)]
+pub enum ParamToken {
+    /// Set in the Spicepod: sent to the component's endpoint, whichever it is.
+    Spicepod(SecretString),
+    /// Loaded from a secret store because the Spicepod does not set it. The environment secret
+    /// store reads `HF_TOKEN` for it, so it is sent only where `HF_TOKEN` is: to the public Hub
+    /// or `HF_ENDPOINT`, never to an `hf_endpoint` the Spicepod sets.
+    SecretStore(SecretString),
+}
+
+impl ParamToken {
+    #[must_use]
+    pub fn secret(&self) -> &SecretString {
+        match self {
+            ParamToken::Spicepod(secret) | ParamToken::SecretStore(secret) => secret,
+        }
+    }
+}
+
 /// A Hub token and where it came from.
 #[derive(Clone)]
 pub struct Token {
@@ -203,7 +223,7 @@ impl Settings {
     ///
     /// Returns an error if an endpoint is not a valid Hub URL, the token file exists but cannot
     /// be read, or no cache directory can be found.
-    pub async fn resolve(token: Option<SecretString>, endpoint: Option<&str>) -> Result<Self> {
+    pub async fn resolve(token: Option<ParamToken>, endpoint: Option<&str>) -> Result<Self> {
         Self::resolve_in(&ProcessEnvironment, token, endpoint).await
     }
 
@@ -214,7 +234,7 @@ impl Settings {
     /// See [`Settings::resolve`].
     pub async fn resolve_in(
         env: &impl Environment,
-        token: Option<SecretString>,
+        token: Option<ParamToken>,
         endpoint: Option<&str>,
     ) -> Result<Self> {
         let var = |name: &str| env.var(name).filter(|value| !value.trim().is_empty());
@@ -251,21 +271,21 @@ impl Settings {
             .or_else(|| hf_home.as_ref().map(|home| home.join("xet")))
             .context(NoCacheDirectorySnafu)?;
 
-        let token = match token.filter(|token| !token.expose_secret().trim().is_empty()) {
-            Some(secret) => Some(Token {
-                secret: SecretString::from(secret.expose_secret().trim().to_string()),
-                source: TokenSource::Param,
-            }),
-            // An implicit token goes only to an endpoint set where it was: the public Hub or
-            // `HF_ENDPOINT`, never a Spicepod's `hf_endpoint`.
-            None if endpoint.origin() == default_endpoint.origin()
-                || env_endpoint
-                    .as_ref()
-                    .is_some_and(|env_endpoint| env_endpoint.origin() == endpoint.origin()) =>
-            {
-                implicit_token(env, hf_home.as_deref()).await?
-            }
-            None => None,
+        // A token the Spicepod does not set goes only to an endpoint set where it was: the
+        // public Hub or `HF_ENDPOINT`, never a Spicepod's `hf_endpoint`.
+        let implicit_allowed = endpoint.origin() == default_endpoint.origin()
+            || env_endpoint
+                .as_ref()
+                .is_some_and(|env_endpoint| env_endpoint.origin() == endpoint.origin());
+        let param = |secret: &SecretString| Token {
+            secret: SecretString::from(secret.expose_secret().trim().to_string()),
+            source: TokenSource::Param,
+        };
+        let token = match token.filter(|token| !token.secret().expose_secret().trim().is_empty()) {
+            Some(ParamToken::Spicepod(secret)) => Some(param(&secret)),
+            Some(ParamToken::SecretStore(secret)) if implicit_allowed => Some(param(&secret)),
+            None if implicit_allowed => implicit_token(env, hf_home.as_deref()).await?,
+            Some(ParamToken::SecretStore(_)) | None => None,
         };
 
         Ok(Self {
@@ -412,13 +432,22 @@ mod tests {
     }
 
     async fn resolve(env: &Env, token: Option<&str>, endpoint: Option<&str>) -> Settings {
-        Settings::resolve_in(
+        resolve_with(
             env,
-            token.map(|t| SecretString::from(t.to_string())),
+            token.map(|t| ParamToken::Spicepod(SecretString::from(t.to_string()))),
             endpoint,
         )
         .await
-        .expect("valid settings")
+    }
+
+    async fn resolve_with(
+        env: &Env,
+        token: Option<ParamToken>,
+        endpoint: Option<&str>,
+    ) -> Settings {
+        Settings::resolve_in(env, token, endpoint)
+            .await
+            .expect("valid settings")
     }
 
     fn token(settings: &Settings) -> Option<(String, TokenSource)> {
@@ -540,6 +569,30 @@ mod tests {
         assert_eq!(
             token(&env_mirror).map(|(_, s)| s),
             Some(TokenSource::Env(HF_TOKEN))
+        );
+    }
+
+    /// A token Spice loaded from a secret store, which the environment secret store reads from
+    /// `HF_TOKEN`, is sent where `HF_TOKEN` is and nowhere else.
+    #[tokio::test]
+    async fn a_token_from_a_secret_store_goes_only_where_an_implicit_token_goes() {
+        let loaded = || Some(ParamToken::SecretStore(SecretString::from("hf_loaded")));
+        let mirror = resolve_with(&env(&[]), loaded(), Some("https://mirror.example")).await;
+        assert!(mirror.token.is_none());
+        let public = resolve_with(&env(&[(HF_TOKEN, "hf_env")]), loaded(), None).await;
+        assert_eq!(
+            token(&public),
+            Some(("hf_loaded".to_string(), TokenSource::Param))
+        );
+        let env_mirror = resolve_with(
+            &env(&[(HF_ENDPOINT, "https://mirror.example")]),
+            loaded(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            token(&env_mirror),
+            Some(("hf_loaded".to_string(), TokenSource::Param))
         );
     }
 
