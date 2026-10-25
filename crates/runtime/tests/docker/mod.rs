@@ -122,12 +122,16 @@ impl RunningContainer {
         scenario: Result<T, anyhow::Error>,
     ) -> Result<T, anyhow::Error> {
         if let Err(e) = self.remove().await {
-            eprintln!(
-                "failed to remove test container {} ({}): {e}",
-                self.name, self.id
-            );
+            self.report_failed_removal(&e);
         }
         scenario
+    }
+
+    fn report_failed_removal(&self, e: &anyhow::Error) {
+        eprintln!(
+            "failed to remove test container {} ({}): {e}",
+            self.name, self.id
+        );
     }
 
     pub async fn stop(&self) -> Result<(), anyhow::Error> {
@@ -282,10 +286,7 @@ impl Drop for RunningContainer {
             });
         match removal.map(std::thread::JoinHandle::join) {
             Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(e))) => eprintln!(
-                "failed to remove test container {} ({}): {e}",
-                self.name, self.id
-            ),
+            Ok(Ok(Err(e))) => self.report_failed_removal(&e),
             Ok(Err(_)) => eprintln!(
                 "cleanup thread for test container {} ({}) panicked",
                 self.name, self.id
