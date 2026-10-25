@@ -30,6 +30,11 @@ limitations under the License.
 //! blocks until `StatementCancel` releases it, the way a real driver blocks on a
 //! remote query. Nothing external is needed, so this runs everywhere.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr::{dangling_mut, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

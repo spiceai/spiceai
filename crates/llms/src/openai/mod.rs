@@ -61,10 +61,7 @@ impl FromStr for ChatBackend {
         match s.trim().to_ascii_lowercase().as_str() {
             "disabled" => Ok(Self::ChatCompletions),
             "enabled" => Ok(Self::Responses),
-            other => Err(format!(
-                "must be one of: {}. Found {other}",
-                Self::VALUES.join(", ")
-            )),
+            _ => Err(format!("must be one of: {}", Self::VALUES.join(", "))),
         }
     }
 }
@@ -320,16 +317,10 @@ mod chat_backend_tests {
 
     #[test]
     fn rejects_values_outside_the_spec() {
-        for (raw, expected) in [
-            // Unlike the other model params, a blank value is not read as unset.
-            ("", "must be one of: enabled, disabled. Found "),
-            ("legacy", "must be one of: enabled, disabled. Found legacy"),
-            ("true", "must be one of: enabled, disabled. Found true"),
-            ("false", "must be one of: enabled, disabled. Found false"),
-        ] {
+        for raw in ["", "legacy", "true", "false"] {
             assert_eq!(
                 raw.parse::<ChatBackend>(),
-                Err(expected.to_string()),
+                Err("must be one of: enabled, disabled".to_string()),
                 "{raw:?} should be rejected"
             );
         }
@@ -363,10 +354,6 @@ mod chat_backend_tests {
 /// had stopped sending the header at all: with no key there must be no
 /// `Authorization` header, and with a key it must carry it as a bearer token.
 #[cfg(test)]
-#[expect(
-    clippy::expect_used,
-    reason = "a failed set-up in a test should name itself and stop"
-)]
 pub(crate) mod authorization_header_tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
@@ -466,10 +453,6 @@ pub(crate) mod authorization_header_tests {
 /// request is read in `OpenAI`'s shape and sent through a client built the way the
 /// runtime builds one, and the body the endpoint receives must carry the same object.
 #[cfg(test)]
-#[expect(
-    clippy::expect_used,
-    reason = "a failed set-up in a test should name itself and stop"
-)]
 mod allowed_tools_wire_tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;

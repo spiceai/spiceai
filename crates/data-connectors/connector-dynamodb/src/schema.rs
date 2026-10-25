@@ -103,26 +103,9 @@ fn infer_dynamodb_type(
             }
         }
         AttributeValue::Ss(_) => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-        AttributeValue::N(n) => {
-            // Determine if it's an integer or float based on the string representation
-            if n.contains('.') || n.contains('e') || n.contains('E') {
-                DataType::Float64
-            } else {
-                DataType::Int64
-            }
-        }
+        AttributeValue::N(n) => number_type(std::slice::from_ref(n)),
         AttributeValue::Ns(numbers) => {
-            // Determine the type based on the first number in the set
-            let inner_type = if let Some(first) = numbers.first() {
-                if first.contains('.') || first.contains('e') || first.contains('E') {
-                    DataType::Float64
-                } else {
-                    DataType::Int64
-                }
-            } else {
-                DataType::Int64 // Default to Int64 for empty sets
-            };
-            DataType::List(Arc::new(Field::new("item", inner_type, true)))
+            DataType::List(Arc::new(Field::new("item", number_type(numbers), true)))
         }
         AttributeValue::B(_) => DataType::Binary,
         AttributeValue::Bs(_) => {
@@ -140,6 +123,15 @@ fn infer_dynamodb_type(
         AttributeValue::Null(_) => DataType::Null,
         _ => return Err(Error::UnknownType),
     })
+}
+
+/// `Int64` when every number is an integer that fits it, otherwise `Float64`.
+fn number_type(numbers: &[String]) -> DataType {
+    if numbers.iter().all(|n| n.parse::<i64>().is_ok()) {
+        DataType::Int64
+    } else {
+        DataType::Float64
+    }
 }
 
 fn infer_struct_type(
@@ -413,6 +405,32 @@ mod tests {
         } else {
             panic!("Expected List<Float64> for float_set");
         }
+    }
+
+    #[test]
+    fn numbers_that_do_not_fit_int64_are_inferred_as_float() {
+        let item = HashMap::from([
+            ("big".to_string(), av_number("9223372036854775808")),
+            (
+                "mixed_set".to_string(),
+                AttributeValue::Ns(vec!["1".to_string(), "2.5".to_string()]),
+            ),
+        ]);
+
+        let schema =
+            infer_arrow_schema_from_rows(&[item], "2006-01-02T15:04:05Z07:00").expect("schema");
+
+        assert_eq!(
+            schema.field_with_name("big").expect("big").data_type(),
+            &DataType::Float64
+        );
+        assert_eq!(
+            schema
+                .field_with_name("mixed_set")
+                .expect("mixed_set")
+                .data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Float64, true)))
+        );
     }
 
     #[test]
