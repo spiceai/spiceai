@@ -39,11 +39,10 @@ use spicepod::{
 use tokio::sync::RwLock;
 
 use crate::model::EmbeddingModelStore;
-use runtime_parameters_typed::TypedParams as _;
 use runtime_search::store_params::elasticsearch::{
     ElasticsearchVectorParams, EsDistanceMetric, build_write_options, merge_index_settings,
 };
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_secrets::{Secrets, typed_params_from_templates};
 
 /// Attempt to construct an [`ElasticsearchIndex`] for the provided dataset/view on the given column.
 #[expect(clippy::too_many_arguments)]
@@ -640,14 +639,7 @@ async fn get_store_params(
         .map(Params::as_string_map)
         .unwrap_or_default();
 
-    let params_with_secrets = get_params_with_secrets(Arc::clone(&secrets), &params).await;
-
-    Ok(ElasticsearchVectorParams::try_from_params(
-        "Elasticsearch vector store",
-        params_with_secrets,
-        &secrets,
-    )
-    .await?)
+    Ok(typed_params_from_templates("Elasticsearch vector store", &secrets, &params).await?)
 }
 
 /// Ensure the Elasticsearch index exists with `text` field mappings for the given fields.

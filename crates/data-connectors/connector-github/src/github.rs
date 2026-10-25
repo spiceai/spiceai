@@ -1396,7 +1396,6 @@ impl GithubRestClient {
         }
     }
 
-    #[expect(clippy::too_many_lines)]
     pub async fn fetch_workflow_runs(
         self: Arc<Self>,
         owner: Arc<str>,

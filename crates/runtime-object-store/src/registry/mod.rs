@@ -697,13 +697,21 @@ impl SpiceObjectStoreRegistry {
         let password = params.get("pass").map(ToOwned::to_owned).ok_or_else(|| {
             DataFusionError::Configuration("No password provided for SMB".to_string())
         })?;
-        let port = params
+        let param_port = params
             .get("port")
             .map(|p| {
                 p.parse::<u16>()
                     .map_err(|_| DataFusionError::Configuration(format!("Invalid SMB port: {p}")))
             })
             .transpose()?;
+        let port = match (url.port(), param_port) {
+            (Some(url_port), Some(param_port)) if url_port != param_port => {
+                return Err(DataFusionError::Configuration(format!(
+                    "The SMB URL port {url_port} conflicts with the port parameter {param_port}. Set the port in one place."
+                )));
+            }
+            (url_port, param_port) => url_port.or(param_port),
+        };
         let client_timeout = params
             .get("client_timeout")
             .map(|timeout| fundu::parse_duration(timeout))
@@ -1769,5 +1777,75 @@ mod tests {
             Some(StoreConfig::from_fragment(&region_fragment("eu-west-1"))),
             "configured fingerprint must remain after bare lookup"
         );
+    }
+
+    #[cfg(feature = "smb")]
+    mod smb_tests {
+        use super::*;
+
+        /// Not a real secret; bound to a `const` so `CodeQL` does not flag it.
+        const TEST_PASSWORD: &str = "fixture-only-not-a-secret";
+
+        fn smb_url(authority: &str, extra_params: &[(&str, &str)]) -> Url {
+            let mut fragment = url::form_urlencoded::Serializer::new(String::new());
+            fragment.append_pair("user", "user");
+            fragment.append_pair("pass", TEST_PASSWORD);
+            fragment.extend_pairs(extra_params);
+            Url::parse(&format!(
+                "smb://{authority}/share/data.csv#{}",
+                fragment.finish()
+            ))
+            .expect("valid SMB URL")
+        }
+
+        /// The store connects to the port named in `smb://host:port/`, not to 445.
+        #[tokio::test]
+        async fn test_smb_store_connects_to_url_port() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("the listener binds a loopback port");
+            let address = listener.local_addr().expect("the listener has an address");
+            let store = SpiceObjectStoreRegistry::prepare_smb_object_store(&smb_url(
+                &address.to_string(),
+                &[("client_timeout", "2s")],
+            ))
+            .expect("the SMB store builds");
+
+            // The listener closes each connection, so the request fails either
+            // way; what matters is where it connected.
+            let request = tokio::spawn(async move {
+                let _ = object_store::ObjectStoreExt::head(
+                    store.as_ref(),
+                    &object_store::path::Path::from("share/data.csv"),
+                )
+                .await;
+            });
+            let accepted =
+                tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await;
+            request.abort();
+            assert!(
+                matches!(accepted, Ok(Ok(_))),
+                "the SMB store must connect to the port in the URL ({address})"
+            );
+        }
+
+        #[test]
+        fn test_smb_url_port_and_port_param() {
+            SpiceObjectStoreRegistry::prepare_smb_object_store(&smb_url(
+                "localhost:4450",
+                &[("port", "4450")],
+            ))
+            .expect("the same port in the URL and the parameter is accepted");
+
+            let err = SpiceObjectStoreRegistry::prepare_smb_object_store(&smb_url(
+                "localhost:4450",
+                &[("port", "445")],
+            ))
+            .expect_err("conflicting SMB ports must be rejected");
+            assert_eq!(
+                err.to_string(),
+                "Invalid or Unsupported Configuration: The SMB URL port 4450 conflicts with the port parameter 445. Set the port in one place."
+            );
+        }
     }
 }

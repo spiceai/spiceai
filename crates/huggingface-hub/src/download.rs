@@ -37,7 +37,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 
-use crate::cache::{HubCache, is_valid_etag, set_mode};
+use crate::cache::{HubCache, file_options, is_valid_etag, set_mode};
 use crate::client::{self, Hub, TreeEntry};
 use crate::location::RepoId;
 
@@ -225,7 +225,8 @@ pub async fn fetch_blob(
     let blobs = blob
         .parent()
         .map_or_else(|| cache.root().to_path_buf(), Path::to_path_buf);
-    crate::cache::ensure_dir(&blobs)
+    cache
+        .ensure_dir(&blobs)
         .await
         .map_err(FetchError::write(&blobs))?;
     let _lock = cache
@@ -297,7 +298,7 @@ async fn download(
     // Opens the file, hashes what a resumed download already wrote, then appends what
     // arrives and hashes it as it goes.
     let writer = tokio::task::spawn_blocking(move || -> io::Result<(u64, String)> {
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = file_options()
             .create(true)
             .read(true)
             .append(true)

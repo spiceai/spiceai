@@ -72,6 +72,19 @@ pub enum ParamsError {
     #[snafu(display("Invalid value for parameter '{user_key}': {reason}"))]
     InvalidValue { user_key: String, reason: String },
 
+    /// Secret-derived parse failures must not include parser text: a `FromStr`
+    /// impl that trims or lowercases the input can echo a value that
+    /// [`redact_value_in_reason`] would miss, and a parser can echo only a
+    /// fragment of a partial interpolation (for example `1e` plus a secret
+    /// reference).
+    #[snafu(display(
+        "invalid value for `{user_key}` from {secret_source}; expected a valid value"
+    ))]
+    InvalidSecretValue {
+        user_key: String,
+        secret_source: String,
+    },
+
     #[snafu(display("Unknown parameter '{user_key}'. Supported parameters: {supported}."))]
     UnknownParameter { user_key: String, supported: String },
 }
@@ -127,41 +140,95 @@ pub trait TypedParams: Sized {
         params: HashMap<String, SecretString>,
         secrets: &Arc<RwLock<R>>,
     ) -> impl Future<Output = Result<Self>> + Send;
+
+    /// [`try_from_params`] with secret-reference provenance so parse errors
+    /// name `${ store:key }` instead of surfacing parser text.
+    fn try_from_params_with_secret_sources<R: SecretAutoload>(
+        component_name: &str,
+        params: HashMap<String, SecretString>,
+        secrets: &Arc<RwLock<R>>,
+        secret_sources: &HashMap<String, String>,
+    ) -> impl Future<Output = Result<Self>> + Send;
 }
 
 /// Parses a single parameter value via [`FromStr`], wrapping failures with the
 /// user-facing (prefixed) key.
 ///
+/// When `secret_source` is `Some` — including when only a fragment of the raw
+/// value was interpolated (`1e${ env:SECRET }`) — the parser message is
+/// discarded so a normalized or substring echo cannot leak.
+///
 /// # Errors
 ///
-/// Returns [`ParamsError::InvalidValue`] when parsing fails.
-pub fn parse_param<T: FromStr>(user_key: &str, value: &SecretString) -> Result<T>
+/// Returns [`ParamsError::InvalidSecretValue`] when `secret_source` is set and
+/// parsing fails, otherwise [`ParamsError::InvalidValue`].
+pub fn parse_param<T: FromStr>(
+    user_key: &str,
+    value: &SecretString,
+    secret_source: Option<&str>,
+) -> Result<T>
 where
     T::Err: Display,
 {
-    value
-        .expose_secret()
-        .parse()
-        .map_err(|e: T::Err| ParamsError::InvalidValue {
-            user_key: user_key.to_string(),
-            reason: e.to_string(),
-        })
+    let raw = value.expose_secret();
+    raw.parse()
+        .map_err(|e: T::Err| invalid_parse(user_key, raw, &e.to_string(), secret_source))
 }
 
 /// [`parse_param`] with a custom parser (`#[param(parse_with = ...)]`).
 ///
 /// # Errors
 ///
-/// Returns [`ParamsError::InvalidValue`] when the parser fails.
+/// Returns [`ParamsError::InvalidSecretValue`] when `secret_source` is set and
+/// parsing fails, otherwise [`ParamsError::InvalidValue`].
 pub fn parse_param_with<T, E: Display>(
     user_key: &str,
     value: &SecretString,
     parser: impl FnOnce(&str) -> std::result::Result<T, E>,
+    secret_source: Option<&str>,
 ) -> Result<T> {
-    parser(value.expose_secret()).map_err(|e| ParamsError::InvalidValue {
+    let raw = value.expose_secret();
+    parser(raw).map_err(|e| invalid_parse(user_key, raw, &e.to_string(), secret_source))
+}
+
+fn invalid_parse(
+    user_key: &str,
+    raw: &str,
+    parser_message: &str,
+    secret_source: Option<&str>,
+) -> ParamsError {
+    if let Some(secret_source) = secret_source {
+        return ParamsError::InvalidSecretValue {
+            user_key: user_key.to_string(),
+            secret_source: secret_source.to_string(),
+        };
+    }
+    ParamsError::InvalidValue {
         user_key: user_key.to_string(),
-        reason: e.to_string(),
-    })
+        reason: redact_value_in_reason(parser_message, raw),
+    }
+}
+
+/// Looks up secret-reference provenance for a parameter, trying the
+/// user-facing key and then any aliases. A hit means any part of the raw
+/// value was secret-derived (including `1e${ env:SECRET }`).
+#[must_use]
+#[expect(clippy::implicit_hasher)]
+pub fn secret_source_for_keys<'a>(
+    secret_sources: &'a HashMap<String, String>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| secret_sources.get(*key).map(String::as_str))
+}
+
+/// Defense in depth: if a `FromStr` / custom parser echoes the input, replace
+/// that text so a secret-derived value cannot leak through typed-param errors.
+fn redact_value_in_reason(reason: &str, value: &str) -> String {
+    if value.is_empty() || !reason.contains(value) {
+        return reason.to_string();
+    }
+    reason.replace(value, "an invalid value")
 }
 
 /// Looks up an absent `#[param(autoload_secret)]` parameter in the configured
@@ -359,4 +426,160 @@ pub fn deny_leftover_keys<S: std::hash::BuildHasher>(
         user_key: user_key.clone(),
         supported,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `FromStr` that echoes the input so we can prove the redact path
+    /// strips a canary that would otherwise appear in the error.
+    #[derive(Debug)]
+    struct EchoingParser;
+
+    impl std::str::FromStr for EchoingParser {
+        type Err = String;
+
+        fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+            Err(format!("cannot parse {s}"))
+        }
+    }
+
+    #[test]
+    fn redact_value_in_reason_replaces_canary() {
+        const CANARY: &str = "CANARYPGPW7731";
+        let redacted = redact_value_in_reason(&format!("invalid bool: {CANARY}"), CANARY);
+        assert!(
+            !redacted.contains(CANARY),
+            "redacted reason still contains the canary: {redacted}"
+        );
+        assert_eq!(redacted, "invalid bool: an invalid value");
+    }
+
+    #[test]
+    fn parse_param_does_not_echo_canary_when_fromstr_repeats_input() {
+        const CANARY: &str = "CANARYPGPW7731";
+        let err = parse_param::<EchoingParser>(
+            "csv_has_header",
+            &SecretString::from(CANARY.to_string()),
+            None,
+        )
+        .expect_err("echoing parser always fails");
+        let message = err.to_string();
+        assert!(
+            !message.contains(CANARY),
+            "typed-param errors must not echo a resolved secret: {message}"
+        );
+        assert!(
+            message.contains("csv_has_header"),
+            "typed-param errors must name the parameter: {message}"
+        );
+        assert!(
+            message.contains("an invalid value"),
+            "typed-param errors must mask the echoed input: {message}"
+        );
+    }
+
+    /// A `FromStr` that trims and lowercases, then echoes the normalized form.
+    #[derive(Debug)]
+    struct NormalizingEchoParser;
+
+    impl std::str::FromStr for NormalizingEchoParser {
+        type Err = String;
+
+        fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+            let normalized = s.trim().to_ascii_lowercase();
+            Err(format!(
+                "must be one of: auto, metadata, env. Found {normalized}"
+            ))
+        }
+    }
+
+    #[test]
+    fn parse_param_secret_derived_does_not_surface_parser_text() {
+        const CANARY: &str = "Secret123";
+        const SOURCE: &str = "${ env:IAM_SRC }";
+        let err = parse_param::<NormalizingEchoParser>(
+            "aws_iam_role_source",
+            &SecretString::from(format!(" {CANARY} ")),
+            Some(SOURCE),
+        )
+        .expect_err("normalizing parser always fails");
+        let message = err.to_string();
+        assert!(
+            !message.contains(CANARY),
+            "secret-derived parse errors must not echo the raw value: {message}"
+        );
+        assert!(
+            !message.contains("secret123"),
+            "secret-derived parse errors must not echo the normalized value: {message}"
+        );
+        assert!(
+            !message.contains("Found"),
+            "secret-derived parse errors must not surface parser text: {message}"
+        );
+        assert_eq!(
+            message,
+            format!(
+                "invalid value for `aws_iam_role_source` from {SOURCE}; expected a valid value"
+            )
+        );
+    }
+
+    /// A `FromStr` that echoes only a substring of the input — the
+    /// `duration_parse` exponent-limit shape (`1e1234` → `1234`).
+    #[derive(Debug)]
+    struct SubstringEchoParser;
+
+    impl std::str::FromStr for SubstringEchoParser {
+        type Err = String;
+
+        fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+            let tail: String = s
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            Err(format!("Exponent magnitude {tail} exceeds maximum (20)"))
+        }
+    }
+
+    #[test]
+    fn parse_param_secret_derived_does_not_surface_substring_echo() {
+        const SECRET_TAIL: &str = "1234";
+        const RAW: &str = "1e1234";
+        const SOURCE: &str = "${ env:SECRET }";
+        let err = parse_param::<SubstringEchoParser>(
+            "client_timeout",
+            &SecretString::from(RAW.to_string()),
+            Some(SOURCE),
+        )
+        .expect_err("substring-echoing parser always fails");
+        let message = err.to_string();
+        assert!(
+            !message.contains(SECRET_TAIL),
+            "secret-derived parse errors must not echo a secret substring: {message}"
+        );
+        assert!(
+            !message.contains(RAW),
+            "secret-derived parse errors must not echo the resolved input: {message}"
+        );
+        assert_eq!(
+            message,
+            format!("invalid value for `client_timeout` from {SOURCE}; expected a valid value")
+        );
+    }
+
+    #[test]
+    fn secret_source_for_keys_prefers_user_key_then_alias() {
+        let sources = HashMap::from([("timeout".to_string(), "${ env:SECRET }".to_string())]);
+        assert_eq!(
+            secret_source_for_keys(&sources, &["client_timeout", "timeout"]),
+            Some("${ env:SECRET }")
+        );
+        assert_eq!(secret_source_for_keys(&sources, &["client_timeout"]), None);
+    }
 }

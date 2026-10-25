@@ -50,7 +50,9 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_checkpoint_api::CheckpointError;
 use runtime_parameters::ParameterSpec;
 use runtime_parameters::{Diagnostics, Parameters};
-use runtime_secrets::{ExposeSecret, Secrets, get_params_with_secrets};
+use runtime_secrets::{
+    ExposeSecret, Secrets, get_params_with_secrets, secret_sources_from_templates,
+};
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use snafu::prelude::*;
 use std::path::PathBuf;
@@ -1211,14 +1213,16 @@ pub async fn acceleration_parameters(
     // writer queued between them.
     let params_with_secrets =
         get_params_with_secrets(Arc::clone(&secrets), &acceleration.params).await;
+    let secret_sources = secret_sources_from_templates(&acceleration.params);
 
-    Parameters::try_new_with_diagnostics(
+    Parameters::try_new_with_secret_sources(
         &format!("accelerator {}", accelerator.name()),
         params_with_secrets.into_iter().collect::<Vec<_>>(),
         accelerator.prefix(),
         secrets,
         accelerator.parameters(),
         diagnostics,
+        Some(secret_sources),
     )
     .await
 }
