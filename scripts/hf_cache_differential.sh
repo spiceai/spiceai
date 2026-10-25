@@ -16,8 +16,11 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${1:-$ROOT/target/hf_cache_differential}"
 HF="$(command -v hf)" || { echo "the hf CLI is not on PATH" >&2; exit 2; }
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p huggingface-hub --example fetch || exit 2
-FETCH="$ROOT/target/debug/examples/fetch"
+# The path cargo reports for the example, so a CARGO_TARGET_DIR is honored.
+FETCH=$(cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p huggingface-hub --example fetch \
+  --message-format=json-render-diagnostics \
+  | python3 -c 'import json, sys; print(next(m["executable"] for m in map(json.loads, sys.stdin) if m.get("executable") and m["target"]["name"] == "fetch"))') \
+  || exit 2
 rm -rf "$WORK"; mkdir -p "$WORK"
 CASES=(
   "model HuggingFaceTB/SmolLM2-135M-Instruct config.json tokenizer.json tokenizer_config.json generation_config.json model.safetensors"
