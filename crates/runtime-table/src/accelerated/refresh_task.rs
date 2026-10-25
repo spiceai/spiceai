@@ -756,7 +756,8 @@ impl RefreshTask {
                     Arc::new(ProviderChangeSinkBackend::new(context)),
                     util::session_state::session_context(),
                     &Handle::current(),
-                    changes::cdc_config().prefetch_buffer,
+                    changes::dataset_cdc_config(self.cdc_param_overrides.as_deref())
+                        .prefetch_buffer,
                 )
             })
             .await
