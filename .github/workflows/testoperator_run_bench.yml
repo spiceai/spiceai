@@ -774,8 +774,9 @@ jobs:
           **Profile:** \`${{ github.event.inputs.profile_option || 'release' }}\`
           EOF
           )
-              # Target the branch the run was dispatched on
-              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base "${{ github.ref_name }}" --head ${BRANCH_NAME} --label kind/bug
+              # Target the branch the run was dispatched on. enforce-pull-with-spice, a required
+              # check, fails a PR without both a kind/ and an area/ label.
+              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base "${{ github.ref_name }}" --head ${BRANCH_NAME} --label kind/bug --label area/tests
               # Auto-merge only into trunk: on an unprotected feature branch
               # --auto merges immediately, before the branch owner can review
               # the snapshots.
