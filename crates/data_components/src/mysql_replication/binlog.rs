@@ -1787,11 +1787,10 @@ mod tests {
         assert_eq!(refused(&registered, "int", "float"), None);
         // A column followed from `INT` to `DECIMAL(10,0)` is still built as
         // `Int32`, so a scale its `DECIMAL` gains later is refused as well.
-        let zero_scale_old = layout_of(&[("id", "bigint"), ("k", "decimal(10,0)"), ("f", "float")]);
         assert_eq!(
             unfollowable_retype(
                 &registered,
-                &zero_scale_old,
+                &layout("decimal(10,0)", "float"),
                 &layout("decimal(12,2)", "float"),
                 &[0, 1, 2]
             ),

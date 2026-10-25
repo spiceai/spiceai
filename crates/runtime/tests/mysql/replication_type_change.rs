@@ -443,53 +443,12 @@ async fn mysql_cayenne_integer_to_decimal_stops_the_stream() -> Result<(), anyho
         .await
 }
 
-/// A `DECIMAL` with no fractional part holds only integers, so the stream keeps
-/// applying changes into the registered integer type.
-#[cfg(not(target_os = "windows"))]
-#[tokio::test(flavor = "multi_thread")]
-async fn mysql_cayenne_integer_to_zero_scale_decimal_keeps_applying() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-    test_request_context()
-        .scope(async {
-            let container = common::start_mysql_docker_container().await?;
-            let port = container.host_port(3306)?;
-            let dir = tempfile::tempdir()?;
-            let table = "type_change_cayenne_decimal0";
-            let (pool, rt) = start(
-                port,
-                table,
-                "INT",
-                "cayenne",
-                OnSchemaChange::SyncAllColumns,
-                dir.path(),
-            )
-            .await?;
-            exec(
-                &pool,
-                &format!("ALTER TABLE {table} MODIFY k DECIMAL(10,0)"),
-            )
-            .await?;
-            exec(&pool, &format!("INSERT INTO {table} VALUES (4, 7)")).await?;
-            wait_for(
-                &rt,
-                &format!("SELECT id, k, arrow_typeof(k) AS t FROM {table} WHERE id = 4"),
-                "+----+---+-------+\n\
-                 | id | k | t     |\n\
-                 +----+---+-------+\n\
-                 | 4  | 7 | Int32 |\n\
-                 +----+---+-------+",
-            )
-            .await
-        })
-        .await
-}
-
-/// An integer column followed to a `DECIMAL` with no fractional part keeps its
-/// integer type, so a later `ALTER` that gives the `DECIMAL` a scale stops the
-/// stream at the `ALTER`, under either policy, as the direct retype from the
-/// integer does: the dataset still stores the column as an integer.
-async fn zero_scale_decimal_kept_as_integer_to_scaled_decimal_stops(
+/// A `DECIMAL` with no fractional part holds only integers, so after `INT` to
+/// `DECIMAL(10,0)` the stream keeps applying changes into the registered integer
+/// type, under either policy. The dataset still stores the column as an integer,
+/// so a later `ALTER` that gives the `DECIMAL` a scale stops the stream at the
+/// `ALTER`, as the direct retype from the integer does.
+async fn zero_scale_decimal_keeps_applying_until_it_gains_a_scale(
     table: &str,
     policy: OnSchemaChange,
 ) -> Result<(), anyhow::Error> {
@@ -541,9 +500,9 @@ async fn zero_scale_decimal_kept_as_integer_to_scaled_decimal_stops(
 
 #[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn mysql_cayenne_block_zero_scale_decimal_kept_as_integer_to_scaled_decimal_stops()
+async fn mysql_cayenne_block_zero_scale_decimal_keeps_applying_until_it_gains_a_scale()
 -> Result<(), anyhow::Error> {
-    zero_scale_decimal_kept_as_integer_to_scaled_decimal_stops(
+    zero_scale_decimal_keeps_applying_until_it_gains_a_scale(
         "type_change_dec0_dec2_block",
         OnSchemaChange::Block,
     )
@@ -552,9 +511,9 @@ async fn mysql_cayenne_block_zero_scale_decimal_kept_as_integer_to_scaled_decima
 
 #[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn mysql_cayenne_sync_all_columns_zero_scale_decimal_kept_as_integer_to_scaled_decimal_stops()
+async fn mysql_cayenne_sync_all_columns_zero_scale_decimal_keeps_applying_until_it_gains_a_scale()
 -> Result<(), anyhow::Error> {
-    zero_scale_decimal_kept_as_integer_to_scaled_decimal_stops(
+    zero_scale_decimal_keeps_applying_until_it_gains_a_scale(
         "type_change_dec0_dec2_sync",
         OnSchemaChange::SyncAllColumns,
     )
