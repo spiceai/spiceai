@@ -14,7 +14,7 @@ pstack-style check for user `INSERT` into a PK-accelerated dataset
 - Existing-key `INSERT` still upserts (default unchanged) and reports `count: 1`.
 - In-batch duplicate keys:
   - DuckDB / SQLite: a uniqueness / constraint error, never `Query is not read-only`.
-  - Cayenne: last-arrival-wins, **incoming** count `2`, last row kept.
+  - Cayenne: last-arrival-wins, count `1` (rows inserted or replaced, #14576), last row kept.
 - NULL primary key: rejected on DuckDB, SQLite, and Cayenne. DuckDB must not leak
   `__data_<dataset>_<n>`.
 

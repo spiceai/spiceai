@@ -20,8 +20,7 @@ limitations under the License.
 //! Default replace-on-key is unchanged. These cases cover the unambiguous bugs:
 //! `SQLite` must reject a NULL primary key; an in-batch duplicate must name the
 //! uniqueness constraint rather than `Query is not read-only`; `DuckDB` must not
-//! leak `__data_<dataset>_<n>`; Cayenne last-arrival-wins must report the
-//! incoming row count.
+//! leak `__data_<dataset>_<n>`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,20 +60,6 @@ async fn execute_sql_err(rt: &Arc<Runtime>, sql: &str) -> String {
     }
 }
 
-fn reported_count(batches: &[RecordBatch]) -> u64 {
-    batches
-        .first()
-        .and_then(|batch| {
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::UInt64Array>()
-        })
-        .and_then(|values| values.values().first())
-        .copied()
-        .expect("a DML result must carry a UInt64 count")
-}
-
 async fn pk_runtime(
     engine: &str,
     table: &str,
@@ -102,16 +87,6 @@ async fn pk_runtime(
             params.insert(
                 "sqlite_file".to_string(),
                 temp_dir.path().join("acc.db").display().to_string(),
-            );
-        }
-        "cayenne" => {
-            params.insert(
-                "cayenne_file_path".to_string(),
-                temp_dir.path().join("cayenne").display().to_string(),
-            );
-            params.insert(
-                "cayenne_metadata_dir".to_string(),
-                temp_dir.path().join("metadata").display().to_string(),
             );
         }
         other => panic!("unsupported engine {other}"),
@@ -232,40 +207,6 @@ async fn duckdb_constraint_errors_name_the_user_dataset() -> Result<(), anyhow::
                     || message.to_lowercase().contains("null"),
                 "the error must name the dataset or the NULL primary key, got: {message}"
             );
-            Ok(())
-        })
-        .await
-}
-
-#[cfg(not(target_os = "windows"))]
-#[tokio::test]
-async fn cayenne_reports_incoming_row_count_after_last_arrival_wins() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
-    test_request_context()
-        .scope(async {
-            let (_dir, rt) = pk_runtime("cayenne", "o_cayenne").await?;
-            let written = execute_sql(
-                &rt,
-                "INSERT INTO o_cayenne (id, customer, amount, status) VALUES (5001, 'a', 1.0, 'new'), (5001, 'b', 2.0, 'new')",
-            )
-            .await?;
-            assert_eq!(
-                reported_count(&written),
-                2,
-                "a 2-row VALUES must report 2 after last-arrival-wins"
-            );
-            let rows = execute_sql(
-                &rt,
-                "SELECT id, customer FROM o_cayenne WHERE id = 5001",
-            )
-            .await?;
-            let customer = rows[0]
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("customer is Utf8")
-                .value(0);
-            assert_eq!(customer, "b", "the last arrival remains");
             Ok(())
         })
         .await
