@@ -37,6 +37,11 @@ limitations under the License.
 //! advertises `supports_snapshot_reload()` (`DuckDB`, `SQLite`, `Cayenne`, `Turso`)
 //! gets its own end-to-end test.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 mod snapshot_refresh;
 mod utils;
 

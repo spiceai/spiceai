@@ -16,6 +16,11 @@ limitations under the License.
 
 //! The crate's integration tests: downloads over real HTTP against a mock Hub.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 mod mock_hub;
 mod snapshot;
 

@@ -1520,11 +1520,6 @@ async fn detect_source_gtid(params: &ReplicationParams) -> bool {
 }
 
 /// The shared pump: one binlog dump driving every member.
-#[expect(
-    clippy::too_many_lines,
-    reason = "single state machine over the multiplexed binlog event loop; mirrors the \
-              per-dataset binlog_change_stream and postgres run_pump"
-)]
 async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::ShutdownDrainGuard) {
     // Captured when the pump was spawned. The guard is held until this returns
     // — on a runtime shutdown, after the final `persist_all` below — and the
