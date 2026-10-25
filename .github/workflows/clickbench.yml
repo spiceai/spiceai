@@ -49,14 +49,30 @@ jobs:
     outputs:
       releases: ${{ steps.releases.outputs.releases }}
     steps:
+      # Inputs reach a shell on the runner and the instance's user data, so each must match its
+      # expected form exactly.
       - id: releases
         env:
           RELEASES: ${{ inputs.releases }}
+          HARNESS_REF: ${{ inputs.harness_ref }}
+          MAX_LIFETIME_MINUTES: ${{ inputs.max_lifetime_minutes }}
         run: |
           set -euo pipefail
-          releases="$(jq -cn --arg r "${RELEASES}" '$r | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')"
+          if ! [[ "${HARNESS_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::harness_ref must be a full commit SHA"
+            exit 1
+          fi
+          if ! [[ "${MAX_LIFETIME_MINUTES}" =~ ^[0-9]{2,3}$ ]] || [ "${MAX_LIFETIME_MINUTES}" -gt 600 ]; then
+            echo "::error::max_lifetime_minutes must be a whole number from 10 to 600"
+            exit 1
+          fi
+          releases="$(jq -cn --arg r "${RELEASES}" '$r | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | unique')"
           if [ "$(jq length <<< "${releases}")" -eq 0 ]; then
             echo "::error::releases is empty"
+            exit 1
+          fi
+          if jq -e 'map(test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-rc\\.[0-9]+)?$") | not) | any' <<< "${releases}" >/dev/null; then
+            echo "::error::each release must be a tag such as v2.3.3 or v2.4.0-rc.3"
             exit 1
           fi
           echo "releases=${releases}" >> "${GITHUB_OUTPUT}"
@@ -144,10 +160,19 @@ jobs:
 
           out=/srv/clickbench
           mkdir -p "\${out}"
+          # Serve whatever exists, so the runner stops waiting on a failed run too.
+          publish() {
+              cp /var/log/cloud-init-output.log "\${out}/" 2>/dev/null
+              touch "\${out}/DONE"
+              # Outlives cloud-init, which stops its own background processes on exit.
+              systemd-run --unit clickbench-results python3 -m http.server ${RESULTS_PORT} --directory "\${out}"
+          }
+          fail() { echo "\$1" > "\${out}/benchmark-exit-code"; publish; exit 1; }
           cd /root
-          git clone https://github.com/ClickHouse/ClickBench.git ClickBench
-          git -C ClickBench checkout --detach ${HARNESS_REF}
-          cd ClickBench/${VARIANT}
+          git clone https://github.com/ClickHouse/ClickBench.git ClickBench || fail clone
+          git -C ClickBench checkout --detach ${HARNESS_REF} || fail checkout
+          git -C ClickBench rev-parse HEAD > "\${out}/harness-commit"
+          cd ClickBench/${VARIANT} || fail variant
           cat > install <<'INSTALL'
           #!/bin/bash
           set -euo pipefail
@@ -175,10 +200,8 @@ jobs:
           echo "${MACHINE}" | tee -a log
           json_path="\$(./make-json.sh "${MACHINE}" 2>>log | tail -n1)"
           cp "\${json_path}" "\${out}/result.json"
-          cp log result.csv spiced.log /var/log/cloud-init-output.log "\${out}/"
-          touch "\${out}/DONE"
-          # Outlives cloud-init, which stops its own background processes on exit.
-          systemd-run --unit clickbench-results python3 -m http.server ${RESULTS_PORT} --directory "\${out}"
+          cp log result.csv spiced.log "\${out}/"
+          publish
           EOF
 
           instance_id="$(aws ec2 run-instances --region "${REGION}" --image-id "${ami_id}" \
@@ -200,7 +223,7 @@ jobs:
         run: |
           set -uo pipefail
           deadline=$(( $(date +%s) + MAX_LIFETIME_MINUTES * 60 ))
-          until curl -fsS -o /dev/null "http://${PUBLIC_IP}:${RESULTS_PORT}/DONE"; do
+          until curl -fsS --connect-timeout 10 --max-time 30 -o /dev/null "http://${PUBLIC_IP}:${RESULTS_PORT}/DONE"; do
             if [ "$(date +%s)" -ge "${deadline}" ]; then
               echo "::error::No results within ${MAX_LIFETIME_MINUTES} minutes"
               exit 1
@@ -208,8 +231,9 @@ jobs:
             sleep 60
           done
           mkdir -p results
-          for file in DONE benchmark-exit-code result.json result.csv log spiced.log install-override.diff cloud-init-output.log; do
-            curl -fsS -o "results/${file}" "http://${PUBLIC_IP}:${RESULTS_PORT}/${file}" || echo "missing ${file}"
+          for file in DONE benchmark-exit-code harness-commit result.json result.csv log spiced.log install-override.diff cloud-init-output.log; do
+            curl -fsS --connect-timeout 10 --max-time 300 --retry 3 -o "results/${file}" \
+              "http://${PUBLIC_IP}:${RESULTS_PORT}/${file}" || echo "missing ${file}"
           done
           {
             echo "release=${RELEASE}"
@@ -227,15 +251,11 @@ jobs:
             echo
             grep -E '^(Load time|Data size|Concurrent QPS|Concurrent error ratio):' results/log || true
           } >> "${GITHUB_STEP_SUMMARY}"
-          test "${status}" = 0
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: clickbench-${{ inputs.variant }}-${{ matrix.release }}
-          path: results/
-          if-no-files-found: warn
+          test "${status}" = 0 || exit 1
+          test "$(cat results/harness-commit)" = "${HARNESS_REF}" || { echo "::error::the instance ran a different harness commit"; exit 1; }
+          jq -e '.result | length > 0' results/result.json >/dev/null || { echo "::error::result.json is missing or empty"; exit 1; }
+          test -s results/result.csv || { echo "::error::result.csv is missing"; exit 1; }
+          test -s results/install-override.diff || { echo "::error::install-override.diff is missing"; exit 1; }
 
       - name: Re-authorize for cleanup
         if: always()
@@ -283,3 +303,11 @@ jobs:
             fi
           done
           exit "${failed}"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: clickbench-${{ inputs.variant }}-${{ matrix.release }}
+          path: results/
+          if-no-files-found: warn
