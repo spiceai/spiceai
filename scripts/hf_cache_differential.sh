@@ -16,10 +16,11 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${1:-$ROOT/target/hf_cache_differential}"
 HF="$(command -v hf)" || { echo "the hf CLI is not on PATH" >&2; exit 2; }
-# The path cargo reports for the example, so a CARGO_TARGET_DIR is honored.
+# The path cargo reports for the example, so a CARGO_TARGET_DIR is honored. The reader takes
+# every message before it picks one: cargo fails its build when a write finds the pipe closed.
 FETCH=$(cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p huggingface-hub --example fetch \
   --message-format=json-render-diagnostics \
-  | python3 -c 'import json, sys; print(next(m["executable"] for m in map(json.loads, sys.stdin) if m.get("executable") and m["target"]["name"] == "fetch"))') \
+  | python3 -c 'import json, sys; messages = [json.loads(line) for line in sys.stdin]; print(next(m["executable"] for m in messages if m.get("executable") and m["target"]["name"] == "fetch"))') \
   || exit 2
 rm -rf "$WORK"; mkdir -p "$WORK"
 CASES=(
