@@ -1,6 +1,3 @@
-# Known failing (no issue filed yet): on a cluster, an aggregate over a
-# subquery with ORDER BY … LIMIT pushes `SELECT COUNT(1) FROM t` to the
-# executors, dropping the limit (400 instead of 7).
 name: cluster-aggregate-over-limit
 description: >
   On a cluster, an aggregate over a subquery with ORDER BY … LIMIT counts the
