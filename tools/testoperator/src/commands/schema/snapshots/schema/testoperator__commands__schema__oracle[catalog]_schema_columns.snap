@@ -42,23 +42,23 @@ description: "Schema columns for oracle[catalog]"
 | oracle_tpch   | TPCH_SF1     | ORDERS       | O_CLERK               | 6                | Utf8                                                                                      | YES         |
 | oracle_tpch   | TPCH_SF1     | ORDERS       | O_SHIPPRIORITY        | 7                | Int64                                                                                     | YES         |
 | oracle_tpch   | TPCH_SF1     | ORDERS       | O_COMMENT             | 8                | Utf8                                                                                      | YES         |
-| oracle_tpch   | TPCH_SF1     | PART         | P_PARTKEY             | 0                | Int64                                                                                     | YES         |
-| oracle_tpch   | TPCH_SF1     | PART         | P_NAME                | 1                | Utf8                                                                                      | YES         |
-| oracle_tpch   | TPCH_SF1     | PART         | P_MFGR                | 2                | Utf8                                                                                      | YES         |
-| oracle_tpch   | TPCH_SF1     | PART         | P_BRAND               | 3                | Utf8                                                                                      | YES         |
-| oracle_tpch   | TPCH_SF1     | PART         | P_TYPE                | 4                | Utf8                                                                                      | YES         |
-| oracle_tpch   | TPCH_SF1     | PART         | P_SIZE                | 5                | Int64                                                                                     | YES         |
-| oracle_tpch   | TPCH_SF1     | PART         | P_CONTAINER           | 6                | Utf8                                                                                      | YES         |
-| oracle_tpch   | TPCH_SF1     | PART         | P_RETAILPRICE         | 7                | Decimal128(12, 2)                                                                         | YES         |
-| oracle_tpch   | TPCH_SF1     | PART         | P_COMMENT             | 8                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_COMMENT             | 0                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_PARTKEY             | 1                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_NAME                | 2                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_MFGR                | 3                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_BRAND               | 4                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_TYPE                | 5                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_SIZE                | 6                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_CONTAINER           | 7                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_RETAILPRICE         | 8                | Decimal128(12, 2)                                                                         | YES         |
 | oracle_tpch   | TPCH_SF1     | PARTSUPP     | PS_PARTKEY            | 0                | Int64                                                                                     | YES         |
 | oracle_tpch   | TPCH_SF1     | PARTSUPP     | PS_SUPPKEY            | 1                | Int64                                                                                     | YES         |
 | oracle_tpch   | TPCH_SF1     | PARTSUPP     | PS_AVAILQTY           | 2                | Int64                                                                                     | YES         |
 | oracle_tpch   | TPCH_SF1     | PARTSUPP     | PS_SUPPLYCOST         | 3                | Decimal128(12, 2)                                                                         | YES         |
 | oracle_tpch   | TPCH_SF1     | PARTSUPP     | PS_COMMENT            | 4                | Utf8                                                                                      | YES         |
-| oracle_tpch   | TPCH_SF1     | REGION       | R_COMMENT             | 0                | Utf8                                                                                      | YES         |
-| oracle_tpch   | TPCH_SF1     | REGION       | R_REGIONKEY           | 1                | Int64                                                                                     | YES         |
-| oracle_tpch   | TPCH_SF1     | REGION       | R_NAME                | 2                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | REGION       | R_REGIONKEY           | 0                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | REGION       | R_NAME                | 1                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | REGION       | R_COMMENT             | 2                | Utf8                                                                                      | YES         |
 | oracle_tpch   | TPCH_SF1     | SUPPLIER     | S_SUPPKEY             | 0                | Int64                                                                                     | YES         |
 | oracle_tpch   | TPCH_SF1     | SUPPLIER     | S_NAME                | 1                | Utf8                                                                                      | YES         |
 | oracle_tpch   | TPCH_SF1     | SUPPLIER     | S_ADDRESS             | 2                | Utf8                                                                                      | YES         |
