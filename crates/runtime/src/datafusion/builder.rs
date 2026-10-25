@@ -1185,6 +1185,10 @@ impl DataFusionBuilder {
             self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
             Some(ClusterRole::Scheduler)
         ) {
+            // Pushes partial aggregates into per-executor Flight SQL. Checked
+            // integer `SUM` keeps the registry name `sum` (federation), so the
+            // rule matches it; the emitted SQL is `SUM(CAST(col AS DECIMAL(38,0)))`
+            // so an executor does not narrow to `Int64` before partitions cancel.
             state = state.with_physical_optimizer_rule(FlightSQLPartialAggregatePushdown::new());
 
             // Distribute small-dimension joins onto executors (broadcast the

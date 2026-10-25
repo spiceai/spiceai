@@ -776,6 +776,34 @@ async fn checked_sum_matches_across_count_distinct_rewrite_and_overflows_when_tr
     );
 }
 
+/// What a `FlightSQL` executor runs when the scheduler pushes a complete
+/// `SUM(v)` for one partition. `MAX+MAX` is not a representable `Int64`
+/// total, so the checked kernel errors. The same rows as
+/// `SUM(CAST(v AS DECIMAL(38, 0)))` stay wide — that is the SQL the
+/// cluster pushdown must send so the scheduler can still cancel.
+#[tokio::test]
+async fn executor_plain_sum_errors_on_overflowing_partition_decimal_sum_stays_wide() {
+    let ctx = checked_session();
+    register_int64_partitions(&ctx, "t_exec", &[&[Some(i64::MAX), Some(i64::MAX)]]);
+
+    let plain_sql = "SELECT SUM(big) FROM t_exec";
+    let (plain_plan, plain) = plan_and_error(&ctx, plain_sql).await;
+    assert_plan_ran(&plain_plan, plain_sql, &["AggregateExec"]);
+    assert!(
+        contains_overflow(&plain),
+        "executor-style SUM(v) of MAX+MAX must overflow, got {plain}\nplan:\n{plain_plan}"
+    );
+
+    let wide_sql = "SELECT SUM(CAST(big AS DECIMAL(38, 0))) FROM t_exec";
+    let (wide_plan, wide) = plan_and_collect(&ctx, wide_sql).await;
+    assert_plan_ran(&wide_plan, wide_sql, &["AggregateExec"]);
+    assert_eq!(
+        render_rows(&wide),
+        vec![(i128::from(i64::MAX) * 2).to_string()],
+        "executor-style wide SUM must keep MAX+MAX\nplan:\n{wide_plan}"
+    );
+}
+
 fn cancel_across_groups_batch() -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
