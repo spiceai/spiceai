@@ -1,0 +1,36 @@
+{
+  "cayenne-catalog-recreate": [
+    {
+      "run": "cayenne-catalog-recreate",
+      "who": "default",
+      "key": "query: SELECT count(*) AS n FROM cat.ns.same",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"2\\\"\" }",
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cayenne-catalog-recreate",
+      "who": "default",
+      "key": "query: SELECT id FROM cat.ns.same",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1, actual: 3 }",
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cayenne-catalog-recreate",
+      "who": "default",
+      "key": "spice-exec: INSERT INTO cat.ns.other VALUES (10, 'new')",
+      "kind": "error",
+      "signature": "Spice rejected the statement: 400 Bad Request: Execution error: Failed to forward INSERT batches for 'cat.ns.other': DoPut to executor failed: code: 'Client specified an invalid argument', message: \"Schema validation error: the provided data schema does not match the expected schema for dataset `cat",
+      "group": "cluster-operations"
+    },
+    {
+      "run": "cayenne-catalog-recreate",
+      "who": "default",
+      "key": "query: SELECT id, val FROM cat.ns.other",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Tonic error: code: 'Client specified an invalid argument', message: \\\"No field named val.\\\\nValid fields are cat.ns.other.id.\\\"\": code: 'Client specified an invalid argument', message: \"Tonic error: code: ",
+      "group": "cluster-operations"
+    }
+  ]
+}
