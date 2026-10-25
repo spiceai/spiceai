@@ -28,6 +28,11 @@ limitations under the License.
 //! first; under plain `cargo test` that call fails the test before it changes
 //! anything its neighbours would see.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 #[macro_use]
 mod common;
 #[path = "correctness/support/mod.rs"]

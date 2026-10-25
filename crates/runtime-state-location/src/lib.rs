@@ -29,8 +29,8 @@ use aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder;
 use object_store::ObjectStore;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use runtime_object_store::{build_azure_object_store, build_gcs_object_store};
-use runtime_parameters::{ParameterSpec, Parameters};
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_parameters::{Diagnostics, ParameterSpec, Parameters};
+use runtime_secrets::{Secrets, get_params_with_secrets, secret_sources_from_templates};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use spicepod::component::runtime::{SCHEDULER_STATE_FOLDER, StateLocation, StateSource};
@@ -450,12 +450,15 @@ pub async fn build_s3_parameters<S: BuildHasher>(
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
             let secret_params = get_params_with_secrets(Arc::clone(&secrets), &params).await;
-            Parameters::try_new(
+            let secret_sources = secret_sources_from_templates(&params);
+            Parameters::try_new_with_secret_sources(
                 usage,
                 secret_params.into_iter().collect(),
                 "s3",
                 secrets,
                 s3_parameters,
+                Diagnostics::Report,
+                Some(secret_sources),
             )
             .await
             .map_err(|source| Error::S3ParameterValidation { usage, source })
@@ -482,12 +485,15 @@ async fn build_gcs_parameters(
         return Ok(HashMap::new());
     };
     let secret_params = get_params_with_secrets(Arc::clone(&secrets), params).await;
-    let params = Parameters::try_new(
+    let secret_sources = secret_sources_from_templates(params);
+    let params = Parameters::try_new_with_secret_sources(
         usage,
         secret_params.into_iter().collect(),
         "gcs",
         secrets,
         &GCS_PARAMETERS,
+        Diagnostics::Report,
+        Some(secret_sources),
     )
     .await
     .map_err(|source| Error::GcsParameterValidation { usage, source })?;
@@ -525,7 +531,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use object_store_occ::{InsertResult, ObjectState, UpdateResult};
-    use runtime_secrets::ClusterSecretExpander;
+    use runtime_secrets::{AnyErrorResult, ClusterSecretExpander, SecretStore};
     use secrecy::SecretString;
     use serde::{Deserialize, Serialize};
 
@@ -549,6 +555,32 @@ mod tests {
 
     fn secrets() -> Arc<RwLock<Secrets>> {
         Arc::new(RwLock::new(Secrets::new()))
+    }
+
+    struct MapStore(HashMap<String, String>);
+
+    #[async_trait]
+    impl SecretStore for MapStore {
+        async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+            Ok(self
+                .0
+                .get(key)
+                .map(|value| SecretString::from(value.clone())))
+        }
+    }
+
+    fn secrets_with_map(entries: &[(&str, &str)]) -> Arc<RwLock<Secrets>> {
+        let mut secrets = Secrets::new();
+        secrets.register_store(
+            "fake",
+            Arc::new(MapStore(
+                entries
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            )),
+        );
+        Arc::new(RwLock::new(secrets))
     }
 
     fn feature_setting(location: &str, params: Option<&Params>) -> StateLocation {
@@ -837,6 +869,43 @@ mod tests {
         .expect_err("invalid S3 parameters should fail");
 
         assert!(matches!(err, Error::S3ParameterValidation { .. }));
+    }
+
+    /// Ordinary S3 state-location params omit `s3_auth`; autoload fills it
+    /// from the store. The empty template map must not send that value
+    /// through `found_clause`'s raw-value branch.
+    #[tokio::test]
+    async fn build_s3_parameters_autoloaded_auth_does_not_echo_canary() {
+        const CANARY: &str = "CANARYPGPW7731";
+        let mut params = HashMap::new();
+        params.insert("s3_region".to_string(), "us-east-1".to_string());
+
+        let err = build_s3_parameters(
+            secrets_with_map(&[("s3_auth", CANARY)]),
+            Some(&params),
+            StateFeature::RateControl,
+            StateSource::RuntimeState,
+        )
+        .await
+        .expect_err("an autoloaded invalid s3_auth must fail validation");
+
+        let message = err.to_string();
+        assert!(
+            matches!(err, Error::S3ParameterValidation { .. }),
+            "expected S3 parameter validation: {err}"
+        );
+        assert!(
+            !message.contains(CANARY),
+            "autoloaded s3_auth must not echo through Found: {message}"
+        );
+        assert!(
+            message.contains("'s3_auth' parameter must be one of: iam_role, key."),
+            "the error must name the parameter: {message}"
+        );
+        assert!(
+            message.contains("Found a value from ${ secrets:s3_auth }."),
+            "the error must name the autoload lookup: {message}"
+        );
     }
 
     #[tokio::test]
