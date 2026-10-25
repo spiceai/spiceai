@@ -1160,25 +1160,57 @@ pub(crate) const COLD_PK_BLOOM_PER_FILE_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// (a false positive would wrongly drop a genuinely new row). Blooms stay a
 /// list, not a union, because each is right-sized to its file's key count.
 pub(crate) struct ColdPkExistence {
-    blooms: Vec<PkBloom>,
+    files: Vec<ColdFileProbe>,
+}
+
+/// Inclusive `[min, max]` of a cold file's primary key in the row-converter
+/// byte encoding probes use. Only built for a single fixed-width integer key
+/// column, where the encoding's byte order equals the numeric order.
+pub(crate) struct PkByteRange {
+    pub(crate) min: Box<[u8]>,
+    pub(crate) max: Box<[u8]>,
+}
+
+struct ColdFileProbe {
+    bloom: PkBloom,
+    /// `None` = no usable range, so the file is always a bloom candidate.
+    range: Option<PkByteRange>,
 }
 
 impl ColdPkExistence {
+    #[cfg(test)]
     pub(crate) fn new(blooms: Vec<PkBloom>) -> Self {
-        Self { blooms }
+        Self::with_ranges(blooms.into_iter().map(|b| (b, None)).collect())
+    }
+
+    /// One entry per live cold file: its bloom and, when known, its key range.
+    pub(crate) fn with_ranges(files: Vec<(PkBloom, Option<PkByteRange>)>) -> Self {
+        Self {
+            files: files
+                .into_iter()
+                .map(|(bloom, range)| ColdFileProbe { bloom, range })
+                .collect(),
+        }
     }
 
     /// `true` if `key` MAY live in any cold file (definitely absent when every
-    /// file's bloom misses — blooms have no false negatives).
+    /// file's bloom misses or the key lies outside every file's key range —
+    /// neither test has false negatives).
     pub(crate) fn maybe_contains(&self, key: &[u8]) -> bool {
-        self.blooms.iter().any(|b| b.maybe_contains(key))
+        self.files.iter().any(|f| {
+            f.range.as_ref().is_none_or(|r| {
+                // Different lengths mean the encoding is not the one the range
+                // was built in, so the range cannot exclude the key.
+                key.len() != r.min.len() || (key >= r.min.as_ref() && key <= r.max.as_ref())
+            }) && f.bloom.maybe_contains(key)
+        })
     }
 
     /// Approximate resident bytes across all per-file blooms, for logging.
     pub(crate) fn approx_bytes(&self) -> usize {
-        self.blooms
+        self.files
             .iter()
-            .map(PkBloom::size_bytes)
+            .map(|f| f.bloom.size_bytes())
             .fold(0, usize::saturating_add)
     }
 }

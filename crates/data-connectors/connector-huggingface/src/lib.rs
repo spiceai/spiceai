@@ -317,10 +317,7 @@ impl HuggingFace {
             return Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: CONNECTOR_NAME.to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                message: format!(
-                    "`file_format` '{}' is not supported for Hugging Face datasets: use parquet, csv, tsv, json, jsonl or orc. See: {DOCS_URL}",
-                    extension.trim_start_matches('.')
-                ),
+                message: unsupported_file_format_message(&self.params),
             });
         };
         let files = selected_files(self.hub(), dataset, &location, &commit.sha, &extension).await?;
@@ -356,7 +353,7 @@ impl HuggingFace {
                     store: Arc::clone(&self.store),
                     dataset: dataset.clone(),
                     location: location.clone(),
-                    extension: extension.clone(),
+                    extension: extension.to_string(),
                     options: csv.options().clone(),
                     columns: column_names(template.file_schema()),
                 };
@@ -554,6 +551,26 @@ fn schema_dataset(
         );
     }
     dataset
+}
+
+/// The error for a `file_format` with no table reader here, such as a document format. It
+/// names `file_format` itself, never the listing suffix, which may come from `file_extension`:
+/// a secret-derived value appears only as its `${ store:key }` reference, and a value of
+/// unknown provenance not at all.
+fn unsupported_file_format_message(params: &Parameters) -> String {
+    let format_clause = match params.secret_source("file_format") {
+        Some(source) => format!(" from {source}"),
+        None if params.origins_tracked() => params
+            .get("file_format")
+            .expose()
+            .ok()
+            .map(|format| format!(" '{}'", format.to_ascii_lowercase()))
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    format!(
+        "`file_format`{format_clause} is not supported for Hugging Face datasets: use parquet, csv, tsv, json, jsonl or orc. See: {DOCS_URL}"
+    )
 }
 
 /// The data files the location selects at `commit`, sorted: the file itself, or the files of

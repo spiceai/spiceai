@@ -1532,6 +1532,94 @@ async fn a_rate_limited_dataset_names_each_fix_that_applies() {
     );
 }
 
+/// A connector whose parameters carry their Spicepod provenance, as the runtime builds them:
+/// `sources` maps each secret-derived parameter to its `${ store:key }` reference.
+fn tracked_connector(
+    mock: &Mock,
+    params: &[(&str, &str)],
+    sources: &[(&str, &str)],
+) -> HuggingFace {
+    let mut connector = connector(mock, None, params);
+    connector.params = connector.params.with_secret_sources(
+        sources
+            .iter()
+            .map(|(key, source)| ((*key).to_string(), (*source).to_string()))
+            .collect(),
+    );
+    connector
+}
+
+/// A document or plain-text `file_format` lists by `file_extension` when one is set, so the
+/// unsupported-format error names `file_format` itself and never the listing suffix: a
+/// secret-derived value appears only as its reference.
+#[tokio::test(flavor = "multi_thread")]
+async fn unsupported_file_format_error_never_echoes_a_secret_value() {
+    const CANARY: &str = "canarypgpw7731";
+    let mock = Mock::start().await;
+    mock.commit("o/docs", C1, vec![("a.parquet", text("id\n1\n"))]);
+    mock.branch("o/docs", "main", C1);
+    let dataset = DatasetSpec::new("hf://datasets/o/docs/", TableReference::bare("t"));
+    let unsupported = |clause: &str| {
+        format!(
+            "Cannot setup the dataset t (hf) with an invalid configuration. `file_format`{clause} is not supported for Hugging Face datasets: use parquet, csv, tsv, json, jsonl or orc. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
+        )
+    };
+
+    let secret_extension = tracked_connector(
+        &mock,
+        &[
+            ("file_format", "pdf"),
+            ("file_extension", ".canarypgpw7731"),
+        ],
+        &[("file_extension", "${ env:HF_EXTENSION }")],
+    );
+    let secret_format = tracked_connector(
+        &mock,
+        &[("file_format", CANARY)],
+        &[("file_format", "${ env:HF_FORMAT }")],
+    );
+    let literal_extension = tracked_connector(
+        &mock,
+        &[("file_format", "pdf"), ("file_extension", ".bin")],
+        &[],
+    );
+    // Without provenance a value may be secret-derived, so none is shown.
+    let untracked = connector(
+        &mock,
+        None,
+        &[
+            ("file_format", "pdf"),
+            ("file_extension", ".canarypgpw7731"),
+        ],
+    );
+
+    for (case, connector, expected) in [
+        (
+            "secret file_extension",
+            &secret_extension,
+            unsupported(" 'pdf'"),
+        ),
+        (
+            "secret file_format",
+            &secret_format,
+            unsupported(" from ${ env:HF_FORMAT }"),
+        ),
+        (
+            "literal file_extension",
+            &literal_extension,
+            unsupported(" 'pdf'"),
+        ),
+        ("untracked", &untracked, unsupported("")),
+    ] {
+        let error = connector.table(&dataset).await.expect_err(case);
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert_eq!(display, expected, "{case}");
+        assert!(!display.contains(CANARY), "{case}: {display}");
+        assert!(!debug.contains(CANARY), "{case}: {debug}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_token_is_sent_to_the_hub_and_never_to_the_cdn() {
     let mock = Mock::start().await;
