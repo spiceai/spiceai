@@ -817,14 +817,15 @@ fn plan_decode_concurrency(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
 /// divide evenly, which a mixed base+delta plan routinely does, and refusing queries
 /// that fit.
 ///
-/// The floor of one batch is the one deliberate exception. With fewer decodes than
-/// partitions some streams take a zero share, and a stream charging nothing is
-/// unaccounted for the batch it is holding; those partitions charge one batch each,
-/// which is the accounting this scaling started from.
+/// With fewer decodes than partitions some streams take a zero share. Such a stream
+/// runs no decode, so it charges nothing before a poll and only the batch it emits
+/// after one. Flooring the share at one instead would charge one estimated batch
+/// per output partition: a one-file scan under a round-robin fan-out of 64
+/// partitions would hold 64 initial estimates for one decode.
 fn partition_decode_share(total: usize, partitions: usize, partition: usize) -> usize {
     let partitions = partitions.max(1);
     let extra = usize::from(partition < total % partitions);
-    ((total / partitions) + extra).max(1)
+    (total / partitions) + extra
 }
 
 /// Counts file-backed scan sources (snapshot generations) and the total files
@@ -1506,8 +1507,9 @@ struct MemoryAccountedScanStream<S> {
     /// Concurrent split decodes running beneath this stream, from
     /// [`CayenneAccelerationExec::decode_fan_out`]. The charge is
     /// `estimate * fan_out`, because a Vortex file scan holds that many
-    /// canonicalized batches at once while emitting one. Its source guarantees at
-    /// least 1, so a serial scan charges exactly one batch.
+    /// canonicalized batches at once while emitting one. Zero for a stream with no
+    /// decode share: it charges nothing before a poll and, once it emits a batch,
+    /// that one batch ([`Self::charge_for_emitted`]).
     fan_out: usize,
     /// True while the reservation covers an in-progress decode rather than a
     /// batch already handed downstream. Keeps the charge in place across a
@@ -1696,6 +1698,12 @@ impl<S> MemoryAccountedScanStream<S> {
     fn charge_for(&self, per_batch: usize) -> usize {
         per_batch.saturating_mul(self.fan_out)
     }
+
+    /// Bytes to hold once a batch of `per_batch` is emitted: its share of the
+    /// decodes still in flight, and never less than the emitted batch itself.
+    fn charge_for_emitted(&self, per_batch: usize) -> usize {
+        per_batch.saturating_mul(self.fan_out.max(1))
+    }
 }
 
 impl<S> futures::Stream for MemoryAccountedScanStream<S>
@@ -1755,7 +1763,7 @@ where
                 // Settle to the measured size, still scaled: the emitted batch is
                 // one of `fan_out` in flight, and the others stay resident while
                 // this one is handed downstream.
-                let settled = self.charge_for(actual);
+                let settled = self.charge_for_emitted(actual);
                 let mut refused = None;
                 if let Some(reservation) = self.reservation.as_mut()
                     && let Err(e) = reservation.try_resize(settled)
@@ -1860,17 +1868,10 @@ mod tests {
                     .map(|partition| partition_decode_share(total, partitions, partition))
                     .collect();
                 let charged: usize = shares.iter().sum();
-                // Below one decode per partition the floor takes over: every stream
-                // still holds a batch, so it charges one rather than nothing.
-                let expected = total.max(partitions);
                 assert_eq!(
-                    charged, expected,
+                    charged, total,
                     "total={total} over {partitions} partitions charged {charged} \
                      (shares {shares:?})"
-                );
-                assert!(
-                    shares.iter().all(|share| *share >= 1),
-                    "every accounted stream must charge at least the batch it holds"
                 );
             }
         }
@@ -1927,6 +1928,42 @@ mod tests {
             err.to_string().contains("Resources exhausted"),
             "expected a pool refusal, got: {err}"
         );
+    }
+
+    /// A stream with no decode share pre-charges nothing, so the output partitions
+    /// of a round-robin fan-out over fewer decodes do not each hold an initial
+    /// estimate. It still charges the batch it emits while that batch is out.
+    #[tokio::test]
+    async fn a_stream_with_no_decode_share_charges_only_the_batch_it_emits() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from((0..16_i64).collect::<Vec<_>>()))],
+        )
+        .expect("batch");
+        let batch_bytes = batch.get_array_memory_size();
+        // Too small for one initial estimate, but room for the batch itself.
+        let pool_bytes = batch_bytes * 2;
+        assert!(pool_bytes < INITIAL_BATCH_ESTIMATE_BYTES);
+        let context = pool_context(pool_bytes);
+        let pool = Arc::clone(context.memory_pool());
+
+        let mut stream = MemoryAccountedScanStream::new(
+            Box::pin(futures::stream::iter(vec![Ok(batch)])),
+            Arc::clone(&schema),
+            Some(Arc::from("test_table")),
+            63,
+            &context,
+            0,
+        );
+        stream
+            .next()
+            .await
+            .expect("one item")
+            .expect("a stream with no decode share must not pre-charge an estimate");
+        assert_eq!(pool.reserved(), batch_bytes, "the emitted batch is charged");
+        assert!(stream.next().await.is_none());
+        assert_eq!(pool.reserved(), 0, "the charge is released at the end");
     }
 
     /// The charge must cover every split a Vortex scan decodes concurrently, not
