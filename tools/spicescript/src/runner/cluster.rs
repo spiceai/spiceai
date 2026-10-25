@@ -20,10 +20,9 @@ limitations under the License.
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::script::Script;
 
 use super::{CLUSTER_ASSIGNMENT_INTERVAL, Instance};
 
@@ -77,23 +76,12 @@ pub(super) async fn start_executors(
 /// the source's change arrived, or that an acceleration serves while its source
 /// is down, would compare against the cache instead.
 /// `--cluster`: the scheduler and executor arguments, with node mTLS from the
-/// `cluster-pki/` directory nearest above the script.
+/// run's generated CA and certificates.
 pub(super) fn cluster_args(
-    script: &Script,
+    pki: &std::path::Path,
     context: &Value,
     executors: usize,
 ) -> Result<(Vec<String>, Vec<Vec<String>>)> {
-    let script_dir = std::path::absolute(&script.dir)?;
-    let pki = script_dir
-        .ancestors()
-        .map(|d| d.join("cluster-pki"))
-        .find(|d| d.join("ca.crt").exists())
-        .ok_or_else(|| {
-            anyhow!(
-                "a cluster needs a cluster-pki/ directory above {}",
-                script_dir.display()
-            )
-        })?;
     let file = |name: &str| pki.join(name).display().to_string();
     let scheduler_port = context["instance"]["port"].to_string();
     let mtls = |node: &str| {

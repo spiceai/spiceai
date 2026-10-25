@@ -321,6 +321,9 @@ pub struct Options {
     pub work_dir: PathBuf,
     pub keep: bool,
     pub spice_cli: PathBuf,
+    /// The directory holding this run's node mTLS CA and certificates
+    /// (`ca.crt`, `<role>.crt`, `<role>.key`), generated when it starts.
+    pub pki: PathBuf,
 }
 
 /// A failed check: where it ran, which step, and what went wrong.
@@ -811,6 +814,7 @@ async fn create_instances(
                 "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port()?,
                     "executor_port": crate::docker::free_port()?, "http_port": crate::docker::free_port()? },
                 "script": { "dir": std::path::absolute(&script.dir)?.display().to_string() },
+                "pki": { "dir": options.pki.display().to_string() },
             });
             let mut spicepod = script.spicepod.clone();
             template::apply_variant(&mut spicepod, variant)
@@ -846,7 +850,7 @@ async fn create_instances(
             let spare_count = script.defaults.cluster.as_ref().map_or(0, |c| c.spare);
             let cluster_args = if cluster {
                 Some(cluster_args(
-                    script,
+                    &options.pki,
                     &context,
                     executor_count + spare_count,
                 )?)

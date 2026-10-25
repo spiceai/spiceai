@@ -51,7 +51,7 @@ target/debug/spicescript --jobs 4 \
 # Start on a release and upgrade in place to the build under test at each `upgrade` step:
 target/debug/spicescript --from $HOME/.spice/bin/spiced \
   --spiced dev=target/release/spiced test/spicescript/postgres-upgrade.yaml
-# Every instance as a scheduler with one executor (node mTLS from cluster-pki/):
+# Every instance as a scheduler with one executor, over node mTLS:
 target/debug/spicescript --cluster test/spicescript/query-coverage.yaml
 # Known-failing scripts of one group, without waiting out every limit:
 target/debug/spicescript --max-wait 20s test/spicescript/known-failing/clickhouse
@@ -185,7 +185,7 @@ file_format: parquet }`.
 **Placeholders**: `${sources.<name>.<field>}`, `${matrix.<key>}`,
 `${variant.name}`, `${instance.name}`, `${instance.dir}`, `${instance.port}`
 (a free port for the script's own use), `${instance.http_port}` (the port
-`spiced` serves HTTP on, for a container that posts to it), `${script.dir}`.
+`spiced` serves HTTP on, for a container that posts to it), `${script.dir}`, `${pki.dir}` (this run's node mTLS CA and certificates: `ca.crt`, `scheduler.crt`/`.key`, `executor.crt`/`.key`, generated when the run starts).
 Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 
 ### Steps

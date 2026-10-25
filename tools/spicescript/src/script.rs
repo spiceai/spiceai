@@ -215,7 +215,7 @@ pub struct Defaults {
     #[serde(default)]
     pub executor_args: Option<Vec<String>>,
     /// Always run as a cluster: a scheduler with this many executors, over
-    /// node mTLS from the nearest `cluster-pki/` above the script.
+    /// node mTLS with a CA and certificates generated for the run.
     #[serde(default)]
     pub cluster: Option<ClusterDefaults>,
     /// When the script runs as a cluster, the column each acceleration without

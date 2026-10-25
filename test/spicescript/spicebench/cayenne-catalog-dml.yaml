@@ -30,15 +30,15 @@ defaults:
   expect: { oracle: src }
   spiced-args: [--role, scheduler, --node-advertise-address, 127.0.0.1,
     --node-bind-address, '127.0.0.1:${instance.port}',
-    --node-mtls-ca-certificate-file, '${script.dir}/../cluster-pki/ca.crt',
-    --node-mtls-certificate-file, '${script.dir}/../cluster-pki/scheduler.crt',
-    --node-mtls-key-file, '${script.dir}/../cluster-pki/scheduler.key']
+    --node-mtls-ca-certificate-file, '${pki.dir}/ca.crt',
+    --node-mtls-certificate-file, '${pki.dir}/scheduler.crt',
+    --node-mtls-key-file, '${pki.dir}/scheduler.key']
   # The scheduler creates a table only while an executor is connected.
   executor-args: [--role, executor, --scheduler-address, 'https://127.0.0.1:${instance.port}',
     --node-advertise-address, 127.0.0.1, --node-bind-address, '127.0.0.1:${instance.executor_port}',
-    --node-mtls-ca-certificate-file, '${script.dir}/../cluster-pki/ca.crt',
-    --node-mtls-certificate-file, '${script.dir}/../cluster-pki/executor.crt',
-    --node-mtls-key-file, '${script.dir}/../cluster-pki/executor.key']
+    --node-mtls-ca-certificate-file, '${pki.dir}/ca.crt',
+    --node-mtls-certificate-file, '${pki.dir}/executor.crt',
+    --node-mtls-key-file, '${pki.dir}/executor.key']
 
 steps:
   - start: {}

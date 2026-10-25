@@ -30,6 +30,7 @@ mod compare;
 mod docker;
 mod generate;
 mod ledger;
+mod pki;
 mod reap;
 mod rqg;
 mod runner;
@@ -65,7 +66,7 @@ struct Cli {
     from: Option<PathBuf>,
 
     /// Run every instance as a cluster: a scheduler with one executor,
-    /// over node mTLS from the nearest `cluster-pki/` above the script.
+    /// over node mTLS with a CA and certificates generated for the run.
     #[arg(long)]
     cluster: bool,
 
@@ -221,6 +222,8 @@ async fn run(cli: Cli) -> Result<bool> {
             from.display()
         );
     }
+    // A fresh CA and node certificates for this run's cluster instances.
+    let pki = pki::generate(&work_dir.join(format!("pki-{}", std::process::id())))?;
     let options = runner::Options {
         targets,
         from: cli.from,
@@ -228,6 +231,7 @@ async fn run(cli: Cli) -> Result<bool> {
         work_dir,
         keep: cli.keep,
         spice_cli: cli.spice,
+        pki,
     };
     let mut ledger = ledger::Ledger::load(&scripts)?;
     let mut passed = 0;
