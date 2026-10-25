@@ -62,7 +62,7 @@ jobs:
             echo "::error::harness_ref must be a full commit SHA"
             exit 1
           fi
-          if ! [[ "${MAX_LIFETIME_MINUTES}" =~ ^[0-9]{2,3}$ ]] || [ "${MAX_LIFETIME_MINUTES}" -gt 600 ]; then
+          if ! [[ "${MAX_LIFETIME_MINUTES}" =~ ^[1-9][0-9]{1,2}$ ]] || [ "${MAX_LIFETIME_MINUTES}" -gt 600 ]; then
             echo "::error::max_lifetime_minutes must be a whole number from 10 to 600"
             exit 1
           fi
@@ -231,9 +231,17 @@ jobs:
             sleep 60
           done
           mkdir -p results
-          for file in DONE benchmark-exit-code harness-commit result.json result.csv log spiced.log install-override.diff cloud-init-output.log; do
-            curl -fsS --connect-timeout 10 --max-time 300 --retry 3 -o "results/${file}" \
-              "http://${PUBLIC_IP}:${RESULTS_PORT}/${file}" || echo "missing ${file}"
+          required=(benchmark-exit-code harness-commit result.json result.csv install-override.diff)
+          missing=()
+          for file in "${required[@]}" log spiced.log cloud-init-output.log; do
+            if curl -fsS --connect-timeout 10 --max-time 300 --retry 3 -o "results/${file}.part" \
+              "http://${PUBLIC_IP}:${RESULTS_PORT}/${file}"; then
+              mv "results/${file}.part" "results/${file}"
+            else
+              rm -f "results/${file}.part"
+              echo "missing ${file}"
+              missing+=("${file}")
+            fi
           done
           {
             echo "release=${RELEASE}"
@@ -251,6 +259,12 @@ jobs:
             echo
             grep -E '^(Load time|Data size|Concurrent QPS|Concurrent error ratio):' results/log || true
           } >> "${GITHUB_STEP_SUMMARY}"
+          for file in "${required[@]}"; do
+            if [[ " ${missing[*]} " == *" ${file} "* ]]; then
+              echo "::error::${file} could not be downloaded"
+              exit 1
+            fi
+          done
           test "${status}" = 0 || exit 1
           test "$(cat results/harness-commit)" = "${HARNESS_REF}" || { echo "::error::the instance ran a different harness commit"; exit 1; }
           jq -e '.result | length > 0' results/result.json >/dev/null || { echo "::error::result.json is missing or empty"; exit 1; }
