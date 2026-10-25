@@ -7418,6 +7418,11 @@ impl CayenneTableProvider {
                 live.insert(id);
             }
         }
+        // A retired directory can return to service: a restore makes a leftover
+        // of an interrupted restore current.
+        self.retired_snapshot_dirs
+            .lock()
+            .retain(|id, _| !live.contains(id));
         let mut on_disk = Vec::new();
         let mut entries = match tokio::fs::read_dir(&table_dir).await {
             Ok(entries) => entries,
@@ -7860,10 +7865,10 @@ impl CayenneTableProvider {
                 .map(|(id, _)| id.clone())
                 .collect()
         };
-        // Paranoia re-check against the LIVE reference set: a retired id can
-        // never legitimately return to service (uuid7 ids are never reused),
-        // but deleting the current/protected dirs is the data-loss failure
-        // mode, so refuse it structurally.
+        // Re-check against the LIVE reference set: a retired directory can return
+        // to service (a restore can make an interrupted restore's leftover
+        // current), and deleting the current/protected dirs is the data-loss
+        // failure mode, so refuse it structurally.
         let current = self.get_current_snapshot_id();
         let protected = self.protected_snapshots.load();
         // Prune listing timestamps for dirs in no live or retired set (e.g.
@@ -21857,9 +21862,14 @@ impl CayenneTableProvider {
 
     /// Claim file deletion for a snapshot-directory sweep, held until its
     /// deletion finishes. `None` while file deletions are held: the sweep skips its
-    /// pass, and releasing the hold runs it again.
+    /// pass, and releasing the hold runs it again. Also `None` once
+    /// [`Self::quiesce`] closed the instance: it waits for a claim taken before the
+    /// close, and one taken after sees it.
     fn claim_file_deletions(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
-        Arc::clone(&self.file_deletion_fence).try_write_owned().ok()
+        let claim = Arc::clone(&self.file_deletion_fence)
+            .try_write_owned()
+            .ok()?;
+        self.maintenance_still_admitted().then_some(claim)
     }
 
     /// Signal that orphaned key-based deletion vectors may now exist: a
@@ -21940,6 +21950,29 @@ impl CayenneTableProvider {
     pub async fn drain_orphan_dv_sweep(&self, min_files: usize) {
         self.drain_orphan_dv_backlog(min_files, ORPHAN_DV_SWEEP_MAX_BATCH)
             .await;
+    }
+
+    /// Test-only: elapse the cleanup grace of every retired directory and listing.
+    #[doc(hidden)]
+    pub fn elapse_snapshot_cleanup_grace(&self) {
+        let Some(past) = Instant::now().checked_sub(Self::SNAPSHOT_CLEANUP_GRACE * 2) else {
+            return;
+        };
+        for at in self.retired_snapshot_dirs.lock().values_mut() {
+            *at = past;
+        }
+        for at in self.snapshot_last_listed.lock().values_mut() {
+            *at = past;
+        }
+    }
+
+    /// Test-only: run the retired-directory sweep as if the grace had elapsed,
+    /// and wait for its deletions.
+    #[doc(hidden)]
+    pub async fn sweep_retired_snapshot_dirs_now(&self) {
+        self.elapse_snapshot_cleanup_grace();
+        self.sweep_retired_snapshot_dirs();
+        drop(Arc::clone(&self.file_deletion_fence).read_owned().await);
     }
 
     /// Whether [`Self::quiesce`] has closed this instance's maintenance.
@@ -22060,6 +22093,9 @@ impl CayenneTableProvider {
         // lock without one of the flags above; once held, nothing is mid-flight.
         // Released immediately — the caller is about to drop/replace this instance.
         drop(self.compaction_lock.write().await);
+        // And behind a snapshot-directory sweep still deleting files: its
+        // detached unlinks hold the deletion fence and none of the flags above.
+        drop(self.file_deletion_fence.read().await);
         flush_error.map_or(Ok(()), Err)
     }
 
@@ -78363,15 +78399,7 @@ mod tests {
         /// Elapse the grace for every retired dir and listing, so a sweep judges
         /// the pins alone.
         fn elapse_grace(provider: &CayenneTableProvider) {
-            let past = Instant::now()
-                .checked_sub(CayenneTableProvider::SNAPSHOT_CLEANUP_GRACE * 2)
-                .expect("the clock has run longer than two graces");
-            for at in provider.retired_snapshot_dirs.lock().values_mut() {
-                *at = past;
-            }
-            for at in provider.snapshot_last_listed.lock().values_mut() {
-                *at = past;
-            }
+            provider.elapse_snapshot_cleanup_grace();
         }
 
         /// Plan a scan without executing it: the plan pins the dirs it will read.
