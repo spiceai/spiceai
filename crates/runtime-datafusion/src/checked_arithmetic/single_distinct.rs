@@ -31,7 +31,9 @@ use datafusion::logical_expr::{Expr, LogicalPlan, expr::AggregateFunction};
 use datafusion::optimizer::single_distinct_to_groupby::SingleDistinctToGroupBy;
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 
-use super::is_checked_sum_return_type;
+use super::decomposability::{
+    complete_preaggregate_would_narrow_early, logical_source_arg_types, unwrap_logical_casts,
+};
 
 pub(crate) const SINGLE_DISTINCT_RULE_NAME: &str = "single_distinct_aggregation_to_group_by";
 
@@ -50,22 +52,25 @@ impl CheckedSingleDistinctToGroupBy {
     }
 }
 
-fn has_checked_integer_sum(aggr_expr: &[Expr], schema: &DFSchema, group_len: usize) -> bool {
-    aggr_expr.iter().enumerate().any(|(i, expr)| {
+fn has_checked_integer_sum(aggr_expr: &[Expr], input_schema: &DFSchema) -> bool {
+    aggr_expr.iter().any(|expr| {
         let Expr::AggregateFunction(AggregateFunction {
             func,
-            params: AggregateFunctionParams { distinct, .. },
-        }) = expr
+            params: AggregateFunctionParams { distinct, args, .. },
+        }) = unwrap_logical_casts(expr)
         else {
             return false;
         };
-        if *distinct || func.name() != "sum" {
+        if *distinct {
             return false;
         }
-        let Some(field) = schema.fields().get(group_len.saturating_add(i)) else {
-            return false;
-        };
-        is_checked_sum_return_type(field.data_type())
+        // Argument types come from the *input* schema. The aggregate output
+        // schema names `sum(v)`, so resolving `v` there misses a 64-bit SUM
+        // and lets SingleDistinct complete it early.
+        complete_preaggregate_would_narrow_early(
+            func.name(),
+            &logical_source_arg_types(args, input_schema),
+        )
     })
 }
 
@@ -84,11 +89,7 @@ impl OptimizerRule for CheckedSingleDistinctToGroupBy {
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         if let LogicalPlan::Aggregate(aggregate) = &plan
-            && has_checked_integer_sum(
-                &aggregate.aggr_expr,
-                aggregate.schema.as_ref(),
-                aggregate.group_expr.len(),
-            )
+            && has_checked_integer_sum(&aggregate.aggr_expr, aggregate.input.schema())
         {
             return Ok(Transformed::no(plan));
         }

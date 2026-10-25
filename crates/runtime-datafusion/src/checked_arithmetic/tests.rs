@@ -23,14 +23,17 @@ use datafusion::catalog::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::Operator;
 use datafusion::optimizer::{AnalyzerRule, Optimizer};
-use datafusion::physical_plan::{collect, displayable};
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
 
 use crate::analyzer_rule::AnalyzerRulesBuilder;
 use crate::checked_arithmetic::op::checked_op_udf;
 use crate::checked_arithmetic::{
     CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME, CheckedIntegerOverflow,
-    install_checked_single_distinct, register_checked_arithmetic,
+    install_checked_eager_aggregation, install_checked_single_distinct,
+    register_checked_arithmetic,
 };
 use crate::session_config::get_df_default_config;
 
@@ -70,6 +73,10 @@ fn register_overflow_table(ctx: &SessionContext) {
 }
 
 fn checked_session() -> SessionContext {
+    checked_session_with_eager(false)
+}
+
+fn checked_session_with_eager(eager_aggregation: bool) -> SessionContext {
     let mut analyzer_rules = AnalyzerRulesBuilder::new()
         .include_federation(false)
         .build();
@@ -81,11 +88,16 @@ fn checked_session() -> SessionContext {
     }
     let mut optimizer_rules = Optimizer::new().rules;
     install_checked_single_distinct(&mut optimizer_rules);
+    let mut config = get_df_default_config();
+    config.options_mut().optimizer.enable_eager_aggregation = eager_aggregation;
+    let mut physical_rules = PhysicalOptimizer::new().rules;
+    install_checked_eager_aggregation(&mut physical_rules);
     let mut state = SessionStateBuilder::new()
-        .with_config(get_df_default_config())
+        .with_config(config)
         .with_default_features()
         .with_analyzer_rules(analyzer_rules)
         .with_optimizer_rules(optimizer_rules)
+        .with_physical_optimizer_rules(physical_rules)
         .build();
     register_checked_arithmetic(&mut state).expect("register checked arithmetic");
     let ctx = SessionContext::new_with_state(state);
@@ -802,6 +814,229 @@ async fn executor_plain_sum_errors_on_overflowing_partition_decimal_sum_stays_wi
         vec![(i128::from(i64::MAX) * 2).to_string()],
         "executor-style wide SUM must keep MAX+MAX\nplan:\n{wide_plan}"
     );
+}
+
+fn aggregates_below_a_join(plan: &Arc<dyn ExecutionPlan>, below_a_join: bool) -> bool {
+    use datafusion::physical_plan::aggregates::AggregateExec;
+
+    if below_a_join && plan.is::<AggregateExec>() {
+        return true;
+    }
+    let below_a_join = below_a_join || plan.is::<HashJoinExec>();
+    plan.children()
+        .into_iter()
+        .any(|child| aggregates_below_a_join(child, below_a_join))
+}
+
+/// Fact rows that make `EagerAggregation`'s cost gate fire (10k rows, 100
+/// join keys, a filter that keeps two keys) and whose join-key subtotals
+/// overflow but cancel: key 1 is `[MAX, MAX, 0…]`, key 2 is `[-MAX, 0…]`.
+/// Both keys map to the same `GROUP BY` name, so the true `SUM` is `MAX`.
+fn register_eager_join_tables(ctx: &SessionContext) {
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("fk", DataType::Int32, false),
+        Field::new("amount", DataType::Int64, false),
+        Field::new("n", DataType::Int32, false),
+    ]));
+    let fact = RecordBatch::try_new(
+        Arc::clone(&fact_schema),
+        vec![
+            Arc::new(Int32Array::from_iter_values((1..=10_000).map(|i| i % 100))) as ArrayRef,
+            Arc::new(Int64Array::from_iter_values((1..=10_000).map(|i| {
+                let fk = i % 100;
+                let nth = (i - 1) / 100;
+                match (fk, nth) {
+                    (1, 0 | 1) => i64::MAX,
+                    (2, 0) => -i64::MAX,
+                    _ => 0,
+                }
+            }))),
+            Arc::new(Int32Array::from_iter_values(std::iter::repeat_n(1, 10_000))),
+        ],
+    )
+    .expect("eager-join fact batch");
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("dk", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let dim = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..100)) as ArrayRef,
+            Arc::new(arrow::array::StringArray::from_iter_values((0..100).map(
+                |k| {
+                    if k == 1 || k == 2 {
+                        "g".to_string()
+                    } else {
+                        format!("n{k}")
+                    }
+                },
+            ))),
+        ],
+    )
+    .expect("eager-join dim batch");
+    for (name, schema, batch) in [("fact", fact_schema, fact), ("dim", dim_schema, dim)] {
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("mem table");
+        ctx.register_table(name, Arc::new(table))
+            .expect("register eager-join table");
+    }
+}
+
+fn register_eager_overflow_tables(ctx: &SessionContext) {
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("fk", DataType::Int32, false),
+        Field::new("amount", DataType::Int64, false),
+    ]));
+    let fact = RecordBatch::try_new(
+        Arc::clone(&fact_schema),
+        vec![
+            Arc::new(Int32Array::from_iter_values((1..=10_000).map(|i| i % 100))) as ArrayRef,
+            Arc::new(Int64Array::from_iter_values((1..=10_000).map(|i| {
+                let fk = i % 100;
+                let nth = (i - 1) / 100;
+                match (fk, nth) {
+                    (1 | 2, 0 | 1) => i64::MAX,
+                    _ => 0,
+                }
+            }))),
+        ],
+    )
+    .expect("eager-overflow fact batch");
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("dk", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let dim = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..100)) as ArrayRef,
+            Arc::new(arrow::array::StringArray::from_iter_values((0..100).map(
+                |k| {
+                    if k == 1 || k == 2 {
+                        "g".to_string()
+                    } else {
+                        format!("n{k}")
+                    }
+                },
+            ))),
+        ],
+    )
+    .expect("eager-overflow dim batch");
+    for (name, schema, batch) in [
+        ("fact_ovf", fact_schema, fact),
+        ("dim_ovf", dim_schema, dim),
+    ] {
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("mem table");
+        ctx.register_table(name, Arc::new(table))
+            .expect("register eager-overflow table");
+    }
+}
+
+const EAGER_JOIN_SUM_SQL: &str = "SELECT d.name, SUM(f.amount) AS total FROM fact f JOIN dim d \
+     ON f.fk = d.dk WHERE f.fk IN (1, 2) GROUP BY d.name";
+const EAGER_JOIN_INT32_SUM_SQL: &str = "SELECT d.name, SUM(f.n) AS total FROM fact f JOIN dim d \
+     ON f.fk = d.dk WHERE f.fk IN (1, 2) GROUP BY d.name";
+const EAGER_JOIN_OVERFLOW_SQL: &str = "SELECT d.name, SUM(f.amount) AS total FROM fact_ovf f \
+     JOIN dim_ovf d ON f.fk = d.dk WHERE f.fk IN (1, 2) GROUP BY d.name";
+
+async fn plan_eager_join_sql(
+    ctx: &SessionContext,
+    sql: &str,
+) -> (bool, String, std::result::Result<Vec<String>, String>) {
+    let df = ctx.sql(sql).await.expect("plan eager-join sql");
+    let plan = df.create_physical_plan().await.expect("physical plan");
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let pushed = aggregates_below_a_join(&plan, false);
+    let rows = match collect(plan, ctx.task_ctx()).await {
+        Ok(batches) => Ok(render_rows(&batches)),
+        Err(error) => Err(error.to_string()),
+    };
+    (pushed, rendered, rows)
+}
+
+/// Codex round 4: `EagerAggregation` completes a checked integer `SUM` per
+/// join-key group (`Partial` → `FinalPartitioned` below the join), so
+/// `evaluate()` narrows to `i64` before groups can cancel.
+///
+/// Stats match the fork-patch guard (`10_000` fact rows, `100` keys, a
+/// `FilterExec` sunk below the join). Join keys `1` (`[MAX, MAX]`) and `2`
+/// (`[-MAX]`) both map to `name = 'g'`. The true total is `MAX`.
+#[tokio::test]
+async fn checked_sum_matches_across_eager_aggregation_and_overflows_when_true_total_overflows() {
+    let expected_cancel = vec![format!("g {}", i64::MAX)];
+    let expected_int32 = vec!["g 200".to_string()];
+
+    let ctx_on = checked_session_with_eager(true);
+    register_eager_join_tables(&ctx_on);
+    let (int32_pushed, int32_plan, int32_rows) =
+        plan_eager_join_sql(&ctx_on, EAGER_JOIN_INT32_SUM_SQL).await;
+    assert!(
+        int32_pushed,
+        "Int32 SUM must still be pre-aggregated below the join when eager aggregation is on, \
+         or the cost-gate control cannot tell the rule firing from the plan's own shape:\n{int32_plan}"
+    );
+    assert_eq!(
+        int32_rows.expect("Int32 SUM must succeed"),
+        expected_int32,
+        "Int32 SUM over the join must stay 200\nplan:\n{int32_plan}"
+    );
+
+    let (on_pushed, on_plan, on_rows) = plan_eager_join_sql(&ctx_on, EAGER_JOIN_SUM_SQL).await;
+    assert!(
+        !on_pushed,
+        "checked integer SUM must stay out of EagerAggregation so per-join-key evaluate cannot \
+         narrow early\nplan:\n{on_plan}"
+    );
+    let on_rows = on_rows.unwrap_or_else(|error| {
+        panic!("eager on: representable join SUM must not overflow, got {error}\nplan:\n{on_plan}")
+    });
+    assert_eq!(
+        on_rows, expected_cancel,
+        "eager on: join-key [MAX, MAX] + [-MAX] must cancel to MAX\nplan:\n{on_plan}"
+    );
+
+    let ctx_off = checked_session_with_eager(false);
+    register_eager_join_tables(&ctx_off);
+    let (off_pushed, off_plan, off_rows) = plan_eager_join_sql(&ctx_off, EAGER_JOIN_SUM_SQL).await;
+    assert!(
+        !off_pushed,
+        "eager off: nothing may be pre-aggregated below the join:\n{off_plan}"
+    );
+    assert_eq!(
+        off_rows.expect("eager off SUM must succeed"),
+        expected_cancel,
+        "eager off: join-key [MAX, MAX] + [-MAX] must cancel to MAX\nplan:\n{off_plan}"
+    );
+    assert_eq!(
+        on_rows, expected_cancel,
+        "eager on and off must return the same representable total"
+    );
+
+    register_eager_overflow_tables(&ctx_on);
+    let (_ovf_on_pushed, ovf_on_plan, ovf_on_rows) =
+        plan_eager_join_sql(&ctx_on, EAGER_JOIN_OVERFLOW_SQL).await;
+    let ovf_on = ovf_on_rows.expect_err("true overflow with eager on must error");
+    assert!(
+        contains_overflow(&ovf_on),
+        "eager on: MAX+MAX+MAX+MAX must overflow, got {ovf_on}\nplan:\n{ovf_on_plan}"
+    );
+
+    register_eager_overflow_tables(&ctx_off);
+    let (_ovf_off_pushed, ovf_off_plan, ovf_off_rows) =
+        plan_eager_join_sql(&ctx_off, EAGER_JOIN_OVERFLOW_SQL).await;
+    let ovf_off = ovf_off_rows.expect_err("true overflow with eager off must error");
+    assert!(
+        contains_overflow(&ovf_off),
+        "eager off: MAX+MAX+MAX+MAX must overflow, got {ovf_off}\nplan:\n{ovf_off_plan}"
+    );
+
+    if std::env::var("DUMP_EAGER_PLANS").is_ok() {
+        eprintln!("int32 pushed={int32_pushed} rows={expected_int32:?}\n{int32_plan}");
+        eprintln!("eager on pushed={on_pushed} rows={on_rows:?}\n{on_plan}");
+        eprintln!("eager off pushed={off_pushed} rows={expected_cancel:?}\n{off_plan}");
+        eprintln!("overflow on: {ovf_on}\n{ovf_on_plan}");
+        eprintln!("overflow off: {ovf_off}\n{ovf_off_plan}");
+    }
 }
 
 fn cancel_across_groups_batch() -> RecordBatch {

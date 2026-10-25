@@ -80,7 +80,6 @@ use {
 use crate::cluster::partition::service::PartitionService;
 #[cfg(feature = "duckdb")]
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-#[cfg(feature = "duckdb")]
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
@@ -1208,6 +1207,19 @@ impl DataFusionBuilder {
                     addresses, /* max_broadcast_dim_rows */ 25_000_000,
                 ));
             }
+        }
+
+        // Checked integer SUM must not be completed as a pre-aggregate: keep
+        // EagerAggregation's name (skip lists) and decline when the plan has a
+        // 64-bit integer SUM / AVG. Must wrap before point-lookup skippable
+        // wrapping so the skippable layer still sees the rule name.
+        {
+            let physical = state
+                .physical_optimizers()
+                .get_or_insert_with(PhysicalOptimizer::new);
+            runtime_datafusion::checked_arithmetic::install_checked_eager_aggregation(
+                &mut physical.rules,
+            );
         }
 
         // Rules a primary-key point lookup cannot trigger are skipped while one is planned.
@@ -4201,7 +4213,7 @@ mod tests {
     /// join, the rendered plan, and the query's rows.
     #[cfg(not(windows))]
     async fn plan_an_aggregate_over_a_join(eager_aggregation: bool) -> (bool, String, String) {
-        use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
+        use arrow::array::{Int32Array, RecordBatch, StringArray};
 
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
@@ -4212,15 +4224,17 @@ mod tests {
         .build();
 
         // 10,000 fact rows over 100 join keys, and one dimension row per key.
+        // Amount is Int32 so this stays a decomposable SUM: checked Int64 SUM
+        // is kept out of EagerAggregation (see integer_overflow.rs).
         let fact_schema = Arc::new(Schema::new(vec![
             Field::new("fk", DataType::Int32, false),
-            Field::new("amount", DataType::Int64, false),
+            Field::new("amount", DataType::Int32, false),
         ]));
         let fact = RecordBatch::try_new(
             Arc::clone(&fact_schema),
             vec![
                 Arc::new(Int32Array::from_iter_values((1..=10_000).map(|i| i % 100))),
-                Arc::new(Int64Array::from_iter_values(1..=10_000)),
+                Arc::new(Int32Array::from_iter_values(1..=10_000)),
             ],
         )
         .expect("build the fact batch");
