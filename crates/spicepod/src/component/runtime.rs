@@ -1195,12 +1195,15 @@ pub struct ApiKeyAuth {
 /// All comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use
 /// constant-time comparison via the `subtle` crate to prevent timing attacks.
 ///
-/// YAML/JSON configuration accepts a string. Optional `:ro` (default) or `:rw`
-/// suffix selects capability (for example `sk_live:rw`).
+/// YAML/JSON configuration accepts a string. Optional `:ro` (default), `:rw`,
+/// or `:admin` suffix selects capability (for example `sk_live:rw`). An
+/// `:admin` key can also define, change, and remove datasets and catalogs with
+/// SQL.
 #[derive(Clone)]
 pub enum ApiKey {
     ReadOnly { key: String },
     ReadWrite { key: String },
+    Admin { key: String },
 }
 
 /// Aligns the generated Spicepod JSON Schema with [`Deserialize`] / [`Serialize`],
@@ -1221,7 +1224,7 @@ impl JsonSchema for ApiKey {
             "description": "API key for authentication. Keys can be read-only or read-write.
 The key value is redacted in Debug output to prevent credential leakage.
 
-Pass the key as a string. Optional `:ro` (default) or `:rw` suffix selects capability.
+Pass the key as a string. Optional `:ro` (default), `:rw`, or `:admin` suffix selects capability. An `:admin` key can also define, change, and remove datasets and catalogs with SQL.
 
 All comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use
 constant-time comparison via the `subtle` crate to prevent timing attacks.",
@@ -1235,7 +1238,8 @@ impl PartialEq for ApiKey {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (ApiKey::ReadOnly { key: a }, ApiKey::ReadOnly { key: b })
-            | (ApiKey::ReadWrite { key: a }, ApiKey::ReadWrite { key: b }) => {
+            | (ApiKey::ReadWrite { key: a }, ApiKey::ReadWrite { key: b })
+            | (ApiKey::Admin { key: a }, ApiKey::Admin { key: b }) => {
                 a.as_bytes().ct_eq(b.as_bytes()).into()
             }
             // Different variants are never equal
@@ -1257,6 +1261,10 @@ impl std::fmt::Debug for ApiKey {
                 .finish(),
             ApiKey::ReadWrite { .. } => f
                 .debug_struct("ApiKey::ReadWrite")
+                .field("key", &"[REDACTED]")
+                .finish(),
+            ApiKey::Admin { .. } => f
+                .debug_struct("ApiKey::Admin")
                 .field("key", &"[REDACTED]")
                 .finish(),
         }
@@ -1367,6 +1375,9 @@ impl ApiKey {
                 "rw" => ApiKey::ReadWrite {
                     key: key.to_string(),
                 },
+                "admin" => ApiKey::Admin {
+                    key: key.to_string(),
+                },
                 _ => ApiKey::ReadOnly {
                     key: input.to_string(),
                 },
@@ -1404,6 +1415,7 @@ impl Serialize for ApiKey {
         match self {
             ApiKey::ReadOnly { key } => serializer.serialize_str(key),
             ApiKey::ReadWrite { key } => serializer.serialize_str(&format!("{key}:rw")),
+            ApiKey::Admin { key } => serializer.serialize_str(&format!("{key}:admin")),
         }
     }
 }
@@ -1417,7 +1429,7 @@ impl PartialEq<str> for ApiKey {
     /// correctly without leaking timing information.
     fn eq(&self, other: &str) -> bool {
         match self {
-            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => {
+            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } | ApiKey::Admin { key } => {
                 key.as_bytes().ct_eq(other.as_bytes()).into()
             }
         }
@@ -1427,7 +1439,9 @@ impl PartialEq<str> for ApiKey {
 impl AsRef<str> for ApiKey {
     fn as_ref(&self) -> &str {
         match self {
-            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key.as_str(),
+            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } | ApiKey::Admin { key } => {
+                key.as_str()
+            }
         }
     }
 }
@@ -2159,6 +2173,42 @@ mod tests {
             ApiKey::ReadWrite {
                 key: "api-key-3".to_string()
             }
+        );
+    }
+
+    /// An `:admin` key is parsed without its suffix and written back with it;
+    /// it equals no read-only or read-write key with the same value.
+    #[test]
+    fn test_admin_api_key_round_trips() {
+        let yaml = r"
+        api_key:
+            enabled: true
+            keys:
+                - admin-key:admin
+        ";
+        let parsed: Auth = yaml::from_str(yaml).expect("Failed to parse Auth");
+        let keys = parsed.api_key.expect("api_key section exists").keys;
+        let admin = ApiKey::Admin {
+            key: "admin-key".to_string(),
+        };
+        assert_eq!(keys, vec![admin.clone()]);
+        assert!(
+            admin == *"admin-key",
+            "a client sends the key without its suffix"
+        );
+        assert_ne!(
+            admin,
+            ApiKey::ReadWrite {
+                key: "admin-key".to_string()
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&admin).expect("serialize"),
+            "\"admin-key:admin\""
+        );
+        assert_eq!(
+            format!("{admin:?}"),
+            "ApiKey::Admin { key: \"[REDACTED]\" }"
         );
     }
 

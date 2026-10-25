@@ -402,6 +402,16 @@ impl Drop for QueryTimeoutTimerGuard {
     }
 }
 
+/// `sql` as the list of active queries shows it, and as task history records
+/// it: SQL that defines a component has the literal values of its secret
+/// parameters redacted.
+fn recorded_text(df: &DataFusion, sql: &Arc<str>) -> Arc<str> {
+    match df.recorded_statement_text(sql) {
+        std::borrow::Cow::Borrowed(_) => Arc::clone(sql),
+        std::borrow::Cow::Owned(redacted) => Arc::from(redacted),
+    }
+}
+
 impl Query {
     fn ensure_not_cancelled(
         token: &tokio_util::sync::CancellationToken,
@@ -454,7 +464,7 @@ impl Query {
             _ => (QueryTimeoutState::default(), None),
         };
         let sql_preview: Arc<str> = match &self.sql {
-            QueryMethod::Text { sql, .. } => Arc::clone(sql),
+            QueryMethod::Text { sql, .. } => recorded_text(&self.df, sql),
             QueryMethod::Plan(_) => Arc::from("<logical plan>"),
         };
         let active_query_guard = self.df.query_cancel_registry().register(
@@ -473,8 +483,18 @@ impl Query {
         }
     }
 
+    /// The query as task history records it: SQL that defines a component has
+    /// the literal values of its secret parameters redacted.
+    fn recorded_input(&self) -> std::borrow::Cow<'_, str> {
+        match &self.sql {
+            QueryMethod::Text { sql, .. } => self.df.recorded_statement_text(sql),
+            QueryMethod::Plan(_) => std::borrow::Cow::Owned(self.sql.to_string()),
+        }
+    }
+
     fn query_spans(&self, request_context: &RequestContext) -> QuerySpans {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
+        let input = self.recorded_input();
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %input, runtime_query = false);
         let trace_span = correlation::begin_task_trace(&span, request_context);
         QuerySpans { span, trace_span }
     }
@@ -822,7 +842,7 @@ impl Query {
             target: "task_history",
             tracing::Level::INFO,
             "sql_query",
-            input = %self.sql,
+            input = %self.recorded_input(),
             runtime_query = false,
             distributed = true,
             job_id = %job_id,
@@ -863,7 +883,7 @@ impl Query {
             target: "task_history",
             tracing::Level::INFO,
             "sql_query",
-            input = %self.sql,
+            input = %self.recorded_input(),
             runtime_query = false,
             distributed = true,
             job_id = %job_id,
@@ -907,7 +927,7 @@ impl Query {
         let results_cache_mode = self.results_cache_mode;
         let query_start = std::time::Instant::now();
         let sql_preview: Arc<str> = match &self.sql {
-            QueryMethod::Text { sql, .. } => Arc::clone(sql),
+            QueryMethod::Text { sql, .. } => recorded_text(&self.df, sql),
             QueryMethod::Plan(_) => Arc::from("<logical plan>"),
         };
 
@@ -1345,7 +1365,7 @@ impl Query {
         // Registered in `run` before the results-cache probe. The SQL preview
         // is owned here before moving `self.sql` into the planning match.
         let sql_preview: Arc<str> = match &self.sql {
-            QueryMethod::Text { sql, .. } => Arc::clone(sql),
+            QueryMethod::Text { sql, .. } => recorded_text(&self.df, sql),
             QueryMethod::Plan(_) => Arc::from("<logical plan>"),
         };
         let skip_query_admission = matches!(
@@ -2161,7 +2181,8 @@ impl Query {
 
     fn handle_schema_error(self, request_context: &RequestContext, e: &DataFusionError) {
         // If there is an error getting the schema, we still want to track it in task history
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
+        let input = self.recorded_input();
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %input, runtime_query = false);
         let trace_span = correlation::begin_task_trace(&span, request_context);
         let error_code = ErrorCode::from(e);
         let _trace = trace_span.enter();

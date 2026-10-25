@@ -740,6 +740,9 @@ async fn track_metrics(
     let request_context = Arc::new(
         request_context_builder
             .with_extension(DataFusionContextExtension::new(Arc::clone(&df)))
+            .with_extension(crate::component_ddl::HttpRequestSite::from_headers(
+                &headers,
+            ))
             .build(),
     );
     let auth_request_context: Arc<dyn AuthRequestContext + Send + Sync> =

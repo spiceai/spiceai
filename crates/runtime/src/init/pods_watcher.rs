@@ -309,6 +309,10 @@ impl Runtime {
         // one-at-a-time. Must be the first statement.
         let _serialize = self.apply_app_lock.lock().await;
 
+        // `new_app` is built from the Spicepods; the datasets and catalogs
+        // defined with SQL are served beside theirs.
+        let new_app = self.with_sql_definitions(new_app).await;
+
         // It is safe to operate by read lock until we actually need to update
         // the app state: with applies serialized by `_serialize`, no other path
         // mutates the app during the diff phase, so a write lock is not needed
@@ -324,7 +328,7 @@ impl Runtime {
     /// The caller holds `apply_app_lock`. `current_app` is what to reconcile
     /// *from*, which is not necessarily the installed app; `new_app` is
     /// installed either way.
-    async fn apply_app_diff(
+    pub(crate) async fn apply_app_diff(
         self: Arc<Self>,
         current_app: Option<&Arc<App>>,
         new_app: Arc<App>,

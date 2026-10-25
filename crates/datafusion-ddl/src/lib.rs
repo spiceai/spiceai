@@ -40,6 +40,8 @@ limitations under the License.
 
 pub mod analyzer;
 pub mod arrow_type;
+pub mod component_ddl;
+pub mod component_options;
 pub mod extension_store;
 pub mod handler;
 pub mod helpers;

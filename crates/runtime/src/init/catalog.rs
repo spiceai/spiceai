@@ -32,6 +32,10 @@ use snafu::prelude::*;
 use util::warn_spaced;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
+/// How long a change waits for the catalogs it adds or replaces to load before
+/// it is applied without them.
+const CATALOG_LOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl Runtime {
     pub(crate) async fn load_catalogs(self: Arc<Self>) {
         let Some(ref app) = self.read_app().await else {
@@ -100,7 +104,10 @@ impl Runtime {
         .await;
     }
 
-    async fn load_catalog_connector(&self, catalog: &Catalog) -> Result<Arc<dyn CatalogConnector>> {
+    pub(crate) async fn load_catalog_connector(
+        &self,
+        catalog: &Catalog,
+    ) -> Result<Arc<dyn CatalogConnector>> {
         let catalog = catalog.clone();
 
         let source = catalog.provider.clone();
@@ -246,49 +253,89 @@ impl Runtime {
             .map(|c| c.name.as_str())
             .collect();
 
-        let mut replaced_a_catalog = false;
-
+        // Each catalog this change adds or replaces loads on its own task. A load
+        // retries an unreachable source without end, and this change holds
+        // `apply_app_lock`, so it waits a bounded time and leaves a load that is
+        // still retrying to finish in the background.
+        let mut loads = Vec::new();
         for catalog in &valid_catalogs {
-            if let Some(current_catalog) = existing_catalogs.iter().find(|c| c.name == catalog.name)
+            let replaces_a_registered_provider = if let Some(current_catalog) =
+                existing_catalogs.iter().find(|c| c.name == catalog.name)
             {
-                if catalog != current_catalog {
-                    // It isn't currently possible to remove catalogs once they have been loaded in DataFusion. `load_catalog` will overwrite the existing catalog.
-                    Arc::clone(&self).load_catalog(catalog).await;
-                    replaced_a_catalog = true;
+                if catalog == current_catalog {
+                    continue;
                 }
+                // `load_catalog` registers the new provider over the existing one.
+                true
             } else {
                 // Checked before the load, which is what registers the provider.
-                let replaces_a_registered_provider = declared_by_current_app
-                    .contains(catalog.name.as_str())
+                let replaces = declared_by_current_app.contains(catalog.name.as_str())
                     || self.df.catalog_exists(&catalog.name);
-
                 self.status
                     .update_catalog(&catalog.name, status::ComponentStatus::Initializing);
-                Arc::clone(&self).load_catalog(catalog).await;
-
-                if replaces_a_registered_provider {
-                    replaced_a_catalog = true;
+                replaces
+            };
+            let runtime = Arc::clone(&self);
+            let catalog = catalog.clone();
+            let name = catalog.name.clone();
+            loads.push((
+                name,
+                tokio::spawn(async move {
+                    Arc::clone(&runtime).load_catalog(&catalog).await;
+                    // A cached logical plan embeds the `TableSource` it was planned
+                    // against, and so keeps reading through the provider the
+                    // *previous* declaration built. Reloading a catalog registers a
+                    // fresh provider under the same name, so every plan that resolved
+                    // a table in it is now stale and must be replanned — the same
+                    // reason dataset and view registration discard cached plans.
+                    // Registering a catalog that was never registered before
+                    // invalidates nothing: no cached plan can have resolved a table in
+                    // it.
+                    if replaces_a_registered_provider {
+                        runtime.df.clear_cached_plans().await;
+                    }
+                }),
+            ));
+        }
+        let loading = futures::future::join_all(loads.iter_mut().map(|(_, load)| load));
+        if tokio::time::timeout(CATALOG_LOAD_WAIT, loading)
+            .await
+            .is_err()
+        {
+            for (name, load) in &loads {
+                if !load.is_finished() {
+                    tracing::warn!(
+                        "Catalog '{name}' did not load within {} seconds, so its tables are not queryable yet. It keeps retrying in the background, and its load errors are logged.",
+                        CATALOG_LOAD_WAIT.as_secs()
+                    );
                 }
             }
         }
 
-        // A cached logical plan embeds the `TableSource` it was planned against, and so keeps
-        // reading through the provider the *previous* declaration built. Reloading a catalog
-        // registers a fresh provider under the same name, so every plan that resolved a table in
-        // it is now stale and must be replanned — the same reason dataset and view registration
-        // discard cached plans. Registering a catalog that was never registered before
-        // invalidates nothing: no cached plan can have resolved a table in it.
-        if replaced_a_catalog {
-            self.df.clear_cached_plans().await;
-        }
-
         // Process catalogs that are no longer in the app
         for catalog in &existing_catalogs {
-            if !valid_catalogs.iter().any(|c| c.name == catalog.name) {
+            if valid_catalogs.iter().any(|c| c.name == catalog.name) {
+                continue;
+            }
+            // An accelerated catalog loads a dataset for each of its tables,
+            // which removing the catalog does not unload yet.
+            if catalog.acceleration.is_some() {
                 tracing::warn!(
-                    "Catalog '{}' was removed from the Spicepod, but a loaded catalog cannot be removed while Spice is running: its tables stay queryable until Spice restarts.",
+                    "Catalog '{}' was removed, but an accelerated catalog cannot be removed while Spice is running: its tables stay queryable until Spice restarts.",
                     catalog.name
                 );
+                continue;
+            }
+            match self.df.deregister_catalog(&catalog.name).await {
+                Ok(_) => {
+                    self.status
+                        .update_catalog(&catalog.name, status::ComponentStatus::Disabled);
+                    tracing::info!("Unloaded catalog '{}'", catalog.name);
+                }
+                Err(e) => tracing::error!(
+                    "Failed to remove catalog '{}', so its tables stay queryable until Spice restarts. Cause: {e}",
+                    catalog.name
+                ),
             }
         }
     }
