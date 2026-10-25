@@ -21,6 +21,11 @@ limitations under the License.
 //! calls the runtime makes: open, `maintain_after_snapshot_restore`,
 //! `download_if_newer`, `reload_from_snapshot`.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
