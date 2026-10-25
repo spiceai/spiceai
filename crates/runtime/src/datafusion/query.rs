@@ -3641,6 +3641,136 @@ mod tests {
         assert!(is_dml_extension(&plan));
     }
 
+    /// The ids `sql` returns through the runtime query path (runtime planner,
+    /// built analyzer rules, parameter binding) from a `Decimal128(38, 17)`
+    /// column holding 4.07 (id 1) and 4.0700000000000003 (id 2), two decimals
+    /// whose nearest `f64` is the same, and 173665.47 (id 3).
+    async fn ids_matching_decimal_literal(sql: &str, parameters: Option<ParamValues>) -> Vec<i64> {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(38, 17), false),
+        ]));
+        let amounts = arrow::array::Decimal128Array::from(vec![
+            407_000_000_000_000_000_i128,
+            407_000_000_000_000_030,
+            17_366_547_000_000_000_000_000,
+        ])
+        .with_precision_and_scale(38, 17)
+        .expect("valid decimal");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(amounts)],
+        )
+        .expect("valid batch");
+        df.ctx
+            .register_batch("decimals", batch)
+            .expect("register table");
+
+        let mut query = QueryBuilder::new(sql, df)
+            .parameters(parameters)
+            .build()
+            .run()
+            .await
+            .expect("Query::run");
+        let mut ids = Vec::new();
+        while let Some(batch) = query.data.next().await {
+            let batch = batch.expect("batch");
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ids");
+            ids.extend(column.values().iter().copied());
+        }
+        ids
+    }
+
+    /// #14970 through the production path: the runtime planner must retain a
+    /// lossy token's spelling and the built analyzer rules must cast from it,
+    /// and a bound float parameter must cast through its decimal spelling.
+    #[tokio::test]
+    async fn runtime_query_casts_float_literals_to_the_decimal_they_spell() {
+        assert_eq!(
+            ids_matching_decimal_literal(
+                "SELECT id FROM decimals WHERE amount = 4.07 ORDER BY id",
+                None
+            )
+            .await,
+            vec![1]
+        );
+        // The token's f64 is 4.07's, so only its retained spelling selects id 2.
+        assert_eq!(
+            ids_matching_decimal_literal(
+                "SELECT id FROM decimals WHERE amount = 4.0700000000000003 ORDER BY id",
+                None
+            )
+            .await,
+            vec![2]
+        );
+        assert_eq!(
+            ids_matching_decimal_literal(
+                "SELECT id FROM decimals WHERE id IN \
+                 (SELECT id FROM decimals WHERE amount = 4.0700000000000003) ORDER BY id",
+                None
+            )
+            .await,
+            vec![2]
+        );
+        // A bound float has no token, so it casts through its shortest
+        // spelling; the binary cast of 173665.47 at scale 17 matches no row.
+        let parameters =
+            convert_json_to_param_values(json!([173_665.47])).expect("json to paramvalues");
+        assert_eq!(
+            ids_matching_decimal_literal(
+                "SELECT id FROM decimals WHERE amount = $1 ORDER BY id",
+                Some(parameters)
+            )
+            .await,
+            vec![3]
+        );
+    }
+
+    /// `VALUES (CAST(<lossy token> AS DECIMAL))` through `Query::run`. The
+    /// `Values` plan names its output columns, but a cast inside a row is not
+    /// one of those columns: its token spelling has to survive so the cast is
+    /// `4.0700000000000003`, not the `f64` `4.07`.
+    #[tokio::test]
+    async fn runtime_query_casts_a_values_literal_to_the_decimal_it_spells() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+        let mut query =
+            QueryBuilder::new("VALUES (CAST(4.0700000000000003 AS DECIMAL(38, 17)))", df)
+                .build()
+                .run()
+                .await
+                .expect("Query::run");
+        let mut values = Vec::new();
+        while let Some(batch) = query.data.next().await {
+            let batch = batch.expect("batch");
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Decimal128Array>()
+                .expect("decimal");
+            values.extend(column.values().iter().copied());
+        }
+        assert_eq!(values, vec![407_000_000_000_000_030]);
+    }
+
     #[tokio::test]
     async fn parameterized_query() {
         let parameters = convert_json_to_param_values(json!([41])).expect("json to paramvalues");
@@ -5853,6 +5983,47 @@ mod placeholder_type_inference {
             plan.get_parameter_types()?.into_iter().collect();
         types.sort();
         Ok(types)
+    }
+
+    /// The shortest time a disjunction of `branches` composite-key equalities takes
+    /// to plan, from SQL text to logical plan, over three tries.
+    async fn disjunction_planning_time(branches: usize) -> std::time::Duration {
+        let ctx = session();
+        let state = ctx.state();
+        let sql = format!(
+            "SELECT id FROM t WHERE {}",
+            (0..branches)
+                .map(|i| format!("(id = {i} AND name = 'n{i}' AND tagged = 't{i}')"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        );
+        let mut fastest = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            state
+                .create_logical_plan(&sql)
+                .await
+                .expect("plan the disjunction");
+            fastest = fastest.min(started.elapsed());
+        }
+        fastest
+    }
+
+    /// Planning a wide disjunction that holds no placeholder grows linearly with
+    /// its width. Placeholder inference runs on every planned expression, and the
+    /// fork's version used to look up an operand's field at every node of the
+    /// chain, rendering the operand's whole subtree each time: a lookup of 100
+    /// composite keys spent ~150 ms in planning. Four times the branches must cost
+    /// well under eight times the time; that walk costs sixteen times or more.
+    #[tokio::test]
+    async fn a_wide_disjunction_plans_in_time_linear_in_its_width() {
+        let narrow = disjunction_planning_time(100).await;
+        let wide = disjunction_planning_time(400).await;
+        assert!(
+            wide < narrow * 8,
+            "planning 400 branches took {wide:?} against {narrow:?} for 100, more than \
+             linear in the width"
+        );
     }
 
     /// Every shape one of the fork patches added inference for. A missing patch

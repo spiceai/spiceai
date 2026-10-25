@@ -44,7 +44,8 @@ runs:
 
         # Every run gets its own branch off the commit it just tested (never an old
         # branch's history) so there is never a divergent base to rebase or merge onto.
-        BRANCH_NAME="snapshot-update/${GITHUB_JOB:-job}-${GITHUB_RUN_ID}"
+        BRANCH_PREFIX="snapshot-update/${GITHUB_JOB:-job}-"
+        BRANCH_NAME="${BRANCH_PREFIX}${GITHUB_RUN_ID}"
 
         # Target the ref the workflow ran on: trunk for the scheduled daily run,
         # the dispatched branch for a manual workflow_dispatch. This keeps the PR
@@ -72,16 +73,19 @@ runs:
         echo "Created snapshot update PR -> ${PR_URL}"
         gh pr merge --squash --auto "${BRANCH_NAME}" || echo "Auto-merge not available for this branch; PR created and requires manual merge."
 
-        # Close any earlier open snapshot-update PR against the same base with the
-        # same title: it carries a snapshot diff against a now-outdated base and is
-        # superseded by the one above. Scope to this base so a manual branch run does
-        # not close the scheduled trunk PRs (or vice versa).
+        # Close any earlier open snapshot-update PR this job opened against the same
+        # base with the same title: the one above supersedes it. Matching the base keeps
+        # a manual branch run from closing the scheduled trunk PRs (or vice versa), and
+        # matching this job's branches keeps jobs that share the default title
+        # (integration_models.yml) from closing each other's PRs, which hold other files.
         EXISTING_PR_JSON="$(mktemp)"
         gh pr list --state open --base "${BASE_BRANCH}" --limit 100 --json number,title,headRefName,author,body,url > "${EXISTING_PR_JSON}"
-        jq -r --arg title "${PR_TITLE}" --arg url "${PR_URL}" '
+        jq -r --arg title "${PR_TITLE}" --arg url "${PR_URL}" --arg prefix "${BRANCH_PREFIX}" '
           [.[]
             | select(.title == $title)
             | select(.url != $url)
+            # Run IDs are all digits, so job "test" does not claim "test-models" branches.
+            | select(.headRefName | startswith($prefix) and (ltrimstr($prefix) | test("^[0-9]+$")))
             | select(
                 .author.login == "github-actions[bot]"
                 or .author.login == "spiceaibot"

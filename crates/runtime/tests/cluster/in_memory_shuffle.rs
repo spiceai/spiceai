@@ -38,12 +38,12 @@ use runtime::{auth::EndpointAuth, config::Config};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
 use spicepod::component::dataset::Dataset;
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 use test_framework::pki::init_pki;
 use tokio::time::{Instant, sleep};
 
+use super::harness::NodePorts;
 use crate::{
     configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context},
@@ -229,21 +229,13 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
             configure_test_datafusion();
 
             // Scheduler config
+            let scheduler_ports = NodePorts::allocate();
             let scheduler_config = Config {
-                http_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    8290,
-                )),
-                flight_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    50251,
-                )),
+                http_bind_address: scheduler_ports.http_addr(),
+                flight_bind_address: scheduler_ports.flight_addr(),
                 cluster: ClusterConfig {
                     role: Some(runtime::config::ClusterRole::Scheduler),
-                    node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                        Ipv4Addr::LOCALHOST,
-                        50252,
-                    )),
+                    node_bind_address: scheduler_ports.cluster_addr(),
                     node_advertise_address: Some("127.0.0.1".to_string()),
                     node_mtls_ca_certificate_file: Some(
                         pki.ca_cert_path.to_string_lossy().to_string(),
@@ -288,22 +280,14 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
             }
 
             // Executor 1 config
+            let executor1_ports = NodePorts::allocate();
             let executor1_config = Config {
-                http_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    8291,
-                )),
-                flight_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    50253,
-                )),
+                http_bind_address: executor1_ports.http_addr(),
+                flight_bind_address: executor1_ports.flight_addr(),
                 cluster: ClusterConfig {
                     role: Some(runtime::config::ClusterRole::Executor),
-                    node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                        Ipv4Addr::LOCALHOST,
-                        50254,
-                    )),
-                    scheduler_address: Some("127.0.0.1:50252".to_string()),
+                    node_bind_address: executor1_ports.cluster_addr(),
+                    scheduler_address: Some(scheduler_ports.cluster_advertise()),
                     node_advertise_address: Some("127.0.0.1".to_string()),
                     node_mtls_ca_certificate_file: Some(
                         pki.ca_cert_path.to_string_lossy().to_string(),
@@ -322,7 +306,8 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
                     .with_runtime_config(executor1_config.clone())
                     .with_resolved_cluster_config(
                         ResolvedClusterConfig::try_new(executor1_config.cluster.clone())
-                            .expect("should resolve cluster config"),
+                            .expect("should resolve cluster config")
+                            .with_instance_id("executor1"),
                     )
                     .with_app(executor1_app)
                     .build()
@@ -347,22 +332,14 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
             }
 
             // Executor 2 config
+            let executor2_ports = NodePorts::allocate();
             let executor2_config = Config {
-                http_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    8292,
-                )),
-                flight_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    50255,
-                )),
+                http_bind_address: executor2_ports.http_addr(),
+                flight_bind_address: executor2_ports.flight_addr(),
                 cluster: ClusterConfig {
                     role: Some(runtime::config::ClusterRole::Executor),
-                    node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                        Ipv4Addr::LOCALHOST,
-                        50256,
-                    )),
-                    scheduler_address: Some("127.0.0.1:50252".to_string()),
+                    node_bind_address: executor2_ports.cluster_addr(),
+                    scheduler_address: Some(scheduler_ports.cluster_advertise()),
                     node_advertise_address: Some("127.0.0.1".to_string()),
                     node_mtls_ca_certificate_file: Some(
                         pki.ca_cert_path.to_string_lossy().to_string(),
@@ -381,7 +358,8 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
                     .with_runtime_config(executor2_config.clone())
                     .with_resolved_cluster_config(
                         ResolvedClusterConfig::try_new(executor2_config.cluster.clone())
-                            .expect("should resolve cluster config"),
+                            .expect("should resolve cluster config")
+                            .with_instance_id("executor2"),
                     )
                     .with_app(executor2_app)
                     .build()

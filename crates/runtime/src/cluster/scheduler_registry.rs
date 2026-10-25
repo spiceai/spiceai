@@ -32,6 +32,7 @@ use app::spicepod::component::runtime::{StateLocation, StateSource};
 use futures::FutureExt;
 use futures::future::{Fuse, FusedFuture};
 use object_store::ObjectStore;
+use object_store_occ::lease::LapseClock;
 use runtime_secrets::Secrets;
 use snafu::prelude::*;
 use tokio::runtime::Handle;
@@ -42,9 +43,13 @@ use uuid::Uuid;
 use crate::Runtime;
 use crate::cluster::cluster_state::{
     self, ClusterStateStore, MutateError, MutateOk, MutationOutcome, SchedulerEntry,
+    TableEntryChanges, UNREGISTERED_TABLE_RETENTION,
 };
-use crate::cluster::heartbeat::{self, CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeatStore};
-use crate::cluster::reaper::Reaper;
+use crate::cluster::heartbeat::{self, SchedulerHeartbeatStore};
+use crate::cluster::reaper::{self, Reaper};
+use crate::datafusion::DataFusion;
+use datafusion::common::TableReference;
+use object_store_occ::cleanup;
 use runtime_metrics::cluster as cluster_metrics;
 
 const DEFAULT_TTL_MS: u64 = 30_000;
@@ -92,9 +97,6 @@ fn worst_case_tick(ttl_ms: u64) -> Duration {
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
-/// How often a scheduler deletes jobs whose results expired. Expired jobs already
-/// read as expired; this only reclaims their state and result chunks.
-const JOB_CLEANUP_INTERVAL: Duration = Duration::from_mins(10);
 const HEARTBEAT_DIVISOR: u64 = 3;
 
 /// Compare-and-set attempts for one heartbeat before skipping this beat.
@@ -109,6 +111,8 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// The process holding the id was seen heartbeating after this one tried
+    /// to register, so two running processes share the identity.
     #[snafu(display(
         "Scheduler registration record already exists for {scheduler_id} and is still active"
     ))]
@@ -127,6 +131,20 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub type SchedulerPeers = HashMap<String, SchedulerEntry>;
+
+/// The advertise addresses of the peer schedulers other than `local`, each once.
+/// During a rolling upgrade one scheduler can be registered under both its
+/// previous `host:port` key and its instance identity until the older entry
+/// expires; both entries carry the same address.
+#[must_use]
+pub fn remote_scheduler_addresses(peers: &SchedulerPeers, local: &str) -> Vec<String> {
+    let addresses: std::collections::BTreeSet<&str> = peers
+        .values()
+        .map(|peer| peer.advertise_address.as_str())
+        .filter(|address| *address != local)
+        .collect();
+    addresses.into_iter().map(str::to_string).collect()
+}
 
 struct SchedulerRegistryRunner {
     cluster: Arc<ClusterStateStore>,
@@ -164,17 +182,18 @@ pub async fn start_scheduler_registry(
         .ok_or(Error::MissingAdvertiseAddress)?
         .to_string();
 
-    let scheduler_id = format!(
-        "{advertise_host}:{}",
-        rt.datafusion().cluster_config.node_bind_address().port()
-    );
+    let scheduler_id = datafusion.cluster_config.instance_id().to_string();
 
-    let instance_id = Uuid::new_v4();
+    // A new id for each run, so two runs of one instance never share it.
+    let instance_id = Uuid::now_v7();
     let now = now_ms()?;
     let entry = SchedulerEntry {
         scheduler_id: scheduler_id.clone(),
         instance_id,
-        advertise_address: scheduler_id.clone(),
+        advertise_address: format!(
+            "{advertise_host}:{}",
+            datafusion.cluster_config.node_bind_address().port()
+        ),
         grpc_address: format!(
             "{advertise_host}:{}",
             rt.config().flight_bind_address.port()
@@ -210,9 +229,9 @@ pub async fn start_scheduler_registry(
 
     let reaper = Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats));
 
-    // The job-recovery sweep runs as another arm of the runner's select loop (see
-    // `run`), so it shares this already-tracked registry task's lifecycle and
-    // graceful shutdown rather than a separate untracked tokio::spawn.
+    // The job-recovery sweep runs inside the runner's select loop (see `run`), so
+    // it shares this already-tracked registry task's lifecycle and graceful
+    // shutdown rather than a separate untracked tokio::spawn.
     let runner = SchedulerRegistryRunner {
         cluster,
         heartbeats,
@@ -226,7 +245,104 @@ pub async fn start_scheduler_registry(
         last_written_version: Arc::new(ArcSwapOption::empty()),
     };
 
-    runner.run(cancel).await
+    let result = runner.run(cancel).await;
+    if let Err(Error::SchedulerIdConflict { scheduler_id }) = &result {
+        tracing::error!(
+            "{}",
+            util::instance_id::duplicate_instance_message(scheduler_id, &state.location)
+        );
+    }
+    result
+}
+
+/// What one scheduler cleanup pass did.
+struct CleanupPass {
+    jobs: crate::jobs::Result<usize>,
+    tables: std::result::Result<TableEntryChanges, MutateError>,
+    heartbeats: reaper::Result<usize>,
+}
+
+impl CleanupPass {
+    fn log(&self) {
+        tracing::debug!(
+            jobs_deleted = self.jobs.as_ref().ok(),
+            tables_removed = self
+                .tables
+                .as_ref()
+                .ok()
+                .map(|changes| changes.removed.len()),
+            heartbeat_files_deleted = self.heartbeats.as_ref().ok(),
+            "State cleanup pass finished"
+        );
+        match &self.jobs {
+            Ok(0) => {}
+            Ok(deleted) => tracing::info!(
+                "State cleanup deleted {deleted} async query jobs, with their results, that finished more than {} ago.",
+                cleanup::describe(cleanup::age(crate::jobs::DEFAULT_RESULT_TTL))
+            ),
+            Err(err) => tracing::warn!(
+                "Failed to delete finished async query jobs, so their results stay in the scheduler state location until the next attempt: {err}"
+            ),
+        }
+        match &self.tables {
+            Ok(changes) if changes.removed.is_empty() => {}
+            Ok(changes) => tracing::info!(
+                "State cleanup removed {} tables from the cluster state, as no scheduler has had them registered for {}: {}.",
+                changes.removed.len(),
+                cleanup::describe(cleanup::age(UNREGISTERED_TABLE_RETENTION)),
+                changes
+                    .removed
+                    .iter()
+                    .map(|table| format!("'{table}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Err(err) => tracing::warn!(
+                "Failed to remove unregistered tables from the cluster state, so they stay until the next attempt: {err}"
+            ),
+        }
+        match &self.heartbeats {
+            Ok(0) => {}
+            Ok(deleted) => tracing::info!(
+                "State cleanup deleted {deleted} heartbeat files of schedulers that left the cluster more than {} ago.",
+                cleanup::describe(cleanup::age(reaper::HEARTBEAT_RETENTION))
+            ),
+            Err(err) => tracing::warn!(
+                "Failed to delete the heartbeat files of schedulers that left the cluster, so they stay in the scheduler state location until the next attempt: {err}"
+            ),
+        }
+    }
+}
+
+/// Records in the cluster document which of its tables this scheduler has
+/// registered, which removes the entries of tables no scheduler has registered
+/// for [`UNREGISTERED_TABLE_RETENTION`].
+async fn reconcile_table_entries(
+    cluster: &ClusterStateStore,
+    df: &DataFusion,
+) -> std::result::Result<TableEntryChanges, MutateError> {
+    let state = cluster.read().await?;
+    let mut registered = HashMap::new();
+    for table in state.accelerations.keys().chain(state.catalog.keys()) {
+        if !registered.contains_key(table) {
+            registered.insert(table.clone(), is_registered(df, table).await);
+        }
+    }
+    cluster.reconcile_table_entries(&registered).await
+}
+
+/// Whether `table`, a table entry's `catalog.schema.table` name, resolves to a
+/// table this scheduler has registered. A name that does not split into exactly
+/// three parts cannot be resolved without guessing where its dots belong, so it
+/// counts as registered and its entry stays.
+async fn is_registered(df: &DataFusion, table: &str) -> bool {
+    let parts: Vec<&str> = table.split('.').collect();
+    let [catalog, schema, name] = parts.as_slice() else {
+        return true;
+    };
+    df.get_table(&TableReference::full(*catalog, *schema, *name))
+        .await
+        .is_some()
 }
 
 /// Resumes any running job whose recorded scheduler instance is not currently
@@ -291,13 +407,11 @@ impl SchedulerRegistryRunner {
             tokio::time::Instant::now() + JOB_RECOVERY_INTERVAL,
             JOB_RECOVERY_INTERVAL,
         );
-        let mut cleanup_tick = tokio::time::interval_at(
-            tokio::time::Instant::now() + JOB_CLEANUP_INTERVAL,
-            JOB_CLEANUP_INTERVAL,
-        );
-        // A cleanup pass issues requests for as long as there are expired jobs to delete,
-        // so it runs beside the other arms rather than inside one: a long pass must not
-        // hold up the heartbeat that tells peers this scheduler is alive.
+        let mut next_cleanup = std::pin::pin!(tokio::time::sleep(cleanup::next_pass_delay()));
+        // A recovery sweep or cleanup pass issues requests for as long as there is work,
+        // so each runs beside the other arms rather than inside one: a long pass must
+        // not hold up the heartbeat that tells peers this scheduler is alive.
+        let mut recovery = std::pin::pin!(Fuse::terminated());
         let mut cleanup = std::pin::pin!(Fuse::terminated());
 
         // Run an initial discovery so peers are populated promptly.
@@ -322,118 +436,145 @@ impl SchedulerRegistryRunner {
                     }
                 }
                 _ = reaper_tick.tick() => {
-                    match now_ms() {
-                        Ok(now) => match self.reaper.tick(now).await {
-                            Ok(out) if !out.evicted.is_empty() => {
-                                tracing::info!(
-                                    evicted = ?out.evicted,
-                                    skipped = ?out.skipped,
-                                    "Reaper tick"
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(err) => tracing::warn!("Reaper tick failed: {err}"),
-                        },
-                        Err(err) => tracing::warn!(
-                            "Skipping reaper tick because current time is unavailable: {err}"
-                        ),
+                    match self.reaper.tick().await {
+                        Ok(out) if !out.evicted.is_empty() => {
+                            tracing::info!(
+                                evicted = ?out.evicted,
+                                skipped = ?out.skipped,
+                                "Reaper tick"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(err) => tracing::warn!("Reaper tick failed: {err}"),
                     }
                 }
-                _ = recovery_tick.tick() => {
-                    recover_orphaned_jobs(&self.job_executor, &self.peers, self.instance_id).await;
+                _ = recovery_tick.tick(), if recovery.is_terminated() => {
+                    recovery.set(
+                        recover_orphaned_jobs(&self.job_executor, &self.peers, self.instance_id)
+                            .fuse(),
+                    );
                 }
-                _ = cleanup_tick.tick(), if cleanup.is_terminated() => {
-                    cleanup.set(self.job_executor.cleanup_expired_jobs().fuse());
+                () = &mut recovery => {}
+                () = &mut next_cleanup, if cleanup.is_terminated() => {
+                    cleanup.set(self.cleanup_pass().fuse());
                 }
-                result = &mut cleanup => match result {
-                    Ok(0) => {}
-                    Ok(deleted) => tracing::debug!(deleted, "Deleted expired async query jobs"),
-                    Err(err) => tracing::warn!(
-                        "Failed to delete expired async query jobs, so their results stay in the scheduler state location until the next attempt: {err}"
-                    ),
-                },
+                pass = &mut cleanup => {
+                    pass.log();
+                    next_cleanup
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + cleanup::next_pass_delay());
+                }
             }
         }
 
         Ok(())
     }
 
-    async fn register_self(&self) -> Result<()> {
-        let observed = self
-            .heartbeats
-            .read_versioned(&self.scheduler_id)
-            .await
-            .context(HeartbeatSnafu)?;
-        let observed_version = observed.as_ref().map(|(_, version)| version.clone());
-        let observed_beat = observed.and_then(|(beat, _)| beat);
+    /// Deletes the async query jobs that finished long enough ago, removes the
+    /// entries of tables no scheduler has had registered for
+    /// [`UNREGISTERED_TABLE_RETENTION`], and deletes the heartbeat files of
+    /// schedulers that left the cluster, once a file is
+    /// [`reaper::HEARTBEAT_RETENTION`] old.
+    async fn cleanup_pass(&self) -> CleanupPass {
+        let jobs = self.job_executor.cleanup_expired_jobs().await;
+        let tables = reconcile_table_entries(&self.cluster, self.job_executor.datafusion()).await;
+        let heartbeats = self
+            .reaper
+            .delete_departed_heartbeats(cleanup::age(reaper::HEARTBEAT_RETENTION))
+            .await;
+        CleanupPass {
+            jobs,
+            tables,
+            heartbeats,
+        }
+    }
 
+    async fn register_self(&self) -> Result<()> {
         let entry = self.entry.clone();
         let scheduler_id = self.scheduler_id.clone();
         let instance_id = self.instance_id;
+        // How long this process has seen the id's heartbeat object, or its
+        // absence, unchanged while one process held the registration, keyed by
+        // that process. A process that has just started has seen nothing yet,
+        // so it cannot judge the registered entry gone until it has watched the
+        // heartbeat for a TTL; neither can it judge an entry registered since
+        // it started watching, such as another restart's.
+        let registration_lapse = LapseClock::default();
 
-        let now = now_ms()?;
+        let observed_version = loop {
+            let read_at = tokio::time::Instant::now();
+            let observed = self
+                .heartbeats
+                .read_versioned(&self.scheduler_id)
+                .await
+                .context(HeartbeatSnafu)?;
+            let observed_version = observed.as_ref().map(|(_, version)| version.clone());
+            let observed_beat = observed.and_then(|(beat, _)| beat);
 
-        let res = self
-            .cluster
-            .mutate(|state| {
-                if let Some(existing) = state.schedulers.get(&scheduler_id) {
-                    // Judge the registered entry by *its own* heartbeat. The
-                    // key is shared, so a beat left by another incarnation says
-                    // nothing about this entry: if a successor commits its
-                    // membership and dies before its first beat, the
-                    // predecessor's beat is what remains, and treating that as
-                    // a disqualifying mismatch would lock the id forever
-                    // (registration refuses, and the reaper skips the same
-                    // mismatch).
-                    //
-                    // A foreign beat is therefore not proof this entry is
-                    // alive — but a *fresh* one is proof that something is
-                    // actively writing the key, so it still blocks takeover.
-                    // Otherwise a legacy writer that briefly overwrites a live
-                    // successor's beat would let a third incarnation evict that
-                    // live successor. Recovery is then delayed by at most the
-                    // TTL it takes the foreign beat to go stale.
-                    let stale_or_missing = match observed_beat.as_ref() {
-                        Some(beat) if beat.instance_id == existing.instance_id => {
-                            beat.is_stale(now)
+            let res = self
+                .cluster
+                .mutate(|state| {
+                    if let Some(existing) = state.schedulers.get(&scheduler_id) {
+                        let unchanged_for = registration_lapse.observe(
+                            &existing.instance_id.to_string(),
+                            observed_version.as_ref(),
+                            read_at,
+                        );
+                        // Judge the registered entry by *its own* heartbeat. The
+                        // key is shared, so a beat left by another incarnation says
+                        // nothing about this entry: if a successor commits its
+                        // membership and dies before its first beat, the
+                        // predecessor's beat is what remains, and treating that as
+                        // a disqualifying mismatch would lock the id forever
+                        // (registration refuses, and the reaper skips the same
+                        // mismatch).
+                        //
+                        // A foreign beat is therefore not proof this entry is
+                        // alive — but a beat that keeps changing is proof that
+                        // something is actively writing the key, so the key must
+                        // also have stopped changing for both TTLs. Otherwise a
+                        // legacy writer that briefly overwrites a live successor's
+                        // beat would let a third incarnation evict that live
+                        // successor.
+                        let lapse_ms = match observed_beat.as_ref() {
+                            Some(beat) if beat.instance_id == existing.instance_id => beat.ttl_ms,
+                            Some(foreign) => foreign.ttl_ms.max(existing.ttl_ms),
+                            None => existing.ttl_ms,
+                        };
+                        if unchanged_for >= Duration::from_millis(lapse_ms) {
+                            state.schedulers.insert(scheduler_id.clone(), entry.clone());
+                            MutationOutcome::Apply
+                        } else if existing.instance_id == instance_id {
+                            // Re-register on top of our own (e.g. retry).
+                            MutationOutcome::NoChange
+                        } else {
+                            MutationOutcome::Abort(MutateError::Conflict {
+                                message: format!(
+                                    "scheduler id {scheduler_id} is already registered"
+                                ),
+                            })
                         }
-                        Some(foreign) => {
-                            let grace = existing.ttl_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
-                            foreign.is_stale(now)
-                                && now.saturating_sub(existing.started_at_ms) > grace
-                        }
-                        None => {
-                            let grace = existing.ttl_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
-                            now.saturating_sub(existing.started_at_ms) > grace
-                        }
-                    };
-                    if stale_or_missing {
+                    } else {
                         state.schedulers.insert(scheduler_id.clone(), entry.clone());
                         MutationOutcome::Apply
-                    } else if existing.instance_id == instance_id {
-                        // Re-register on top of our own (e.g. retry).
-                        MutationOutcome::NoChange
-                    } else {
-                        MutationOutcome::Abort(MutateError::Conflict {
-                            message: format!("scheduler id {scheduler_id} is already registered"),
-                        })
                     }
-                } else {
-                    state.schedulers.insert(scheduler_id.clone(), entry.clone());
-                    MutationOutcome::Apply
-                }
-            })
-            .await;
+                })
+                .await;
 
-        match res {
-            Ok(_) => {}
-            Err(MutateError::Conflict { .. }) => {
-                return Err(Error::SchedulerIdConflict {
-                    scheduler_id: self.scheduler_id.clone(),
-                });
+            match res {
+                Ok(_) => break observed_version,
+                Err(MutateError::Conflict { .. }) => {
+                    if self.holder_keeps_beating(observed_version.as_ref()).await {
+                        return Err(Error::SchedulerIdConflict {
+                            scheduler_id: self.scheduler_id.clone(),
+                        });
+                    }
+                    // The heartbeat did not move for another interval: look
+                    // again, until it has stayed unchanged for the TTL.
+                }
+                Err(other) => return Err(Error::ClusterState { source: other }),
             }
-            Err(other) => return Err(Error::ClusterState { source: other }),
-        }
+        };
 
         // Write our first heartbeat so peers see liveness on next discovery. This
         // write is conditional on the beat observed above, like every other
@@ -518,6 +659,22 @@ impl SchedulerRegistryRunner {
         }
     }
 
+    /// Watches the id's heartbeat for one heartbeat interval after
+    /// registration found the id held by another process. `true` when another
+    /// process wrote it in that time, so that process is still running. A
+    /// process that crashed leaves a heartbeat that no longer changes.
+    async fn holder_keeps_beating(&self, observed: Option<&UpdateVersion>) -> bool {
+        let interval =
+            Duration::from_millis(self.entry.ttl_ms.saturating_div(HEARTBEAT_DIVISOR).max(1));
+        tokio::time::sleep(interval).await;
+        match self.heartbeats.read_versioned(&self.scheduler_id).await {
+            Ok(Some((beat, version))) if Some(&version) != observed => {
+                beat.is_none_or(|beat| beat.instance_id != self.instance_id)
+            }
+            Ok(_) | Err(_) => false,
+        }
+    }
+
     /// A registration heartbeat write, bounded like the loop's writes: an
     /// unbounded put here can outlast the grace period that lets another
     /// incarnation take the id over, which is worse than publishing late.
@@ -531,7 +688,6 @@ impl SchedulerRegistryRunner {
             self.heartbeats.heartbeat_if_unchanged(
                 &self.scheduler_id,
                 self.instance_id,
-                now_ms().unwrap_or_default(),
                 self.entry.ttl_ms,
                 expected,
             ),
@@ -551,8 +707,8 @@ impl SchedulerRegistryRunner {
     }
 
     async fn send_heartbeat(&self) -> Result<()> {
-        // `scheduler_id` is `{advertise_host}:{port}` and so is stable across
-        // restarts, while `instance_id` is per-process. Two incarnations can
+        // `scheduler_id` is the instance identity and so is stable across
+        // restarts, while `instance_id` is new for each run. Two incarnations can
         // therefore share the heartbeat key, and registration deliberately
         // lets a new one take over once the old looks stale. An incarnation
         // that has been superseded must stop claiming the id: otherwise it
@@ -691,14 +847,12 @@ impl SchedulerRegistryRunner {
             }
 
             let expected = observed.as_ref().map(|(_, version)| version.clone());
-            let now = now_ms()?;
             let write_timeout = heartbeat_write_timeout(self.entry.ttl_ms);
             let written = tokio::time::timeout(
                 write_timeout,
                 self.heartbeats.heartbeat_if_unchanged(
                     &self.scheduler_id,
                     self.instance_id,
-                    now,
                     self.entry.ttl_ms,
                     expected.as_ref(),
                 ),
@@ -798,16 +952,15 @@ impl SchedulerRegistryRunner {
 
     async fn refresh_peers(&self) -> Result<()> {
         let snap = self.cluster.read().await.context(ClusterStateSnafu)?;
-        let now = now_ms()?;
         let alive = self
             .heartbeats
-            .list_alive(now, &snap)
+            .list_alive(&snap)
             .await
             .context(HeartbeatSnafu)?;
 
         let mut next: HashMap<String, SchedulerEntry> = HashMap::new();
         for (id, entry) in &snap.schedulers {
-            if alive.contains_key(id) || id == &self.scheduler_id {
+            if alive.contains(id) || id == &self.scheduler_id {
                 next.insert(id.clone(), entry.clone());
             }
         }
@@ -825,7 +978,7 @@ impl SchedulerRegistryRunner {
             );
         }
         *peers = next;
-        cluster_metrics::set_scheduler_count(&self.scheduler_id, peers.len() as u64);
+        cluster_metrics::set_scheduler_count(&self.entry.advertise_address, peers.len() as u64);
         Ok(())
     }
 
@@ -976,11 +1129,8 @@ mod tests {
         // Shutdown removes membership and deliberately leaves the heartbeat
         // object alone: deleting a key shared with a possible successor races
         // that successor. With no registered entry the object is inert.
-        let alive = heartbeats
-            .list_alive(1_000, &snap)
-            .await
-            .expect("list alive");
-        assert!(!alive.contains_key("test:50051"));
+        let alive = heartbeats.list_alive(&snap).await.expect("list alive");
+        assert!(!alive.contains("test:50051"));
     }
 
     /// A superseded incarnation must stop claiming the shared heartbeat key.
@@ -2490,8 +2640,9 @@ mod tests {
     /// A successor that commits its membership entry and dies before its first
     /// heartbeat leaves the *predecessor's* beat under a shared key. That must
     /// not lock the id: registration has to judge the entry by its own beat,
-    /// treat an unrelated one as absent, and take over after the grace window.
-    #[tokio::test]
+    /// treat an unrelated one as absent, and take over once the key has
+    /// stayed unchanged for the entry's TTL.
+    #[tokio::test(start_paused = true)]
     async fn a_successor_that_died_before_its_first_heartbeat_does_not_lock_the_id() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
@@ -2524,14 +2675,15 @@ mod tests {
             })
             .await
             .expect("seed the crashed successor");
-        // Long stale: a *fresh* foreign beat deliberately still blocks
-        // takeover, because something is actively writing the key.
+        // A foreign beat that keeps changing deliberately still blocks
+        // takeover, because something is actively writing the key; this one
+        // never changes again.
         heartbeats
             .heartbeat("test:50051", predecessor, 1, 1)
             .await
             .expect("predecessor heartbeat");
 
-        // A fresh process starts long after the grace window.
+        // A fresh process starts.
         dead_entry.instance_id = newcomer;
         let entry = dead_entry;
         let job_store = crate::jobs::JobStore::new(Arc::clone(&store), "", newcomer.to_string());
@@ -2716,6 +2868,556 @@ mod tests {
         assert!(
             !runner.superseded.load(Ordering::Relaxed),
             "a read failure is not evidence of supersession"
+        );
+    }
+
+    /// Registers a holder under the shared test id and returns a runner for a
+    /// second process with the same identity.
+    async fn second_process_under_one_identity(
+        store: &Arc<dyn ObjectStore>,
+    ) -> (
+        Arc<SchedulerHeartbeatStore>,
+        Uuid,
+        SchedulerRegistryRunner,
+        Arc<ClusterStateStore>,
+    ) {
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+        let holder = Uuid::new_v4();
+        runner_over(&cluster, &heartbeats, store, holder)
+            .register_self()
+            .await
+            .expect("the holder registers");
+        let second = runner_over(&cluster, &heartbeats, store, Uuid::new_v4());
+        (heartbeats, holder, second, cluster)
+    }
+
+    /// A second running process under one identity is refused, and is reported
+    /// as a duplicate because the holder keeps heartbeating.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_running_process_under_one_identity_is_a_duplicate() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (heartbeats, holder, second, cluster) = second_process_under_one_identity(&store).await;
+        let beater = tokio::spawn({
+            let heartbeats = Arc::clone(&heartbeats);
+            async move {
+                for beat in 1..=20 {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    heartbeats
+                        .heartbeat("test:50051", holder, beat * 5_000, 30_000)
+                        .await
+                        .expect("the holder heartbeats");
+                }
+            }
+        });
+
+        let err = second
+            .register_self()
+            .await
+            .expect_err("a second running process must be refused");
+        beater.abort();
+
+        assert!(
+            matches!(err, Error::SchedulerIdConflict { .. }),
+            "the holder kept heartbeating, so this is a duplicate: {err:?}"
+        );
+        let snap = cluster.read().await.expect("read");
+        assert_eq!(
+            snap.schedulers
+                .get("test:50051")
+                .map(|entry| entry.instance_id),
+            Some(holder),
+            "the holder keeps its registration"
+        );
+    }
+
+    /// A process whose predecessor crashed moments ago waits until the
+    /// predecessor's heartbeat has stayed unchanged for its TTL, then takes the
+    /// id over. It cannot tell sooner: it has no earlier observation, and it
+    /// compares no clock with the predecessor's.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_after_a_crash_takes_over_once_the_heartbeat_lapses() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (_heartbeats, holder, second, cluster) =
+            second_process_under_one_identity(&store).await;
+
+        let started = tokio::time::Instant::now();
+        second
+            .register_self()
+            .await
+            .expect("the crashed predecessor's heartbeat lapses");
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(30),
+            "took over after {waited:?}, before the heartbeat was unchanged for its TTL"
+        );
+        assert!(
+            waited < Duration::from_secs(45),
+            "took over after {waited:?}, well after the heartbeat lapsed"
+        );
+        let snap = cluster.read().await.expect("read");
+        let registered = snap
+            .schedulers
+            .get("test:50051")
+            .map(|entry| entry.instance_id);
+        assert_ne!(registered, Some(holder));
+        assert_eq!(registered, Some(second.instance_id));
+    }
+
+    /// Object store whose heartbeat writes land a second after they are sent.
+    #[derive(Debug)]
+    struct SlowHeartbeatWrites {
+        inner: Arc<dyn ObjectStore>,
+    }
+
+    impl std::fmt::Display for SlowHeartbeatWrites {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SlowHeartbeatWrites")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for SlowHeartbeatWrites {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().starts_with("heartbeats") {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Two processes that restart under one identity after a crash both wait
+    /// out the crashed holder's heartbeat. One registers; the other, whose
+    /// membership write then conflicts while the first beat is still in
+    /// flight, is refused as a duplicate instead of replacing it.
+    #[tokio::test(start_paused = true)]
+    async fn two_restarts_under_one_identity_register_once() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (heartbeats, _holder, _, _) = second_process_under_one_identity(&store).await;
+        let slow: Arc<dyn ObjectStore> = Arc::new(SlowHeartbeatWrites {
+            inner: Arc::clone(&store),
+        });
+        let restart = || {
+            let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&slow), ""));
+            let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&slow), ""));
+            runner_over(&cluster, &heartbeats, &slow, Uuid::new_v4())
+        };
+        let (first, second) = (restart(), restart());
+
+        let results = tokio::join!(first.register_self(), second.register_self());
+
+        let registered = match results {
+            (Ok(()), Err(Error::SchedulerIdConflict { .. })) => first.instance_id,
+            (Err(Error::SchedulerIdConflict { .. }), Ok(())) => second.instance_id,
+            other => panic!("one restart registers and the other is a duplicate: {other:?}"),
+        };
+        let snap = ClusterStateStore::new(Arc::clone(&store), "")
+            .read()
+            .await
+            .expect("read");
+        assert_eq!(
+            snap.schedulers
+                .get("test:50051")
+                .map(|entry| entry.instance_id),
+            Some(registered)
+        );
+        let beat = heartbeats
+            .read("test:50051")
+            .await
+            .expect("read")
+            .expect("heartbeat");
+        assert_eq!(beat.instance_id, registered);
+    }
+
+    /// A scheduler that restarts under its name while another scheduler's
+    /// heartbeat cleanup runs keeps a live heartbeat and its `cluster.json`
+    /// entry, even when the cleanup chose its old file before the restart and
+    /// deletes the file after the restarted scheduler wrote it.
+    #[tokio::test(start_paused = true)]
+    async fn a_scheduler_restarting_during_the_heartbeat_cleanup_stays_live() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+        let first = runner_over(&cluster, &heartbeats, &store, Uuid::new_v4());
+        first.register_self().await.expect("register");
+        first.shutdown().await;
+
+        // A peer's cleanup chooses the departed scheduler's file; the test
+        // shortens the retention to nothing.
+        let peer_cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let peer_heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        let peer_reaper = Reaper::new(Arc::clone(&peer_cluster), Arc::clone(&peer_heartbeats));
+        let departed = peer_reaper
+            .departed_heartbeats(Duration::ZERO)
+            .await
+            .expect("departed");
+        assert_eq!(departed, vec!["test:50051".to_string()]);
+
+        // The scheduler restarts under its name; then the delete lands on the
+        // file it just wrote.
+        let restarted = runner_over(&cluster, &heartbeats, &store, Uuid::new_v4());
+        restarted.register_self().await.expect("register");
+        assert_eq!(
+            peer_reaper
+                .delete_heartbeats(&departed)
+                .await
+                .expect("delete"),
+            1
+        );
+        assert!(heartbeats.read("test:50051").await.expect("read").is_none());
+
+        // Peers still count it alive and keep its entry while the file is
+        // missing for less than its TTL.
+        let snap = peer_cluster.read().await.expect("read");
+        assert!(
+            peer_heartbeats
+                .list_alive(&snap)
+                .await
+                .expect("list alive")
+                .contains("test:50051")
+        );
+        assert!(peer_reaper.tick().await.expect("tick").evicted.is_empty());
+
+        // Its next beat writes the file again.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        restarted.send_heartbeat().await.expect("heartbeat");
+        let beat = heartbeats
+            .read("test:50051")
+            .await
+            .expect("read")
+            .expect("the heartbeat is written again");
+        assert_eq!(beat.instance_id, restarted.instance_id);
+        let snap = peer_cluster.read().await.expect("read");
+        assert!(
+            peer_heartbeats
+                .list_alive(&snap)
+                .await
+                .expect("list alive")
+                .contains("test:50051")
+        );
+        assert!(peer_reaper.tick().await.expect("tick").evicted.is_empty());
+        assert_eq!(
+            snap.schedulers
+                .get("test:50051")
+                .map(|entry| entry.instance_id),
+            Some(restarted.instance_id)
+        );
+    }
+
+    /// Object store whose deletes never finish and whose listings date every
+    /// object to the Unix epoch, so a heartbeat cleanup pass finds a departed
+    /// scheduler's file and then stalls deleting it.
+    #[derive(Debug)]
+    struct StalledDeletes {
+        inner: Arc<dyn ObjectStore>,
+        deletes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::fmt::Display for StalledDeletes {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "StalledDeletes")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for StalledDeletes {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            futures::StreamExt::boxed(futures::StreamExt::map(self.inner.list(prefix), |meta| {
+                meta.map(|meta| object_store::ObjectMeta {
+                    last_modified: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+                    ..meta
+                })
+            }))
+        }
+        fn delete_stream(
+            &self,
+            _locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            futures::StreamExt::boxed(futures::stream::pending())
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A state cleanup pass that stalls deleting a departed scheduler's heartbeat
+    /// file must not hold up the heartbeat that tells peers this scheduler is alive.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_heartbeat_cleanup_does_not_hold_up_the_heartbeat() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wrapper = Arc::new(StalledDeletes {
+            inner: Arc::clone(&inner),
+            deletes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        heartbeats
+            .heartbeat("departed", Uuid::new_v4(), 0, 30_000)
+            .await
+            .expect("a departed scheduler's heartbeat");
+        let runner = runner_over(&cluster, &heartbeats, &store, Uuid::new_v4());
+        let run = tokio::spawn(runner.run(CancellationToken::new()));
+
+        // Past the longest delay before the first cleanup: the pass has started
+        // and stalled on its delete.
+        tokio::time::sleep(cleanup::PASS_INTERVAL * 2).await;
+        assert_eq!(wrapper.deletes.load(Ordering::SeqCst), 1);
+
+        let path = heartbeats.path_for("test:50051");
+        let before = inner.head(&path).await.expect("heartbeat").e_tag;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let after = inner.head(&path).await.expect("heartbeat").e_tag;
+        assert_ne!(
+            after, before,
+            "the heartbeat keeps changing during the cleanup"
+        );
+        run.abort();
+    }
+
+    /// Object store whose async-query job writes never finish, counting them.
+    #[derive(Debug)]
+    struct StalledJobWrites {
+        inner: Arc<dyn ObjectStore>,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::fmt::Display for StalledJobWrites {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "StalledJobWrites")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for StalledJobWrites {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().starts_with("jobs/") {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                return futures::future::pending().await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A recovery sweep whose takeover of an orphaned job stalls must not hold
+    /// up the heartbeat that tells peers this scheduler is alive.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_job_recovery_does_not_hold_up_the_heartbeat() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let lost = crate::jobs::JobStore::new(Arc::clone(&inner), "", "lost-scheduler");
+        let job_id = lost
+            .create_job(
+                crate::http::v1::queries::SubmitQueryRequest {
+                    sql: "SELECT 1".to_string(),
+                    parameters: None,
+                    timeout_seconds: None,
+                    maximum_size: None,
+                },
+                true,
+                crate::jobs::PUBLIC_JOB_OWNER.to_string(),
+            )
+            .await
+            .expect("create the job")
+            .job_id;
+        lost.set_job_running(&job_id)
+            .await
+            .expect("the lost scheduler started the job");
+
+        let jobs = Arc::new(StalledJobWrites {
+            inner: Arc::clone(&inner),
+            writes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let jobs_store: Arc<dyn ObjectStore> = Arc::clone(&jobs) as Arc<dyn ObjectStore>;
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&inner), ""));
+        let runner = runner_over(&cluster, &heartbeats, &jobs_store, Uuid::new_v4());
+        let run = tokio::spawn(runner.run(CancellationToken::new()));
+
+        // Past the first recovery sweep: its takeover write has stalled.
+        tokio::time::sleep(JOB_RECOVERY_INTERVAL + Duration::from_secs(5)).await;
+        assert_eq!(jobs.writes.load(Ordering::SeqCst), 1);
+
+        let path = heartbeats.path_for("test:50051");
+        let before = inner.head(&path).await.expect("heartbeat").e_tag;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let after = inner.head(&path).await.expect("heartbeat").e_tag;
+        assert_ne!(
+            after, before,
+            "the heartbeat keeps changing during the recovery"
+        );
+        run.abort();
+    }
+
+    /// A scheduler registered under both its previous `host:port` key and its
+    /// instance identity is reached once, and this scheduler not at all.
+    #[test]
+    fn remote_scheduler_addresses_are_listed_once() {
+        let entry = |id: &str, address: &str| SchedulerEntry {
+            scheduler_id: id.to_string(),
+            instance_id: Uuid::new_v4(),
+            advertise_address: address.to_string(),
+            grpc_address: address.to_string(),
+            http_address: address.to_string(),
+            started_at_ms: 0,
+            ttl_ms: 30_000,
+            build_version: "test".to_string(),
+            labels: HashMap::new(),
+        };
+        let peers = SchedulerPeers::from([
+            (
+                "10.0.0.2:50052".to_string(),
+                entry("10.0.0.2:50052", "10.0.0.2:50052"),
+            ),
+            ("sched-b".to_string(), entry("sched-b", "10.0.0.2:50052")),
+            ("sched-a".to_string(), entry("sched-a", "10.0.0.1:50052")),
+        ]);
+        assert_eq!(
+            remote_scheduler_addresses(&peers, "10.0.0.1:50052"),
+            ["10.0.0.2:50052"]
         );
     }
 }

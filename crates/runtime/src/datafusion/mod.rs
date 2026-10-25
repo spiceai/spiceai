@@ -113,7 +113,7 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
-use futures::StreamExt;
+use futures::{StreamExt, future::join_all};
 use itertools::Itertools;
 use parking_lot::Mutex as ParkingMutex;
 use query::QueryBuilder;
@@ -503,7 +503,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' (optionally with 'partition_by') or 'cayenne' instead."
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
     ))]
     UnsupportedDistributedAccelerationEngine {
         dataset_name: String,
@@ -640,7 +640,7 @@ impl Error {
                 | Self::SnapshotRefreshModeRequiresSnapshots
                 | Self::SnapshotRefreshModeUnsupportedEngine { .. }
                 | Self::SnapshotRefreshModeReloadUnsupported { .. }
-                // An invalid `snapshots.params.s3_queue_url`.
+                // An invalid snapshot `s3_queue_url`.
                 | Self::SnapshotNotificationsConfig { .. }
                 // Unparseable `snapshots_trigger_threshold` value.
                 | Self::InvalidSnapshotCreationInterval { .. }
@@ -1444,6 +1444,10 @@ pub struct DataFusion {
     schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
     change_generations: ChangeGenerations,
     bootstrap_owners: ParkingMutex<HashMap<ResolvedTableReference, Weak<BootstrapOwner>>>,
+    /// Snapshot managers by dataset, so shutdown can resign their writer leases.
+    snapshot_writers: ParkingMutex<
+        HashMap<ResolvedTableReference, Weak<runtime_acceleration::snapshot::SnapshotManager>>,
+    >,
     /// `sink` datasets waiting for their first write, which is when their schema becomes
     /// known and the dataset is registered. Keyed by dataset name, matched by `resolved_eq`
     /// so any way of naming the dataset finds it (see `ensure_sink_dataset`). One writer
@@ -4115,18 +4119,12 @@ impl DataFusion {
             .await
             && checkpoint.exists().await
         {
-            // For append refreshes that rely on a time column (i.e. file-based appends) that have
-            // snapshotting enabled, we delay readiness until the first refresh completes so that
-            // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
-            // Additionally, for CDC we let connector/stream to decide when dataset is ready.
+            // For CDC we let connector/stream to decide when dataset is ready.
             //
             // A dataset that reads snapshots (`file_format: snapshot`) is ready only once it
             // has restored a snapshot in this process: a copy left from an earlier run can be
             // arbitrarily old, or from a location the dataset no longer reads.
-            let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
-                && dataset.time_column.is_some()
-                && acceleration_settings.snapshot_behavior.bootstrap_enabled()
-                || matches!(refresh_mode, RefreshMode::Changes)
+            let delay_initial_ready = matches!(refresh_mode, RefreshMode::Changes)
                 || (dataset.is_snapshot_source()
                     && bootstrap_status.loaded_snapshot_id().is_none());
 
@@ -4495,6 +4493,10 @@ impl DataFusion {
                     )
                     .await?
                     {
+                        self.snapshot_writers.lock().insert(
+                            resolve_table_reference(dataset.name.clone()),
+                            Arc::downgrade(&snapshot_config.manager),
+                        );
                         accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
                     }
                 } else {
@@ -4718,9 +4720,9 @@ impl DataFusion {
     }
 
     /// Subscribe a `refresh_mode: snapshot` dataset to its snapshot location's
-    /// S3 event notifications, when `snapshots.params.s3_queue_url` names the
-    /// SQS queue that receives them. `None` when no queue is configured, and on
-    /// a scheduler, which loads no accelerations itself.
+    /// S3 event notifications, when the `s3_queue_url` in the dataset's snapshot
+    /// params names the SQS queue that receives them. `None` when no queue is
+    /// configured, and on a scheduler, which loads no accelerations itself.
     async fn subscribe_to_snapshot_notifications(
         &self,
         dataset: &Dataset,
@@ -4736,6 +4738,13 @@ impl DataFusion {
             .context(SnapshotNotificationsConfigSnafu {
                 dataset_name: dataset.name.to_string(),
             })
+    }
+
+    /// Sets the `runtime.state.location` that snapshot queue subscriptions
+    /// resolve against.
+    pub(crate) fn set_runtime_state_location(&self, location: Option<String>) {
+        self.snapshot_notifications
+            .set_runtime_state_location(location);
     }
 
     /// The queue consumers shared by local snapshot bootstrap and refresh.
@@ -6707,6 +6716,18 @@ impl DataFusion {
         QueryBuilder::new(sql, Arc::clone(self))
     }
 
+    /// Resigns this runtime's snapshot writer leases, so another instance can
+    /// take over without waiting for them to lapse.
+    pub async fn resign_snapshot_writer_leases(&self) {
+        let writers: Vec<_> = self
+            .snapshot_writers
+            .lock()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        join_all(writers.iter().map(|writer| writer.resign_writer_lease())).await;
+    }
+
     /// Performs `DataFusion` cleanup during shutdown.
     /// Currently cancels active queries and cleans up accelerated tables.
     pub async fn shutdown(&self) {
@@ -6823,7 +6844,11 @@ impl DataFusion {
         let statement = session.sql_to_statement(sql, &dialect)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
-        session.statement_to_plan(statement).await
+        let spellings =
+            runtime_datafusion::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings::collect(
+                &statement,
+            );
+        spellings.retain(session.statement_to_plan(statement).await?)
     }
 
     pub(crate) async fn clear_cached_plans(&self) {
@@ -7321,16 +7346,20 @@ async fn build_snapshot_creation_config(
         return Ok(None);
     }
 
-    // A partitioned Cayenne dataset must not publish snapshots: its exported
-    // metastore slice omits the partition child tables, so the uploaded archive
-    // could not be restored, yet `create_snapshot` would still make it the
-    // store's `current-snapshot-id`. Same gate as `snapshot_before_recreate`.
-    if acceleration_settings.engine == Engine::Cayenne
-        && !acceleration_settings.partition_by.is_empty()
-    {
+    // The same rule `snapshot_before_recreate` applies, read from the one place
+    // that states it — rationale on `archive_would_be_unrestorable`. A copy per
+    // publish path is how the periodic path came to publish an archive the
+    // pre-recreation path already refused.
+    if engine_to_acceleration_engine(acceleration_settings.engine).is_some_and(|engine| {
+        data_accelerator_api::snapshots::archive_would_be_unrestorable(
+            &engine,
+            snapshot_engine_override.as_ref(),
+        )
+    }) {
         tracing::warn!(
             dataset = %dataset.name,
-            "Snapshot creation is disabled for this dataset: snapshots of a partitioned Cayenne acceleration are not yet supported, and an archive without the partitions' metadata could not be restored"
+            "Dataset '{}' will not publish snapshots: its Cayenne metastore catalog is unavailable, so an archive of it would carry no metastore slice and could not be restored. Check that this dataset's `cayenne_metadata_dir` and data directory are readable.",
+            dataset.name
         );
         return Ok(None);
     }
@@ -8225,6 +8254,60 @@ mod tests {
             assert!(result.expect("config should exist").is_none());
         }
 
+        /// A Cayenne dataset must not publish a snapshot the default engine
+        /// wrote: that archive carries the raw `cayenne.db` and no per-dataset
+        /// metastore slice, and publishing it makes an unrestorable archive the
+        /// store's `current-snapshot-id`. `snapshot_engine_for_source` returns
+        /// `None` on a catalog or data-directory failure, so the absent
+        /// override is the observable form of that failure here.
+        ///
+        /// Partitioned and unpartitioned alike: `snapshot_before_recreate`
+        /// draws no such distinction, and the slice is what makes either one
+        /// restorable.
+        #[tokio::test]
+        async fn cayenne_does_not_publish_without_its_snapshot_engine() {
+            for partition_by in [
+                vec![],
+                vec![spicepod::partitioning::PartitionedBy {
+                    name: "part_col".to_string(),
+                    expression: "part_col".to_string(),
+                }],
+            ] {
+                let dataset = create_test_dataset(None).await;
+                let acceleration = Acceleration {
+                    partition_by,
+                    ..create_acceleration_with_trigger(
+                        Some("file:///tmp".to_string()),
+                        Engine::Cayenne,
+                        Some(SnapshotsTrigger::RefreshComplete),
+                        None,
+                        &dataset.runtime().secrets(),
+                    )
+                };
+                let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+                let result = build_snapshot_creation_config(
+                    &dataset,
+                    &acceleration,
+                    RefreshMode::Full,
+                    AccelerationLayout::cayenne(
+                        temp_dir.path().join("metadata"),
+                        temp_dir.path().join("data"),
+                    ),
+                    None,
+                )
+                .await;
+
+                assert!(
+                    result
+                        .expect("an absent snapshot engine is not an error")
+                        .is_none(),
+                    "Cayenne must not publish through the default engine (partition_by={:?})",
+                    acceleration.partition_by
+                );
+            }
+        }
+
         #[tokio::test]
         async fn test_snapshot_refresh_mode_is_reader_only() {
             let dataset = create_test_dataset(None).await;
@@ -8631,6 +8714,12 @@ mod tests {
                     Err(Error::UnsupportedDistributedAccelerationEngine { .. })
                 ),
                 "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+            // The fix it names is the engine that stays: `arrow` is deprecated, and
+            // Cayenne partitions only in file mode.
+            assert_eq!(
+                result.expect_err("duckdb is rejected").to_string(),
+                "Failed to create an accelerated table for dataset my_dataset: the 'duckdb' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
             );
         }
 

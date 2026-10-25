@@ -247,6 +247,7 @@ impl CayenneStagedUpsert {
             context: Arc::clone(self.table.context()),
             table: self.table,
             _write_guard: write_guard,
+            _held_write_lock: super::write_lock_held::held_guard(),
             snapshot_id: self.new_snapshot_id,
             rows: self.row_count,
             stats: self.stats,

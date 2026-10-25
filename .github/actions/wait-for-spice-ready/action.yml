@@ -16,6 +16,14 @@ inputs:
     description: 'Seconds to wait before failing'
     required: false
     default: '300'
+  datasets:
+    description: |
+      Space-separated dataset names that must also report `Ready` in
+      /v1/datasets?status=true. Set it when a step adds a dataset to a runtime
+      that is already running: /v1/ready can still answer "ready" from before
+      the new dataset started initializing. Needs jq.
+    required: false
+    default: ''
 runs:
   using: 'composite'
   steps:
@@ -25,6 +33,7 @@ runs:
       env:
         SPICE_READY_URL: ${{ inputs.url }}
         SPICE_READY_TIMEOUT: ${{ inputs.timeout }}
+        SPICE_READY_DATASETS: ${{ inputs.datasets }}
       # The script owns the timeout so it can diagnose before exiting; a step-level
       # `timeout-minutes` would kill it before it printed anything, which is the
       # behaviour being fixed.

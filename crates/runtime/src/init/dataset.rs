@@ -26,6 +26,7 @@ use std::{
 
 use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
 use crate::cluster::partition::get_partition_filter_exprs;
+use crate::config::ClusterRole;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::reconnecting::{
     ConnectorBuilder, ReconnectingConnector, SourceUnavailable,
@@ -51,7 +52,8 @@ use crate::{
         builder::DatasetBuilder,
     },
     component::{
-        AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
+        AcceleratedComponent, component_accelerations, deprecated_acceleration_engines_warning,
+        deprecated_ready_state_warning, disabled_acceleration_warning,
     },
     dataaccelerator::{AccelerationSource, validate_snapshot_paths},
     dataconnector::{
@@ -290,22 +292,40 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
         let startup_datasets = valid_datasets;
 
-        if let Some(snapshots) = app.effective_snapshots().as_deref() {
-            let any_snapshot_mode_dataset = startup_datasets.iter().any(|ds| {
-                ds.acceleration.as_ref().is_some_and(|acceleration| {
-                    acceleration.enabled
-                        && acceleration
-                            .refresh_mode
-                            .is_some_and(|mode| mode.is_snapshot_only())
-                })
-            });
+        // An executor runs the scheduler's spicepod, whose own startup logs these warnings.
+        if self.df.cluster_config.effective_role() != Some(ClusterRole::Executor) {
             if let Some(warning) =
-                runtime_acceleration::snapshot::notifications::unread_queue_warning(
-                    snapshots,
-                    any_snapshot_mode_dataset,
+                runtime_state_location::scheduler_deprecation::scheduler_deprecation_warning(
+                    &app.runtime,
                 )
             {
                 tracing::warn!("{warning}");
+            }
+            // Once for the whole Spicepod, not per component. A hot reload warns about
+            // the components it adds or changes (`Runtime::apply_app_diff`).
+            if let Some(warning) = deprecated_acceleration_engines_warning(component_accelerations(
+                &app.datasets,
+                &app.views,
+            )) {
+                tracing::warn!("{warning}");
+            }
+            if let Some(section) = app.snapshots.as_deref() {
+                tracing::warn!(
+                    "{}",
+                    runtime_acceleration::snapshot::section_deprecation::section_deprecation_warning(
+                        section,
+                        app.runtime.state.as_ref(),
+                    )
+                );
+            }
+        }
+        // A scheduler loads no accelerations, so it reads no queue whatever its datasets.
+        if self.df.snapshot_notifications().is_some() {
+            for setting in app.unread_snapshot_queues() {
+                tracing::warn!(
+                    "{}",
+                    runtime_acceleration::snapshot::notifications::unread_queue_warning(&setting)
+                );
             }
         }
 

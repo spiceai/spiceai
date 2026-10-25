@@ -87,14 +87,14 @@ fn allocate_ports(n: usize) -> Vec<u16> {
 
 /// The three ports each cluster node needs.
 #[derive(Debug, Clone, Copy)]
-struct NodePorts {
+pub(crate) struct NodePorts {
     http: u16,
     flight: u16,
     cluster: u16,
 }
 
 impl NodePorts {
-    fn allocate() -> Self {
+    pub(crate) fn allocate() -> Self {
         let ports = allocate_ports(3);
         Self {
             http: ports[0],
@@ -103,19 +103,19 @@ impl NodePorts {
         }
     }
 
-    fn http_addr(self) -> SocketAddr {
+    pub(crate) fn http_addr(self) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.http))
     }
 
-    fn flight_addr(self) -> SocketAddr {
+    pub(crate) fn flight_addr(self) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.flight))
     }
 
-    fn cluster_addr(self) -> SocketAddr {
+    pub(crate) fn cluster_addr(self) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.cluster))
     }
 
-    fn cluster_advertise(self) -> String {
+    pub(crate) fn cluster_advertise(self) -> String {
         format!("127.0.0.1:{}", self.cluster)
     }
 }
@@ -234,6 +234,21 @@ impl ClusterHarness {
                 )));
             }
         }
+    }
+
+    /// The executors the scheduler's Ballista state holds, as `(id, host:port)`
+    /// sorted by id.
+    pub async fn registered_executors(&self) -> Result<Vec<(String, String)>, anyhow::Error> {
+        let mut executors: Vec<(String, String)> = self
+            .executor_manager
+            .get_executors_state()
+            .await
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?
+            .into_iter()
+            .map(|(metadata, _, _)| (metadata.id, format!("{}:{}", metadata.host, metadata.port)))
+            .collect();
+        executors.sort();
+        Ok(executors)
     }
 
     /// Run a SQL query through the scheduler and collect all result batches.
@@ -403,7 +418,8 @@ impl ClusterHarnessBuilder {
                 .with_runtime_config(scheduler_config.clone())
                 .with_resolved_cluster_config(
                     ResolvedClusterConfig::try_new(scheduler_config.cluster.clone())
-                        .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?,
+                        .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?
+                        .with_instance_id("scheduler"),
                 )
                 .with_app(scheduler_app)
                 .build()
@@ -525,7 +541,8 @@ async fn start_executor(
             .with_runtime_config(executor_config.clone())
             .with_resolved_cluster_config(
                 ResolvedClusterConfig::try_new(executor_config.cluster.clone())
-                    .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?,
+                    .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?
+                    .with_instance_id(label),
             )
             .with_app(app)
             .build()
