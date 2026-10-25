@@ -17,9 +17,11 @@ limitations under the License.
 use crate::federated::FederatedTableProvider;
 use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
+use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
+use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -73,6 +75,7 @@ use data_components::object::{
 };
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ExposedParamLookup, Parameters};
+use util::levenshtein::closest_match;
 
 use super::{
     DelimitedFormat, ParsedFileExtension, detect_file_extension_from_path,
@@ -95,6 +98,93 @@ const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
 /// publish an incomplete schema for that full scan.
 const ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT: usize = 10_000;
 
+/// Where [`ListingSuffix`] was resolved from. Display and secret-masking
+/// follow this origin rather than comparing the suffix string to a parameter:
+/// a secret `file_format: csv` still lists as the hardcoded `.csv`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListingSuffixOrigin {
+    /// Configured `file_extension`.
+    FileExtension,
+    /// Fallback `.{file_format}` for document and unknown formats.
+    FileFormat,
+    /// Path suffix or a structured format's hardcoded default (for example `.csv`).
+    Default,
+}
+
+/// The listing suffix [`ListingTableConnector::get_file_format_and_extension`]
+/// resolved, plus the parameter that produced it when one did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingSuffix {
+    value: String,
+    origin: ListingSuffixOrigin,
+}
+
+impl ListingSuffix {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    /// How this suffix should appear in a user-facing error or warning.
+    #[must_use]
+    fn display(&self, params: &Parameters) -> String {
+        match self.origin {
+            ListingSuffixOrigin::FileExtension => {
+                params.display_value("file_extension", &self.value)
+            }
+            ListingSuffixOrigin::FileFormat => params.display_value("file_format", &self.value),
+            ListingSuffixOrigin::Default => self.value.clone(),
+        }
+    }
+
+    #[must_use]
+    fn secret_source<'a>(&self, params: &'a Parameters) -> Option<&'a str> {
+        match self.origin {
+            ListingSuffixOrigin::FileExtension => params.secret_source("file_extension"),
+            ListingSuffixOrigin::FileFormat => params.secret_source("file_format"),
+            ListingSuffixOrigin::Default => None,
+        }
+    }
+}
+
+impl Deref for ListingSuffix {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.value
+    }
+}
+
+impl AsRef<str> for ListingSuffix {
+    fn as_ref(&self) -> &str {
+        &self.value
+    }
+}
+
+impl Display for ListingSuffix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.value)
+    }
+}
+
+impl PartialEq<str> for ListingSuffix {
+    fn eq(&self, other: &str) -> bool {
+        self.value == other
+    }
+}
+
+impl PartialEq<&str> for ListingSuffix {
+    fn eq(&self, other: &&str) -> bool {
+        self.value == *other
+    }
+}
+
+impl PartialEq<String> for ListingSuffix {
+    fn eq(&self, other: &String) -> bool {
+        self.value == *other
+    }
+}
+
 /// The listing options and file schema a dataset's listing table is built from, as
 /// [`ListingTableConnector::listing_table_template`] resolves them.
 ///
@@ -109,6 +199,12 @@ pub struct ListingTableTemplate {
     object_store: Arc<dyn ObjectStore>,
     /// Listing extension from [`ListingTableConnector::get_file_format_and_extension`].
     extension: String,
+    /// The dataset name, for schema-drift messages.
+    dataset_name: String,
+    /// Whether scans are checked for registered columns missing from every scanned file
+    /// (see [`data_components::file_schema_drift`]). Off when `schema_source_path` names the
+    /// schema: its columns need not appear in the data files.
+    check_schema_drift: bool,
 }
 
 impl ListingTableTemplate {
@@ -163,7 +259,7 @@ impl ListingTableTemplate {
         table: Arc<ListingTable>,
         table_path: ListingTableUrl,
     ) -> Arc<dyn TableProvider> {
-        if has_location_metadata(table.options()) {
+        let table: Arc<dyn TableProvider> = if has_location_metadata(table.options()) {
             Arc::new(LocationPruningListingTable::new(
                 table,
                 Arc::clone(&self.object_store),
@@ -173,7 +269,25 @@ impl ListingTableTemplate {
             ))
         } else {
             table
+        };
+        match self.schema_drift_guard() {
+            Some(guard) => FileSchemaDriftLayer::over(table, guard),
+            None => table,
         }
+    }
+
+    /// The guard that checks this dataset's scans for registered columns missing from every
+    /// scanned file, or `None` when the check is off or the file format cannot be checked.
+    fn schema_drift_guard(&self) -> Option<FileSchemaDriftGuard> {
+        (self.check_schema_drift
+            && FileSchemaDriftGuard::supports_format(self.options.format.as_ref()))
+        .then(|| {
+            FileSchemaDriftGuard::new(
+                self.dataset_name.clone(),
+                Arc::clone(&self.schema),
+                Arc::clone(&self.options.format),
+            )
+        })
     }
 }
 
@@ -909,15 +1023,17 @@ pub trait ListingTableConnector: DataConnector {
         let store = self.get_object_store(dataset)?;
         let (_, extension) = self.get_file_format_and_extension(dataset).await?;
 
-        let table = ObjectStoreMetadataTable::try_new(store, &store_url, Some(extension.clone()))
-            .context(crate::InvalidConfigurationSnafu {
-            dataconnector: format!("{self}"),
-            message: format!(
-                "Invalid file extension ({extension}) for source ({})",
-                dataset.name
-            ),
-            connector_component: ConnectorComponent::from(dataset),
-        })?;
+        let table =
+            ObjectStoreMetadataTable::try_new(store, &store_url, Some(extension.to_string()))
+                .map_err(|source| {
+                    invalid_file_extension_error(
+                        format!("{self}"),
+                        dataset,
+                        self.get_params(),
+                        &extension,
+                        source,
+                    )
+                })?;
         Ok(table as Arc<dyn TableProvider>)
     }
 
@@ -934,11 +1050,11 @@ pub trait ListingTableConnector: DataConnector {
     /// For tabular formats, file options can also be specified in the [`Dataset`]'s `param`s.
     ///
     /// For unstructured text formats, the [`Dataset`]'s `file_format` param key must be set. `Ok`
-    /// responses, are always of the format `Ok((None, String))`. The data must be UTF8 compatible.
+    /// responses are always of the format `Ok((None, ListingSuffix))`. The data must be UTF8 compatible.
     async fn get_file_format_and_extension(
         &self,
         dataset: &DatasetSpec,
-    ) -> DataConnectorResult<(Option<Arc<dyn FileFormat>>, String)>
+    ) -> DataConnectorResult<(Option<Arc<dyn FileFormat>>, ListingSuffix)>
     where
         Self: Display,
     {
@@ -969,7 +1085,7 @@ pub trait ListingTableConnector: DataConnector {
 
         // Annotate before `?` so rustc unifies each arm as `Arc<dyn FileFormat>`
         // instead of pinning the match to the first (`CsvFormat`) arm.
-        let result: DataConnectorResult<(Option<Arc<dyn FileFormat>>, String)> =
+        let result: DataConnectorResult<(Option<Arc<dyn FileFormat>>, ListingSuffix)> =
             match (file_format_param.as_deref(), inferred_file_extension) {
             (Some("csv"), _) | (None, Some("csv")) => Ok((
                 Some(self.delimiter_separated_format(
@@ -1197,7 +1313,77 @@ pub trait ListingTableConnector: DataConnector {
                     )),
                 }
             },
-            (Some(format), _) => Ok((None, format!(".{format}"))),
+            (Some(format), _) if is_document_file_format(format) => {
+                Ok((
+                    None,
+                    file_format_listing_extension(
+                        configured_extension.as_ref(),
+                        path_extension.as_ref(),
+                        &format!(".{format}"),
+                        file_compression_type,
+                    ),
+                ))
+            }
+            (Some(format), _) => {
+                match classify_unknown_file_format(format) {
+                    UnknownFileFormatAction::ConfirmStructuredTypo { suggested } => {
+                        if listing_confirms_structured_typo(self, dataset, format, &suggested).await
+                        {
+                            Err(crate::DataConnectorError::InvalidConfiguration {
+                                dataconnector: format!("{self}"),
+                                message: unknown_file_format_message(dataset, params, format),
+                                connector_component: ConnectorComponent::from(dataset),
+                                source: "Unknown file format".into(),
+                            })
+                        } else {
+                            // No listing evidence (or listing unavailable):
+                            // keep trunk's text-table fallthrough.
+                            tracing::warn!(
+                                "{}",
+                                unknown_file_format_fallback_warning(
+                                    dataset,
+                                    params,
+                                    format,
+                                    Some(suggested.as_str()),
+                                )
+                            );
+                            Ok((
+                                None,
+                                file_format_listing_extension(
+                                    configured_extension.as_ref(),
+                                    path_extension.as_ref(),
+                                    &format!(".{format}"),
+                                    file_compression_type,
+                                ),
+                            ))
+                        }
+                    }
+                    UnknownFileFormatAction::LoadAsText { hint } => {
+                        // Trunk treated unknown formats such as `log`, `xml`,
+                        // and `yaml` as a plain-text table. Keep that
+                        // fallthrough unless listing evidence confirms a
+                        // structured-format typo (the arm above).
+                        tracing::warn!(
+                            "{}",
+                            unknown_file_format_fallback_warning(
+                                dataset,
+                                params,
+                                format,
+                                hint.as_deref(),
+                            )
+                        );
+                        Ok((
+                            None,
+                            file_format_listing_extension(
+                                configured_extension.as_ref(),
+                                path_extension.as_ref(),
+                                &format!(".{format}"),
+                                file_compression_type,
+                            ),
+                        ))
+                    }
+                }
+            }
             (_, _) => Err(
                     crate::DataConnectorError::InvalidConfiguration {
                         dataconnector: format!("{self}"),
@@ -1209,10 +1395,13 @@ pub trait ListingTableConnector: DataConnector {
         };
 
         if format_selected_listing {
-            let (file_format, default_extension) = result?;
+            let (file_format, suffix) = result?;
             Ok((
                 file_format,
-                format_selected_listing_extension(&default_extension),
+                ListingSuffix {
+                    value: format_selected_listing_extension(suffix.as_str()),
+                    origin: suffix.origin,
+                },
             ))
         } else {
             result
@@ -1240,12 +1429,16 @@ pub trait ListingTableConnector: DataConnector {
         if let ExposedParamLookup::Present(infer_max_rec_str) =
             params.get("schema_infer_max_records").expose()
         {
-            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(crate::InvalidConfigurationSnafu {
+            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(
+                crate::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
-                        "JSONL parameter 'schema_infer_max_records' must be an integer, not {infer_max_rec_str}"),
-                    connector_component: ConnectorComponent::from(dataset)
-                })?;
+                        "JSONL parameter 'schema_infer_max_records' must be an integer, not {}",
+                        params.display_value("schema_infer_max_records", infer_max_rec_str)
+                    ),
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            )?;
             format = format.with_schema_infer_max_rec(schema_infer_max_rec);
         }
 
@@ -1277,12 +1470,16 @@ pub trait ListingTableConnector: DataConnector {
         if let ExposedParamLookup::Present(infer_max_rec_str) =
             params.get("schema_infer_max_records").expose()
         {
-            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(crate::InvalidConfigurationSnafu {
+            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(
+                crate::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
-                        "JSON parameter 'schema_infer_max_records' must be an integer, not {infer_max_rec_str}"),
-                    connector_component: ConnectorComponent::from(dataset)
-                })?;
+                        "JSON parameter 'schema_infer_max_records' must be an integer, not {}",
+                        params.display_value("schema_infer_max_records", infer_max_rec_str)
+                    ),
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            )?;
             format = format.with_schema_infer_max_rec(schema_infer_max_rec);
         }
 
@@ -1290,7 +1487,9 @@ pub trait ListingTableConnector: DataConnector {
             let json_format = json_format_str.parse::<Format>().boxed().context(crate::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
-                        "Invalid JSON format: {json_format_str}, supported formats are: 'json', 'jsonl', 'ndjson', 'ldjson', 'array', 'object', 'soda', 'socrata', 'auto'"),
+                        "Invalid JSON format: {}, supported formats are: 'json', 'jsonl', 'ndjson', 'ldjson', 'array', 'object', 'soda', 'socrata', 'auto'",
+                        params.display_value("json_format", json_format_str)
+                    ),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
             format = format.with_format(json_format);
@@ -1481,22 +1680,28 @@ pub trait ListingTableConnector: DataConnector {
         }
     }
 
+    /// Build an [`ObjectStoreTextTable`]. `extension` is the listing suffix
+    /// (`file_extension` or the path suffix). `parser_key` is the document
+    /// parser registry key — typically the lowercased `file_format` — and is
+    /// distinct from the listing suffix so `file_format: pdf` plus
+    /// `file_extension: .bin` still extracts PDF text.
     async fn create_text_table(
         &self,
         dataset: &DatasetSpec,
         url: &Url,
-        extension: &str,
+        extension: &ListingSuffix,
+        parser_key: Option<&str>,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>
     where
         Self: Display,
     {
-        let content_formatter =
-            document_parse::get_parser_factory(extension)
-                .await
-                .map(|factory| {
-                    // TODO: add opts.
-                    factory.default()
-                });
+        let lookup = parser_key.unwrap_or(extension.as_str());
+        let content_formatter = document_parse::get_parser_factory(lookup)
+            .await
+            .map(|factory| {
+                // TODO: add opts.
+                factory.default()
+            });
 
         let metadata_columns = dataset.listing_table_metadata_columns(
             get_url_prefix(url),
@@ -1511,13 +1716,14 @@ pub trait ListingTableConnector: DataConnector {
                 content_formatter,
                 metadata_columns,
             )
-            .context(crate::InvalidConfigurationSnafu {
-                dataconnector: format!("{self}"),
-                connector_component: ConnectorComponent::from(dataset),
-                message: format!(
-                    "Invalid file extension ({extension}) for source ({})",
-                    dataset.name
-                ),
+            .map_err(|source| {
+                invalid_file_extension_error(
+                    format!("{self}"),
+                    dataset,
+                    self.get_params(),
+                    extension,
+                    source,
+                )
             })?,
         ))
     }
@@ -1572,6 +1778,10 @@ pub trait ListingTableConnector: DataConnector {
                 "Enabled single-file ETag/Version caching for {}",
                 dataset.name
             );
+            let cached_table = match template.schema_drift_guard() {
+                Some(guard) => cached_table.with_schema_drift_guard(guard),
+                None => cached_table,
+            };
             return Ok(Arc::new(cached_table));
         }
 
@@ -1608,6 +1818,12 @@ pub trait ListingTableConnector: DataConnector {
         let object_store = self.get_object_store(dataset)?;
 
         let ctx: SessionContext = self.get_session_context();
+        let params = self.get_params();
+        let displayed_extension = if params.secret_source("file_extension").is_some() {
+            params.display_value("file_extension", extension)
+        } else {
+            extension.to_string()
+        };
 
         let (schema_infer_url, schema_infer_meta) =
             if table_path.is_collection() && listing_extension_is_orc(extension) {
@@ -1618,6 +1834,7 @@ pub trait ListingTableConnector: DataConnector {
                     format!("{self}"),
                     dataset,
                     extension,
+                    &displayed_extension,
                     table_path.clone(),
                     &ctx,
                     &object_store,
@@ -1639,6 +1856,7 @@ pub trait ListingTableConnector: DataConnector {
                     format!("{self}"),
                     dataset,
                     extension,
+                    &displayed_extension,
                     schema_infer_url.clone(),
                     &ctx,
                     &object_store,
@@ -1655,6 +1873,7 @@ pub trait ListingTableConnector: DataConnector {
                     format!("{self}"),
                     dataset,
                     extension,
+                    &displayed_extension,
                     table_path.clone(),
                     &ctx,
                     &object_store,
@@ -1788,6 +2007,10 @@ pub trait ListingTableConnector: DataConnector {
             schema: final_schema,
             object_store,
             extension: extension.to_string(),
+            dataset_name: dataset.name.to_string(),
+            // An `ORC` collection infers from the scan path and ignores `schema_source_path`.
+            check_schema_drift: (table_path.is_collection() && listing_extension_is_orc(extension))
+                || !dataset.params.contains_key("schema_source_path"),
         })
     }
 
@@ -1892,7 +2115,9 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         match file_format_opt {
             None => {
                 // Assume its unstructured text data. Use a [`ObjectStoreTextTable`].
-                self.create_text_table(dataset, &url, &extension).await
+                let parser_key = listing_document_parser_key(self.get_params());
+                self.create_text_table(dataset, &url, &extension, parser_key.as_deref())
+                    .await
             }
             Some(file_format) => {
                 // Structured tabular data, use a [`ListingTable`].
@@ -2071,7 +2296,8 @@ fn resolve_file_compression_type(
             crate::InvalidConfigurationSnafu {
                 dataconnector: dataconnector.to_string(),
                 message: format!(
-                    "Invalid file_compression_type: {compression}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"
+                    "Invalid file_compression_type: {}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+                    params.display_value("file_compression_type", compression)
                 ),
                 connector_component: ConnectorComponent::from(dataset),
             },
@@ -2081,23 +2307,104 @@ fn resolve_file_compression_type(
     Ok(detected_compression.unwrap_or(FileCompressionType::UNCOMPRESSED))
 }
 
+/// Configuration error for an unusable listing suffix.
+///
+/// Masking follows [`ListingSuffix`] origin: a secret `file_format` that
+/// became `.{format}` is shown as its `${ store:key }` reference, and the
+/// regex compiler error is replaced so the resolved pattern cannot leak
+/// through [`std::error::Error::source`].
+fn invalid_file_extension_error(
+    dataconnector: String,
+    dataset: &DatasetSpec,
+    params: &Parameters,
+    suffix: &ListingSuffix,
+    source: Box<dyn std::error::Error + Send + Sync>,
+) -> crate::DataConnectorError {
+    let displayed = suffix.display(params);
+    let source = if suffix.secret_source(params).is_some() {
+        "invalid regex".into()
+    } else {
+        source
+    };
+    crate::DataConnectorError::InvalidConfiguration {
+        dataconnector,
+        connector_component: ConnectorComponent::from(dataset),
+        message: format!(
+            "Invalid file extension ({displayed}) for source ({})",
+            dataset.name
+        ),
+        source,
+    }
+}
+
+/// Document parser registry key for a listing dataset. Distinct from the
+/// listing suffix: `file_format: pdf` plus `file_extension: .bin` must still
+/// look up the PDF parser.
+fn listing_document_parser_key(params: &Parameters) -> Option<String> {
+    params
+        .get("file_format")
+        .expose()
+        .ok()
+        .map(str::to_ascii_lowercase)
+}
+
 fn listing_extension(
     configured_extension: Option<&ParsedFileExtension>,
     path_extension: Option<&ParsedFileExtension>,
     default_extension: &str,
     file_compression_type: FileCompressionType,
-) -> String {
+) -> ListingSuffix {
+    listing_suffix(
+        configured_extension,
+        path_extension,
+        default_extension,
+        file_compression_type,
+        ListingSuffixOrigin::Default,
+    )
+}
+
+fn file_format_listing_extension(
+    configured_extension: Option<&ParsedFileExtension>,
+    path_extension: Option<&ParsedFileExtension>,
+    default_extension: &str,
+    file_compression_type: FileCompressionType,
+) -> ListingSuffix {
+    listing_suffix(
+        configured_extension,
+        path_extension,
+        default_extension,
+        file_compression_type,
+        ListingSuffixOrigin::FileFormat,
+    )
+}
+
+fn listing_suffix(
+    configured_extension: Option<&ParsedFileExtension>,
+    path_extension: Option<&ParsedFileExtension>,
+    default_extension: &str,
+    file_compression_type: FileCompressionType,
+    fallback_origin: ListingSuffixOrigin,
+) -> ListingSuffix {
     if let Some(extension) = configured_extension {
-        return extension.file_extension.clone();
+        return ListingSuffix {
+            value: extension.file_extension.clone(),
+            origin: ListingSuffixOrigin::FileExtension,
+        };
     }
 
     if let Some(extension) = path_extension
         && extension.format_extension.as_deref() == Some(default_extension.trim_start_matches('.'))
     {
-        return extension.file_extension.clone();
+        return ListingSuffix {
+            value: extension.file_extension.clone(),
+            origin: ListingSuffixOrigin::Default,
+        };
     }
 
-    format!("{}{}", default_extension, file_compression_type.get_ext())
+    ListingSuffix {
+        value: format!("{}{}", default_extension, file_compression_type.get_ext()),
+        origin: fallback_origin,
+    }
 }
 
 fn default_jsonl_extension(
@@ -2109,6 +2416,216 @@ fn default_jsonl_extension(
         Some("ldjson") => ".ldjson",
         _ => ".jsonl",
     }
+}
+
+const DOCUMENT_FILE_FORMATS: &[&str] = &[
+    "docx", "htm", "html", "markdown", "md", "pdf", "pptx", "rst", "text", "txt", "xlsx",
+];
+
+/// Common real text and source extensions that `closest_match` can treat as
+/// typos of a structured or document format (`org`→`orc`, `css`→`csv`,
+/// `tex`→`tsv`/`text`). Fast path: load as text and skip the `Did you mean`
+/// hint. The list is not exhaustive — unlisted near-misses still load as
+/// text unless listing evidence confirms a typo.
+const TEXT_TABLE_FILE_EXTENSIONS: &[&str] = &[
+    "css", "doc", "htmlx", "json5", "jsonc", "mdx", "mkd", "org", "ppt", "psv", "qmd", "rmd", "rs",
+    "srt", "tex", "ts", "tsx", "xhtml", "xls",
+];
+
+fn is_document_file_format(format: &str) -> bool {
+    DOCUMENT_FILE_FORMATS.contains(&format)
+}
+
+fn is_text_table_file_extension(format: &str) -> bool {
+    TEXT_TABLE_FILE_EXTENSIONS.contains(&format)
+}
+
+fn structured_file_formats() -> Vec<&'static str> {
+    let mut formats = vec![
+        "auto", "csv", "json", "jsonl", "ldjson", "ndjson", "orc", "parquet", "soda", "socrata",
+        "tsv",
+    ];
+    #[cfg(not(windows))]
+    formats.push("vortex");
+    formats
+}
+
+fn valid_listing_file_formats() -> Vec<&'static str> {
+    let mut formats = structured_file_formats();
+    formats.extend_from_slice(DOCUMENT_FILE_FORMATS);
+    formats.sort_unstable();
+    formats
+}
+
+/// What to do with a `file_format` that is neither a structured listing
+/// format nor a document format.
+#[derive(Debug, PartialEq, Eq)]
+enum UnknownFileFormatAction {
+    /// Near-miss of a format the listing connector parses natively. Hard-error
+    /// only after listing evidence confirms it is a typo.
+    ConfirmStructuredTypo { suggested: String },
+    /// Trunk-compatible text-table fallthrough. `hint` is a suggested format
+    /// to mention in the WARN, if any (document near-miss, or a structured
+    /// near-miss that listing has not confirmed).
+    LoadAsText { hint: Option<String> },
+}
+
+fn classify_unknown_file_format(format: &str) -> UnknownFileFormatAction {
+    if is_text_table_file_extension(format) {
+        return UnknownFileFormatAction::LoadAsText { hint: None };
+    }
+    if let Some(suggested) = closest_file_format(format, &structured_file_formats()) {
+        return UnknownFileFormatAction::ConfirmStructuredTypo { suggested };
+    }
+    UnknownFileFormatAction::LoadAsText {
+        hint: closest_file_format(format, &valid_listing_file_formats()),
+    }
+}
+
+/// Whether a listed object's format suffix matches `format` (`csv` matches
+/// `orders.csv` and `orders.csv.gz`).
+fn object_matches_file_format(location: &str, format: &str) -> bool {
+    if detect_file_extension_from_path(location)
+        .and_then(|ext| ext.format_extension)
+        .is_some_and(|fmt| fmt.eq_ignore_ascii_case(format))
+    {
+        return true;
+    }
+    location.rsplit(['/', '\\']).next().is_some_and(|name| {
+        name.to_ascii_lowercase()
+            .ends_with(&format!(".{}", format.to_ascii_lowercase()))
+    })
+}
+
+/// True only when a complete listing confirms a typo: no object uses
+/// `claimed` as its format suffix, and at least one uses `suggested`.
+/// Listing failure, an incomplete scan, or any `claimed` object is not
+/// evidence — the caller must WARN and load as text.
+async fn listing_confirms_structured_typo<T>(
+    connector: &T,
+    dataset: &DatasetSpec,
+    claimed: &str,
+    suggested: &str,
+) -> bool
+where
+    T: ListingTableConnector + Display + ?Sized,
+{
+    let Ok(url) = connector.get_object_store_url(dataset, None) else {
+        return false;
+    };
+    let Ok(store) = connector.get_object_store(dataset) else {
+        return false;
+    };
+    let Ok(table_path) = ListingTableUrl::parse(url) else {
+        return false;
+    };
+    let ctx = connector.get_session_context();
+    let state = ctx.state();
+    let Ok(mut file_stream) = table_path.list_all_files(&state, &store, "").await else {
+        return false;
+    };
+
+    let mut saw_claimed = false;
+    let mut saw_suggested = false;
+    let mut scanned = 0usize;
+
+    loop {
+        match file_stream.try_next().await {
+            Ok(Some(file)) => {
+                scanned += 1;
+                if scanned > SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT {
+                    return false;
+                }
+                let location = file.location.as_ref();
+                if object_matches_file_format(location, claimed) {
+                    saw_claimed = true;
+                    break;
+                }
+                if object_matches_file_format(location, suggested) {
+                    saw_suggested = true;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return false,
+        }
+    }
+
+    !saw_claimed && saw_suggested
+}
+
+/// Closest valid format for a typo.
+///
+/// [`closest_match`] allows one edit per three characters (minimum 1), so
+/// a three-letter adjacent transposition such as `cvs` → `csv` is rejected.
+/// Those are the typos this error exists to catch, so an adjacent swap that
+/// lands on a valid format is accepted as a fallback.
+fn closest_file_format(format: &str, valid: &[&str]) -> Option<String> {
+    if let Some(hint) = closest_match(format, valid) {
+        return Some(hint);
+    }
+    adjacent_transposition_match(format, valid)
+}
+
+fn adjacent_transposition_match(typo: &str, valid: &[&str]) -> Option<String> {
+    let mut chars: Vec<char> = typo.chars().collect();
+    for i in 0..chars.len().saturating_sub(1) {
+        chars.swap(i, i + 1);
+        let candidate: String = chars.iter().collect();
+        chars.swap(i, i + 1);
+        if let Some(hit) = valid
+            .iter()
+            .find(|option| option.eq_ignore_ascii_case(&candidate))
+        {
+            return Some((*hit).to_string());
+        }
+    }
+    None
+}
+
+fn unknown_file_format_message(dataset: &DatasetSpec, params: &Parameters, format: &str) -> String {
+    let valid = valid_listing_file_formats();
+    let valid_list = valid.join(", ");
+    let dataset_name = dataset.name.to_string();
+    let (format_clause, suggest) = match params.secret_source("file_format") {
+        Some(source) => (format!(" from {source}"), false),
+        None if params.origins_tracked() => (format!(" '{format}'"), true),
+        None => (String::new(), false),
+    };
+    let suggestion = if suggest {
+        closest_file_format(format, &structured_file_formats())
+            .map(|hint| format!(" Did you mean `{hint}`?"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    format!(
+        "Unknown `file_format`{format_clause} for dataset '{dataset_name}'. Valid formats: {valid_list}.{suggestion} Update `file_format` and retry. See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+    )
+}
+
+/// Warning when an unknown `file_format` falls through to the plain-text
+/// table (trunk-compatible). `hint` is a suggested format when one exists.
+fn unknown_file_format_fallback_warning(
+    dataset: &DatasetSpec,
+    params: &Parameters,
+    format: &str,
+    hint: Option<&str>,
+) -> String {
+    let dataset_name = dataset.name.to_string();
+    let (format_clause, suggest) = match params.secret_source("file_format") {
+        Some(source) => (format!(" from {source}"), false),
+        None if params.origins_tracked() => (format!(" '{format}'"), true),
+        None => (String::new(), false),
+    };
+    let suggestion = if suggest {
+        hint.map(|hint| format!(" Did you mean `{hint}`?"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    format!(
+        "Unknown `file_format`{format_clause} for dataset '{dataset_name}' is not a recognized structured or document format, so the dataset is loaded as a plain-text table.{suggestion} Set `file_format` to a known format if that is not intended. See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+    )
 }
 
 // 1024³
@@ -2125,6 +2642,7 @@ async fn get_last_modified(
     dataconnector: String,
     dataset: &DatasetSpec,
     extension: &str,
+    displayed_extension: &str,
     table_path: ListingTableUrl,
     ctx: &SessionContext,
     object_store: &Arc<dyn ObjectStore>,
@@ -2197,7 +2715,7 @@ async fn get_last_modified(
             dataconnector: dataconnector.clone(),
             connector_component: ConnectorComponent::from(dataset),
             message: format!(
-                "Spice could not find any files matching the extension '{extension}' at the specified path."
+                "Spice could not find any files matching the extension '{displayed_extension}' at the specified path."
             ),
         });
     }
@@ -2214,7 +2732,7 @@ async fn get_last_modified(
             dataconnector: dataconnector.clone(),
             connector_component: ConnectorComponent::from(dataset),
             message: format!(
-                "Failed to find any files matching the extension '{extension}'. Is your `file_format` parameter correct? Spice found the following file extensions: {display_extensions}. For details, visit: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+                "Failed to find any files matching the extension '{displayed_extension}'. Is your `file_format` parameter correct? Spice found the following file extensions: {display_extensions}. For details, visit: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
             ),
         })
     }
@@ -2224,6 +2742,7 @@ async fn verify_schema_source_path(
     dataconnector: String,
     dataset: &DatasetSpec,
     extension: &str,
+    displayed_extension: &str,
     schema_source_path: ListingTableUrl,
     ctx: &SessionContext,
     object_store: &Arc<dyn ObjectStore>,
@@ -2266,7 +2785,7 @@ async fn verify_schema_source_path(
             // We've reached the limit of files to scan, but have not found any with the expected extension.
             // We do warning, not an error, as the dataset might have a large number of files.
             tracing::warn!(
-                "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}` after scanning {SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT} files. Ensure the `schema_source_path` is correct."
+                "Failed to find any files matching the extension '{displayed_extension}' at the specified path `{schema_source_path}` after scanning {SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT} files. Ensure the `schema_source_path` is correct."
             );
             return Ok(None);
         }
@@ -2276,7 +2795,7 @@ async fn verify_schema_source_path(
         dataconnector: dataconnector.clone(),
         connector_component: ConnectorComponent::from(dataset),
         message: format!(
-            "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}`. Verify that `schema_source_path` is correct and try again."
+            "Failed to find any files matching the extension '{displayed_extension}' at the specified path `{schema_source_path}`. Verify that `schema_source_path` is correct and try again."
         ),
     })
 }
@@ -2663,6 +3182,7 @@ mod tests {
     use crate::listing::LISTING_TABLE_PARAMETERS;
     use crate::{ConnectorParams, DataConnectorFactory};
     use runtime_parameters::ParameterSpec;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -2738,6 +3258,55 @@ mod tests {
         }
     }
 
+    /// Listing connector whose [`ObjectStore`] is injected, so tests can
+    /// exercise `list_all_files` without writing thousands of files to disk.
+    #[derive(Debug)]
+    struct ListingStoreConnector {
+        params: Parameters,
+        store: Arc<dyn ObjectStore>,
+    }
+
+    impl std::fmt::Display for ListingStoreConnector {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ListingStoreConnector")
+        }
+    }
+
+    impl ListingTableConnector for ListingStoreConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn get_params(&self) -> &Parameters {
+            &self.params
+        }
+
+        fn get_tokio_io_runtime(&self) -> Handle {
+            Handle::current()
+        }
+
+        fn get_object_store_url(
+            &self,
+            dataset: &DatasetSpec,
+            url: Option<&str>,
+        ) -> DataConnectorResult<Url> {
+            Url::parse(url.unwrap_or(dataset.from.as_str()))
+                .boxed()
+                .context(crate::InvalidConfigurationSnafu {
+                    dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: "Invalid URL".to_string(),
+                })
+        }
+
+        fn get_object_store(
+            &self,
+            _dataset: &DatasetSpec,
+        ) -> DataConnectorResult<Arc<dyn ObjectStore>> {
+            Ok(Arc::clone(&self.store))
+        }
+    }
+
     const TEST_PARAMETERS: &[ParameterSpec] = LISTING_TABLE_PARAMETERS;
 
     fn setup_connector(
@@ -2749,7 +3318,8 @@ mod tests {
                 to_secret_map(params).into_iter().collect(),
                 "test",
                 TEST_PARAMETERS,
-            ),
+            )
+            .with_tracked_origins(),
         };
 
         (
@@ -2769,6 +3339,888 @@ mod tests {
                 "Cannot setup the dataset test (TestConnector) with an invalid configuration. The required 'file_format' parameter is missing. Ensure the parameter is provided, and try again."
             ),
         }
+    }
+
+    fn setup_listed_connector(
+        filenames: &[&str],
+        format: &str,
+    ) -> (TestConnector, DatasetSpec, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in filenames {
+            std::fs::write(dir.path().join(name), "hello").expect("write listed object");
+        }
+        let (connector, dataset) = setup_connector(
+            format!("file://{}/", dir.path().display()),
+            HashMap::from([("file_format".to_string(), format.to_string())]),
+        );
+        (connector, dataset, dir)
+    }
+
+    async fn assert_text_table_format(connector: &TestConnector, dataset: &DatasetSpec, ext: &str) {
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(dataset)
+            .await
+            .unwrap_or_else(|err| panic!("{ext} must keep the text-table path: {err}"));
+        assert!(file_format.is_none(), "{ext} must use the text-table path");
+        assert_eq!(extension, format!(".{ext}"));
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_cvs_over_csv_is_rejected_with_suggestion() {
+        let (connector, dataset, _dir) = setup_listed_connector(&["orders.csv"], "cvs");
+
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("cvs over .csv files must fail dataset setup");
+        let message = err.to_string();
+        assert!(
+            message.contains("Unknown `file_format` 'cvs'"),
+            "error must name the invalid format: {message}"
+        );
+        assert!(
+            message.contains("Did you mean `csv`?"),
+            "error must suggest the closest valid format: {message}"
+        );
+        assert!(
+            message.contains("Valid formats:"),
+            "error must list valid formats: {message}"
+        );
+        assert!(
+            message.contains(
+                "https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+            ),
+            "error must link to the file-format docs: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_parqet_over_parquet_is_rejected_with_suggestion() {
+        let (connector, dataset, _dir) = setup_listed_connector(&["data.parquet"], "parqet");
+
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("parqet over .parquet files must fail dataset setup");
+        let message = err.to_string();
+        assert!(
+            message.contains("Unknown `file_format` 'parqet'"),
+            "error must name the invalid format: {message}"
+        );
+        assert!(
+            message.contains("Did you mean `parquet`?"),
+            "error must suggest parquet: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_jsno_over_json_is_rejected_with_suggestion() {
+        let (connector, dataset, _dir) = setup_listed_connector(&["data.json"], "jsno");
+
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("jsno over .json files must fail dataset setup");
+        let message = err.to_string();
+        assert!(
+            message.contains("Unknown `file_format` 'jsno'"),
+            "error must name the invalid format: {message}"
+        );
+        assert!(
+            message.contains("Did you mean `json`?"),
+            "error must suggest json: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_parquett_over_parquet_is_rejected_with_suggestion() {
+        let (connector, dataset, _dir) = setup_listed_connector(&["data.parquet"], "parquett");
+
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("parquett over .parquet files must fail dataset setup");
+        let message = err.to_string();
+        assert!(
+            message.contains("Unknown `file_format` 'parquett'"),
+            "error must name the invalid format: {message}"
+        );
+        assert!(
+            message.contains("Did you mean `parquet`?"),
+            "error must suggest parquet: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_real_text_near_misses_load_over_matching_files() {
+        for format in ["cs", "csx", "rc", "jsonld"] {
+            let (connector, dataset, _dir) =
+                setup_listed_connector(&[format!("notes.{format}").as_str()], format);
+            assert_text_table_format(&connector, &dataset, format).await;
+            let warning = unknown_file_format_fallback_warning(
+                &dataset,
+                connector.get_params(),
+                format,
+                closest_file_format(format, &structured_file_formats()).as_deref(),
+            );
+            assert!(
+                warning.contains("Did you mean"),
+                "{format} is an unlisted near-miss and must WARN with a hint: {warning}"
+            );
+            assert!(
+                warning.contains("plain-text table"),
+                "{format} must stay on the text fallthrough: {warning}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_cvs_over_only_cvs_files_loads_as_text() {
+        let (connector, dataset, _dir) = setup_listed_connector(&["notes.cvs"], "cvs");
+        assert_text_table_format(&connector, &dataset, "cvs").await;
+        let warning = unknown_file_format_fallback_warning(
+            &dataset,
+            connector.get_params(),
+            "cvs",
+            Some("csv"),
+        );
+        assert!(
+            warning.contains("Did you mean `csv`?"),
+            "unconfirmed cvs must WARN with the hint: {warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_cvs_over_mixed_claimed_and_suggested_loads_as_text() {
+        let (connector, dataset, _dir) =
+            setup_listed_connector(&["notes.cvs", "orders.csv"], "cvs");
+        assert_text_table_format(&connector, &dataset, "cvs").await;
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_cvs_over_csv_gz_is_rejected_with_suggestion() {
+        let (connector, dataset, _dir) = setup_listed_connector(&["orders.csv.gz"], "cvs");
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("cvs over .csv.gz must fail dataset setup");
+        let message = err.to_string();
+        assert!(
+            message.contains("Unknown `file_format` 'cvs'"),
+            "error must name the invalid format: {message}"
+        );
+        assert!(
+            message.contains("Did you mean `csv`?"),
+            "error must suggest csv: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_cvs_without_listing_degrades_to_text() {
+        let (connector, dataset) = setup_connector(
+            "test:test/".to_string(),
+            HashMap::from([("file_format".to_string(), "cvs".to_string())]),
+        );
+        assert_text_table_format(&connector, &dataset, "cvs").await;
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_incomplete_scan_loads_as_text() {
+        let meta_files: Vec<ObjectMeta> = (0..=SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT)
+            .map(|i| create_meta(&format!("file{i}.csv"), 100, 100))
+            .collect();
+        let store = Arc::new(TestObjectStore::new(meta_files));
+        let connector = ListingStoreConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([(
+                    "file_format".to_string(),
+                    "cvs".to_string(),
+                )]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_tracked_origins(),
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
+        };
+        let dataset = DatasetSpec::new("file:///unused/".to_string(), TableReference::bare("test"));
+
+        assert!(
+            !listing_confirms_structured_typo(&connector, &dataset, "cvs", "csv").await,
+            "hitting the scan cap is not listing confirmation"
+        );
+        assert!(
+            store.list_calls() >= 1,
+            "incomplete-scan coverage must list objects, not degrade on a store error"
+        );
+
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .unwrap_or_else(|err| panic!("cvs must keep the text-table path: {err}"));
+        assert!(file_format.is_none(), "cvs must use the text-table path");
+        assert_eq!(extension, ".cvs");
+        let warning = unknown_file_format_fallback_warning(
+            &dataset,
+            connector.get_params(),
+            "cvs",
+            Some("csv"),
+        );
+        assert!(
+            warning.contains("plain-text table"),
+            "incomplete scan must stay on the text fallthrough: {warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_text_extensions_still_load() {
+        for format in ["tex", "org", "json5", "jsonc", "mdx", "css", "ts", "psv"] {
+            let (connector, dataset) = setup_connector(
+                "test:test/".to_string(),
+                HashMap::from([("file_format".to_string(), format.to_string())]),
+            );
+            let (file_format, extension) = connector
+                .get_file_format_and_extension(&dataset)
+                .await
+                .unwrap_or_else(|err| panic!("{format} must keep the text-table path: {err}"));
+            assert!(
+                file_format.is_none(),
+                "{format} must use the text-table path"
+            );
+            assert_eq!(extension, format!(".{format}"));
+            let warning =
+                unknown_file_format_fallback_warning(&dataset, &connector.params, format, None);
+            assert!(
+                !warning.contains("Did you mean"),
+                "{format} is a real text extension and must not suggest a structured format: {warning}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_text_file_format_honors_file_extension_tex() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.tex"), "hello").expect("write tex");
+        std::fs::write(dir.path().join("notes.md"), "skip").expect("write md");
+
+        let (connector, dataset) = setup_connector(
+            format!("test:{}/", dir.path().display()),
+            HashMap::from([
+                ("file_format".to_string(), "text".to_string()),
+                ("file_extension".to_string(), ".tex".to_string()),
+            ]),
+        );
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("file_format text plus file_extension .tex must succeed");
+        assert!(file_format.is_none(), "text stays on the text-table path");
+        assert_eq!(extension, ".tex");
+
+        let mut matched = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).expect("read_dir") {
+            let name = entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            if file_matches_extension(&Path::from(name.as_str()), &extension) {
+                matched.push(name);
+            }
+        }
+        matched.sort_unstable();
+        assert_eq!(
+            matched,
+            vec!["notes.tex".to_string()],
+            "file_extension .tex must list only *.tex files"
+        );
+    }
+
+    #[test]
+    fn classify_unknown_file_format_allowlist_loads_as_text() {
+        for format in TEXT_TABLE_FILE_EXTENSIONS {
+            assert_eq!(
+                classify_unknown_file_format(format),
+                UnknownFileFormatAction::LoadAsText { hint: None },
+                "{format} is a real text extension"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_unknown_file_format_structured_near_misses_need_listing() {
+        for (format, suggested) in [
+            ("cvs", "csv"),
+            ("parqet", "parquet"),
+            ("jsno", "json"),
+            ("parquett", "parquet"),
+            ("cs", "csv"),
+            ("csx", "csv"),
+            ("rc", "orc"),
+            ("jsonld", "jsonl"),
+        ] {
+            assert_eq!(
+                classify_unknown_file_format(format),
+                UnknownFileFormatAction::ConfirmStructuredTypo {
+                    suggested: suggested.to_string()
+                },
+                "{format} is a structured near-miss; listing decides"
+            );
+        }
+    }
+
+    #[test]
+    fn object_matches_file_format_suffix_and_gzip() {
+        assert!(object_matches_file_format("orders.csv", "csv"));
+        assert!(object_matches_file_format("orders.CSV", "csv"));
+        assert!(object_matches_file_format("/data/orders.csv.gz", "csv"));
+        assert!(object_matches_file_format("notes.jsonld", "jsonld"));
+        assert!(!object_matches_file_format("notes.jsonld", "jsonl"));
+        assert!(!object_matches_file_format("notes.cs", "csv"));
+        assert!(!object_matches_file_format("orders.csv", "cs"));
+        assert!(!object_matches_file_format("notes.cvs", "csv"));
+    }
+
+    #[test]
+    fn classify_unknown_file_format_document_near_miss_warns_with_hint() {
+        assert_eq!(
+            classify_unknown_file_format("mardown"),
+            UnknownFileFormatAction::LoadAsText {
+                hint: Some("markdown".to_string())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_mardown_loads_with_did_you_mean() {
+        let (connector, dataset) = setup_connector(
+            "test:test/".to_string(),
+            HashMap::from([("file_format".to_string(), "mardown".to_string())]),
+        );
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("document near-miss must keep the text-table path");
+        assert!(file_format.is_none());
+        assert_eq!(extension, ".mardown");
+        let warning = unknown_file_format_fallback_warning(
+            &dataset,
+            &connector.params,
+            "mardown",
+            Some("markdown"),
+        );
+        assert!(
+            warning.contains("Did you mean `markdown`?"),
+            "document near-miss WARN must include the hint: {warning}"
+        );
+        assert!(
+            warning.contains("plain-text table"),
+            "document near-miss WARN must keep the text fallthrough: {warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_log_falls_through_to_text_table() {
+        let (connector, dataset) = setup_connector(
+            "test:test/".to_string(),
+            HashMap::from([("file_format".to_string(), "log".to_string())]),
+        );
+
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("unknown non-near-miss file_format must keep the text-table path");
+        assert!(
+            file_format.is_none(),
+            "log is not a near-miss of a known format and must use the text-table path"
+        );
+        assert_eq!(extension, ".log");
+        let warning =
+            unknown_file_format_fallback_warning(&dataset, &connector.params, "log", None);
+        assert!(
+            warning.contains("Unknown `file_format` 'log'"),
+            "fallback warning must name the format: {warning}"
+        );
+        assert!(
+            warning.contains("plain-text table"),
+            "fallback warning must say the dataset is loaded as a plain-text table: {warning}"
+        );
+        assert!(
+            warning.contains(
+                "https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+            ),
+            "fallback warning must link to the file-format docs: {warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_document_file_format_md_still_uses_text_table() {
+        let (connector, dataset) = setup_connector(
+            "test:test/".to_string(),
+            HashMap::from([("file_format".to_string(), "md".to_string())]),
+        );
+
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("md is a valid document format");
+        assert!(
+            file_format.is_none(),
+            "document formats must keep the text-table path"
+        );
+        assert_eq!(extension, ".md");
+    }
+
+    #[tokio::test]
+    async fn test_document_file_format_pdf_still_uses_text_table() {
+        let (connector, dataset) = setup_connector(
+            "test:test/".to_string(),
+            HashMap::from([("file_format".to_string(), "pdf".to_string())]),
+        );
+
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("pdf is a valid document format");
+        assert!(file_format.is_none());
+        assert_eq!(extension, ".pdf");
+    }
+
+    /// A minimal, well-formed single-page PDF whose content stream draws the
+    /// text "Spice Hello". Same fixture as `document_parse::pdf` tests.
+    const SAMPLE_PDF: &[u8] = include_bytes!("../../../document_parse/tests/fixtures/hello.pdf");
+
+    async fn create_document_text_table(
+        connector: &TestConnector,
+        dataset: &DatasetSpec,
+        expected_extension: &str,
+    ) -> Arc<dyn TableProvider> {
+        document_parse::register_all().await;
+        let url = connector
+            .get_object_store_url(dataset, None)
+            .expect("dataset url");
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(dataset)
+            .await
+            .expect("document file_format must stay on the text-table path");
+        assert!(
+            file_format.is_none(),
+            "document formats must keep the text-table path"
+        );
+        assert_eq!(extension, expected_extension);
+        let parser_key = listing_document_parser_key(connector.get_params());
+        connector
+            .create_text_table(dataset, &url, &extension, parser_key.as_deref())
+            .await
+            .expect("create text table")
+    }
+
+    async fn scan_text_table_content(table: Arc<dyn TableProvider>) -> String {
+        let ctx = SessionContext::new();
+        ctx.register_table("docs", table)
+            .expect("register text table");
+        let batches = ctx
+            .sql("SELECT content FROM docs")
+            .await
+            .expect("plan content scan")
+            .collect()
+            .await
+            .expect("collect content");
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1, "expected one document row, got {batches:?}");
+        let col = batches[0]
+            .column_by_name("content")
+            .expect("content column");
+        let values = col
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content is utf8");
+        values.value(0).to_string()
+    }
+
+    #[tokio::test]
+    async fn test_document_file_format_pdf_with_bin_extension_extracts_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("hello.bin"), SAMPLE_PDF).expect("write pdf as bin");
+
+        let (connector, dataset) = setup_connector(
+            format!("file://{}/", dir.path().display()),
+            HashMap::from([
+                ("file_format".to_string(), "pdf".to_string()),
+                ("file_extension".to_string(), ".bin".to_string()),
+            ]),
+        );
+
+        let table = create_document_text_table(&connector, &dataset, ".bin").await;
+        let content = scan_text_table_content(table).await;
+        assert!(
+            content.contains("Spice"),
+            "pdf + .bin must extract text, got: {content:?}"
+        );
+        assert!(
+            !content.contains("%PDF"),
+            "pdf + .bin must not UTF-8-decode raw PDF bytes, got: {content:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_document_file_format_pdf_uppercase_path_is_parsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.PDF"), SAMPLE_PDF).expect("write uppercase PDF");
+
+        let (connector, dataset) = setup_connector(
+            format!("file://{}/a.PDF", dir.path().display()),
+            HashMap::from([("file_format".to_string(), "pdf".to_string())]),
+        );
+
+        let table = create_document_text_table(&connector, &dataset, ".PDF").await;
+        let content = scan_text_table_content(table).await;
+        assert!(
+            content.contains("Spice"),
+            "uppercase .PDF path must be parsed, got: {content:?}"
+        );
+        assert!(
+            !content.contains("%PDF"),
+            "uppercase .PDF path must not UTF-8-decode raw PDF bytes, got: {content:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_from_secret_does_not_echo_value() {
+        const CANARY: &str = "cvs";
+        const REFERENCE: &str = "${ env:FILE_FMT }";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("orders.csv"), "hello").expect("write csv");
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([(
+                    "file_format".to_string(),
+                    CANARY.to_string(),
+                )]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_format".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new(
+            format!("file://{}/", dir.path().display()),
+            TableReference::bare("test"),
+        );
+
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("listing-confirmed secret-derived file_format must fail");
+        let message = err.to_string();
+        assert!(
+            !message.contains(CANARY),
+            "unknown file_format errors must not echo a resolved secret: {message}"
+        );
+        assert!(
+            message.contains(REFERENCE),
+            "unknown file_format errors must name the secret reference: {message}"
+        );
+        assert!(
+            !message.contains("Did you mean"),
+            "do not suggest a correction from a secret-derived value: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_from_secret_without_listing_does_not_echo_value() {
+        const CANARY: &str = "cvs";
+        const REFERENCE: &str = "${ env:FILE_FMT }";
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([(
+                    "file_format".to_string(),
+                    CANARY.to_string(),
+                )]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_format".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new("test:test/".to_string(), TableReference::bare("test"));
+
+        assert_text_table_format(&connector, &dataset, CANARY).await;
+        let warning =
+            unknown_file_format_fallback_warning(&dataset, &connector.params, CANARY, Some("csv"));
+        assert!(
+            !warning.contains(CANARY),
+            "unconfirmed secret-derived fallthrough must not echo a resolved secret: {warning}"
+        );
+        assert!(
+            warning.contains(REFERENCE),
+            "unconfirmed secret-derived fallthrough must name the secret reference: {warning}"
+        );
+        assert!(
+            !warning.contains("Did you mean"),
+            "do not suggest a correction from a secret-derived value: {warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_file_format_secret_non_near_miss_falls_through_without_echo() {
+        const CANARY: &str = "CANARYPGPW7731";
+        const REFERENCE: &str = "${ env:FILE_FMT }";
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([(
+                    "file_format".to_string(),
+                    CANARY.to_string(),
+                )]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_format".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new("test:test/".to_string(), TableReference::bare("test"));
+
+        let (file_format, _extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("non-near-miss secret-derived file_format must fall through");
+        assert!(file_format.is_none());
+        let warning =
+            unknown_file_format_fallback_warning(&dataset, &connector.params, CANARY, None);
+        assert!(
+            !warning.contains(CANARY),
+            "fallback warning must not echo a resolved secret: {warning}"
+        );
+        assert!(
+            warning.contains(REFERENCE),
+            "fallback warning must name the secret reference: {warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_file_compression_type_from_secret_does_not_echo_value() {
+        const CANARY: &str = "CANARYPGPW7731";
+        const REFERENCE: &str = "${ env:PG_PW }";
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([
+                    ("file_format".to_string(), "csv".to_string()),
+                    ("file_compression_type".to_string(), CANARY.to_string()),
+                ]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_compression_type".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new("test:test/".to_string(), TableReference::bare("test"));
+
+        let err = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect_err("secret-derived compression must fail");
+        let message = err.to_string();
+        assert!(
+            !message.contains(CANARY),
+            "file_compression_type errors must not echo a resolved secret: {message}"
+        );
+        assert!(
+            message.contains(REFERENCE),
+            "file_compression_type errors must name the secret reference: {message}"
+        );
+    }
+
+    fn error_chain_text(err: &dyn std::error::Error) -> String {
+        let mut out = err.to_string();
+        let mut cur = err.source();
+        while let Some(inner) = cur {
+            out.push('\n');
+            out.push_str(&inner.to_string());
+            cur = inner.source();
+        }
+        out
+    }
+
+    fn secret_invalid_file_extension_connector(
+        format: &str,
+    ) -> (TestConnector, DatasetSpec, tempfile::TempDir) {
+        const CANARY: &str = ".CANARYPGPW7731[";
+        const REFERENCE: &str = "${ env:SECRET }";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "hello").expect("write listed object");
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([
+                    ("file_format".to_string(), format.to_string()),
+                    ("file_extension".to_string(), CANARY.to_string()),
+                ]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_extension".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new(
+            format!("file://{}/", dir.path().display()),
+            TableReference::bare("test"),
+        );
+        (connector, dataset, dir)
+    }
+
+    fn assert_invalid_file_extension_hides_secret(err: &DataConnectorError) {
+        const CANARY: &str = "CANARYPGPW7731";
+        const REFERENCE: &str = "${ env:SECRET }";
+        assert_error_hides_canary(err, CANARY, REFERENCE);
+    }
+
+    fn assert_error_hides_canary(err: &DataConnectorError, canary: &str, reference: &str) {
+        let chain = error_chain_text(err);
+        let debug = format!("{err:?}");
+        assert!(
+            chain.contains(reference),
+            "error must name the secret reference: {chain}"
+        );
+        assert!(
+            !chain.contains(canary),
+            "error Display/source must not echo a resolved secret: {chain}"
+        );
+        assert!(
+            !debug.contains(canary),
+            "error Debug must not echo a resolved secret: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_secret_file_extension_text_does_not_echo_value() {
+        let (connector, dataset, _dir) = secret_invalid_file_extension_connector("text");
+        let url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("directory url");
+        let (_file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("text plus file_extension must resolve");
+        let err = connector
+            .create_text_table(&dataset, &url, &extension, Some("text"))
+            .await
+            .expect_err("invalid secret-derived file_extension must fail text table setup");
+        assert_invalid_file_extension_hides_secret(&err);
+    }
+
+    #[tokio::test]
+    async fn test_secret_file_extension_csv_does_not_echo_value() {
+        let (connector, dataset, _dir) = secret_invalid_file_extension_connector("csv");
+        let err = connector
+            .construct_metadata_provider(&dataset)
+            .await
+            .expect_err("invalid secret-derived file_extension must fail metadata setup");
+        assert_invalid_file_extension_hides_secret(&err);
+    }
+
+    #[tokio::test]
+    async fn test_secret_file_format_text_fallthrough_does_not_echo_value() {
+        const CANARY: &str = "secret123[";
+        const REFERENCE: &str = "${ env:SECRET }";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "hello").expect("write listed object");
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([(
+                    "file_format".to_string(),
+                    CANARY.to_string(),
+                )]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_format".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new(
+            format!("file://{}/", dir.path().display()),
+            TableReference::bare("test"),
+        );
+        let url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("directory url");
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("secret-derived unknown file_format must fall through to text");
+        assert!(
+            file_format.is_none(),
+            "unknown file_format must use the text-table path"
+        );
+        let err = connector
+            .create_text_table(&dataset, &url, &extension, None)
+            .await
+            .expect_err("invalid secret-derived file_format suffix must fail text table setup");
+        assert_error_hides_canary(&err, "secret123", REFERENCE);
+    }
+
+    #[tokio::test]
+    async fn test_secret_file_extension_missing_files_does_not_echo_value() {
+        const CANARY: &str = ".CANARYPGPW7731[";
+        const REFERENCE: &str = "${ env:SECRET }";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "hello").expect("write non-matching object");
+        let connector = TestConnector {
+            params: Parameters::new(
+                to_secret_map(HashMap::from([
+                    ("file_format".to_string(), "csv".to_string()),
+                    ("file_extension".to_string(), CANARY.to_string()),
+                ]))
+                .into_iter()
+                .collect(),
+                "test",
+                TEST_PARAMETERS,
+            )
+            .with_secret_sources(HashMap::from([(
+                "file_extension".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        };
+        let dataset = DatasetSpec::new(
+            format!("file://{}/", dir.path().display()),
+            TableReference::bare("test"),
+        );
+        let url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("directory url");
+        let (file_format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv plus file_extension must resolve");
+        let file_format = file_format.expect("csv must use the listing-table path");
+        let err = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect_err("secret-derived file_extension with no matching files must fail");
+        assert_error_hides_canary(&err, "CANARYPGPW7731", REFERENCE);
     }
 
     #[tokio::test]
@@ -3217,6 +4669,7 @@ mod tests {
             "TestConnector".to_string(),
             &dataset,
             ".orc",
+            ".orc",
             table_path,
             &ctx,
             &store,
@@ -3590,11 +5043,19 @@ mod tests {
     #[derive(Debug)]
     struct TestObjectStore {
         meta: Vec<ObjectMeta>,
+        list_calls: AtomicUsize,
     }
 
     impl TestObjectStore {
         fn new(meta: Vec<ObjectMeta>) -> Self {
-            Self { meta }
+            Self {
+                meta,
+                list_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn list_calls(&self) -> usize {
+            self.list_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -3610,6 +5071,7 @@ mod tests {
             &self,
             _prefix: Option<&Path>,
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
             stream::iter(self.meta.clone().into_iter().map(Ok)).boxed()
         }
 
@@ -3689,6 +5151,7 @@ mod tests {
         let last_modified = get_last_modified(
             "TestListingConnector".to_string(),
             &dataset,
+            ".parquet",
             ".parquet",
             table_path,
             &ctx,
@@ -4201,6 +5664,7 @@ mod tests {
             "TestListingConnector".to_string(),
             &dataset,
             "*.orc",
+            "*.orc",
             table_path,
             &ctx,
             &test_store,
@@ -4227,6 +5691,7 @@ mod tests {
         let err = get_last_modified(
             "TestListingConnector".to_string(),
             &dataset,
+            "*.orc",
             "*.orc",
             table_path,
             &ctx,
@@ -4271,6 +5736,7 @@ mod tests {
         let err = get_last_modified(
             "TestListingConnector".to_string(),
             &dataset,
+            ".parquet",
             ".parquet",
             table_path,
             &ctx,
@@ -4321,6 +5787,7 @@ mod tests {
         let last_modified = get_last_modified(
             "TestListingConnector".to_string(),
             &dataset,
+            ".csv.gz",
             ".csv.gz",
             table_path,
             &ctx,
@@ -5187,6 +6654,7 @@ mod tests {
             "TestListingConnector".to_string(),
             &dataset,
             ".csv",
+            ".csv",
             table_path,
             &ctx,
             &test_store,
@@ -5233,6 +6701,7 @@ mod tests {
             "TestListingConnector".to_string(),
             &dataset,
             ".parquet",
+            ".parquet",
             table_path,
             &ctx,
             &test_store,
@@ -5269,6 +6738,7 @@ mod tests {
             "TestListingConnector".to_string(),
             &dataset,
             ".parquet",
+            ".parquet",
             schema_source_path,
             &ctx,
             &test_store,
@@ -5296,6 +6766,7 @@ mod tests {
             "TestListingConnector".to_string(),
             &dataset,
             ".csv.gz",
+            ".csv.gz",
             schema_source_path,
             &ctx,
             &test_store,
@@ -5322,6 +6793,7 @@ mod tests {
         let result = verify_schema_source_path(
             "TestListingConnector".to_string(),
             &dataset,
+            ".parquet",
             ".parquet",
             schema_source_path.clone(),
             &ctx,
@@ -5358,6 +6830,7 @@ mod tests {
         let result = verify_schema_source_path(
             "TestListingConnector".to_string(),
             &dataset,
+            ".parquet",
             ".parquet",
             schema_source_path,
             &ctx,
@@ -5831,6 +7304,38 @@ mod tests {
         decoder
             .push_range(0..3, bytes::Bytes::from_static(b"abc"))
             .expect("a well-formed range is still accepted after a rejected one");
+    }
+
+    /// A footer whose Thrift list header declares more elements than the file could hold is
+    /// refused before anything is reserved for that count.
+    ///
+    /// Every footer list (`schema`, `row_groups`, `key_value_metadata`, `column_orders`) and
+    /// the offset index's `page_locations` decodes into a `Vec` sized from the element count
+    /// in that header, so an unreadable file of a few bytes can ask for room for `i32::MAX`
+    /// elements before a single one is read. That happens during schema inference at dataset
+    /// initialization, and again on every refresh of the dataset, and the process is killed
+    /// for it. A Spice patch to the `spiceai/arrow-rs` fork bounds the count by the bytes left
+    /// in the input ([spiceai/arrow-rs#32](https://github.com/spiceai/arrow-rs/pull/32)).
+    ///
+    /// Driven through `ParquetMetaDataReader::decode_metadata`, the public surface the footer
+    /// decode sits behind. The error has to name the declared count: an oversized footer is a
+    /// malformed file, and an error that does not say so reads like a truncated download.
+    #[test]
+    fn an_oversized_footer_list_length_is_a_parquet_error_and_not_an_allocation() {
+        use datafusion::parquet::file::metadata::ParquetMetaDataReader;
+
+        // Struct header, then field 2 (`schema`): a `list<SchemaElement>` declaring
+        // i32::MAX elements, with no element following it.
+        const FOOTER: &[u8] = &[0x29, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x00];
+
+        let error = ParquetMetaDataReader::decode_metadata(FOOTER)
+            .expect_err("no file holds as many schema elements as this footer declares");
+        let message = error.to_string();
+        assert!(
+            message.contains("Thrift list declares 2147483647 elements"),
+            "the error has to name the declared count, or an oversized footer is \
+             indistinguishable from a truncated one: {message}"
+        );
     }
 
     /// A Parquet page whose header declares more uncompressed bytes than its

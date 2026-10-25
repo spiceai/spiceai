@@ -193,6 +193,41 @@ impl Parameters {
         all_params: &'static [ParameterSpec],
         diagnostics: Diagnostics,
     ) -> AnyErrorResult<Self> {
+        Self::try_new_with_secret_sources(
+            component_name,
+            params,
+            prefix,
+            secrets,
+            all_params,
+            diagnostics,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::try_new_with_diagnostics`], recording which parameter values
+    /// came from a `${ store:key }` template so validation errors can name
+    /// the reference instead of the resolved secret.
+    ///
+    /// Pass `Some(map)` when the caller tracked secret-reference templates
+    /// (an empty map means every supplied value is a literal and is safe to
+    /// show). Successfully autoloaded `.secret()` params are recorded on that
+    /// map as `${ secrets:<lookup key> }`. Pass `None` when provenance is
+    /// unknown — `Found` clauses then never interpolate the raw value,
+    /// including autoloaded secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when supplied parameters do not satisfy the provided `ParameterSpec`.
+    pub async fn try_new_with_secret_sources(
+        component_name: &str,
+        params: Vec<(String, SecretString)>,
+        prefix: &'static str,
+        secrets: Arc<RwLock<Secrets>>,
+        all_params: &'static [ParameterSpec],
+        diagnostics: Diagnostics,
+        secret_sources: Option<HashMap<String, String>>,
+    ) -> AnyErrorResult<Self> {
         // Check for deprecated parameters using the original user-provided keys
         // before normalization strips prefixes.
         if diagnostics == Diagnostics::Report {
@@ -224,6 +259,12 @@ impl Parameters {
         // `Secrets::snapshot`.
         let secrets = Secrets::snapshot(&secrets).await;
 
+        // Remap supplied origins before autoload so a successfully
+        // autoloaded secret can be recorded on the same map validation
+        // consults. `None` stays conservative.
+        let mut secret_sources = secret_sources
+            .map(|sources| remap_secret_sources(all_params, prefix, component_name, sources));
+
         // Try to autoload secrets that might be missing from params.
         for secret_key in all_params.iter().filter(|p| p.secret) {
             let secret_key_with_prefix = if secret_key.name.starts_with(prefix) {
@@ -245,6 +286,12 @@ impl Parameters {
                 );
                 // Insert without the prefix into the params
                 params.push((secret_key.name.to_string(), secret));
+                if let Some(sources) = secret_sources.as_mut() {
+                    sources.insert(
+                        secret_key.name.to_string(),
+                        format!("${{ secrets:{secret_key_with_prefix} }}"),
+                    );
+                }
             }
         }
 
@@ -263,10 +310,11 @@ impl Parameters {
                     one_of.contains(&value)
                 };
                 if !value_is_allowed {
+                    let found = found_clause(secret_sources.as_ref(), parameter.name, value);
                     return Err(Box::new(Error::InvalidConfigurationNoSource {
                         component: component_name.to_string(),
                         message: format!(
-                            "'{}' parameter must be one of: {}. Found {value}.",
+                            "'{}' parameter must be one of: {}. Found {found}.",
                             parameter.display_name(prefix),
                             one_of.iter().join(", ")
                         ),
@@ -296,7 +344,12 @@ impl Parameters {
             }
         }
 
-        Ok(Parameters::new(params, prefix, all_params))
+        Ok(Parameters {
+            params,
+            prefix,
+            all_params,
+            secret_sources,
+        })
     }
 
     #[must_use]
@@ -309,7 +362,52 @@ impl Parameters {
             params,
             prefix,
             all_params,
+            secret_sources: None,
         }
+    }
+
+    /// Record secret-reference templates for these parameters.
+    ///
+    /// An empty map means every value is a known literal and is safe to show
+    /// in validation errors.
+    #[must_use]
+    pub fn with_secret_sources(mut self, sources: HashMap<String, String>) -> Self {
+        self.secret_sources = Some(sources);
+        self
+    }
+
+    /// Mark origins as tracked with no secret-derived values.
+    #[must_use]
+    pub fn with_tracked_origins(mut self) -> Self {
+        self.secret_sources = Some(HashMap::new());
+        self
+    }
+
+    /// Whether the caller recorded secret-reference templates for these
+    /// parameters. When `false`, validation errors must not interpolate raw
+    /// values.
+    #[must_use]
+    pub fn origins_tracked(&self) -> bool {
+        self.secret_sources.is_some()
+    }
+
+    /// The `${ store:key }` template this parameter was built from, if any.
+    #[must_use]
+    pub fn secret_source(&self, name: &str) -> Option<&str> {
+        self.secret_sources
+            .as_ref()
+            .and_then(|sources| sources.get(name))
+            .map(String::as_str)
+    }
+
+    /// How a parameter value should appear in a validation error.
+    ///
+    /// Secret-derived values become `a value from ${store:key}`. Tracked
+    /// literals are shown as-is. Untracked values become `an invalid value`
+    /// so a missed provenance path cannot leak a secret.
+    #[must_use]
+    pub fn display_value(&self, name: &str, value: &str) -> String {
+        found_clause(self.secret_sources.as_ref(), name, value)
     }
 
     #[must_use]
@@ -469,6 +567,7 @@ pub struct Parameters {
     params: Vec<(String, SecretString)>,
     pub(crate) prefix: &'static str,
     all_params: &'static [ParameterSpec],
+    secret_sources: Option<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for Parameters {
@@ -480,6 +579,15 @@ impl std::fmt::Debug for Parameters {
             )
             .field("prefix", &self.prefix)
             .field("all_params", &self.all_params)
+            .field(
+                "secret_sources",
+                &self.secret_sources.as_ref().map(|sources| {
+                    sources
+                        .iter()
+                        .map(|(key, source)| (key.as_str(), source.as_str()))
+                        .collect::<Vec<_>>()
+                }),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -612,6 +720,44 @@ fn describe_missing_parameter(parameter: &ParameterSpec) -> String {
     } else {
         format!(". {}.", parts.join(". "))
     }
+}
+
+/// How a rejected parameter value appears after `Found` in a validation error.
+///
+/// Secret-derived values name the `${ store:key }` template. Tracked literals
+/// are shown as-is. Untracked values become `an invalid value` so a missed
+/// provenance path cannot leak a secret.
+fn found_clause(
+    secret_sources: Option<&HashMap<String, String>>,
+    name: &str,
+    value: &str,
+) -> String {
+    match secret_sources.and_then(|sources| sources.get(name)) {
+        Some(source) => format!("a value from {source}"),
+        None if secret_sources.is_some() => value.to_string(),
+        None => "an invalid value".to_string(),
+    }
+}
+
+fn remap_secret_sources(
+    all_params: &[ParameterSpec],
+    prefix: &'static str,
+    component_name: &str,
+    secret_sources: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut remapped = HashMap::new();
+    for (key, source) in secret_sources {
+        if let Some(formatted) = Parameters::validate_and_format_key(
+            all_params,
+            prefix,
+            &key,
+            component_name,
+            Diagnostics::Suppress,
+        ) {
+            remapped.insert(formatted, source);
+        }
+    }
+    remapped
 }
 
 #[cfg(test)]
@@ -886,8 +1032,179 @@ mod test {
 
         assert!(
             err.to_string().contains(
+                "'test_mode' parameter must be one of: enabled, disabled. Found an invalid value."
+            ),
+            "untracked one_of errors must not interpolate the raw value: {err}"
+        );
+        assert!(
+            !err.to_string().contains("ENABLED"),
+            "untracked one_of errors must not echo the rejected value: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_of_tracked_literal_still_names_the_value() {
+        static SPECS: &[ParameterSpec] =
+            &[ParameterSpec::component("mode").one_of(&["enabled", "disabled"])];
+        let err = Parameters::try_new_with_secret_sources(
+            "connector test",
+            vec![(
+                "test_mode".to_string(),
+                SecretString::new("ENABLED".to_string().into()),
+            )],
+            "test",
+            Arc::new(RwLock::new(Secrets::new())),
+            SPECS,
+            Diagnostics::Report,
+            Some(HashMap::new()),
+        )
+        .await
+        .expect_err("case-sensitive one_of should reject differently-cased values");
+
+        assert!(
+            err.to_string().contains(
                 "'test_mode' parameter must be one of: enabled, disabled. Found ENABLED."
-            )
+            ),
+            "tracked literals are safe to name: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_of_secret_source_masks_canary_and_names_the_reference() {
+        static SPECS: &[ParameterSpec] = &[ParameterSpec::runtime("csv_has_header").is_boolean()];
+        const CANARY: &str = "CANARYPGPW7731";
+        const REFERENCE: &str = "${ env:PG_PW }";
+        let err = Parameters::try_new_with_secret_sources(
+            "connector file",
+            vec![(
+                "csv_has_header".to_string(),
+                SecretString::new(CANARY.to_string().into()),
+            )],
+            "file",
+            Arc::new(RwLock::new(Secrets::new())),
+            SPECS,
+            Diagnostics::Report,
+            Some(HashMap::from([(
+                "csv_has_header".to_string(),
+                REFERENCE.to_string(),
+            )])),
+        )
+        .await
+        .expect_err("a secret-derived bool must fail one_of");
+
+        let message = err.to_string();
+        assert!(
+            !message.contains(CANARY),
+            "validation errors must not echo a resolved secret: {message}"
+        );
+        assert!(
+            message.contains("csv_has_header"),
+            "the error must name the parameter: {message}"
+        );
+        assert!(
+            message.contains(REFERENCE),
+            "the error must name the secret reference: {message}"
+        );
+        assert!(
+            message.contains("Found a value from ${ env:PG_PW }."),
+            "unexpected found-clause: {message}"
+        );
+    }
+
+    struct MapStore(HashMap<String, String>);
+
+    #[async_trait::async_trait]
+    impl runtime_secrets::SecretStore for MapStore {
+        async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+            Ok(self
+                .0
+                .get(key)
+                .map(|value| SecretString::from(value.clone())))
+        }
+    }
+
+    fn secrets_with_map(entries: &[(&str, &str)]) -> Arc<RwLock<Secrets>> {
+        let mut secrets = Secrets::new();
+        secrets.register_store(
+            "fake",
+            Arc::new(MapStore(
+                entries
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            )),
+        );
+        Arc::new(RwLock::new(secrets))
+    }
+
+    /// Autoload fills a missing `.secret()` + `.one_of()` param. An empty
+    /// template map used to send that value through `found_clause`'s raw-value
+    /// branch. Record the autoload as `${ secrets:<lookup key> }` so the
+    /// canary never appears.
+    #[tokio::test]
+    async fn test_one_of_autoloaded_secret_masks_canary_and_names_the_lookup() {
+        static SPECS: &[ParameterSpec] = &[ParameterSpec::component("auth")
+            .one_of(&["iam_role", "key"])
+            .secret()];
+        const CANARY: &str = "CANARYPGPW7731";
+        const REFERENCE: &str = "${ secrets:test_auth }";
+        let err = Parameters::try_new_with_secret_sources(
+            "S3 state location",
+            vec![],
+            "test",
+            secrets_with_map(&[("test_auth", CANARY)]),
+            SPECS,
+            Diagnostics::Report,
+            Some(HashMap::new()),
+        )
+        .await
+        .expect_err("an autoloaded one_of reject must fail validation");
+
+        let message = err.to_string();
+        assert!(
+            !message.contains(CANARY),
+            "autoloaded secrets must not echo through Found: {message}"
+        );
+        assert!(
+            message.contains("'test_auth' parameter must be one of: iam_role, key."),
+            "the error must name the parameter: {message}"
+        );
+        assert!(
+            message.contains(REFERENCE),
+            "the error must name the autoload lookup: {message}"
+        );
+        assert!(
+            message.contains("Found a value from ${ secrets:test_auth }."),
+            "unexpected found-clause: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_of_autoloaded_secret_none_provenance_stays_conservative() {
+        static SPECS: &[ParameterSpec] = &[ParameterSpec::component("auth")
+            .one_of(&["iam_role", "key"])
+            .secret()];
+        const CANARY: &str = "CANARYPGPW7731";
+        let err = Parameters::try_new_with_secret_sources(
+            "S3 state location",
+            vec![],
+            "test",
+            secrets_with_map(&[("test_auth", CANARY)]),
+            SPECS,
+            Diagnostics::Report,
+            None,
+        )
+        .await
+        .expect_err("an autoloaded one_of reject must fail validation");
+
+        let message = err.to_string();
+        assert!(
+            !message.contains(CANARY),
+            "None provenance must stay conservative for autoload: {message}"
+        );
+        assert!(
+            message.contains("Found an invalid value."),
+            "unexpected found-clause: {message}"
         );
     }
 

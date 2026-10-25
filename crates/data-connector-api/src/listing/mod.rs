@@ -22,14 +22,15 @@ use runtime_parameters::{ParameterSpec, Parameters};
 mod connector;
 mod infer;
 pub use connector::{
-    ListingTableConnector, ListingTableTemplate, ObjectVersionType, build_table_parquet_options,
-    file_matches_extension, object_store_timeout_message,
+    ListingSuffix, ListingSuffixOrigin, ListingTableConnector, ListingTableTemplate,
+    ObjectVersionType, build_table_parquet_options, file_matches_extension,
+    object_store_timeout_message,
 };
 
 /// All [`super::DataConnectorFactory`] that create [`ListingTableConnector`]s should have at least these parameters returned from the associated [`super::DataConnectorFactory::parameters`].
 pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_format")
-        .description("File format: parquet, csv, tsv, json, jsonl, ndjson, ldjson, soda, socrata, vortex, orc, or auto. Inferred from the path extension when unset."),
+        .description("File format: parquet, csv, tsv, json, jsonl, ndjson, ldjson, soda, socrata, vortex, orc, auto, or a document format (md, markdown, txt, text, html, pdf, docx, pptx, xlsx). Inferred from the path extension when unset. A near-miss of a structured format is a configuration error only when the listing has objects in the suggested format and none named `.{claimed}`. Common text extensions and other unknown values fall through to the plain-text table. Document and text formats honor `file_extension`."),
     ParameterSpec::runtime("file_extension"),
     ParameterSpec::runtime("schema_infer_max_records")
         .description("Set a limit in terms of records to scan to infer the schema."),
@@ -205,6 +206,32 @@ pub fn build_fragments(params: &Parameters, keys: Vec<&str>) -> String {
     fragments.join("&")
 }
 
+/// Moves the port parameter `key` into `url`, so the URL alone names the
+/// server: the object store registry keys stores by `scheme://host:port`, and
+/// a port carried only in the fragment would let two ports share one store.
+///
+/// # Errors
+///
+/// Returns a message if the parameter is not a valid port, or if `url` already
+/// names a different port.
+pub fn set_port_from_param(url: &mut Url, params: &Parameters, key: &str) -> Result<(), String> {
+    let Some(value) = params.get(key).expose().ok() else {
+        return Ok(());
+    };
+    let param = params.user_param(key);
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| format!("Invalid {param}: {value}. Specify a port number."))?;
+    match url.port() {
+        Some(url_port) if url_port != port => Err(format!(
+            "The port in the URL ({url_port}) conflicts with {param} ({port}). Set the port in one place."
+        )),
+        _ => url
+            .set_port(Some(port))
+            .map_err(|()| format!("{param} requires a host in the URL.")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +265,69 @@ mod tests {
         assert_eq!(
             build_fragments(&params, vec!["file_format", "csv_has_header"]),
             "file_format=csv&csv_has_header=true"
+        );
+    }
+
+    const PORT_PARAMETERS: &[ParameterSpec] = &[ParameterSpec::component("port")];
+
+    fn port_params(port: Option<&str>) -> Parameters {
+        let params: HashMap<String, String> = port
+            .map(|port| ("port".to_string(), port.to_string()))
+            .into_iter()
+            .collect();
+        Parameters::new(
+            to_secret_map(params).into_iter().collect(),
+            "smb",
+            PORT_PARAMETERS,
+        )
+    }
+
+    fn url_with_port_param(url: &str, port: Option<&str>) -> Result<Url, String> {
+        let mut url = Url::parse(url).expect("valid URL");
+        set_port_from_param(&mut url, &port_params(port), "port")?;
+        Ok(url)
+    }
+
+    #[test]
+    fn test_set_port_from_param_moves_the_port_into_the_url() {
+        assert_eq!(
+            url_with_port_param("smb://host/share/", Some("4450")).map(String::from),
+            Ok("smb://host:4450/share/".to_string())
+        );
+        assert_eq!(
+            url_with_port_param("smb://host:4450/share/", Some("4450")).map(String::from),
+            Ok("smb://host:4450/share/".to_string())
+        );
+    }
+
+    #[test]
+    fn test_set_port_from_param_keeps_the_url_without_the_param() {
+        assert_eq!(
+            url_with_port_param("smb://host:4450/share/", None).map(String::from),
+            Ok("smb://host:4450/share/".to_string())
+        );
+        assert_eq!(
+            url_with_port_param("smb://host/share/", None).map(String::from),
+            Ok("smb://host/share/".to_string())
+        );
+    }
+
+    #[test]
+    fn test_set_port_from_param_rejects_a_conflicting_port() {
+        assert_eq!(
+            url_with_port_param("smb://host:4450/share/", Some("445")),
+            Err(
+                "The port in the URL (4450) conflicts with smb_port (445). Set the port in one place."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_set_port_from_param_rejects_an_invalid_port() {
+        assert_eq!(
+            url_with_port_param("smb://host/share/", Some("70000")),
+            Err("Invalid smb_port: 70000. Specify a port number.".to_string())
         );
     }
 }

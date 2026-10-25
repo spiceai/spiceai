@@ -379,6 +379,8 @@ jobs:
               --head "${BRANCH_NAME}" \
               --label kind/bug
           fi
+          # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
+          bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Never fall back to an interactive prompt; fail fast if auth is rejected.

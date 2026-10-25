@@ -898,7 +898,9 @@ pub async fn s3_changes_stream(
         Err(error) => return Some(error_stream(error)),
     };
     let listing_files = match connector.get_file_format_and_extension(dataset).await {
-        Ok((_, extension)) => ListingFileFilter { extension },
+        Ok((_, extension)) => ListingFileFilter {
+            extension: extension.to_string(),
+        },
         Err(error) => return Some(error_stream(error)),
     };
     // Only the object store can say whether a `from` without a trailing `/`

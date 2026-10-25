@@ -322,6 +322,8 @@ async fn prepare_transaction(
         let mut statement = session
             .sql_to_statement(stmt_sql, &dialect)
             .map_err(TransactionError::Plan)?;
+        crate::datafusion::sql_depth_guard::ensure_statement_within_depth_limits(&statement)
+            .map_err(TransactionError::Plan)?;
         let _ =
             bind_table_function_args(&mut statement, parameters).map_err(TransactionError::Plan)?;
         let plan = session

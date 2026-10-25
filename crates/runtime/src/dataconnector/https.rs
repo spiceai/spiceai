@@ -42,8 +42,7 @@ use data_components::http::auth::{
 use data_components::http::json_nest::HttpJsonNesting;
 use data_components::rate_limit::RateLimiter;
 use percent_encoding::percent_decode_str;
-use runtime_datafusion::url_table::{is_blocked_internal_hostname, is_internal_ip};
-use runtime_object_store::http_auth;
+use runtime_object_store::{http_auth, ssrf};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use snafu::prelude::*;
@@ -51,7 +50,6 @@ use spicepod::semantic::Column;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -984,22 +982,11 @@ impl Https {
                     return attempt.error("too many redirects");
                 }
                 // SSRF defense-in-depth: refuse to follow a redirect to an
-                // internal target. Reuses the URL-table SSRF classifier so the
-                // two guards stay in lock-step — covering loopback, private/
-                // RFC1918, link-local (incl. the cloud-metadata endpoint),
-                // unique-local, CGNAT, unspecified, multicast, and reserved
-                // ranges for both IPv4 and IPv6, including IPv4-mapped IPv6
-                // forms like `::ffff:169.254.169.254`. Hostname redirects (e.g.
-                // `localhost`) can't be DNS-resolved in this synchronous
+                // internal target, with the same classifier URL tables use.
+                // Hostname redirects can't be DNS-resolved in this synchronous
                 // closure, so well-known internal names are rejected by literal
-                // match; reqwest resolves any remaining hostnames at connect time.
-                let to_internal = match attempt.url().host() {
-                    Some(url::Host::Ipv4(ip)) => is_internal_ip(IpAddr::V4(ip)),
-                    Some(url::Host::Ipv6(ip)) => is_internal_ip(IpAddr::V6(ip)),
-                    Some(url::Host::Domain(domain)) => is_blocked_internal_hostname(domain),
-                    None => false,
-                };
-                if to_internal {
+                // match.
+                if ssrf::redirect_target_is_internal(attempt.url()) {
                     return attempt.error("redirect to a private address is not allowed");
                 }
                 attempt.follow()
@@ -1016,7 +1003,9 @@ impl Https {
             builder = builder.use_rustls_tls().identity(identity);
         }
 
-        builder
+        // The provider decodes compressed bodies itself, so it can refuse one that
+        // expands like a compression bomb before it is held in memory.
+        http_body_limit::decode_manually(builder)
             .build()
             .boxed()
             .map_err(|e| DataConnectorError::InternalWithSource {
@@ -2250,6 +2239,16 @@ impl ListingTableConnector for HttpListingConnector {
         }
 
         let mut fragment = build_fragments(&self.params, vec!["client_timeout"]);
+        // The operator wrote `http://` in the dataset URL. That is the
+        // permission the object store's `allow_http` setting requires. An
+        // `https://` dataset stays HTTPS-only, so a redirect cannot switch
+        // the fetch to plaintext.
+        if u.scheme() == "http" {
+            if !fragment.is_empty() {
+                fragment.push('&');
+            }
+            fragment.push_str("allow_http=true");
+        }
         if !username.is_empty() || password.is_some() {
             let token = http_auth::register(
                 &u,
@@ -2373,6 +2372,23 @@ mod tests {
         });
 
         dataset
+    }
+
+    #[tokio::test]
+    async fn http_dataset_url_opts_into_plaintext() {
+        let dataset = test_dataset("http://example.com/data/", RefreshMode::Full, None).await;
+        let connector =
+            HttpListingConnector::new(test_params(&[]).await, tokio::runtime::Handle::current());
+        let url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("an http dataset URL is valid");
+        assert_eq!(url.fragment(), Some("allow_http=true"));
+
+        let https = test_dataset("https://example.com/data/", RefreshMode::Full, None).await;
+        let url = connector
+            .get_object_store_url(&https, None)
+            .expect("an https dataset URL is valid");
+        assert_eq!(url.fragment(), Some(""));
     }
 
     fn test_client_identity_pems() -> (String, String) {
@@ -4542,5 +4558,218 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
             "_fetched_at should have its base_table_schema type"
         );
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    /// A gzip-compressed JSON object of `len` bytes, `{"a":"…"}`, whose string holds
+    /// `fill(i)` at offset `i`, built a block at a time so the whole is never held.
+    fn gzip_json(len: usize, fill: fn(usize) -> u8) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(br#"{"a":""#).expect("compress");
+        let mut offset = 0;
+        while offset < len - 8 {
+            let block: Vec<u8> = (offset..(offset + MIB).min(len - 8)).map(fill).collect();
+            encoder.write_all(&block).expect("compress");
+            offset += block.len();
+        }
+        encoder.write_all(br#""}"#).expect("compress");
+        encoder.finish().expect("finish gzip")
+    }
+
+    /// Zero-padded ascending eight-digit numbers separated by spaces, like an id column:
+    /// text that compresses a few times over, as real data does.
+    fn ids(i: usize) -> u8 {
+        let (number, position) = (i / 9, i % 9);
+        if position == 8 {
+            return b' ';
+        }
+        let place = 10usize.pow(u32::try_from(7 - position).expect("a digit place"));
+        b"0123456789"[number / place % 10]
+    }
+
+    /// Serve `body` as gzip-compressed JSON to every request, and count the requests
+    /// for `/data`.
+    async fn serve_gzip(body: Vec<u8>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test origin");
+        let origin = format!(
+            "http://{}",
+            listener.local_addr().expect("test origin address")
+        );
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let body = Arc::new(body);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let counter = Arc::clone(&counter);
+                let body = Arc::clone(&body);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    // The connector also probes the origin on a path of its own, in the
+                    // background; only requests for the dataset count.
+                    if request.starts_with(b"GET /data") {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Encoding: gzip\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n",
+                        body.len()
+                    );
+                    // A client that refuses the body hangs up part way through it.
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                });
+            }
+        });
+        (origin, requests)
+    }
+
+    /// Query `content` from a dynamic HTTP dataset at `{origin}/data`, through the
+    /// connector's own client, and count the requests the query made for it.
+    async fn query_content(
+        origin: &str,
+        requests: &std::sync::atomic::AtomicUsize,
+    ) -> (datafusion::error::Result<Vec<String>>, usize) {
+        let connector = test_connector_with(&[
+            ("file_format", "json"),
+            ("request_query_filters", "enabled"),
+            ("client_timeout", "300"),
+        ])
+        .await;
+        let dataset = test_dataset(&format!("{origin}/data"), RefreshMode::Append, None).await;
+        let provider = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
+            .await
+            .expect("build the HTTP provider");
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("origin", provider)
+            .expect("register the table");
+
+        let before = requests.load(std::sync::atomic::Ordering::SeqCst);
+        let rows = async {
+            let batches = ctx
+                .sql("SELECT content FROM origin")
+                .await?
+                .collect()
+                .await?;
+            Ok::<_, datafusion::error::DataFusionError>(
+                batches
+                    .iter()
+                    .flat_map(|batch| {
+                        let content = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringArray>()
+                            .expect("content is a string column");
+                        content
+                            .iter()
+                            .map(|value| value.unwrap_or_default().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect(),
+            )
+        }
+        .await;
+        let made = requests.load(std::sync::atomic::Ordering::SeqCst) - before;
+        (rows, made)
+    }
+
+    #[tokio::test]
+    async fn compression_bomb_is_refused_just_past_the_floor_without_retrying() {
+        let len = http_body_limit::RATIO_CHECK_FLOOR_BYTES + 64 * MIB;
+        let body = gzip_json(len, |_| b'A');
+        assert!(
+            body.len() * http_body_limit::MAX_COMPRESSION_RATIO < len,
+            "the response expands past the ratio: {} bytes on the wire",
+            body.len()
+        );
+        let (origin, requests) = serve_gzip(body).await;
+
+        let (rows, made) = query_content(&origin, &requests).await;
+        let message = match rows {
+            Err(error) => error.to_string(),
+            Ok(rows) => panic!(
+                "a compression bomb fails the query, but it returned rows of {:?} bytes",
+                rows.iter().map(String::len).collect::<Vec<_>>()
+            ),
+        };
+        let (prefix, rest) = message
+            .split_once(" decoded (")
+            .unwrap_or_else(|| panic!("no byte counts in {message}"));
+        let (counts, suffix) = rest
+            .split_once(" received)")
+            .unwrap_or_else(|| panic!("no byte counts in {message}"));
+        assert!(
+            prefix.ends_with(&format!(
+                "Failed to read the response from {origin} for dataset 'http_test': the \
+                 gzip-compressed response body expanded more than 100:1 when"
+            )),
+            "{message}"
+        );
+        assert_eq!(
+            suffix,
+            ", which is refused once a body passes 64 MiB decoded. Ask the endpoint for an \
+             uncompressed response by adding `Accept-Encoding: identity` to `http_headers`, \
+             or request less data per call. \
+             See: https://spiceai.org/docs/components/data-connectors/https"
+        );
+
+        // Refused as soon as it passed the floor: never more than one decode block past it.
+        let (decoded, received) = counts
+            .split_once(" bytes from ")
+            .unwrap_or_else(|| panic!("malformed byte counts in {message}"));
+        let decoded: usize = decoded.parse().expect("decoded byte count");
+        let received: usize = received.parse().expect("received byte count");
+        assert!(
+            decoded > http_body_limit::RATIO_CHECK_FLOOR_BYTES
+                && decoded
+                    <= http_body_limit::RATIO_CHECK_FLOOR_BYTES
+                        + http_body_limit::DECODE_BLOCK_BYTES,
+            "refused at {decoded} decoded bytes"
+        );
+        assert!(decoded > received * http_body_limit::MAX_COMPRESSION_RATIO);
+
+        // The refusal is permanent: the origin is asked once, not once per retry.
+        assert_eq!(made, 1);
+    }
+
+    #[tokio::test]
+    async fn large_compressed_response_at_a_realistic_ratio_is_read_in_full() {
+        let len = http_body_limit::RATIO_CHECK_FLOOR_BYTES + 16 * MIB;
+        let body = gzip_json(len, ids);
+        let ratio = len / body.len();
+        assert!(
+            (2..http_body_limit::MAX_COMPRESSION_RATIO).contains(&ratio),
+            "the response compresses {ratio}:1"
+        );
+        let (origin, requests) = serve_gzip(body).await;
+
+        let (rows, made) = query_content(&origin, &requests).await;
+        let rows = rows.expect("a large compressed response at a realistic ratio is read");
+        assert_eq!(rows.len(), 1);
+        let row = rows[0].as_bytes();
+        assert_eq!(row.len(), len);
+        assert_eq!(&row[..6], br#"{"a":""#);
+        assert_eq!(&row[len - 2..], br#""}"#);
+        assert!(
+            row[6..len - 2]
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == ids(i)),
+            "the decoded response matches what was sent"
+        );
+        assert_eq!(made, 1);
     }
 }

@@ -32,6 +32,8 @@ pub enum Capability {
     Chat,
     /// The `OpenAI` Responses API: `/v1/responses`.
     Responses,
+    /// The Anthropic Messages API: `/v1/messages`.
+    Messages,
     /// Decisions: `/v1/decisions`, the SQL decision functions and decision-based rerank.
     Decisions,
 }
@@ -45,6 +47,15 @@ pub enum DecisionsBackend {
     ViaChat,
 }
 
+/// How a model answers the Messages API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessagesBackend {
+    /// The provider's own Messages API: Anthropic's.
+    Native,
+    /// The request translated into a chat completion, and the completion back.
+    ViaChat,
+}
+
 /// What a model can serve.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelCapabilities {
@@ -52,6 +63,7 @@ pub struct ModelCapabilities {
     chat: bool,
     responses: bool,
     native_decisions: bool,
+    messages: Option<MessagesBackend>,
 }
 
 /// What a model-id rule adds to its provider's default. It has no way to remove a
@@ -82,6 +94,7 @@ impl ModelCapabilities {
             Capability::Chat => self.chat,
             Capability::Responses => self.responses,
             Capability::Decisions => self.decisions().is_some(),
+            Capability::Messages => self.messages.is_some(),
         }
     }
 
@@ -96,6 +109,13 @@ impl ModelCapabilities {
         } else {
             None
         }
+    }
+
+    /// How the model answers the Messages API: through its provider's when it has one, else
+    /// through chat. `None` for a model with neither.
+    #[must_use]
+    pub fn messages(&self) -> Option<MessagesBackend> {
+        self.messages
     }
 
     fn with(mut self, additions: Additions) -> Self {
@@ -113,9 +133,16 @@ fn provider_default(provider: ModelSource) -> ModelCapabilities {
             chat: true,
             responses: true,
             native_decisions: false,
+            messages: Some(MessagesBackend::ViaChat),
         },
-        ModelSource::Anthropic
-        | ModelSource::Bedrock
+        ModelSource::Anthropic => ModelCapabilities {
+            provider,
+            chat: true,
+            responses: false,
+            native_decisions: false,
+            messages: Some(MessagesBackend::Native),
+        },
+        ModelSource::Bedrock
         | ModelSource::Databricks
         | ModelSource::File
         | ModelSource::Google
@@ -125,12 +152,14 @@ fn provider_default(provider: ModelSource) -> ModelCapabilities {
             chat: true,
             responses: false,
             native_decisions: false,
+            messages: Some(MessagesBackend::ViaChat),
         },
         ModelSource::TypeSafe => ModelCapabilities {
             provider,
             chat: false,
             responses: false,
             native_decisions: true,
+            messages: None,
         },
     }
 }
@@ -215,6 +244,27 @@ mod tests {
             assert!(
                 found.has(Capability::Chat),
                 "an id rule never removes chat: {from}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_serves_messages_natively_and_every_other_chat_model_through_chat() {
+        for (from, messages) in [
+            ("anthropic:claude-sonnet-4-6", Some(MessagesBackend::Native)),
+            ("openai:gpt-4o-mini", Some(MessagesBackend::ViaChat)),
+            (
+                "bedrock:anthropic.claude-sonnet-4-6",
+                Some(MessagesBackend::ViaChat),
+            ),
+            ("spiceai:chat-only", Some(MessagesBackend::ViaChat)),
+            ("typesafe:jev", None),
+        ] {
+            let found = capabilities(from);
+            assert_eq!(
+                (found.messages(), found.has(Capability::Messages)),
+                (messages, messages.is_some()),
+                "{from}"
             );
         }
     }

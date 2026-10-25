@@ -45,6 +45,7 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::DeferredRefreshOutcome;
 use crate::datafusion::error::format_datafusion_error;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::model::LLMMessagesModelStore;
 use crate::model::LLMResponsesModelStore;
 use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
@@ -878,6 +879,11 @@ impl Runtime {
     #[must_use]
     pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
         self.llm_runtime_stores.responses_llms()
+    }
+
+    #[must_use]
+    pub fn messages_llms(&self) -> Arc<RwLock<LLMMessagesModelStore>> {
+        self.llm_runtime_stores.messages_llms()
     }
 
     #[must_use]
@@ -2173,13 +2179,14 @@ impl Runtime {
             }
         });
 
-        if let Some(cfg) = self
+        let management_cfg = self
             .app
             .read()
             .await
             .as_ref()
-            .and_then(|app| app.management.as_ref())
-            && let Err(err) = management::init_management(Arc::clone(&self), cfg).await
+            .and_then(|app| app.management.clone());
+        if let Some(cfg) = management_cfg
+            && let Err(err) = management::init_management(Arc::clone(&self), &cfg).await
         {
             tracing::error!("Failed to initialize management of the Spice runtime: {err}");
         }
