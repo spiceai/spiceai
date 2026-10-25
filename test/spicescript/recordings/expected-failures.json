@@ -4228,14 +4228,6 @@
     {
       "run": "surface",
       "who": "sqlite",
-      "key": "query: SELECT id, d / 3 AS third, d * d AS sq FROM ev WHERE id < 60",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"third\", row_number: 8, expected: \"\\\"-9.66666667\\\"\", actual: \"\\\"-9.00000000\\\"\" }",
-      "group": "sqlite"
-    },
-    {
-      "run": "surface",
-      "who": "sqlite",
       "key": "query: SELECT id, split_part(s, ',', 2) AS p2, strpos(s, 'a') AS pos, initcap(s) AS cap FROM ev WHERE s IS NOT NULL",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: split_part in SELECT `ev`.`id`, split_part(`ev`.`s`, ',', 2) AS `p2`, strpos(`ev`.`s`, 'a') AS `pos`, initcap(`ev`.`s`) AS `cap` FROM `ev",
