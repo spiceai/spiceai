@@ -485,6 +485,82 @@ async fn mysql_cayenne_integer_to_zero_scale_decimal_keeps_applying() -> Result<
         .await
 }
 
+/// An integer column followed to a `DECIMAL` with no fractional part keeps its
+/// integer type, so a later `ALTER` that gives the `DECIMAL` a scale stops the
+/// stream at the `ALTER`, under either policy, as the direct retype from the
+/// integer does: the dataset still stores the column as an integer.
+async fn zero_scale_decimal_kept_as_integer_to_scaled_decimal_stops(
+    table: &str,
+    policy: OnSchemaChange,
+) -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+    test_request_context()
+        .scope(async {
+            let container = common::start_mysql_docker_container().await?;
+            let port = container.host_port(3306)?;
+            let dir = tempfile::tempdir()?;
+            let (pool, rt) = start(port, table, "INT", "cayenne", policy, dir.path()).await?;
+            exec(
+                &pool,
+                &format!("ALTER TABLE {table} MODIFY k DECIMAL(10,0)"),
+            )
+            .await?;
+            exec(&pool, &format!("INSERT INTO {table} VALUES (4, 7)")).await?;
+            wait_for(
+                &rt,
+                &format!("SELECT id, k, arrow_typeof(k) AS t FROM {table} WHERE id = 4"),
+                "+----+---+-------+\n\
+                 | id | k | t     |\n\
+                 +----+---+-------+\n\
+                 | 4  | 7 | Int32 |\n\
+                 +----+---+-------+",
+            )
+            .await?;
+
+            exec(
+                &pool,
+                &format!("ALTER TABLE {table} MODIFY k DECIMAL(12,2)"),
+            )
+            .await?;
+            let message = wait_for_stream_error(&rt, table).await?;
+            assert_eq!(
+                message,
+                stop_message(
+                    table,
+                    &format!("ALTER TABLE {table} MODIFY k DECIMAL(12,2)"),
+                    "column 'k' changed from `decimal(10,0)` to `decimal(12,2)`, and the dataset \
+                     keeps the column's integer type, which cannot store a fractional value"
+                )
+            );
+            exec(&pool, &format!("INSERT INTO {table} VALUES (5, 1.5)")).await?;
+            assert_never_applied(&rt, table, 5).await
+        })
+        .await
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_cayenne_block_zero_scale_decimal_kept_as_integer_to_scaled_decimal_stops()
+-> Result<(), anyhow::Error> {
+    zero_scale_decimal_kept_as_integer_to_scaled_decimal_stops(
+        "type_change_dec0_dec2_block",
+        OnSchemaChange::Block,
+    )
+    .await
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_cayenne_sync_all_columns_zero_scale_decimal_kept_as_integer_to_scaled_decimal_stops()
+-> Result<(), anyhow::Error> {
+    zero_scale_decimal_kept_as_integer_to_scaled_decimal_stops(
+        "type_change_dec0_dec2_sync",
+        OnSchemaChange::SyncAllColumns,
+    )
+    .await
+}
+
 /// Under `block` a `FLOAT` column keeps its registered `Float32` type, so a
 /// `DOUBLE` it becomes stops the stream at the `ALTER` rather than storing
 /// `16777217` rounded to `16777216`.

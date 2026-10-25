@@ -827,7 +827,10 @@ fn lossy_retype(
 /// - An integer column that becomes a `DECIMAL` with a scale keeps its integer
 ///   type, since no accelerator widens an integer to a decimal, so the first
 ///   fractional value the source sends would fail to decode. A scale of `0`
-///   holds only integers, which decode exactly into the integer type.
+///   holds only integers, which decode exactly into the integer type. The
+///   column's built type counts as well as its old source type: one followed
+///   from `INT` to `DECIMAL(10,0)` is still built as an integer, so a scale its
+///   `DECIMAL` gains later is refused too.
 /// - A column still built as `Float32` (under `block`, or a primary key under
 ///   `sync_all_columns`) whose source is no longer `FLOAT` would have its new
 ///   values rounded to `f32` with nothing to say so.
@@ -852,7 +855,7 @@ fn unfollowable_retype(
             if from == to {
                 return None;
             }
-            let reason = if from.is_integer()
+            let reason = if (from.is_integer() || field.data_type().is_integer())
                 && matches!(
                     to,
                     DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale) if scale > 0
@@ -1782,6 +1785,23 @@ mod tests {
         assert_eq!(refused(&registered, "decimal(10,0)", "float"), None);
         assert_eq!(refused(&registered, "bigint", "float"), None);
         assert_eq!(refused(&registered, "int", "float"), None);
+        // A column followed from `INT` to `DECIMAL(10,0)` is still built as
+        // `Int32`, so a scale its `DECIMAL` gains later is refused as well.
+        let zero_scale_old = layout_of(&[("id", "bigint"), ("k", "decimal(10,0)"), ("f", "float")]);
+        assert_eq!(
+            unfollowable_retype(
+                &registered,
+                &zero_scale_old,
+                &layout("decimal(12,2)", "float"),
+                &[0, 1, 2]
+            ),
+            Some(RetypeRefusal::new(
+                "k",
+                "decimal(10,0)",
+                "decimal(12,2)",
+                RetypeRefusalReason::FractionIntoInteger
+            ))
+        );
 
         // An unsigned integer column reads decimal text as `BIT` bytes, so a
         // `DECIMAL` source is refused at any scale; a signed one parses it.
