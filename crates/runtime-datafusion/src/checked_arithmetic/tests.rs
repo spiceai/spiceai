@@ -16,7 +16,9 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, UInt64Array};
+use arrow::array::{
+    ArrayRef, Decimal128Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::array_value_to_string;
 use datafusion::catalog::MemTable;
@@ -1036,6 +1038,231 @@ async fn checked_sum_matches_across_eager_aggregation_and_overflows_when_true_to
         eprintln!("eager off pushed={off_pushed} rows={expected_cancel:?}\n{off_plan}");
         eprintln!("overflow on: {ovf_on}\n{ovf_on_plan}");
         eprintln!("overflow off: {ovf_off}\n{ovf_off_plan}");
+    }
+}
+
+fn cancel_across_groups_cast_batch() -> RecordBatch {
+    let max = i64::MAX.to_string();
+    let neg = (-i64::MAX).to_string();
+    let decimals = Decimal128Array::from(vec![
+        Some(i128::from(i64::MAX)),
+        Some(i128::from(i64::MAX)),
+        Some(-i128::from(i64::MAX)),
+    ])
+    .with_precision_and_scale(38, 0)
+    .expect("decimal128 cancel values");
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("d", DataType::Decimal128(38, 0), true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some(max.as_str()),
+                Some(max.as_str()),
+                Some(neg.as_str()),
+            ])),
+            Arc::new(decimals),
+        ],
+    )
+    .expect("cast-cancel batch")
+}
+
+fn true_total_overflow_cast_batch() -> RecordBatch {
+    let max = i64::MAX.to_string();
+    let decimals = Decimal128Array::from(vec![
+        Some(i128::from(i64::MAX)),
+        Some(i128::from(i64::MAX)),
+        Some(i128::from(i64::MAX)),
+    ])
+    .with_precision_and_scale(38, 0)
+    .expect("decimal128 overflow values");
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("d", DataType::Decimal128(38, 0), true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some(max.as_str()),
+                Some(max.as_str()),
+                Some(max.as_str()),
+            ])),
+            Arc::new(decimals),
+        ],
+    )
+    .expect("cast-overflow batch")
+}
+
+fn eager_join_cast_amount(i: i32) -> i64 {
+    let fk = i % 100;
+    let nth = (i - 1) / 100;
+    match (fk, nth) {
+        (1, 0 | 1) => i64::MAX,
+        (2, 0) => -i64::MAX,
+        _ => 0,
+    }
+}
+
+fn register_eager_join_cast_tables(ctx: &SessionContext) {
+    let amounts: Vec<i64> = (1..=10_000).map(eager_join_cast_amount).collect();
+    let strings: Vec<String> = amounts.iter().map(ToString::to_string).collect();
+    let decimals = Decimal128Array::from(
+        amounts
+            .iter()
+            .map(|value| Some(i128::from(*value)))
+            .collect::<Vec<_>>(),
+    )
+    .with_precision_and_scale(38, 0)
+    .expect("eager-join decimal amounts");
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("fk", DataType::Int32, false),
+        Field::new("amount_str", DataType::Utf8, false),
+        Field::new("amount_dec", DataType::Decimal128(38, 0), false),
+    ]));
+    let fact = RecordBatch::try_new(
+        Arc::clone(&fact_schema),
+        vec![
+            Arc::new(Int32Array::from_iter_values((1..=10_000).map(|i| i % 100))) as ArrayRef,
+            Arc::new(StringArray::from_iter_values(strings)),
+            Arc::new(decimals),
+        ],
+    )
+    .expect("eager-join cast fact batch");
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("dk", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let dim = RecordBatch::try_new(
+        Arc::clone(&dim_schema),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..100)) as ArrayRef,
+            Arc::new(StringArray::from_iter_values((0..100).map(|k| {
+                if k == 1 || k == 2 {
+                    "g".to_string()
+                } else {
+                    format!("n{k}")
+                }
+            }))),
+        ],
+    )
+    .expect("eager-join cast dim batch");
+    for (name, schema, batch) in [
+        ("fact_cast", fact_schema, fact),
+        ("dim_cast", dim_schema, dim),
+    ] {
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("mem table");
+        ctx.register_table(name, Arc::new(table))
+            .expect("register eager-join cast table");
+    }
+}
+
+const EAGER_JOIN_CAST_SUM_SQL: &str = "SELECT d.name, SUM(CAST(f.amount_str AS BIGINT)) AS total \
+     FROM fact_cast f JOIN dim_cast d ON f.fk = d.dk WHERE f.fk IN (1, 2) GROUP BY d.name";
+const EAGER_JOIN_TRY_CAST_SUM_SQL: &str = "SELECT d.name, SUM(TRY_CAST(f.amount_dec AS BIGINT)) AS total \
+     FROM fact_cast f JOIN dim_cast d ON f.fk = d.dk WHERE f.fk IN (1, 2) GROUP BY d.name";
+
+/// Copilot on `804b67cd53`: the unwrap helpers used to strip every
+/// `CAST` / `TRY_CAST`, so `SUM(CAST(utf8 AS BIGINT))` and
+/// `SUM(TRY_CAST(decimal AS BIGINT))` looked like non-64-bit SUMs and
+/// could complete early. Keys `[1, 1, 2]`, values `[MAX, MAX, -MAX]`.
+#[tokio::test]
+async fn checked_sum_cast_and_try_cast_to_bigint_cancel_across_single_distinct_and_eager() {
+    let expected_sum = vec![i64::MAX.to_string()];
+    let expected_mixed = vec![format!("{} 2", i64::MAX)];
+    let expected_join = vec![format!("g {}", i64::MAX)];
+
+    let ctx = checked_session();
+    register_table(&ctx, "t_cast", cancel_across_groups_cast_batch());
+
+    for (label, sum_sql, mixed_sql) in [
+        (
+            "CAST(utf8 AS BIGINT)",
+            "SELECT SUM(CAST(s AS BIGINT)) FROM t_cast",
+            "SELECT SUM(CAST(s AS BIGINT)), COUNT(DISTINCT k) FROM t_cast",
+        ),
+        (
+            "TRY_CAST(decimal AS BIGINT)",
+            "SELECT SUM(TRY_CAST(d AS BIGINT)) FROM t_cast",
+            "SELECT SUM(TRY_CAST(d AS BIGINT)), COUNT(DISTINCT k) FROM t_cast",
+        ),
+    ] {
+        let (sum_plan, sum_rows) = plan_and_collect(&ctx, sum_sql).await;
+        assert_plan_ran(&sum_plan, sum_sql, &["AggregateExec"]);
+        assert_eq!(
+            render_rows(&sum_rows),
+            expected_sum,
+            "{label}: MAX+MAX+(-MAX) is MAX\nplan:\n{sum_plan}"
+        );
+
+        let (mixed_plan, mixed_rows) = plan_and_collect(&ctx, mixed_sql).await;
+        assert_plan_ran(&mixed_plan, mixed_sql, &["AggregateExec"]);
+        assert_eq!(
+            render_rows(&mixed_rows),
+            expected_mixed,
+            "{label}: mixed SUM + COUNT(DISTINCT) must match SUM and count two keys\nplan:\n{mixed_plan}"
+        );
+        assert!(
+            mixed_plan.contains("DISTINCT"),
+            "{label}: checked CAST/TRY_CAST SUM must stay out of single_distinct_to_groupby\nplan:\n{mixed_plan}"
+        );
+    }
+
+    register_table(&ctx, "t_cast_ovf", true_total_overflow_cast_batch());
+    for (label, sql) in [
+        (
+            "CAST overflow",
+            "SELECT SUM(CAST(s AS BIGINT)), COUNT(DISTINCT k) FROM t_cast_ovf",
+        ),
+        (
+            "TRY_CAST overflow",
+            "SELECT SUM(TRY_CAST(d AS BIGINT)), COUNT(DISTINCT k) FROM t_cast_ovf",
+        ),
+    ] {
+        let (ovf_plan, ovf) = plan_and_error(&ctx, sql).await;
+        assert_plan_ran(&ovf_plan, sql, &["AggregateExec"]);
+        assert!(
+            contains_overflow(&ovf),
+            "{label}: MAX+MAX+MAX must overflow, got {ovf}\nplan:\n{ovf_plan}"
+        );
+    }
+
+    let ctx_on = checked_session_with_eager(true);
+    register_eager_join_cast_tables(&ctx_on);
+    let ctx_off = checked_session_with_eager(false);
+    register_eager_join_cast_tables(&ctx_off);
+
+    for (label, sql) in [
+        ("CAST eager", EAGER_JOIN_CAST_SUM_SQL),
+        ("TRY_CAST eager", EAGER_JOIN_TRY_CAST_SUM_SQL),
+    ] {
+        let (on_pushed, on_plan, on_rows) = plan_eager_join_sql(&ctx_on, sql).await;
+        assert!(
+            !on_pushed,
+            "{label} on: must stay out of EagerAggregation\nplan:\n{on_plan}"
+        );
+        let on_rows = on_rows.unwrap_or_else(|error| {
+            panic!("{label} on: representable join SUM must not overflow, got {error}\nplan:\n{on_plan}")
+        });
+        assert_eq!(
+            on_rows, expected_join,
+            "{label} on: join-key [MAX, MAX] + [-MAX] must cancel to MAX\nplan:\n{on_plan}"
+        );
+
+        let (off_pushed, off_plan, off_rows) = plan_eager_join_sql(&ctx_off, sql).await;
+        assert!(
+            !off_pushed,
+            "{label} off: nothing may be pre-aggregated below the join:\n{off_plan}"
+        );
+        assert_eq!(
+            off_rows.expect("eager off CAST/TRY_CAST SUM must succeed"),
+            expected_join,
+            "{label} off: join-key [MAX, MAX] + [-MAX] must cancel to MAX\nplan:\n{off_plan}"
+        );
     }
 }
 

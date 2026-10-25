@@ -33,7 +33,7 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::eager_aggregation::EagerAggregation;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateInputMode};
 
 use super::decomposability::{complete_preaggregate_would_narrow_early, physical_source_arg_types};
 
@@ -55,7 +55,12 @@ impl CheckedEagerAggregation {
 }
 
 fn plan_has_checked_integer_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+        // Merge stages keep the original args (`CAST(n AS Int64)`) but sit
+        // on the partial-state schema, so resolving those args there can
+        // look like `CAST(utf8 AS Int64)` and false-skip `SUM(INT)`.
+        && aggregate.mode().input_mode() == AggregateInputMode::Raw
+    {
         let input_schema = aggregate.input().schema();
         if aggregate.aggr_expr().iter().any(|expr| {
             complete_preaggregate_would_narrow_early(
