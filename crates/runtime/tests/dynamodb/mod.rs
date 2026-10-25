@@ -113,8 +113,22 @@ async fn dynamodb_scan_no_filter() -> Result<(), anyhow::Error> {
                 () = cloned_rt.load_components() => {}
             }
 
-            run_and_snapshot_query(&rt, "SELECT * FROM test_dynamodb ORDER BY id;", "full_scan")
-                .await?;
+            // DynamoDB sets have no element order; sort their list projections for the snapshot.
+            run_and_snapshot_query(
+                &rt,
+                "SELECT col_binary, array_sort(col_binary_set) AS col_binary_set, col_bool, \
+                 col_date, col_list, \"col_map_fully_unnested.age\", \
+                 \"col_map_fully_unnested.balance\", \"col_map_fully_unnested.is_active\", \
+                 \"col_map_fully_unnested.name\", \"col_map_partially_unnested.foo\", \
+                 \"col_map_partially_unnested.nested_lvl_1\", col_number_float, \
+                 col_number_int, col_number_scientific, \
+                 array_sort(col_number_set_float) AS col_number_set_float, \
+                 array_sort(col_number_set_int) AS col_number_set_int, col_string, \
+                 array_sort(col_string_set) AS col_string_set, col_time, col_timestamp, \
+                 col_timestamp_tz, id, version FROM test_dynamodb ORDER BY id;",
+                "full_scan",
+            )
+            .await?;
 
             Ok(())
         })
@@ -591,8 +605,12 @@ async fn dynamodb_json_nesting_simple() -> Result<(), anyhow::Error> {
                 () = cloned_rt.load_components() => {}
             }
 
-            run_and_snapshot_query(&rt, r"SELECT * FROM test_dynamodb", "json_nesting_simple")
-                .await?;
+            run_and_snapshot_json_query(
+                &rt,
+                r"SELECT * FROM test_dynamodb ORDER BY id DESC",
+                "json_nesting_simple",
+            )
+            .await?;
 
             Ok(())
         })
@@ -634,9 +652,9 @@ async fn dynamodb_json_nesting_with_unnest() -> Result<(), anyhow::Error> {
                 () = cloned_rt.load_components() => {}
             }
 
-            run_and_snapshot_query(
+            run_and_snapshot_json_query(
                 &rt,
-                r"SELECT * FROM test_dynamodb",
+                r"SELECT * FROM test_dynamodb ORDER BY id DESC",
                 "json_nesting_with_unnest",
             )
             .await?;
@@ -651,6 +669,23 @@ async fn run_and_snapshot_query(
     query: &str,
     test_name: &str,
 ) -> Result<(), anyhow::Error> {
+    run_and_snapshot_query_with_json_sets(rt, query, test_name, false).await
+}
+
+async fn run_and_snapshot_json_query(
+    rt: &Runtime,
+    query: &str,
+    test_name: &str,
+) -> Result<(), anyhow::Error> {
+    run_and_snapshot_query_with_json_sets(rt, query, test_name, true).await
+}
+
+async fn run_and_snapshot_query_with_json_sets(
+    rt: &Runtime,
+    query: &str,
+    test_name: &str,
+    normalize_json_sets: bool,
+) -> Result<(), anyhow::Error> {
     let mut query_result = rt
         .datafusion()
         .query_builder(query)
@@ -661,13 +696,62 @@ async fn run_and_snapshot_query(
 
     let mut batches = vec![];
     while let Some(batch) = query_result.data.next().await {
-        batches.push(batch?);
+        let batch = batch?;
+        batches.push(if normalize_json_sets {
+            normalize_json_sets_in_batch(&batch)?
+        } else {
+            batch
+        });
     }
 
     let formatted = arrow::util::pretty::pretty_format_batches(&batches)
         .map_err(|e| anyhow::Error::msg(e.to_string()))?;
     insta::assert_snapshot!(test_name, formatted);
     Ok(())
+}
+
+fn normalize_json_sets_in_batch(
+    batch: &arrow::record_batch::RecordBatch,
+) -> Result<arrow::record_batch::RecordBatch, anyhow::Error> {
+    use arrow::array::{Array, StringArray};
+
+    // Keep list ordering intact while making DynamoDB set values stable in JSON snapshots.
+    anyhow::ensure!(batch.num_columns() == 2, "Expected JSON and id columns");
+    let json_column = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow::anyhow!("Expected JSON string column"))?;
+    let normalized = (0..json_column.len())
+        .map(|row| {
+            if json_column.is_null(row) {
+                return Ok(None);
+            }
+            let mut value: serde_json::Value = serde_json::from_str(json_column.value(row))?;
+            for name in [
+                "col_binary_set",
+                "col_number_set_float",
+                "col_number_set_int",
+                "col_string_set",
+            ] {
+                if let Some(values) = value
+                    .get_mut(name)
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    values.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+                }
+            }
+            Ok(Some(serde_json::to_string(&value)?))
+        })
+        .collect::<Result<Vec<_>, anyhow::Error>>()?;
+
+    Ok(arrow::record_batch::RecordBatch::try_new(
+        batch.schema(),
+        vec![
+            Arc::new(StringArray::from(normalized)),
+            Arc::clone(batch.column(1)),
+        ],
+    )?)
 }
 
 fn get_test_dataset(
