@@ -390,8 +390,7 @@ async fn reads_replicated_snapshots_in_the_engine_that_created_them() -> Result<
             let (rustfs, container) = start_rustfs(REPLICATED).await?;
             let result = replicated_snapshots_scenario(rustfs, &modules, &orders).await;
             remove_local_copies(&[&modules, &orders]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -505,8 +504,7 @@ async fn waits_for_the_first_snapshot_to_be_published() -> Result<()> {
             let (rustfs, container) = start_rustfs(FIRST_SNAPSHOT).await?;
             let result = first_snapshot_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -642,8 +640,7 @@ async fn loads_a_snapshot_dataset_that_a_reload_adds() -> Result<()> {
             let (rustfs, container) = start_rustfs(RELOAD).await?;
             let result = reload_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -691,8 +688,7 @@ async fn a_moved_dataset_never_serves_the_previous_locations_rows() -> Result<()
             let (rustfs, container) = start_rustfs(MOVED).await?;
             let result = moved_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -776,8 +772,7 @@ async fn refuses_snapshots_of_a_publisher_that_stores_some_columns() -> Result<(
             let (rustfs, container) = start_rustfs(PROJECTED).await?;
             let result = projected_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -865,8 +860,7 @@ async fn a_replaced_snapshot_dataset_stops_waiting_for_its_snapshot() -> Result<
             let (rustfs, container) = start_rustfs(REPLACED).await?;
             let result = replaced_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -1025,8 +1019,7 @@ async fn a_replaced_snapshot_dataset_waits_for_its_in_progress_restore() -> Resu
             let (rustfs, container) = start_rustfs(RESTORE_HELD).await?;
             let result = restore_held_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -1145,8 +1138,7 @@ async fn restores_cayenne_snapshots_to_the_paths_the_dataset_sets() -> Result<()
             let (rustfs, container) = start_rustfs(CUSTOM_PATHS).await?;
             let result = custom_paths_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -1223,8 +1215,7 @@ async fn a_reader_reclaims_the_snapshot_directories_a_reload_supersedes() -> Res
             let (rustfs, container) = start_rustfs(RECLAIM).await?;
             let result = reclaim_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -1435,8 +1426,7 @@ async fn refuses_cayenne_paths_for_another_engines_snapshots() -> Result<()> {
             let (rustfs, container) = start_rustfs(OTHER_ENGINE_PATHS).await?;
             let result = other_engine_paths_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -1602,8 +1592,7 @@ async fn counts_the_polls_that_cannot_advance_to_the_published_snapshot() -> Res
             let (rustfs, container) = start_rustfs(METRICS).await?;
             let result = metrics_scenario(rustfs, &container, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }

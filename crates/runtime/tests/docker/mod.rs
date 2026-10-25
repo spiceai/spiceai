@@ -112,6 +112,24 @@ impl RunningContainer {
         Ok(())
     }
 
+    /// Removes the container once a test's scenario has finished, and returns the
+    /// scenario's result. A removal that fails, such as one timing out on a stalled
+    /// daemon, is reported like a failed removal in `Drop` instead of being returned:
+    /// it must not replace the scenario's error, nor fail a scenario that passed.
+    /// `Drop` then tries the removal again.
+    pub async fn remove_after<T>(
+        &self,
+        scenario: Result<T, anyhow::Error>,
+    ) -> Result<T, anyhow::Error> {
+        if let Err(e) = self.remove().await {
+            eprintln!(
+                "failed to remove test container {} ({}): {e}",
+                self.name, self.id
+            );
+        }
+        scenario
+    }
+
     pub async fn stop(&self) -> Result<(), anyhow::Error> {
         Ok(self.docker.stop_container(&self.id, None).await?)
     }
