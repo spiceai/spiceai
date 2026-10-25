@@ -270,6 +270,34 @@ stall_after=${SPICE_FAKE_STALL_AFTER_TURN:-0}
 # consumes the stream with a greedy catch-all eats the first piece and then
 # waits forever for a prompt that has already gone by.
 split_prompt=${SPICE_FAKE_SPLIT_PROMPT:-0}
+# Fails this turn the way both REPLs report a failed request: a red `Error`
+# line, then straight back to the prompt.
+error_turn=${SPICE_FAKE_ERROR_TURN:-0}
+# Answers with text that mentions an error without being one: a model talking
+# about an error, or a search result whose content contains the word.
+mention_error=${SPICE_FAKE_ANSWER_MENTIONS_ERROR:-0}
+# Fails mid-answer with the error line split across two reads, the way a
+# request that dies while streaming can reach the script.
+split_error=${SPICE_FAKE_SPLIT_ERROR:-0}
+# The REPL's spinner, drawn the way `repl::util::Spinner` draws it: a frame
+# after a bare carriage return every 80ms, then `\r  \r` to clear it. It runs
+# from the request until the first token, and writes no newline.
+spinner_secs=${SPICE_FAKE_SPINNER_SECONDS:-0}
+# Answer tokens printed one at a time with no newline between them, the way
+# `spice chat` streams a one-sentence answer, before the rest of the answer.
+stream_tokens=${SPICE_FAKE_STREAM_TOKENS:-0}
+token_delay=${SPICE_FAKE_TOKEN_DELAY_SECONDS:-0}
+
+draw_spinner() {
+  spinner_end=$(($(date +%s) + spinner_secs))
+  while [ "$(date +%s)" -lt "$spinner_end" ]; do
+    printf '\r\342\240\213 '
+    sleep 0.08
+    printf '\r\342\240\231 '
+    sleep 0.08
+  done
+  printf '\r  \r'
+}
 
 write_prompt() {
   if [ "$split_prompt" -ne 0 ]; then
@@ -316,12 +344,41 @@ while IFS= read -r line; do
     emitted=$((emitted + 1))
   done
 
+  if [ "$spinner_secs" -gt 0 ]; then
+    draw_spinner
+  fi
+
+  emitted=0
+  while [ "$emitted" -lt "$stream_tokens" ]; do
+    sleep "$token_delay"
+    printf 'token%s ' "$((emitted + 1))"
+    emitted=$((emitted + 1))
+  done
+
+  if [ "$split_error" -ne 0 ]; then
+    printf '\033[31mEr'
+    sleep 0.5
+    printf 'ror\033[0m Failed to read the response stream\r\n'
+    write_prompt
+    continue
+  fi
+
   if [ "$stall_after" -ne 0 ] && [ "$turn" -ge "$stall_after" ]; then
     # No answer, no prompt, no exit: the script has to notice the silence. The
     # sleep only has to outlast the bound under test, and is kept short so a
     # stand-in that outlives its pty does not sit on the runner.
     sleep 30
     exit 45
+  fi
+
+  if [ "$error_turn" -ne 0 ] && [ "$turn" -eq "$error_turn" ]; then
+    printf '\033[31mError\033[0m Failed to send the request: connection refused\r\n'
+    write_prompt
+    continue
+  fi
+
+  if [ "$mention_error" -ne 0 ]; then
+    printf 'An ERROR line in a log, or an Error: message, is not a failed request.\r\n'
   fi
 
   if [ "$mode" = 'search' ]; then
@@ -409,6 +466,39 @@ assert_reports 'Checking the chat REPL is still running'
 assert_reports 'exited with status 44'
 
 # ---------------------------------------------------------------------------
+# A request the REPL reports as failed
+# ---------------------------------------------------------------------------
+#
+# Both REPLs print a failed request as a red `Error` line and return to the
+# prompt. The prompt alone cannot tell that turn from an answer, so each script
+# has to recognise the line itself; it used to wait for " ERROR ", which the CLI
+# never prints, and passed every turn that failed.
+
+for script in chat_01.exp chat_01_simple.exp search_01.exp; do
+  script_case "$script when the REPL reports a failed request" "$script" \
+    SPICE_FAKE_ERROR_TURN=1
+  assert_status 1
+  assert_reports 'the REPL reported a failed request'
+  assert_reports 'connection refused'
+  assert_silent_about 'returned expected'
+  assert_silent_about 'Model confirmed access'
+
+  # The word on its own is not the marker: an answer about an error, or a search
+  # result that contains one, is still an answer.
+  script_case "$script when an answer mentions an error" "$script" \
+    SPICE_FAKE_ANSWER_MENTIONS_ERROR=1
+  assert_status 0
+  assert_silent_about 'the REPL reported a failed request'
+  assert_silent_about 'Error detected'
+done
+
+# A failed request on a later turn is caught there, not only on the first.
+script_case 'chat_01.exp when the REPL reports a failed request on the second turn' chat_01.exp \
+  SPICE_FAKE_ERROR_TURN=2
+assert_status 1
+assert_reports 'Waiting for the issue count: the REPL reported a failed request'
+
+# ---------------------------------------------------------------------------
 # What the wait on a REPL response is bounded by
 # ---------------------------------------------------------------------------
 #
@@ -484,6 +574,51 @@ script_case 'chat_01_simple.exp when the REPL streams part of an answer and then
   SPICE_REPL_IDLE_TIMEOUT=3 \
   SPICE_FAKE_STREAM_LINES=2 \
   SPICE_FAKE_STALL_AFTER_TURN=1
+assert_status 1
+assert_reports 'no output from the REPL for 3s'
+assert_reports 'Waiting for the response to'
+assert_silent_about 'Model returned expected response'
+
+# chat_01_simple.exp asks for one sentence, which `spice chat` prints token by
+# token with no newline until the answer is complete (#14967). Tokens arriving
+# for longer than the bound, behind the real spinner, are progress: each one
+# restarts the wait.
+script_case 'chat_01_simple.exp when a one-line answer streams for longer than the bound' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=4 \
+  SPICE_FAKE_SPINNER_SECONDS=1 \
+  SPICE_FAKE_STREAM_TOKENS=6 \
+  SPICE_FAKE_TOKEN_DELAY_SECONDS=2
+assert_status 0
+assert_silent_about 'no output from the REPL'
+
+# Same answer, with the prompt that ends it split across two reads: consuming
+# the streamed text must leave enough of it for the prompt branch.
+script_case 'chat_01_simple.exp when a one-line answer streams and the prompt arrives split' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=4 \
+  SPICE_FAKE_STREAM_TOKENS=3 \
+  SPICE_FAKE_TOKEN_DELAY_SECONDS=1 \
+  SPICE_FAKE_SPLIT_PROMPT=1
+assert_status 0
+assert_silent_about 'no output from the REPL'
+
+# Consuming streamed text must not consume part of the error line: a request
+# that fails mid-answer, with its error line split across two reads, still
+# fails the turn.
+script_case 'chat_01_simple.exp when a streamed answer ends in an error line split across two reads' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=4 \
+  SPICE_FAKE_STREAM_TOKENS=3 \
+  SPICE_FAKE_TOKEN_DELAY_SECONDS=1 \
+  SPICE_FAKE_SPLIT_ERROR=1
+assert_status 1
+assert_reports 'the REPL reported a failed request'
+assert_reports 'Failed to read the response stream'
+assert_silent_about 'Model returned expected response'
+
+# The spinner is not progress. A request that never gets a first token keeps
+# redrawing it, and that has to trip the bound like silence does.
+script_case 'chat_01_simple.exp when the request sits behind the spinner for longer than the bound' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=3 \
+  SPICE_FAKE_SPINNER_SECONDS=6
 assert_status 1
 assert_reports 'no output from the REPL for 3s'
 assert_reports 'Waiting for the response to'
