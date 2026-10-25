@@ -1,6 +1,6 @@
 name: cluster-text-search
 description: >
-  Known failing: empty answers, on a cluster only. `text_search` over a
+  Known failing (#15539): empty answers, on a cluster only. `text_search` over a
   Cayenne dataset with a full-text index returns no rows, with no error,
   although the dataset's rows are there and a plain query sees them; on one
   spiced the same search finds every matching row (search.yaml).

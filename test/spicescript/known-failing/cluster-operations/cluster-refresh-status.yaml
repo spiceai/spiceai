@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): on a cluster, a refresh requested from
+# Known failing (#15539): on a cluster, a refresh requested from
 # the scheduler runs (the next query sees the change), but the scheduler's
 # dataset status never records it: `last_refresh` stays as it was, so nothing
 # can tell when the refresh finished.

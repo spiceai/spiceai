@@ -1,3 +1,4 @@
+# Known failing (#15495).
 name: debezium-kafka-arrow
 description: >
   An Arrow acceleration of a Debezium topic in Kafka (`from: debezium:`)

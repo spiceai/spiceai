@@ -1,6 +1,6 @@
 name: append-same-time
 description: >
-  Known failing: silent row loss. Append refresh reads rows strictly newer
+  Known failing (#15542): silent row loss. Append refresh reads rows strictly newer
   than the stored maximum time, so a row committed after a refresh with the
   same time value as the newest loaded row is never loaded — for epoch
   seconds and for timestamps alike (two rows in one second are ordinary).

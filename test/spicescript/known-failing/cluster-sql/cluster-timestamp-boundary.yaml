@@ -1,6 +1,6 @@
 name: cluster-timestamp-boundary
 description: >
-  Known failing, on a cluster only (dynamodb-types.yaml passes on one
+  Known failing (#15539), on a cluster only (dynamodb-types.yaml passes on one
   spiced). Over DynamoDB items accelerated into Cayenne, `col_timestamp_tz >
   '2018-12-31 19:00:00.456Z'` returns the item whose value is exactly that
   instant ('2019-01-01T00:00:00.456+05:00'): a strict comparison answered as

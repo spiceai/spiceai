@@ -1,4 +1,4 @@
-# Known failing: after an incompatible source change and
+# Known failing (#15547): after an incompatible source change and
 # a restart, block, append_new_columns and sync_all_columns stop updating the
 # dataset and say so only in a WARN line; its status is Ready. (Before the
 # restart its refreshes fail and its status is Error, naming the column.) Move

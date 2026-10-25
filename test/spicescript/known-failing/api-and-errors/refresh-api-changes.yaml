@@ -1,6 +1,6 @@
 name: refresh-api-changes
 description: >
-  Known failing. A manual refresh of a `refresh_mode: changes` dataset is
+  Known failing (#15546). A manual refresh of a `refresh_mode: changes` dataset is
   refused, as documented, but with 500 and "Manual refresh is not supported
   for `append` mode. Only `full` refresh mode supports manual refreshes." —
   the dataset is in changes mode, and append datasets do accept manual

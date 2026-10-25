@@ -1,4 +1,4 @@
-# Known failing: a column widened at the source (int4 -> int8, with values only
+# Known failing (#15547): a column widened at the source (int4 -> int8, with values only
 # int8 holds) is not adopted by sync_all_columns under full refresh until a
 # restart (the refresh fails with a cast error). Under CDC, block and
 # append_new_columns stop applying changes and keep serving with an Error

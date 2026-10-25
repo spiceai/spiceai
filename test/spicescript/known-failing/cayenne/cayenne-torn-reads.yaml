@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): readers see part of a source
+# Known failing (#15540): readers see part of a source
 # transaction. A self-join of a CDC acceleration reads the table at two
 # points; in memory mode and on partitioned layouts a single scan can show a
 # moved row twice or half a transfer, and a partitioned full refresh exposes a

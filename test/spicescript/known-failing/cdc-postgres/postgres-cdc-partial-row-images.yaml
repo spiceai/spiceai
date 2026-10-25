@@ -1,4 +1,4 @@
-# Known failing: Fails under REPLICA IDENTITY DEFAULT for the same reason as cdc-unchanged-
+# Known failing (#15543): Fails under REPLICA IDENTITY DEFAULT for the same reason as cdc-unchanged-
 # toast-default-identity.yaml; passes under FULL.
 # Move this script to test/spicescript/ once it passes.
 name: postgres-cdc-partial-row-images

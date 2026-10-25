@@ -1,3 +1,4 @@
+# Known failing (#15546).
 name: http-float-specials
 description: >
   A query answers over HTTP (`/v1/sql`, JSON) as it does over Flight, NaN and

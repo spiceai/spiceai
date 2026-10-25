@@ -1,3 +1,4 @@
+# Known failing (#15545).
 name: postgres-timestamp-before-epoch
 description: >
   A PostgreSQL `timestamp` (without time zone) before 1970-01-01 reads as

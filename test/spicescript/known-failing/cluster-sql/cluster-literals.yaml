@@ -1,6 +1,6 @@
 name: cluster-literals
 description: >
-  Known failing, on a cluster only. The SQL sent to executors writes typed
+  Known failing (#15538), on a cluster only. The SQL sent to executors writes typed
   literals bare, so the executor reads them as other types: a REAL literal
   (`r = 0.1`) is read as a double and matches nothing, an infinity is
   written `inf` and read as a column name, and a 38-digit decimal is read

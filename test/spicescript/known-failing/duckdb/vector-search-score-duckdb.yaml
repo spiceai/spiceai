@@ -1,4 +1,4 @@
-# Known failing: vector_search on a DuckDB acceleration reports a different
+# Known failing (#15549): vector_search on a DuckDB acceleration reports a different
 # _score (0.655) from Arrow, Cayenne and the exact cosine similarity over the
 # stored embeddings (0.8275), though it ranks the rows the same.
 name: vector-search-score-duckdb

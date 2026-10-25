@@ -1,6 +1,6 @@
 name: memory-limit-spill
 description: >
-  Known failing. Under a small `runtime.query.memory_limit`, work that can
+  Known failing (#15541). Under a small `runtime.query.memory_limit`, work that can
   spill is refused instead: at 64 MiB, a global sort, distinct counts, a
   join and a partitioned window over 2 million rows of a Cayenne
   acceleration fail with "resources exhausted" (the sort-merge buffers of

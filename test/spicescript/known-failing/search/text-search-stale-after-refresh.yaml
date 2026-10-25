@@ -1,4 +1,4 @@
-# Known failing: after a refresh removes a document, text_search asked with
+# Known failing (#15547): after a refresh removes a document, text_search asked with
 # the same SQL text as before still answers with it (for at least 30 s, with
 # the SQL and search results caches disabled); the same search worded
 # differently answers correctly, as does vector_search with unchanged text.

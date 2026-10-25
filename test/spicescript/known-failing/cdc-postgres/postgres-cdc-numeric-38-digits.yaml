@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): PostgreSQL CDC fails to decode a
+# Known failing (#15543): PostgreSQL CDC fails to decode a
 # numeric(38, 10) value with 28 integer digits ("numeric magnitude exceeds
 # Decimal128 range"), and the dataset stops applying every later change.
 name: postgres-cdc-numeric-38-digits

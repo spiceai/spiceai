@@ -1,4 +1,4 @@
-# Known failing: Federated queries inherit the source's collation and accelerated ones
+# Known failing (#15545): Federated queries inherit the source's collation and accelerated ones
 # compare bytes, so accelerating a dataset changes string comparison and
 # grouping answers.
 # Move this script to test/spicescript/ once it passes.

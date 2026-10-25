@@ -1,4 +1,4 @@
-# Known failing: a federated table of files keeps its file listing and file
+# Known failing (#15547): a federated table of files keeps its file listing and file
 # metadata, so an added file is not seen. After files are replaced, local
 # Parquet reads fail ("Requested range was invalid", "Unexpected PageType"), a
 # local CSV query over byte ranges past the new end of a file never returns,

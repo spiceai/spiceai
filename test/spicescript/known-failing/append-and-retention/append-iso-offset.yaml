@@ -1,6 +1,6 @@
 name: append-iso-offset
 description: >
-  Known failing: silent, permanent row loss. Append refresh with an ISO 8601
+  Known failing (#15542): silent, permanent row loss. Append refresh with an ISO 8601
   text time column compares the text with the stored maximum as strings, so
   a value written with a non-UTC offset is ordered by its local digits, not
   by its instant: '2031-05-01T06:00:00-05:00' (11:00 UTC, the newest row)

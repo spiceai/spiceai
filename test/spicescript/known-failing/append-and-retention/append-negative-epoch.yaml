@@ -1,6 +1,6 @@
 name: append-negative-epoch
 description: >
-  Known failing. Append refresh with epoch milliseconds as the time column
+  Known failing (#15542). Append refresh with epoch milliseconds as the time column
   over rows before 1970: the initial load is right, but the next refresh
   fails "Integer time column value -133200000 is negative and cannot be
   used as a timestamp", the dataset goes to Error, and no later row loads.

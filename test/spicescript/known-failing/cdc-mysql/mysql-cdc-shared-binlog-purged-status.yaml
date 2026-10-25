@@ -1,3 +1,4 @@
+# Known failing (#15543).
 name: mysql-cdc-shared-binlog-purged-status
 description: >
   When the binlog that datasets sharing one MySQL connection would resume

@@ -1,6 +1,6 @@
 name: append-null-time
 description: >
-  Known failing: silent row loss. Append refresh reads rows newer than the
+  Known failing (#15542): silent row loss. Append refresh reads rows newer than the
   stored maximum of the time column, which a NULL never is: a row with a
   NULL time present at the first load is loaded, one inserted afterwards
   never is, and nothing is logged. The acceleration's rows then depend on

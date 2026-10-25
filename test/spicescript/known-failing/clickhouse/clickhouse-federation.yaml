@@ -1,4 +1,4 @@
-# Known failing: queries pushed to ClickHouse keep
+# Known failing (#15538): queries pushed to ClickHouse keep
 # PostgreSQL/DataFusion semantics they do not have there (NOT IN with NULL,
 # ASCII-only upper, byte substr, date_part, Decimal(38) sums, correlated
 # EXISTS). Fold back into federation-matrix.yaml once it passes.

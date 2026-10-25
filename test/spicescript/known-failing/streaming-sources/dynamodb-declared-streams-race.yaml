@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): with declared columns, a DynamoDB
+# Known failing (#15544): with declared columns, a DynamoDB
 # Streams dataset over a table that is created (with streams) or gets streams
 # enabled after startup registers empty, and rows written right afterwards can
 # be missed for good — in 3 of 4 runs at least one such table stays empty.

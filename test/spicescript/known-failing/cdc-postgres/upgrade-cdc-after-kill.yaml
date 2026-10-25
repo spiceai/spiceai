@@ -1,3 +1,4 @@
+# Known failing (#15543).
 name: upgrade-cdc-after-kill
 description: >
   As postgres-cdc-upgrade.yaml and mysql-cdc-upgrade.yaml together, but the older runtime is killed (SIGKILL) rather than

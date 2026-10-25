@@ -1,4 +1,4 @@
-# Known failing: in a partitioned Cayenne table with a primary key, a key that
+# Known failing (#15540): in a partitioned Cayenne table with a primary key, a key that
 # moves to another partition keeps its old row too: through an INSERT, and
 # through change capture of a source UPDATE to the partition column.
 name: cayenne-partition-key-move

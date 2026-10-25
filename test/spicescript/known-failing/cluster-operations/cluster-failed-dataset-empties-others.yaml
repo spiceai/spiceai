@@ -1,6 +1,6 @@
 name: cluster-failed-dataset-empties-others
 description: >
-  Known failing: wrong results, on a cluster only. One dataset that cannot
+  Known failing (#15539): wrong results, on a cluster only. One dataset that cannot
   load (its source table does not exist) keeps the executor from ever
   becoming ready, so partitions are never assigned and a healthy dataset
   beside it holds the 0 rows the executor loaded before assignment. Queries

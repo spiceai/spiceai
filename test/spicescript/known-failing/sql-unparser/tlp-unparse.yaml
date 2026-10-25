@@ -1,4 +1,4 @@
-# Known failing: `(NOT x) IS NULL` is unparsed without its parentheses, so the
+# Known failing (#15538): `(NOT x) IS NULL` is unparsed without its parentheses, so the
 # source filters different rows, wherever SQL is unparsed for execution; and
 # nested IS predicates are a syntax error on MySQL. TLP over random
 # predicates without avoiding NOT. Federated to ClickHouse it breaks even with

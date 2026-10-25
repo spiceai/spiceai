@@ -1,3 +1,4 @@
+# Known failing (#15546).
 name: connector-errors-gaps
 description: >
   What the other connectors already do when a source is misconfigured: a

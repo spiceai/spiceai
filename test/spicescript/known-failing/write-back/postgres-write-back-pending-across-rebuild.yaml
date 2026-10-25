@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): a write-back write that Spice has
+# Known failing (#15550): a write-back write that Spice has
 # acknowledged but not yet delivered is lost when the acceleration is rebuilt
 # from the source (here because the replication slot is gone at restart):
 # Spice serves the value from before the write, and the write never reaches

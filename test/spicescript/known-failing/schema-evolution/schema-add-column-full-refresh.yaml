@@ -1,4 +1,4 @@
-# Known failing: under full refresh, a column added at the source is not adopted
+# Known failing (#15547): under full refresh, a column added at the source is not adopted
 # by append_new_columns or sync_all_columns until a restart; and after a restart
 # block disables updates ("updates are disabled") while the refresh API still
 # answers success and the dataset reports Ready.

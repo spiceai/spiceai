@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): on a cluster, a change-captured Cayenne
+# Known failing (#15539): on a cluster, a change-captured Cayenne
 # dataset serves correct and current rows, but the scheduler reports it
 # Refreshing forever and the runtime never becomes ready.
 name: cluster-cdc-ready

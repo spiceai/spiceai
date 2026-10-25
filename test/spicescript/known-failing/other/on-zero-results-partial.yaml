@@ -1,4 +1,4 @@
-# Known failing (#14010): with a partly loaded acceleration, a filter only a
+# Known failing (#15547; related: #14010): with a partly loaded acceleration, a filter only a
 # subquery can evaluate does not fall back to the source, so the row the
 # acceleration lacks is missing from the answer.
 name: on-zero-results-partial

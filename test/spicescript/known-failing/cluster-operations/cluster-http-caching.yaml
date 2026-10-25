@@ -1,6 +1,6 @@
 name: cluster-http-caching
 description: >
-  Known failing, on a cluster only (the same steps pass on one spiced:
+  Known failing (#15539), on a cluster only (the same steps pass on one spiced:
   http-caching-keys.yaml). A Cayenne `refresh_mode: caching` dataset keeps
   each API key's entries apart: on a cluster the second key is answered
   from the entry the first key's request stored, without asking the origin

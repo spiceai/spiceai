@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): a Cayenne caching acceleration does not
+# Known failing (#15548): a Cayenne caching acceleration does not
 # ask the origin when a filter on the response leaves a cached entry no rows,
 # and with caching_ttl: 1h a caching_max_items budget is not enforced for at
 # least 90 seconds (it is within 30 s when caching_ttl is 30s), and when it is

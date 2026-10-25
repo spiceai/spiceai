@@ -1,4 +1,4 @@
-# Known failing: many PostgreSQL types register but
+# Known failing (#15545): many PostgreSQL types register but
 # cannot be read, an array with a NULL element cannot be read, a NULL
 # composite value panics the query, and some types keep their table out of the
 # catalog altogether. Move this script to test/spicescript/ once it passes.

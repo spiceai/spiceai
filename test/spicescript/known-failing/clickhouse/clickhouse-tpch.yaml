@@ -1,4 +1,4 @@
-# Known failing: 17 of the 21 TPC-H queries fail federated
+# Known failing (#15538): 17 of the 21 TPC-H queries fail federated
 # to ClickHouse (Q13 with wrong rows); every accelerated variant passes.
 name: clickhouse-tpch
 description: >

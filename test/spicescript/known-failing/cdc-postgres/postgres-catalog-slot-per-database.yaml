@@ -1,4 +1,4 @@
-# Known failing: both instances derive one slot name from the catalog name
+# Known failing (#15543): both instances derive one slot name from the catalog name
 # alone; the second never becomes ready. Move up a level once it passes.
 name: postgres-catalog-slot-per-database
 description: >

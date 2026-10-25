@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): on a cluster, TPC-H joins over Cayenne
+# Known failing (#15539): on a cluster, TPC-H joins over Cayenne
 # accelerations fail with "executor_table: table 'orders' must be
 # catalog-qualified" (8 of the 22 queries).
 name: cluster-tpch-joins

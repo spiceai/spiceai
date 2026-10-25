@@ -1,4 +1,4 @@
-# Known failing until DuckDB is 1.5 or later: DuckDB 1.4.4 and 1.4.5, running
+# Known failing (#15549) until DuckDB is 1.5 or later: DuckDB 1.4.4 and 1.4.5, running
 # in parallel, lose the last branch of a UNION ALL nested in another UNION ALL
 # (with one thread, or from DuckDB 1.5.0, every row comes back).
 name: duckdb-nested-union-all

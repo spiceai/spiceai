@@ -1,4 +1,4 @@
-# Known failing (no issue filed; possibly the cause behind #10861): HTTP
+# Known failing (#15548; possibly the cause behind #10861): HTTP
 # request headers chosen by a subquery over another source fail with
 # "Internal error: Schema metadata mismatch", and an accelerated view built on
 # that never loads.

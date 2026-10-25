@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): a refresh_mode: snapshot reader whose
+# Known failing (#15547): a refresh_mode: snapshot reader whose
 # own source table does not exist bootstraps from the first snapshot but never
 # loads a newer one ("cannot connect to its source because of its
 # configuration, so it … will not refresh"), though snapshot refreshes are

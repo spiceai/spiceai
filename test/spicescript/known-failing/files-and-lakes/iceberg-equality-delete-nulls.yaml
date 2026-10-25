@@ -1,4 +1,4 @@
-# Known failing (oracle): DuckDB's Iceberg reader drops a row whose
+# Known failing (#15549; oracle): DuckDB's Iceberg reader drops a row whose
 # equality-delete key columns are NULL, so it disagrees with Spice — which is
 # right per the Iceberg spec — after Spice deletes a row that shares the NULL
 # row's non-NULL keys. Move this script up a level once DuckDB is fixed.

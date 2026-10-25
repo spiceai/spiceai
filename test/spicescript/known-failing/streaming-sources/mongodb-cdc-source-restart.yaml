@@ -1,3 +1,4 @@
+# Known failing (#15544).
 name: mongodb-cdc-source-restart
 description: >
   A MongoDB collection followed by change streams into Cayenne keeps following

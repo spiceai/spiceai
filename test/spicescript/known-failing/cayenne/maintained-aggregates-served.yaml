@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): with maintained aggregates declared in
+# Known failing (#15541): with maintained aggregates declared in
 # the spicepod, no query matching one plans MaintainedAggregateExec through
 # spiced, under full refresh or change capture; the answers are right because
 # the scan and aggregate run as usual.

@@ -1,6 +1,6 @@
 name: http-caching-request-key
 description: >
-  Known failing. A caching acceleration whose primary key is the request
+  Known failing (#15548). A caching acceleration whose primary key is the request
   columns says one row per request; a response of three rows contradicts it.
   The write should be refused, leaving nothing cached, so the next lookup
   asks the origin again and answers all three rows. On Cayenne one of the

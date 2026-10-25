@@ -1,6 +1,6 @@
 name: retention-epoch-formats
 description: >
-  Known failing. Time retention over an epoch time column (`unix_seconds`,
+  Known failing (#15542). Time retention over an epoch time column (`unix_seconds`,
   `unix_millis`, `unix_nanos`) refuses to create the acceleration:
   "Unsupported data type 'Int64' for time-based retention on column
   't_unix_seconds'. Expected Timestamp, Date, or string (ISO 8601) type",

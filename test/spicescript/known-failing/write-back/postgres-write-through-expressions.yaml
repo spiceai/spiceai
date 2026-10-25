@@ -1,4 +1,4 @@
-# Known failing: An UPDATE through a write-through Postgres dataset that computes an integer,
+# Known failing (#15550): An UPDATE through a write-through Postgres dataset that computes an integer,
 # smallint, numeric or timestamp column from its own value is rejected
 # (`Expression not supported CAST(…)`), because the SQL sent to the source
 # cannot express the cast.

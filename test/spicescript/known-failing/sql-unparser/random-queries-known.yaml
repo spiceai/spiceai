@@ -1,4 +1,4 @@
-# Known failing: random-queries without steering clear of the known defects
+# Known failing (#15538): random-queries without steering clear of the known defects
 # (`(NOT x) IS NULL` unparsed without parentheses, groupings unparsed without
 # their aggregation when none of their aggregates is read, DuckDB before 1.5
 # losing rows of nested UNION ALL, MySQL collation and NULLS LAST). Every

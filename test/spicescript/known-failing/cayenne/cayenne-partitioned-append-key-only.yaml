@@ -1,4 +1,4 @@
-# Known failing: a partitioned Cayenne acceleration with append refresh and a
+# Known failing (#15540): a partitioned Cayenne acceleration with append refresh and a
 # primary key but no time_column refuses to load, saying "Append mode requires
 # either `time_column` or `primary_key`" though the primary key is set.
 name: cayenne-partitioned-append-key-only

@@ -1,6 +1,6 @@
 name: localpod-follow
 description: >
-  Known failing. `localpod:` children of a Cayenne parent do not follow it
+  Known failing (#15547). `localpod:` children of a Cayenne parent do not follow it
   in four cases (Cayenne, results cache off):
   a grandchild (`localpod:child`) never takes a refresh that reached its
   parent; after the parent's spicepod entry changes its refresh SQL, the

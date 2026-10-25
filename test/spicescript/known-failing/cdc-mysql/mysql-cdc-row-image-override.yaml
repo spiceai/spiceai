@@ -1,4 +1,4 @@
-# Known failing: One writer session with binlog_row_image=MINIMAL stops replication for the
+# Known failing (#15543): One writer session with binlog_row_image=MINIMAL stops replication for the
 # table, and a restart does not recover it.
 # Move this script to test/spicescript/ once it passes.
 name: mysql-cdc-row-image-override

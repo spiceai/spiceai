@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): a tombstone in a Kafka topic stops the
+# Known failing (#15544): a tombstone in a Kafka topic stops the
 # dataset loading ("Unable to deserialize JSON message from Kafka: expected
 # value at line 1 column 1").
 name: kafka-tombstone

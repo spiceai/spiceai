@@ -1,4 +1,4 @@
-# Known failing: Under REPLICA IDENTITY DEFAULT, one UPDATE that leaves an out-of-line value
+# Known failing (#15543): Under REPLICA IDENTITY DEFAULT, one UPDATE that leaves an out-of-line value
 # unchanged stops replication for the whole table until a restart rebuilds it.
 # Move this script to test/spicescript/ once it passes.
 name: postgres-cdc-unchanged-toast

@@ -1,6 +1,6 @@
 name: append-iso-day
 description: >
-  Known failing: silent, permanent row loss. Append refresh with a day held
+  Known failing (#15542): silent, permanent row loss. Append refresh with a day held
   as ISO 8601 text ('2031-05-02') as the partition column beside a
   timestamp time column: the filter for new rows compares the text with the
   stored maximum written as a full timestamp ('2031-05-02T01:00:00Z'), and

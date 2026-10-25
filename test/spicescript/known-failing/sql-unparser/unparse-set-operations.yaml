@@ -1,4 +1,4 @@
-# Known failing wherever Spice sends SQL to an engine (federated PostgreSQL,
+# Known failing (#15538) wherever Spice sends SQL to an engine (federated PostgreSQL,
 # DuckDB accelerations): INTERSECT and EXCEPT are sent as
 # EXISTS / NOT EXISTS with `=`, where a set operation compares NULLs as equal,
 # so INTERSECT drops a shared NULL row and EXCEPT keeps one; and over one table

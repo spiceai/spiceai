@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): in a cluster, a Cayenne catalog table
+# Known failing (#15539): in a cluster, a Cayenne catalog table
 # recreated under a dropped table's name still serves the dropped table's rows
 # and schema, and the identical CREATE TABLE text is refused the second time.
 # Needs a `spiced` built with the `spicebench` feature.

@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): a dataset whose acceleration names an
+# Known failing (#15546): a dataset whose acceleration names an
 # unknown engine or an unparseable refresh_check_interval is missing from
 # /v1/datasets (the error is only logged, without the dataset in its text); a
 # dataset whose refresh_cron does not parse reports Ready and never refreshes

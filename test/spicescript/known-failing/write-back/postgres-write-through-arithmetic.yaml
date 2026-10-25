@@ -1,3 +1,4 @@
+# Known failing (#15550).
 name: postgres-write-through-arithmetic
 description: >
   Under `write_mode: write_through` to PostgreSQL, an UPDATE that sets a

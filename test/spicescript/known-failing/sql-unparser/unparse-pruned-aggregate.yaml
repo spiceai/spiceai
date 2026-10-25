@@ -1,3 +1,4 @@
+# Known failing (#15538).
 name: unparse-pruned-aggregate
 description: >
   An aggregate in a subquery whose outputs the outer query never reads still

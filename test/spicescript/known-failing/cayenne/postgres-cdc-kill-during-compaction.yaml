@@ -1,3 +1,4 @@
+# Known failing (#15540).
 name: postgres-cdc-kill-during-compaction
 description: >
   spiced killed while Cayenne is compacting a CDC-fed table loses and

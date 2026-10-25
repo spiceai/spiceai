@@ -1,4 +1,4 @@
-# Known failing: Over federated MySQL, char_length() returns byte counts: Spice rewrites it
+# Known failing (#15538): Over federated MySQL, char_length() returns byte counts: Spice rewrites it
 # to MySQL's LENGTH(), which counts bytes.
 # Move this script to test/spicescript/ once it passes.
 name: slt-strings

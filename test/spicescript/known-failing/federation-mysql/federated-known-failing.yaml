@@ -1,4 +1,4 @@
-# Known failing: the queries in corpus/pushdown-known-failing.sql, each with
+# Known failing (#15538): the queries in corpus/pushdown-known-failing.sql, each with
 # its cause. Move a query back to pushdown.sql once it passes.
 name: federated-known-failing
 description: >

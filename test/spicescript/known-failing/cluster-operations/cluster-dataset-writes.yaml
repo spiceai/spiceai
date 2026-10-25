@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): on a cluster, INSERT INTO a write-mode
+# Known failing (#15539): on a cluster, INSERT INTO a write-mode
 # Cayenne acceleration is acknowledged but the rows never appear in queries.
 name: cluster-dataset-writes
 description: >

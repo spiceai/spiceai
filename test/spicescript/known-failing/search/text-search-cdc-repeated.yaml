@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet; the change-capture form of
+# Known failing (#15547; the change-capture form of
 # text-search-stale-after-refresh.yaml): a text_search asked once before a
 # document arrives through change capture keeps answering without it when
 # asked again with the identical text, while other wordings find it.

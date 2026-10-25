@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): on a cluster, the plan puts a
+# Known failing (#15539): on a cluster, the plan puts a
 # round-robin repartition under the global limit and fails "does not satisfy
 # distribution requirements: SinglePartition".
 name: cluster-limit-offset

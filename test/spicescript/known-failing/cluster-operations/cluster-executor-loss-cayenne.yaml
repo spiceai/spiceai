@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): when one of two executors holding a
+# Known failing (#15539): when one of two executors holding a
 # Cayenne acceleration's partitions dies, its partitions are not reassigned to
 # the survivor, so every query of the table fails ("no ready executor serves 2
 # of its 5 partitions; retry the query") until the executor returns.
