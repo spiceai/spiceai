@@ -226,6 +226,10 @@ pub struct Hit {
     /// The primary term `seq_no` was assigned under, returned alongside it.
     #[serde(default, rename = "_primary_term")]
     pub primary_term: Option<i64>,
+    /// The concrete index holding the document. A search through an alias names the index
+    /// behind it.
+    #[serde(default, rename = "_index")]
+    pub index: Option<String>,
 }
 
 /// A document as one write left it: any later write to the same `_id` assigns a new
@@ -233,6 +237,10 @@ pub struct Hit {
 /// if nothing has rewritten it since.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentVersion {
+    /// The concrete index the version was read from. `(seq_no, primary_term)` is assigned per
+    /// shard of one index, so it identifies a document only in that index, not in another
+    /// index an alias points to later.
+    pub index: String,
     pub id: String,
     pub seq_no: i64,
     pub primary_term: i64,
@@ -667,13 +675,12 @@ impl Client {
     /// for the caller to inspect.
     pub async fn bulk_delete_if_unchanged(
         &self,
-        index: &str,
         docs: &[DocumentVersion],
     ) -> Result<serde_json::Value> {
         let mut ndjson = String::new();
         for doc in docs {
             let action = serde_json::json!({"delete": {
-                "_index": index,
+                "_index": doc.index,
                 "_id": doc.id,
                 "if_seq_no": doc.seq_no,
                 "if_primary_term": doc.primary_term,
@@ -870,11 +877,8 @@ pub trait Elasticsearch: std::fmt::Debug + Send + Sync {
         index: &str,
         query: &serde_json::Value,
     ) -> Result<serde_json::Value>;
-    async fn bulk_delete_if_unchanged(
-        &self,
-        index: &str,
-        docs: &[DocumentVersion],
-    ) -> Result<serde_json::Value>;
+    async fn bulk_delete_if_unchanged(&self, docs: &[DocumentVersion])
+    -> Result<serde_json::Value>;
 }
 
 #[async_trait::async_trait]
@@ -970,10 +974,9 @@ impl Elasticsearch for Client {
 
     async fn bulk_delete_if_unchanged(
         &self,
-        index: &str,
         docs: &[DocumentVersion],
     ) -> Result<serde_json::Value> {
-        Client::bulk_delete_if_unchanged(self, index, docs).await
+        Client::bulk_delete_if_unchanged(self, docs).await
     }
 }
 

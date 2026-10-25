@@ -215,7 +215,6 @@ pub(super) mod unused_client {
         }
         async fn bulk_delete_if_unchanged(
             &self,
-            _: &str,
             _: &[elasticsearch::DocumentVersion],
         ) -> Result<serde_json::Value> {
             Self::refuse("bulk_delete_if_unchanged")
@@ -258,7 +257,8 @@ struct ReplaceSnapshot {
     /// Elasticsearch may hand back a new id on any search against the reader, so the renewal
     /// task and the reconcile both read and update the latest one here.
     pit_id: Arc<parking_lot::Mutex<String>>,
-    renewal: tokio::task::JoinHandle<()>,
+    /// `None` once [`Self::stop_renewal`] has ended it.
+    renewal: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ReplaceSnapshot {
@@ -287,7 +287,10 @@ impl ReplaceSnapshot {
         };
         let pit_id = Arc::new(parking_lot::Mutex::new(pit_id));
         let renewal = tokio::spawn(Self::renew(Arc::clone(client), Arc::clone(&pit_id)));
-        Ok(Some(Self { pit_id, renewal }))
+        Ok(Some(Self {
+            pit_id,
+            renewal: Some(renewal),
+        }))
     }
 
     /// Renews the reader's keep-alive until the write finishes, however long it runs. Stops
@@ -318,13 +321,13 @@ impl ReplaceSnapshot {
     /// Deletes every snapshot document the write did not rewrite, page by page, and closes
     /// the reader. Returns how many documents were deleted.
     async fn delete_unrewritten(
-        self,
+        mut self,
         client: &dyn Elasticsearch,
         es_index: &str,
     ) -> Result<u64, DataFusionError> {
-        self.renewal.abort();
+        self.stop_renewal().await;
         let mut pit_id = self.pit_id.lock().clone();
-        let result = Self::delete_pages(client, es_index, &mut pit_id).await;
+        let result = Self::delete_pages(client, &mut pit_id).await;
         *self.pit_id.lock() = pit_id;
         self.close(client, es_index).await;
         result.map_err(|cause| {
@@ -334,11 +337,7 @@ impl ReplaceSnapshot {
         })
     }
 
-    async fn delete_pages(
-        client: &dyn Elasticsearch,
-        es_index: &str,
-        pit_id: &mut String,
-    ) -> Result<u64, String> {
+    async fn delete_pages(client: &dyn Elasticsearch, pit_id: &mut String) -> Result<u64, String> {
         let mut search_after: Option<Vec<serde_json::Value>> = None;
         let mut deleted = 0;
         loop {
@@ -384,19 +383,21 @@ impl ReplaceSnapshot {
             let full_page = hits.len() == REPLACE_RECONCILE_PAGE_SIZE;
             let versions = hits
                 .into_iter()
-                .map(|hit| match (hit.seq_no, hit.primary_term) {
-                    (Some(seq_no), Some(primary_term)) => Ok(DocumentVersion {
+                .map(|hit| match (hit.index, hit.seq_no, hit.primary_term) {
+                    (Some(index), Some(seq_no), Some(primary_term)) => Ok(DocumentVersion {
+                        index,
                         id: hit.id,
                         seq_no,
                         primary_term,
                     }),
                     _ => Err(
-                        "the snapshot returned a document without its sequence number".to_string(),
+                        "the snapshot returned a document without its index or sequence number"
+                            .to_string(),
                     ),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let response = client
-                .bulk_delete_if_unchanged(es_index, &versions)
+                .bulk_delete_if_unchanged(&versions)
                 .await
                 .map_err(|e| format!("the delete request failed: {e}"))?;
             deleted += count_conditional_deletes(&response)?;
@@ -408,10 +409,21 @@ impl ReplaceSnapshot {
 }
 
 impl ReplaceSnapshot {
+    /// Stops the renewal and waits for it to end. `abort` takes effect at the renewal's next
+    /// `.await`, so one already past its request could otherwise store a newer reader id after
+    /// the caller has read the id.
+    async fn stop_renewal(&mut self) {
+        if let Some(renewal) = self.renewal.take() {
+            renewal.abort();
+            // The aborted task's `JoinError::Cancelled` (or its normal end) is the expected result.
+            let _ = renewal.await;
+        }
+    }
+
     /// Stops the renewal and releases the reader. A failure only delays the release until
     /// the keep-alive lapses, so it is not reported.
-    async fn close(self, client: &dyn Elasticsearch, es_index: &str) {
-        self.renewal.abort();
+    async fn close(mut self, client: &dyn Elasticsearch, es_index: &str) {
+        self.stop_renewal().await;
         let pit_id = self.pit_id.lock().clone();
         if let Err(e) = client.close_point_in_time(&pit_id).await {
             tracing::debug!("Could not close a full-refresh snapshot of '{es_index}': {e}");
@@ -421,7 +433,9 @@ impl ReplaceSnapshot {
 
 impl Drop for ReplaceSnapshot {
     fn drop(&mut self) {
-        self.renewal.abort();
+        if let Some(renewal) = &self.renewal {
+            renewal.abort();
+        }
     }
 }
 
@@ -495,11 +509,14 @@ impl ElasticsearchIndexWriteMaintenance {
     /// [`Self::on_write_complete`] can delete the documents of every row the write dropped.
     /// The sinks run each index's `on_write_start` before the write sends any row, so the
     /// snapshot never misses one of this write's rows. Every start first closes the snapshot
-    /// it finds: one still here belongs to a replacing write that was dropped without
-    /// `on_write_failed`, as a refresh request arriving mid-refresh drops the running one and
-    /// can change the refresh mode. It predates the dropped write's rows, so a replacing write
-    /// reconciling against it would keep a row the dropped write rewrote, and an append would
-    /// delete the documents of every row the dropped write had not re-sent.
+    /// it finds. When a vector and a full-text index share this Elasticsearch index, and so
+    /// this maintenance, that is the other index's snapshot of the same write, taken before any
+    /// row was sent, so the fresh one replaces it at no loss. Otherwise it belongs to a
+    /// replacing write that was dropped without `on_write_failed`, as a refresh request
+    /// arriving mid-refresh drops the running one and can change the refresh mode. It predates
+    /// the dropped write's rows, so a replacing write reconciling against it would keep a row
+    /// the dropped write rewrote, and an append would delete the documents of every row the
+    /// dropped write had not re-sent.
     ///
     /// The tuning and the snapshot are independent, and the sink writes whichever of them
     /// fails, so neither failure costs the write the other. A failed tuning that opened the
@@ -1349,7 +1366,6 @@ mod write_maintenance_tests {
         }
         async fn bulk_delete_if_unchanged(
             &self,
-            _: &str,
             _: &[elasticsearch::DocumentVersion],
         ) -> elasticsearch::Result<serde_json::Value> {
             unimplemented!()
@@ -1543,7 +1559,7 @@ mod write_maintenance_tests {
             };
             let mut pit_id = "pit-0".to_string();
             assert_eq!(
-                ReplaceSnapshot::delete_pages(&client, "my-index", &mut pit_id).await,
+                ReplaceSnapshot::delete_pages(&client, &mut pit_id).await,
                 Err(expected.to_string())
             );
         }
@@ -2015,7 +2031,6 @@ mod chunked_group_pruning_tests {
     impl ElasticsearchTrait for StoreClient {
         async fn bulk_delete_if_unchanged(
             &self,
-            _index: &str,
             _docs: &[elasticsearch::DocumentVersion],
         ) -> EsResult<serde_json::Value> {
             Err(unexpected("bulk_delete_if_unchanged"))

@@ -389,3 +389,68 @@ async fn a_full_refresh_whose_refresh_interval_override_is_rejected_removes_the_
     );
     t.drop_index().await;
 }
+
+/// The configured index name can be an alias, and a version read through it belongs to the
+/// concrete index behind it. Here the alias moves to a fresh index during the refresh, and the
+/// refresh's rewrite of row 1 lands there at the same `(seq_no, primary_term)` the snapshot
+/// recorded in the old index. A delete addressed to the alias would remove that live document.
+#[tokio::test]
+async fn a_full_refresh_across_an_alias_switch_keeps_the_rows_it_rewrote() {
+    let t = TestIndex::new("alias").await;
+    let (old, new) = (format!("{}-old", t.name), format!("{}-new", t.name));
+    for index in [&old, &new] {
+        let _ = t.http.delete(format!("{}/{index}", es_url())).send().await;
+        let resp = t
+            .http
+            .put(format!("{}/{index}", es_url()))
+            .json(&serde_json::json!({ "settings": { "number_of_shards": 1 } }))
+            .send()
+            .await
+            .expect("create index request");
+        assert!(
+            resp.status().is_success(),
+            "create {index}: {}",
+            resp.status()
+        );
+    }
+    let point_alias = |from: Option<&str>, to: &str| {
+        let mut actions = vec![serde_json::json!({ "add": { "index": to, "alias": t.name } })];
+        if let Some(from) = from {
+            actions.insert(
+                0,
+                serde_json::json!({ "remove": { "index": from, "alias": t.name } }),
+            );
+        }
+        let request = t
+            .http
+            .post(format!("{}/_aliases", es_url()))
+            .json(&serde_json::json!({ "actions": actions }));
+        async move {
+            let resp = request.send().await.expect("alias request");
+            assert!(
+                resp.status().is_success(),
+                "alias update: {}",
+                resp.status()
+            );
+        }
+    };
+    point_alias(None, &old).await;
+    t.write(WriteWindow::Append, rows([1], "first")).await;
+    assert_eq!(t.ids().await, BTreeSet::from([1]));
+
+    t.index
+        .on_write_start(WriteWindow::ReplaceAll)
+        .await
+        .expect("on_write_start succeeds");
+    point_alias(Some(&old), &new).await;
+    t.finish_write(rows([1], "second")).await;
+
+    assert_eq!(
+        t.ids().await,
+        BTreeSet::from([1]),
+        "the refresh rewrote row 1 into the index the alias now names, so it must stay searchable"
+    );
+    for index in [&old, &new] {
+        let _ = t.http.delete(format!("{}/{index}", es_url())).send().await;
+    }
+}

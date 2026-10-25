@@ -1470,7 +1470,6 @@ mod tests {
         }
         async fn bulk_delete_if_unchanged(
             &self,
-            _index: &str,
             _docs: &[elasticsearch::DocumentVersion],
         ) -> EsResult<Value> {
             Err(unexpected("bulk_delete_if_unchanged"))

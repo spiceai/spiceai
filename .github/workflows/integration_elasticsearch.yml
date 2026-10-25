@@ -11,6 +11,8 @@ on:
       - 'crates/data-connectors/connector-elasticsearch/**'
       - 'crates/search/src/index/elasticsearch/**'
       - 'crates/search/tests/elasticsearch_full_refresh.rs'
+      - 'crates/search/tests/integration.rs'
+      - 'crates/search/Cargo.toml'
       - 'crates/runtime/src/embeddings/index/elasticsearch/**'
   merge_group:
     branches:
@@ -58,6 +60,8 @@ jobs:
               - 'crates/data-connectors/connector-elasticsearch/**'
               - 'crates/search/src/index/elasticsearch/**'
               - 'crates/search/tests/elasticsearch_full_refresh.rs'
+              - 'crates/search/tests/integration.rs'
+              - 'crates/search/Cargo.toml'
               - 'crates/runtime/src/embeddings/index/elasticsearch/**'
 
   test-elasticsearch:

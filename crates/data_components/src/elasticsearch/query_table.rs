@@ -896,6 +896,7 @@ mod tests {
             source,
             seq_no: None,
             primary_term: None,
+            index: None,
         }
     }
 
@@ -907,6 +908,7 @@ mod tests {
             source: json!({ "title": format!("title-{id}") }),
             seq_no: None,
             primary_term: None,
+            index: None,
         }
     }
 
@@ -1107,7 +1109,6 @@ mod tests {
 
         async fn bulk_delete_if_unchanged(
             &self,
-            _index: &str,
             _docs: &[elasticsearch::DocumentVersion],
         ) -> elasticsearch::Result<serde_json::Value> {
             Err(unexpected_call_error("bulk_delete_if_unchanged"))
