@@ -1,0 +1,183 @@
+# Known failing (#15544): with declared columns, a DynamoDB
+# Streams dataset over a table that is created (with streams) or gets streams
+# enabled after startup registers empty, and rows written right afterwards can
+# be missed for good — in 3 of 4 runs at least one such table stays empty.
+name: dynamodb-declared-streams-race
+description: >
+  A DynamoDB Streams dataset with declared columns, over a table created with
+  streams, or given streams, after Spice has started, loads every row written
+  to it afterwards.
+
+sources:
+  ddb:
+    kind: docker
+    image: docker.io/localstack/localstack:4.9
+    ports: [4566]
+    env: { SERVICES: dynamodb, AWS_DEFAULT_REGION: us-east-1 }
+    ready: awslocal dynamodb list-tables
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: dynamodb-declared-streams-race
+  datasets:
+    - from: dynamodb:created0_${sources.ddb.namespace}
+      name: created0
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      columns:
+        - { name: id, type: text }
+        - { name: name, type: text }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+    - from: dynamodb:created1_${sources.ddb.namespace}
+      name: created1
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      columns:
+        - { name: id, type: text }
+        - { name: name, type: text }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+    - from: dynamodb:created2_${sources.ddb.namespace}
+      name: created2
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      columns:
+        - { name: id, type: text }
+        - { name: name, type: text }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+    - from: dynamodb:created3_${sources.ddb.namespace}
+      name: created3
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      columns:
+        - { name: id, type: text }
+        - { name: name, type: text }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+    - from: dynamodb:streamed0_${sources.ddb.namespace}
+      name: streamed0
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      columns:
+        - { name: id, type: text }
+        - { name: name, type: text }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+    - from: dynamodb:streamed1_${sources.ddb.namespace}
+      name: streamed1
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      columns:
+        - { name: id, type: text }
+        - { name: name, type: text }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+    - from: dynamodb:streamed2_${sources.ddb.namespace}
+      name: streamed2
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      columns:
+        - { name: id, type: text }
+        - { name: name, type: text }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+    - from: dynamodb:streamed3_${sources.ddb.namespace}
+      name: streamed3
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4566}
+      columns:
+        - { name: id, type: text }
+        - { name: name, type: text }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+
+steps:
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        d = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        c = boto3.client('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        N = '${sources.ddb.namespace}'
+        def make(name, stream):
+            spec = dict(TableName=name + '_' + N, KeySchema=[{'AttributeName': 'id', 'KeyType': 'HASH'}],
+                AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'S'}], BillingMode='PAY_PER_REQUEST')
+            if stream:
+                spec['StreamSpecification'] = {'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'}
+            d.create_table(**spec).wait_until_exists()
+        for i in range(4):
+            make('streamed' + str(i), False)
+        PY
+  - start: { ready: false }
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        d = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        c = boto3.client('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        N = '${sources.ddb.namespace}'
+        def make(name, stream):
+            spec = dict(TableName=name + '_' + N, KeySchema=[{'AttributeName': 'id', 'KeyType': 'HASH'}],
+                AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'S'}], BillingMode='PAY_PER_REQUEST')
+            if stream:
+                spec['StreamSpecification'] = {'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'}
+            d.create_table(**spec).wait_until_exists()
+        for i in range(4):
+            make('created' + str(i), True)
+            c.update_table(TableName='streamed' + str(i) + '_' + N, StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'})
+        for t in ['created', 'streamed']:
+            for i in range(4):
+                for k in range(3):
+                    d.Table(t + str(i) + '_' + N).put_item(Item={'id': str(k), 'name': 'Item ' + str(k)})
+        PY
+  - query: SELECT id, name FROM created0
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM created1
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM created2
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM created3
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM streamed0
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM streamed1
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM streamed2
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s
+  - query: SELECT id, name FROM streamed3
+    expect: { rows: [['0', Item 0], ['1', Item 1], ['2', Item 2]] }
+    eventually: 90s

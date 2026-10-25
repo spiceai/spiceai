@@ -20803,6 +20803,7 @@ dependencies = [
  "nix 0.30.1",
  "parking_lot",
  "parquet",
+ "rcgen",
  "regex",
  "reqwest 0.13.4",
  "result-compare",

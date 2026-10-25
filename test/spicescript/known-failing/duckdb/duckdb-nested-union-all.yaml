@@ -1,0 +1,43 @@
+# Known failing (#15549) until DuckDB is 1.5 or later: DuckDB 1.4.4 and 1.4.5, running
+# in parallel, lose the last branch of a UNION ALL nested in another UNION ALL
+# (with one thread, or from DuckDB 1.5.0, every row comes back).
+name: duckdb-nested-union-all
+description: >
+  A UNION ALL whose second branch is itself a UNION ALL returns every row of
+  every branch from a DuckDB acceleration, as it does from Cayenne.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  cayenne: cayenne-file
+  duckdb: duckdb-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: duckdb-nested-union-all
+  datasets:
+    - from: postgres:public.u
+      name: u
+      params: ${sources.src.params}
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: CREATE TABLE u (id int PRIMARY KEY, v int); INSERT INTO u SELECT i, i % 7 FROM generate_series(1, 150) i;
+  - start: {}
+  # Controls: a flat UNION ALL, and the nested one under ORDER BY.
+  - query: SELECT id FROM u WHERE id <= 1 UNION ALL SELECT id FROM u WHERE id BETWEEN 2 AND 3 UNION ALL SELECT id FROM u WHERE id BETWEEN 4 AND 7 UNION ALL SELECT id FROM u WHERE id BETWEEN 8 AND 15
+  - query: >-
+      SELECT * FROM (SELECT id FROM (SELECT id FROM u WHERE id <= 1 UNION ALL SELECT id FROM u WHERE id BETWEEN 2 AND 3) a
+      UNION ALL SELECT id FROM (SELECT id FROM u WHERE id BETWEEN 4 AND 7 UNION ALL SELECT id FROM u WHERE id BETWEEN 8 AND 15) b) z ORDER BY id
+  - query: >-
+      SELECT id FROM (SELECT id FROM u WHERE id <= 1 UNION ALL SELECT id FROM u WHERE id BETWEEN 2 AND 3) a
+      UNION ALL SELECT id FROM (SELECT id FROM u WHERE id BETWEEN 4 AND 7 UNION ALL SELECT id FROM u WHERE id BETWEEN 8 AND 15) b
+  - query: >-
+      SELECT id FROM u WHERE id <= 3
+      UNION ALL SELECT id FROM (SELECT id FROM u WHERE id BETWEEN 4 AND 7 UNION ALL SELECT id FROM u WHERE id BETWEEN 8 AND 15) b
