@@ -25,6 +25,10 @@ dataformat-orc = { path = "../dataformat-orc" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
 datafusion-expr.workspace = true
+# `FileSource::try_to_proto` exists only with datafusion-datasource's `proto`
+# feature, which datafusion-proto enables. Listing parquet scans serialize as
+# a tagged `Extension` so cluster executors can restore the NaN-safe source.
+datafusion-proto.workspace = true
 datafusion-table-providers = { workspace = true }
 document_parse = { path = "../document_parse" }
 futures.workspace = true

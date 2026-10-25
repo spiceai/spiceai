@@ -6353,6 +6353,7 @@ dependencies = [
  "datafusion",
  "datafusion-datasource",
  "datafusion-expr",
+ "datafusion-proto",
  "datafusion-table-providers",
  "document_parse",
  "futures",
