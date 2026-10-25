@@ -492,6 +492,9 @@ pub struct CayenneAccelerator {
     /// completes or is dropped (`InheritedPinsEntry`).
     inherited_snapshot_dir_pins:
         parking_lot::Mutex<HashMap<datafusion::common::TableReference, cayenne::SnapshotDirPins>>,
+    /// The provider serving each dataset's restored snapshot, which the snapshot
+    /// engine quiesces before extracting a newer one.
+    serving_snapshot_providers: Arc<crate::snapshot_engine::ServingProviders>,
 }
 
 /// Removes a dataset's hand-off entry when dropped, so a reload the refresh
@@ -1547,6 +1550,7 @@ impl CayenneAccelerator {
             footer_cache_mb,
             compaction_semaphore: cayenne::compaction_budget(),
             inherited_snapshot_dir_pins: parking_lot::Mutex::new(HashMap::new()),
+            serving_snapshot_providers: Arc::default(),
         }
     }
 
@@ -4645,7 +4649,8 @@ impl DataAccelerator for CayenneAccelerator {
                 catalog,
                 source.name().to_string(),
                 PathBuf::from(dir_path),
-            ),
+            )
+            .with_serving_providers(Arc::clone(&self.serving_snapshot_providers)),
         ))
     }
 
@@ -4693,11 +4698,14 @@ impl DataAccelerator for CayenneAccelerator {
     /// Reclaim the snapshot directories the restored snapshot no longer
     /// references. The pins handed over in `reload_from_snapshot` keep the ones
     /// the replaced instance's queries still read.
+    /// Also records `provider` for the snapshot engine to quiesce on the next restore.
     async fn maintain_after_snapshot_restore(
         &self,
         source: &dyn AccelerationSource,
         provider: &Arc<dyn TableProvider>,
     ) {
+        self.serving_snapshot_providers
+            .record(source.name().to_string(), provider);
         let Some(table) =
             find_concrete::<cayenne::CayenneTableProvider>(provider.as_ref(), LayerWalk::Write)
         else {
