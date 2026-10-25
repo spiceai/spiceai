@@ -38,9 +38,11 @@ use runtime_tls::TlsConfig;
 pub use routes::get_api_doc;
 #[cfg(feature = "mcp")]
 mod mcp_transport;
-#[cfg(all(test, feature = "models"))]
+#[cfg(test)]
+#[cfg(feature = "models")]
 mod messages_tests;
-#[cfg(all(test, feature = "models"))]
+#[cfg(test)]
+#[cfg(feature = "models")]
 mod model_capability_tests;
 mod mtls;
 mod response_outcome;

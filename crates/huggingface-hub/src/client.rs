@@ -794,6 +794,30 @@ impl Hub {
     }
 
     /// `{endpoint}/[{type}s/]{repo}/resolve/{commit}/{path}`.
+    /// The commit `revision` names now, read from the Hub's answer to a `HEAD` of `path` at
+    /// that revision. The Hub answers without sending the file, so this is one request where
+    /// [`Hub::commit`] and a listing are two. `None` when the answer does not say, as a
+    /// renamed repository's redirect does not.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the repository, revision or file does not exist, access is denied,
+    /// or the Hub cannot be reached.
+    pub async fn commit_of_file(
+        &self,
+        repo: &RepoId,
+        revision: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        let url = self.resolve_url(repo, revision, path);
+        let response = self
+            .request(repo, Some(revision), Method::HEAD, url, None)
+            .await?;
+        Ok(header_str(response.headers(), "x-repo-commit")
+            .filter(|commit| is_commit_sha(commit))
+            .map(ToString::to_string))
+    }
+
     fn resolve_url(&self, repo: &RepoId, commit: &str, path: &str) -> Url {
         let mut url = self.config.endpoint.clone();
         {
