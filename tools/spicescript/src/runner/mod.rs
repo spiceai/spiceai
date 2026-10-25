@@ -160,26 +160,43 @@ struct BusyState {
 
 impl Busy {
     fn enter(&self) {
+        self.enter_at(Instant::now());
+    }
+
+    fn leave(&self) {
+        self.leave_at(Instant::now());
+    }
+
+    pub fn total(&self) -> Duration {
+        self.total_at(Instant::now())
+    }
+
+    // The `_at` forms take the clock reading, so a test can drive them with
+    // exact instants instead of sleeping.
+    fn enter_at(&self, now: Instant) {
         let mut state = self.0.lock();
         if state.holding == 0 {
-            state.since = Some(Instant::now());
+            state.since = Some(now);
         }
         state.holding += 1;
     }
 
-    fn leave(&self) {
+    fn leave_at(&self, now: Instant) {
         let mut state = self.0.lock();
         state.holding = state.holding.saturating_sub(1);
         if state.holding == 0
             && let Some(since) = state.since.take()
         {
-            state.total += since.elapsed();
+            state.total += now.saturating_duration_since(since);
         }
     }
 
-    pub fn total(&self) -> Duration {
+    fn total_at(&self, now: Instant) -> Duration {
         let state = self.0.lock();
-        state.total + state.since.map_or(Duration::ZERO, |since| since.elapsed())
+        state.total
+            + state
+                .since
+                .map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
     }
 }
 
@@ -1330,25 +1347,18 @@ mod tests {
 
     #[test]
     fn busy_counts_overlapping_holds_once_and_no_idle_time() {
-        // Real time is what is measured, so the test sleeps: one hold, a
-        // second overlapping it, the first ends, the second ends, then idle.
+        // One hold, a second overlapping it, the first ends, the second ends,
+        // then idle, each a step apart on a clock the test sets.
         let busy = Busy::default();
+        let t0 = Instant::now();
         let step = Duration::from_millis(40);
-        busy.enter();
-        std::thread::sleep(step);
-        busy.enter();
-        std::thread::sleep(step);
-        busy.leave();
-        std::thread::sleep(step);
-        busy.leave();
-        std::thread::sleep(step * 2);
-        let total = busy.total();
+        busy.enter_at(t0);
+        busy.enter_at(t0 + step);
+        busy.leave_at(t0 + step * 2);
+        busy.leave_at(t0 + step * 3);
         // Held for 3 steps (120 ms). Each hold counted on its own would be
         // 160 ms, and counting the idle time 200 ms.
-        assert!(
-            total >= step * 3 && total < Duration::from_millis(150),
-            "{total:?}"
-        );
+        assert_eq!(busy.total_at(t0 + step * 5), step * 3);
     }
 
     #[test]
