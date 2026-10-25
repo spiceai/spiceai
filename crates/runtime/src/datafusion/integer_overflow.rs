@@ -282,16 +282,17 @@ async fn built_session_eager_aggregation_keeps_representable_integer_sum() {
         "built session eager on must return MAX\n{on_rows}\n{on_plan}"
     );
 
-    let (off_pushed, off_plan, off_rows) = plan_join_sum(false, &cancel_amounts).await;
+    let (eager_off_pushed, eager_off_plan, eager_off_rows) =
+        plan_join_sum(false, &cancel_amounts).await;
     assert!(
-        !off_pushed,
-        "built session eager off must not pre-aggregate below the join\n{off_plan}"
+        !eager_off_pushed,
+        "built session eager off must not pre-aggregate below the join\n{eager_off_plan}"
     );
-    let off_rows = off_rows.unwrap_or_else(|error| {
-        panic!("built session eager off must keep MAX, got {error}\n{off_plan}")
+    let eager_off_rows = eager_off_rows.unwrap_or_else(|error| {
+        panic!("built session eager off must keep MAX, got {error}\n{eager_off_plan}")
     });
     assert_eq!(
-        on_rows, off_rows,
+        on_rows, eager_off_rows,
         "built session eager on and off must return the same rows"
     );
 
@@ -365,10 +366,11 @@ async fn built_session_eager_aggregation_keeps_representable_integer_sum() {
         "Int32 SUM over 200 ones must be 200\n{rows}"
     );
 
-    let (_ovf_pushed, ovf_plan, ovf_rows) = plan_join_sum(true, &overflow_amounts).await;
-    let ovf = ovf_rows.expect_err("true overflow must error");
+    let (_overflow_pushed, overflow_plan, overflow_rows) =
+        plan_join_sum(true, &overflow_amounts).await;
+    let overflow_error = overflow_rows.expect_err("true overflow must error");
     assert!(
-        ovf.to_ascii_lowercase().contains("overflow"),
-        "built session true overflow must error, got {ovf}\n{ovf_plan}"
+        overflow_error.to_ascii_lowercase().contains("overflow"),
+        "built session true overflow must error, got {overflow_error}\n{overflow_plan}"
     );
 }

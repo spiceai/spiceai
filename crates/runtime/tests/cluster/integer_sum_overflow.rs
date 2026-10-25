@@ -199,8 +199,7 @@ async fn wait_for_row_count(
         harness
             .query(&format!("SELECT COUNT(*) FROM {TABLE}"))
             .await
-            .ok()
-            .is_some_and(|rows| single_i64(&rows) == expected_i64)
+            .is_ok_and(|rows| single_i64(&rows) == expected_i64)
     })
     .await;
     if ready {
@@ -227,8 +226,7 @@ async fn wait_for_wide_two_executor_plan(
         harness
             .explain(SUM_SQL)
             .await
-            .ok()
-            .is_some_and(|rows| plan_is_wide_two_executor(&format_batches(&rows)))
+            .is_ok_and(|rows| plan_is_wide_two_executor(&format_batches(&rows)))
     })
     .await;
     let plan = format_batches(&harness.explain(SUM_SQL).await?);
