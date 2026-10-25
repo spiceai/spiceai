@@ -1,0 +1,285 @@
+name: ClickBench (official harness)
+run-name: clickbench - ${{ inputs.variant }} - ${{ inputs.releases }}
+
+# Runs the official ClickBench harness (ClickHouse/ClickBench) for each release
+# on its own temporary EC2 instance in the sandbox account, and uploads the
+# harness's results. The only change to the harness is the `install` script,
+# which installs the release under test instead of the version the upstream
+# entry pins.
+
+on:
+  workflow_dispatch:
+    inputs:
+      releases:
+        description: 'Comma-separated release tags to benchmark, e.g. `v2.3.3,v2.4.0-rc.3`. Each runs on its own instance.'
+        required: true
+        type: string
+      variant:
+        description: 'ClickBench system directory'
+        required: true
+        default: 'spiceai-cayenne'
+        type: choice
+        options:
+          - 'spiceai-cayenne'
+          - 'spiceai-parquet'
+          - 'spiceai-parquet-partitioned'
+      harness_ref:
+        description: 'ClickHouse/ClickBench commit to run'
+        required: true
+        default: '3b6a28d423c5162cd18bbd7d5f9f76e3a715bd1f'
+        type: string
+      max_lifetime_minutes:
+        description: 'Each instance shuts itself down (and terminates) after this long, even if this workflow is cancelled'
+        required: true
+        default: '240'
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGION: us-west-2
+  MACHINE: c6a.4xlarge
+  RESULTS_PORT: '8080'
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      releases: ${{ steps.releases.outputs.releases }}
+    steps:
+      - id: releases
+        env:
+          RELEASES: ${{ inputs.releases }}
+        run: |
+          set -euo pipefail
+          releases="$(jq -cn --arg r "${RELEASES}" '$r | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')"
+          if [ "$(jq length <<< "${releases}")" -eq 0 ]; then
+            echo "::error::releases is empty"
+            exit 1
+          fi
+          echo "releases=${releases}" >> "${GITHUB_OUTPUT}"
+
+  clickbench:
+    needs: plan
+    name: ClickBench ${{ matrix.release }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ${{ fromJSON(needs.plan.outputs.releases) }}
+    env:
+      RELEASE: ${{ matrix.release }}
+      VARIANT: ${{ inputs.variant }}
+      HARNESS_REF: ${{ inputs.harness_ref }}
+      MAX_LIFETIME_MINUTES: ${{ inputs.max_lifetime_minutes }}
+      RUN_TAG: clickbench-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.release }}
+    steps:
+      - name: Resolve the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for binary in spice spiced; do
+            digest="$(gh api "repos/spiceai/spiceai/releases/tags/${RELEASE}" \
+              --jq ".assets[] | select(.name == \"${binary}_linux_x86_64.tar.gz\") | .digest")"
+            case "${digest}" in
+              sha256:*) ;;
+              *) echo "::error::${RELEASE} has no ${binary}_linux_x86_64.tar.gz digest"; exit 1 ;;
+            esac
+            echo "${binary^^}_SHA256=${digest#sha256:}" >> "${GITHUB_ENV}"
+          done
+
+      # Credentials must outlast the benchmark and its teardown.
+      - name: Authorize with the sandbox benchmark role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::211125479522:role/spiceai-github-actions-ballista-bench
+          role-session-name: gha-clickbench-${{ github.run_id }}
+          role-duration-seconds: 21600
+          aws-region: ${{ env.REGION }}
+
+      - name: Launch the benchmark instance
+        env:
+          SUBNET_ID: ${{ vars.BALLISTA_BENCH_SUBNET_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SUBNET_ID}" ]; then
+            echo "::error::Repository variable BALLISTA_BENCH_SUBNET_ID is not set"
+            exit 1
+          fi
+          ami_id="$(aws ssm get-parameters --region "${REGION}" \
+            --names /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+            --query 'Parameters[0].Value' --output text)"
+          vpc_id="$(aws ec2 describe-subnets --region "${REGION}" --subnet-ids "${SUBNET_ID}" \
+            --query 'Subnets[0].VpcId' --output text)"
+          runner_ip="$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')"
+          tags="{Key=Name,Value=${RUN_TAG}},{Key=spice:purpose,Value=clickbench},{Key=spice:run-id,Value=${RUN_TAG}},{Key=spice:github-run-id,Value=${GITHUB_RUN_ID}}"
+
+          group_id="$(aws ec2 create-security-group --region "${REGION}" --vpc-id "${vpc_id}" \
+            --group-name "${RUN_TAG}" --description "ClickBench results for ${RUN_TAG}" \
+            --tag-specifications "ResourceType=security-group,Tags=[${tags}]" \
+            --query GroupId --output text)"
+          aws ec2 authorize-security-group-ingress --region "${REGION}" --group-id "${group_id}" \
+            --protocol tcp --port "${RESULTS_PORT}" --cidr "${runner_ip}/32" >/dev/null
+
+          # The official cloud-init flow, with the release's binaries in `install`
+          # and the results served to this runner instead of sent to ClickHouse.
+          cat > user-data.sh <<EOF
+          #!/bin/bash -x
+          shutdown -h +${MAX_LIFETIME_MINUTES}
+          export HOME="\${HOME:-/root}"
+          if [ ! -f /swapfile ]; then
+              fallocate -l 16G /swapfile
+              chmod 600 /swapfile
+              mkswap /swapfile >/dev/null
+              swapon /swapfile
+          fi
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y wget curl git jq earlyoom
+          systemctl enable --now earlyoom
+
+          out=/srv/clickbench
+          mkdir -p "\${out}"
+          cd /root
+          git clone https://github.com/ClickHouse/ClickBench.git ClickBench
+          git -C ClickBench checkout --detach ${HARNESS_REF}
+          cd ClickBench/${VARIANT}
+          cat > install <<'INSTALL'
+          #!/bin/bash
+          set -euo pipefail
+          mkdir -p "\$HOME/.spice/bin"
+          for binary in spice spiced; do
+              asset="\${binary}_linux_x86_64.tar.gz"
+              sha=${SPICE_SHA256}
+              [ "\$binary" != spiced ] || sha=${SPICED_SHA256}
+              curl --fail --location --retry 2 --connect-timeout 20 --max-time 900 \\
+                  "https://github.com/spiceai/spiceai/releases/download/${RELEASE}/\$asset" --output "/tmp/\$asset"
+              printf '%s  %s\n' "\$sha" "/tmp/\$asset" | sha256sum --check
+              tar -xzf "/tmp/\$asset" -C "\$HOME/.spice/bin" "\$binary"
+              ln -sf "\$HOME/.spice/bin/\$binary" "/usr/local/bin/\$binary"
+          done
+          spiced --version
+          spiced --version | grep -F "${RELEASE#v}"
+          spice version
+          INSTALL
+          chmod +x install
+          git -C /root/ClickBench diff > "\${out}/install-override.diff"
+
+          timeout 10800 ./benchmark.sh 2>&1 | tee -a log
+          echo "\${PIPESTATUS[0]}" > "\${out}/benchmark-exit-code"
+          echo -n 'Machine: ' | tee -a log
+          echo "${MACHINE}" | tee -a log
+          json_path="\$(./make-json.sh "${MACHINE}" 2>>log | tail -n1)"
+          cp "\${json_path}" "\${out}/result.json"
+          cp log result.csv spiced.log /var/log/cloud-init-output.log "\${out}/"
+          touch "\${out}/DONE"
+          # Outlives cloud-init, which stops its own background processes on exit.
+          systemd-run --unit clickbench-results python3 -m http.server ${RESULTS_PORT} --directory "\${out}"
+          EOF
+
+          instance_id="$(aws ec2 run-instances --region "${REGION}" --image-id "${ami_id}" \
+            --instance-type "${MACHINE}" --count 1 \
+            --network-interfaces "DeviceIndex=0,SubnetId=${SUBNET_ID},Groups=${group_id},AssociatePublicIpAddress=true" \
+            --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=500,VolumeType=gp2,DeleteOnTermination=true}' \
+            --instance-initiated-shutdown-behavior terminate \
+            --metadata-options HttpTokens=required \
+            --user-data file://user-data.sh \
+            --tag-specifications "ResourceType=instance,Tags=[${tags}]" "ResourceType=volume,Tags=[${tags}]" "ResourceType=network-interface,Tags=[${tags}]" \
+            --query 'Instances[0].InstanceId' --output text)"
+          aws ec2 wait instance-running --region "${REGION}" --instance-ids "${instance_id}"
+          public_ip="$(aws ec2 describe-instances --region "${REGION}" --instance-ids "${instance_id}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
+          echo "Instance ${instance_id} (${MACHINE}, ${ami_id}) at ${public_ip}"
+          echo "PUBLIC_IP=${public_ip}" >> "${GITHUB_ENV}"
+
+      - name: Wait for the benchmark
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + MAX_LIFETIME_MINUTES * 60 ))
+          until curl -fsS -o /dev/null "http://${PUBLIC_IP}:${RESULTS_PORT}/DONE"; do
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              echo "::error::No results within ${MAX_LIFETIME_MINUTES} minutes"
+              exit 1
+            fi
+            sleep 60
+          done
+          mkdir -p results
+          for file in DONE benchmark-exit-code result.json result.csv log spiced.log install-override.diff cloud-init-output.log; do
+            curl -fsS -o "results/${file}" "http://${PUBLIC_IP}:${RESULTS_PORT}/${file}" || echo "missing ${file}"
+          done
+          {
+            echo "release=${RELEASE}"
+            echo "variant=${VARIANT}"
+            echo "machine=${MACHINE}"
+            echo "harness_ref=${HARNESS_REF}"
+            echo "spiced_sha256=${SPICED_SHA256}"
+            echo "spice_sha256=${SPICE_SHA256}"
+          } > results/provenance.txt
+          status="$(cat results/benchmark-exit-code 2>/dev/null || echo unknown)"
+          {
+            echo "### ClickBench ${RELEASE} (${VARIANT}, ${MACHINE})"
+            echo
+            echo "benchmark.sh exit code: ${status}"
+            echo
+            grep -E '^(Load time|Data size|Concurrent QPS|Concurrent error ratio):' results/log || true
+          } >> "${GITHUB_STEP_SUMMARY}"
+          test "${status}" = 0
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: clickbench-${{ inputs.variant }}-${{ matrix.release }}
+          path: results/
+          if-no-files-found: warn
+
+      - name: Re-authorize for cleanup
+        if: always()
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::211125479522:role/spiceai-github-actions-ballista-bench
+          role-session-name: gha-clickbench-cleanup-${{ github.run_id }}
+          aws-region: ${{ env.REGION }}
+
+      - name: Remove this job's EC2 resources
+        if: always()
+        run: |
+          set -uo pipefail
+          filters=(
+            "Name=tag:spice:purpose,Values=clickbench"
+            "Name=tag:spice:run-id,Values=${RUN_TAG}"
+          )
+          failed=0
+          instance_ids="$(aws ec2 describe-instances --region "${REGION}" \
+            --filters "${filters[@]}" "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)" || failed=1
+          if [ -n "${instance_ids}" ]; then
+            echo "Terminating ${instance_ids}"
+            # shellcheck disable=SC2086
+            aws ec2 terminate-instances --region "${REGION}" --instance-ids ${instance_ids} >/dev/null || failed=1
+            # shellcheck disable=SC2086
+            aws ec2 wait instance-terminated --region "${REGION}" --instance-ids ${instance_ids} || failed=1
+          fi
+          group_ids="$(aws ec2 describe-security-groups --region "${REGION}" \
+            --filters "${filters[@]}" --query 'SecurityGroups[].GroupId' --output text)" || failed=1
+          for group_id in ${group_ids}; do
+            echo "Deleting security group ${group_id}"
+            deleted=0
+            # A terminated instance's network interface can hold the group for a short while.
+            for _ in $(seq 1 30); do
+              if aws ec2 delete-security-group --region "${REGION}" --group-id "${group_id}"; then
+                deleted=1
+                break
+              fi
+              sleep 10
+            done
+            if [ "${deleted}" -eq 0 ]; then
+              echo "::error::Could not delete security group ${group_id}"
+              failed=1
+            fi
+          done
+          exit "${failed}"
