@@ -430,6 +430,9 @@ impl Accumulator for CheckedInt64Sum {
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
+        // Narrow only here. `SingleDistinctToGroupBy` must not evaluate a
+        // per-group total that is not the query result; see
+        // `CheckedSingleDistinctToGroupBy`.
         match self.sum {
             None => Ok(ScalarValue::Int64(None)),
             Some(sum) => {

@@ -24,10 +24,12 @@ limitations under the License.
 
 mod analyzer;
 mod op;
+mod single_distinct;
 mod sum;
 
 pub use analyzer::CheckedIntegerOverflow;
 pub use op::{CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME};
+pub use single_distinct::{CheckedSingleDistinctToGroupBy, install_checked_single_distinct};
 pub use sum::CheckedSum;
 
 use std::sync::Arc;

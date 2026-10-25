@@ -27,3 +27,26 @@ table = pa.table(
 )
 pq.write_table(table, out)
 print(out, table.num_rows, table.schema)
+
+# (k, v) rows for SUM(v), COUNT(DISTINCT k): group 1 is MAX+MAX, group 2
+# cancels with -MAX so the true total is MAX. A second file has no cancel.
+i64_max = 2**63 - 1
+cancel_out = sys.argv[2] if len(sys.argv) > 2 else "cancel.parquet"
+cancel = pa.table(
+    {
+        "k": pa.array([1, 1, 2], pa.int64()),
+        "v": pa.array([i64_max, i64_max, -i64_max], pa.int64()),
+    }
+)
+pq.write_table(cancel, cancel_out)
+print(cancel_out, cancel.num_rows, cancel.schema)
+
+ovf_out = sys.argv[3] if len(sys.argv) > 3 else "ovf.parquet"
+ovf = pa.table(
+    {
+        "k": pa.array([1, 1, 2], pa.int64()),
+        "v": pa.array([i64_max, i64_max, i64_max], pa.int64()),
+    }
+)
+pq.write_table(ovf, ovf_out)
+print(ovf_out, ovf.num_rows, ovf.schema)

@@ -28,10 +28,13 @@ use arrow::array::{ArrayRef, Decimal128Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::MemTable;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::optimizer::Optimizer;
 use datafusion::prelude::SessionContext;
 
 use crate::analyzer_rule::AnalyzerRulesBuilder;
-use crate::checked_arithmetic::{CheckedIntegerOverflow, register_checked_arithmetic};
+use crate::checked_arithmetic::{
+    CheckedIntegerOverflow, install_checked_single_distinct, register_checked_arithmetic,
+};
 use crate::session_config::get_df_default_config;
 
 const ROWS: usize = 100_000;
@@ -48,10 +51,13 @@ fn checked_session() -> SessionContext {
     {
         analyzer_rules.push(Arc::new(CheckedIntegerOverflow::new()));
     }
+    let mut optimizer_rules = Optimizer::new().rules;
+    install_checked_single_distinct(&mut optimizer_rules);
     let mut state = SessionStateBuilder::new()
         .with_config(get_df_default_config())
         .with_default_features()
         .with_analyzer_rules(analyzer_rules)
+        .with_optimizer_rules(optimizer_rules)
         .build();
     register_checked_arithmetic(&mut state).expect("register checked arithmetic");
     SessionContext::new_with_state(state)

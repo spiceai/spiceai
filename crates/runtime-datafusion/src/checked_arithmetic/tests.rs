@@ -22,7 +22,7 @@ use arrow::util::display::array_value_to_string;
 use datafusion::catalog::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::Operator;
-use datafusion::optimizer::AnalyzerRule;
+use datafusion::optimizer::{AnalyzerRule, Optimizer};
 use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::SessionContext;
 
@@ -30,7 +30,7 @@ use crate::analyzer_rule::AnalyzerRulesBuilder;
 use crate::checked_arithmetic::op::checked_op_udf;
 use crate::checked_arithmetic::{
     CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME, CheckedIntegerOverflow,
-    register_checked_arithmetic,
+    install_checked_single_distinct, register_checked_arithmetic,
 };
 use crate::session_config::get_df_default_config;
 
@@ -79,10 +79,13 @@ fn checked_session() -> SessionContext {
     {
         analyzer_rules.push(Arc::new(CheckedIntegerOverflow::new()));
     }
+    let mut optimizer_rules = Optimizer::new().rules;
+    install_checked_single_distinct(&mut optimizer_rules);
     let mut state = SessionStateBuilder::new()
         .with_config(get_df_default_config())
         .with_default_features()
         .with_analyzer_rules(analyzer_rules)
+        .with_optimizer_rules(optimizer_rules)
         .build();
     register_checked_arithmetic(&mut state).expect("register checked arithmetic");
     let ctx = SessionContext::new_with_state(state);
@@ -705,6 +708,108 @@ async fn checked_bounded_window_sum_distinct_retracts_int64_and_uint64() {
         expected,
         "UInt64 bounded SUM(DISTINCT) must keep a duplicate, drop the last occurrence, and NULL a NULL-only frame\nplan:\n{u64_plan}"
     );
+}
+
+#[tokio::test]
+async fn vanilla_datafusion_wraps_mixed_sum_and_count_distinct_to_max() {
+    let ctx = vanilla_session();
+    let batch = cancel_across_groups_batch();
+    register_table(&ctx, "t_cancel", batch);
+
+    let mixed = ctx
+        .sql("SELECT SUM(v), COUNT(DISTINCT k) FROM t_cancel")
+        .await
+        .expect("plan vanilla mixed")
+        .collect()
+        .await
+        .expect("run vanilla mixed");
+    assert_eq!(
+        render_rows(&mixed),
+        vec![format!("{} 2", i64::MAX)],
+        "vanilla wrapping MAX+MAX+(-MAX) happens to be MAX"
+    );
+}
+
+#[tokio::test]
+async fn checked_sum_matches_across_count_distinct_rewrite_and_overflows_when_true_total_overflows()
+{
+    let ctx = checked_session();
+    register_table(&ctx, "t_cancel", cancel_across_groups_batch());
+
+    let sum_sql = "SELECT SUM(v) FROM t_cancel";
+    let (sum_plan, sum_rows) = plan_and_collect(&ctx, sum_sql).await;
+    assert_plan_ran(&sum_plan, sum_sql, &["AggregateExec"]);
+    assert_eq!(
+        render_rows(&sum_rows),
+        vec![i64::MAX.to_string()],
+        "MAX+MAX+(-MAX) is MAX\nplan:\n{sum_plan}"
+    );
+
+    let mixed_sql = "SELECT SUM(v), COUNT(DISTINCT k) FROM t_cancel";
+    let (mixed_plan, mixed_rows) = plan_and_collect(&ctx, mixed_sql).await;
+    assert_plan_ran(&mixed_plan, mixed_sql, &["AggregateExec"]);
+    assert_eq!(
+        render_rows(&mixed_rows),
+        vec![format!("{} 2", i64::MAX)],
+        "SUM(v), COUNT(DISTINCT k) must match SUM(v) and count two keys\nplan:\n{mixed_plan}"
+    );
+    assert!(
+        mixed_plan.contains("DISTINCT"),
+        "checked integer SUM must stay out of single_distinct_to_groupby so per-group evaluate cannot narrow early\nplan:\n{mixed_plan}"
+    );
+
+    register_table(&ctx, "t_ovf", true_total_overflow_batch());
+    let ovf_sum_sql = "SELECT SUM(v) FROM t_ovf";
+    let (ovf_sum_plan, ovf_sum) = plan_and_error(&ctx, ovf_sum_sql).await;
+    assert_plan_ran(&ovf_sum_plan, ovf_sum_sql, &["AggregateExec"]);
+    assert!(
+        contains_overflow(&ovf_sum),
+        "true total MAX+MAX+MAX must overflow, got {ovf_sum}\nplan:\n{ovf_sum_plan}"
+    );
+
+    let ovf_mixed_sql = "SELECT SUM(v), COUNT(DISTINCT k) FROM t_ovf";
+    let (ovf_mixed_plan, ovf_mixed) = plan_and_error(&ctx, ovf_mixed_sql).await;
+    assert_plan_ran(&ovf_mixed_plan, ovf_mixed_sql, &["AggregateExec"]);
+    assert!(
+        contains_overflow(&ovf_mixed),
+        "mixed query whose true total overflows must overflow, got {ovf_mixed}\nplan:\n{ovf_mixed_plan}"
+    );
+}
+
+fn cancel_across_groups_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(i64::MAX),
+                Some(i64::MAX),
+                Some(-i64::MAX),
+            ])),
+        ],
+    )
+    .expect("cancel-across-groups batch")
+}
+
+fn true_total_overflow_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(i64::MAX),
+                Some(i64::MAX),
+                Some(i64::MAX),
+            ])),
+        ],
+    )
+    .expect("true-total-overflow batch")
 }
 
 async fn run_slt(ctx: &SessionContext, script: &str) {

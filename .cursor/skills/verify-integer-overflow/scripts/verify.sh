@@ -26,7 +26,10 @@ mkdir -p "${ROOT}/data"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cp "${SCRIPT_DIR}/../spicepod.yaml" "${ROOT}/spicepod.yaml"
 
-"${PYTHON}" "${SCRIPT_DIR}/gen_overflow_parquet.py" "${ROOT}/data/overflow.parquet"
+"${PYTHON}" "${SCRIPT_DIR}/gen_overflow_parquet.py" \
+  "${ROOT}/data/overflow.parquet" \
+  "${ROOT}/data/cancel.parquet" \
+  "${ROOT}/data/ovf.parquet"
 
 cd "${ROOT}"
 
@@ -99,4 +102,14 @@ for table in t_fed t_arrow t_cayenne; do
   sql "SELECT SUM(DISTINCT big) FROM ${table}"
   sql "SELECT SUM(DISTINCT big) FROM ${table} WHERE id IN (3, 4)"
   sql "SELECT SUM(DISTINCT big) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM ${table} WHERE id IN (1, 3)"
+done
+
+for table in t_cancel_fed t_cancel_arrow t_cancel_cayenne; do
+  sql "SELECT SUM(v) FROM ${table}"
+  sql "SELECT SUM(v), COUNT(DISTINCT k) FROM ${table}"
+done
+
+for table in t_ovf_fed t_ovf_arrow t_ovf_cayenne; do
+  sql "SELECT SUM(v) FROM ${table}"
+  sql "SELECT SUM(v), COUNT(DISTINCT k) FROM ${table}"
 done

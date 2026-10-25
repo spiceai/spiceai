@@ -1554,6 +1554,7 @@ fn with_spice_logical_optimizers(
         let _ = cayenne_optimizer_rules;
         let _ = cte_materialization;
     }
+    runtime_datafusion::checked_arithmetic::install_checked_single_distinct(&mut optimizer_rules);
     optimizer_rules.extend(trailing_rules);
     // Leaf-expression pushdown would move a model call below the filters that decide
     // which rows it runs on; the decision functions' own rule runs last and places it.

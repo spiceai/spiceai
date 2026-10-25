@@ -15,3 +15,29 @@ datasets:
       enabled: true
       engine: cayenne
       mode: memory
+  - from: file:data/cancel.parquet
+    name: t_cancel_fed
+  - from: file:data/cancel.parquet
+    name: t_cancel_arrow
+    acceleration:
+      enabled: true
+      engine: arrow
+  - from: file:data/cancel.parquet
+    name: t_cancel_cayenne
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: memory
+  - from: file:data/ovf.parquet
+    name: t_ovf_fed
+  - from: file:data/ovf.parquet
+    name: t_ovf_arrow
+    acceleration:
+      enabled: true
+      engine: arrow
+  - from: file:data/ovf.parquet
+    name: t_ovf_cayenne
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: memory

@@ -118,4 +118,40 @@ async fn built_session_errors_on_bigint_sum_and_add() {
         distinct_value, "3",
         "non-overflowing SUM(DISTINCT BIGINT) must stay 3"
     );
+
+    let cancel = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])),
+            Arc::new(Int64Array::from(vec![
+                Some(i64::MAX),
+                Some(i64::MAX),
+                Some(-i64::MAX),
+            ])),
+        ],
+    )
+    .expect("cancel batch");
+    df.ctx
+        .register_batch("t_cancel", cancel)
+        .expect("register cancel table");
+    let mixed = df
+        .ctx
+        .sql("SELECT SUM(v), COUNT(DISTINCT k) FROM t_cancel")
+        .await
+        .expect("plan mixed SUM + COUNT(DISTINCT)")
+        .collect()
+        .await
+        .expect("run mixed SUM + COUNT(DISTINCT)");
+    let mixed_sum = arrow::util::display::array_value_to_string(mixed[0].column(0), 0)
+        .expect("render mixed SUM");
+    let mixed_count = arrow::util::display::array_value_to_string(mixed[0].column(1), 0)
+        .expect("render mixed COUNT");
+    assert_eq!(
+        (mixed_sum.as_str(), mixed_count.as_str()),
+        (i64::MAX.to_string().as_str(), "2"),
+        "built session SUM + COUNT(DISTINCT) must keep the representable total"
+    );
 }

@@ -20,7 +20,18 @@ On a built `spiced` from this branch, each of `t_fed`, `t_arrow`, and `t_cayenne
 5. Return `3` for `SELECT SUM(DISTINCT big) FROM <table> WHERE id IN (3, 4)`.
 6. Return an error whose text contains `overflow` for window `SUM(DISTINCT big)` over `id IN (1, 3)`.
 
-On trunk, the overflow queries return a wrapped integer and no error.
+On a built `spiced` from this branch, each of `t_cancel_fed`, `t_cancel_arrow`, and
+`t_cancel_cayenne` (rows `(1, MAX), (1, MAX), (2, -MAX)`) must:
+
+7. Return `MAX` for `SELECT SUM(v) FROM <table>`.
+8. Return `MAX, 2` for `SELECT SUM(v), COUNT(DISTINCT k) FROM <table>` (never an overflow
+   error: the inner per-group total `MAX+MAX` is not the query result).
+
+Each of `t_ovf_fed`, `t_ovf_arrow`, and `t_ovf_cayenne` (rows `(1, MAX), (1, MAX), (2, MAX)`)
+must error on both `SUM(v)` and `SUM(v), COUNT(DISTINCT k)`.
+
+On trunk, the overflow queries return a wrapped integer and no error. The cancel mixed
+query happens to return `MAX` because wrapping `MAX+MAX+(-MAX)` is `MAX`.
 
 ## Layout
 
