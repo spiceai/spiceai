@@ -132,6 +132,8 @@ jobs:
                 --base trunk \
                 --head "$branch"
             fi
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
+            bash .github/scripts/approve_bot_pr_runs.sh "$branch" "$(git rev-parse HEAD)"
           fi
 
           if [ -n "$number" ] && [ "$age_hours" -ge "$STALE_AFTER_HOURS" ]; then
