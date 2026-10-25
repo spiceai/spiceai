@@ -387,6 +387,7 @@ impl ReplaceSnapshot {
                     (Some(index), Some(seq_no), Some(primary_term)) => Ok(DocumentVersion {
                         index,
                         id: hit.id,
+                        routing: hit.routing,
                         seq_no,
                         primary_term,
                     }),

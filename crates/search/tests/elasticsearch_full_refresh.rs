@@ -454,3 +454,53 @@ async fn a_full_refresh_across_an_alias_switch_keeps_the_rows_it_rewrote() {
         let _ = t.http.delete(format!("{}/{index}", es_url())).send().await;
     }
 }
+
+/// An alias can set `routing`, so every write through it lands on one shard of a multi-shard
+/// index. A delete has to repeat that routing to reach the document; without it, the request
+/// goes to the shard the `_id` hashes to, finds nothing, and the dropped row stays searchable.
+#[tokio::test]
+async fn a_full_refresh_through_a_routed_alias_removes_the_rows_it_dropped() {
+    let t = TestIndex::new("routed").await;
+    let concrete = format!("{}-routed", t.name);
+    let _ = t
+        .http
+        .delete(format!("{}/{concrete}", es_url()))
+        .send()
+        .await;
+    let resp = t
+        .http
+        .put(format!("{}/{concrete}", es_url()))
+        .json(&serde_json::json!({
+            "settings": { "number_of_shards": 4 },
+            "aliases": { (t.name.clone()): { "routing": "tenant-1" } },
+        }))
+        .send()
+        .await
+        .expect("create index request");
+    assert!(
+        resp.status().is_success(),
+        "create {concrete}: {}",
+        resp.status()
+    );
+
+    t.write(WriteWindow::ReplaceAll, rows(0..40, "first")).await;
+    assert_eq!(t.ids().await, (0..40).collect::<BTreeSet<i64>>());
+
+    let kept: BTreeSet<i64> = (0..40).filter(|id| id % 2 == 0).collect();
+    t.write(
+        WriteWindow::ReplaceAll,
+        rows(kept.iter().copied(), "second"),
+    )
+    .await;
+
+    assert_eq!(
+        t.ids().await,
+        kept,
+        "the odd rows are gone from the source, so their documents must be gone from the index"
+    );
+    let _ = t
+        .http
+        .delete(format!("{}/{concrete}", es_url()))
+        .send()
+        .await;
+}

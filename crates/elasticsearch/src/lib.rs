@@ -230,6 +230,11 @@ pub struct Hit {
     /// behind it.
     #[serde(default, rename = "_index")]
     pub index: Option<String>,
+    /// The custom routing the document was written with, if any (for example by a write
+    /// through an alias that sets `routing`). Without it, a request for this `_id` goes to
+    /// the shard the `_id` hashes to, which need not be the one holding the document.
+    #[serde(default, rename = "_routing")]
+    pub routing: Option<String>,
 }
 
 /// A document as one write left it: any later write to the same `_id` assigns a new
@@ -242,6 +247,8 @@ pub struct DocumentVersion {
     /// index an alias points to later.
     pub index: String,
     pub id: String,
+    /// The document's custom routing, which a request has to repeat to reach its shard.
+    pub routing: Option<String>,
     pub seq_no: i64,
     pub primary_term: i64,
 }
@@ -679,12 +686,16 @@ impl Client {
     ) -> Result<serde_json::Value> {
         let mut ndjson = String::new();
         for doc in docs {
-            let action = serde_json::json!({"delete": {
+            let mut delete = serde_json::json!({
                 "_index": doc.index,
                 "_id": doc.id,
                 "if_seq_no": doc.seq_no,
                 "if_primary_term": doc.primary_term,
-            }});
+            });
+            if let Some(routing) = &doc.routing {
+                delete["routing"] = serde_json::Value::String(routing.clone());
+            }
+            let action = serde_json::json!({ "delete": delete });
             ndjson.push_str(&serde_json::to_string(&action).context(JsonSerializeSnafu)?);
             ndjson.push('\n');
         }

@@ -897,6 +897,7 @@ mod tests {
             seq_no: None,
             primary_term: None,
             index: None,
+            routing: None,
         }
     }
 
@@ -909,6 +910,7 @@ mod tests {
             seq_no: None,
             primary_term: None,
             index: None,
+            routing: None,
         }
     }
 
