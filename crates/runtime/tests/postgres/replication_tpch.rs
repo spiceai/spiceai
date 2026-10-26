@@ -50,9 +50,9 @@ use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, Date32Type, Float64Type, Int64Type};
 use futures::TryStreamExt;
 use runtime::Runtime;
-use runtime_request_context::{CacheControl, Protocol, RequestContext};
 use secrecy::ExposeSecret;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
+use spicepod::component::caching::SQLResultsCacheConfig;
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 use spicepod::partitioning::PartitionedBy;
@@ -452,18 +452,12 @@ enum Cell {
     Date(i32),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `rows` is sorted when the answer is built, so equal multisets compare equal.
+#[derive(Debug)]
 struct Answer {
     columns: Vec<String>,
     kinds: Vec<Kind>,
     rows: Vec<Vec<Cell>>,
-}
-
-impl Answer {
-    fn sorted(mut self) -> Self {
-        self.rows.sort();
-        self
-    }
 }
 
 /// Fail unless Spice returns the rows the source returns for every statement
@@ -477,7 +471,7 @@ async fn assert_matches_source(
     let mut answers = Vec::with_capacity(ORACLE_QUERIES.len());
     for (name, sql) in ORACLE_QUERIES {
         let postgres = answer_from_postgres(source, sql).await?;
-        let spice = answer_from_batches(&run_query_uncached(rt, sql).await?)?;
+        let spice = answer_from_batches(&run_query(rt, sql).await?)?;
         assert_same_answer(engine, stage, name, sql, &spice, &postgres)?;
         answers.push(postgres);
     }
@@ -495,40 +489,25 @@ async fn assert_answers_from_acceleration(
     expected: &[Answer],
 ) -> Result<(), anyhow::Error> {
     container.pause().await?;
-    let mut outcome = Ok(());
-    for ((name, sql), postgres) in ORACLE_QUERIES.iter().zip(expected) {
-        let spice =
-            match tokio::time::timeout(PAUSED_SOURCE_QUERY_TIMEOUT, run_query_uncached(rt, sql))
+    let outcome = async {
+        for ((name, sql), postgres) in ORACLE_QUERIES.iter().zip(expected) {
+            let batches = tokio::time::timeout(PAUSED_SOURCE_QUERY_TIMEOUT, run_query(rt, sql))
                 .await
-            {
-                Ok(batches) => batches.and_then(|batches| answer_from_batches(&batches)),
-                Err(_) => Err(anyhow!(
-                    "{engine} paused-source {name}: no answer within \
-                 {PAUSED_SOURCE_QUERY_TIMEOUT:?} while the source was paused, so \
-                 the query did not read the acceleration\n  sql: {sql}"
-                )),
-            };
-        outcome = spice.and_then(|spice| {
-            assert_same_answer(engine, "paused-source", name, sql, &spice, postgres)
-        });
-        if outcome.is_err() {
-            break;
+                .map_err(|_| {
+                    anyhow!(
+                        "{engine} paused-source {name}: no answer within \
+                         {PAUSED_SOURCE_QUERY_TIMEOUT:?} while the source was paused, so \
+                         the query did not read the acceleration\n  sql: {sql}"
+                    )
+                })??;
+            let spice = answer_from_batches(&batches)?;
+            assert_same_answer(engine, "paused-source", name, sql, &spice, postgres)?;
         }
+        Ok(())
     }
+    .await;
     container.unpause().await?;
     outcome
-}
-
-/// [`run_query`] with the SQL results cache bypassed, so the answer is read from
-/// the acceleration rather than served from a cached result of the same text.
-async fn run_query_uncached(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    Arc::new(
-        RequestContext::builder(Protocol::Internal)
-            .with_cache_control(CacheControl::NoCache)
-            .build(),
-    )
-    .scope(run_query(rt, sql))
-    .await
 }
 
 fn assert_same_answer(
@@ -539,8 +518,6 @@ fn assert_same_answer(
     spice: &Answer,
     postgres: &Answer,
 ) -> Result<(), anyhow::Error> {
-    let spice = spice.clone().sorted();
-    let postgres = postgres.clone().sorted();
     if spice.rows.is_empty() || postgres.rows.is_empty() {
         return Err(anyhow!(
             "{engine} {stage} {name}: an empty answer compares nothing\n  sql: {sql}\n  \
@@ -595,7 +572,7 @@ async fn answer_from_postgres(
         .iter()
         .map(|column| pg_kind(column.type_()))
         .collect::<Result<Vec<_>, _>>()?;
-    let rows = rows
+    let mut rows = rows
         .iter()
         .map(|row| {
             (0..row.len())
@@ -603,6 +580,7 @@ async fn answer_from_postgres(
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
+    rows.sort();
     Ok(Answer {
         columns,
         kinds,
@@ -669,7 +647,7 @@ fn answer_from_batches(batches: &[RecordBatch]) -> Result<Answer, anyhow::Error>
         kinds.push(kind);
         column_cells.push(cells);
     }
-    let rows = (0..batch.num_rows())
+    let mut rows: Vec<Vec<Cell>> = (0..batch.num_rows())
         .map(|row| {
             column_cells
                 .iter()
@@ -677,6 +655,7 @@ fn answer_from_batches(batches: &[RecordBatch]) -> Result<Answer, anyhow::Error>
                 .collect()
         })
         .collect();
+    rows.sort();
     Ok(Answer {
         columns,
         kinds,
@@ -780,7 +759,13 @@ async fn run_tpch_postgres_replication(
             let acceleration_dir = tempfile::tempdir()?;
             let partitioned_in = partitioned.then_some(acceleration_dir.path());
             let app = || {
-                let mut builder = AppBuilder::new(format!("tpch_replication_integration_{engine}"));
+                // With the SQL results cache on, a repeated statement can be
+                // answered from a cached result instead of the acceleration.
+                let mut builder = AppBuilder::new(format!("tpch_replication_integration_{engine}"))
+                    .with_sql_cache(SQLResultsCacheConfig {
+                        enabled: false,
+                        ..Default::default()
+                    });
                 for ds in TPCH_DATASETS {
                     builder =
                         builder.with_dataset(make_dataset(ds, &pg_params, engine, partitioned_in));
