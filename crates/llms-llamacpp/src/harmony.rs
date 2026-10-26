@@ -114,25 +114,35 @@ pub(crate) enum Mark {
     Done,
 }
 
+/// What part of a reply a grammar holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// None of it.
+    Nothing,
+    /// The final message, to a `response_format`'s schema.
+    Final,
+    /// All of it, to a call one of the tools a required call may name.
+    Whole,
+}
+
 /// Reads one reply.
 #[derive(Debug)]
 pub(crate) struct Reader {
     markers: Markers,
     /// The tools a call may name.
     tools: Vec<String>,
-    /// Whether a `response_format` holds the final message to a schema.
-    structured: bool,
+    held: Held,
     route: Route,
 }
 
 impl Reader {
     /// The chat template's generation prompt opens the reply's first message, so the reply
     /// starts in its header.
-    pub(crate) fn new(markers: Markers, tools: Vec<String>, structured: bool) -> Self {
+    pub(crate) fn new(markers: Markers, tools: Vec<String>, held: Held) -> Self {
         Self {
             markers,
             tools,
-            structured,
+            held,
             route: Route::Header(String::new()),
         }
     }
@@ -152,7 +162,7 @@ impl Reader {
                 [m.start, m.channel, m.message, m.end, m.constrain].contains(&token)
             }
             Route::Call { arguments, .. } => token == m.end && is_json(arguments),
-            Route::Content { last: true } if self.structured => false,
+            Route::Content { last: true } if self.held == Held::Final => false,
             Route::Reasoning | Route::Content { .. } | Route::Dropped => token == m.end,
         }
     }
@@ -162,9 +172,14 @@ impl Reader {
         matches!(self.route, Route::Header(_))
     }
 
-    /// Whether the reply is in its final message, which a `response_format` holds to a schema.
-    pub(crate) fn in_final(&self) -> bool {
-        matches!(self.route, Route::Content { last: true })
+    /// Whether the grammar holds the token that comes next: in the final message, a
+    /// `response_format`'s; anywhere, a required call's.
+    pub(crate) fn in_grammar(&self) -> bool {
+        match self.held {
+            Held::Nothing => false,
+            Held::Final => matches!(self.route, Route::Content { last: true }),
+            Held::Whole => true,
+        }
     }
 
     /// Reads `token`, a marker.
@@ -332,16 +347,16 @@ mod tests {
 
     /// The reasoning, the content and the call `reply` reads as, and whether it ended.
     fn read(reply: &str, tools: &[&str]) -> (String, String, Option<(String, String)>, bool) {
-        read_as(reply, tools, false)
+        read_as(reply, tools, Held::Nothing)
     }
 
     fn read_as(
         reply: &str,
         tools: &[&str],
-        structured: bool,
+        held: Held,
     ) -> (String, String, Option<(String, String)>, bool) {
         let tools = tools.iter().map(ToString::to_string).collect();
-        let mut reader = Reader::new(TEST_MARKERS, tools, structured);
+        let mut reader = Reader::new(TEST_MARKERS, tools, held);
         let (mut reasoning, mut content) = (String::new(), String::new());
         for (token, text) in spell(reply) {
             if let Some(token) = token
@@ -512,7 +527,7 @@ mod tests {
             read_as(
                 "<|channel|>final<|message|>{\"s\":\"<|end|>\"}<|return|>",
                 &[],
-                true
+                Held::Final
             ),
             answer("", "{\"s\":\"<|end|>\"}")
         );
@@ -520,7 +535,7 @@ mod tests {
             read_as(
                 "<|channel|>final<|message|>a<|end|><|start|>assistant<|channel|>final<|message|>b<|return|>",
                 &[],
-                false
+                Held::Nothing
             ),
             answer("", "ab")
         );
@@ -528,7 +543,7 @@ mod tests {
 
     #[test]
     fn a_reply_that_ends_after_complete_arguments_still_makes_its_call() {
-        let mut reader = Reader::new(TEST_MARKERS, vec!["f".to_string()], false);
+        let mut reader = Reader::new(TEST_MARKERS, vec!["f".to_string()], Held::Nothing);
         for (token, text) in spell("<|channel|>commentary to=functions.f<|message|>") {
             match token {
                 Some(token) => {
@@ -557,19 +572,24 @@ mod tests {
 
     #[test]
     fn only_the_final_message_is_held_to_a_response_format() {
-        let mut reader = Reader::new(TEST_MARKERS, Vec::new(), false);
-        assert!(!reader.in_final() && reader.in_header());
+        let mut reader = Reader::new(TEST_MARKERS, Vec::new(), Held::Final);
+        assert!(!reader.in_grammar() && reader.in_header());
         reader.mark(TEST_MARKERS.channel);
         reader.text("commentary");
         reader.mark(TEST_MARKERS.message);
-        assert!(!reader.in_final() && !reader.in_header(), "a preamble");
+        assert!(!reader.in_grammar() && !reader.in_header(), "a preamble");
         reader.mark(TEST_MARKERS.end);
         reader.mark(TEST_MARKERS.start);
         reader.text("assistant");
         reader.mark(TEST_MARKERS.channel);
         reader.text("final");
         reader.mark(TEST_MARKERS.message);
-        assert!(reader.in_final());
+        assert!(reader.in_grammar());
+        let whole = Reader::new(TEST_MARKERS, Vec::new(), Held::Whole);
+        assert!(
+            whole.in_grammar(),
+            "a required call's grammar holds the whole reply"
+        );
     }
 
     #[test]

@@ -565,10 +565,13 @@ impl LlamaCpp {
             .is_some_and(ToolCallingMatcher::requires_tool_call);
         let ban_eog = require_tool_call && grammar.is_none();
         let nameable = nameable_tools(&callable, &obliged);
-        let structured = matches!(
-            req.response_format,
-            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
-        );
+        let held = if !obliged.is_empty() {
+            harmony::Held::Whole
+        } else if grammar.is_some() {
+            harmony::Held::Final
+        } else {
+            harmony::Held::Nothing
+        };
         let prompt = self.prompt(&req.messages, reasoning, tools)?;
         let stop = match &req.stop {
             Some(StopConfiguration::String(s)) => vec![s.clone()],
@@ -582,7 +585,7 @@ impl LlamaCpp {
             let (events, rx) = mpsc::channel(STREAM_BUFFER);
             let harmony = self
                 .harmony
-                .map(|markers| harmony::Reader::new(markers, nameable.clone(), structured));
+                .map(|markers| harmony::Reader::new(markers, nameable.clone(), held));
             let job = Job {
                 reasoning: reasoning_parser(template, &prompt),
                 prompt: prompt.clone(),
@@ -1616,7 +1619,7 @@ impl Output {
     /// Harmony reply, whether it is in its final message.
     fn in_content(&self) -> bool {
         match &self.harmony {
-            Some(reader) => reader.in_final(),
+            Some(reader) => reader.in_grammar(),
             None => !self
                 .reasoning
                 .as_ref()
@@ -2396,6 +2399,8 @@ fn content_grammar(
         // The turn must be a tool call, so a structured reply waits for a later turn.
         return if tagged {
             json_grammar(&call_schema(obliged), "tools").map(|call| Some(tagged_call(&call)))
+        } else if is_harmony_template(template) {
+            harmony_call(obliged).map(Some)
         } else {
             Ok(None)
         };
@@ -2416,15 +2421,44 @@ fn content_grammar(
     Ok(Some(either_grammar(&call, &reply)))
 }
 
+/// The grammar of a whole Harmony reply that must call one of `tools`: any reasoning, then a
+/// `commentary` message addressed to the tool, its arguments held to the tool's schema, as
+/// llama.cpp's server forces one. A marker in the grammar matches the marker's token.
+fn harmony_call(tools: &[&Tool]) -> std::result::Result<String, OpenAIError> {
+    let mut grammar = String::new();
+    let mut calls = Vec::with_capacity(tools.len());
+    for (i, tool) in tools.iter().enumerate() {
+        let prefix = format!("tool{i}-");
+        let arguments = json_grammar(&arguments_schema(tool), "tools")?;
+        grammar.push_str(&prefix_rules(&arguments, &prefix));
+        let name = serde_json::Value::String(tool.function.name.clone());
+        calls.push(format!("{name} constrain? \"<|message|>\" {prefix}root"));
+    }
+    grammar.push_str("call ::= ");
+    grammar.push_str(&calls.join(" | "));
+    grammar.push('\n');
+    grammar.push_str("constrain ::= \" \" \"<|constrain|>\"? [A-Za-z0-9_-]+\n");
+    grammar.push_str("reasoning ::= ([^<] | \"<\" [^|])*\n");
+    grammar.push_str(
+        "root ::= (\"<|channel|>analysis<|message|>\" reasoning \"<|end|><|start|>assistant\")? \"<|channel|>commentary to=functions.\" call\n",
+    );
+    Ok(grammar)
+}
+
+/// A tool's arguments schema: its parameters, or any object.
+fn arguments_schema(tool: &Tool) -> serde_json::Value {
+    tool.function.parameters.as_ref().map_or_else(
+        || serde_json::json!({ "type": "object" }),
+        |p| serde_json::Value::Object(p.clone().into_iter().collect()),
+    )
+}
+
 /// The JSON schema of a call to one of `tools`, with the arguments held to the tool's schema.
 fn call_schema(tools: &[&Tool]) -> serde_json::Value {
     let calls: Vec<serde_json::Value> = tools
         .iter()
         .map(|tool| {
-            let arguments = tool.function.parameters.as_ref().map_or_else(
-                || serde_json::json!({ "type": "object" }),
-                |p| serde_json::Value::Object(p.clone().into_iter().collect()),
-            );
+            let arguments = arguments_schema(tool);
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3097,7 +3131,11 @@ mod tests {
             stop: stop.iter().map(ToString::to_string).collect(),
             reasoning: None,
             tools: None,
-            harmony: Some(harmony::Reader::new(HARMONY_MARKERS, tools, false)),
+            harmony: Some(harmony::Reader::new(
+                HARMONY_MARKERS,
+                tools,
+                harmony::Held::Nothing,
+            )),
             require_tool_call: false,
             stopping: Arc::default(),
             events,
@@ -3256,7 +3294,7 @@ mod tests {
             harmony: Some(harmony::Reader::new(
                 HARMONY_MARKERS,
                 nameable_tools(&[&f, &g], &[&f]),
-                false,
+                harmony::Held::Nothing,
             )),
             require_tool_call: true,
             stopping: Arc::default(),
@@ -3270,6 +3308,34 @@ mod tests {
         assert_eq!(
             output.finish(FinishReason::Stop, 1).map(|o| o.finish),
             Err("Tool choice was required but no tools were called.".to_string())
+        );
+    }
+
+    #[test]
+    fn a_required_harmony_call_is_forced_by_a_grammar_over_the_whole_reply() {
+        let tool = weather_tool();
+        let grammar = content_grammar("m", HARMONY, None, &[&tool], &[&tool])
+            .expect("the tool's schema converts")
+            .expect("a required call in a Harmony template has a grammar");
+        assert!(
+            grammar.ends_with(
+                "root ::= (\"<|channel|>analysis<|message|>\" reasoning \"<|end|><|start|>assistant\")? \"<|channel|>commentary to=functions.\" call\n"
+            ),
+            "{grammar}"
+        );
+        assert!(
+            grammar.contains("call ::= \"get_weather\" constrain? \"<|message|>\" tool0-root\n"),
+            "{grammar}"
+        );
+        assert_eq!(
+            grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
+            1,
+            "one start rule: {grammar}"
+        );
+        // without a required call there is nothing to force
+        assert_eq!(
+            content_grammar("m", HARMONY, None, &[&tool], &[]).expect("no grammar"),
+            None
         );
     }
 
