@@ -18,10 +18,11 @@ limitations under the License.
 
 use super::{Source, TextResult};
 use crate::generate::Dialect;
-use std::fmt::Write;
+use std::{collections::BTreeMap, fmt::Write};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde_json::{Map, Value};
+use serde::{Serialize, Serializer, ser::SerializeMap};
+use serde_json::value::RawValue;
 use sqlparser::{
     ast::{
         Assignment, AssignmentTarget, FromTable, ObjectName, OnConflictAction, OnInsert, Statement,
@@ -31,10 +32,44 @@ use sqlparser::{
     parser::Parser,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+/// Scalars keep numeric text until the container CLI decodes it. Routing
+/// decimals through an f64 would change the oracle's row images.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cell {
+    Null,
+    Bool(bool),
+    Number(String),
+    String(String),
+}
+
+impl Serialize for Cell {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Null => serializer.serialize_none(),
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::String(value) => serializer.serialize_str(value),
+            Self::Number(value) => RawValue::from_string(value.clone())
+                .map_err(serde::ser::Error::custom)?
+                .serialize(serializer),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowChange {
-    Upsert(Map<String, Value>),
-    Delete(Value),
+    Upsert(BTreeMap<String, Cell>),
+    Delete(Cell),
+}
+
+impl Serialize for RowChange {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self {
+            Self::Upsert(doc) => map.serialize_entry("doc", doc)?,
+            Self::Delete(key) => map.serialize_entry("delete", key)?,
+        }
+        map.end()
+    }
 }
 
 #[derive(Debug)]
@@ -183,24 +218,27 @@ pub fn numeric(kind: &str) -> bool {
     )
 }
 
-pub fn json_value(text: Option<&str>, kind: &str) -> Result<Value> {
+pub fn json_value(text: Option<&str>, kind: &str) -> Result<Cell> {
     let Some(text) = text else {
-        return Ok(Value::Null);
+        return Ok(Cell::Null);
     };
     if numeric(kind) {
-        let number = text
-            .parse::<serde_json::Number>()
+        let number = RawValue::from_string(text.into())
             .with_context(|| format!("'{text}' of type {kind} is not a finite JSON number"))?;
-        return Ok(Value::Number(number));
+        ensure!(
+            text.starts_with('-') || text.as_bytes().first().is_some_and(u8::is_ascii_digit),
+            "'{text}' of type {kind} is not a finite JSON number"
+        );
+        return Ok(Cell::Number(number.get().into()));
     }
     if matches!(kind, "bool" | "boolean") {
         return match text {
-            "t" | "true" => Ok(Value::Bool(true)),
-            "f" | "false" => Ok(Value::Bool(false)),
+            "t" | "true" => Ok(Cell::Bool(true)),
+            "f" | "false" => Ok(Cell::Bool(false)),
             _ => bail!("invalid boolean '{text}'"),
         };
     }
-    Ok(Value::String(text.into()))
+    Ok(Cell::String(text.into()))
 }
 
 pub fn row_changes(
@@ -225,7 +263,7 @@ pub fn row_changes(
                 row.len() == images.columns.len(),
                 "row image width does not match columns"
             );
-            let doc: Map<String, Value> = images
+            let doc: BTreeMap<String, Cell> = images
                 .columns
                 .iter()
                 .zip(row)
@@ -240,7 +278,7 @@ pub fn row_changes(
                 .collect::<Result<_>>()?;
             let value = doc
                 .get(key)
-                .filter(|v| !v.is_null())
+                .filter(|v| !matches!(v, Cell::Null))
                 .with_context(|| format!("row image has no non-NULL key '{key}'"))?;
             if delete {
                 Ok(RowChange::Delete(value.clone()))
@@ -259,18 +297,18 @@ fn identifier(text: &str, dialect: Dialect) -> String {
     )
 }
 
-fn literal(value: &Value, dialect: Dialect) -> Result<String> {
-    Ok(match value {
-        Value::Null => "NULL".into(),
-        Value::Bool(v) => {
+fn literal(value: &Cell, dialect: Dialect) -> String {
+    match value {
+        Cell::Null => "NULL".into(),
+        Cell::Bool(v) => {
             if dialect == Dialect::Mysql {
                 u8::from(*v).to_string()
             } else {
                 v.to_string()
             }
         }
-        Value::Number(v) => v.to_string(),
-        Value::String(v) => {
+        Cell::Number(v) => v.clone(),
+        Cell::String(v) => {
             let escaped = v.replace('\'', "''");
             if dialect == Dialect::Mysql {
                 format!("'{}'", escaped.replace('\\', "\\\\"))
@@ -278,8 +316,7 @@ fn literal(value: &Value, dialect: Dialect) -> Result<String> {
                 format!("E'{}'", escaped.replace('\\', "\\\\"))
             }
         }
-        _ => bail!("SQL row images must contain scalar values"),
-    })
+    }
 }
 
 pub fn sql_changes(
@@ -300,7 +337,7 @@ pub fn sql_changes(
             RowChange::Delete(value) => writeln!(
                 sql,
                 "DELETE FROM {table} WHERE {key} = {};",
-                literal(value, dialect)?
+                literal(value, dialect)
             )?,
             RowChange::Upsert(doc) => {
                 let columns = doc
@@ -310,7 +347,7 @@ pub fn sql_changes(
                 let values = doc
                     .values()
                     .map(|v| literal(v, dialect))
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect::<Vec<_>>();
                 let update = columns
                     .iter()
                     .map(|c| {
@@ -342,7 +379,49 @@ pub fn sql_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
+
+    fn test_doc(value: &Value) -> BTreeMap<String, Cell> {
+        value
+            .as_object()
+            .expect("document")
+            .iter()
+            .map(|(key, value)| {
+                let cell = match value {
+                    Value::Null => Cell::Null,
+                    Value::Bool(v) => Cell::Bool(*v),
+                    Value::Number(v) => Cell::Number(v.to_string()),
+                    Value::String(v) => Cell::String(v.clone()),
+                    _ => panic!("test documents contain only scalars"),
+                };
+                (key.clone(), cell)
+            })
+            .collect()
+    }
+
+    fn json_text(value: &Cell) -> String {
+        serde_json::to_string(value).expect("JSON scalar")
+    }
+
+    #[test]
+    fn row_image_json_keeps_numeric_text_and_distinguishes_strings() {
+        let changes = vec![RowChange::Upsert(BTreeMap::from([
+            (
+                "decimal".into(),
+                json_value(Some("12345678901234567890.123456789"), "numeric").expect("decimal"),
+            ),
+            (
+                "integer".into(),
+                json_value(Some("18446744073709551615"), "numeric").expect("integer"),
+            ),
+            ("text".into(), Cell::String("18446744073709551615".into())),
+            ("null".into(), Cell::Null),
+        ]))];
+        assert_eq!(
+            serde_json::to_string(&changes).expect("row images"),
+            r#"[{"doc":{"decimal":12345678901234567890.123456789,"integer":18446744073709551615,"null":null,"text":"18446744073709551615"}}]"#
+        );
+    }
 
     #[test]
     fn returning_rewrite_and_statement_order() {
@@ -421,17 +500,16 @@ mod tests {
         assert_eq!(
             row_changes(&images, &types, "id", false).expect("images"),
             vec![
-                RowChange::Upsert(
-                    serde_json::from_value(json!({"id":42,"s":null,"b":true})).expect("object")
-                ),
-                RowChange::Upsert(
-                    serde_json::from_value(json!({"id":43,"s":"","b":false})).expect("object")
-                )
+                RowChange::Upsert(test_doc(&json!({"id":42,"s":null,"b":true}))),
+                RowChange::Upsert(test_doc(&json!({"id":43,"s":"","b":false})))
             ]
         );
         assert_eq!(
             row_changes(&images, &types, "id", true).expect("deletes"),
-            vec![RowChange::Delete(json!(42)), RowChange::Delete(json!(43))]
+            vec![
+                RowChange::Delete(Cell::Number("42".into())),
+                RowChange::Delete(Cell::Number("43".into()))
+            ]
         );
         assert_eq!(
             row_changes(&images, &types, "s", false)
@@ -464,33 +542,37 @@ mod tests {
     #[test]
     fn json_types_are_exact_and_invalid_numbers_fail() {
         for kind in ["int2", "int4", "int8", "numeric", "float4", "float8"] {
-            assert_eq!(json_value(Some("123"), kind).expect("number"), json!(123));
+            assert_eq!(
+                json_value(Some("123"), kind).expect("number"),
+                Cell::Number("123".into())
+            );
         }
         assert_eq!(
-            json_value(Some("9223372036854775807"), "int8")
-                .expect("integer")
-                .to_string(),
+            json_text(&json_value(Some("9223372036854775807"), "int8").expect("integer")),
             "9223372036854775807"
         );
         assert_eq!(
-            json_value(Some("12345678901234567890.123456789"), "numeric")
-                .expect("decimal")
-                .to_string(),
+            json_text(
+                &json_value(Some("12345678901234567890.123456789"), "numeric").expect("decimal")
+            ),
             "12345678901234567890.123456789"
         );
-        assert_eq!(json_value(None, "numeric").expect("null"), Value::Null);
-        assert_eq!(json_value(Some(""), "text").expect("empty"), json!(""));
+        assert_eq!(json_value(None, "numeric").expect("null"), Cell::Null);
+        assert_eq!(
+            json_value(Some(""), "text").expect("empty"),
+            Cell::String(String::new())
+        );
         assert_eq!(
             json_value(Some("123"), "text").expect("string"),
-            json!("123")
+            Cell::String("123".into())
         );
         assert_eq!(
             json_value(Some("true"), "bool").expect("boolean"),
-            json!(true)
+            Cell::Bool(true)
         );
         assert_eq!(
             json_value(Some("f"), "bool").expect("boolean"),
-            json!(false)
+            Cell::Bool(false)
         );
         assert_eq!(
             json_value(Some("NaN"), "numeric")
@@ -514,9 +596,11 @@ mod tests {
 
     #[test]
     fn dialect_upserts_and_deletes_are_exact() {
-        let doc = serde_json::from_value(json!({"id": 1, "s": "a'\\b", "v": null, "b": true}))
-            .expect("object");
-        let changes = vec![RowChange::Upsert(doc), RowChange::Delete(json!(2))];
+        let doc = test_doc(&json!({"id": 1, "s": "a'\\b", "v": null, "b": true}));
+        let changes = vec![
+            RowChange::Upsert(doc),
+            RowChange::Delete(Cell::Number("2".into())),
+        ];
         assert_eq!(
             sql_changes("t", "id", &changes, Dialect::Postgres).expect("SQL"),
             "INSERT INTO \"t\" (\"b\", \"id\", \"s\", \"v\") VALUES (true, 1, E'a''\\\\b', NULL) ON CONFLICT (\"id\") DO UPDATE SET \"b\" = EXCLUDED.\"b\", \"id\" = EXCLUDED.\"id\", \"s\" = EXCLUDED.\"s\", \"v\" = EXCLUDED.\"v\";\nDELETE FROM \"t\" WHERE \"id\" = 2;\n"
@@ -529,7 +613,7 @@ mod tests {
             sql_changes(
                 "\"Odd.Table\"",
                 "k",
-                &[RowChange::Delete(json!("x'y"))],
+                &[RowChange::Delete(Cell::String("x'y".into()))],
                 Dialect::Postgres
             )
             .expect("quoted"),

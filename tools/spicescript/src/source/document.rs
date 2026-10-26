@@ -18,12 +18,13 @@ limitations under the License.
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::{
     Namespace, Source, TextResult,
     generic::Generic,
-    write::{RowChange, row_changes, table_parts},
+    write::{Cell, RowChange, row_changes, table_parts},
 };
 use crate::{
     docker::Container,
@@ -121,13 +122,11 @@ impl Document {
                 ),
                 RowChange::Delete(key) => (key, Vec::new()),
             };
-            let key = match key {
-                Value::String(v) => v.clone(),
-                other => other.to_string(),
-            };
+            // Spice decodes both Kafka keys and values as JSON.
+            let key = serde_json::to_vec(key)?;
             input.extend_from_slice(&u32::try_from(key.len())?.to_be_bytes());
             input.extend_from_slice(&u32::try_from(value.len())?.to_be_bytes());
-            input.extend_from_slice(key.as_bytes());
+            input.extend_from_slice(&key);
             input.extend(value);
         }
         if !input.is_empty() {
@@ -149,24 +148,38 @@ impl Document {
     }
 }
 
-/// Extended JSON preserves integer precision when mongosh reads the batch.
-fn mongo_value(value: &Value) -> Value {
+/// Extended JSON decodes signed integers as Long and wider numbers as Decimal128.
+fn mongo_cell(value: &Cell) -> Value {
     match value {
-        Value::Number(number) => {
-            if number.is_i64() {
-                json!({"$numberLong": number.to_string()})
-            } else {
-                json!({"$numberDecimal": number.to_string()})
-            }
-        }
-        Value::Array(values) => Value::Array(values.iter().map(mongo_value).collect()),
-        Value::Object(doc) => Value::Object(
-            doc.iter()
-                .map(|(k, v)| (k.clone(), mongo_value(v)))
-                .collect(),
-        ),
-        other => other.clone(),
+        Cell::Number(number) if number.parse::<i64>().is_ok() => json!({"$numberLong": number}),
+        Cell::Number(number) => json!({"$numberDecimal": number}),
+        Cell::Null => Value::Null,
+        Cell::Bool(value) => Value::Bool(*value),
+        Cell::String(value) => Value::String(value.clone()),
     }
+}
+
+fn mongo_changes(changes: &[RowChange]) -> Vec<Value> {
+    changes
+        .iter()
+        .map(|change| match change {
+            RowChange::Upsert(doc) => {
+                let doc: serde_json::Map<String, Value> = doc
+                    .iter()
+                    .map(|(name, value)| (name.clone(), mongo_cell(value)))
+                    .collect();
+                json!({"doc": doc})
+            }
+            RowChange::Delete(key) => json!({"delete": mongo_cell(key)}),
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct WriteBatch<'a> {
+    table: &'a str,
+    key: &'a str,
+    operations: &'a [RowChange],
 }
 
 #[async_trait]
@@ -225,16 +238,10 @@ impl Source for Document {
         if changes.is_empty() {
             return Ok(());
         }
-        let operations = changes
-            .iter()
-            .map(|change| match change {
-                RowChange::Upsert(doc) => json!({"doc": doc}),
-                RowChange::Delete(value) => json!({"delete": value}),
-            })
-            .collect::<Vec<_>>();
-        let payload = json!({"table": table, "key": key, "operations": operations});
         if self.kind == "mongodb" {
-            let payload = serde_json::to_string(&mongo_value(&payload))?;
+            let payload = serde_json::to_string(
+                &json!({"table": table, "key": key, "operations": mongo_changes(changes)}),
+            )?;
             let program = format!(
                 r"const p = EJSON.parse({}, {{relaxed: false}});
 const operations = p.operations.map(o => {{
@@ -275,8 +282,15 @@ for o in p['operations']:
     else:
         t.put_item(Item=o['doc'])
 ";
-            self.input(&["python3", "-c", program], serde_json::to_vec(&payload)?)
-                .await
+            self.input(
+                &["python3", "-c", program],
+                serde_json::to_vec(&WriteBatch {
+                    table: &table,
+                    key,
+                    operations: changes,
+                })?,
+            )
+            .await
         }
     }
 
@@ -372,28 +386,46 @@ except d.meta.client.exceptions.ResourceNotFoundException:
 
 #[cfg(test)]
 mod tests {
-    use super::mongo_value;
+    use super::{mongo_cell, mongo_changes};
+    use crate::source::write::{Cell, RowChange};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn mongo_unsigned_integers_use_decimal_instead_of_wrapping() {
         assert_eq!(
-            mongo_value(&json!([
-                9_223_372_036_854_775_807_i64,
-                9_223_372_036_854_775_808_u64,
-                u64::MAX
-            ])),
-            json!([{"$numberLong": "9223372036854775807"}, {"$numberDecimal": "9223372036854775808"}, {"$numberDecimal": "18446744073709551615"}])
+            [
+                "9223372036854775807",
+                "9223372036854775808",
+                "18446744073709551615"
+            ]
+            .map(|n| mongo_cell(&Cell::Number(n.into()))),
+            [
+                json!({"$numberLong": "9223372036854775807"}),
+                json!({"$numberDecimal": "9223372036854775808"}),
+                json!({"$numberDecimal": "18446744073709551615"})
+            ]
         );
     }
 
     #[test]
     fn mongo_batches_keep_numeric_types_inside_operation_arrays() {
+        let doc = BTreeMap::from([
+            ("id".into(), Cell::Number("9223372036854775807".into())),
+            ("n".into(), Cell::Number("1.25".into())),
+            ("b".into(), Cell::Bool(true)),
+            ("s".into(), Cell::String("42".into())),
+            ("v".into(), Cell::Null),
+        ]);
         assert_eq!(
-            mongo_value(
-                &json!({"operations": [{"doc": {"id": 9_223_372_036_854_775_807_i64, "n": 1.25, "b": true, "s": "42", "v": null}}, {"delete": 7}]})
-            ),
-            json!({"operations": [{"doc": {"id": {"$numberLong": "9223372036854775807"}, "n": {"$numberDecimal": "1.25"}, "b": true, "s": "42", "v": null}}, {"delete": {"$numberLong": "7"}}]})
+            mongo_changes(&[
+                RowChange::Upsert(doc),
+                RowChange::Delete(Cell::Number("7".into()))
+            ]),
+            vec![
+                json!({"doc": {"id": {"$numberLong": "9223372036854775807"}, "n": {"$numberDecimal": "1.25"}, "b": true, "s": "42", "v": null}}),
+                json!({"delete": {"$numberLong": "7"}})
+            ]
         );
     }
 }

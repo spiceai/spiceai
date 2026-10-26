@@ -1123,6 +1123,17 @@
       "group": "sqlite"
     }
   ],
+  "feed-chaos": [
+    {
+      "run": "feed-chaos[src=mongodb]",
+      "who": "mongodb",
+      "key": "query: SELECT _id, n, v, s FROM t #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 457, actual: 368 }",
+      "group": "streaming-sources",
+      "may-pass": true
+    }
+  ],
   "files-coverage": [
     {
       "run": "files-coverage[format=parquet]",

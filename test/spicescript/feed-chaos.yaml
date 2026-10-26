@@ -41,7 +41,7 @@ variants:
     when: { src: mongodb }
     datasets:
       t:
-        params: { change_stream_batch_max_duration: 100ms, change_stream_max_await_time: 100ms }
+        params: { $merge: '${sources.src.params}', change_stream_batch_max_duration: 100ms, change_stream_max_await_time: 100ms }
   dynamodb:
     when: { src: dynamodb }
   debezium:
@@ -102,6 +102,7 @@ steps:
     eventually: 120s
   - background:
       id: no-duplicates
+      every: 20ms
       query: SELECT count(*) - count(DISTINCT _id) AS duplicates FROM t
       expect: { duplicates: '0' }
 

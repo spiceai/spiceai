@@ -295,6 +295,13 @@ transaction or automatic retry. Connector refresh semantics still apply:
 Kafka append acceleration does not promise UPDATE/DELETE parity with a SQL
 mirror. Choose the connector's supported refresh mode in the spicepod.
 
+`feed-chaos.yaml` shares mutation and restart phases across these feeds and
+PostgreSQL through Debezium. Its MongoDB source-restart check retains the
+known, timing-dependent failure tracked in #15544. Kafka append receives only
+inserts and runs without a primary key so deduplication cannot hide replayed
+messages. `debezium-offset-recovery.yaml` separately keeps the stress case
+that kills the supervisor while background mutations are in flight.
+
 ### Checking answers
 
 `expect:` takes one of:
