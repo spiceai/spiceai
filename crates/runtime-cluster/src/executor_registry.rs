@@ -801,6 +801,30 @@ impl ExecutorRegistry {
         {
             seen.generations.insert(incumbent, recorded.unwrap_or(0));
         }
+        // Likewise for an endpoint whose process has not registered here.
+        let endpoint_owner = self
+            .flight_sql_endpoints
+            .read()
+            .get(executor_id)
+            .filter(|endpoint| {
+                endpoint.generation.is_none()
+                    && !endpoint.process_id.is_empty()
+                    && endpoint.process_id != process_id
+            })
+            .map(|endpoint| endpoint.process_id.clone());
+        if let Some(owner) = endpoint_owner
+            && let Ok(recorded) = self
+                .process_order
+                .recorded_generation(executor_id, &owner)
+                .await
+            && let Some(endpoint) = self
+                .flight_sql_endpoints
+                .write()
+                .get_mut(executor_id)
+                .filter(|endpoint| endpoint.process_id == owner && endpoint.generation.is_none())
+        {
+            endpoint.generation = Some(recorded.unwrap_or(0));
+        }
         match self
             .process_order
             .admit(executor_id, process_id, now_ms, is_connected)
@@ -808,6 +832,20 @@ impl ExecutorRegistry {
         {
             Ok(admission) => Some(admission),
             Err(err) => {
+                // An endpoint the process registered first carries the
+                // generation the order gave it.
+                let endpoint_generation = self
+                    .flight_sql_endpoints
+                    .read()
+                    .get(executor_id)
+                    .filter(|endpoint| endpoint.process_id == process_id)
+                    .and_then(|endpoint| endpoint.generation);
+                if let Some(generation) = endpoint_generation {
+                    return Some(Admission {
+                        generation,
+                        superseded: false,
+                    });
+                }
                 tracing::warn!(
                     "Failed to record the start of a process of executor {executor_id} in the cluster state, so it is ordered against the executor's other processes by its id, which depends on its host's clock: {err}"
                 );
@@ -1789,8 +1827,8 @@ impl TablePartitionProvider for FederatedPartitionProvider {
 
 #[cfg(test)]
 mod tests {
-    use object_store::ObjectStore;
     use object_store::memory::InMemory;
+    use object_store::{ObjectStore, ObjectStoreExt};
 
     use crate::cluster_state::ClusterStateStore;
 
@@ -2353,6 +2391,100 @@ mod tests {
             assert_eq!(
                 registry.flight_sql_endpoints.read()["exec-a"].address,
                 "127.0.0.1:50101",
+                "replacement endpoint first: {replacement_endpoint_first}"
+            );
+        }
+    }
+
+    /// Makes the shared process order in `store` unreadable.
+    async fn break_process_order(registry: &ExecutorRegistry, store: &Arc<dyn ObjectStore>) {
+        store
+            .put(
+                &object_store::path::Path::from("executor_processes.json"),
+                "not json".into(),
+            )
+            .await
+            .expect("put");
+        registry
+            .process_order
+            .recorded_generation("exec-a", "run-0")
+            .await
+            .expect_err("the order is unreadable");
+    }
+
+    /// A replacement whose endpoint was ordered before the order became
+    /// unreadable keeps that order when its control stream registers.
+    #[tokio::test]
+    async fn a_replacement_whose_endpoint_came_first_is_a_restart_while_the_order_is_unreadable() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let registry = registry_over(&store).await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        registry.register("exec-a".to_string(), "run-2", tx1).await;
+        assert!(
+            registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        break_process_order(&registry, &store).await;
+
+        let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+        assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50101"]
+        );
+    }
+
+    /// An endpoint registered while the order was unreadable, by a process that
+    /// never registered its control stream, gives way to a replacement recorded
+    /// once the order is readable, even when the replacement's id sorts first.
+    #[tokio::test]
+    async fn an_unrecorded_endpoint_gives_way_to_a_recorded_replacement() {
+        for replacement_endpoint_first in [false, true] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let registry = registry_over(&store).await;
+            break_process_order(&registry, &store).await;
+            assert!(
+                registry
+                    .insert_flight_sql_client(
+                        "exec-a".to_string(),
+                        "127.0.0.1:50102".to_string(),
+                        "run-2",
+                        dummy_flight_sql_client(),
+                    )
+                    .await
+            );
+            store
+                .delete(&object_store::path::Path::from("executor_processes.json"))
+                .await
+                .expect("delete");
+
+            let (tx, _rx) = mpsc::channel(1);
+            let insert_replacement_endpoint = || {
+                registry.insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+            };
+            if replacement_endpoint_first {
+                assert!(insert_replacement_endpoint().await);
+                registry.register("exec-a".to_string(), "run-1", tx).await;
+            } else {
+                let replacement = registry.register("exec-a".to_string(), "run-1", tx).await;
+                assert_eq!(replacement.registration, ExecutorRegistration::New);
+                assert!(insert_replacement_endpoint().await);
+            }
+            assert_eq!(
+                registry.ready_executor_addresses_sync(),
+                ["127.0.0.1:50101"],
                 "replacement endpoint first: {replacement_endpoint_first}"
             );
         }
