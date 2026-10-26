@@ -50,6 +50,7 @@ use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, Date32Type, Float64Type, Int64Type};
 use futures::TryStreamExt;
 use runtime::Runtime;
+use runtime_request_context::{CacheControl, Protocol, RequestContext};
 use secrecy::ExposeSecret;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
 use spicepod::component::dataset::Dataset;
@@ -476,7 +477,7 @@ async fn assert_matches_source(
     let mut answers = Vec::with_capacity(ORACLE_QUERIES.len());
     for (name, sql) in ORACLE_QUERIES {
         let postgres = answer_from_postgres(source, sql).await?;
-        let spice = answer_from_batches(&run_query(rt, sql).await?)?;
+        let spice = answer_from_batches(&run_query_uncached(rt, sql).await?)?;
         assert_same_answer(engine, stage, name, sql, &spice, &postgres)?;
         answers.push(postgres);
     }
@@ -497,7 +498,9 @@ async fn assert_answers_from_acceleration(
     let mut outcome = Ok(());
     for ((name, sql), postgres) in ORACLE_QUERIES.iter().zip(expected) {
         let spice =
-            match tokio::time::timeout(PAUSED_SOURCE_QUERY_TIMEOUT, run_query(rt, sql)).await {
+            match tokio::time::timeout(PAUSED_SOURCE_QUERY_TIMEOUT, run_query_uncached(rt, sql))
+                .await
+            {
                 Ok(batches) => batches.and_then(|batches| answer_from_batches(&batches)),
                 Err(_) => Err(anyhow!(
                     "{engine} paused-source {name}: no answer within \
@@ -514,6 +517,18 @@ async fn assert_answers_from_acceleration(
     }
     container.unpause().await?;
     outcome
+}
+
+/// [`run_query`] with the SQL results cache bypassed, so the answer is read from
+/// the acceleration rather than served from a cached result of the same text.
+async fn run_query_uncached(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
+    Arc::new(
+        RequestContext::builder(Protocol::Internal)
+            .with_cache_control(CacheControl::NoCache)
+            .build(),
+    )
+    .scope(run_query(rt, sql))
+    .await
 }
 
 fn assert_same_answer(
