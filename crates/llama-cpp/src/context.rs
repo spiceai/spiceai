@@ -152,6 +152,13 @@ impl Context<'_> {
         }
     }
 
+    /// Waits for the computation queued by earlier decodes to finish: a decode returns once
+    /// its computation is queued, and a time taken without waiting would leave it out.
+    pub fn synchronize(&mut self) {
+        // SAFETY: the context is live.
+        unsafe { sys::llama_synchronize(self.raw.as_ptr()) };
+    }
+
     /// Empties the KV cache of every sequence.
     pub fn clear(&mut self) {
         // SAFETY: the context is live; a context always has memory.

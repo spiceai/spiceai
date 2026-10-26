@@ -1454,14 +1454,18 @@ fn read_prompt<'m>(
     // follows exactly the tokens before it; without one, the first span is empty.
     let checkpoint = cache.checkpoint_at(start, tokens.len());
     let split = checkpoint.unwrap_or(start);
+    // Each span is timed to its computation's end, so the reading's cost and the save's stay
+    // apart; sampling, and the save itself, wait for that computation anyway.
     let started = Instant::now();
     decode_span(target, &mut batch, &tokens, start..split, stopping)?;
+    target.context_mut().synchronize();
     let mut read = started.elapsed();
     if let Some(at) = checkpoint {
         cache.save_checkpoint(target.context(), at);
     }
     let resumed = Instant::now();
     decode_span(target, &mut batch, &tokens, split..tokens.len(), stopping)?;
+    target.context_mut().synchronize();
     read += resumed.elapsed();
     cache.read(tokens.len() - start, read);
     Ok((tokens, batch))
