@@ -266,7 +266,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "642e121192fcc4c3430e28e01e660ee5d189d517" } # branch: spiceai-54 (DuckDB 1.4.4; this crate pins duckdb by git rev, so patch.crates-io alone cannot move it)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "cca25d7e1bcfd4ffcba058e220d6ac73ae89ae20" } # branch: spiceai-54 (DuckDB 1.4.4; this crate pins duckdb by git rev, so patch.crates-io alone cannot move it)
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
@@ -562,7 +562,7 @@ datafusion-federation = { git = "https://github.com/spiceai/datafusion-federatio
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "714d64fd5369efc4835109be0fd718db5a3be0aa" } # branch: spiceai-0.23.0
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "9d7be742f060d70066fc041319af787772716e0d" } # branch: spiceai-1.4.4 (DuckDB v1.4.4, arrow 58; must match the rev datafusion-table-providers pins, or cargo resolves two copies of duckdb)
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a15f36bf0ac4a20e832f1e44efb8677f82046745" } # branch: spiceai-1.4.4 (DuckDB v1.4.4, arrow 58; must match the rev datafusion-table-providers pins, or cargo resolves two copies of duckdb)
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 

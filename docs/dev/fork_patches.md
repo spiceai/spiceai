@@ -103,10 +103,10 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `0cb3781608b89f40c6585618ec3071f83345671a` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `642e121192fcc4c3430e28e01e660ee5d189d517` | `spiceai-54` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `cca25d7e1bcfd4ffcba058e220d6ac73ae89ae20` | `duckdb-brotli-cve-release-2.2` (TEMPORARY: spiceai/datafusion-table-providers#98) |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
+| [duckdb-rs](#duckdb-rs) | `a15f36bf0ac4a20e832f1e44efb8677f82046745` | `backport-brotli-cve-release-2.2` (TEMPORARY: spiceai/duckdb-rs#55) |
 | [graph-rs-sdk](#graph-rs-sdk) | `af383410a9c86915263fbd1145b8becfc1e317b5` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `c86f2f7ae9b37a8a795cc4c25574df436aa1d392` | `spiceai-0.10.0-df-54` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
@@ -292,6 +292,7 @@ Upstream [duckdb/duckdb-rs](https://github.com/duckdb/duckdb-rs), branch
 | ICU extension statically linked into bundled DuckDB (fork PR #23) | Any query using a named timezone (`AT TIME ZONE 'America/New_York'`) fails at runtime, and DuckDB tries to download the extension from the network | silent (query failure) | `crates/runtime/src/dataaccelerator/duckdb.rs::bundled_duckdb_resolves_a_named_time_zone_without_installing_icu` |
 | VSS (HNSW) extension statically linked (fork PR #37) | Vector search over a DuckDB accelerator fails, or silently falls back to a full scan | silent (query failure) | `crates/runtime/src/dataaccelerator/duckdb.rs::bundled_duckdb_builds_an_hnsw_index_without_installing_vss` |
 | Bundled DuckDB version pinned to the release (fork PR #38) | Extension downloads resolve against a mismatched DuckDB version and fail | silent | covered by the two extension guards above |
+| Brotli decoder rejects an invalid block switch with `BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH` instead of decoding on with stale block-type state (fork PR #55; upstream [duckdb/duckdb#27791](https://github.com/duckdb/duckdb/pull/27791), a port of [google/brotli@0ed4268a](https://github.com/google/brotli/commit/0ed4268a4401abcb4472096340477cf4af7d1a2b)) | A malformed Brotli-compressed page in a Parquet file that DuckDB reads can write out of bounds in the decoder (CVE-2026-111497) | silent (memory corruption) | **GAP** — see [Open gaps](#open-gaps) |
 
 ## iceberg-rust
 
@@ -470,7 +471,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**36 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**37 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -535,3 +536,9 @@ without becoming a flaky timing test:
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
     cheap one exists); `async-openai` retry-after handling.
+
+**Security.** A lost patch here reopens a known vulnerability without a build or test failure:
+
+26. `duckdb-rs` Brotli decoder fix for CVE-2026-111497 (fork PR #55) — a malformed
+    Brotli page in a Parquet file that DuckDB reads can corrupt memory. A re-cut that
+    drops it still builds and decodes valid Brotli.
