@@ -12,7 +12,7 @@ version.workspace = true
 autotests = false
 
 [dependencies]
-llama-cpp-src = { git = "https://github.com/spiceai/llama.cpp", rev = "1082d1983689a13315cdf2a80d9bd0bbdd572da2" } # branch: spiceai-b11803 (tag b11803-spiceai.2: upstream release b11803, the Cargo packaging, and failed checks that throw while a model loads)
+llama-cpp-src = { git = "https://github.com/spiceai/llama.cpp", rev = "bd3dc081eae944c13aa24fe84319cc832d0bcecb" } # branch: lukim/b11803-tp3-mesh (TEMPORARY: spiceai/llama.cpp#8, stacked on #7; back to a spiceai-b11803 tag once both land)
 snafu.workspace = true
 tracing.workspace = true
 

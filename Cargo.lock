@@ -11977,7 +11977,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-src"
 version = "0.1.11803"
-source = "git+https://github.com/spiceai/llama.cpp?rev=1082d1983689a13315cdf2a80d9bd0bbdd572da2#1082d1983689a13315cdf2a80d9bd0bbdd572da2"
+source = "git+https://github.com/spiceai/llama.cpp?rev=bd3dc081eae944c13aa24fe84319cc832d0bcecb#bd3dc081eae944c13aa24fe84319cc832d0bcecb"
 
 [[package]]
 name = "llguidance"
@@ -12078,6 +12078,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
