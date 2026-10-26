@@ -39,8 +39,9 @@ pub struct ListedFile {
 /// One quantization of the model: every shard of it, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Quantization {
-    /// The name a model's `files` can give it: its folder, or else the quantization tag of its
-    /// file names (`UD-Q4_K_XL`, `Q8_0`, `BF16`).
+    /// The name a model's `files` can give it, unique in the repository: its folder when the
+    /// folder holds no other quantization, or else the quantization tag of its file names
+    /// (`UD-Q4_K_XL`, `Q8_0`, `BF16`), or its path when two would share a tag.
     pub name: String,
     /// Repository paths, shard 1 first.
     pub files: Vec<String>,
@@ -81,6 +82,16 @@ pub enum ResolveError {
         missing.join(", ")
     ))]
     IncompleteShards { path: String, missing: Vec<String> },
+    /// A folder that holds several quantizations, which would each be its name.
+    #[snafu(display(
+        "'{name}' holds {} quantizations of the repository, {}; name one of them",
+        quantizations.len(),
+        quantizations.join(", ")
+    ))]
+    AmbiguousQuantization {
+        name: String,
+        quantizations: Vec<String>,
+    },
     /// A name that is neither a file nor a quantization of the repository.
     #[snafu(display(
         "the repository has no file or quantization '{name}'; its quantizations are {}",
@@ -169,34 +180,57 @@ pub fn quantizations(listing: &[ListedFile]) -> Vec<Quantization> {
             .or_default()
             .push(path);
     }
-    let mut out = Vec::new();
+    let mut complete = Vec::new();
     for ((dir, stem), mut files) in groups {
-        let complete = match shard(files[0]) {
+        let whole = match shard(files[0]) {
             None => files.len() == 1,
             Some((_, _, n)) => {
                 (1..=n).all(|i| size.contains_key(shard_path(&stem, i, n).as_str()))
                     && files.len() == n as usize
             }
         };
-        if !complete {
-            continue;
+        if whole {
+            files.sort_unstable();
+            complete.push((dir, stem, files));
         }
-        files.sort_unstable();
-        let name = if dir.is_empty() {
+    }
+    let mut in_folder: BTreeMap<String, usize> = BTreeMap::new();
+    for (dir, _, _) in &complete {
+        *in_folder.entry(dir.clone()).or_default() += 1;
+    }
+    let mut out = Vec::new();
+    let mut paths = Vec::new();
+    for (dir, stem, files) in complete {
+        // A folder names the one quantization it holds; several in one folder go by their tags.
+        let name = if !dir.is_empty() && in_folder.get(&dir) == Some(&1) {
+            dir.rsplit('/').next().unwrap_or(&dir).to_string()
+        } else {
             tag(files[0])
                 .unwrap_or_else(|| file_name(files[0]).trim_end_matches(".gguf").to_string())
-        } else {
-            dir.rsplit('/').next().unwrap_or(&dir).to_string()
         };
         let bytes = files
             .iter()
             .map(|f| size.get(f).copied().unwrap_or(0))
             .sum();
+        paths.push(stem.trim_end_matches(".gguf").to_string());
         out.push(Quantization {
             name,
             files: files.into_iter().map(ToString::to_string).collect(),
             bytes,
         });
+    }
+    // Two quantizations that would share a name, as one tag in two folders, go by their paths.
+    let mut uses: BTreeMap<String, usize> = BTreeMap::new();
+    for q in &out {
+        *uses.entry(q.name.to_ascii_lowercase()).or_default() += 1;
+    }
+    for (q, path) in out.iter_mut().zip(paths) {
+        if uses
+            .get(&q.name.to_ascii_lowercase())
+            .is_some_and(|&n| n > 1)
+        {
+            q.name = path;
+        }
     }
     // Largest first; a stable tie-break by name keeps the order reproducible.
     out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
@@ -227,14 +261,16 @@ pub fn draft_head(listing: &[ListedFile], quantization: &str) -> Option<String> 
 }
 
 /// Resolves a model's `files` against the repository listing. An exact `.gguf` path is
-/// honoured, with the sibling shards of a shard; any other entry names a quantization, by
-/// folder or tag, which brings all its shards and, unless a draft head is named, the
-/// repository's draft head. `Ok(None)` when `files` names nothing.
+/// honoured, with the sibling shards of a shard; any other entry names a quantization, by its
+/// name or the folder that holds only it, which brings all its shards and, unless a draft head
+/// is named, the repository's draft head. Another file the repository has is left to the
+/// engine, and so is every entry of a repository that offers no GGUF quantization. `Ok(None)`
+/// when `files` names no GGUF weights.
 ///
 /// # Errors
 ///
-/// Returns an error when a named file is missing, a shard series is incomplete, or a name is
-/// neither a file nor a quantization of the repository.
+/// Returns an error when a named file is missing, a shard series is incomplete, a folder holds
+/// several quantizations, or a name is neither a file nor a quantization of the repository.
 pub fn resolve(
     listing: &[ListedFile],
     files: &[&str],
@@ -280,20 +316,38 @@ pub fn resolve(
             }
         } else {
             let name = entry.trim_end_matches('/');
-            let Some(q) = quantizations.iter().find(|q| {
-                q.name.eq_ignore_ascii_case(name)
-                    || q.files.iter().all(|f| folder(f).eq_ignore_ascii_case(name))
-            }) else {
-                return Err(ResolveError::UnknownQuantization {
-                    name: name.to_string(),
-                    available: quantizations.iter().map(|q| q.name.clone()).collect(),
-                });
+            let named = quantizations
+                .iter()
+                .find(|q| q.name.eq_ignore_ascii_case(name));
+            let in_folder: Vec<&Quantization> = quantizations
+                .iter()
+                .filter(|q| q.files.iter().all(|f| folder(f).eq_ignore_ascii_case(name)))
+                .collect();
+            let q = match (named, in_folder.as_slice()) {
+                (Some(q), _) => q,
+                (None, [q]) => *q,
+                (None, []) if present.contains(entry) || quantizations.is_empty() => continue,
+                (None, []) => {
+                    return Err(ResolveError::UnknownQuantization {
+                        name: name.to_string(),
+                        available: quantizations.iter().map(|q| q.name.clone()).collect(),
+                    });
+                }
+                (None, several) => {
+                    return Err(ResolveError::AmbiguousQuantization {
+                        name: name.to_string(),
+                        quantizations: several.iter().map(|q| q.name.clone()).collect(),
+                    });
+                }
             };
             weights.extend(q.files.iter().cloned());
             named_quantization = Some(q.name.clone());
         }
     }
     weights.dedup();
+    if weights.is_empty() && draft.is_none() {
+        return Ok(None);
+    }
     if let Some(name) = &named_quantization {
         if draft.is_none() {
             draft = draft_head(listing, name);
@@ -608,5 +662,109 @@ mod tests {
         ] {
             assert_eq!(tag(file).as_deref(), want, "{file}");
         }
+    }
+
+    /// Two single-file quantizations in one folder, the shape of a repository that keeps its
+    /// GGUFs under `gguf/`.
+    fn one_folder() -> Vec<ListedFile> {
+        listing(&[
+            ("gguf/Model-Q8_0.gguf", 8 * GB),
+            ("gguf/Model-Q4_K_M.gguf", 4 * GB),
+            ("config.json", 1_000),
+        ])
+    }
+
+    #[test]
+    fn quantizations_sharing_a_folder_are_named_by_their_tags() {
+        let qs = quantizations(&one_folder());
+        assert_eq!(names(&qs), ["Q8_0", "Q4_K_M"]);
+        assert_eq!(
+            resolve(&one_folder(), &["gguf"]),
+            Err(ResolveError::AmbiguousQuantization {
+                name: "gguf".to_string(),
+                quantizations: vec!["Q8_0".to_string(), "Q4_K_M".to_string()],
+            })
+        );
+        let err = resolve(&one_folder(), &["gguf/"]).expect_err("the folder holds two");
+        assert_eq!(
+            err.to_string(),
+            "'gguf' holds 2 quantizations of the repository, Q8_0, Q4_K_M; name one of them"
+        );
+        // The quantization a budget chooses is pinned by the name it is advertised under.
+        let chosen = choose(&qs, 5 * GB).expect("Q4_K_M fits");
+        let pinned = resolve(&one_folder(), &[chosen.name.as_str()])
+            .expect("the advertised name resolves")
+            .expect("it names weights");
+        assert_eq!(pinned.weights, ["gguf/Model-Q4_K_M.gguf"]);
+        assert_eq!(pinned.weights, chosen.files);
+    }
+
+    #[test]
+    fn a_tag_in_two_folders_goes_by_the_folders_and_a_shared_folder_name_by_the_paths() {
+        let two_folders = listing(&[
+            ("a/Model-Q4_K_M.gguf", 4 * GB),
+            ("b/Other-Q4_K_M.gguf", 5 * GB),
+        ]);
+        assert_eq!(names(&quantizations(&two_folders)), ["b", "a"]);
+        let same_leaf = listing(&[
+            ("x/q/Model-Q4_K_M.gguf", 4 * GB),
+            ("y/q/Model-Q4_K_M.gguf", 5 * GB),
+        ]);
+        assert_eq!(
+            names(&quantizations(&same_leaf)),
+            ["y/q/Model-Q4_K_M", "x/q/Model-Q4_K_M"]
+        );
+    }
+
+    /// Every quantization resolves, by the name it is listed and advertised under, to exactly
+    /// its own files.
+    #[test]
+    fn every_quantization_name_resolves_to_its_own_files() {
+        let fixtures = [
+            ("glm", glm()),
+            ("qwen38", qwen38()),
+            ("qwen3", qwen3()),
+            ("one_folder", one_folder()),
+            (
+                "two_folders",
+                listing(&[
+                    ("a/Model-Q4_K_M.gguf", 4 * GB),
+                    ("b/Other-Q4_K_M.gguf", 5 * GB),
+                ]),
+            ),
+            (
+                "same_leaf",
+                listing(&[
+                    ("x/q/Model-Q4_K_M.gguf", 4 * GB),
+                    ("y/q/Model-Q4_K_M.gguf", 5 * GB),
+                ]),
+            ),
+        ];
+        for (fixture, files) in fixtures {
+            let qs = quantizations(&files);
+            assert!(!qs.is_empty(), "{fixture} has quantizations");
+            for q in &qs {
+                let resolved = resolve(&files, &[q.name.as_str()])
+                    .unwrap_or_else(|e| panic!("{fixture}: '{}' does not resolve: {e}", q.name))
+                    .unwrap_or_else(|| panic!("{fixture}: '{}' names no weights", q.name));
+                assert_eq!(resolved.weights, q.files, "{fixture}: '{}'", q.name);
+                assert_eq!(resolved.quantization.as_deref(), Some(q.name.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn another_file_of_the_repository_is_left_to_the_engine() {
+        assert_eq!(resolve(&one_folder(), &["config.json"]), Ok(None));
+        let resolved = resolve(&one_folder(), &["config.json", "Q8_0"])
+            .expect("resolves")
+            .expect("names weights");
+        assert_eq!(resolved.weights, ["gguf/Model-Q8_0.gguf"]);
+        // A repository with no GGUF quantization leaves every entry to the engine.
+        let safetensors = listing(&[("model.safetensors", 4 * GB), ("tokenizer.model", 1_000)]);
+        assert_eq!(
+            resolve(&safetensors, &["tokenizer.model", "extra.v1"]),
+            Ok(None)
+        );
     }
 }

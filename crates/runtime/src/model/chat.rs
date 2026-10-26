@@ -35,8 +35,6 @@ use snafu::ResultExt;
 #[cfg(feature = "models")]
 use spicepod::component::model::ModelFileType;
 use spicepod::component::model::{Model, ModelSource};
-#[cfg(feature = "models")]
-use std::path::Path;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::sync::RwLock;
@@ -439,24 +437,10 @@ async fn huggingface(
         endpoint: params.hf_endpoint.as_deref(),
     };
 
-    // The model's GGUF files, or a GGUF quantization by name (a path without an extension), as
-    // `files` lists them; the download resolves them against the repository, and with none
-    // chooses a GGUF repository's quantization.
-    let files: Vec<String> = component
-        .get_all_files()
-        .into_iter()
-        .filter(|file| {
-            let extension = Path::new(&file.path).extension();
-            match file.file_type() {
-                Some(ModelFileType::Weights) => {
-                    extension.is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
-                }
-                None => extension.is_none(),
-                Some(_) => false,
-            }
-        })
-        .map(|file| file.path)
-        .collect();
+    // The model's GGUF files, or a GGUF quantization or its folder by name; the download
+    // resolves them against the repository, and with none chooses a GGUF repository's
+    // quantization.
+    let files = component.gguf_selectors();
     let files: Vec<&str> = files.iter().map(String::as_str).collect();
 
     let chat_template_literal = params.chat_template.as_deref();
