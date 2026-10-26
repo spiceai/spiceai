@@ -116,6 +116,28 @@ impl ExecutorProcessOrder {
         }
     }
 
+    /// The generation of `process_id` under `executor_id`, if the order records
+    /// it. Reads the order without changing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the order cannot be read.
+    pub async fn recorded_generation(
+        &self,
+        executor_id: &str,
+        process_id: &str,
+    ) -> Result<Option<u64>, object_store_occ::Error> {
+        Ok(self.state.get(KEY).await?.and_then(|order| {
+            order.executors.get(executor_id).and_then(|entry| {
+                entry
+                    .processes
+                    .iter()
+                    .find(|process| process.process_id == process_id)
+                    .map(|process| process.generation)
+            })
+        }))
+    }
+
     /// Returns where `process_id` stands under `executor_id`, recording it as
     /// the latest process when it registers for the first time.
     ///

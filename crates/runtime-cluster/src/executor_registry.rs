@@ -783,22 +783,23 @@ impl ExecutorRegistry {
         };
         let is_connected = |id: &str| !others_known || connected.contains(id);
         // The current process has no generation when the order could not be
-        // read as it registered. Admitting it first finds the generation another
-        // scheduler recorded for it, or records it before the new process.
+        // read as it registered. If another scheduler recorded it, that
+        // generation orders it; if none did, it registered while the order was
+        // unreadable, before any process the order records, so it is the oldest.
         let incumbent = self.processes.lock().get(executor_id).and_then(|seen| {
             seen.current
                 .clone()
                 .filter(|current| !current.is_empty() && !seen.generations.contains_key(current))
         });
         if let Some(incumbent) = incumbent
-            && let Ok(admission) = self
+            && let Ok(recorded) = self
                 .process_order
-                .admit(executor_id, &incumbent, now_ms, is_connected)
+                .recorded_generation(executor_id, &incumbent)
                 .await
             && let Some(seen) = self.processes.lock().get_mut(executor_id)
             && seen.is_known(&incumbent)
         {
-            seen.generations.insert(incumbent, admission.generation);
+            seen.generations.insert(incumbent, recorded.unwrap_or(0));
         }
         match self
             .process_order
@@ -2250,6 +2251,47 @@ mod tests {
 
         let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
         assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
+    }
+
+    /// A process registered while the order could not be read, and never
+    /// recorded, is older than a replacement another scheduler recorded, even
+    /// when the replacement's id sorts first; it is not added to the order.
+    #[tokio::test]
+    async fn an_unrecorded_process_is_older_than_a_recorded_replacement() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cluster = ClusterStateStore::new(Arc::clone(&store), "");
+        let order = ExecutorProcessOrder::new(&cluster);
+        order
+            .admit("exec-a", "run-1", now_ms().expect("clock"), |_| true)
+            .await
+            .expect("admit");
+
+        let registry = registry_over(&store).await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        {
+            let mut processes = registry.processes.lock();
+            let seen = processes.entry("exec-a".to_string()).or_default();
+            assert_eq!(
+                classify_registration(seen, "run-2", None, false),
+                ExecutorRegistration::New
+            );
+        }
+        registry
+            .connections
+            .write()
+            .await
+            .insert("exec-a".to_string(), ExecutorConnection::new(tx1));
+
+        let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+        assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
+        assert_eq!(
+            order
+                .recorded_generation("exec-a", "run-2")
+                .await
+                .expect("read"),
+            None
+        );
     }
 
     /// A process that replaces an executor is a restart even when its id sorts
