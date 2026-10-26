@@ -251,6 +251,14 @@ jobs:
           psql -U postgres -d tpch_sf1 -tAc \
             "SELECT 'tables in public: ' || count(*) FROM information_schema.tables WHERE table_schema = 'public';"
 
+      # The image restores its database once, after a fixed sleep, and never retries;
+      # see .github/scripts/mssql_tpch_restore.sh.
+      - name: Wait for the SQL Server TPC-H database
+        if: ${{ contains(github.event.inputs.spicepod_path, 'mssql') }}
+        env:
+          MSSQL_SA_PASSWORD: S3cretP@ssw0rd
+        run: bash .github/scripts/mssql_tpch_restore.sh "${{ job.services.mssql_tpch.id }}" tpch_sf1
+
       - name: Run the schema test - ${{ github.event.inputs.spicepod_path }}
         run: |
           # A variable set to "" is not unset. `AWS_ENDPOINT_URL=""` is an endpoint
