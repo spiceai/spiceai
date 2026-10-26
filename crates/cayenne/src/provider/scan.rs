@@ -339,7 +339,7 @@ impl CayenneAccelerationExec {
     /// would over-reserve the pool by that factor and refuse queries that fit.
     ///
     /// See [`partition_decode_share`] for how a total that does not divide evenly
-    /// is split.
+    /// is split, and [`output_decode_share`] for when a share may be zero.
     fn decode_fan_out(&self, partition: usize) -> Option<usize> {
         let total = (*self
             .decode_concurrency
@@ -349,7 +349,12 @@ impl CayenneAccelerationExec {
             .output_partitioning()
             .partition_count()
             .max(1);
-        Some(partition_decode_share(total, partitions, partition))
+        Some(output_decode_share(
+            &self.inner,
+            total,
+            partitions,
+            partition,
+        ))
     }
 
     /// Returns a stable identity for the underlying scan source, derived from
@@ -817,15 +822,43 @@ fn plan_decode_concurrency(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
 /// divide evenly, which a mixed base+delta plan routinely does, and refusing queries
 /// that fit.
 ///
-/// With fewer decodes than partitions some streams take a zero share. Such a stream
-/// runs no decode, so it charges nothing before a poll and only the batch it emits
-/// after one. Flooring the share at one instead would charge one estimated batch
-/// per output partition: a one-file scan under a round-robin fan-out of 64
-/// partitions would hold 64 initial estimates for one decode.
+/// With fewer decodes than partitions some streams take a zero share;
+/// [`output_decode_share`] decides whether that zero stands.
 fn partition_decode_share(total: usize, partitions: usize, partition: usize) -> usize {
     let partitions = partitions.max(1);
     let extra = usize::from(partition < total % partitions);
     (total / partitions) + extra
+}
+
+/// The decode share an accounted output stream of `inner` pre-charges.
+///
+/// Under a round-robin `RepartitionExec`, the repartition's input tasks run every
+/// decode and its output streams only receive batches, so a zero share stands: that
+/// stream charges nothing before a poll and only the batch it emits after one.
+/// Flooring it at one would charge one estimated batch per output partition, so a
+/// one-file scan fanned out to 64 partitions would hold 64 initial estimates for one
+/// decode.
+///
+/// Anywhere else an output stream is the inner partition that decodes, and the
+/// shares are spread by index rather than by which partition holds a file, so every
+/// stream charges at least one batch.
+fn output_decode_share(
+    inner: &Arc<dyn ExecutionPlan>,
+    total: usize,
+    partitions: usize,
+    partition: usize,
+) -> usize {
+    let share = partition_decode_share(total, partitions, partition);
+    let receives_round_robin = inner
+        .downcast_ref::<RepartitionExec>()
+        .is_some_and(|repartition| {
+            matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_))
+        });
+    if receives_round_robin {
+        share
+    } else {
+        share.max(1)
+    }
 }
 
 /// Counts file-backed scan sources (snapshot generations) and the total files
@@ -1875,6 +1908,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Only the outputs of a round-robin repartition, which decode nothing, may take a
+    /// zero share; a stream that is itself a decoding partition charges at least one
+    /// batch however the shares fall by index.
+    #[test]
+    fn only_round_robin_outputs_take_a_zero_decode_share() {
+        let direct = one_partition_plan();
+        let round_robin = round_robin_repartition_if_needed(Arc::clone(&direct), 64)
+            .expect("repartition")
+            .expect("one partition fans out to 64");
+        assert_eq!(output_decode_share(&round_robin, 1, 64, 0), 1);
+        assert_eq!(output_decode_share(&round_robin, 1, 64, 63), 0);
+        assert_eq!(output_decode_share(&direct, 1, 2, 0), 1);
+        assert_eq!(output_decode_share(&direct, 1, 2, 1), 1);
     }
 
     /// The remainder must land on distinct partitions, so no stream is charged two
