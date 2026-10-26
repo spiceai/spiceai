@@ -169,14 +169,17 @@ fn merge_modes(plan: &Arc<dyn ExecutionPlan>) -> Vec<AggregateMode> {
 /// Split `sql` into stages, decode each the way an executor does, and
 /// require every node to keep the scheduler's schema. Returns the rendered
 /// scheduler plan for messages.
-async fn assert_stages_decode_to_the_planned_schemas(ctx: &SessionContext, sql: &str) -> String {
+async fn assert_stages_decode_to_the_planned_schemas(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<String, String> {
     let plan = ctx
         .sql(sql)
         .await
-        .expect("plan")
+        .map_err(|error| format!("plan: {error}"))?
         .create_physical_plan()
         .await
-        .expect("physical plan");
+        .map_err(|error| format!("physical plan: {error}"))?;
     let rendered = displayable(plan.as_ref()).indent(true).to_string();
     assert!(
         aggregate_above_a_join(&plan),
@@ -189,7 +192,7 @@ async fn assert_stages_decode_to_the_planned_schemas(ctx: &SessionContext, sql: 
             Arc::clone(&plan),
             ctx.state().config().options(),
         )
-        .expect("plan stages");
+        .map_err(|error| format!("plan stages: {error}"))?;
 
     // The merge must straddle a shuffle: its `Partial` ends one stage and its
     // final half starts the next.
@@ -225,10 +228,10 @@ async fn assert_stages_decode_to_the_planned_schemas(ctx: &SessionContext, sql: 
     for stage in stages {
         let stage = stage as Arc<dyn ExecutionPlan>;
         let node = PhysicalPlanNode::try_from_physical_plan(Arc::clone(&stage), &codec)
-            .expect("encode stage");
+            .map_err(|error| format!("encode stage: {error}"))?;
         let decoded = node
             .try_into_physical_plan(&task_ctx, &codec)
-            .expect("executor decodes stage");
+            .map_err(|error| format!("executor decodes stage: {error}"))?;
         assert_eq!(
             node_schemas(&decoded),
             node_schemas(&stage),
@@ -236,7 +239,7 @@ async fn assert_stages_decode_to_the_planned_schemas(ctx: &SessionContext, sql: 
             displayable(stage.as_ref()).indent(true)
         );
     }
-    rendered
+    Ok(rendered)
 }
 
 async fn rows(ctx: &SessionContext, sql: &str) -> Result<String, String> {
@@ -244,9 +247,9 @@ async fn rows(ctx: &SessionContext, sql: &str) -> Result<String, String> {
         Err(error) => Err(error.to_string()),
         Ok(df) => match df.collect().await {
             Err(error) => Err(error.to_string()),
-            Ok(batches) => Ok(arrow::util::pretty::pretty_format_batches(&batches)
-                .expect("format")
-                .to_string()),
+            Ok(batches) => arrow::util::pretty::pretty_format_batches(&batches)
+                .map(|table| table.to_string())
+                .map_err(|error| error.to_string()),
         },
     }
 }
@@ -257,7 +260,9 @@ async fn eager_count_merge_decodes_on_executors_with_the_planned_state() {
     let ctx = scheduler_session(&zero_amounts()).expect("scheduler session");
     let sql = "SELECT d.name, COUNT(f.n) AS c FROM fact f JOIN dim d ON f.fk = d.dk \
                WHERE f.fk IN (1, 2) GROUP BY d.name";
-    let plan = assert_stages_decode_to_the_planned_schemas(&ctx, sql).await;
+    let plan = assert_stages_decode_to_the_planned_schemas(&ctx, sql)
+        .await
+        .expect("stages decode");
     let rows = rows(&ctx, sql)
         .await
         .unwrap_or_else(|error| panic!("eager COUNT must run, got {error}\n{plan}"));
@@ -273,7 +278,9 @@ async fn eager_float_avg_merge_decodes_on_executors_with_the_planned_state() {
     let ctx = scheduler_session(&zero_amounts()).expect("scheduler session");
     let sql = "SELECT d.name, AVG(f.x) AS a FROM fact f JOIN dim d ON f.fk = d.dk \
                WHERE f.fk IN (1, 2) GROUP BY d.name";
-    let plan = assert_stages_decode_to_the_planned_schemas(&ctx, sql).await;
+    let plan = assert_stages_decode_to_the_planned_schemas(&ctx, sql)
+        .await
+        .expect("stages decode");
     let rows = rows(&ctx, sql)
         .await
         .unwrap_or_else(|error| panic!("eager AVG must run, got {error}\n{plan}"));
