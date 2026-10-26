@@ -608,7 +608,7 @@ async fn restart_over_partial_restore(fixture: &SnapshotRefreshFixture) -> Resul
         .build();
     let writer = Arc::new(Runtime::builder().with_app(writer_app).build().await);
     load_runtime(Arc::clone(&writer)).await?;
-    let first_id = fixture
+    fixture
         .wait_for_snapshot_id(0, Duration::from_mins(1))
         .await
         .context("waiting for the writer's first snapshot")?;
@@ -620,12 +620,24 @@ async fn restart_over_partial_restore(fixture: &SnapshotRefreshFixture) -> Resul
     drop(reader);
 
     fixture.write_source(MUTATED_CSV)?;
-    let next_id = fixture
-        .wait_for_snapshot_id(first_id + 1, Duration::from_mins(1))
+    // The writer republishes unchanged data too, so a newer snapshot id alone
+    // can still hold the old rows. Once the writer serves the mutated rows, any
+    // later snapshot holds them.
+    wait_for_reader_swap(&writer, 5, Duration::from_mins(1)).await?;
+    let served_at = fixture
+        .current_snapshot_id()
+        .await?
+        .context("no snapshot is published")?;
+    fixture
+        .wait_for_snapshot_id(served_at + 1, Duration::from_mins(1))
         .await
         .context("waiting for the writer's snapshot of the mutated source")?;
-    // No later snapshot, so the reader restores exactly this one.
+    // No later snapshot, so the reader restores exactly the current one.
     writer.shutdown().await;
+    let next_id = fixture
+        .current_snapshot_id()
+        .await?
+        .context("no snapshot is published")?;
     fixture.leave_partial_restore(next_id).await?;
 
     let reader = Arc::new(Runtime::builder().with_app(reader_app()).build().await);
