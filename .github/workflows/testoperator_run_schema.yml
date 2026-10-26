@@ -371,13 +371,15 @@ jobs:
             echo "Updated the open PR -> ${PR_URL}"
           else
             # Target the branch the run was dispatched on: a release branch's
-            # snapshots describe that branch, not trunk.
+            # snapshots describe that branch, not trunk. enforce-pull-with-spice, a
+            # required check, fails a PR without both a kind/ and an area/ label.
             gh pr create \
               --title "fix: Update schema snapshots for ${{ github.event.inputs.spicepod_path }}" \
               --body "Updates the schema snapshots for \`${{ github.event.inputs.spicepod_path }}\` on \`${{ github.ref_name }}\`." \
               --base "${{ github.ref_name }}" \
               --head "${BRANCH_NAME}" \
-              --label kind/bug
+              --label kind/bug \
+              --label area/tests
           fi
           # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
           bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"

@@ -1,0 +1,30 @@
+{
+  "duckdb-nested-union-all": [
+    {
+      "run": "duckdb-nested-union-all",
+      "who": "duckdb",
+      "key": "query: SELECT id FROM (SELECT id FROM u WHERE id <= 1 UNION ALL SELECT id FROM u WHERE id BETWEEN 2 AND 3) a UNION ALL SELECT id FROM (SELECT id FROM u WHERE id BETWEEN 4 AND 7 UNION ALL SELECT id FROM u WHERE id BETWEEN 8 AND 15) b",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 15, actual: 7 }",
+      "group": "duckdb"
+    },
+    {
+      "run": "duckdb-nested-union-all",
+      "who": "duckdb",
+      "key": "query: SELECT id FROM u WHERE id <= 3 UNION ALL SELECT id FROM (SELECT id FROM u WHERE id BETWEEN 4 AND 7 UNION ALL SELECT id FROM u WHERE id BETWEEN 8 AND 15) b",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 15, actual: 7 }",
+      "group": "duckdb"
+    }
+  ],
+  "vector-search-score-duckdb": [
+    {
+      "run": "vector-search-score-duckdb",
+      "who": "duckdb",
+      "key": "query: SELECT id, round(1 - cosine_distance(body_embedding, embed('fox fox fox', 'potion')), 4) AS s FROM docs WHERE body_embedding IS NOT NULL ORDER BY s DESC, id LIMIT 10",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"s\", row_number: 1, expected: \"0.655\", actual: \"0.8275\" }",
+      "group": "duckdb"
+    }
+  ]
+}

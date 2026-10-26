@@ -1,0 +1,115 @@
+name: served-while-source-down
+description: >
+  An acceleration already on disk is served while its source is down, slow, or
+  rejecting the connection: queries answer from it at once, the status says it
+  is served and why, the runtime is ready (under on_load) or waits for the
+  source (under on_schema_resolved), a refresh waiting for the source keeps
+  reporting Error rather than Refreshing, and the data catches up once the
+  source answers.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  engine: [duckdb, cayenne]
+
+variants:
+  on-load: {}
+  on-schema-resolved:
+    datasets: { items: { ready_state: on_schema_resolved } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: served-while-source-down
+  datasets:
+    - from: postgres:public.items
+      name: items
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: '${matrix.engine}'
+        mode: file
+        refresh_mode: full
+        primary_key: id
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE items (id integer PRIMARY KEY, name text, price numeric(10, 2));
+        INSERT INTO items SELECT i, 'item ' || i, i * 1.25 FROM generate_series(1, 1000) AS i;
+  - start: {}
+  - query: SELECT * FROM items
+    id: loaded
+
+  # Restart with the source down.
+  - stop: {}
+  - stop-source: src
+  - start: { ready: false }
+  # `ready: false` returns before the dataset registers; it is served from
+  # then on.
+  - query: SELECT * FROM items
+    expect: { same-as: loaded }
+    eventually: 15s
+  - assert-status:
+      dataset: items
+      status: Error
+      message-contains: Serving data from the existing acceleration
+      has: [last_refresh]
+    eventually: 30s
+  - assert-status: { dataset: items, ready: true }
+    eventually: 30s
+    only: on-load
+  - assert-status: { dataset: items, ready: false }
+    consistently: 5s
+    only: on-schema-resolved
+
+  # A refresh waiting for the source does not claim to be refreshing.
+  - refresh: { dataset: items, wait: false }
+  - assert-status: { dataset: items, status: Error }
+    consistently: 5s
+  - query: SELECT * FROM items
+    expect: { same-as: loaded }
+
+  # The source returns with changes; the data catches up.
+  - start-source: src
+  - source-exec:
+      src: "UPDATE items SET price = price * 2 WHERE id % 10 = 0; DELETE FROM items WHERE id > 990"
+  - refresh: items
+  - query: SELECT * FROM items
+    eventually: 30s
+    id: caught-up
+  - assert-status: { dataset: items, status: Ready, ready: true }
+    eventually: 30s
+
+  # A source that accepts the connection but never answers (frozen): the
+  # acceleration is served at once.
+  - stop: {}
+  - pause-source: src
+  - start: { ready: false }
+  - query: SELECT * FROM items
+    expect: { same-as: caught-up }
+    eventually: 15s
+  - assert-status: { dataset: items, ready: true }
+    eventually: 30s
+    only: on-load
+  - unpause-source: src
+  - assert-status: { dataset: items, status: Ready, ready: true }
+    eventually: 60s
+
+  # Credentials the source rejects: served, and reported as an error no retry
+  # clears rather than as an unreachable source.
+  - restart:
+      ready: false
+      patch: { datasets: { items: { params: { pg_pass: not-the-password } } } }
+  - query: SELECT * FROM items
+    expect: { same-as: caught-up }
+    eventually: 15s
+  - assert-status: { dataset: items, status: Error, message-contains: password }
+    eventually: 30s
+  - assert-status: { dataset: items, ready: true }
+    eventually: 30s
+    only: on-load

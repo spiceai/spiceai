@@ -1,0 +1,45 @@
+name: source-down-at-start
+description: >
+  A dataset whose source is unreachable when Spice first starts reports the
+  failure and then loads, by full refresh or by change capture, once the
+  source is reachable, without a restart; it serves the source's rows,
+  including changes made after it came back.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  refresh_mode: [full, changes]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: source-down-at-start
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: '${matrix.refresh_mode}', refresh_check_interval: 2s, primary_key: id }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text);
+        INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 100) i;
+  - stop-source: src
+  - start: { ready: false }
+  - assert-status: { dataset: t, ready: false }
+    consistently: 5s
+  - query: SELECT count(*) FROM t
+    expect-error: true
+  - start-source: src
+  - assert-status: { dataset: t, status: Ready, ready: true }
+    eventually: 120s
+  - query: SELECT * FROM t
+    eventually: 30s
+  - source-exec: { src: "UPDATE t SET v = 'after' WHERE id <= 10; DELETE FROM t WHERE id > 95" }
+  - query: SELECT * FROM t
+    eventually: 30s

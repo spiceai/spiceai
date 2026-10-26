@@ -49,7 +49,9 @@ jobs:
             # scripts/check_ci_git_push_noninteractive.py.
             git -c credential.helper='' -c credential.interactive=false \
               push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:acknowledgements/${GITHUB_RUN_ID}
-            gh pr create --title "Update acknowledgements" --body "Updated OSS acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}
+            # enforce-pull-with-spice, a required check, fails a PR without both a kind/ and
+            # an area/ label.
+            gh pr create --title "Update acknowledgements" --body "Updated OSS acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID} --label kind/documentation --label area/docs
             # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
             bash .github/scripts/approve_bot_pr_runs.sh "acknowledgements/${GITHUB_RUN_ID}" "$(git rev-parse HEAD)"
           else
