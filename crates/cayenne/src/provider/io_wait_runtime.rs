@@ -67,6 +67,7 @@ mod tests {
     use datafusion::common::runtime::set_io_wait_hook;
     use tokio::sync::Semaphore;
     use tokio::sync::oneshot;
+    use vortex::VortexSessionDefault;
 
     use super::*;
 
