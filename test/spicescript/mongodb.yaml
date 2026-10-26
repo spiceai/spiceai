@@ -1,0 +1,81 @@
+name: mongodb
+description: >
+  The MongoDB connector against a replica set: a collection answers the
+  corpus as PostgreSQL does over the same rows, federated (filters, ORDER BY
+  and LIMIT pushed down), accelerated into Cayenne, and kept current by
+  change streams; after inserts, updates and deletes in both, every place
+  still agrees.
+
+sources:
+  mongo:
+    kind: docker
+    image: docker.io/library/mongo:8.0
+    ports: [27017]
+    command: [mongod, --replSet, rs0, --bind_ip_all]
+    # Initiates the replica set on the first probe; ready once it accepts
+    # writes (a new primary reports PRIMARY briefly before it does).
+    ready: >-
+      mongosh --quiet --eval "try { rs.status(); db.hello().isWritablePrimary ? 1 : 0 } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}); 0 }" | grep -qx 1
+  ref: { kind: postgres }
+
+variants:
+  federated: {}
+  cayenne: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+  cayenne-changes:
+    datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: _id } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mongodb
+  datasets:
+    - from: mongodb:t
+      name: t
+      params:
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        change_stream_batch_max_duration: 100ms
+        change_stream_max_await_time: 100ms
+
+defaults:
+  expect: { oracle: ref }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      mongo: >-
+        mongosh --quiet ${sources.mongo.namespace} --eval "
+          const docs = [];
+          for (let g = 1; g <= 500; g++) {
+            docs.push({ _id: NumberLong(g), i: NumberLong(g % 17 - 8), s: g % 10 == 0 ? null : ['apple', 'banana', 'cherry'][g % 3], f: g * 0.5, b: g % 2 == 0 });
+          }
+          db.t.insertMany(docs);"
+  - source-exec:
+      ref: >-
+        CREATE TABLE t (_id bigint PRIMARY KEY, i bigint, s text, f double precision, b boolean);
+        INSERT INTO t SELECT g, g % 17 - 8, CASE WHEN g % 10 = 0 THEN NULL ELSE (ARRAY['apple', 'banana', 'cherry'])[g % 3 + 1] END, g * 0.5, g % 2 = 0
+          FROM generate_series(1, 500) g;
+  - start: {}
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['500']] }
+    eventually: 60s
+  - corpus: corpus/mongodb.sql
+
+  # Inserts, updates and deletes in both stores.
+  - source-exec:
+      mongo: >-
+        mongosh --quiet ${sources.mongo.namespace} --eval "
+          db.t.insertMany([{ _id: NumberLong(501), i: NumberLong(4), s: 'durian', f: 0.25, b: true }, { _id: NumberLong(502), i: null, s: 'apple', f: 1.5, b: false }]);
+          db.t.updateMany({ s: 'banana' }, { \$set: { f: 99.5 } });
+          db.t.updateOne({ _id: NumberLong(7) }, { \$set: { s: null, i: NumberLong(0) } });
+          db.t.deleteMany({ i: NumberLong(-8) });"
+  - source-exec:
+      ref: >-
+        INSERT INTO t VALUES (501, 4, 'durian', 0.25, true), (502, NULL, 'apple', 1.5, false);
+        UPDATE t SET f = 99.5 WHERE s = 'banana';
+        UPDATE t SET s = NULL, i = 0 WHERE _id = 7;
+        DELETE FROM t WHERE i = -8;
+  - refresh: t
+    only: cayenne
+  - query: SELECT count(*) AS n, sum(f) AS sf FROM t
+    eventually: 60s
+  - corpus: corpus/mongodb.sql

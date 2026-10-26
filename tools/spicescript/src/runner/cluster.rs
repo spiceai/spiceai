@@ -20,10 +20,8 @@ limitations under the License.
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
-
-use crate::script::Script;
 
 use super::{CLUSTER_ASSIGNMENT_INTERVAL, Instance};
 
@@ -77,23 +75,12 @@ pub(super) async fn start_executors(
 /// the source's change arrived, or that an acceleration serves while its source
 /// is down, would compare against the cache instead.
 /// `--cluster`: the scheduler and executor arguments, with node mTLS from the
-/// `cluster-pki/` directory nearest above the script.
+/// run's generated CA and certificates.
 pub(super) fn cluster_args(
-    script: &Script,
+    pki: &std::path::Path,
     context: &Value,
     executors: usize,
 ) -> Result<(Vec<String>, Vec<Vec<String>>)> {
-    let script_dir = std::path::absolute(&script.dir)?;
-    let pki = script_dir
-        .ancestors()
-        .map(|d| d.join("cluster-pki"))
-        .find(|d| d.join("ca.crt").exists())
-        .ok_or_else(|| {
-            anyhow!(
-                "a cluster needs a cluster-pki/ directory above {}",
-                script_dir.display()
-            )
-        })?;
     let file = |name: &str| pki.join(name).display().to_string();
     let scheduler_port = context["instance"]["port"].to_string();
     let mtls = |node: &str| {
@@ -142,6 +129,22 @@ pub(super) fn cluster_args(
     Ok((scheduler, all))
 }
 
+/// The engine an acceleration block runs, or `None` when it is disabled,
+/// with the Spicepod's defaults applied: omitted `enabled` is true, and an
+/// omitted `engine` is Cayenne (Arrow only on Windows, where the harness
+/// does not run).
+fn accelerated_engine(acceleration: &Value) -> Option<&str> {
+    if acceleration.get("enabled").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
+    Some(
+        acceleration
+            .get("engine")
+            .and_then(Value::as_str)
+            .unwrap_or("cayenne"),
+    )
+}
+
 /// The first acceleration engine in the spicepod a cluster cannot run
 /// (anything but Cayenne and Arrow).
 pub(super) fn undistributed_engine(spicepod: &Value) -> Option<String> {
@@ -150,8 +153,7 @@ pub(super) fn undistributed_engine(spicepod: &Value) -> Option<String> {
         .as_array()?
         .iter()
         .filter_map(|d| d.get("acceleration"))
-        .filter(|a| a.get("enabled") == Some(&Value::Bool(true)))
-        .filter_map(|a| a.get("engine").and_then(Value::as_str))
+        .filter_map(accelerated_engine)
         .find(|e| !matches!(*e, "cayenne" | "arrow"))
         .map(str::to_string)
 }
@@ -162,9 +164,7 @@ pub(super) fn undistributed_engine(spicepod: &Value) -> Option<String> {
 pub(super) fn unpartitionable_acceleration(spicepod: &Value) -> Option<String> {
     spicepod.get("datasets")?.as_array()?.iter().find_map(|d| {
         let a = d.get("acceleration")?;
-        if a.get("enabled") != Some(&Value::Bool(true))
-            || a.get("engine").and_then(Value::as_str).unwrap_or("arrow") != "cayenne"
-        {
+        if accelerated_engine(a) != Some("cayenne") {
             return None;
         }
         let name = d.get("name").and_then(Value::as_str).unwrap_or("?");
@@ -220,20 +220,22 @@ pub(super) fn make_cluster_ready(
             .get("name")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let Some(engine) = dataset
+            .get("acceleration")
+            .and_then(accelerated_engine)
+            .map(str::to_string)
+        else {
+            continue;
+        };
         let Some(acceleration) = dataset
             .get_mut("acceleration")
             .and_then(Value::as_object_mut)
         else {
             continue;
         };
-        if acceleration.get("enabled") != Some(&Value::Bool(true)) {
-            continue;
-        }
         // Partitioned Cayenne lives in files; one that leaves the mode to its
         // default (memory) is given files rather than skipped.
-        if acceleration.get("engine").and_then(Value::as_str) == Some("cayenne")
-            && !acceleration.contains_key("mode")
-        {
+        if engine == "cayenne" && !acceleration.contains_key("mode") {
             acceleration.insert("mode".into(), json!("file"));
         }
         if acceleration.contains_key("partition_by") {
@@ -259,5 +261,49 @@ pub(super) fn make_cluster_ready(
                 json!([{ "bucket": format!("bucket(4, {key})") }]),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{make_cluster_ready, undistributed_engine, unpartitionable_acceleration};
+
+    fn pod(acceleration: &serde_json::Value) -> serde_json::Value {
+        json!({ "datasets": [{ "name": "t", "acceleration": acceleration }] })
+    }
+
+    #[test]
+    fn applies_the_spicepod_acceleration_defaults() {
+        // Omitted `enabled` is true.
+        assert_eq!(
+            undistributed_engine(&pod(&json!({ "engine": "duckdb" }))).as_deref(),
+            Some("duckdb")
+        );
+        assert_eq!(
+            undistributed_engine(&pod(&json!({ "enabled": false, "engine": "duckdb" }))),
+            None
+        );
+        // Omitted `engine` is Cayenne.
+        assert_eq!(
+            unpartitionable_acceleration(&pod(&json!({ "enabled": true, "mode": "memory" })))
+                .as_deref(),
+            Some("'t' is an in-memory Cayenne acceleration, which cannot be partitioned")
+        );
+        let mut spicepod = pod(&json!({ "primary_key": "id" }));
+        make_cluster_ready(
+            &mut spicepod,
+            std::path::Path::new("/w"),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(
+            spicepod["datasets"][0]["acceleration"],
+            json!({
+                "primary_key": "id",
+                "mode": "file",
+                "partition_by": [{ "bucket": "bucket(4, id)" }]
+            })
+        );
     }
 }

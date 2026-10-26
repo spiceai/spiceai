@@ -1,0 +1,64 @@
+name: readiness
+description: >
+  `ready_state` decides when an accelerated dataset counts as ready while its
+  first load is slow: `on_registration` and `on_schema_resolved` are ready at
+  once and answer from the source until the load finishes, `on_load` is not
+  ready and refuses queries until then; afterwards every mode serves the
+  source's rows. A dataset that cannot load does not hold back the runtime's
+  readiness for the others. A dataset whose source is down, or refuses its
+  reads, at startup loads once the source lets it.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  ready_state: [on_registration, on_schema_resolved, on_load]
+  engine: [cayenne, duckdb]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: readiness
+  datasets:
+    # Reading this view takes 8 seconds; describing it does not.
+    - from: postgres:public.slow_t
+      name: slow
+      params: ${sources.src.params}
+      ready_state: '${matrix.ready_state}'
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file }
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text, n numeric(8, 2));
+        INSERT INTO t SELECT i, CASE WHEN i % 9 = 0 THEN NULL ELSE 'v' || i END, i * 0.5 FROM generate_series(1, 300) i;
+        CREATE VIEW slow_t AS SELECT t.* FROM t, (SELECT pg_sleep(8)) s;
+  - start: { ready: false }
+
+  # While the first load runs.
+  - assert-status: { dataset: slow, ready: true }
+    eventually: 4s
+    when: { ready_state: [on_registration, on_schema_resolved] }
+  - query: SELECT * FROM slow
+    oracle-sql: SELECT * FROM t
+    when: { ready_state: [on_registration, on_schema_resolved] }
+  - assert-status: { dataset: slow, ready: false }
+    consistently: 4s
+    when: { ready_state: on_load }
+  - query: SELECT count(*) FROM slow
+    expect-error: true
+    when: { ready_state: on_load }
+
+  # Once it has loaded, every mode is ready and serves the acceleration.
+  - assert-status: { dataset: slow, status: Ready, ready: true }
+    eventually: 60s
+  - query: SELECT * FROM slow
+    oracle-sql: SELECT * FROM t
+  - query: SELECT count(*), sum(n), count(v) FROM slow WHERE id > 100
+    oracle-sql: SELECT count(*), sum(n), count(v) FROM t WHERE id > 100
+

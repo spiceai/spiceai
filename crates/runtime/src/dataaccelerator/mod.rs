@@ -647,7 +647,6 @@ mod test {
     clippy::uninlined_format_args,
     clippy::bool_assert_comparison,
     clippy::used_underscore_binding,
-    clippy::too_many_lines,
     clippy::items_after_statements,
     clippy::cast_possible_wrap,
     clippy::cast_possible_truncation,

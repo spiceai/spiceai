@@ -19,7 +19,6 @@ use crate::embeddings::{
 };
 use crate::hf::{SAFETENSORS_INDEX, read_shards};
 use async_openai::types::embeddings::EmbeddingInput;
-use hf_hub::{Repo, RepoType, api::tokio::ApiBuilder};
 use huggingface_hub::{DownloadError, Snapshot};
 use serde::Deserialize;
 use snafu::ResultExt;
@@ -165,62 +164,6 @@ pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
             .map(|x| EncodingInput::Ids(x.clone()))
             .collect::<Vec<_>>(),
     }
-}
-
-/// Builds a `HuggingFace` API client, honouring `HF_HUB_CACHE` and applying `hf_token`
-/// only when it actually carries a value.
-///
-/// `ApiBuilder::with_token` *overwrites* the builder's token, and `ApiBuilder::new`
-/// pre-populates it from the Hub's own credential file (`~/.cache/huggingface/token`,
-/// written by `huggingface-cli login`). Passing `None` through therefore discards a
-/// credential the machine already has, leaving every download anonymous and at the
-/// mercy of the Hub's unauthenticated access rules. An empty string is worse than
-/// `None`: it is sent as an empty bearer token and rejected with 401. So both are
-/// treated as "no token supplied — keep whatever the Hub cache provided".
-fn hf_api_builder(hf_token: Option<&str>) -> ApiBuilder {
-    let mut builder = ApiBuilder::new().with_progress(false);
-
-    if let Some(token) = hf_token.map(str::trim).filter(|t| !t.is_empty()) {
-        builder = builder.with_token(Some(token.to_string()));
-    }
-
-    if let Ok(cache_dir) = std::env::var("HF_HUB_CACHE") {
-        let cache_path: PathBuf = cache_dir.into();
-        if cache_path.exists() {
-            tracing::debug!("Using HF_HUB_CACHE directory {:?}", cache_path);
-            builder = builder.with_cache_dir(cache_path);
-        } else {
-            tracing::debug!(
-                "HF_HUB_CACHE directory {:?} does not exist, ignoring.",
-                cache_path
-            );
-        }
-    }
-
-    builder
-}
-
-pub async fn download_hf_file(
-    repo_id: &str,
-    revision: Option<&str>,
-    repo_type_opt: Option<&str>,
-    file: &str,
-    hf_token: Option<&str>,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let api = hf_api_builder(hf_token).build().boxed()?;
-
-    let repo_type = match repo_type_opt {
-        Some("datasets") => RepoType::Dataset,
-        Some("spaces") => RepoType::Space,
-        _ => RepoType::Model,
-    };
-
-    let repo = if let Some(revision) = revision {
-        Repo::with_revision(repo_id.to_string(), repo_type, revision.to_string())
-    } else {
-        Repo::new(repo_id.to_string(), repo_type)
-    };
-    api.repo(repo).get(file).await.boxed()
 }
 
 /// Downloads the files the TEI backend loads an embedding or reranker model from into the

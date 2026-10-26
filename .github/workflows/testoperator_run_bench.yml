@@ -424,7 +424,7 @@ jobs:
 
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
@@ -765,7 +765,6 @@ jobs:
             PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
             if [[ -n "${PR_URL}" ]]; then
               echo "PR already exists -> ${PR_URL}"
-              exit 0
             else
               BODY=$(cat <<EOF
           Automated benchmark snapshot update from workflow run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
@@ -775,8 +774,9 @@ jobs:
           **Profile:** \`${{ github.event.inputs.profile_option || 'release' }}\`
           EOF
           )
-              # Target the branch the run was dispatched on
-              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base "${{ github.ref_name }}" --head ${BRANCH_NAME} --label kind/bug
+              # Target the branch the run was dispatched on. enforce-pull-with-spice, a required
+              # check, fails a PR without both a kind/ and an area/ label.
+              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base "${{ github.ref_name }}" --head ${BRANCH_NAME} --label kind/bug --label area/tests
               # Auto-merge only into trunk: on an unprotected feature branch
               # --auto merges immediately, before the branch owner can review
               # the snapshots.
@@ -784,6 +784,8 @@ jobs:
                 gh pr merge --squash --auto ${BRANCH_NAME}
               fi
             fi
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
+            bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

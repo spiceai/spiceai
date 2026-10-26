@@ -30,6 +30,7 @@ mod compare;
 mod docker;
 mod generate;
 mod ledger;
+mod pki;
 mod reap;
 mod rqg;
 mod runner;
@@ -65,7 +66,7 @@ struct Cli {
     from: Option<PathBuf>,
 
     /// Run every instance as a cluster: a scheduler with one executor,
-    /// over node mTLS from the nearest `cluster-pki/` above the script.
+    /// over node mTLS with a CA and certificates generated for the run.
     #[arg(long)]
     cluster: bool,
 
@@ -117,6 +118,21 @@ struct Cli {
     /// otherwise wait out every limit in full.
     #[arg(long = "max-wait", value_name = "DURATION", value_parser = humantime::parse_duration)]
     max_wait: Option<std::time::Duration>,
+
+    /// Run only the matrix combinations with this value, as `KEY=VALUE` (a
+    /// key under the script's `matrix:`, such as `src=clickhouse`). Each
+    /// combination is a separate run with its own sources; this picks which
+    /// runs happen. Repeat a key for several values. Scripts without the key
+    /// or any of its values are skipped.
+    #[arg(long = "matrix", value_name = "KEY=VALUE", value_parser = parse_matrix_value)]
+    matrix: Vec<(String, String)>,
+
+    /// Run only this variant (a name under the script's `variants:`, such as
+    /// `cayenne`). Variants are the instances within each run, compared with
+    /// each other; this picks which of them start. Repeat it for several.
+    /// Scripts with none of them are skipped.
+    #[arg(long = "variant", value_name = "NAME", value_parser = parse_variant_name)]
+    variants: Vec<String>,
 }
 
 #[tokio::main]
@@ -143,6 +159,40 @@ async fn run(cli: Cli) -> Result<bool> {
         .iter()
         .map(|p| script::Script::load(p, cli.record_durations || cli.check))
         .collect::<Result<Vec<_>>>()?;
+    let mut selection = script::Selection::default();
+    for (key, value) in &cli.matrix {
+        selection
+            .matrix
+            .entry(key.clone())
+            .or_default()
+            .push(value.clone());
+    }
+    selection.variants.clone_from(&cli.variants);
+    if !selection.is_empty() {
+        anyhow::ensure!(
+            !cli.record_durations,
+            "--record-durations records whole scripts' run times; run it without {}",
+            selection.describe()
+        );
+        let before = scripts.len();
+        (paths, scripts) = paths
+            .into_iter()
+            .zip(scripts)
+            .filter_map(|(path, mut script)| script.select(&selection).then_some((path, script)))
+            .unzip();
+        anyhow::ensure!(
+            !scripts.is_empty(),
+            "No script has {}",
+            selection.describe()
+        );
+        if scripts.len() < before {
+            println!(
+                "{} of {before} scripts have {}; running those",
+                scripts.len(),
+                selection.describe()
+            );
+        }
+    }
     if let Some((index, count)) = cli.partition {
         let share = partition(&scripts, count);
         (paths, scripts) = paths
@@ -172,6 +222,8 @@ async fn run(cli: Cli) -> Result<bool> {
             from.display()
         );
     }
+    // A fresh CA and node certificates for this run's cluster instances.
+    let pki = pki::generate(&work_dir.join(format!("pki-{}", std::process::id())))?;
     let options = runner::Options {
         targets,
         from: cli.from,
@@ -179,6 +231,7 @@ async fn run(cli: Cli) -> Result<bool> {
         work_dir,
         keep: cli.keep,
         spice_cli: cli.spice,
+        pki,
     };
     let mut ledger = ledger::Ledger::load(&scripts)?;
     let mut passed = 0;
@@ -208,8 +261,12 @@ async fn run(cli: Cli) -> Result<bool> {
     while let Some((script, report, out, waited)) = futures::StreamExt::next(&mut running).await {
         print!("{out}");
         let report = report?;
-        // From its first slot, not from when it started waiting for one.
-        let took = report.started.map_or(waited, |t| t.elapsed());
+        // The time it held slots, not the time it waited for them.
+        let took = if report.ran.is_zero() {
+            waited
+        } else {
+            report.ran
+        };
         done += 1;
         let problems = if cli.record_failures {
             ledger.record(script, &report.failures);
@@ -350,6 +407,24 @@ fn expected_failures_note(expected: usize) -> String {
     }
 }
 
+fn parse_matrix_value(text: &str) -> Result<(String, String), String> {
+    match text.split_once('=') {
+        Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
+        _ => Err(format!(
+            "`{text}` is not KEY=VALUE, a key under the script's `matrix:`; to run one of its `variants:`, use --variant {text}"
+        )),
+    }
+}
+
+fn parse_variant_name(text: &str) -> Result<String, String> {
+    if text.contains('=') {
+        return Err(format!(
+            "`{text}` is a matrix value, not a variant name; to run the combinations with it, use --matrix {text}"
+        ));
+    }
+    Ok(text.to_string())
+}
+
 fn parse_partition(text: &str) -> Result<(usize, usize), String> {
     let parsed = text
         .split_once('/')
@@ -384,11 +459,13 @@ fn partition(scripts: &[script::Script], count: usize) -> Vec<usize> {
     share
 }
 
-/// The scripts directly in a directory, in name order.
+/// The scripts directly in a directory, in name order: every YAML file but
+/// the shared variants.
 fn scripts_in(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+        .filter(|p| p.file_name().is_none_or(|n| n != script::VARIANTS_FILE))
         .collect();
     entries.sort();
     Ok(entries)
@@ -447,6 +524,23 @@ mod tests {
             parse_partition("0/3").is_err()
                 && parse_partition("4/3").is_err()
                 && parse_partition("x").is_err()
+        );
+    }
+
+    #[test]
+    fn a_selection_meant_for_the_other_flag_names_it() {
+        assert_eq!(
+            parse_matrix_value("src=clickhouse"),
+            Ok(("src".to_string(), "clickhouse".to_string()))
+        );
+        assert_eq!(
+            parse_matrix_value("cayenne"),
+            Err("`cayenne` is not KEY=VALUE, a key under the script's `matrix:`; to run one of its `variants:`, use --variant cayenne".to_string())
+        );
+        assert_eq!(parse_variant_name("cayenne"), Ok("cayenne".to_string()));
+        assert_eq!(
+            parse_variant_name("src=clickhouse"),
+            Err("`src=clickhouse` is a matrix value, not a variant name; to run the combinations with it, use --matrix src=clickhouse".to_string())
         );
     }
 }

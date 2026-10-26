@@ -319,6 +319,23 @@ fn renamed_location(renamed: &HashMap<String, String>, path: &str, query: &str) 
     })
 }
 
+/// A file as the tree and `paths-info` endpoints describe it. The Hub masks the content ids of a
+/// gated repository's LFS files from an account without access.
+fn entry_json(path: &str, file: &MockFile, gated: bool) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "type": "file",
+        "oid": file.git_oid(),
+        "size": file.bytes.len(),
+        "path": path,
+    });
+    if file.lfs {
+        let oid = if gated { "*".repeat(64) } else { file.sha256() };
+        entry["lfs"] =
+            serde_json::json!({"oid": oid, "size": file.bytes.len(), "pointerSize": 133});
+    }
+    entry
+}
+
 /// The byte range a `Range` header asks of a file of `size` bytes, inclusive.
 fn requested_range(range: Option<&str>, size: u64) -> Option<(u64, u64)> {
     let range = range?.strip_prefix("bytes=")?;
@@ -396,6 +413,13 @@ fn ranged(state: &mut MockState, bytes: &Bytes, range: Option<&str>) -> Response
 }
 
 async fn hub_handler(State(mock): State<MockHub>, request: Request<Body>) -> Response<Body> {
+    // A `paths-info` lookup posts its paths as a form: read it before taking the lock.
+    let (parts, body) = request.into_parts();
+    let form = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let request = Request::from_parts(parts, Body::empty());
     let mut state = mock.0.lock();
     record(&mut state, false, &request);
     if state.faults.hub_down {
@@ -490,9 +514,6 @@ async fn hub_handler(State(mock): State<MockHub>, request: Request<Body>) -> Res
             };
             let folder = rest.join("/");
             let recursive = query.contains("recursive=true");
-            // The Hub masks the content ids of a gated repository's LFS files from an account
-            // without access.
-            let masked = repo.gated;
             let mut entries = Vec::new();
             for (path, file) in files {
                 let Some(relative) = (if folder.is_empty() {
@@ -505,22 +526,33 @@ async fn hub_handler(State(mock): State<MockHub>, request: Request<Body>) -> Res
                 if !recursive && relative.contains('/') {
                     continue;
                 }
-                let mut entry = serde_json::json!({
-                    "type": "file",
-                    "oid": file.git_oid(),
-                    "size": file.bytes.len(),
-                    "path": path,
-                });
-                if file.lfs {
-                    let oid = if masked {
-                        "*".repeat(64)
-                    } else {
-                        file.sha256()
-                    };
-                    entry["lfs"] = serde_json::json!({"oid": oid, "size": file.bytes.len(), "pointerSize": 133});
-                }
-                entries.push(entry);
+                entries.push(entry_json(path, file, repo.gated));
             }
+            response(
+                StatusCode::OK,
+                &[],
+                serde_json::to_string(&entries).expect("JSON"),
+            )
+        }
+        ["api", plural, owner, name, "paths-info", commit, ..] => {
+            let Some(repo) = state.repos.get(&format!("{plural}/{owner}/{name}")) else {
+                return hub_error(
+                    StatusCode::NOT_FOUND,
+                    "RepoNotFound",
+                    "Repository not found",
+                );
+            };
+            let Some(files) = repo.commits.get(*commit) else {
+                return hub_error(StatusCode::NOT_FOUND, "RevisionNotFound", "Invalid rev id");
+            };
+            let entries: Vec<serde_json::Value> = url::form_urlencoded::parse(form.as_bytes())
+                .filter(|(key, _)| key == "paths")
+                .filter_map(|(_, path)| {
+                    files
+                        .get(path.as_ref())
+                        .map(|file| entry_json(&path, file, repo.gated))
+                })
+                .collect();
             response(
                 StatusCode::OK,
                 &[],
@@ -551,9 +583,15 @@ async fn hub_handler(State(mock): State<MockHub>, request: Request<Body>) -> Res
                 );
             }
             let file_path = file_path.join("/");
+            // A branch resolves to its commit, which every answer names.
+            let commit = repo
+                .branches
+                .get(*commit)
+                .cloned()
+                .unwrap_or_else(|| (*commit).to_string());
             let Some(file) = repo
                 .commits
-                .get(*commit)
+                .get(&commit)
                 .and_then(|files| files.get(&file_path))
                 .cloned()
             else {
@@ -564,6 +602,7 @@ async fn hub_handler(State(mock): State<MockHub>, request: Request<Body>) -> Res
                 response(
                     StatusCode::FOUND,
                     &[
+                        ("x-repo-commit", commit),
                         ("x-linked-etag", format!("\"{}\"", file.sha256())),
                         ("x-linked-size", file.bytes.len().to_string()),
                         ("location", location),
@@ -571,7 +610,11 @@ async fn hub_handler(State(mock): State<MockHub>, request: Request<Body>) -> Res
                     "",
                 )
             } else {
-                ranged(&mut state, &file.bytes, range.as_deref())
+                let mut answer = ranged(&mut state, &file.bytes, range.as_deref());
+                if let Ok(value) = commit.parse() {
+                    answer.headers_mut().insert("x-repo-commit", value);
+                }
+                answer
             }
         }
         _ => hub_error(StatusCode::NOT_FOUND, "", "Not found"),

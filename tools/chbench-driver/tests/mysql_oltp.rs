@@ -38,6 +38,11 @@ limitations under the License.
 //! absolute numbers depend on the host, and a CI-hostile assertion would be
 //! either flaky or meaningless.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
