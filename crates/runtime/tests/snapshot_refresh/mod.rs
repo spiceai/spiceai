@@ -638,8 +638,8 @@ async fn restart_over_partial_restore(fixture: &SnapshotRefreshFixture) -> Resul
         .build();
     let writer = Arc::new(Runtime::builder().with_app(writer_app).build().await);
     load_runtime(Arc::clone(&writer)).await?;
-    let first_id = fixture
-        .wait_for_snapshot_id(0, Duration::from_mins(1))
+    fixture
+        .wait_for_snapshot_rows(3, Duration::from_mins(1))
         .await
         .context("waiting for the writer's first snapshot")?;
 
