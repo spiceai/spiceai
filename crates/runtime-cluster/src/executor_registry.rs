@@ -836,6 +836,8 @@ impl ExecutorRegistry {
         process_id: &str,
         client: FlightSqlClient,
     ) -> bool {
+        // An endpoint can arrive before its process's control stream registers.
+        let admission = self.admit(&executor_id, process_id).await;
         let mut clients = self.flight_sql_clients.write().await;
         // Older than the process registered last (a replaced run or a refused
         // duplicate), or older than the process whose endpoint is registered.
@@ -843,16 +845,22 @@ impl ExecutorRegistry {
             let processes = self.processes.lock();
             let unseen = ExecutorProcesses::default();
             let seen = processes.get(&executor_id).unwrap_or(&unseen);
-            seen.replaced.iter().any(|replaced| replaced == process_id)
+            let generation = admission
+                .map(|admission| admission.generation)
+                .or_else(|| seen.generations.get(process_id).copied());
+            admission.is_some_and(|admission| admission.superseded)
+                || seen.replaced.iter().any(|replaced| replaced == process_id)
                 || seen
                     .current
                     .as_deref()
-                    .is_some_and(|current| seen.is_older(process_id, current))
+                    .is_some_and(|current| seen.precedes(process_id, generation, current))
                 || self
                     .flight_sql_endpoints
                     .read()
                     .get(&executor_id)
-                    .is_some_and(|endpoint| seen.is_older(process_id, &endpoint.process_id))
+                    .is_some_and(|endpoint| {
+                        seen.precedes(process_id, generation, &endpoint.process_id)
+                    })
         };
         if superseded {
             return false;
@@ -2019,6 +2027,53 @@ mod tests {
         let replacement = registry.register("exec-a".to_string(), "run-05", tx).await;
         assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
         assert!(registry.is_current("exec-a", replacement.connection));
+    }
+
+    /// An endpoint that arrives before its process registers is refused when the
+    /// cluster's order shows a later process, even when its id sorts after the
+    /// later process's.
+    #[tokio::test]
+    async fn an_early_endpoint_from_a_replaced_process_is_refused() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let earlier_scheduler = registry_over(&store).await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        earlier_scheduler
+            .register("exec-a".to_string(), "run-2", tx1)
+            .await;
+        earlier_scheduler
+            .register("exec-a".to_string(), "run-1", tx2)
+            .await;
+
+        let later_scheduler = registry_over(&store).await;
+        let (tx3, _rx3) = mpsc::channel(1);
+        later_scheduler
+            .register("exec-a".to_string(), "run-1", tx3)
+            .await;
+        assert!(
+            later_scheduler
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert!(
+            !later_scheduler
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50102".to_string(),
+                    "run-2",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert_eq!(
+            later_scheduler.ready_executor_addresses_sync(),
+            ["127.0.0.1:50101"]
+        );
     }
 
     /// A process that replaces an executor is a restart even when its id sorts
