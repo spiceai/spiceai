@@ -1,8 +1,13 @@
 {
-  "snapshots": 6,
-  "snapshots-kill-during-upload": 65,
-  "snapshots-object-store": 9,
+  "snapshots": 5,
+  "snapshots-append-restore": 12,
+  "snapshots-cross-bucket-replication": 215,
+  "snapshots-index-restore": 11,
+  "snapshots-kill-during-upload": 97,
+  "snapshots-object-store": 8,
   "snapshots-policies": 34,
-  "snapshots-reader": 24,
-  "snapshots-writer-lease": 52
+  "snapshots-reader": 20,
+  "snapshots-reader-publication-failures": 217,
+  "snapshots-source-replication": 32,
+  "snapshots-writer-lease": 71
 }
