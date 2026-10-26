@@ -2751,9 +2751,7 @@ mod tests {
                 order_exprs: vec![],
                 unbounded: false,
                 options: HashMap::new(),
-                constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(
-                    key.clone(),
-                )]),
+                constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(key.clone())]),
                 column_defaults: HashMap::default(),
                 temporary: false,
             };
