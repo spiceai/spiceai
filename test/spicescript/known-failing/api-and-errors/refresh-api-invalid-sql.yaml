@@ -1,0 +1,44 @@
+name: refresh-api-invalid-sql
+description: >
+  Known failing (#15546). The refresh API accepts `refresh_sql` it can never run —
+  another table, two statements, a DELETE — with 201 "Dataset refresh
+  triggered"; the refresh then fails in the background, where only the log
+  says why (three lines per failure, ending with advice to check the data
+  connector). The validation already exists and could answer 400 with its
+  message. A PATCH of the same SQL answers 500, a server error for a client
+  mistake (it is not kept).
+sources:
+  src: { kind: postgres }
+variants:
+  full: {}
+  append: { datasets: { t: { acceleration: { refresh_mode: append } } } }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: refresh-api-invalid-sql
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, ts timestamptz NOT NULL);
+        INSERT INTO t SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 minute' FROM generate_series(1, 100) i;
+  - start: {}
+  # SQL that can never run is refused when asked for.
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, headers: { content-type: application/json }, body: '{"refresh_sql": "SELECT * FROM other"}' }
+    expect: { status: 400 }
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, headers: { content-type: application/json }, body: '{"refresh_sql": "SELECT * FROM t; DROP TABLE t"}' }
+    expect: { status: 400 }
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, headers: { content-type: application/json }, body: '{"refresh_sql": "DELETE FROM t"}' }
+    expect: { status: 400 }
+  # and so is keeping it.
+  - http: { method: PATCH, path: /v1/datasets/t/acceleration, headers: { content-type: application/json }, body: '{"refresh_sql": "DELETE FROM t"}' }
+    expect: { status: 400 }

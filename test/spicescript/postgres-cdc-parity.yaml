@@ -1,0 +1,161 @@
+name: postgres-cdc-parity
+description: >
+  Postgres CDC converges to the source after inserts, updates, deletes, key
+  changes and large transactions, across a clean restart and a kill: Cayenne
+  under every metastore and deletion mode, with file CDC durability, and
+  partitioned on its key, and DuckDB.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  sqlite-key:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: key } } } }
+  sqlite-position:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: position } } } }
+  turso-key:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: turso, cayenne_deletion_mode: key } } } }
+  turso-position:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: turso, cayenne_deletion_mode: position } } } }
+  # CDC batches written to files before the source is acknowledged, instead
+  # of the default in-memory tier.
+  file-durability:
+    datasets: { '*': { acceleration: { params: { cayenne_cdc_durability: file } } } }
+  # File accelerations partitioned on the primary key (#14947).
+  partitioned:
+    datasets:
+      orders: { acceleration: { partition_by: [{ bucket: 'bucket(4, o_id)' }] } }
+      customers: { acceleration: { partition_by: [{ bucket: 'bucket(4, c_id)' }] } }
+  duckdb:
+    datasets: { '*': { acceleration: { engine: duckdb, mode: memory } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-parity
+  datasets:
+    - from: postgres:public.orders
+      name: orders
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: o_id
+        on_conflict: { o_id: upsert }
+    - from: postgres:public.customers
+      name: customers
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: c_id
+        on_conflict: { c_id: upsert }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE customers (
+          c_id      integer PRIMARY KEY,
+          c_name    text NOT NULL,
+          c_segment varchar(16),
+          c_balance numeric(15, 2),
+          c_active  boolean,
+          c_since   date
+        );
+        CREATE TABLE orders (
+          o_id       bigint PRIMARY KEY,
+          o_custkey  integer,
+          o_status   char(1),
+          o_total    numeric(15, 2),
+          o_qty      smallint,
+          o_weight   double precision,
+          o_ratio    real,
+          o_note     text,
+          o_placed   timestamp,
+          o_updated  timestamptz,
+          o_payload  bytea
+        );
+        INSERT INTO customers
+          SELECT i, 'Customer#' || i, (ARRAY['AUTO', 'BUILDING', 'FURNITURE', NULL])[1 + i % 4],
+                 (i * 37 % 10000) / 7.0, i % 3 <> 0, DATE '2020-01-01' + i
+          FROM generate_series(1, 500) AS i;
+        INSERT INTO orders
+          SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+                 (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+                 TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+                 TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+                 decode(lpad(to_hex(i), 8, '0'), 'hex')
+          FROM generate_series(1, 20000) AS i;
+
+  - start: {}
+
+  # Bootstrap: the initial snapshot matches the source.
+  - query: SELECT * FROM orders
+    eventually: 90s
+  - query: SELECT * FROM customers
+    eventually: 30s
+
+  # Single-row changes on every path.
+  - source-exec:
+      src:
+        - INSERT INTO customers VALUES (501, 'Customer#501', 'AUTO', 12.50, true, DATE '2024-02-29')
+        - UPDATE customers SET c_balance = -c_balance, c_segment = NULL WHERE c_id % 50 = 0
+        - UPDATE orders SET o_note = NULL, o_total = o_total + 0.01 WHERE o_id % 101 = 0
+        - DELETE FROM orders WHERE o_id % 97 = 0
+        # A primary-key change is a delete of the old key and an insert of the new one.
+        - UPDATE orders SET o_id = o_id + 1000000 WHERE o_id BETWEEN 100 AND 120
+        # Delete and re-insert the same keys inside one transaction.
+        - |
+          BEGIN;
+          DELETE FROM orders WHERE o_id BETWEEN 200 AND 260;
+          INSERT INTO orders (o_id, o_custkey, o_status, o_note) SELECT i, 1, 'X', 'reinserted' FROM generate_series(200, 260) AS i;
+          COMMIT;
+  - query: SELECT * FROM orders
+    eventually: 60s
+  - query: SELECT * FROM customers
+    eventually: 30s
+
+  # One large transaction touching most rows.
+  - source-exec:
+      src: UPDATE orders SET o_qty = (o_qty + 1) % 50, o_updated = o_updated + INTERVAL '1 day' WHERE o_id % 3 = 0
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Changes made while spiced is stopped arrive after it starts again.
+  - stop: {}
+  - source-exec:
+      src:
+        - DELETE FROM customers WHERE c_id BETWEEN 10 AND 30
+        - INSERT INTO orders (o_id, o_custkey, o_status) SELECT i, 7, 'N' FROM generate_series(2000000, 2000500) AS i
+        - UPDATE orders SET o_status = 'S' WHERE o_custkey = 7
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+  - query: SELECT * FROM customers
+    eventually: 30s
+
+  # The same after a kill, with changes in flight when it dies.
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - kill-spiced: {}
+  - source-exec:
+      src:
+        - DELETE FROM orders WHERE o_id % 11 = 0
+        - UPDATE customers SET c_active = NOT c_active
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+  - query: SELECT * FROM customers
+    eventually: 30s
+  - query: SELECT o_status, count(*), sum(o_total), min(o_placed), max(o_updated) FROM orders GROUP BY o_status ORDER BY o_status NULLS LAST
+    eventually: 30s
+  # Both tables replicated to the same point.
+  - query: SELECT c.c_segment, count(*), sum(o.o_total) FROM orders o JOIN customers c ON o.o_custkey = c.c_id GROUP BY c.c_segment
+    eventually: 30s

@@ -1,0 +1,130 @@
+{
+  "localpod-follow": [
+    {
+      "run": "localpod-follow",
+      "who": "no-results-cache",
+      "key": "query: SELECT id, v FROM grandchild #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 2, expected: \"\\\"3\\\"\", actual: \"\\\"2\\\"\" }",
+      "group": "other"
+    },
+    {
+      "run": "localpod-follow",
+      "who": "no-results-cache",
+      "key": "query: SELECT id, v FROM child #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 3, actual: 5 }",
+      "group": "other"
+    },
+    {
+      "run": "localpod-follow",
+      "who": "no-results-cache",
+      "key": "query: SELECT id, v FROM grandchild #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 3, actual: 5 }",
+      "group": "other"
+    },
+    {
+      "run": "localpod-follow",
+      "who": "no-results-cache",
+      "key": "query: SELECT count(*) FROM passthrough",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: the query succeeded, but the script expected an error:",
+      "group": "other"
+    },
+    {
+      "run": "localpod-follow",
+      "who": "no-results-cache",
+      "key": "query: SELECT id, v FROM child #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 6, actual: 5 }",
+      "group": "other"
+    },
+    {
+      "run": "localpod-follow",
+      "who": "no-results-cache",
+      "key": "query: SELECT id, v FROM grandchild #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 6, actual: 5 }",
+      "group": "other"
+    },
+    {
+      "run": "localpod-follow",
+      "who": "no-results-cache",
+      "key": "query: SELECT count(*) FROM parent",
+      "kind": "other",
+      "signature": "the query succeeded, but the script expected an error",
+      "pattern": "the query succeeded, but the script expected an error",
+      "group": "other",
+      "may-pass": true
+    }
+  ],
+  "on-zero-results-partial": [
+    {
+      "run": "on-zero-results-partial[action=use_source,contents=partial]",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM items WHERE id IN (SELECT item_id FROM details WHERE val = 5)",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "other"
+    },
+    {
+      "run": "on-zero-results-partial[action=use_source,contents=partial]",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM items WHERE EXISTS (SELECT 1 FROM details WHERE item_id = id AND val = 5)",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "other"
+    },
+    {
+      "run": "on-zero-results-partial[action=use_source,contents=partial]",
+      "who": "duckdb-file",
+      "key": "query: SELECT id FROM items WHERE id IN (SELECT item_id FROM details WHERE val = 5)",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "other"
+    },
+    {
+      "run": "on-zero-results-partial[action=use_source,contents=partial]",
+      "who": "duckdb-file",
+      "key": "query: SELECT id FROM items WHERE EXISTS (SELECT 1 FROM details WHERE item_id = id AND val = 5)",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "other"
+    },
+    {
+      "run": "on-zero-results-partial[action=use_source,contents=partial]",
+      "who": "duckdb-memory",
+      "key": "query: SELECT id FROM items WHERE id IN (SELECT item_id FROM details WHERE val = 5)",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "other"
+    },
+    {
+      "run": "on-zero-results-partial[action=use_source,contents=partial]",
+      "who": "duckdb-memory",
+      "key": "query: SELECT id FROM items WHERE EXISTS (SELECT 1 FROM details WHERE item_id = id AND val = 5)",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "other"
+    }
+  ],
+  "snapshots-reader-without-source": [
+    {
+      "run": "snapshots-reader-without-source",
+      "who": "reader",
+      "key": "query: SELECT count(*) AS n, sum(id) AS s FROM t #2",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.t' not found: table 'spice.public.t' not found",
+      "group": "other"
+    },
+    {
+      "run": "snapshots-reader-without-source",
+      "who": "reader",
+      "key": "query: SELECT count(*) AS n, sum(id) AS s, count(*) FILTER (WHERE v = 'new') AS changed FROM t",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.t' not found: table 'spice.public.t' not found",
+      "group": "other"
+    }
+  ]
+}

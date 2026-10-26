@@ -1,0 +1,30 @@
+{
+  "text-search-cdc-repeated": [
+    {
+      "run": "text-search-cdc-repeated",
+      "who": "default",
+      "key": "query: SELECT q.id FROM text_search(docs_cdc, 'unicorn') q #2",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 1",
+      "group": "search"
+    }
+  ],
+  "text-search-stale-after-refresh": [
+    {
+      "run": "text-search-stale-after-refresh",
+      "who": "search-cache-off",
+      "key": "query: SELECT id FROM text_search(docs, 'dog') #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 55, actual: 56 }",
+      "group": "search"
+    },
+    {
+      "run": "text-search-stale-after-refresh",
+      "who": "search-cache-on",
+      "key": "query: SELECT id FROM text_search(docs, 'dog') #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 55, actual: 56 }",
+      "group": "search"
+    }
+  ]
+}

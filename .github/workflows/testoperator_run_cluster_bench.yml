@@ -745,10 +745,13 @@ jobs:
           # so it stands apart in the auto-PR list.
           title="snapshot(cluster-bench): ${commit_summary} (${QUERY_SET} sf${SCALE_FACTOR})"
 
+          # enforce-pull-with-spice, a required check, fails a PR without both a kind/
+          # and an area/ label.
           gh pr create \
             --title "${title}" \
             --body-file "${body_file}" \
             --base "${{ github.ref_name }}" \
             --head "${BRANCH_NAME}" \
+            --label kind/bug \
             --label area/ci
           bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
