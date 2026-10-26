@@ -77,6 +77,20 @@ impl Markers {
     pub(crate) fn call(&self) -> Token {
         self.call
     }
+
+    /// GBNF terminals matching each marker's token alone, never text that spells it, as
+    /// `(start, channel, message, end, constrain)`: a grammar that let a reply spell a
+    /// marker would let it write a call this reader cannot read.
+    pub(crate) fn terminals(&self) -> [String; 5] {
+        [
+            self.start,
+            self.channel,
+            self.message,
+            self.end,
+            self.constrain,
+        ]
+        .map(|token| format!("<[{}]>", token.0))
+    }
 }
 
 /// Where the text of the message being read goes.

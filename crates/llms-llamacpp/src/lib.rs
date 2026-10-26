@@ -29,6 +29,7 @@ limitations under the License.
 
 use std::{
     collections::{HashMap, VecDeque},
+    fmt::Write as _,
     num::NonZeroU32,
     ops::Range,
     path::{Path, PathBuf},
@@ -537,13 +538,17 @@ impl LlamaCpp {
         // The template this request renders with, for what its markup decides.
         let template = chosen_template(&self.template, !tools.is_empty())
             .map_err(OpenAIError::InvalidArgument)?;
-        let grammar = content_grammar(
-            &self.model_name,
-            template,
-            req.response_format.as_ref(),
-            &callable,
-            &obliged,
-        )?;
+        // A required Harmony call is forced over the whole reply, by the vocabulary's markers.
+        let grammar = match &self.harmony {
+            Some(markers) if !obliged.is_empty() => Some(harmony_call(markers, &obliged)?),
+            _ => content_grammar(
+                &self.model_name,
+                template,
+                req.response_format.as_ref(),
+                &callable,
+                &obliged,
+            )?,
+        };
         // Each choice reads its own reply, so each has its own reader.
         let matchers = (0..choices)
             .map(|_| {
@@ -2399,8 +2404,6 @@ fn content_grammar(
         // The turn must be a tool call, so a structured reply waits for a later turn.
         return if tagged {
             json_grammar(&call_schema(obliged), "tools").map(|call| Some(tagged_call(&call)))
-        } else if is_harmony_template(template) {
-            harmony_call(obliged).map(Some)
         } else {
             Ok(None)
         };
@@ -2423,8 +2426,12 @@ fn content_grammar(
 
 /// The grammar of a whole Harmony reply that must call one of `tools`: any reasoning, then a
 /// `commentary` message addressed to the tool, its arguments held to the tool's schema, as
-/// llama.cpp's server forces one. A marker in the grammar matches the marker's token.
-fn harmony_call(tools: &[&Tool]) -> std::result::Result<String, OpenAIError> {
+/// llama.cpp's server forces one. Each marker is its token, never text spelling it.
+fn harmony_call(
+    markers: &harmony::Markers,
+    tools: &[&Tool],
+) -> std::result::Result<String, OpenAIError> {
+    let [start, channel, message, end, constrain] = markers.terminals();
     let mut grammar = String::new();
     let mut calls = Vec::with_capacity(tools.len());
     for (i, tool) in tools.iter().enumerate() {
@@ -2432,15 +2439,17 @@ fn harmony_call(tools: &[&Tool]) -> std::result::Result<String, OpenAIError> {
         let arguments = json_grammar(&arguments_schema(tool), "tools")?;
         grammar.push_str(&prefix_rules(&arguments, &prefix));
         let name = serde_json::Value::String(tool.function.name.clone());
-        calls.push(format!("{name} constrain? \"<|message|>\" {prefix}root"));
+        calls.push(format!("{name} constrain? {message} {prefix}root"));
     }
     grammar.push_str("call ::= ");
     grammar.push_str(&calls.join(" | "));
     grammar.push('\n');
-    grammar.push_str("constrain ::= \" \" \"<|constrain|>\"? [A-Za-z0-9_-]+\n");
+    // The text between markers holds no `<|`, so it cannot spell one either.
+    let _ = writeln!(grammar, "constrain ::= \" \" {constrain}? [A-Za-z0-9_-]+");
     grammar.push_str("reasoning ::= ([^<] | \"<\" [^|])*\n");
-    grammar.push_str(
-        "root ::= (\"<|channel|>analysis<|message|>\" reasoning \"<|end|><|start|>assistant\")? \"<|channel|>commentary to=functions.\" call\n",
+    let _ = writeln!(
+        grammar,
+        "root ::= ({channel} \"analysis\" {message} reasoning {end} {start} \"assistant\")? {channel} \"commentary to=functions.\" call"
     );
     Ok(grammar)
 }
@@ -3314,27 +3323,34 @@ mod tests {
     #[test]
     fn a_required_harmony_call_is_forced_by_a_grammar_over_the_whole_reply() {
         let tool = weather_tool();
-        let grammar = content_grammar("m", HARMONY, None, &[&tool], &[&tool])
-            .expect("the tool's schema converts")
-            .expect("a required call in a Harmony template has a grammar");
+        let grammar = harmony_call(&HARMONY_MARKERS, &[&tool]).expect("the tool's schema converts");
+        // the test vocabulary's markers are tokens 1 to 7, matched as tokens
         assert!(
             grammar.ends_with(
-                "root ::= (\"<|channel|>analysis<|message|>\" reasoning \"<|end|><|start|>assistant\")? \"<|channel|>commentary to=functions.\" call\n"
+                "root ::= (<[2]> \"analysis\" <[3]> reasoning <[4]> <[1]> \"assistant\")? <[2]> \"commentary to=functions.\" call\n"
             ),
             "{grammar}"
         );
         assert!(
-            grammar.contains("call ::= \"get_weather\" constrain? \"<|message|>\" tool0-root\n"),
+            grammar.contains("call ::= \"get_weather\" constrain? <[3]> tool0-root\n"),
             "{grammar}"
+        );
+        assert!(
+            grammar.contains("constrain ::= \" \" <[7]>? [A-Za-z0-9_-]+\n"),
+            "{grammar}"
+        );
+        assert!(
+            !grammar.contains("<|"),
+            "no marker is written as text: {grammar}"
         );
         assert_eq!(
             grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
             1,
             "one start rule: {grammar}"
         );
-        // without a required call there is nothing to force
+        // nor does a Harmony template make one without its markers
         assert_eq!(
-            content_grammar("m", HARMONY, None, &[&tool], &[]).expect("no grammar"),
+            content_grammar("m", HARMONY, None, &[&tool], &[&tool]).expect("no grammar"),
             None
         );
     }
