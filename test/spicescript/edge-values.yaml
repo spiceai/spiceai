@@ -1,0 +1,68 @@
+name: edge-values
+description: >
+  The boundary values of each type answer through Spice as PostgreSQL answers
+  them: NaN, infinities and negative zero in ordering, grouping, comparison and
+  aggregates; 38-digit decimals; the integer limits, where an overflow is an
+  error rather than a wrapped value; empty, multibyte and long strings; bytes
+  with zero bytes; and times before the epoch and around a daylight-saving
+  change. (A `timestamp` before 1970 cannot be read from PostgreSQL at all,
+  and HTTP returns NaN and the infinities as null; known-failing/ has both.) Federated to PostgreSQL, and accelerated into each engine.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+  duckdb: duckdb-file
+  sqlite: sqlite-file
+  arrow: arrow
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: edge-values
+  datasets:
+    - from: postgres:public.e
+      name: e
+      params: ${sources.src.params}
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE e (
+          id int PRIMARY KEY, f float8, r float4, d numeric(38, 10), n numeric(38, 0),
+          i8 bigint, i4 int, i2 smallint, s text, bin bytea, tz timestamptz, ts timestamp, dt date);
+        INSERT INTO e VALUES
+          (1, 'NaN', 'NaN', 0, 0, 9223372036854775807, 2147483647, 32767, '', '\x00',
+           '2024-03-10 01:30:00-08', '1970-01-01 00:00:00', '1970-01-01'),
+          (2, 'Infinity', 'Infinity', 9999999999999999999999999999.9999999999,
+           99999999999999999999999999999999999999, 0, 1, 1, ' ', '\x',
+           '2024-03-10 03:30:00-07', '2024-03-10 02:30:00', '2024-03-10'),
+          (3, '-Infinity', '-Infinity', -9999999999999999999999999999.9999999999,
+           -99999999999999999999999999999999999999, -9223372036854775808, -2147483648, -32768,
+           '日本語', '\x00ff00', '1969-12-31 23:59:59.999999+00', '1970-01-01 00:00:00.000001', '1969-12-31'),
+          (4, '-0', '-0', 0.0000000001, 1, -1, -1, -1, '😀 emoji', '\xdeadbeef',
+           '2024-11-03 01:30:00-07', '2024-11-03 01:30:00.5', '2024-11-03'),
+          (5, '0', '0', -0.0000000001, -1, 1, 0, 0, 'naïve', '\x0a0d',
+           '2024-11-03 01:30:00-08', '2000-02-29 12:00:00.000001', '2000-02-29'),
+          (6, 1e308, 3.4e38, 12345678901234567890.1234567890, 12345678901234567890123456789012345678,
+           9223372036854775807, 2147483647, 100, e'tab\there', '\x7f',
+           '1900-01-01 00:00:00+00', '1999-12-31 23:59:59', '1900-01-01'),
+          (7, 5e-324, 1e-45, 0.5, 5, 7, 7, 7, e'line\nbreak', '\x80',
+           '2038-01-19 03:14:08+00', '2038-01-19 03:14:08', '2038-01-19'),
+          (8, 2.2250738585072014e-308, 1.17549435e-38, 1.5, 15, 8, 8, 8, repeat('xyz', 4000), decode(repeat('ab', 5000), 'hex'),
+           '2100-12-31 23:59:59.999999+00', '2100-12-31 23:59:59.999999', '2100-12-31'),
+          (9, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+          (10, 0.30000000000000004, 0.1, 2.5, 25, 10, 10, 10, e'a''b"c\\d_e', '\x5c',
+           '2024-06-30 23:59:59+14', '2024-06-30 23:59:59', '2024-06-30'),
+          (11, 'NaN', 1, 2.5, 25, 11, 11, 11, 'naïve', '\x00',
+           '2024-03-10 10:00:00+00', '2024-03-10 10:00:00', '2024-03-10');
+  - start: {}
+  - corpus: corpus/edge-values.sql

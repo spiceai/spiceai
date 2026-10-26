@@ -1,0 +1,70 @@
+name: postgres-dml
+description: >
+  DELETE and UPDATE through Spice reach PostgreSQL (write-through), by key, by
+  predicate and for every row: on a federated dataset, and on DuckDB and
+  Cayenne accelerations, whose refresh then serves what PostgreSQL holds.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  federated: {}
+  duckdb: { datasets: { items: { acceleration: { enabled: true, engine: duckdb, refresh_mode: full } } } }
+  cayenne: { datasets: { items: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-dml
+  datasets:
+    - from: postgres:public.items
+      name: items
+      params: ${sources.src.params}
+      access: read_write
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: CREATE TABLE items (id int PRIMARY KEY, name text NOT NULL, value int NOT NULL); INSERT INTO items VALUES (1, 'alpha', 10), (2, 'beta', 20), (3, 'gamma', 30), (4, 'delta', 40);
+  - start: {}
+
+  - spice-exec: DELETE FROM items WHERE id = 2
+  - source-query: { src: "SELECT id, name, value FROM items ORDER BY id" }
+    expect: { rows: [['1', alpha, '10'], ['3', gamma, '30'], ['4', delta, '40']] }
+  - refresh: items
+    except: federated
+  - query: SELECT id, name, value FROM items
+    oracle-sql: SELECT id, name, value FROM items
+    eventually: 30s
+
+  - spice-exec: UPDATE items SET name = 'updated', value = 99 WHERE id = 1
+  - source-query: { src: "SELECT id, name, value FROM items ORDER BY id" }
+    expect: { rows: [['1', updated, '99'], ['3', gamma, '30'], ['4', delta, '40']] }
+  # An expression over the column (value + 1) is refused when sent to
+  # PostgreSQL: known-failing/write-back/postgres-write-through-expressions.yaml.
+  - spice-exec: UPDATE items SET value = 77 WHERE value < 50
+  - source-query: { src: "SELECT id, value FROM items ORDER BY id" }
+    expect: { rows: [['1', '99'], ['3', '77'], ['4', '77']] }
+  - refresh: items
+    except: federated
+  - query: SELECT id, name, value FROM items
+    oracle-sql: SELECT id, name, value FROM items
+    eventually: 30s
+
+  - spice-exec: UPDATE items SET value = 0
+  - source-query: { src: "SELECT count(*), sum(value) FROM items" }
+    expect: { rows: [['3', '0']] }
+
+  - spice-exec: DELETE FROM items
+  - source-query: { src: "SELECT count(*) FROM items" }
+    expect: { rows: [['0']] }
+  - refresh: items
+    except: federated
+  - query: SELECT count(*) AS n FROM items
+    expect: { rows: [['0']] }
+    eventually: 30s

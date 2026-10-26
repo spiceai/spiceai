@@ -224,9 +224,9 @@ impl ChatEvaluator {
         }
         match choice.finish_reason {
             Some(FinishReason::Stop) | None => Ok(choice.message.content.unwrap_or_default()),
-            Some(FinishReason::Length) => Err(failed(
-                "the reply was cut off at the model's output token limit before every question was answered. Raise the model's maximum output tokens, or ask fewer questions per request".to_string(),
-            )),
+            Some(FinishReason::Length) => Err(Error::ReplyTruncated {
+                model: self.name.clone(),
+            }),
             Some(FinishReason::ContentFilter) => Err(failed(
                 "the provider's content filter withheld the reply".to_string(),
             )),
@@ -369,9 +369,9 @@ impl Evaluate for ChatEvaluator {
 }
 
 /// Maps a chat model's failure onto the evaluation error with the same meaning: a
-/// rejected request, key or rate limit keeps its kind, and a provider that cannot be
-/// reached is unavailable (as a System One provider's transport failure is). Anything
-/// else is a failed call.
+/// rejected request, key, missing model or rate limit keeps its kind, and a provider
+/// that cannot be reached is unavailable (as a System One provider's transport failure
+/// is). Anything else is a failed call.
 ///
 /// The kind is read by [`ApiErrorKind::of`], the same reading `/v1/chat/completions`
 /// takes of the same failure.
@@ -396,12 +396,14 @@ fn chat_error(model: &str, error: OpenAIError) -> Error {
                 model,
                 message: api.message,
             },
-            Some(ApiErrorKind::NotFound | ApiErrorKind::InsufficientQuota) | None => {
-                Error::ModelCallFailed {
-                    model,
-                    source: Box::new(OpenAIError::ApiError(api)),
-                }
-            }
+            Some(ApiErrorKind::NotFound) => Error::ModelNotFound {
+                model,
+                message: api.message,
+            },
+            Some(ApiErrorKind::InsufficientQuota) | None => Error::ModelCallFailed {
+                model,
+                source: Box::new(OpenAIError::ApiError(api)),
+            },
         },
         OpenAIError::Reqwest(e) => Error::ServiceUnavailable {
             model,
@@ -755,6 +757,8 @@ mod tests {
 
         let error = evaluator.evaluate(request()).await.expect_err("truncated");
 
+        // Its own variant, so callers that retry failed calls do not retry it.
+        assert!(matches!(error, Error::ReplyTruncated { .. }), "{error:?}");
         assert!(
             error
                 .to_string()
@@ -993,6 +997,17 @@ mod tests {
             (type_only("authentication_error"), "AuthenticationFailed"),
             (type_only("permission_error"), "PermissionDenied"),
             (type_only("rate_limit_error"), "RateLimited"),
+            (type_only("not_found_error"), "ModelNotFound"),
+            // Bedrock puts the AWS error name in `code` and the kind in `type`.
+            (
+                openai("invalid_request_error", "ValidationException"),
+                "InvalidRequest",
+            ),
+            (
+                openai("permission_error", "AccessDeniedException"),
+                "PermissionDenied",
+            ),
+            (api_error("InternalServerException"), "ModelCallFailed"),
             (
                 Err(OpenAIError::InvalidArgument("bad".to_string())),
                 "InvalidRequest",

@@ -69,7 +69,9 @@ runs:
         if [[ -z "${BODY}" ]]; then
           BODY="$(printf 'Automated snapshot update from workflow run [#%s](%s/%s/actions/runs/%s).\n\n<!-- spice-snapshot-update -->' "${GITHUB_RUN_ID}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")"
         fi
-        PR_URL="$(gh pr create --title "${PR_TITLE}" --body "${BODY}" --base "${BASE_BRANCH}" --head "${BRANCH_NAME}" --label kind/bug)"
+        # enforce-pull-with-spice, a required check, fails a PR without both a kind/ and an
+        # area/ label.
+        PR_URL="$(gh pr create --title "${PR_TITLE}" --body "${BODY}" --base "${BASE_BRANCH}" --head "${BRANCH_NAME}" --label kind/bug --label area/tests)"
         echo "Created snapshot update PR -> ${PR_URL}"
         gh pr merge --squash --auto "${BRANCH_NAME}" || echo "Auto-merge not available for this branch; PR created and requires manual merge."
         # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).

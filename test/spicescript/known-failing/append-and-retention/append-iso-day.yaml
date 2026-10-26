@@ -1,0 +1,56 @@
+name: append-iso-day
+description: >
+  Known failing (#15542): silent, permanent row loss. Append refresh with a day held
+  as ISO 8601 text ('2031-05-02') as the partition column beside a
+  timestamp time column: the filter for new rows compares the text with the
+  stored maximum written as a full timestamp ('2031-05-02T01:00:00Z'), and
+  '2031-05-02' sorts before it, so every row arriving later on the day of
+  the stored maximum is skipped, and never read again once a later day
+  arrives (rows 3 and 5 here). The same rows load with the day as a `date`
+  column (append-time-partition.yaml). As the time column itself, the same
+  text fails every refresh: "Failed to parse ISO8601 timestamp
+  '2031-05-01' from time column".
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  day-text-partition: {}
+  day-text-time-column:
+    datasets:
+      events: { time_column: day_text, time_format: ISO8601, time_partition_column: null, time_partition_format: null }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: append-iso-day
+  datasets:
+    - from: postgres:public.events
+      name: events
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      time_partition_column: day_text
+      time_partition_format: ISO8601
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: append }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE events (id int NOT NULL, ts timestamptz NOT NULL, day_text text NOT NULL);
+        INSERT INTO events VALUES (1, '2031-05-01 10:00Z', '2031-05-01'), (2, '2031-05-01 11:00Z', '2031-05-01');
+  - start: {}
+  - query: SELECT * FROM events
+  - source-exec: { src: "INSERT INTO events VALUES (3, '2031-05-01 12:00Z', '2031-05-01'), (4, '2031-05-02 01:00Z', '2031-05-02')" }
+  - refresh: events
+  - query: SELECT * FROM events
+  - source-exec: { src: "INSERT INTO events VALUES (5, '2031-05-02 02:00Z', '2031-05-02')" }
+  - refresh: events
+  - query: SELECT * FROM events
+  # A later day arrives; the skipped rows are still missing.
+  - source-exec: { src: "INSERT INTO events VALUES (6, '2031-05-03 00:30Z', '2031-05-03')" }
+  - refresh: events
+  - query: SELECT * FROM events
