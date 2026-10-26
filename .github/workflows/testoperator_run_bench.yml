@@ -251,7 +251,8 @@ jobs:
           spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
       # A release tag benchmarks the binary that release published, so releases older than the
-      # MinIO builds (kept only for recent commits) can be measured.
+      # MinIO builds (kept only for recent commits) can be measured. GitHub publishes asset digests
+      # only from v1.3.2 on; an earlier release has none to verify against and is refused.
       - name: Resolve the spiced source
         id: spiced_source
         env:
@@ -295,11 +296,15 @@ jobs:
           auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
           asset="spiced_linux_x86_64.tar.gz"
           release_asset="$(curl -fsSL "${auth[@]}" "${api}/releases/tags/${RELEASE}" \
-            | python3 -c 'import json,sys; a = next(a for a in json.load(sys.stdin)["assets"] if a["name"] == sys.argv[1]); print(a["id"], a["digest"])' "${asset}")"
+            | python3 -c 'import json,sys; a = next((a for a in json.load(sys.stdin)["assets"] if a["name"] == sys.argv[1]), {}); print(a.get("id") or "-", a.get("digest") or "-")' "${asset}")"
           read -r asset_id digest <<< "${release_asset}"
+          if [ "${asset_id}" = "-" ]; then
+            echo "::error::${RELEASE} has no ${asset}"
+            exit 1
+          fi
           case "${digest}" in
             sha256:*) ;;
-            *) echo "::error::${RELEASE} has no ${asset} digest"; exit 1 ;;
+            *) echo "::error::${RELEASE} has no published SHA-256 digest for ${asset}, so its binary cannot be verified; benchmark it from a commit or branch build instead"; exit 1 ;;
           esac
           curl -fsSL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" \
             -o "${asset}" "${api}/releases/assets/${asset_id}"
