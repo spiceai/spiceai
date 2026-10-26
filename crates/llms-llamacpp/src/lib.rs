@@ -564,7 +564,11 @@ impl LlamaCpp {
             .and_then(Option::as_ref)
             .is_some_and(ToolCallingMatcher::requires_tool_call);
         let ban_eog = require_tool_call && grammar.is_none();
-        let callable: Vec<String> = callable.iter().map(|t| t.function.name.clone()).collect();
+        let nameable = nameable_tools(&callable, &obliged);
+        let structured = matches!(
+            req.response_format,
+            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        );
         let prompt = self.prompt(&req.messages, reasoning, tools)?;
         let stop = match &req.stop {
             Some(StopConfiguration::String(s)) => vec![s.clone()],
@@ -578,7 +582,7 @@ impl LlamaCpp {
             let (events, rx) = mpsc::channel(STREAM_BUFFER);
             let harmony = self
                 .harmony
-                .map(|markers| harmony::Reader::new(markers, callable.clone()));
+                .map(|markers| harmony::Reader::new(markers, nameable.clone(), structured));
             let job = Job {
                 reasoning: reasoning_parser(template, &prompt),
                 prompt: prompt.clone(),
@@ -1802,6 +1806,12 @@ impl Output {
             }
         }
         if !self.called
+            && self.failure.is_none()
+            && let Some(call) = self.harmony.as_mut().and_then(harmony::Reader::finish)
+        {
+            finish = self.calls(None, vec![call]);
+        }
+        if !self.called
             && let Some(parser) = self.reasoning.as_mut()
         {
             parser.finalize();
@@ -2329,6 +2339,17 @@ fn callable_tools<'t>(choice: Option<&ToolChoice>, tools: &'t [Tool]) -> Vec<&'t
         Some(ToolChoice::AllowedTools(allowed)) => allowed_tools(allowed, tools),
         _ => tools.iter().collect(),
     }
+}
+
+/// The names a Harmony reply's call may take: the tools `tool_choice` obliges a call to, when
+/// it obliges one, as a named choice does; otherwise the callable ones.
+fn nameable_tools(callable: &[&Tool], obliged: &[&Tool]) -> Vec<String> {
+    let tools = if obliged.is_empty() {
+        callable
+    } else {
+        obliged
+    };
+    tools.iter().map(|t| t.function.name.clone()).collect()
 }
 
 /// The tools among `tools` that `allowed` names.
@@ -3076,7 +3097,7 @@ mod tests {
             stop: stop.iter().map(ToString::to_string).collect(),
             reasoning: None,
             tools: None,
-            harmony: Some(harmony::Reader::new(HARMONY_MARKERS, tools)),
+            harmony: Some(harmony::Reader::new(HARMONY_MARKERS, tools, false)),
             require_tool_call: false,
             stopping: Arc::default(),
             events,
@@ -3192,6 +3213,64 @@ mod tests {
         out.finish(FinishReason::Length, 1)
             .expect("the request succeeds");
         assert_eq!(joined(sent(rx)), ["c:ab".to_string()]);
+    }
+
+    #[test]
+    fn a_harmony_call_cut_off_after_complete_arguments_is_still_made() {
+        // `<|channel|>`, `commentary to=functions.f` (25 characters), `<|message|>` and `{}`
+        let (mut out, rx) = harmony_output(&["f"], &[], Some(29));
+        let reply = "<|channel|>commentary to=functions.f<|message|>{}<|call|>";
+        assert_eq!(
+            generate_harmony(&mut out, reply),
+            (Some(FinishReason::Length), 29)
+        );
+        let outcome = out
+            .finish(FinishReason::Length, 1)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::ToolCalls);
+        assert_eq!(joined(sent(rx)), ["t:f({})".to_string()]);
+    }
+
+    #[test]
+    fn a_named_tool_choice_is_the_only_name_a_harmony_call_may_take() {
+        let tool = |name: &str| {
+            let mut tool = weather_tool();
+            tool.function.name = name.to_string();
+            tool
+        };
+        let (f, g) = (tool("f"), tool("g"));
+        assert_eq!(nameable_tools(&[&f, &g], &[&f]), ["f".to_string()]);
+        assert_eq!(
+            nameable_tools(&[&f, &g], &[]),
+            ["f".to_string(), "g".to_string()]
+        );
+        // a call to the other tool is dropped, so a required call is not made
+        let (events, _rx) = mpsc::channel(STREAM_BUFFER);
+        let (_, _, mut output) = Output::new(Job {
+            prompt: String::new(),
+            limit: None,
+            sampling: Sampling::default(),
+            stop: Vec::new(),
+            reasoning: None,
+            tools: None,
+            harmony: Some(harmony::Reader::new(
+                HARMONY_MARKERS,
+                nameable_tools(&[&f, &g], &[&f]),
+                false,
+            )),
+            require_tool_call: true,
+            stopping: Arc::default(),
+            events,
+        });
+        let reply = "<|channel|>commentary to=functions.g<|message|>{}<|call|>";
+        assert_eq!(
+            generate_harmony(&mut output, reply).0,
+            Some(FinishReason::Stop)
+        );
+        assert_eq!(
+            output.finish(FinishReason::Stop, 1).map(|o| o.finish),
+            Err("Tool choice was required but no tools were called.".to_string())
+        );
     }
 
     #[test]

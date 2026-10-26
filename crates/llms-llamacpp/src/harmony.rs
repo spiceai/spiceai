@@ -28,6 +28,11 @@ limitations under the License.
 //! to that tool with the body as its JSON arguments. A message addressed to anything else, such
 //! as a built-in tool the request does not offer, is dropped.
 //!
+//! A body ends only at `<|end|>` or with the reply, so any other marker in it is text. A call's
+//! arguments and a final message held to a `response_format` are JSON, which may spell a marker
+//! inside a string: a call ends at `<|end|>` only once its arguments are a complete JSON value,
+//! and a structured final message only with the reply.
+//!
 //! The markers are read as tokens, never as text, so text that spells one is only text.
 
 use llama_cpp::{Token, Vocab};
@@ -115,16 +120,19 @@ pub(crate) struct Reader {
     markers: Markers,
     /// The tools a call may name.
     tools: Vec<String>,
+    /// Whether a `response_format` holds the final message to a schema.
+    structured: bool,
     route: Route,
 }
 
 impl Reader {
     /// The chat template's generation prompt opens the reply's first message, so the reply
     /// starts in its header.
-    pub(crate) fn new(markers: Markers, tools: Vec<String>) -> Self {
+    pub(crate) fn new(markers: Markers, tools: Vec<String>, structured: bool) -> Self {
         Self {
             markers,
             tools,
+            structured,
             route: Route::Header(String::new()),
         }
     }
@@ -133,12 +141,20 @@ impl Reader {
         &self.markers
     }
 
-    /// Whether `token` is a marker here. In a body, `<|message|>` and `<|constrain|>` mark
-    /// nothing, so they are read as text.
+    /// Whether `token` is a marker here, rather than text of the body it is in.
     pub(crate) fn marks(&self, token: Token) -> bool {
         let m = &self.markers;
-        [m.start, m.channel, m.end, m.done, m.call].contains(&token)
-            || (matches!(self.route, Route::Header(_)) && [m.message, m.constrain].contains(&token))
+        if token == m.done || token == m.call {
+            return true;
+        }
+        match &self.route {
+            Route::Header(_) => {
+                [m.start, m.channel, m.message, m.end, m.constrain].contains(&token)
+            }
+            Route::Call { arguments, .. } => token == m.end && is_json(arguments),
+            Route::Content { last: true } if self.structured => false,
+            Route::Reasoning | Route::Content { .. } | Route::Dropped => token == m.end,
+        }
     }
 
     /// Whether the reply is in a header, whose text is read here rather than sent.
@@ -174,11 +190,21 @@ impl Reader {
         if token == m.done || token == m.call {
             return Mark::Done;
         }
-        // `<|end|>` closes the message, and a `<|start|>` or `<|channel|>` without one opens
-        // the next as well.
-        let header = if token == m.channel { CHANNEL } else { "" };
-        self.route = Route::Header(header.to_string());
+        // `<|end|>` closes the message, and the next one's header follows.
+        self.route = Route::Header(String::new());
         Mark::Next
+    }
+
+    /// The call a reply that ends without its `<|call|>`, at a stop sequence or the token
+    /// budget, still makes: one whose arguments are already a complete JSON value, as
+    /// llama.cpp's server reads it.
+    pub(crate) fn finish(&mut self) -> Option<ToolCallResponse> {
+        match &mut self.route {
+            Route::Call { name, arguments } if is_json(arguments) => {
+                Some(call(std::mem::take(name), arguments.trim()))
+            }
+            _ => None,
+        }
     }
 
     /// Reads `text`, which is not a marker, and says where it goes.
@@ -221,6 +247,11 @@ fn route(header: &str, tools: &[String]) -> Route {
             _ => Route::Content { last: false },
         },
     }
+}
+
+/// Whether `text` is one complete JSON value.
+fn is_json(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text).is_ok()
 }
 
 /// The channel name `text` starts with.
@@ -301,8 +332,16 @@ mod tests {
 
     /// The reasoning, the content and the call `reply` reads as, and whether it ended.
     fn read(reply: &str, tools: &[&str]) -> (String, String, Option<(String, String)>, bool) {
+        read_as(reply, tools, false)
+    }
+
+    fn read_as(
+        reply: &str,
+        tools: &[&str],
+        structured: bool,
+    ) -> (String, String, Option<(String, String)>, bool) {
         let tools = tools.iter().map(ToString::to_string).collect();
-        let mut reader = Reader::new(TEST_MARKERS, tools);
+        let mut reader = Reader::new(TEST_MARKERS, tools, structured);
         let (mut reasoning, mut content) = (String::new(), String::new());
         for (token, text) in spell(reply) {
             if let Some(token) = token
@@ -436,26 +475,89 @@ mod tests {
     }
 
     #[test]
-    fn a_message_without_its_end_closes_at_the_next_header() {
+    fn a_body_ends_only_at_its_end_marker() {
+        // as llama.cpp's server reads a body: up to `<|end|>`
         assert_eq!(
             read(
-                "<|channel|>analysis<|message|>r<|channel|>final<|message|>c<|return|>",
+                "<|channel|>analysis<|message|>r<|channel|>final<|message|>c<|end|><|start|>assistant<|channel|>final<|message|>d<|return|>",
                 &[]
             ),
-            answer("r", "c")
+            answer("r<|channel|>final<|message|>c", "d")
+        );
+        assert_eq!(
+            read("<|channel|>final<|message|>a<|start|>b<|return|>", &[]),
+            answer("", "a<|start|>b")
+        );
+    }
+
+    #[test]
+    fn json_may_spell_an_end_marker_inside_a_string() {
+        // a call's arguments end at `<|end|>` only once they are complete
+        assert_eq!(
+            read(
+                "<|channel|>commentary to=functions.f<|message|>{\"s\":\"a<|end|>b\"}<|call|>",
+                &["f"]
+            ),
+            called("", "f", "{\"s\":\"a<|end|>b\"}")
         );
         assert_eq!(
             read(
-                "<|channel|>analysis<|message|>r<|start|>assistant<|channel|>final<|message|>c<|return|>",
-                &[]
+                "<|channel|>commentary to=functions.f<|message|>{\"s\":1}<|end|><|start|>assistant<|channel|>final<|message|>x<|return|>",
+                &["f"]
             ),
-            answer("r", "c")
+            called("", "f", "{\"s\":1}")
+        );
+        // a final message held to a schema ends only with the reply
+        assert_eq!(
+            read_as(
+                "<|channel|>final<|message|>{\"s\":\"<|end|>\"}<|return|>",
+                &[],
+                true
+            ),
+            answer("", "{\"s\":\"<|end|>\"}")
+        );
+        assert_eq!(
+            read_as(
+                "<|channel|>final<|message|>a<|end|><|start|>assistant<|channel|>final<|message|>b<|return|>",
+                &[],
+                false
+            ),
+            answer("", "ab")
+        );
+    }
+
+    #[test]
+    fn a_reply_that_ends_after_complete_arguments_still_makes_its_call() {
+        let mut reader = Reader::new(TEST_MARKERS, vec!["f".to_string()], false);
+        for (token, text) in spell("<|channel|>commentary to=functions.f<|message|>") {
+            match token {
+                Some(token) => {
+                    reader.mark(token);
+                }
+                None => {
+                    reader.text(&text);
+                }
+            }
+        }
+        reader.text("{\"a\":");
+        assert!(
+            reader.finish().is_none(),
+            "arguments cut short make no call"
+        );
+        reader.text("1} ");
+        let call = reader.finish().expect("complete arguments make a call");
+        assert_eq!(
+            (
+                call.function.name.as_str(),
+                call.function.arguments.as_str()
+            ),
+            ("f", "{\"a\":1}")
         );
     }
 
     #[test]
     fn only_the_final_message_is_held_to_a_response_format() {
-        let mut reader = Reader::new(TEST_MARKERS, Vec::new());
+        let mut reader = Reader::new(TEST_MARKERS, Vec::new(), false);
         assert!(!reader.in_final() && reader.in_header());
         reader.mark(TEST_MARKERS.channel);
         reader.text("commentary");
