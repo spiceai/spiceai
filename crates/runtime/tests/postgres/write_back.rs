@@ -14,12 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![expect(
-    clippy::expect_used,
-    clippy::clone_on_ref_ptr,
-    reason = "test code clones Arcs and asserts with expect rather than propagating"
-)]
-
 //! End-to-end durable write-back against a Postgres source.
 //!
 //! The write is driven through a `BEGIN … COMMIT` transaction because that is

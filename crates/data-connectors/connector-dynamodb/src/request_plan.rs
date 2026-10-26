@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::filter::{KeyReading, MAX_EXPRESSION_BYTES, SortPredicate};
+use crate::filter::{MAX_EXPRESSION_BYTES, SortPredicate};
 use aws_sdk_dynamodb::types::AttributeValue;
 use std::collections::HashMap;
 use std::fmt;
@@ -75,8 +75,6 @@ pub struct QueryParams {
     pub(crate) residual: Vec<SortPredicate>,
     /// The sort-key attribute `residual` reads.
     pub sort_key: Option<String>,
-    /// How the sort key's column reads the values `residual` is checked on.
-    pub(crate) sort_key_reading: KeyReading,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -148,7 +146,6 @@ impl QueryParamsBuilder {
             scan_index_forward: None,
             residual: Vec::new(),
             sort_key: None,
-            sort_key_reading: KeyReading::Stored,
         }
     }
 }
@@ -273,7 +270,6 @@ impl fmt::Debug for QueryParams {
         }
         if !self.residual.is_empty() {
             debug_struct.field("residual", &self.residual);
-            debug_struct.field("sort_key_reading", &self.sort_key_reading);
         }
 
         debug_struct.finish_non_exhaustive()

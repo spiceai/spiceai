@@ -74,7 +74,7 @@ impl FromStr for Tier {
         match s {
             "free" => Ok(Tier::Free),
             "paid" => Ok(Tier::Paid),
-            other => Err(format!("must be one of: free, paid. Found {other}")),
+            _ => Err("must be one of: free, paid".to_string()),
         }
     }
 }
@@ -226,6 +226,54 @@ async fn parse_with_failure_names_prefixed_key() {
     assert!(
         message.contains("'acme_sample_percent'") && message.contains("between 0 and 100"),
         "unexpected message: {message}"
+    );
+}
+
+fn parse_echoing_timeout(s: &str) -> Result<u32, String> {
+    if let Some(tail) = s.strip_prefix("1e") {
+        return Err(format!("Exponent magnitude {tail} exceeds maximum (20)"));
+    }
+    s.parse().map_err(|e| format!("{e}"))
+}
+
+/// Mirrors Elasticsearch `client_timeout: 1e${ env:SECRET }` — the secret is
+/// only a fragment of the raw value, and the parser echoes just that fragment.
+#[derive(Debug, TypedParams)]
+#[params(prefix = "echo")]
+struct EchoTimeoutParams {
+    /// Total request timeout.
+    #[expect(dead_code)]
+    #[param(runtime, alias = "timeout", parse_with = parse_echoing_timeout)]
+    client_timeout: Option<u32>,
+}
+
+#[tokio::test]
+async fn secret_derived_partial_interpolation_on_alias_does_not_echo() {
+    let sources = HashMap::from([("timeout".to_string(), "${ env:SECRET }".to_string())]);
+    let err = EchoTimeoutParams::try_from_params_with_secret_sources(
+        "component echo_test",
+        params(&[("timeout", "1e1234")]),
+        &empty_secrets(),
+        &sources,
+    )
+    .await
+    .expect_err("1e1234 is not a valid timeout");
+    let message = err.to_string();
+    assert!(
+        !message.contains("1234"),
+        "secret-derived parse errors must not echo a secret substring: {message}"
+    );
+    assert!(
+        !message.contains("1e1234"),
+        "secret-derived parse errors must not echo the resolved input: {message}"
+    );
+    assert!(
+        !message.contains("Exponent"),
+        "secret-derived parse errors must not surface parser text: {message}"
+    );
+    assert_eq!(
+        message,
+        "invalid value for `client_timeout` from ${ env:SECRET }; expected a valid value"
     );
 }
 

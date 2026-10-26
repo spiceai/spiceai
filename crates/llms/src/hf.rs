@@ -17,7 +17,8 @@ limitations under the License.
 //! What every local model, embedding and reranker shares for reading the Hugging Face Hub:
 //! the Hub settings a component names, and opening a repository's snapshot with them.
 
-use huggingface_hub::{DownloadError, ParamToken, RepoType, Requester, Settings, Snapshot};
+use huggingface_hub::{DownloadError, ParamToken, RepoId, Settings, Snapshot};
+pub use huggingface_hub::{RepoType, Requester};
 use secrecy::SecretString;
 
 /// The Hugging Face Hub settings a component names: its `hf_token` and `hf_endpoint`, which the
@@ -44,6 +45,37 @@ pub async fn open_model(
     hub: HubParams<'_>,
 ) -> Result<Snapshot, DownloadError> {
     let repo = DownloadError::parse_repo(&requester, RepoType::Model, model_id, revision)?;
+    let settings = settings(&requester, &repo, revision, hub).await?;
+    Snapshot::open(settings, requester, repo, revision).await
+}
+
+/// Opens `paths` of `repo` (`org/name`), a repository of `kind`, at `revision` for
+/// `requester`, with `hub`'s settings. Only those paths are described, so the repository is
+/// never listed (see [`Snapshot::open_paths`]).
+///
+/// # Errors
+///
+/// Returns an error if the repository id or a setting is not valid, or the repository or
+/// revision cannot be read and the cache holds no snapshot of it.
+pub async fn open_paths(
+    requester: Requester,
+    kind: RepoType,
+    repo: &str,
+    revision: Option<&str>,
+    hub: HubParams<'_>,
+    paths: &[&str],
+) -> Result<Snapshot, DownloadError> {
+    let repo = DownloadError::parse_repo(&requester, kind, repo, revision)?;
+    let settings = settings(&requester, &repo, revision, hub).await?;
+    Snapshot::open_paths(settings, requester, repo, revision, paths).await
+}
+
+async fn settings(
+    requester: &Requester,
+    repo: &RepoId,
+    revision: Option<&str>,
+    hub: HubParams<'_>,
+) -> Result<Settings, DownloadError> {
     let token = hub.token.cloned().map(|secret| {
         if hub.token_in_spicepod {
             ParamToken::Spicepod(secret)
@@ -51,10 +83,9 @@ pub async fn open_model(
             ParamToken::SecretStore(secret)
         }
     });
-    let settings = Settings::resolve(token, hub.endpoint)
+    Settings::resolve(token, hub.endpoint)
         .await
-        .map_err(|source| DownloadError::settings(&requester, &repo, revision, source))?;
-    Snapshot::open(settings, requester, repo, revision).await
+        .map_err(|source| DownloadError::settings(requester, repo, revision, source))
 }
 
 /// The safetensors index of a sharded model, `model.safetensors.index.json`.

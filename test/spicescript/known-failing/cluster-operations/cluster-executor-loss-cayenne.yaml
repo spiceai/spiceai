@@ -1,0 +1,77 @@
+# Known failing (#15539): when one of two executors holding a
+# Cayenne acceleration's partitions dies, its partitions are not reassigned to
+# the survivor, so every query of the table fails ("no ready executor serves 2
+# of its 5 partitions; retry the query") until the executor returns.
+name: cluster-executor-loss-cayenne
+description: >
+  A scheduler with two executors answers queries over PostgreSQL, federated
+  and accelerated into Cayenne, as PostgreSQL does; while one executor is
+  killed a concurrent reader gets either the right answer or an error, never
+  a wrong one; the survivor alone then answers every query right, and so do
+  both once the killed executor is back.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  cayenne: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file, primary_key: id } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-executor-loss-cayenne
+  datasets:
+    - { from: 'postgres:t', name: t, params: '${sources.src.params}' }
+    - { from: 'postgres:u', name: u, params: '${sources.src.params}' }
+
+defaults:
+  cluster: { executors: 2 }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - generate:
+      src:
+        table: t
+        rows: 5000
+        seed: 41
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: i, int: [-50, 50], nulls: 0.1 }
+          - { name: d, decimal: { range: [-100, 100], scale: 2 } }
+          - { name: s, choice: [apple, banana, cherry], nulls: 0.1 }
+          - { name: dt, date: ['2024-01-01', '2024-12-31'] }
+  - generate:
+      src:
+        table: u
+        rows: 800
+        seed: 42
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: t_id, int: [1, 5200] }
+          - { name: label, choice: [red, blue, green] }
+  - start: {}
+  - corpus: ../../corpus/cluster.sql
+
+  - background:
+      id: reader
+      concurrency: 2
+      query: SELECT count(*) AS n, sum(d) AS total FROM t
+      expect: { n: '5000' }
+  - query: SELECT count(*) AS n FROM t
+    consistently: 5s
+  - kill-executor: 1
+  - query: SELECT count(*) AS n FROM t
+    eventually: 60s
+  - query: SELECT count(*) AS n FROM t
+    consistently: 10s
+  # Errors while the scheduler notices the loss are allowed; wrong answers are not.
+  - stop-background: { id: reader, allow: ['^[45][0-9][0-9] '] }
+  - corpus: ../../corpus/cluster.sql
+
+  - start-executors: {}
+  - query: SELECT count(*) AS n FROM t
+    eventually: 60s
+  - corpus: ../../corpus/cluster.sql

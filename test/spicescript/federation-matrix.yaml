@@ -1,0 +1,65 @@
+name: federation-matrix
+description: >
+  The pushdown corpus answers the same through Spice whichever database a
+  table federates to, PostgreSQL or MySQL (ClickHouse: known-failing/
+  clickhouse-federation.yaml): each backend receives
+  the query rewritten in its own dialect, and every answer is checked against
+  one reference, PostgreSQL holding the same generated rows, so one corpus in
+  one dialect covers every backend.
+
+sources:
+  backend: { kind: '${matrix.backend}' }
+  ref: { kind: postgres }
+
+matrix:
+  backend: [postgres, mysql]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: federation-matrix
+  datasets:
+    - from: '${matrix.backend}:t'
+      name: t
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:u'
+      name: u
+      params: ${sources.backend.params}
+
+defaults:
+  expect: { oracle: ref }
+
+steps:
+  - generate:
+      backend:
+        table: t
+        rows: 400
+        seed: 31
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: i, int: [-50, 50], nulls: 0.1 }
+          - { name: big, bigint: [0, 10000000000] }
+          - { name: d, decimal: { range: [-100, 100], scale: 2 } }
+          - { name: f, float: [0, 50] }
+          - { name: s, choice: [apple, Apple, APPLE, banana, "O'Brien", naïve, '', under_score, b], nulls: 0.1 }
+          - { name: dt, date: ['2024-01-01', '2024-12-31'] }
+          - { name: ts, timestamp: ['2024-01-01', '2024-12-31'] }
+          - { name: b, bool: 0.33 }
+    mirror: ref
+  - generate:
+      backend:
+        table: u
+        rows: 150
+        seed: 32
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: t_id, int: [1, 440] }
+          - { name: label, choice: [red, blue, green] }
+    mirror: ref
+  - start: {}
+  - corpus: corpus/pushdown.sql
+  # The federated query reached the backend rather than being answered locally.
+  - explain: SELECT id FROM t WHERE i > 40
+    contains: [VirtualExecutionPlan]

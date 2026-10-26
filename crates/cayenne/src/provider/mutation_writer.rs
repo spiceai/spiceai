@@ -1315,6 +1315,7 @@ impl<'a> AppendMutationWriter<'a> {
             table: self.table.clone_for_write(),
             context: Arc::clone(self.context),
             _write_guard: write_guard,
+            _held_write_lock: super::write_lock_held::held_guard(),
             _checkpoint_guard: Some(checkpoint_guard),
             snapshot_id,
             rows,

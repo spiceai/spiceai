@@ -1767,7 +1767,8 @@ mod epoch_reload_tests {
 }
 
 /// MCP Streamable HTTP `Origin` policy is derived from `runtime.cors`.
-#[cfg(all(test, feature = "mcp"))]
+#[cfg(test)]
+#[cfg(feature = "mcp")]
 mod mcp_origin_tests {
     use super::{
         CorsConfig, LocalSessionManager, McpConfig, StreamableHttpServerConfig,

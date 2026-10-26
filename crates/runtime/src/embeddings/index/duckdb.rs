@@ -23,7 +23,7 @@ use datafusion_table_providers::{
     duckdb::{TableDefinition, write::DuckDBTableWriter},
     sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_secrets::{Secrets, typed_params_from_templates};
 use search::{generation::util::get_primary_keys, index::duckdb::DuckDBVectorIndex};
 use snafu::prelude::*;
 use spice_table::{Index, IndexLayer, SpiceTable};
@@ -31,7 +31,6 @@ use spicepod::{param::Params, semantic::ColumnLevelEmbeddingConfig, vector::Vect
 use tokio::sync::RwLock;
 
 use crate::model::EmbeddingModelStore;
-use runtime_parameters_typed::TypedParams as _;
 use runtime_search::store_params::duckdb::DuckDbVectorParams;
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
@@ -175,7 +174,8 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let Some((pool, table_definition)) = duckdb_writer_context(&accelerator_provider) else {
         return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-            "DuckDB vector engine for table {tbl} requires a DuckDB accelerator provider."
+            "Table '{tbl}' cannot use the DuckDB vector engine: {}",
+            crate::embeddings::connector::duckdb_vector_engine_without_duckdb_message()
         )));
     };
 
@@ -309,9 +309,7 @@ async fn get_store_params(
         .map(Params::as_string_map)
         .unwrap_or_default();
 
-    let params_with_secrets = get_params_with_secrets(Arc::clone(&secrets), &params).await;
-
-    DuckDbVectorParams::try_from_params("DuckDB vector store", params_with_secrets, &secrets)
+    typed_params_from_templates("DuckDB vector store", &secrets, &params)
         .await
         .boxed()
         .context(GetStoreParamsSnafu)

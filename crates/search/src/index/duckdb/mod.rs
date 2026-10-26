@@ -184,7 +184,7 @@ impl SearchIndex for DuckDBVectorIndex {
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         let Some(query_context) = self.query_context.clone() else {
             return Err(DataFusionError::Plan(
-                "DuckDB vector search requires a DuckDB-accelerated table. Configure the dataset with `acceleration.engine: duckdb`.".to_string(),
+                "`vectors.engine: duckdb` requires `acceleration.engine: duckdb`, and both are deprecated and will be removed in v2.5. Remove the `vectors` block and use `acceleration.engine: cayenne`, which indexes embedding columns for `vector_search` itself. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration#migrating-the-duckdb-vector-engine".to_string(),
             ));
         };
         let schema = self.query_result_schema()?;

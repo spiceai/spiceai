@@ -1,0 +1,130 @@
+name: postgres-cdc-edge-values
+description: >
+  The boundary values of each type (as in edge-values.yaml) arriving through
+  PostgreSQL CDC rather than the initial snapshot: inserted, then rotated
+  through every row by one UPDATE, moved to new keys and deleted, with the
+  table's replica identity both default and FULL (so old row images carry
+  them too). After each change Spice answers the edge-values corpus as
+  PostgreSQL does, on Cayenne and DuckDB.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  identity: [default, full]
+
+variants:
+  cayenne: {}
+  duckdb: { datasets: { '*': { acceleration: { engine: duckdb, mode: memory, on_conflict: { id: upsert } } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-edge-values
+  datasets:
+    - from: postgres:public.e
+      name: e
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE e (
+          id int PRIMARY KEY, f float8, r float4, d numeric(38, 10), n numeric(38, 0),
+          i8 bigint, i4 int, i2 smallint, s text, bin bytea, tz timestamptz, ts timestamp, dt date);
+        INSERT INTO e (id) VALUES (0);
+  - source-exec: { src: ALTER TABLE e REPLICA IDENTITY FULL }
+    when: { identity: full }
+  - start: {}
+  - query: SELECT * FROM e
+    eventually: 60s
+
+  # Every edge row arrives as an INSERT. The largest numeric(38, 10) values
+  # stop CDC (known-failing/cdc-postgres/postgres-cdc-numeric-38-digits.yaml), so these use 24
+  # integer digits rather than 28.
+  - source-exec:
+      src: |
+        INSERT INTO e VALUES
+          (1, 'NaN', 'NaN', 0, 0, 9223372036854775807, 2147483647, 32767, '', '\x00',
+           '2024-03-10 01:30:00-08', '1970-01-01 00:00:00', '1970-01-01'),
+          (2, 'Infinity', 'Infinity', 999999999999999999999999.9999999999,
+           99999999999999999999999999999999999999, 0, 1, 1, ' ', '\x',
+           '2024-03-10 03:30:00-07', '2024-03-10 02:30:00', '2024-03-10'),
+          (3, '-Infinity', '-Infinity', -999999999999999999999999.9999999999,
+           -99999999999999999999999999999999999999, -9223372036854775808, -2147483648, -32768,
+           '日本語', '\x00ff00', '1969-12-31 23:59:59.999999+00', '1970-01-01 00:00:00.000001', '1969-12-31'),
+          (4, '-0', '-0', 0.0000000001, 1, -1, -1, -1, '😀 emoji', '\xdeadbeef',
+           '2024-11-03 01:30:00-07', '2024-11-03 01:30:00.5', '2024-11-03'),
+          (5, '0', '0', -0.0000000001, -1, 1, 0, 0, 'naïve', '\x0a0d',
+           '2024-11-03 01:30:00-08', '2000-02-29 12:00:00.000001', '2000-02-29'),
+          (6, 1e308, 3.4e38, 12345678901234567890.1234567890, 12345678901234567890123456789012345678,
+           9223372036854775807, 2147483647, 100, e'tab\there', '\x7f',
+           '1900-01-01 00:00:00+00', '1999-12-31 23:59:59', '1900-01-01'),
+          (7, 5e-324, 1e-45, 0.5, 5, 7, 7, 7, e'line\nbreak', '\x80',
+           '2038-01-19 03:14:08+00', '2038-01-19 03:14:08', '2038-01-19'),
+          (8, 2.2250738585072014e-308, 1.17549435e-38, 1.5, 15, 8, 8, 8, repeat('xyz', 4000), decode(repeat('ab', 5000), 'hex'),
+           '2100-12-31 23:59:59.999999+00', '2100-12-31 23:59:59.999999', '2100-12-31'),
+          (9, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+          (10, 0.30000000000000004, 0.1, 2.5, 25, 10, 10, 10, e'a''b"c\\d_e', '\x5c',
+           '2024-06-30 23:59:59+14', '2024-06-30 23:59:59', '2024-06-30'),
+          (11, 'NaN', 1, 2.5, 25, 11, 11, 11, 'naïve', '\x00',
+           '2024-03-10 10:00:00+00', '2024-03-10 10:00:00', '2024-03-10');
+  - query: SELECT count(*) AS n FROM e
+    expect: { rows: [['12']] }
+    eventually: 60s
+  - corpus: corpus/edge-values.sql
+
+  # Every value moves to the next row by UPDATE, so each passes through an
+  # update's new (and, under FULL, old) row image; then back again, so the
+  # corpus (which names rows by id) applies once more.
+  - source-exec:
+      src: |
+        UPDATE e SET (f, r, d, n, i8, i4, i2, s, bin, tz, ts, dt) =
+          (SELECT o.f, o.r, o.d, o.n, o.i8, o.i4, o.i2, o.s, o.bin, o.tz, o.ts, o.dt FROM e AS o
+           WHERE o.id = CASE WHEN e.id = 11 THEN 0 ELSE e.id + 1 END);
+  - query: SELECT * FROM e
+    eventually: 60s
+  - query: SELECT id, f, r FROM e
+  - query: SELECT id, d, n FROM e
+  - query: SELECT id, i8, i4, i2 FROM e
+  - query: SELECT id, s FROM e
+  - query: SELECT id, tz, ts, dt FROM e
+  - query: SELECT id, bin FROM e
+  - source-exec:
+      src: |
+        UPDATE e SET (f, r, d, n, i8, i4, i2, s, bin, tz, ts, dt) =
+          (SELECT o.f, o.r, o.d, o.n, o.i8, o.i4, o.i2, o.s, o.bin, o.tz, o.ts, o.dt FROM e AS o
+           WHERE o.id = CASE WHEN e.id = 0 THEN 11 ELSE e.id - 1 END);
+  - query: SELECT * FROM e
+    eventually: 60s
+  - query: SELECT id, f, r FROM e
+  - query: SELECT id, d, n FROM e
+  - query: SELECT id, i8, i4, i2 FROM e
+  - query: SELECT id, s FROM e
+  - query: SELECT id, tz, ts, dt FROM e
+  - query: SELECT id, bin FROM e
+  - corpus: corpus/edge-values.sql
+
+  # Key changes and deletes carry edge values in the rows they remove.
+  - source-exec:
+      src: |
+        UPDATE e SET id = id + 100 WHERE id IN (2, 3, 8);
+        DELETE FROM e WHERE id IN (1, 4, 102, 108);
+  - query: SELECT count(*) AS n FROM e
+    expect: { rows: [['8']] }
+    eventually: 60s
+  - query: SELECT * FROM e
+    eventually: 60s
+  - query: SELECT id, f, r FROM e
+  - query: SELECT id, d, n FROM e
+  - query: SELECT id, i8, i4, i2 FROM e
+  - query: SELECT id, s FROM e
+  - query: SELECT id, tz, ts, dt FROM e
+  - query: SELECT id, bin FROM e

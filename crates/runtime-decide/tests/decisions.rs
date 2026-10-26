@@ -18,6 +18,11 @@ limitations under the License.
 //! a model that answers from the text it is given and records every request. Each test
 //! asserts the exact rows and the exact requests the model received.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -43,6 +48,9 @@ use tokio::sync::RwLock;
 struct Mock {
     decision: bool,
     fail_when_contains: Option<&'static str>,
+    /// The error for a text that `fail_when_contains` matches, from the model name.
+    /// An invalid request when unset.
+    fail_with: Option<fn(String) -> evaluate_api::Error>,
     /// Declines every choice question about a text containing this.
     decline_choices_when_contains: Option<&'static str>,
     requests: Mutex<Vec<EvaluateRequest>>,
@@ -64,6 +72,15 @@ impl Mock {
         Arc::new(Self {
             decision: true,
             fail_when_contains: Some(text),
+            ..Self::default()
+        })
+    }
+
+    fn failing_with(text: &'static str, fail: fn(String) -> evaluate_api::Error) -> Arc<Self> {
+        Arc::new(Self {
+            decision: true,
+            fail_when_contains: Some(text),
+            fail_with: Some(fail),
             ..Self::default()
         })
     }
@@ -107,6 +124,9 @@ impl Evaluate for Mock {
         if let Some(bad) = self.fail_when_contains
             && text.contains(bad)
         {
+            if let Some(fail) = self.fail_with {
+                return Err(fail(request.model));
+            }
             return evaluate_api::InvalidRequestSnafu {
                 model: request.model,
                 message: "the input cannot be answered",
@@ -738,8 +758,52 @@ async fn a_row_the_model_cannot_answer_fails_the_query_by_default() {
 
     assert_eq!(
         run_err(&ctx, "SELECT ai_if(body, 'refund') FROM tickets").await,
-        "Execution error: ai_if: model 'jev' could not answer a row, so the query stopped. Cause: Invalid evaluation request for model 'jev': the input cannot be answered. Retry the query, or pass `on_error => 'null'` to return NULL for rows the model cannot answer."
+        "Execution error: ai_if: model 'jev' could not answer a row, so the query stopped. Cause: Invalid evaluation request for model 'jev': the input cannot be answered. Pass `on_error => 'null'` to return NULL for rows the model cannot answer."
     );
+}
+
+/// Every attempt is billed, so a failure that the same request gets every time is asked
+/// once, and only a failure that a retry can change is asked again.
+#[tokio::test]
+async fn only_a_failure_a_retry_can_change_is_asked_again() {
+    let truncated: fn(String) -> evaluate_api::Error =
+        |model| evaluate_api::Error::ReplyTruncated { model };
+    let permission_denied: fn(String) -> evaluate_api::Error =
+        |model| evaluate_api::Error::PermissionDenied {
+            model,
+            message: "AccessDeniedException".to_string(),
+        };
+    let not_found: fn(String) -> evaluate_api::Error = |model| evaluate_api::Error::ModelNotFound {
+        model,
+        message: "ResourceNotFoundException".to_string(),
+    };
+    let server_error: fn(String) -> evaluate_api::Error =
+        |model| evaluate_api::Error::ModelCallFailed {
+            model,
+            source: "InternalServerException".into(),
+        };
+    for (name, fail, attempts) in [
+        ("truncated", truncated, 1),
+        ("permission denied", permission_denied, 1),
+        ("not found", not_found, 1),
+        ("server error", server_error, 3),
+    ] {
+        let jev = Mock::failing_with("technical", fail);
+        let ctx = session(vec![("jev", Arc::clone(&jev))], tickets(4, 1));
+
+        run(
+            &ctx,
+            "SELECT id, ai_if(body, 'refund', on_error => 'null') AS refund FROM tickets ORDER BY id",
+        )
+        .await;
+
+        let asked = jev
+            .requests()
+            .iter()
+            .filter(|request| text_of(&request.state).contains("technical"))
+            .count();
+        assert_eq!(asked, attempts, "{name}");
+    }
 }
 
 #[tokio::test]

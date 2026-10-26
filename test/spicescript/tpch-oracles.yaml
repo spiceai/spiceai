@@ -1,0 +1,60 @@
+name: tpch-oracles
+description: >
+  TPC-H (scale 0.01) through Spice over PostgreSQL, federated and in Cayenne,
+  answers as MySQL does over the same rows: an oracle that shares neither
+  PostgreSQL's planner nor its semantics.
+
+sources:
+  backend: { kind: '${matrix.backend}' }
+  ref: { kind: '${matrix.oracle}' }
+
+matrix:
+  backend: [postgres]
+  # ClickHouse is not used: it cannot run seven of the queries (correlated
+  # subqueries), and evaluates Q6's `0.06 - 0.01` as a float just under 0.05.
+  oracle: [mysql]
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: tpch-oracles
+  datasets:
+    - from: '${matrix.backend}:region'
+      name: region
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:nation'
+      name: nation
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:supplier'
+      name: supplier
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:customer'
+      name: customer
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:part'
+      name: part
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:partsupp'
+      name: partsupp
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:orders'
+      name: orders
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:lineitem'
+      name: lineitem
+      params: ${sources.backend.params}
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { region: r_regionkey, nation: n_nationkey, supplier: s_suppkey, customer: c_custkey, part: p_partkey, partsupp: ps_partkey, orders: o_orderkey, lineitem: l_orderkey }
+  expect: { oracle: ref }
+  compare-variants: false
+
+steps:
+  - dbgen: { scale: 0.01, into: [backend, ref] }
+  - start: {}
+  - corpus: ../../crates/test-framework/src/queries/tpch/q*.sql

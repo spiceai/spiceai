@@ -1,0 +1,66 @@
+name: auth
+description: >
+  With API keys required, HTTP and Flight accept a valid key (as `x-api-key`
+  or a Bearer token, read-write or read-only) and refuse a missing or wrong
+  one with 401 / Unauthenticated, while /health stays public.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: auth
+  runtime:
+    auth:
+      api-key:
+        enabled: true
+        keys: [valid-key, reader-key:ro]
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true }
+
+defaults:
+  api-key: valid-key
+
+steps:
+  - source-exec:
+      src: CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 20) i;
+  - start: {}
+
+  # Public endpoints.
+  - http: { path: /health, api-key: none }
+    expect: { status: 200 }
+
+  # HTTP: a key, by header or as a Bearer token; read-only keys read.
+  - http: { path: /v1/status, api-key: none }
+    expect: { status: 401 }
+  - http: { path: /v1/status, api-key: wrong-key }
+    expect: { status: 401 }
+  - http: { path: /v1/status }
+    expect: { status: 200 }
+  - http: { path: /v1/status, api-key: none, headers: { authorization: Bearer valid-key } }
+    expect: { status: 200 }
+  - http: { path: /v1/status, api-key: none, headers: { authorization: Bearer wrong-key } }
+    expect: { status: 401 }
+  - http: { method: POST, path: /v1/sql, api-key: none, headers: { content-type: text/plain }, body: SELECT count(*) AS n FROM t }
+    expect: { status: 401 }
+  - http: { method: POST, path: /v1/sql, api-key: reader-key, headers: { content-type: text/plain }, body: SELECT count(*) AS n FROM t }
+    expect: { status: 200, body-contains: '20' }
+  - http: { path: /v1/datasets, api-key: none }
+    expect: { status: 401 }
+
+  # Flight.
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['20']] }
+  - query: SELECT count(*) AS n FROM t
+    api-key: reader-key
+    expect: { rows: [['20']] }
+  - query: SELECT count(*) AS n FROM t
+    api-key: none
+    expect-error: true
+  - query: SELECT count(*) AS n FROM t
+    api-key: wrong-key
+    expect-error: true

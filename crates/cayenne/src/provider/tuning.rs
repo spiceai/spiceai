@@ -2951,10 +2951,6 @@ pub(crate) fn decide_with_goals(
 /// for ingest speed — and the contested `write_concurrency` lever is gated so the
 /// two never fight (queries shed shards only when not also behind on ingest; lag
 /// adds shards only when no query goal is violated and read-amp/deletes are low).
-#[expect(
-    clippy::too_many_lines,
-    reason = "one bounded move per tier; splitting would obscure the priority ladder"
-)]
 fn decide_goal(
     s: &IngestSnapshot,
     cur: &ActuatorValues,
