@@ -114,6 +114,8 @@
   "settings-evolution": 54,
   "source-down-at-start": 36,
   "surface": 6,
+  "text-search-cdc-repeated": 21,
+  "text-search-stale-after-refresh": 18,
   "time-columns": 21,
   "time-columns-retention": 11,
   "tlp": 108,

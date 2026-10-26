@@ -1,7 +1,6 @@
-# Known failing (#15547; the change-capture form of
-# text-search-stale-after-refresh.yaml): a text_search asked once before a
-# document arrives through change capture keeps answering without it when
-# asked again with the identical text, while other wordings find it.
+# The change-capture form of text-search-stale-after-refresh.yaml: a
+# text_search asked once before a document arrives through change capture
+# finds it when asked again with the identical text (#15392).
 name: text-search-cdc-repeated
 description: >
   A text_search over a change-captured Cayenne dataset, asked again with the
@@ -40,7 +39,7 @@ defaults:
 
 steps:
   - source-exec:
-      src: { file: ../../seed/search-postgres.sql }
+      src: { file: seed/search-postgres.sql }
   - start: { ready-timeout: 300s }
 
   - query: SELECT q.id FROM text_search(docs_cdc, 'unicorn') q

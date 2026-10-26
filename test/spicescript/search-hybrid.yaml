@@ -77,8 +77,8 @@ steps:
         INSERT INTO docs VALUES (500, 'unicorn unicorn stone stone stone stone stone stone stone stone stone stone', 0, 0);
         UPDATE docs SET body = 'unicorn stone stone stone stone stone stone stone stone stone stone stone', fox = 0, dog = 0 WHERE id = 1;
         DELETE FROM docs WHERE id = 4;
-  # Searched only once the changes have arrived: the identical text asked
-  # earlier would answer from before them (known-failing/search/text-search-cdc-repeated.yaml).
+  # Searched only once the changes have arrived; text-search-cdc-repeated.yaml
+  # covers the identical text asked before and after them.
   - query: SELECT count(*) AS n FROM docs_cdc WHERE id IN (1, 500)
     expect: { rows: [['2']] }
     eventually: 60s
