@@ -77,28 +77,33 @@ give_up() {
 # or SQL Server returns an error message to it.
 restore_failed='Sqlcmd: Error|Msg [0-9]+, Level [0-9]+'
 
+# Gives up with $1 once the deadline has passed, otherwise waits one poll interval.
+wait_or_give_up() {
+  if ((SECONDS >= deadline)); then
+    give_up "$1"
+  fi
+  sleep "$poll"
+}
+
 while :; do
   state="$(db_state)"
   if [ "$state" = ONLINE ]; then
     echo "$db is ONLINE."
     exit 0
   fi
-  logs="$(docker logs "$container" 2>&1)" || logs=''
-  if [ -z "$state" ] && grep -Eq "$restore_failed" <<<"$logs"; then
-    break
+  # The log only matters while the database is absent.
+  if [ -z "$state" ]; then
+    logs="$(docker logs "$container" 2>&1)" || logs=''
+    if grep -Eq "$restore_failed" <<<"$logs"; then
+      break
+    fi
   fi
-  if ((SECONDS >= deadline)); then
-    give_up "$db was not ONLINE within ${timeout}s (state: '${state:-absent}'), and the image's restore has not reported a failure."
-  fi
-  sleep "$poll"
+  wait_or_give_up "$db was not ONLINE within ${timeout}s (state: '${state:-absent}'), and the image's restore has not reported a failure."
 done
 
 echo "::warning::The image's restore of $db failed, most likely because SQL Server was not yet accepting connections when it ran. Restoring /data/$db.bak here."
 until sqlcmd 30 -Q 'SELECT 1' >/dev/null 2>&1; do
-  if ((SECONDS >= deadline)); then
-    give_up "SQL Server did not accept connections within ${timeout}s."
-  fi
-  sleep "$poll"
+  wait_or_give_up "SQL Server did not accept connections within ${timeout}s."
 done
 if ! sqlcmd "$(remaining)" -Q "RESTORE DATABASE [$db] FROM DISK = N'/data/$db.bak' WITH REPLACE"; then
   give_up "RESTORE DATABASE $db from /data/$db.bak failed."

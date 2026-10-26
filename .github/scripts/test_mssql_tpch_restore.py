@@ -102,6 +102,12 @@ class MssqlTpchRestoreTest(unittest.TestCase):
         return proc, calls
 
     @staticmethod
+    def split_call(call):
+        """Splits a recorded stub call into its docker arguments and the SQLCMDPASSWORD it saw."""
+        command, _, password = call.partition(" SQLCMDPASSWORD=")
+        return command, password
+
+    @staticmethod
     def restores(calls):
         return [c for c in calls if "RESTORE DATABASE" in c]
 
@@ -127,7 +133,7 @@ class MssqlTpchRestoreTest(unittest.TestCase):
     def test_waits_for_connections_before_restoring(self):
         proc, calls = self.run_restore(LOGIN_TIMEOUT, ["DOWN", "ONLINE"], pings=["1", "1", "0"])
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        pings = [i for i, c in enumerate(calls) if c.split(" SQLCMDPASSWORD=")[0].endswith("SELECT 1")]
+        pings = [i for i, c in enumerate(calls) if self.split_call(c)[0].endswith("SELECT 1")]
         restore = next(i for i, c in enumerate(calls) if "RESTORE DATABASE" in c)
         self.assertEqual(len(pings), 3)
         self.assertGreater(restore, pings[-1])
@@ -158,7 +164,7 @@ class MssqlTpchRestoreTest(unittest.TestCase):
     def test_every_query_is_time_bounded(self):
         proc, calls = self.run_restore(LOGIN_TIMEOUT, ["DOWN", "ONLINE"], MSSQL_RESTORE_TIMEOUT_SECONDS="120")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        execs = [c.split(" SQLCMDPASSWORD=")[0].split() for c in calls if c.startswith("exec")]
+        execs = [self.split_call(c)[0].split() for c in calls if c.startswith("exec")]
         self.assertTrue(execs)
         for args in execs:
             self.assertIn("-t", args)
@@ -171,7 +177,7 @@ class MssqlTpchRestoreTest(unittest.TestCase):
         _, calls = self.run_restore(LOGIN_TIMEOUT, ["", "ONLINE"])
         self.assertTrue(calls)
         for call in calls:
-            command, _, env_password = call.partition(" SQLCMDPASSWORD=")
+            command, env_password = self.split_call(call)
             self.assertNotIn(PASSWORD, command)
             if command.startswith("exec"):
                 self.assertEqual(env_password, PASSWORD)
