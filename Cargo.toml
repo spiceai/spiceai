@@ -360,7 +360,7 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "b082895b151a8a0cf65aaefc0994117ebb961295" }               # spiceai-51
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "b082895b151a8a0cf65aaefc0994117ebb961295" }                   # spiceai-51
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "041235f84ba1cff205b6a5003695274627a5a504" } # spiceai-51
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "71bdf186d213981b91d15ec8873cc71f19d387b9" } # spiceai-51-release-1.11
 
 # Spiceai fork of datafusion-ballista with Vortex shuffle format support and PollNow interrupt
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "626181fbc04a6f964abc459f99f62cf7742f75b4" }      # branch: spiceai-51
@@ -369,7 +369,7 @@ ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "86998110637f3a0ef241f0e91813deac1e597fbc" } # spiceai-0.17.0
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f4096c7592ed46b9e68755a49252d69783dece96" } # spiceai-1.4.4
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "cf3c413f796160aaf070d94af49a16b6801a8e98" } # spiceai-1.4.4-release-1.11
 
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" }
 
