@@ -208,3 +208,31 @@ async fn a_sliding_window_cache_reuses_the_shared_prompt() {
     .await;
 }
 
+/// `n` choices run one after another on the same prompt, so every choice after the first
+/// reuses the whole prompt but its last token, and greedy, all choices are the same reply.
+#[tokio::test]
+async fn each_further_choice_reuses_the_prompt() {
+    let gguf = crate::qwen3_gguf().await;
+    let model = load(&gguf, "qwen3-0.6b-choices").await;
+    let reply = model
+        .chat_request(request(json!({
+            "model": "qwen3-0.6b-choices",
+            "messages": [{ "role": "user", "content": USER_TURNS[0] }],
+            "temperature": 0,
+            "reasoning_effort": "none",
+            "max_tokens": 32,
+            "n": 2,
+        })))
+        .await
+        .expect("a reply");
+    let prompt_tokens =
+        usize::try_from(reply.usage.expect("usage").prompt_tokens).expect("a prompt length fits");
+    let texts: Vec<_> = reply
+        .choices
+        .iter()
+        .map(|choice| choice.message.content.clone().expect("content"))
+        .collect();
+    assert_eq!(texts.len(), 2);
+    assert_eq!(texts[0], texts[1], "greedy choices are the same reply");
+    assert_eq!(model.reused_prompt_tokens(), prompt_tokens - 1);
+}

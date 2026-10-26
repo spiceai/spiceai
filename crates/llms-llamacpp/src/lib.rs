@@ -1897,10 +1897,12 @@ fn generate_mtp(
             let token = picker.sample(spec.target(), index, out.in_content());
             if accepted < real && token == draft[accepted] {
                 accepted += 1;
+                // An accepted draft was decoded in the verify batch, so the cache holds it
+                // whether or not it ends the reply, and the next request may reuse it.
+                history.push(token);
                 if let Some(finish) = out.token(model, token) {
                     break 'generate finish;
                 }
-                history.push(token);
             } else {
                 break token;
             }
