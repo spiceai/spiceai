@@ -1,0 +1,135 @@
+name: mysql-cdc-shared-binlog
+description: >
+  Datasets on one MySQL connection share one binlog reader and each follows its
+  own table, including a transaction spanning tables; across a clean restart
+  they resume with the changes made while Spice was down. When the binlog they
+  would resume from has been purged, they fail with a message naming the fix
+  by default, and with `invalid_checkpoint_behavior: restart` rebuild from the
+  source and serve its rows, deletions included.
+
+sources:
+  src: { kind: mysql }
+
+matrix:
+  engine: [cayenne, duckdb]
+
+variants:
+  fail-loud: {}
+  restart:
+    datasets: { '*': { params: { mysql_replication_invalid_checkpoint_behavior: restart } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-cdc-shared-binlog
+  datasets:
+    - from: mysql:ta
+      name: a
+      params: { $merge: '${sources.src.params}' }
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+    - from: mysql:tb
+      name: b
+      params: { $merge: '${sources.src.params}' }
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+    - from: mysql:tc
+      name: c
+      params: { $merge: '${sources.src.params}' }
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE ta (id int PRIMARY KEY, v varchar(64));
+        CREATE TABLE tb (id int PRIMARY KEY, v varchar(64), n decimal(10, 2));
+        CREATE TABLE tc (id int PRIMARY KEY, v varchar(64));
+        INSERT INTO ta WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 200) SELECT i, CONCAT('a', i) FROM s;
+        INSERT INTO tb WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 200) SELECT i, CONCAT('b', i), i * 1.5 FROM s;
+        INSERT INTO tc WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 200) SELECT i, CONCAT('c', i) FROM s;
+  - start: {}
+  - query: SELECT * FROM a
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM tb
+    eventually: 60s
+  - query: SELECT * FROM c
+    oracle-sql: SELECT * FROM tc
+    eventually: 60s
+
+  - source-exec:
+      src: |
+        START TRANSACTION;
+        UPDATE ta SET v = 'a-upd' WHERE id % 10 = 0;
+        DELETE FROM tb WHERE id > 190;
+        INSERT INTO tc VALUES (201, 'c-new');
+        COMMIT;
+  - query: SELECT * FROM a
+    oracle-sql: SELECT * FROM ta
+    eventually: 30s
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM tb
+    eventually: 30s
+  - query: SELECT * FROM c
+    oracle-sql: SELECT * FROM tc
+    eventually: 30s
+
+  # A clean restart resumes from the binlog.
+  - stop: {}
+  - source-exec: { src: "INSERT INTO ta VALUES (300, 'while down'); UPDATE tb SET n = 0 WHERE id = 5; DELETE FROM tc WHERE id = 7" }
+  - start: {}
+  - query: SELECT * FROM a
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM tb
+    eventually: 60s
+  - query: SELECT * FROM c
+    oracle-sql: SELECT * FROM tc
+    eventually: 60s
+
+  # The binlog holding the changes made while Spice was down is purged before
+  # it returns: it rebuilds, and rows deleted meanwhile are gone.
+  - stop: {}
+  - source-exec:
+      src: |
+        DELETE FROM ta WHERE id <= 20;
+        UPDATE tb SET v = 'purged-gap' WHERE id <= 10;
+        DELETE FROM tc WHERE id > 150;
+        INSERT INTO tc VALUES (500, 'after purge');
+        FLUSH BINARY LOGS;
+        PURGE BINARY LOGS BEFORE NOW() + INTERVAL 1 SECOND;
+  - start: { ready: false }
+  # Which datasets' statuses carry the cause depends on timing
+  # (known-failing/cdc-mysql/mysql-cdc-shared-binlog-purged-status.yaml); the log always does.
+  - assert-status: { dataset: a, status: Error }
+    eventually: 60s
+    only: fail-loud
+  - assert-log: { contains: 'mysql_replication_invalid_checkpoint_behavior' }
+    eventually: 30s
+    only: fail-loud
+  - query: SELECT * FROM a
+    oracle-sql: SELECT * FROM ta
+    eventually: 90s
+    only: restart
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM tb
+    eventually: 90s
+    only: restart
+  - query: SELECT * FROM c
+    oracle-sql: SELECT * FROM tc
+    eventually: 90s
+    only: restart
+  # And changes after the rebuild still arrive.
+  - source-exec: { src: "UPDATE ta SET v = 'post-rebuild' WHERE id = 50; DELETE FROM tb WHERE id = 60" }
+  - query: SELECT * FROM a
+    oracle-sql: SELECT * FROM ta
+    eventually: 30s
+    only: restart
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM tb
+    eventually: 30s
+    only: restart

@@ -1,0 +1,48 @@
+# Known failing (#15538).
+name: unparse-pruned-aggregate
+description: >
+  An aggregate in a subquery whose outputs the outer query never reads still
+  produces its rows: one for a global aggregate (even over no rows), one per
+  group under GROUP BY. It fails today wherever Spice sends SQL to an engine
+  (federated PostgreSQL and MySQL, DuckDB accelerations): pruning
+  the unused aggregate expressions leaves an aggregate with none, which is
+  sent as `SELECT FROM e` with the aggregation and its GROUP BY gone, so the
+  outer query counts the table's rows instead. Cayenne, which DataFusion
+  executes, answers correctly.
+
+sources:
+  pg: { kind: postgres }
+  my: { kind: mysql }
+
+variants:
+  postgres: {}
+  mysql: { datasets: { e: { from: 'mysql:e', params: '${sources.my.params}' } } }
+  duckdb: { datasets: { e: { acceleration: { enabled: true, engine: duckdb, mode: file } } } }
+  cayenne: { datasets: { e: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: unparse-pruned-aggregate
+  datasets:
+    - from: postgres:public.e
+      name: e
+      params: ${sources.pg.params}
+
+defaults:
+  expect: { oracle: pg }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      pg: CREATE TABLE e (id int PRIMARY KEY, v int); INSERT INTO e SELECT i, i % 3 FROM generate_series(1, 11) i;
+  - source-exec:
+      my: CREATE TABLE e (id int PRIMARY KEY, v int); INSERT INTO e VALUES (1,1),(2,2),(3,0),(4,1),(5,2),(6,0),(7,1),(8,2),(9,0),(10,1),(11,2);
+  - start: {}
+  # Control: an aggregate whose output is read.
+  - query: SELECT count(*) AS n, max(m) AS top FROM (SELECT max(id) AS m FROM e) x
+  - query: SELECT count(*) AS n FROM (SELECT max(id) AS m FROM e) x
+  - query: SELECT count(*) AS n FROM (SELECT max(id) AS m FROM e WHERE v = 99) x
+  - query: SELECT count(*) AS n FROM (SELECT v, max(id) AS m FROM e GROUP BY v) x
+  - query: SELECT 42 AS k FROM (SELECT sum(v) AS s FROM e) x
+  - query: SELECT count(*) AS n FROM (SELECT v FROM e GROUP BY v) x

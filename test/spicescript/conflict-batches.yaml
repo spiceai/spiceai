@@ -1,0 +1,166 @@
+name: conflict-batches
+description: >
+  Cayenne keeps one row per primary key, the version that arrived last, for a
+  key repeated in one refresh or statement, across record batches and within
+  one, whatever on_conflict says (upsert, drop, or none), under full and
+  append refresh, in memory and file mode, plain and partitioned; an append
+  after the first load finds the stored keys; a localpod child's refresh
+  resolves repeated keys as its parent's does; an INSERT reports the rows it
+  inserted or replaced; and an UPDATE that would give a key two rows, or a
+  NULL key, fails with a message saying so and changes nothing.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  mode: [memory, file]
+  refresh: [full, append]
+
+variants:
+  upsert: { datasets: { across: &upsert { acceleration: { on_conflict: { id: upsert } } }, wsame: *upsert, wdiff: *upsert, ap: *upsert, lp: *upsert } }
+  drop: { datasets: { across: &drop { acceleration: { on_conflict: { id: drop } } }, wsame: *drop, wdiff: *drop, ap: *drop, lp: *drop } }
+  none: {}
+  partitioned:
+    when: { mode: file }
+    datasets: { across: &part { acceleration: { partition_by: [region] } }, wsame: *part, wdiff: *part, ap: *part }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: conflict-batches
+  datasets:
+    - &ds
+      from: postgres:public.across
+      name: across
+      params: ${sources.src.params}
+      # Every row has the same time, so the last arrival decides. (Without a
+      # time_column a partitioned append refuses to load:
+      # known-failing/cayenne/cayenne-partitioned-append-key-only.yaml.)
+      time_column: ts
+      acceleration: { enabled: true, engine: cayenne, mode: '${matrix.mode}', refresh_mode: '${matrix.refresh}', primary_key: id }
+    - { <<: *ds, from: postgres:public.wsame, name: wsame }
+    - { <<: *ds, from: postgres:public.wdiff, name: wdiff }
+    - from: postgres:public.apsrc
+      name: ap
+      params: ${sources.src.params}
+      time_column: ts
+      acceleration: { enabled: true, engine: cayenne, mode: '${matrix.mode}', refresh_mode: append, primary_key: id }
+    - from: postgres:public.lpsrc
+      name: lp
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, primary_key: id }
+    - from: localpod:lp
+      name: lp_child
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+    - &writable
+      from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      access: read_write
+      acceleration: { enabled: true, engine: cayenne, mode: '${matrix.mode}', refresh_mode: full, write_mode: acceleration, primary_key: id }
+    - { <<: *writable, from: postgres:public.ti, name: ti }
+    - from: postgres:public.tc
+      name: tc
+      params: ${sources.src.params}
+      access: read_write
+      acceleration: { enabled: true, engine: cayenne, mode: '${matrix.mode}', refresh_mode: full, write_mode: acceleration, primary_key: '(user_id, product_id)' }
+    - from: postgres:public.tp
+      name: tp
+      params: ${sources.src.params}
+      access: read_write
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        write_mode: acceleration
+        primary_key: '(id, region)'
+        partition_by: [region]
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { tc: user_id, '*': id }
+
+steps:
+  - source-exec:
+      src: { file: seed/conflict-batches.sql }
+  - start: {}
+
+  # A key repeated across batches and within one keeps the last arrival.
+  - query: SELECT v FROM across WHERE id = 0
+    expect: { rows: [[last]] }
+  - query: SELECT count(*) AS n FROM across
+    expect: { rows: [['8192']] }
+  - query: SELECT id, v FROM wsame
+    expect: { rows: [['1', a], ['2', b]] }
+  - query: SELECT id, v FROM wdiff
+    expect: { rows: [['1', c], ['2', b]] }
+
+  # An append after the first load finds the stored keys.
+  - source-exec: { src: "INSERT INTO apsrc VALUES (0, 'us', '2026-01-02', 'newer'), (9000, 'us', '2026-01-02', 'new')" }
+  - refresh: ap
+  - query: SELECT id, v FROM ap WHERE id IN (0, 9000)
+    expect: { rows: [['0', newer], ['9000', new]] }
+    eventually: 60s
+  - query: SELECT count(*) AS n FROM ap
+    expect: { rows: [['8193']] }
+    eventually: 60s
+
+  # A localpod parent's refresh resolves a repeated key for its child too.
+  - query: SELECT count(*) AS n FROM lp_child
+    expect: { rows: [['8192']] }
+    eventually: 60s
+  - source-exec: { src: "INSERT INTO lpsrc VALUES (0, 'us', '2026-01-01', 'last')" }
+  - refresh: lp
+  - query: SELECT v, (SELECT count(*) FROM lp_child) AS n FROM lp_child WHERE id = 0
+    expect: { rows: [[last, '8192']] }
+    eventually: 60s
+
+  # An INSERT reports the rows it inserted or replaced; a key repeated in it
+  # keeps the last.
+  - http:
+      method: POST
+      path: /v1/sql
+      headers: { content-type: text/plain }
+      body: >-
+        INSERT INTO ti VALUES (1, 'us', TIMESTAMP '2026-01-02 00:00:00', 'replaced'),
+        (2, 'us', TIMESTAMP '2026-01-02 00:00:00', 'first'), (2, 'us', TIMESTAMP '2026-01-02 00:00:00', 'second'),
+        (3, 'us', TIMESTAMP '2026-01-02 00:00:00', 'new')
+    expect: { status: 200, body-contains: '"count":3' }
+  - query: SELECT id, v FROM ti
+    expect: { rows: [['1', replaced], ['2', second], ['3', new]] }
+
+  # A composite key: a write onto an existing pair replaces it; a new pair adds a row.
+  - spice-exec: INSERT INTO tc VALUES (1, 10, 10, 15.0)
+  - query: SELECT user_id, product_id, quantity, price FROM tc
+    expect: { rows: [['1', '10', '10', '15.0'], ['1', '20', '2', '20.0'], ['2', '10', '3', '30.0'], ['2', '20', '4', '40.0']] }
+  - spice-exec: INSERT INTO tc VALUES (3, 30, 5, 50.0)
+  - query: SELECT count(*) AS n FROM tc
+    expect: { rows: [['5']] }
+
+  # An UPDATE that would leave a key with two rows, or a NULL key, fails and
+  # changes nothing.
+  - spice-exec: UPDATE t SET id = 0
+    expect-error: "Failed to update dataset 't': 8193 rows would get the same new 'id', so nothing was changed."
+  - spice-exec: UPDATE t SET id = 0 WHERE id > 0
+    expect-error: "Failed to update dataset 't': the new 'id' of 8192 rows match a key already stored, so nothing was changed."
+  - spice-exec: UPDATE t SET id = 1 WHERE id = 2
+    expect-error: "Failed to update dataset 't': the new 'id' of 1 row matches a key already stored, so nothing was changed."
+  - spice-exec: UPDATE t SET id = 100000 WHERE id IN (3, 4)
+    expect-error: "Failed to update dataset 't': 2 rows would get the same new 'id', so nothing was changed."
+  - spice-exec: UPDATE t SET id = NULL WHERE id = 2
+    expect-error: "Failed to update dataset 't': the new 'id' of 1 row is NULL, and a primary key cannot be NULL, so nothing was changed."
+  - query: SELECT count(*) AS n, min(id) AS lo, max(id) AS hi FROM t
+    expect: { rows: [['8193', '0', '8192']] }
+  - query: SELECT id, v FROM t WHERE id IN (1, 2, 3, 4)
+    expect: { rows: [['1', v1], ['2', v2], ['3', v3], ['4', v4]] }
+  # A key that can still move does.
+  - spice-exec: UPDATE t SET id = 100000 WHERE id = 3
+  - query: SELECT id, v FROM t WHERE id IN (3, 100000)
+    expect: { rows: [['100000', v3]] }
+
+  # Partitioned: the update would collide in one partition, so no partition changes.
+  - spice-exec: UPDATE tp SET id = 2 WHERE id = 1
+    expect-error: "Failed to update dataset 'tp': the new '(id, region)' of 1 row matches a key already stored, so nothing was changed."
+  - query: SELECT CAST(id AS VARCHAR) || ':' || v AS r FROM tp
+    expect: { rows: [['1:a1'], ['3:a3'], ['1:b1'], ['3:b3'], ['1:c1'], ['3:c3'], ['1:d1'], ['3:d3'], ['1:e1'], ['3:e3'], ['1:z1'], ['2:z2']] }

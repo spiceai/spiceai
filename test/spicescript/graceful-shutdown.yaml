@@ -1,0 +1,124 @@
+name: graceful-shutdown
+description: >
+  Under query load, with the source rewriting its rows every second and append
+  refreshes running against them, `spiced` exits cleanly and promptly on
+  SIGTERM, leaves a file acceleration it can reopen, and after a restart
+  serves one row per key: the newest version (upsert, and Cayenne, which keeps
+  the newest by time column whatever `on_conflict` says) or the first (DuckDB's
+  drop). Every query during the load succeeds. (Turso, an accelerator being retired,
+  is not covered.)
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  engine: [duckdb, cayenne]
+
+variants:
+  default: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: graceful-shutdown
+  datasets:
+    - from: postgres:public.service_data
+      name: data_upsert
+      params: ${sources.src.params}
+      time_column: date_updated
+      acceleration:
+        enabled: true
+        engine: '${matrix.engine}'
+        mode: file
+        refresh_mode: append
+        refresh_check_interval: 1s
+        primary_key: id
+        indexes: { id: enabled }
+        on_conflict: { id: upsert }
+    - from: postgres:public.service_data
+      name: data_drop
+      params: ${sources.src.params}
+      time_column: date_updated
+      acceleration:
+        enabled: true
+        engine: '${matrix.engine}'
+        mode: file
+        refresh_mode: append
+        refresh_check_interval: 1s
+        primary_key: id
+        indexes: { id: enabled }
+        on_conflict: { id: drop }
+    - from: postgres:public.service_data
+      name: data_full
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: '${matrix.engine}'
+        mode: file
+        refresh_mode: full
+        refresh_check_interval: 1s
+        primary_key: id
+        indexes: { id: enabled }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE service_data (id integer PRIMARY KEY, data text NOT NULL, date_created timestamp NOT NULL, date_updated timestamp NOT NULL);
+        INSERT INTO service_data SELECT i, 'initial ' || i, TIMESTAMP '2025-01-01', TIMESTAMP '2025-01-01' FROM generate_series(1, 100) AS i;
+  - start: {}
+  - query: SELECT * FROM data_upsert
+    oracle-sql: SELECT * FROM service_data
+    eventually: 30s
+  - query: SELECT * FROM data_drop
+    oracle-sql: SELECT * FROM service_data
+    eventually: 30s
+    id: first-versions
+
+  # Every row rewritten each second with a newer date_updated, and queries
+  # against both accelerations all the while.
+  - background:
+      id: writer
+      every: 1s
+      source-exec:
+        src: >
+          UPDATE service_data
+          SET data = 'round ${round} of ' || id, date_updated = TIMESTAMP '2025-01-01' + ${round} * INTERVAL '1 second'
+  - background:
+      id: load
+      concurrency: 8
+      query: >
+        SELECT (SELECT max(date_updated) FROM data_upsert) AS upsert_newest,
+               (SELECT max(date_updated) FROM data_drop) AS drop_newest,
+               (SELECT count(*) FROM data_full) AS full_rows,
+               (SELECT count(*) FROM data_upsert) AS upsert_rows
+  - sleep: 20s
+  - stop-background: load
+  - stop-background: writer
+
+  # SIGTERM while append refreshes are still catching up.
+  - stop: {}
+  # A clean shutdown leaves no write-ahead log to replay (DuckDB's `.wal`).
+  - assert-files: { contains: '^\.spice/data/', lacks: '\.wal$' }
+  - start: {}
+  - query: SELECT * FROM data_full
+    oracle-sql: SELECT * FROM service_data
+    eventually: 30s
+  # upsert keeps each key's newest version: the source's rows.
+  - query: SELECT * FROM data_upsert
+    oracle-sql: SELECT * FROM service_data
+    eventually: 60s
+  # DuckDB's drop keeps each key's first version; Cayenne keeps the newest.
+  - query: SELECT * FROM data_drop
+    expect: { same-as: first-versions }
+    eventually: 30s
+    when: { engine: duckdb }
+  - query: SELECT * FROM data_drop
+    oracle-sql: SELECT * FROM service_data
+    eventually: 60s
+    when: { engine: cayenne }
+  # A refresh in flight when SIGTERM arrives can log this as an ERROR,
+  # though the shutdown is clean and no data is affected.
+  - assert-log: { clean: true, allow: ['ERROR runtime_table::accelerated::refresh_task: Failed to provide stats on the amount of data written into data_(full|drop|upsert) *$'] }
