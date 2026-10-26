@@ -16,6 +16,8 @@ limitations under the License.
 
 //! Qwen3.5-0.8B, whose GGUF carries an MTP (`NextN`) layer the model drafts its own tokens with.
 
+use std::path::PathBuf;
+
 use llama_cpp::{Backend, Model, ModelParams};
 use llms::chat::{LocalModelOptions, ReasoningDefault};
 use llms::hf::HubParams;
@@ -27,6 +29,20 @@ use crate::{fixture, numbers, request};
 const MODEL: &str = "unsloth/Qwen3.5-0.8B-MTP-GGUF";
 const REVISION: &str = "cf8a611f6ed2c2060046219a19f12cd3d5ecd67c";
 const FILE: &str = "Qwen3.5-0.8B-Q4_K_M.gguf";
+
+/// The downloaded Qwen3.5-0.8B GGUF, MTP layer included.
+pub(crate) async fn qwen35_gguf() -> PathBuf {
+    llms::chat::hf_files::download_model(
+        &format!("{MODEL}:{REVISION}"),
+        &[FILE],
+        HubParams::default(),
+        "qwen3.5",
+    )
+    .await
+    .expect("Qwen3.5-0.8B downloads")
+    .join(FILE)
+}
+
 /// A fused query, key and value projection for the MTP layer, in its shape: the 1024-wide
 /// embedding projected to the 4096-wide gated query and the 512-wide key and value.
 const FUSED_QKV: &str = "blk.24.attn_qkv.weight";
@@ -39,21 +55,9 @@ const FUSED_QKV_SHAPE: [u64; 2] = [1024, 4096 + 512 + 512];
 /// layer that no longer fits in memory.
 #[tokio::test]
 async fn a_model_whose_mtp_layer_does_not_load_decodes_without_drafting() {
-    let downloaded = llms::chat::hf_files::download_model(
-        &format!("{MODEL}:{REVISION}"),
-        &[FILE],
-        HubParams::default(),
-        "qwen3.5",
-    )
-    .await
-    .expect("Qwen3.5-0.8B downloads");
+    let downloaded = qwen35_gguf().await;
     let scratch = tempfile::tempdir().expect("a scratch directory");
-    let gguf = fixture::copy_with_tensor(
-        &downloaded.join(FILE),
-        scratch.path(),
-        FUSED_QKV,
-        FUSED_QKV_SHAPE,
-    );
+    let gguf = fixture::copy_with_tensor(&downloaded, scratch.path(), FUSED_QKV, FUSED_QKV_SHAPE);
 
     // llama.cpp refuses the copy with its MTP layer, loads it without, and still reports the
     // layer from the file's header.

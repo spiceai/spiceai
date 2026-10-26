@@ -24,6 +24,10 @@ use snafu::ensure;
 use crate::mtp::DraftKind;
 use crate::{BatchFullSnafu, Error, Result, Token, sys};
 
+/// The parts of a sequence's state a truncation cannot restore: recurrent states and
+/// sliding-window caches, not the full-attention cache.
+const PARTIAL_ONLY: sys::llama_state_seq_flags = sys::LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+
 /// How a context is created.
 #[expect(
     clippy::struct_field_names,
@@ -146,6 +150,43 @@ impl Context<'_> {
     pub fn truncate(&mut self, from: i32) -> bool {
         // SAFETY: as above; -1 means "to the end".
         unsafe { sys::llama_memory_seq_rm(sys::llama_get_memory(self.raw.as_ptr()), 0, from, -1) }
+    }
+
+    /// Sequence 0's state that a truncation cannot restore, as llama.cpp's server saves a
+    /// context checkpoint: a recurrent layer's state or a sliding-window cache, never the
+    /// full-attention cache. `None` when llama.cpp writes less than it sized.
+    #[must_use]
+    pub fn partial_state(&self) -> Option<Vec<u8>> {
+        // SAFETY: the context is live.
+        let size = unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), 0, PARTIAL_ONLY) };
+        let mut state = vec![0u8; size];
+        // SAFETY: `state` holds `size` writable bytes.
+        let written = unsafe {
+            sys::llama_state_seq_get_data_ext(
+                self.raw.as_ptr(),
+                state.as_mut_ptr(),
+                size,
+                0,
+                PARTIAL_ONLY,
+            )
+        };
+        (size > 0 && written == size).then_some(state)
+    }
+
+    /// Restores a state `partial_state` saved, leaving the full-attention cache as it is.
+    /// Returns false when llama.cpp does not read all of it.
+    pub fn restore_partial_state(&mut self, state: &[u8]) -> bool {
+        // SAFETY: `state` holds `state.len()` readable bytes.
+        let read = unsafe {
+            sys::llama_state_seq_set_data_ext(
+                self.raw.as_ptr(),
+                state.as_ptr(),
+                state.len(),
+                0,
+                PARTIAL_ONLY,
+            )
+        };
+        !state.is_empty() && read == state.len()
     }
 }
 
