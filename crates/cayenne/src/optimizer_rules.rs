@@ -930,10 +930,13 @@ fn try_rewrite_oversized_join(
             if !should_spill_unknown_size_join(hash_join) {
                 return Ok(None);
             }
-            return finish_sort_merge_rewrite(
-                hash_join,
-                !input_is_filtered_aggregate(hash_join.left()),
-            );
+            // A HAVING-filtered build keeps its partitions, but only where the
+            // coalesced rewrite applies, so the same joins spill either way.
+            let coalesced = finish_sort_merge_rewrite(hash_join, true)?;
+            if coalesced.is_none() || !input_is_filtered_aggregate(hash_join.left()) {
+                return Ok(coalesced);
+            }
+            return Ok(finish_sort_merge_rewrite(hash_join, false)?.or(coalesced));
         };
         fire
     } else {
@@ -4705,14 +4708,10 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn having_filtered_aggregate_build_sort_merges_without_coalescing() {
-        // TPC-H Q18: `orders` RightSemi-joined to the `l_orderkey` groups that
-        // pass `HAVING sum(l_quantity) > 300`. The build can still be large, so
-        // it spills, but sorting each side on one thread made Q18 slow. The
-        // same build without the HAVING filter keeps coalescing (TPC-DS Q78).
+    /// TPC-H Q18's build side, hash-partitioned 8 ways: the `l_orderkey`
+    /// groups, and the same groups under `HAVING sum(l_quantity) > 300`.
+    fn q18_aggregate_builds() -> (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) {
         let lineitem_schema = channel_schema("l_orderkey", "l_quantity");
-        let orders_schema = channel_schema("o_orderkey", "o_custkey");
         let grouped = hash_repartition(
             grouped_count_over(
                 cayenne_file_exec_with_num_rows(
@@ -4738,28 +4737,55 @@ mod tests {
             )
             .expect("having filter"),
         ) as Arc<dyn ExecutionPlan>;
+        (grouped, having)
+    }
+
+    /// `orders` RightSemi-joined to `build` on the order key, Partitioned 8 ways,
+    /// with an optional embedded output projection.
+    fn q18_semi_join(
+        build: Arc<dyn ExecutionPlan>,
+        projection: Option<Vec<usize>>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let orders = hash_repartition(
+            cayenne_file_exec_with_num_rows(
+                &channel_schema("o_orderkey", "o_custkey"),
+                "orders.vortex",
+                Precision::Absent,
+            ),
+            "o_orderkey",
+            8,
+        );
+        let on = vec![(
+            col("l_orderkey", &build.schema()).expect("build key"),
+            col("o_orderkey", &orders.schema()).expect("probe key"),
+        )];
+        Arc::new(
+            HashJoinExec::try_new(
+                build,
+                orders,
+                on,
+                None,
+                &JoinType::RightSemi,
+                projection,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .expect("hash join should be valid"),
+        )
+    }
+
+    #[test]
+    fn having_filtered_aggregate_build_sort_merges_without_coalescing() {
+        // The build can still be large, so it spills, but sorting each side on
+        // one thread made Q18 slow. The same build without the HAVING filter
+        // keeps coalescing (TPC-DS Q78).
+        let (grouped, having) = q18_aggregate_builds();
         let config =
             config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
-        let semi_join = |build: Arc<dyn ExecutionPlan>| {
-            Arc::new(hash_join_with_join_type(
-                build,
-                hash_repartition(
-                    cayenne_file_exec_with_num_rows(
-                        &orders_schema,
-                        "orders.vortex",
-                        Precision::Absent,
-                    ),
-                    "o_orderkey",
-                    8,
-                ),
-                "l_orderkey",
-                "o_orderkey",
-                JoinType::RightSemi,
-                NullEquality::NullEqualsNothing,
-            )) as Arc<dyn ExecutionPlan>
-        };
 
-        let optimized = optimize_anti_join_sort_merge_with_config(semi_join(having), &config);
+        let optimized =
+            optimize_anti_join_sort_merge_with_config(q18_semi_join(having, None), &config);
         assert!(
             optimized.is::<SortMergeJoinExec>(),
             "a HAVING-filtered aggregate build must sort-merge in place, got:\n{}",
@@ -4775,7 +4801,8 @@ mod tests {
             );
         }
 
-        let optimized = optimize_anti_join_sort_merge_with_config(semi_join(grouped), &config);
+        let optimized =
+            optimize_anti_join_sort_merge_with_config(q18_semi_join(grouped, None), &config);
         for input in sort_merge_sort_inputs(&optimized) {
             assert!(
                 input.is::<CoalescePartitionsExec>(),
@@ -4783,6 +4810,27 @@ mod tests {
                 displayable(optimized.as_ref()).indent(true)
             );
         }
+    }
+
+    #[test]
+    fn having_filtered_aggregate_build_stays_hash_join_where_coalesced_rewrite_declines() {
+        // Projecting away the probe key leaves the coalesced rewrite no
+        // partitioning to restore, so the join stays a hash join. Skipping the
+        // coalesce for a HAVING build must not start spilling it (TPC-DS
+        // Q23/Q34/Q47/Q57/Q73).
+        let (_, having) = q18_aggregate_builds();
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(
+            q18_semi_join(having, Some(vec![1])),
+            &config,
+        );
+        assert!(
+            optimized.is::<HashJoinExec>(),
+            "got:\n{}",
+            displayable(optimized.as_ref()).indent(true)
+        );
     }
 
     #[test]
