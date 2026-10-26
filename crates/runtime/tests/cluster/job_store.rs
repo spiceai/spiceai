@@ -29,13 +29,13 @@ use runtime::jobs::{JobExecutor, JobStore};
 use runtime::{auth::EndpointAuth, config::Config};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
 use spicepod::component::dataset::Dataset;
-use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 use test_framework::object_store::MemoryObjectStore;
 use test_framework::pki::init_pki;
 use tokio::time::{Instant, sleep_until};
 
+use super::harness::NodePorts;
 use crate::{
     configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context},
@@ -95,21 +95,14 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
 
             configure_test_datafusion();
 
+            let scheduler_ports = NodePorts::allocate();
+
             let scheduler_config = Config {
-                http_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    8290,
-                )),
-                flight_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    50251,
-                )),
+                http_bind_address: scheduler_ports.http_addr(),
+                flight_bind_address: scheduler_ports.flight_addr(),
                 cluster: ClusterConfig {
                     role: Some(runtime::config::ClusterRole::Scheduler),
-                    node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                        Ipv4Addr::LOCALHOST,
-                        50252,
-                    )),
+                    node_bind_address: scheduler_ports.cluster_addr(),
                     node_advertise_address: Some("127.0.0.1".to_string()),
                     node_mtls_ca_certificate_file: Some(
                         pki.ca_cert_path.to_string_lossy().to_string(),
@@ -152,22 +145,15 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
                 () = Arc::clone(&scheduler_rt).load_components() => {}
             }
 
+            let executor_ports = NodePorts::allocate();
+
             let executor_config = Config {
-                http_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    8291,
-                )),
-                flight_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
-                    50253,
-                )),
+                http_bind_address: executor_ports.http_addr(),
+                flight_bind_address: executor_ports.flight_addr(),
                 cluster: ClusterConfig {
                     role: Some(runtime::config::ClusterRole::Executor),
-                    node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                        Ipv4Addr::LOCALHOST,
-                        50254,
-                    )),
-                    scheduler_address: Some("127.0.0.1:50252".to_string()),
+                    node_bind_address: executor_ports.cluster_addr(),
+                    scheduler_address: Some(scheduler_ports.cluster_advertise()),
                     node_advertise_address: Some("127.0.0.1".to_string()),
                     node_mtls_ca_certificate_file: Some(
                         pki.ca_cert_path.to_string_lossy().to_string(),

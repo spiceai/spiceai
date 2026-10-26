@@ -19,6 +19,8 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # Approves the snapshot PR's held pull_request runs.
+  actions: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -53,6 +55,9 @@ jobs:
 
       - name: Run search integration tests
         env:
+          # Metal runners do not have `xcrun metal`
+          # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
+          MISTRALRS_METAL_PRECOMPILE: 0
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}

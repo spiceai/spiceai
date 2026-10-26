@@ -56,10 +56,20 @@ pub use rdkafka;
 // the local buffer, eliminating per-tombstone seek overhead.
 const TOMBSTONE_SCAN_WINDOW: i64 = 100;
 
-// Brief pause before retrying a transient poll error during schema peek
-// (`fetch_latest_message`). Long enough to avoid tight spin on a reconnecting
-// broker; short enough to stay within the peek timeout budget.
-const PEEK_TRANSIENT_POLL_BACKOFF: Duration = Duration::from_millis(100);
+// Brief pause before polling again after a transient consumption error, in the
+// schema peek (`fetch_latest_message`) and in `next_json`. Long enough to avoid
+// a tight spin on a reconnecting broker; short enough to stay within either
+// caller's time budget.
+const TRANSIENT_POLL_BACKOFF: Duration = Duration::from_millis(100);
+
+// How long `next_json` keeps polling after a transient consumption error before
+// it returns that error. librdkafka reports a failed connection attempt as a
+// consumption error and then tries the next resolved address or reconnects on
+// its own, so the first such error says nothing about whether a message will
+// arrive. Shorter than the Debezium connector's 30 s schema inference timeout,
+// so a broker that stays unreachable surfaces its own error rather than that
+// timeout's "no message" one.
+const NEXT_MESSAGE_TRANSIENT_BUDGET: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -539,11 +549,49 @@ impl KafkaConsumer {
     }
 
     /// Receive a JSON message from the Kafka topic.
+    ///
+    /// Transient consumption errors (a refused connection, all brokers
+    /// briefly down) are polled through. Once one has been seen, the wait for a
+    /// message ends [`NEXT_MESSAGE_TRANSIENT_BUDGET`] after the call started and
+    /// returns the last such error; until then it waits for a message as long
+    /// as it takes.
     pub async fn next_json<K: DeserializeOwned, V: DeserializeOwned>(
         &self,
     ) -> Result<Option<KafkaMessage<'_, K, V>>> {
+        self.next_json_within(NEXT_MESSAGE_TRANSIENT_BUDGET).await
+    }
+
+    async fn next_json_within<K: DeserializeOwned, V: DeserializeOwned>(
+        &self,
+        transient_budget: Duration,
+    ) -> Result<Option<KafkaMessage<'_, K, V>>> {
+        let deadline = tokio::time::Instant::now() + transient_budget;
         let mut stream = Box::pin(self.stream_json::<K, V>());
-        stream.next().await.transpose()
+        let mut last_transient = None;
+        loop {
+            let next = match last_transient.take() {
+                None => stream.next().await,
+                Some(source) => match tokio::time::timeout_at(deadline, stream.next()).await {
+                    Ok(next) => next,
+                    Err(_elapsed) => return Err(Error::UnableToReceiveMessage { source }),
+                },
+            };
+            match next {
+                Some(Err(Error::UnableToReceiveMessage { source }))
+                    if is_transient_kafka_consumption_error(&source) =>
+                {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(Error::UnableToReceiveMessage { source });
+                    }
+                    tracing::debug!(
+                        "Transient Kafka error while waiting for a message, polling again: {source}"
+                    );
+                    tokio::time::sleep(TRANSIENT_POLL_BACKOFF).await;
+                    last_transient = Some(source);
+                }
+                next => return next.transpose(),
+            }
+        }
     }
 
     /// Stream JSON messages from the Kafka topic.
@@ -848,7 +896,7 @@ impl KafkaConsumer {
                 Ok(Some(Err(e)))
                     if is_transient_kafka_consumption_error(&e) && Instant::now() < deadline =>
                 {
-                    tokio::time::sleep(PEEK_TRANSIENT_POLL_BACKOFF).await;
+                    tokio::time::sleep(TRANSIENT_POLL_BACKOFF).await;
                 }
                 Ok(Some(Err(e))) => {
                     return Err(Error::UnableToReceiveMessage { source: e });
@@ -1227,33 +1275,52 @@ impl Kafka {
         let consumer = self.consumer;
         let metrics = Arc::clone(self.consumer.metrics());
         let offset_commit_hook = self.offset_commit_hook.clone();
-        let inner = self
+        let to_envelope = move |messages: &[BorrowedMessage<'static>]| {
+            let change_batch = messages_to_change_batch(messages, flatten_json.as_ref(), &schema)?;
+
+            let committer = MessageBatchCommitter::from_borrowed_messages(consumer, messages)
+                .with_offset_commit_hook(offset_commit_hook.clone());
+
+            Ok(ChangeEnvelope::new(Box::new(committer), change_batch, true))
+        };
+        let chunks = self
             .consumer
             .consumer
             .stream()
-            .chunks_timeout(self.batching.0, self.batching.1)
-            .map(move |msgs| {
-                let schema = Arc::clone(&schema);
+            .chunks_timeout(self.batching.0, self.batching.1);
+        // A batch can hold a consumption error between messages: a broker
+        // reconnect reports one while the fetches after it already return
+        // messages. The consumer's fetch position has moved past every message
+        // in the batch, so each one is delivered here or never again; the error
+        // goes out between the envelopes on either side of it, in order.
+        let inner = futures::StreamExt::flat_map(chunks, move |msgs| {
+            if msgs.is_empty() {
+                return futures::stream::iter(vec![Err(cdc::StreamError::Kafka(
+                    Error::EmptyBatch,
+                ))]);
+            }
 
-                // Collect all successful messages, fail on first error
-                let messages: Vec<_> = msgs
-                    .into_iter()
-                    .map(|msg| msg.context(UnableToReceiveMessageSnafu))
-                    .collect::<Result<Vec<_>>>()
-                    .map_err(cdc::StreamError::Kafka)?;
-
-                if messages.is_empty() {
-                    return Err(cdc::StreamError::Kafka(Error::EmptyBatch));
+            let mut items = Vec::new();
+            let mut messages = Vec::new();
+            for msg in msgs {
+                match msg {
+                    Ok(msg) => messages.push(msg),
+                    Err(source) => {
+                        if !messages.is_empty() {
+                            items.push(to_envelope(&messages));
+                            messages.clear();
+                        }
+                        items.push(Err(cdc::StreamError::Kafka(
+                            Error::UnableToReceiveMessage { source },
+                        )));
+                    }
                 }
-
-                let change_batch =
-                    messages_to_change_batch(&messages, flatten_json.as_ref(), &schema)?;
-
-                let committer = MessageBatchCommitter::from_borrowed_messages(consumer, &messages)
-                    .with_offset_commit_hook(offset_commit_hook.clone());
-
-                Ok(ChangeEnvelope::new(Box::new(committer), change_batch, true))
-            });
+            }
+            if !messages.is_empty() {
+                items.push(to_envelope(&messages));
+            }
+            futures::stream::iter(items)
+        });
 
         Box::pin(inject_ready_signal_on_caught_up(
             inner,
@@ -2038,6 +2105,199 @@ mod tests {
         assert!(
             res.is_err(),
             "spurious notify without is_caught_up must not produce a ready envelope"
+        );
+    }
+
+    /// A one-broker mock cluster holding one message on topic `t`, with the
+    /// broker taken down, and a consumer subscribed to `t` that has not yet
+    /// connected.
+    fn consumer_of_a_downed_broker() -> (
+        rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext>,
+        KafkaConsumer,
+    ) {
+        let cluster = cluster_holding_one_message();
+        cluster.broker_down(-1).expect("take broker down");
+        let consumer = consumer_subscribed_to_t(&cluster);
+        (cluster, consumer)
+    }
+
+    /// A one-broker mock cluster holding one message, `{"id": 1}`, on topic `t`.
+    fn cluster_holding_one_message()
+    -> rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext> {
+        use rdkafka::mocking::MockCluster;
+        use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+
+        let cluster = MockCluster::new(1).expect("mock cluster");
+        cluster.create_topic("t", 1, 1).expect("create topic");
+        let producer: BaseProducer = ClientConfig::new()
+            .set("bootstrap.servers", cluster.bootstrap_servers())
+            .create()
+            .expect("producer");
+        producer
+            .send(BaseRecord::<(), str>::to("t").payload(r#"{"id": 1}"#))
+            .map_err(|(e, _)| e)
+            .expect("enqueue message");
+        producer
+            .flush(Duration::from_secs(10))
+            .expect("flush message");
+        cluster
+    }
+
+    /// A consumer of topic `t` on `cluster`, subscribed but not yet connected.
+    fn consumer_subscribed_to_t(
+        cluster: &rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext>,
+    ) -> KafkaConsumer {
+        let consumer = KafkaConsumer::create_for_dataset(
+            "t",
+            None,
+            &KafkaConfig {
+                brokers: cluster.bootstrap_servers(),
+                security_protocol: "plaintext".to_string(),
+                sasl_mechanism: String::new(),
+                sasl_username: None,
+                sasl_password: None,
+                ssl_ca_location: None,
+                ssl_certificate_location: None,
+                ssl_key_location: None,
+                ssl_key_password: None,
+                enable_ssl_certificate_verification: false,
+                ssl_endpoint_identification_algorithm: SslIdentification::None,
+                consumer_group_id: None,
+                metrics_store: None,
+            },
+        )
+        .expect("consumer");
+        consumer.subscribe("t").expect("subscribe");
+        consumer
+    }
+
+    /// A broker that refuses the first connection attempts must not fail the
+    /// first read: librdkafka reports each refusal as a consumption error and
+    /// then retries, as it does when `localhost` resolves to `::1` first and the
+    /// broker listens on IPv4 only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_json_waits_through_a_broker_that_is_down_at_startup() {
+        const BROKER_DOWN_FOR: Duration = Duration::from_secs(3);
+        let (cluster, consumer) = consumer_of_a_downed_broker();
+
+        // `MockCluster` is neither `Send` nor `Sync`, so the broker comes back
+        // from a future polled on this task rather than from another thread.
+        let started = Instant::now();
+        let (message, ()) = tokio::join!(
+            tokio::time::timeout(
+                NEXT_MESSAGE_TRANSIENT_BUDGET,
+                consumer.next_json::<Value, Value>(),
+            ),
+            async {
+                tokio::time::sleep(BROKER_DOWN_FOR).await;
+                cluster.broker_up(-1).expect("bring broker up");
+            },
+        );
+        let message = message
+            .expect("a message within the transient budget")
+            .expect("no error once the broker is back")
+            .expect("a message");
+
+        assert_eq!(message.value(), &json!({"id": 1}));
+        assert!(
+            started.elapsed() >= BROKER_DOWN_FOR,
+            "the message arrived before the broker came back up, so the test never exercised a transient error"
+        );
+    }
+
+    /// A broker that never comes back still fails the read, with the broker's
+    /// own error, once the transient budget has passed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_json_returns_the_transient_error_once_the_budget_passes() {
+        const BUDGET: Duration = Duration::from_secs(2);
+        let (_cluster, consumer) = consumer_of_a_downed_broker();
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            consumer.next_json_within::<Value, Value>(BUDGET),
+        )
+        .await
+        .expect("next_json_within returns once the budget passes");
+        let elapsed = started.elapsed();
+
+        match result {
+            Err(Error::UnableToReceiveMessage { source }) => assert!(
+                is_transient_kafka_consumption_error(&source),
+                "expected a transient broker error, got {source}"
+            ),
+            Err(e) => panic!("expected UnableToReceiveMessage, got {e}"),
+            Ok(m) => panic!(
+                "expected an error, got a message: {:?}",
+                m.map(|m| m.value().clone())
+            ),
+        }
+        assert!(
+            elapsed >= BUDGET,
+            "returned after {elapsed:?}, before the {BUDGET:?} budget passed"
+        );
+    }
+
+    /// A transient consumption error and a message fetched in the same batching
+    /// window must not cost the message. The consumer's fetch position has
+    /// already moved past it, so a message dropped with the error is never
+    /// delivered again until the consumer is recreated from its committed
+    /// offsets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_changes_keeps_the_messages_batched_with_a_transient_error() {
+        use rdkafka::types::{RDKafkaApiKey, RDKafkaRespErr};
+
+        // Long enough that the disconnect's error and the message fetched after
+        // the reconnect land in one batch.
+        const BATCH_WINDOW: Duration = Duration::from_secs(5);
+        let cluster = cluster_holding_one_message();
+        // The broker drops the connection that sends the first fetch, as a
+        // broker restart does mid-stream, and the consumer reconnects and
+        // fetches again. Injecting the disconnect keeps the error's timing
+        // independent of how long a platform takes to report a refused
+        // connection.
+        cluster.request_errors(
+            RDKafkaApiKey::Fetch,
+            &[RDKafkaRespErr::RD_KAFKA_RESP_ERR__TRANSPORT],
+        );
+        let consumer = consumer_subscribed_to_t(&cluster);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let kafka = Kafka::new(schema, consumer).with_batching((10_000, BATCH_WINDOW));
+        let mut stream = kafka.stream_changes();
+
+        let mut errors_at = Vec::new();
+        let deadline = tokio::time::Instant::now() + BATCH_WINDOW * 3;
+        let rows_at = loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Err(_) | Ok(None) => break None,
+                Ok(Some(Err(cdc::StreamError::Kafka(Error::UnableToReceiveMessage {
+                    source,
+                }))))
+                    if is_transient_kafka_consumption_error(&source) =>
+                {
+                    errors_at.push(Instant::now());
+                }
+                Ok(Some(Err(e))) => panic!("unexpected stream error: {e}"),
+                Ok(Some(Ok(envelope))) if envelope.num_rows_hint() > 0 => {
+                    assert_eq!(envelope.num_rows_hint(), 1, "one message was produced");
+                    break Some(Instant::now());
+                }
+                Ok(Some(Ok(_ready_signal))) => {}
+            }
+        };
+
+        let rows_at = rows_at.expect(
+            "the message fetched after the reconnect was never delivered; \
+             it was dropped with the transient error in its batch",
+        );
+        let last_error_at = errors_at
+            .last()
+            .expect("the broker dropped the first fetch, so the stream reports a transient error");
+        assert!(
+            rows_at.duration_since(*last_error_at) < BATCH_WINDOW / 2,
+            "the error and the message arrived {:?} apart, so they were not batched together \
+             and the test did not exercise a mixed batch",
+            rows_at.duration_since(*last_error_at)
         );
     }
 }

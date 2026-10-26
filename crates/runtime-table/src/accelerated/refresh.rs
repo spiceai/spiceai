@@ -733,7 +733,12 @@ pub enum AccelerationRefreshMode {
     Disabled,
     Full(Receiver<Option<RefreshOverrides>>),
     Append(Receiver<Option<RefreshOverrides>>),
-    Changes(ChangesStream),
+    /// A change stream, and for a stream scoped to a cluster executor's
+    /// partitions, the requests that reload those partitions.
+    Changes(
+        ChangesStream,
+        Option<Receiver<super::refresh_completion::RefreshRequestId>>,
+    ),
     Caching(Receiver<Option<RefreshOverrides>>),
     /// Snapshot mode: refreshes are driven by polling the snapshot store for
     /// snapshots newer than the currently loaded one.
@@ -794,6 +799,9 @@ pub struct Refresher {
     engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    /// The status an existing acceleration starts with, applied by [`Self::start`] once the
+    /// dataset's indexes have been rebuilt from it, and before any refresh can report its own.
+    initial_status: Option<status::ComponentStatus>,
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<AppendCursorStore>,
 }
@@ -859,6 +867,7 @@ impl Refresher {
             is_s3_express_acceleration: false,
             engine_type_rewrites: &[],
             cdc_param_overrides: None,
+            initial_status: None,
             append_cursor_store: None,
         }
     }
@@ -976,6 +985,15 @@ impl Refresher {
         self
     }
 
+    /// Sets the status [`Self::start`] reports for the dataset once its indexes are rebuilt.
+    pub fn set_initial_status(
+        &mut self,
+        initial_status: Option<status::ComponentStatus>,
+    ) -> &mut Self {
+        self.initial_status = initial_status;
+        self
+    }
+
     /// The refresh-completion signal for this table, or `None` when no refresh
     /// runs here. Callers pick the question they are asking:
     /// [`RefreshCompletion::any`] for the initial load, or
@@ -1056,6 +1074,76 @@ impl Refresher {
         }
     }
 
+    /// Replays the rows the accelerator holds through every index of this dataset that
+    /// reports [`spice_table::Index::requires_rebuild`].
+    ///
+    /// Holds the accelerator write lock, so no write lands in the accelerator between the
+    /// scan and the indexes it feeds.
+    ///
+    /// A caching-mode dataset is left alone: its accelerator holds every principal's cached
+    /// rows in one table, scoped only by the hidden `__spice_cache_namespace` column, and no
+    /// index carries that scope, so a replay would let a search answer one principal with the
+    /// row ids and match counts of rows another principal cached. Cached rows never reach these
+    /// indexes through the caching write path either.
+    async fn rebuild_indexes_from_accelerator(&self) -> super::Result<()> {
+        if self.refresh_mode().await == RefreshMode::Caching {
+            return Ok(());
+        }
+
+        let indexes = crate::accelerated::refresh_task::collect_all_indexes(
+            &self.accelerator,
+            &self.federated,
+        );
+        if !indexes.iter().any(|index| index.requires_rebuild()) {
+            return Ok(());
+        }
+
+        let _write_guard = self.accelerator_write_mutex.lock().await;
+        let start = std::time::Instant::now();
+        let dataset_name = self.dataset_name.clone();
+        let accelerator = Arc::clone(&self.accelerator);
+        // The runtime's query environment carries the object-store registrations an
+        // object-store-backed acceleration is read through, and the memory pool that bounds it.
+        let runtime_env = self.query_runtime_env.clone().unwrap_or_else(|| {
+            runtime_object_store::registry::default_runtime_env(self.io_runtime.clone())
+        });
+        let rebuild = async move {
+            super::index_rebuild::rebuild_indexes_from_accelerator(
+                &dataset_name,
+                &accelerator,
+                &indexes,
+                runtime_env,
+            )
+            .await
+        };
+        let result = match &self.cpu_runtime {
+            Some(cpu_runtime) => cpu_runtime
+                .spawn(tracing::Instrument::instrument(
+                    rebuild,
+                    tracing::Span::current(),
+                ))
+                .await
+                .unwrap_or_else(|e| Err(datafusion::error::DataFusionError::External(Box::new(e)))),
+            None => rebuild.await,
+        };
+
+        match result {
+            Ok(Some(rows)) => {
+                tracing::debug!(
+                    "Rebuilt the search index of dataset '{}' from {rows} accelerated row(s) in {}ms.",
+                    self.dataset_name,
+                    start.elapsed().as_millis()
+                );
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(source) => Err(super::Error::FailedToRebuildIndex {
+                dataset_name: self.dataset_name.to_string(),
+                source,
+            }),
+        }
+    }
+
     /// Starts the refresh loop for `acceleration_refresh_mode`, returning the
     /// spawned task handle when the mode runs one.
     ///
@@ -1069,6 +1157,22 @@ impl Refresher {
         acceleration_refresh_mode: AccelerationRefreshMode,
     ) -> super::Result<Option<tokio::task::JoinHandle<()>>> {
         let dataset_name = self.dataset_name.clone();
+
+        // Before any refresh or change stream writes to it, give every index that holds none
+        // of the accelerator's rows the ones it already has. The refresh that follows a
+        // restart loads only what the accelerator is missing, or nothing at all, so an index
+        // that starts empty would otherwise never catch up (#14618).
+        self.rebuild_indexes_from_accelerator().await?;
+
+        // An existing acceleration is servable from here on, but not before: reporting it ready
+        // earlier would let `/v1/ready` answer while the dataset is still unregistered and its
+        // rebuild still running. Reported before the refresh starts, so a refresh that runs
+        // reports `Refreshing` over it rather than being overwritten by it.
+        if let Some(initial_status) = self.initial_status.take() {
+            self.runtime_status
+                .update_dataset(&self.dataset_name, initial_status);
+        }
+
         let time_column = self.refresh.read().await.time_column.clone();
         let initial_refresh_delay = {
             let refresh = self.refresh.read().await;
@@ -1157,7 +1261,7 @@ impl Refresher {
                 | AccelerationRefreshMode::Snapshot(receiver),
                 _,
             ) => receiver,
-            (AccelerationRefreshMode::Changes(stream), _) => {
+            (AccelerationRefreshMode::Changes(stream, reload_requests), _) => {
                 let (snapshot_task, on_batch_process_callback) = match snapshot_trigger {
                     None | Some(SnapshotCreateTrigger::RefreshComplete) => (None, None),
                     Some(SnapshotCreateTrigger::Interval(duration)) => (
@@ -1197,9 +1301,11 @@ impl Refresher {
                 };
                 self.snapshot_task = snapshot_task;
 
-                return Ok(Some(
-                    self.start_changes_stream(stream, on_batch_process_callback),
-                ));
+                return Ok(Some(self.start_changes_stream(
+                    stream,
+                    on_batch_process_callback,
+                    reload_requests,
+                )));
             }
         };
 
@@ -1594,6 +1700,7 @@ impl Refresher {
         &mut self,
         changes_stream: ChangesStream,
         on_batch_process_callback: Option<SnapshotCallback>,
+        reload_requests: Option<Receiver<super::refresh_completion::RefreshRequestId>>,
     ) -> tokio::task::JoinHandle<()> {
         let refresh_task_builder = RefreshTask::builder(
             Arc::clone(&self.runtime_status),
@@ -1613,6 +1720,7 @@ impl Refresher {
         .with_engine_type_rewrites(self.engine_type_rewrites)
         .with_initial_load_completed(Arc::clone(&self.initial_load_completed))
         .with_cdc_param_overrides(self.cdc_param_overrides.clone())
+        .with_reload_requests(reload_requests)
         .with_change_sink(self.change_sink.clone())
         .with_cache_write_sender(self.cache_write_sender.clone());
 
@@ -2865,6 +2973,110 @@ mod tests {
         );
 
         drop(refresh_handle);
+    }
+
+    /// Records the dataset's status each time the startup rebuild writes through it.
+    #[derive(Debug)]
+    struct StatusProbeIndex {
+        status: Arc<status::RuntimeStatus>,
+        dataset: TableReference,
+        seen: parking_lot::Mutex<Vec<Option<status::ComponentStatus>>>,
+    }
+
+    #[async_trait]
+    impl spice_table::Index for StatusProbeIndex {
+        fn name(&self) -> &'static str {
+            "status_probe"
+        }
+
+        fn required_columns(&self) -> Vec<String> {
+            vec!["time_in_string".to_string()]
+        }
+
+        async fn compute_index(
+            &self,
+            batches: Vec<RecordBatch>,
+        ) -> Result<Vec<RecordBatch>, datafusion::error::DataFusionError> {
+            self.seen
+                .lock()
+                .push(self.status.get_dataset_status(&self.dataset));
+            Ok(batches)
+        }
+
+        fn requires_rebuild(&self) -> bool {
+            true
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// An existing acceleration's initial status is reported only once its search indexes are
+    /// rebuilt: reported earlier, `/v1/ready` answers while the rebuild still runs and before
+    /// the dataset is registered, so every query against it fails (#14618).
+    #[tokio::test]
+    async fn the_initial_status_is_reported_only_after_the_index_rebuild() {
+        let status = status::RuntimeStatus::new();
+        let dataset = TableReference::bare("docs");
+        status.update_dataset(&dataset, status::ComponentStatus::Refreshing);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_in_string",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["1970-01-01"]))],
+        )
+        .expect("data should be created");
+        let probe = Arc::new(StatusProbeIndex {
+            status: Arc::clone(&status),
+            dataset: dataset.clone(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let accelerator = spice_table::SpiceTable::over(
+            Arc::new(spice_table::IndexLayer::with_indexes(vec![
+                Arc::clone(&probe) as Arc<dyn spice_table::Index + Send + Sync>,
+            ])),
+            Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                    .expect("mem table should be created"),
+            ),
+        );
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::new(
+            MemTable::try_new(schema, vec![]).expect("mem table should be created"),
+        )));
+
+        let mut refresher = Refresher::new(
+            Arc::clone(&status),
+            dataset.clone(),
+            federated,
+            Some("mem_table".to_string()),
+            Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
+            accelerator,
+            None,
+            None,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        );
+        refresher.set_initial_status(Some(status::ComponentStatus::Ready));
+        refresher
+            .start(AccelerationRefreshMode::Disabled)
+            .await
+            .expect("the refresher starts");
+
+        assert_eq!(
+            *probe.seen.lock(),
+            vec![Some(status::ComponentStatus::Refreshing)],
+            "the dataset must not be reported ready while its index is still being rebuilt"
+        );
+        assert_eq!(
+            status.get_dataset_status(&dataset),
+            Some(status::ComponentStatus::Ready),
+            "once rebuilt, the existing acceleration reports its initial status"
+        );
     }
 
     async fn setup_and_test(

@@ -44,13 +44,14 @@ use reqwest::header::{
     AUTHORIZATION, CONTENT_RANGE, HeaderMap, HeaderValue, LINK, LOCATION, RANGE, RETRY_AFTER,
 };
 use reqwest::{Method, StatusCode};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use serde::Deserialize;
 use snafu::prelude::*;
 use tokio::runtime::Handle;
 use url::Url;
 
 use crate::location::{RepoId, RepoType};
+use crate::settings::{Token, TokenScope, TokenSource};
 
 /// The public Hugging Face Hub.
 pub const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
@@ -90,9 +91,15 @@ pub enum Error {
     #[snafu(display(
         "Hugging Face {kind} '{repo}' was not found{private_hint}. Check the owner and {kind} name in `from`. See: {docs}",
         kind = repo.kind(),
+        private_hint = private_hint(repo.kind(), token.as_ref(), *token_scope),
         docs = docs_url(repo.kind())
     ))]
-    RepoNotFound { repo: RepoId, private_hint: String },
+    RepoNotFound {
+        repo: RepoId,
+        /// Where the token sent came from; `None` when none was.
+        token: Option<TokenSource>,
+        token_scope: TokenScope,
+    },
 
     #[snafu(display(
         "Revision '{revision}' does not exist in Hugging Face {kind} '{repo}'. Use an existing branch, tag or commit after '{separator}' in `from`, or remove '{separator}{revision}' to read 'main'.",
@@ -105,30 +112,41 @@ pub enum Error {
     EntryNotFound { repo: RepoId, path: String },
 
     #[snafu(display(
-        "Hugging Face {kind} '{repo}' is gated{token_hint}: accept its access conditions at {repo_url} with the account `hf_token` belongs to. See: {docs}",
+        "Hugging Face {kind} '{repo}' is gated{access}. See: {docs}",
         kind = repo.kind(),
+        access = gated_access(repo_url, token.as_ref(), *token_scope),
         docs = docs_url(repo.kind())
     ))]
     Gated {
         repo: RepoId,
         repo_url: String,
-        token_hint: String,
+        token: Option<TokenSource>,
+        token_scope: TokenScope,
     },
 
     #[snafu(display(
-        "The Hugging Face Hub rejected `hf_token` for {kind} '{repo}' (HTTP {status}). Check that the token is valid and grants read access to the {kind}. See: {docs}",
-        kind = repo.kind(),
-        docs = docs_url(repo.kind())
+        "{}",
+        token_rejected(repo, *status, token.as_ref(), *token_scope)
     ))]
-    TokenRejected { repo: RepoId, status: u16 },
+    TokenRejected {
+        repo: RepoId,
+        status: u16,
+        token: Option<TokenSource>,
+        token_scope: TokenScope,
+    },
 
     #[snafu(display(
-        "The Hugging Face Hub kept rate-limiting requests for {kind} '{repo}'{reset_hint}. Set `hf_token` (authenticated requests have higher limits){advice}. See: {docs}",
+        "The Hugging Face Hub kept rate-limiting requests for {kind} '{repo}'{reset_hint}.{fix} See: {docs}",
         kind = repo.kind(),
-        advice = rate_limit_advice(repo.kind()),
+        fix = rate_limit_fix(repo.kind(), token.as_ref(), *token_scope),
         docs = docs_url(repo.kind())
     ))]
-    RateLimited { repo: RepoId, reset_hint: String },
+    RateLimited {
+        repo: RepoId,
+        reset_hint: String,
+        token: Option<TokenSource>,
+        token_scope: TokenScope,
+    },
 
     #[snafu(display(
         "The Hugging Face Hub returned HTTP {status} for {kind} '{repo}' after {attempts} attempt(s){message}",
@@ -149,7 +167,9 @@ pub enum Error {
         repo: RepoId,
         endpoint: String,
         attempts: u32,
-        source: reqwest::Error,
+        // Shared so a failure that concurrent callers of one cached lookup receive keeps its
+        // kind: whether the connection failed or timed out is what a caller reports.
+        source: Arc<reqwest::Error>,
     },
 
     #[snafu(display(
@@ -178,9 +198,10 @@ pub enum Error {
     HttpClient { source: reqwest::Error },
 
     #[snafu(display(
-        "`hf_token` is not a valid Hugging Face access token: it contains characters an HTTP header cannot carry. See: {DATASET_DOCS_URL}"
+        "{} is not a valid Hugging Face access token: it contains characters an HTTP header cannot carry. See: {DATASET_DOCS_URL}",
+        token_subject(token)
     ))]
-    InvalidToken,
+    InvalidToken { token: TokenSource },
 }
 
 /// The page a message about a repository of `kind` links to.
@@ -200,11 +221,96 @@ fn revision_separator(kind: RepoType) -> char {
     }
 }
 
-/// The second way out of rate limiting, beside a token, for a repository of `kind`.
-fn rate_limit_advice(kind: RepoType) -> &'static str {
-    match kind {
-        RepoType::Dataset => " or accelerate the dataset so it is read once per refresh",
-        RepoType::Model | RepoType::Space => "",
+/// The token a message names as its subject: `hf_token`, or where the token came from.
+fn token_subject(token: &TokenSource) -> String {
+    match token {
+        TokenSource::Param => token.to_string(),
+        TokenSource::Secret | TokenSource::Env(_) | TokenSource::File(_) => {
+            format!("The token from {token}")
+        }
+    }
+}
+
+/// The token a message names within a sentence.
+fn token_object(token: &TokenSource) -> String {
+    match token {
+        TokenSource::Param => token.to_string(),
+        TokenSource::Secret | TokenSource::Env(_) | TokenSource::File(_) => {
+            format!("the token from {token}")
+        }
+    }
+}
+
+/// What follows "was not found" for a repository of `kind` the Hub may be hiding.
+fn private_hint(kind: RepoType, token: Option<&TokenSource>, token_scope: TokenScope) -> String {
+    match token {
+        Some(token) => format!(
+            ", or the account {} belongs to cannot read it",
+            token_object(token)
+        ),
+        None => format!(
+            " or it is private: to read a private {kind}, {}",
+            token_scope.how_to_set()
+        ),
+    }
+}
+
+/// What follows "is gated": where access is granted, and with which account.
+fn gated_access(repo_url: &str, token: Option<&TokenSource>, token_scope: TokenScope) -> String {
+    match token {
+        Some(token) => format!(
+            ": accept its access conditions at {repo_url} with the account {} belongs to",
+            token_object(token)
+        ),
+        None => format!(
+            " and no token is set: accept its access conditions at {repo_url}, then {}",
+            token_scope.how_to_set()
+        ),
+    }
+}
+
+/// The message for a token the Hub rejected, with the fix for where the token came from.
+fn token_rejected(
+    repo: &RepoId,
+    status: u16,
+    token: Option<&TokenSource>,
+    token_scope: TokenScope,
+) -> String {
+    let kind = repo.kind();
+    let docs = docs_url(kind);
+    match token {
+        Some(token @ TokenSource::Param) => format!(
+            "The Hugging Face Hub rejected {token} for {kind} '{repo}' (HTTP {status}). Check that the token is valid and grants read access to the {kind}. See: {docs}"
+        ),
+        Some(token @ TokenSource::Secret) => format!(
+            "The Hugging Face Hub rejected the token from {token} for {kind} '{repo}' (HTTP {status}). Update the secret to a token that is valid and grants read access to the {kind}. See: {docs}"
+        ),
+        Some(token @ TokenSource::Env(_)) => format!(
+            "The Hugging Face Hub rejected the token from {token} for {kind} '{repo}' (HTTP {status}). Check that the token is valid and grants read access to the {kind}, or set `hf_token`. See: {docs}"
+        ),
+        Some(token @ TokenSource::File(_)) => format!(
+            "The Hugging Face Hub rejected the token from {token} for {kind} '{repo}' (HTTP {status}), which may have expired. Run `hf auth login`, or set `hf_token`. See: {docs}"
+        ),
+        None => format!(
+            "The Hugging Face Hub refused access to {kind} '{repo}' (HTTP {status}) and no token is set: {}. See: {docs}",
+            token_scope.how_to_set()
+        ),
+    }
+}
+
+/// What a user can do about rate limiting of a repository of `kind`: send a token, and read a
+/// dataset less often.
+fn rate_limit_fix(kind: RepoType, token: Option<&TokenSource>, token_scope: TokenScope) -> String {
+    let raise = token
+        .is_none()
+        .then(|| format!("To raise the limit, {}", token_scope.how_to_set()));
+    let read_less = matches!(kind, RepoType::Dataset)
+        .then_some("accelerate the dataset so it is read once per refresh");
+    match (raise, read_less) {
+        (Some(raise), Some(read_less)) => format!(" {raise}; to read the Hub less, {read_less}."),
+        (Some(raise), None) => format!(" {raise}."),
+        (None, Some(read_less)) => format!(" To read the Hub less, {read_less}."),
+        (None, None) => String::new(),
     }
 }
 
@@ -267,6 +373,20 @@ impl TreeEntry {
             .as_ref()
             .map_or(self.oid.as_str(), |lfs| lfs.oid.as_str())
     }
+
+    /// The git object id: the SHA-1 of `blob <size>\0` and the content of a file stored in
+    /// git, or of the LFS pointer of one stored in LFS.
+    #[must_use]
+    pub fn git_oid(&self) -> &str {
+        &self.oid
+    }
+
+    /// The SHA-256 of the content of a file stored in LFS (or Xet); `None` for a file stored in
+    /// git.
+    #[must_use]
+    pub fn lfs_oid(&self) -> Option<&str> {
+        self.lfs.as_ref().map(|lfs| lfs.oid.as_str())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,14 +427,17 @@ pub struct FileRead {
 #[derive(Clone)]
 pub struct HubConfig {
     pub endpoint: Url,
-    pub token: Option<SecretString>,
+    pub token: Option<Token>,
+    /// Which tokens `endpoint` receives, which decides how a message says to set one.
+    pub token_scope: TokenScope,
 }
 
 impl fmt::Debug for HubConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HubConfig")
             .field("endpoint", &self.endpoint.as_str())
-            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("token", &self.token)
+            .field("token_scope", &self.token_scope)
             .finish()
     }
 }
@@ -361,8 +484,11 @@ impl Hub {
             .token
             .as_ref()
             .map(|token| {
-                let mut value = HeaderValue::from_str(&format!("Bearer {}", token.expose_secret()))
-                    .map_err(|_| Error::InvalidToken)?;
+                let mut value =
+                    HeaderValue::from_str(&format!("Bearer {}", token.secret().expose_secret()))
+                        .map_err(|_| Error::InvalidToken {
+                            token: token.source().clone(),
+                        })?;
                 value.set_sensitive(true);
                 Ok::<_, Error>(value)
             })
@@ -778,6 +904,30 @@ impl Hub {
     }
 
     /// `{endpoint}/[{type}s/]{repo}/resolve/{commit}/{path}`.
+    /// The commit `revision` names now, read from the Hub's answer to a `HEAD` of `path` at
+    /// that revision. The Hub answers without sending the file, so this is one request where
+    /// [`Hub::commit`] and a listing are two. `None` when the answer does not say, as a
+    /// renamed repository's redirect does not.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the repository, revision or file does not exist, access is denied,
+    /// or the Hub cannot be reached.
+    pub async fn commit_of_file(
+        &self,
+        repo: &RepoId,
+        revision: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        let url = self.resolve_url(repo, revision, path);
+        let response = self
+            .request(repo, Some(revision), Method::HEAD, url, None)
+            .await?;
+        Ok(header_str(response.headers(), "x-repo-commit")
+            .filter(|commit| is_commit_sha(commit))
+            .map(ToString::to_string))
+    }
+
     fn resolve_url(&self, repo: &RepoId, commit: &str, path: &str) -> Url {
         let mut url = self.config.endpoint.clone();
         {
@@ -796,8 +946,17 @@ impl Hub {
         url.origin() == self.config.endpoint.origin()
     }
 
+    /// Where the token every request carries came from, which an error about access names.
+    fn token_source(&self) -> Option<TokenSource> {
+        self.config
+            .token
+            .as_ref()
+            .map(|token| token.source().clone())
+    }
+
     /// Sends an API request and reads its whole body, returning the body and the response
-    /// headers.
+    /// headers. A redirect within the Hub's origin is followed: the Hub moves the API of a
+    /// renamed repository to its new name that way.
     ///
     /// A body that breaks off part way, by a reset connection or a read timeout, is requested
     /// again like a request that failed to connect, from the same budget of attempts: an API
@@ -811,7 +970,7 @@ impl Hub {
         url: Url,
         form: Option<String>,
     ) -> Result<(HeaderMap, Bytes)> {
-        let request = HubRequest {
+        let mut request = HubRequest {
             repo,
             revision,
             method,
@@ -820,8 +979,22 @@ impl Hub {
             form,
         };
         let mut attempts = Attempts::new();
+        let mut redirects = 0;
         loop {
             let mut response = self.send_with_retry(&request, &mut attempts).await?;
+            if response.status().is_redirection() {
+                ensure!(
+                    redirects < MAX_REDIRECTS,
+                    UnexpectedResponseSnafu {
+                        repo: repo.clone(),
+                        message: format!("a request redirected more than {MAX_REDIRECTS} times"),
+                    }
+                );
+                redirects += 1;
+                self.follow_redirect(&mut request, &response)?;
+                attempts = Attempts::new();
+                continue;
+            }
             let headers = std::mem::take(response.headers_mut());
             let source = match response.bytes().await {
                 Ok(body) => return Ok((headers, body)),
@@ -832,7 +1005,7 @@ impl Hub {
                     repo: repo.clone(),
                     endpoint: self.config.endpoint.to_string(),
                     attempts: attempts.made,
-                    source,
+                    source: Arc::new(source),
                 });
             }
             tracing::debug!(
@@ -842,6 +1015,52 @@ impl Hub {
             );
             attempts.wait(None).await;
         }
+    }
+
+    /// Points `request` at the location the redirect `response` names. Only a location on the
+    /// Hub's origin is followed: an API response anywhere else is not the Hub's.
+    fn follow_redirect(
+        &self,
+        request: &mut HubRequest<'_>,
+        response: &reqwest::Response,
+    ) -> Result<()> {
+        let repo = request.repo;
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|location| request.url.join(location).ok())
+            .context(UnexpectedResponseSnafu {
+                repo: repo.clone(),
+                message: "a request redirected without a location".to_string(),
+            })?;
+        ensure!(
+            self.is_endpoint_origin(&location),
+            UnexpectedResponseSnafu {
+                repo: repo.clone(),
+                message: format!(
+                    "a request redirected off the Hub, to {}, which was not followed",
+                    location.origin().ascii_serialization()
+                ),
+            }
+        );
+        tracing::debug!(
+            "Following the Hub's redirect of a request for Hugging Face {} '{repo}' to {}",
+            repo.kind(),
+            location.path()
+        );
+        // A 303, and a 301 or 302 after a POST, continue as a GET (RFC 9110, section 15.4); a
+        // 307 or 308 repeats the request as it was.
+        let status = response.status();
+        if status == StatusCode::SEE_OTHER
+            || (matches!(status, StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND)
+                && request.method == Method::POST)
+        {
+            request.method = Method::GET;
+            request.form = None;
+        }
+        request.url = location;
+        Ok(())
     }
 
     async fn request(
@@ -905,7 +1124,7 @@ impl Hub {
                 repo: (*repo).clone(),
                 endpoint: self.config.endpoint.to_string(),
                 attempts: attempt,
-                source: source.without_url(),
+                source: Arc::new(source.without_url()),
             })?;
 
             let client = self.http.clone();
@@ -932,7 +1151,7 @@ impl Hub {
                         repo: (*repo).clone(),
                         endpoint: self.config.endpoint.to_string(),
                         attempts: attempt,
-                        source: source.without_url(),
+                        source: Arc::new(source.without_url()),
                     });
                 }
             };
@@ -957,6 +1176,8 @@ impl Hub {
                     reset_hint: reset.map_or_else(String::new, |reset| {
                         format!(" (the limit resets in {}s)", reset.as_secs())
                     }),
+                    token: self.token_source(),
+                    token_scope: self.config.token_scope,
                 }
                 .fail();
             }
@@ -985,22 +1206,21 @@ impl Hub {
         let message = header_str(response.headers(), "x-error-message")
             .map(str::to_string)
             .filter(|message| !message.is_empty());
-        let has_token = self.config.token.is_some();
+        let token = self.token_source();
+        let token_scope = self.config.token_scope;
         let from_hub = self.is_endpoint_origin(url);
 
         match (status, code.as_deref()) {
             (_, Some("GatedRepo")) => Error::Gated {
                 repo: repo.clone(),
                 repo_url: self.repo_url(repo),
-                token_hint: if has_token {
-                    String::new()
-                } else {
-                    " and no `hf_token` is set".to_string()
-                },
+                token,
+                token_scope,
             },
             (_, Some("RepoNotFound")) => Error::RepoNotFound {
                 repo: repo.clone(),
-                private_hint: private_hint(repo.kind(), has_token),
+                token,
+                token_scope,
             },
             (_, Some("RevisionNotFound")) => Error::RevisionNotFound {
                 repo: repo.clone(),
@@ -1012,14 +1232,17 @@ impl Hub {
             },
             // Without a token the Hub answers 401 for a repository that does not exist and for
             // one that is private, so the two cannot be told apart.
-            (StatusCode::UNAUTHORIZED, _) if !has_token && from_hub => Error::RepoNotFound {
+            (StatusCode::UNAUTHORIZED, _) if token.is_none() && from_hub => Error::RepoNotFound {
                 repo: repo.clone(),
-                private_hint: private_hint(repo.kind(), false),
+                token: None,
+                token_scope,
             },
             (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, _) if from_hub => {
                 Error::TokenRejected {
                     repo: repo.clone(),
                     status: status.as_u16(),
+                    token,
+                    token_scope,
                 }
             }
             _ => Error::Status {
@@ -1038,9 +1261,14 @@ impl Error {
     /// A copy of an error that a cache shared between concurrent callers.
     fn duplicate(&self) -> Self {
         match self {
-            Error::RepoNotFound { repo, private_hint } => Error::RepoNotFound {
+            Error::RepoNotFound {
+                repo,
+                token,
+                token_scope,
+            } => Error::RepoNotFound {
                 repo: repo.clone(),
-                private_hint: private_hint.clone(),
+                token: token.clone(),
+                token_scope: *token_scope,
             },
             Error::RevisionNotFound { repo, revision } => Error::RevisionNotFound {
                 repo: repo.clone(),
@@ -1053,19 +1281,38 @@ impl Error {
             Error::Gated {
                 repo,
                 repo_url,
-                token_hint,
+                token,
+                token_scope,
             } => Error::Gated {
                 repo: repo.clone(),
                 repo_url: repo_url.clone(),
-                token_hint: token_hint.clone(),
+                token: token.clone(),
+                token_scope: *token_scope,
             },
-            Error::TokenRejected { repo, status } => Error::TokenRejected {
+            Error::TokenRejected {
+                repo,
+                status,
+                token,
+                token_scope,
+            } => Error::TokenRejected {
                 repo: repo.clone(),
                 status: *status,
+                token: token.clone(),
+                token_scope: *token_scope,
             },
-            Error::RateLimited { repo, reset_hint } => Error::RateLimited {
+            Error::RateLimited {
+                repo,
+                reset_hint,
+                token,
+                token_scope,
+            } => Error::RateLimited {
                 repo: repo.clone(),
                 reset_hint: reset_hint.clone(),
+                token: token.clone(),
+                token_scope: *token_scope,
+            },
+            Error::InvalidToken { token } => Error::InvalidToken {
+                token: token.clone(),
             },
             Error::Status {
                 repo,
@@ -1078,11 +1325,20 @@ impl Error {
                 attempts: *attempts,
                 message: message.clone(),
             },
+            Error::Request {
+                repo,
+                endpoint,
+                attempts,
+                source,
+            } => Error::Request {
+                repo: repo.clone(),
+                endpoint: endpoint.clone(),
+                attempts: *attempts,
+                source: Arc::clone(source),
+            },
             // `reqwest::Error` and `JoinError` are not `Clone`: keep their message.
-            Error::Request { .. }
-            | Error::TaskStopped { .. }
+            Error::TaskStopped { .. }
             | Error::HttpClient { .. }
-            | Error::InvalidToken
             | Error::InvalidEndpoint { .. }
             | Error::Shared { .. } => Error::Shared {
                 message: self.to_string(),
@@ -1092,14 +1348,6 @@ impl Error {
                 message: message.clone(),
             },
         }
-    }
-}
-
-fn private_hint(kind: RepoType, has_token: bool) -> String {
-    if has_token {
-        ", or the account `hf_token` belongs to cannot read it".to_string()
-    } else {
-        format!(" or it is private: a private {kind} needs `hf_token`")
     }
 }
 
@@ -1544,6 +1792,7 @@ mod tests {
             HubConfig {
                 endpoint: url("https://huggingface.co"),
                 token: None,
+                token_scope: TokenScope::Any,
             },
             tokio::runtime::Builder::new_current_thread()
                 .build()

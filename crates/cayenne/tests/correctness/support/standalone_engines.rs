@@ -38,7 +38,8 @@ use arrow::array::RecordBatch;
 
 // --- SQLite (always available via cayenne → rusqlite) ---
 
-#[expect(unused_imports)] // re-exported for integration test crates
+// Re-exported for `result_correctness_standalone_engines_test`, the only user.
+#[cfg_attr(not(feature = "result-correctness-duckdb"), expect(unused_imports))]
 pub use super::sqlite_engine::{
     load_sqlite_from_batches, load_sqlite_from_parquet, sqlite_query_batches,
 };

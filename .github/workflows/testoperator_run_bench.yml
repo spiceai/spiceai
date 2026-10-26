@@ -1,5 +1,5 @@
 name: benchmark e2e tests
-run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}${{ contains(github.event.inputs.spicepod_path, 'postgres') && format(' - PostgreSQL {0}', github.event.inputs.postgres_version || '16') || '' }}${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}
+run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}${{ contains(github.event.inputs.spicepod_path, 'postgres') && format(' - PostgreSQL {0}', github.event.inputs.postgres_version || '16') || '' }}${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}${{ github.event.inputs.spiced_ref != '' && format(' - spiced {0}', github.event.inputs.spiced_ref) || '' }}
 
 on:
   workflow_dispatch:
@@ -8,6 +8,15 @@ on:
         description: 'spiced build commit'
         required: false
         type: string
+      # Benchmarks another release's spiced with this ref's testoperator and spec files. The
+      # newest commit within ten of the ref that has a MinIO build is used, so a release tag
+      # resolves to the build of its release-branch commit. No result or explain-plan snapshot
+      # is compared or written back, since those record this ref's answers and plans.
+      spiced_ref:
+        description: 'Branch or tag whose spiced to benchmark, e.g. v2.3.3 or release/2.4; empty = trunk. Ignored when spiced_commit is set'
+        required: false
+        type: string
+        default: ''
       spicepod_path:
         description: 'The spicepod file to test with'
         required: true
@@ -171,9 +180,13 @@ jobs:
 
       - name: Determine snapshot update mode
         id: determine_update_snapshots
+        env:
+          SPICED_REF: ${{ github.event.inputs.spiced_ref }}
         run: |
           update_mode="${{ github.event.inputs.update_snapshots }}"
-          if [ "${update_mode}" = "default" ] || [ -z "${update_mode}" ]; then
+          if [ -n "${SPICED_REF}" ]; then
+            update_mode="no"
+          elif [ "${update_mode}" = "default" ] || [ -z "${update_mode}" ]; then
             branch_name="${{ github.ref_name }}"
             if [[ "${branch_name}" == "release/"* ]]; then
               update_mode="no"
@@ -242,6 +255,7 @@ jobs:
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
+          ref: ${{ github.event.inputs.spiced_ref || 'refs/heads/trunk' }}
           with_odbc: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
 
       - name: Display spiced commit
@@ -410,7 +424,7 @@ jobs:
 
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
@@ -596,6 +610,7 @@ jobs:
             --disable-caching=${{ github.event.inputs.disable_caching }} \
             --validate=${{ github.event.inputs.validate_results }} \
             ${LAYOUT:+--layout "$LAYOUT"} \
+            --snapshots=${{ github.event.inputs.spiced_ref == '' }} \
             --metrics \
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
@@ -750,7 +765,6 @@ jobs:
             PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
             if [[ -n "${PR_URL}" ]]; then
               echo "PR already exists -> ${PR_URL}"
-              exit 0
             else
               BODY=$(cat <<EOF
           Automated benchmark snapshot update from workflow run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
@@ -769,6 +783,8 @@ jobs:
                 gh pr merge --squash --auto ${BRANCH_NAME}
               fi
             fi
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
+            bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

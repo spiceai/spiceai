@@ -20,11 +20,14 @@ rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
 description = "The Hugging Face Hub client every Spice.ai component reads models and datasets through"
+# Integration tests are modules of `integration` (`tests/integration.rs`).
+autotests = false
 
 [dependencies]
 bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
+hex.workspace = true
 moka.workspace = true
 object_store.workspace = true
 percent-encoding.workspace = true
@@ -32,14 +35,27 @@ reqwest = { workspace = true, features = ["stream"] }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1 = "0.10"
+sha2.workspace = true
 snafu.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "sync", "time"] }
 tracing.workspace = true
 url.workspace = true
 util = { path = "../util", default-features = false }
 
 [dev-dependencies]
+axum.workspace = true
+parking_lot.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["fs"] }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [lints]
 workspace = true

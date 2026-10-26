@@ -19,13 +19,11 @@ use async_openai::{config::OpenAIConfig, error::OpenAIError};
 use aws_config::Region;
 use aws_credential_types::Credentials;
 use aws_sdk_credential_bridge::default_aws_config;
-use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use llms::{
     anthropic::Anthropic,
     bedrock::chat::BedrockConverse,
     chat::{Chat, Error as ChatError, create_hf_model, create_local_model},
     config::GenericAuthMechanism,
-    embeddings::candle::link_files_into_tmp_dir,
     google::{Google, auth},
     openai::{Openai, new_openai_client},
     responses::Responses,
@@ -33,8 +31,6 @@ use llms::{
 };
 use secrecy::SecretString;
 use std::{
-    collections::HashMap,
-    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -129,17 +125,22 @@ pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<dyn Chat>, 
 }
 
 pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError> {
+    let token = std::env::var("HF_TOKEN").ok().map(SecretString::from);
     create_hf_model(
         model_id,
         None,
+        &[],
+        llms::hf::HubParams {
+            token: token.as_ref(),
+            token_in_spicepod: true,
+            endpoint: None,
+        },
         None,
-        std::env::var("HF_TOKEN")
-            .ok()
-            .map(SecretString::from)
-            .as_ref(),
         None,
-        None,
-        llms::chat::ReasoningDefault::default(),
+        llms::chat::ReasoningDefault {
+            model_name: model_id,
+            effort: None,
+        },
     )
     .await
 }
@@ -169,14 +170,14 @@ pub(crate) async fn create_google(model_id: &str) -> Result<Arc<dyn Chat>, anyho
 }
 
 pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
-    let (temp_dir, model_weights) =
-        download_hf_model_artifacts(model_id, None, std::env::var("HF_TOKEN").ok())?;
+    let (model_dir, model_weights) =
+        download_hf_model_artifacts(model_id, None, std::env::var("HF_TOKEN").ok()).await?;
 
     let model = create_local_model(
         &model_weights,
-        temp_dir.join("config.json").to_str(),
-        temp_dir.join("tokenizer.json").to_str(),
-        temp_dir.join("tokenizer_config.json").to_str(),
+        model_dir.join("config.json").to_str(),
+        model_dir.join("tokenizer.json").to_str(),
+        model_dir.join("tokenizer_config.json").to_str(),
         None,
         None,
         llms::chat::LocalModelOptions::default(),
@@ -186,54 +187,44 @@ pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow
     Ok(model)
 }
 
-/// For a given `HuggingFace` repo, downloads the specified file and save them into provided folder. Return folder, and which ones are model weights.
+/// Downloads every file of a `HuggingFace` repo but its code and docs into the Hugging Face
+/// cache. Returns the snapshot's folder, and the paths of the model weights in it.
 #[expect(clippy::case_sensitive_file_extension_comparisons)]
-fn download_hf_model_artifacts(
+async fn download_hf_model_artifacts(
     model_id: &str,
     revision: Option<&str>,
     hf_token: Option<String>,
 ) -> Result<(PathBuf, Vec<String>), anyhow::Error> {
-    let api = ApiBuilder::new()
-        .with_progress(false)
-        .with_token(hf_token)
-        .build()
-        .context("Failed to instantiate API for downloading model artifacts")?;
-
-    let repo = if let Some(revision) = revision {
-        Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string())
-    } else {
-        Repo::new(model_id.to_string(), RepoType::Model)
-    };
-    let api_repo = api.repo(repo);
-
-    let mut files = HashMap::<String, PathBuf>::new();
-    let mut weights = vec![];
-    for sibling in api_repo.info()?.siblings {
-        if !(sibling.rfilename.ends_with(".py") || sibling.rfilename.ends_with(".md")) {
-            let path = api_repo.get(sibling.rfilename.as_str())?;
-
-            // `abs_path` will have symlinks and relative paths resolved, but will have a hash for a filename. This is fine after its symlinked in `link_files_into_tmp_dir`.
-            // use `path` to get the original filename.
-            let abs_path = fs::canonicalize(path.clone())?;
-
-            if let Some(filename) = path.file_name() {
-                files.insert(filename.to_string_lossy().to_string(), abs_path);
-                if path_is_weights(&path) {
-                    weights.push(filename.to_string_lossy().to_string());
-                }
-            }
-        }
-    }
-
-    let dir =
-        link_files_into_tmp_dir(files.clone()).context("Failed to link files into tmp dir")?;
-    Ok((
-        dir.clone(),
-        weights // Reconstruct absolute model weights path based in the tmp dir.
-            .iter()
-            .map(|w| dir.join(w).display().to_string())
-            .collect(),
-    ))
+    let token = hf_token.map(SecretString::from);
+    let snapshot = llms::hf::open_model(
+        llms::hf::Requester {
+            kind: "model",
+            name: model_id.to_string(),
+            docs_url: "https://spiceai.org/docs/components/models/huggingface",
+            retried: false,
+        },
+        model_id,
+        revision,
+        llms::hf::HubParams {
+            token: token.as_ref(),
+            token_in_spicepod: true,
+            endpoint: None,
+        },
+    )
+    .await?;
+    let wanted: Vec<&str> = snapshot
+        .files()
+        .map(|file| file.path.as_str())
+        .filter(|path| !(path.ends_with(".py") || path.ends_with(".md")))
+        .collect();
+    let weights = snapshot
+        .download(&wanted)
+        .await?
+        .iter()
+        .filter(|path| path_is_weights(path))
+        .map(|path| path.display().to_string())
+        .collect();
+    Ok((snapshot.dir(), weights))
 }
 
 /// Attempts to figure out if a given path is a model weights file.

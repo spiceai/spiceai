@@ -22,6 +22,9 @@ limitations under the License.
 //! | `DuckDB` accelerator (`DataAccelerator`) | `duckdb` crate |
 //! | `SQLite` accelerator (`DataAccelerator`) | `rusqlite` crate |
 //!
+//! The micro tests here reach the accelerator `TableProvider` directly; `surfaces` runs the
+//! same SQL through a Spicepod-built runtime, in-process and over HTTP and Flight SQL.
+//!
 //! Cayenne vs standalone oracles live under `crates/cayenne/tests/result_correctness_*`.
 //! Standalone DuckDB↔SQLite agreement (no Spice) lives under
 //! `result_correctness_standalone_engines_test`.
@@ -59,6 +62,8 @@ use test_framework::queries::validation::{
     QueryValidationResult, RowOrder, compare_query_result_batches_with_sort_check,
     has_top_level_limit, has_top_level_order_by,
 };
+
+mod surfaces;
 
 // ---------------------------------------------------------------------------
 // Shared micro fixtures (id, name, value) / (id, region)
@@ -149,6 +154,21 @@ fn micro_queries() -> Vec<Query> {
             false,
         ),
     ]
+}
+
+fn write_parquet(path: &std::path::Path, batch: &RecordBatch) {
+    use datafusion::parquet::arrow::ArrowWriter;
+    use datafusion::parquet::file::properties::WriterProperties;
+
+    let file = std::fs::File::create(path).expect("parquet file");
+    let mut writer = ArrowWriter::try_new(
+        file,
+        batch.schema(),
+        Some(WriterProperties::builder().build()),
+    )
+    .expect("writer");
+    writer.write(batch).expect("write");
+    writer.close().expect("close");
 }
 
 fn create_cmd(name: &str, schema: SchemaRef) -> datafusion::logical_expr::CreateExternalTable {
@@ -266,7 +286,9 @@ mod sqlite_accel {
     use rusqlite::Connection;
     use std::sync::Arc;
 
-    fn load_standalone_sqlite(tables: &[(&str, RecordBatch)]) -> (tempfile::TempDir, Connection) {
+    pub(super) fn load_standalone_sqlite(
+        tables: &[(&str, RecordBatch)],
+    ) -> (tempfile::TempDir, Connection) {
         let temp = tempfile::tempdir().expect("sqlite temp");
         let path = temp.path().join("oracle.sqlite");
         let conn = Connection::open(&path).expect("open");
@@ -342,7 +364,10 @@ mod sqlite_accel {
         }
     }
 
-    fn standalone_query(conn: &Connection, sql: &str) -> Result<Vec<RecordBatch>, String> {
+    pub(super) fn standalone_query(
+        conn: &Connection,
+        sql: &str,
+    ) -> Result<Vec<RecordBatch>, String> {
         // Reuse cayenne-style conversion via a minimal path: fetch as text/int and build batches.
         // Prefer duck-simple: only types used by micro suite.
         use arrow::array::{Int64Builder, StringBuilder};
@@ -504,6 +529,7 @@ mod sqlite_accel {
 mod duckdb_accel {
     use super::{
         compare, create_cmd, insert_batch, make_dim, make_fact, micro_queries, spice_query,
+        write_parquet,
     };
     use accelerator_duckdb::DuckDBAccelerator;
     use arrow::array::RecordBatch;
@@ -512,22 +538,12 @@ mod duckdb_accel {
     use duckdb::Connection;
     use std::sync::Arc;
 
-    fn load_standalone_duckdb(tables: &[(&str, RecordBatch)]) -> (tempfile::TempDir, Connection) {
-        use datafusion::parquet::arrow::ArrowWriter;
-        use datafusion::parquet::file::properties::WriterProperties;
-
+    pub(super) fn load_standalone_duckdb(
+        tables: &[(&str, RecordBatch)],
+    ) -> (tempfile::TempDir, Connection) {
         let stage = tempfile::tempdir().expect("stage");
         for (name, batch) in tables {
-            let path = stage.path().join(format!("{name}.parquet"));
-            let file = std::fs::File::create(&path).expect("parquet file");
-            let mut writer = ArrowWriter::try_new(
-                file,
-                batch.schema(),
-                Some(WriterProperties::builder().build()),
-            )
-            .expect("writer");
-            writer.write(batch).expect("write");
-            writer.close().expect("close");
+            write_parquet(&stage.path().join(format!("{name}.parquet")), batch);
         }
         let temp = tempfile::tempdir().expect("duckdb temp");
         let db = temp.path().join("oracle.duckdb");
@@ -545,7 +561,10 @@ mod duckdb_accel {
         (temp, conn)
     }
 
-    fn standalone_query(conn: &Connection, sql: &str) -> Result<Vec<RecordBatch>, String> {
+    pub(super) fn standalone_query(
+        conn: &Connection,
+        sql: &str,
+    ) -> Result<Vec<RecordBatch>, String> {
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
         let batches: Vec<RecordBatch> = stmt.query_arrow([]).map_err(|e| e.to_string())?.collect();
         Ok(batches)

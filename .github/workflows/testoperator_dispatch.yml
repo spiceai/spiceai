@@ -57,7 +57,9 @@ jobs:
   # Resolves which schedule this run dispatches (the cron that fired, or the manual `schedule`
   # input) and for which branches. trunk dispatches the configs on that schedule. A release
   # branch changes only when a fix is cherry-picked onto it, so the daily schedule also plans it,
-  # and its job dispatches the whole suite, weekly configs included, once per spiced build.
+  # and its job dispatches the whole suite, weekly configs included, once per spiced build. The
+  # release branch is the newest `release/<major>.<minor>`; `release/<version>-rc.<n>` branches are
+  # not planned.
   plan-scheduled:
     name: Plan scheduled dispatch
     runs-on: ubuntu-24.04
@@ -71,7 +73,6 @@ jobs:
         env:
           CRON: ${{ github.event.schedule }}
           INPUT_SCHEDULE: ${{ github.event.inputs.schedule }}
-          RELEASE_BRANCH: 'release/2.3'
         run: |
           set -euo pipefail
           case "$CRON" in
@@ -89,7 +90,14 @@ jobs:
             matrix=$(jq -cn --arg schedule "$schedule" '[{branch: "trunk", schedule: $schedule}]')
           fi
           if [ "$schedule" = daily ]; then
-            matrix=$(jq -c --arg branch "$RELEASE_BRANCH" '. + [{branch: $branch, schedule: ""}]' <<< "$matrix")
+            release_branch=$(git ls-remote --heads "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" 'refs/heads/release/*' \
+              | cut -f 2 | sed -n 's#^refs/heads/\(release/[0-9][0-9]*\.[0-9][0-9]*\)$#\1#p' | sort -V | tail -n 1)
+            if [ -z "$release_branch" ]; then
+              echo "::error::Found no release/<major>.<minor> branch to dispatch."
+              exit 1
+            fi
+            echo "Release branch: $release_branch"
+            matrix=$(jq -c --arg branch "$release_branch" '. + [{branch: $branch, schedule: ""}]' <<< "$matrix")
           fi
           echo "Dispatching for: $matrix"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"

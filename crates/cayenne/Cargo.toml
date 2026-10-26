@@ -119,6 +119,11 @@ result-correctness-duckdb = ["dep:duckdb"]
 result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
+# getrusage for the `wide_column_point_lookup` bench, and the allocators it can run under: the
+# two `spiced` can be built with (`snmalloc-rs` is its default).
+libc = "0.2"
+snmalloc-rs = { version = "0.3.6" }
+tikv-jemallocator = { version = "0.7.0" }
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 tpcdsgen = { workspace = true }
 tpchgen = { workspace = true }
@@ -172,6 +177,18 @@ name = "in_list_query_e2e"
 [[bench]]
 harness = false
 name = "lookup_index_freshness"
+
+[[bench]]
+harness = false
+name = "wide_column_point_lookup"
+
+[[bench]]
+harness = false
+name = "wide_column_point_lookup_jemalloc"
+
+[[bench]]
+harness = false
+name = "wide_column_point_lookup_snmalloc"
 
 [[bench]]
 harness = false
@@ -288,6 +305,10 @@ name = "compaction_sort_serialization"
 [[bench]]
 harness = false
 name = "inline_memtable_read_overhead"
+
+[[bench]]
+harness = false
+name = "segment_statistics_pruning"
 
 [[bench]]
 harness = false

@@ -119,7 +119,7 @@ impl EmbeddingConnector {
                     dataconnector: dataset.source().to_string(),
                     connector_component: dataset.into(),
                     source: Box::<dyn std::error::Error + Send + Sync>::from(
-                        "DuckDB vector engine requires DuckDB acceleration. Configure the dataset with `acceleration.engine: duckdb`.",
+                        duckdb_vector_engine_without_duckdb_message(),
                     ),
                 });
             }
@@ -355,6 +355,10 @@ impl DataConnector for EmbeddingConnector {
         self.inner_connector.supports_changes_stream()
     }
 
+    fn supports_partitioned_changes(&self) -> bool {
+        self.inner_connector.supports_partitioned_changes()
+    }
+
     fn supports_durable_write_back_delivery(&self) -> bool {
         self.inner_connector.supports_durable_write_back_delivery()
     }
@@ -524,6 +528,18 @@ impl DataConnector for EmbeddingConnector {
     ) -> crate::component::ComponentInitialization {
         self.inner_connector.initialization_for_dataset(dataset)
     }
+}
+
+/// The cause reported when a dataset or view sets `vectors.engine: duckdb` on an
+/// acceleration that is not `duckdb`. It points at Cayenne rather than at
+/// `acceleration.engine: duckdb`: the `DuckDB` accelerator and vector engine are both
+/// deprecated, and Cayenne indexes embedding columns without a `vectors` block.
+#[cfg(feature = "duckdb")]
+pub(crate) fn duckdb_vector_engine_without_duckdb_message() -> String {
+    format!(
+        "`vectors.engine: duckdb` requires `acceleration.engine: duckdb`, and both are deprecated and will be removed in v2.5. Remove the `vectors` block and use `acceleration.engine: cayenne`, which indexes embedding columns for `vector_search` itself. See: {}#migrating-the-duckdb-vector-engine",
+        crate::component::CAYENNE_MIGRATION_DOCS
+    )
 }
 
 #[cfg(feature = "duckdb")]
@@ -985,5 +1001,14 @@ mod tests {
 
         source.assert_handed_only(&table);
         assert_yields_only_the_marker(&mut stream).await;
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn the_duckdb_vector_engine_error_points_to_cayenne_not_back_to_duckdb() {
+        assert_eq!(
+            super::duckdb_vector_engine_without_duckdb_message(),
+            "`vectors.engine: duckdb` requires `acceleration.engine: duckdb`, and both are deprecated and will be removed in v2.5. Remove the `vectors` block and use `acceleration.engine: cayenne`, which indexes embedding columns for `vector_search` itself. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration#migrating-the-duckdb-vector-engine"
+        );
     }
 }

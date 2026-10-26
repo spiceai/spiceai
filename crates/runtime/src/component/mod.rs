@@ -31,6 +31,8 @@ pub use runtime_component::{
     find_first_delimiter, validate_identifier,
 };
 
+use std::fmt::Write;
+
 // The `Arc<Runtime>`-bound wrappers stay in `runtime`.
 pub mod catalog;
 pub mod dataset;
@@ -114,6 +116,124 @@ pub(crate) fn deprecated_ready_state_warning(
     )
 }
 
+/// The guide every deprecated-engine warning points at. It carries what one line cannot:
+/// which accelerations are safe to rebuild from their source, and, per engine, where its
+/// acceleration files and snapshots are, so the user can delete them.
+pub(crate) const CAYENNE_MIGRATION_DOCS: &str =
+    "https://spiceai.org/docs/components/data-accelerators/cayenne/migration";
+
+/// How many components the deprecated-engine warning names per engine before it
+/// summarizes the rest as a count, so one line stays readable for a Spicepod with
+/// hundreds of accelerated datasets.
+const DEPRECATED_ENGINE_NAMED_COMPONENTS: usize = 5;
+
+/// The one warning for the enabled accelerations among `accelerations` that use an
+/// engine other than Cayenne, or `None` when none do. Logged once for the whole
+/// Spicepod at startup, and once per hot reload for the components it added or changed.
+///
+/// One line for the whole Spicepod rather than one per component: the deprecation is a
+/// single decision with a single remedy, and a Spicepod with hundreds of `duckdb`
+/// datasets should not bury every other startup line under it. Components are grouped
+/// by engine, in engine-name order, and named in the order the Spicepod declares them,
+/// up to [`DEPRECATED_ENGINE_NAMED_COMPONENTS`] each.
+///
+/// An acceleration that leaves `engine` unset is judged by the engine it resolves to,
+/// and one whose `engine` is not a known engine is left to the load path, which reports
+/// it as an error. Disabled accelerations are skipped: they use no engine.
+///
+/// Cayenne is not built for native Windows, where `arrow` is the default, so there the
+/// remedy is to run Spice in Docker or WSL rather than to leave `engine` unset.
+///
+/// The remedy also says to delete the old engine's files and snapshots: Cayenne fills a
+/// new acceleration from its source and neither reads nor removes them. Which files, and
+/// which accelerations must not be rebuilt, is left to the linked guide.
+pub(crate) fn deprecated_acceleration_engines_warning<'a>(
+    accelerations: impl IntoIterator<
+        Item = (
+            AcceleratedComponent,
+            &'a str,
+            &'a spicepod::acceleration::Acceleration,
+        ),
+    >,
+) -> Option<String> {
+    let mut by_engine: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (component, name, acceleration) in accelerations {
+        if !acceleration.enabled {
+            continue;
+        }
+        let Ok(engine) = runtime_acceleration::Engine::try_from(acceleration.engine_name()) else {
+            continue;
+        };
+        if engine == runtime_acceleration::Engine::Cayenne {
+            continue;
+        }
+        // Escaped for the same reason as `disabled_acceleration_warning`: a quoted
+        // Spicepod identifier may carry a newline through validation.
+        by_engine
+            .entry(engine.to_string())
+            .or_default()
+            .push(format!("{} '{}'", component.noun(), name.escape_debug()));
+    }
+    if by_engine.is_empty() {
+        return None;
+    }
+
+    let engines = by_engine
+        .iter()
+        .map(|(engine, components)| {
+            let mut named = components
+                .iter()
+                .take(DEPRECATED_ENGINE_NAMED_COMPONENTS)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let unnamed = components
+                .len()
+                .saturating_sub(DEPRECATED_ENGINE_NAMED_COMPONENTS);
+            if unnamed > 0 {
+                let _ = write!(named, " and {unnamed} more");
+            }
+            format!("`{engine}` ({named})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let switch = if cfg!(windows) {
+        "Cayenne is not available on native Windows: run Spice in Docker or WSL and set `acceleration.engine: cayenne`"
+    } else {
+        "Set `acceleration.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`"
+    };
+    Some(format!(
+        "Acceleration engines other than `cayenne` are deprecated and will be removed in v2.5, so these accelerations must move to `cayenne` before upgrading: {engines}. {switch}, then delete the old engine's acceleration files and snapshots. See: {CAYENNE_MIGRATION_DOCS}"
+    ))
+}
+
+/// The acceleration blocks of `datasets` and `views`, in the shape
+/// [`deprecated_acceleration_engines_warning`] reads: datasets first, each in declared
+/// order.
+pub(crate) fn component_accelerations<'a>(
+    datasets: impl IntoIterator<Item = &'a spicepod::component::dataset::Dataset>,
+    views: impl IntoIterator<Item = &'a spicepod::component::view::View>,
+) -> impl Iterator<
+    Item = (
+        AcceleratedComponent,
+        &'a str,
+        &'a spicepod::acceleration::Acceleration,
+    ),
+> {
+    let datasets = datasets.into_iter().filter_map(|ds| {
+        ds.acceleration
+            .as_ref()
+            .map(|a| (AcceleratedComponent::Dataset, ds.name.as_str(), a))
+    });
+    let views = views.into_iter().filter_map(|view| {
+        view.acceleration
+            .as_ref()
+            .map(|a| (AcceleratedComponent::View, view.name.as_str(), a))
+    });
+    datasets.chain(views)
+}
+
 /// What to tell an operator whose dataset or view sets `acceleration.enabled:
 /// false` and leaves settings in the block that the runtime will not apply.
 ///
@@ -163,7 +283,8 @@ pub(crate) fn disabled_acceleration_warning(
 #[cfg(test)]
 mod tests {
     use super::{
-        AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
+        AcceleratedComponent, deprecated_acceleration_engines_warning,
+        deprecated_ready_state_warning, disabled_acceleration_warning,
     };
 
     #[test]
@@ -314,5 +435,111 @@ mod tests {
             warning.contains("WARN forged"),
             "the name is still reported, only escaped: {warning}"
         );
+    }
+
+    fn acceleration(engine: Option<&str>) -> spicepod::acceleration::Acceleration {
+        spicepod::acceleration::Acceleration {
+            engine: engine.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_deprecated_engine_warning_is_one_line_grouped_by_engine() {
+        let duckdb = acceleration(Some("duckdb"));
+        let sqlite = acceleration(Some("sqlite"));
+        let postgres = acceleration(Some("postgresql"));
+        let cayenne = acceleration(Some("cayenne"));
+        let default = acceleration(None);
+        let warning = deprecated_acceleration_engines_warning([
+            (AcceleratedComponent::Dataset, "orders", &duckdb),
+            (AcceleratedComponent::Dataset, "customers", &sqlite),
+            (AcceleratedComponent::View, "daily_totals", &duckdb),
+            (AcceleratedComponent::Dataset, "events", &cayenne),
+            (AcceleratedComponent::Dataset, "lines", &default),
+            (AcceleratedComponent::Dataset, "ledger", &postgres),
+        ])
+        .expect("deprecated engines are in use");
+        insta::assert_snapshot!("deprecated_acceleration_engines_warning", warning);
+    }
+
+    #[test]
+    fn the_deprecated_engine_warning_counts_components_past_the_named_ones() {
+        let arrow = acceleration(Some("arrow"));
+        let names: Vec<String> = (1..=8).map(|i| format!("ds{i}")).collect();
+        let warning = deprecated_acceleration_engines_warning(
+            names
+                .iter()
+                .map(|name| (AcceleratedComponent::Dataset, name.as_str(), &arrow)),
+        )
+        .expect("arrow is deprecated");
+        assert!(
+            warning.contains(
+                "`arrow` (dataset 'ds1', dataset 'ds2', dataset 'ds3', dataset 'ds4', dataset 'ds5' and 3 more)"
+            ),
+            "{warning}"
+        );
+        assert!(!warning.contains("ds6"), "{warning}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn no_deprecated_engine_warning_without_a_deprecated_engine_in_use() {
+        let cayenne = acceleration(Some("cayenne"));
+        let vortex = acceleration(Some("vortex"));
+        let default = acceleration(None);
+        let unknown = acceleration(Some("not_an_engine"));
+        let disabled_duckdb = spicepod::acceleration::Acceleration {
+            enabled: false,
+            ..acceleration(Some("duckdb"))
+        };
+        assert_eq!(
+            deprecated_acceleration_engines_warning([
+                (AcceleratedComponent::Dataset, "a", &cayenne),
+                (AcceleratedComponent::Dataset, "b", &vortex),
+                (AcceleratedComponent::View, "c", &default),
+                (AcceleratedComponent::Dataset, "d", &unknown),
+                (AcceleratedComponent::Dataset, "e", &disabled_duckdb),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_control_character_in_the_name_cannot_break_the_deprecated_engine_line_in_two() {
+        let duckdb = acceleration(Some("duckdb"));
+        let warning = deprecated_acceleration_engines_warning([(
+            AcceleratedComponent::Dataset,
+            "api\nWARN forged",
+            &duckdb,
+        )])
+        .expect("duckdb is deprecated");
+        assert!(
+            !warning.contains('\n'),
+            "the message must stay one line: {warning}"
+        );
+        assert!(
+            warning.contains("WARN forged"),
+            "the name is still reported, only escaped: {warning}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_an_unset_engine_is_deprecated_and_the_remedy_is_docker_or_wsl() {
+        let default = acceleration(None);
+        let warning = deprecated_acceleration_engines_warning([(
+            AcceleratedComponent::Dataset,
+            "orders",
+            &default,
+        )])
+        .expect("an unset engine resolves to arrow on Windows");
+        assert!(warning.contains("`arrow` (dataset 'orders')"), "{warning}");
+        assert!(
+            warning.contains("run Spice in Docker or WSL and set `acceleration.engine: cayenne`"),
+            "{warning}"
+        );
+        assert!(!warning.contains("remove `engine`"), "{warning}");
     }
 }

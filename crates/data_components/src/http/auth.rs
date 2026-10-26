@@ -101,6 +101,12 @@ pub enum Error {
     #[snafu(display("Failed to parse OAuth2 token response: {source}"))]
     InvalidTokenResponse { source: reqwest::Error },
 
+    #[snafu(display("Failed to read the OAuth2 token response from {url}: {source}"))]
+    TokenResponseBody {
+        url: String,
+        source: http_body_limit::Error,
+    },
+
     #[snafu(display(
         "OAuth2 token endpoint returned unsupported token_type '{token_type}'; only 'Bearer' is supported."
     ))]
@@ -430,7 +436,9 @@ fn validate_token_url(url: &str) -> Result<()> {
 }
 
 fn build_token_client() -> Result<Client> {
-    configure_client_builder(ClientBuilder::new())
+    // Token responses are read through `http_body_limit`, which decodes them while
+    // refusing decompression amplification.
+    http_body_limit::decode_manually(configure_client_builder(ClientBuilder::new()))
         .user_agent(util::spiceai_user_agent())
         .build()
         .context(BuildClientSnafu)
@@ -478,7 +486,14 @@ async fn exchange_token(
         });
     }
 
-    let raw: RawTokenResponse = response.json().await.context(InvalidTokenResponseSnafu)?;
+    let raw: RawTokenResponse = http_body_limit::buffer(response, http_body_limit::Limit::METADATA)
+        .await
+        .context(TokenResponseBodySnafu {
+            url: config.token_url.clone(),
+        })?
+        .json()
+        .await
+        .context(InvalidTokenResponseSnafu)?;
 
     if let Some(token_type) = raw.token_type.as_deref()
         && !token_type.eq_ignore_ascii_case("bearer")

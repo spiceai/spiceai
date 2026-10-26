@@ -18,6 +18,11 @@ limitations under the License.
 //! a model that answers from the text it is given and records every request. Each test
 //! asserts the exact rows and the exact requests the model received.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
