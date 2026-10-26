@@ -44,9 +44,10 @@ const KEY: &str = "executor_processes";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ProcessOrder {
-    /// The generation the next new process gets. It never decreases, so a
-    /// process that registers after its executor's entry was removed still
-    /// sorts after every process seen before it.
+    /// The generation the next new process gets, from 1: generation 0 ranks a
+    /// process the order does not list below every recorded one. It never
+    /// decreases, so a process that registers after its executor's entry was
+    /// removed still sorts after every process seen before it.
     next_generation: u64,
     #[serde(default)]
     executors: HashMap<String, ExecutorEntry>,
@@ -189,8 +190,8 @@ impl ExecutorProcessOrder {
                         || is_connected(id)
                         || now_ms.saturating_sub(entry.admitted_at_ms) <= retention_ms
                 });
-                let generation = order.next_generation;
-                order.next_generation += 1;
+                let generation = order.next_generation.max(1);
+                order.next_generation = generation + 1;
                 let entry = order
                     .executors
                     .entry(executor_id.to_string())

@@ -2294,6 +2294,70 @@ mod tests {
         );
     }
 
+    /// An unrecorded process's endpoint gives way to a replacement that is the
+    /// first process the order records, whichever endpoint arrives first.
+    #[tokio::test]
+    async fn an_unrecorded_process_gives_way_to_the_first_recorded_one() {
+        for replacement_endpoint_first in [false, true] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let cluster = ClusterStateStore::new(Arc::clone(&store), "");
+            ExecutorProcessOrder::new(&cluster)
+                .admit("exec-a", "run-1", now_ms().expect("clock"), |_| true)
+                .await
+                .expect("admit");
+
+            let registry = registry_over(&store).await;
+            let (tx1, _rx1) = mpsc::channel(1);
+            let (tx2, _rx2) = mpsc::channel(1);
+            let incumbent_connection = {
+                let mut processes = registry.processes.lock();
+                let seen = processes.entry("exec-a".to_string()).or_default();
+                assert_eq!(
+                    classify_registration(seen, "run-2", None, false),
+                    ExecutorRegistration::New
+                );
+                seen.connection = Some(0);
+                0
+            };
+            registry
+                .connections
+                .write()
+                .await
+                .insert("exec-a".to_string(), ExecutorConnection::new(tx1));
+            registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50102".to_string(),
+                    "run-2",
+                    dummy_flight_sql_client(),
+                )
+                .await;
+
+            let insert_replacement_endpoint = || {
+                registry.insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+            };
+            if replacement_endpoint_first {
+                assert!(insert_replacement_endpoint().await);
+                assert!(registry.unregister("exec-a", incumbent_connection).await);
+            } else {
+                let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+                assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
+                assert!(registry.ready_executor_addresses_sync().is_empty());
+                assert!(insert_replacement_endpoint().await);
+            }
+            assert_eq!(
+                registry.flight_sql_endpoints.read()["exec-a"].address,
+                "127.0.0.1:50101",
+                "replacement endpoint first: {replacement_endpoint_first}"
+            );
+        }
+    }
+
     /// A process that replaces an executor is a restart even when its id sorts
     /// before its predecessor's, as when it starts on a host whose clock reads
     /// earlier. Its endpoint replaces the predecessor's, and the predecessor is
