@@ -1,0 +1,7 @@
+{
+  "postgres-catalog-slot-per-database": 96,
+  "postgres-cdc-numeric-38-digits": 63,
+  "postgres-cdc-partial-row-images": 172,
+  "postgres-cdc-unchanged-toast": 53,
+  "upgrade-cdc-after-kill": 42
+}

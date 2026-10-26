@@ -1,0 +1,143 @@
+name: on-zero-results
+description: >
+  Subqueries over accelerations with on_zero_results answer as the source
+  does: populated, empty (with use_source the source answers, with
+  return_empty nothing does), and partly loaded (a filter that finds no
+  loaded row falls back), on DuckDB and SQLite (memory and file) and Cayenne.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  contents: [populated, empty, partial]
+  action: [use_source, return_empty]
+
+variants:
+  duckdb-memory: { datasets: { '*': { acceleration: { engine: duckdb, mode: memory } } } }
+  duckdb-file: { datasets: { '*': { acceleration: { engine: duckdb, mode: file } } } }
+  sqlite-memory: { datasets: { '*': { acceleration: { engine: sqlite, mode: memory } } } }
+  sqlite-file: { datasets: { '*': { acceleration: { engine: sqlite, mode: file } } } }
+  cayenne: { datasets: { '*': { acceleration: { engine: cayenne, mode: file } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: on-zero-results
+  datasets:
+    - from: postgres:public.items
+      name: items
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        on_zero_results: '${matrix.action}'
+        refresh_sql: >-
+          SELECT * FROM items WHERE '${matrix.contents}' = 'populated'
+          OR ('${matrix.contents}' = 'partial' AND id <> 2)
+    - from: postgres:public.details
+      name: details
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        on_zero_results: '${matrix.action}'
+        refresh_sql: SELECT * FROM details WHERE '${matrix.contents}' <> 'empty'
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { details: item_id, '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE items (id bigint PRIMARY KEY, v int);
+        INSERT INTO items VALUES (1, 10), (2, 20), (3, NULL), (4, 40);
+        CREATE TABLE details (item_id bigint, val int);
+        INSERT INTO details VALUES (1, 10), (1, 20), (2, 5), (NULL, 7);
+  - start: {}
+  - query: SELECT id FROM items WHERE EXISTS (SELECT 1 FROM details WHERE item_id = id)
+    when: { contents: [populated, empty], action: use_source }
+  - query: SELECT id FROM items WHERE EXISTS (SELECT 1 FROM details WHERE item_id = id)
+    when: { contents: empty, action: return_empty }
+    expect-empty: true
+    oracle-sql: SELECT 1 WHERE false
+  - query: SELECT id FROM items WHERE NOT EXISTS (SELECT 1 FROM details WHERE item_id = id)
+    when: { contents: [populated, empty], action: use_source }
+  - query: SELECT id FROM items WHERE NOT EXISTS (SELECT 1 FROM details WHERE item_id = id)
+    when: { contents: empty, action: return_empty }
+    expect-empty: true
+    oracle-sql: SELECT 1 WHERE false
+  - query: SELECT id FROM items WHERE id IN (SELECT item_id FROM details)
+    when: { contents: [populated, empty], action: use_source }
+  - query: SELECT id FROM items WHERE id IN (SELECT item_id FROM details)
+    when: { contents: empty, action: return_empty }
+    expect-empty: true
+    oracle-sql: SELECT 1 WHERE false
+  - query: SELECT id FROM items WHERE id NOT IN (SELECT item_id FROM details)
+    when: { contents: [populated, empty], action: use_source }
+    expect-empty: true
+  - query: SELECT id FROM items WHERE id NOT IN (SELECT item_id FROM details)
+    when: { contents: empty, action: return_empty }
+    expect-empty: true
+    oracle-sql: SELECT 1 WHERE false
+  - query: SELECT id FROM items WHERE id IN (SELECT item_id FROM details GROUP BY item_id HAVING count(*) > 1)
+    when: { contents: [populated, empty], action: use_source }
+  - query: SELECT id FROM items WHERE id IN (SELECT item_id FROM details GROUP BY item_id HAVING count(*) > 1)
+    when: { contents: empty, action: return_empty }
+    expect-empty: true
+    oracle-sql: SELECT 1 WHERE false
+  - query: SELECT id FROM items WHERE v > (SELECT avg(val) FROM details WHERE item_id = id)
+    when: { contents: [populated, empty], action: use_source }
+  - query: SELECT id FROM items WHERE v > (SELECT avg(val) FROM details WHERE item_id = id)
+    when: { contents: empty, action: return_empty }
+    expect-empty: true
+    oracle-sql: SELECT 1 WHERE false
+  - query: SELECT id FROM items WHERE v = (SELECT min(val) FROM details WHERE item_id = id)
+    when: { contents: [populated, empty], action: use_source }
+  - query: SELECT id FROM items WHERE v = (SELECT min(val) FROM details WHERE item_id = id)
+    when: { contents: empty, action: return_empty }
+    expect-empty: true
+    oracle-sql: SELECT 1 WHERE false
+  - query: SELECT id FROM items WHERE v > (SELECT avg(val) FROM details)
+    when: { contents: [populated, empty], action: use_source }
+  - query: SELECT id FROM items WHERE v > (SELECT avg(val) FROM details)
+    when: { contents: empty, action: return_empty }
+    expect-empty: true
+    oracle-sql: SELECT 1 WHERE false
+  - query: SELECT id FROM items WHERE id NOT IN (SELECT item_id FROM details WHERE val > 100)
+    when: { contents: [populated, empty], action: use_source }
+  - query: SELECT id FROM items WHERE id NOT IN (SELECT item_id FROM details WHERE val > 100)
+    when: { contents: empty, action: return_empty }
+    expect-empty: true
+    oracle-sql: SELECT 1 WHERE false
+  - query: SELECT id FROM items WHERE v > ANY (SELECT val FROM details)
+    when: { contents: [populated, empty], action: use_source }
+    except: [sqlite-memory, sqlite-file]
+  - query: SELECT id FROM items WHERE v >= ALL (SELECT val FROM details)
+    when: { contents: [populated, empty], action: use_source }
+    except: [sqlite-memory, sqlite-file]
+  - query: SELECT id FROM items WHERE id > ALL (SELECT item_id FROM details)
+    when: { contents: [populated, empty], action: use_source }
+    expect-empty: true
+    except: [sqlite-memory, sqlite-file]
+  - query: SELECT id FROM items WHERE v > ALL (SELECT val FROM details WHERE val > 100)
+    when: { contents: [populated, empty], action: use_source }
+    except: [sqlite-memory, sqlite-file]
+  - query: SELECT id FROM items WHERE v > ANY (SELECT val FROM details WHERE item_id = id)
+    when: { contents: [populated, empty], action: use_source }
+    except: [sqlite-memory, sqlite-file]
+  - query: SELECT id FROM items WHERE v >= ALL (SELECT val FROM details WHERE item_id = id)
+    when: { contents: [populated, empty], action: use_source }
+    except: [sqlite-memory, sqlite-file]
+  - query: SELECT id FROM items WHERE id = 2 AND id IN (SELECT item_id FROM details WHERE val = 5)
+    when: { contents: partial, action: use_source }
+  - query: SELECT id FROM items WHERE id = 2 AND EXISTS (SELECT 1 FROM details WHERE item_id = id AND val = 5)
+    when: { contents: partial, action: use_source }
+  - query: SELECT id FROM items WHERE id = 2 AND v > (SELECT avg(val) FROM details WHERE item_id = id)
+    when: { contents: partial, action: use_source }
+  - query: SELECT id FROM items WHERE id = 2 AND v > ANY (SELECT val FROM details)
+    when: { contents: partial, action: use_source }
+  - query: SELECT id FROM items WHERE id = 2 AND v >= ALL (SELECT val FROM details)
+    when: { contents: partial, action: use_source }
+  - query: SELECT id FROM items WHERE id = 2
+    when: { contents: partial, action: use_source }

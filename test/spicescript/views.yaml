@@ -1,0 +1,131 @@
+name: views
+description: >
+  Views answer as their SQL does over the source tables: a join across
+  datasets, a view over another view, several views over one dataset, and an
+  accelerated aggregate view that follows source changes once its dataset and
+  then the view are refreshed (`refresh_sql` is refused on a view, by design). A view with
+  invalid SQL, or over a dataset that cannot load, fails on its own and leaves
+  every other view serving.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  engine: [cayenne, duckdb]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: views
+  datasets:
+    - from: postgres:public.orders
+      name: orders
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: full }
+    - from: postgres:public.items
+      name: items
+      params: ${sources.src.params}
+    - from: postgres:public.no_such_table
+      name: missing
+      params: ${sources.src.params}
+      ready_state: on_registration
+  views:
+    - name: order_lines
+      sql: >
+        SELECT o.id, o.qty, o.placed, i.name, i.price, o.qty * i.price AS amount
+        FROM orders o JOIN items i ON o.item_id = i.id
+    - name: big_lines
+      sql: SELECT * FROM order_lines WHERE amount > 100
+    - name: open_orders
+      sql: SELECT * FROM orders WHERE note IS NULL
+    - name: daily
+      sql: >
+        SELECT CAST(placed AS DATE) AS day, count(*) AS orders, sum(qty) AS qty
+        FROM orders GROUP BY CAST(placed AS DATE)
+      acceleration:
+        enabled: true
+        engine: '${matrix.engine}'
+        mode: file
+        refresh_mode: full
+        on_zero_results: use_source
+    - name: bad_syntax
+      sql: SELECT * FORM orders
+    - name: over_missing
+      sql: SELECT * FROM missing
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE items (id int PRIMARY KEY, name text NOT NULL, price numeric(10, 2) NOT NULL);
+        INSERT INTO items SELECT i, 'item ' || i, i * 3.25 FROM generate_series(1, 30) i;
+        CREATE TABLE orders (id int PRIMARY KEY, item_id int NOT NULL, qty int NOT NULL, placed timestamp NOT NULL, note text);
+        INSERT INTO orders SELECT i, 1 + i % 30, 1 + i % 9, TIMESTAMP '2024-01-01' + i * INTERVAL '97 minutes', CASE WHEN i % 6 = 0 THEN NULL ELSE 'n' END FROM generate_series(1, 600) i;
+  - start: { ready: false }
+  - query: SELECT count(*) FROM daily
+    oracle-sql: SELECT count(DISTINCT CAST(placed AS DATE)) FROM orders
+    eventually: 60s
+  # Views register independently of one another, and `ready` can't be awaited
+  # (the dataset `missing` never loads), so wait for the last view to appear.
+  - query: SELECT count(*) FROM big_lines
+    oracle-sql: >
+      SELECT count(*) FROM orders o JOIN items i ON o.item_id = i.id WHERE o.qty * i.price > 100
+    eventually: 30s
+  - query: SELECT count(*) FROM open_orders
+    oracle-sql: SELECT count(*) FROM orders WHERE note IS NULL
+    eventually: 30s
+
+  - query: SELECT * FROM order_lines
+    oracle-sql: >
+      SELECT o.id, o.qty, o.placed, i.name, i.price, o.qty * i.price AS amount
+      FROM orders o JOIN items i ON o.item_id = i.id
+  - query: SELECT * FROM big_lines
+    oracle-sql: >
+      SELECT o.id, o.qty, o.placed, i.name, i.price, o.qty * i.price AS amount
+      FROM orders o JOIN items i ON o.item_id = i.id WHERE o.qty * i.price > 100
+  - query: SELECT name, count(*), sum(amount) FROM big_lines GROUP BY name
+    oracle-sql: >
+      SELECT i.name, count(*), sum(o.qty * i.price) FROM orders o JOIN items i ON o.item_id = i.id
+      WHERE o.qty * i.price > 100 GROUP BY i.name
+  - query: SELECT * FROM open_orders
+    oracle-sql: SELECT * FROM orders WHERE note IS NULL
+  - query: SELECT * FROM daily
+    oracle-sql: >
+      SELECT CAST(placed AS DATE) AS day, count(*) AS orders, sum(qty) AS qty
+      FROM orders GROUP BY CAST(placed AS DATE)
+  - query: SELECT * FROM daily WHERE day >= DATE '2024-01-20' AND qty > 30
+    oracle-sql: >
+      SELECT * FROM (SELECT CAST(placed AS DATE) AS day, count(*) AS orders, sum(qty) AS qty
+      FROM orders GROUP BY CAST(placed AS DATE)) d WHERE day >= DATE '2024-01-20' AND qty > 30
+
+  # A broken view fails alone.
+  - query: SELECT count(*) FROM bad_syntax
+    expect-error: true
+  - query: SELECT count(*) FROM over_missing
+    expect-error: true
+  - assert-log: { contains: ["View 'bad_syntax' has invalid SQL", 'missing for view over_missing'] }
+
+  # Source changes: the federated items are seen at once; the accelerated
+  # orders after their refresh; the accelerated view after its own.
+  - source-exec: { src: "UPDATE orders SET qty = qty + 10 WHERE id % 7 = 0; DELETE FROM orders WHERE id <= 20; UPDATE items SET price = price * 2 WHERE id = 3" }
+  - refresh: orders
+  - query: SELECT * FROM order_lines
+    oracle-sql: >
+      SELECT o.id, o.qty, o.placed, i.name, i.price, o.qty * i.price AS amount
+      FROM orders o JOIN items i ON o.item_id = i.id
+    eventually: 30s
+  - refresh: { dataset: daily, wait: false }
+  - query: SELECT * FROM daily
+    oracle-sql: >
+      SELECT CAST(placed AS DATE) AS day, count(*) AS orders, sum(qty) AS qty
+      FROM orders GROUP BY CAST(placed AS DATE)
+    eventually: 30s
+  - query: SELECT * FROM big_lines
+    oracle-sql: >
+      SELECT o.id, o.qty, o.placed, i.name, i.price, o.qty * i.price AS amount
+      FROM orders o JOIN items i ON o.item_id = i.id WHERE o.qty * i.price > 100
+    eventually: 30s
