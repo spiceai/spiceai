@@ -538,16 +538,20 @@ impl LlamaCpp {
         // The template this request renders with, for what its markup decides.
         let template = chosen_template(&self.template, !tools.is_empty())
             .map_err(OpenAIError::InvalidArgument)?;
-        // A required Harmony call is forced over the whole reply, by the vocabulary's markers.
-        let grammar = match &self.harmony {
-            Some(markers) if !obliged.is_empty() => Some(harmony_call(markers, &obliged)?),
-            _ => content_grammar(
+        let content = || {
+            content_grammar(
                 &self.model_name,
                 template,
                 req.response_format.as_ref(),
                 &callable,
                 &obliged,
-            )?,
+            )
+        };
+        // A Harmony grammar holds the whole reply, by the vocabulary's markers.
+        let grammar = match &self.harmony {
+            Some(markers) if !obliged.is_empty() => Some(harmony_call(markers, &obliged)?),
+            Some(markers) => content()?.map(|reply| harmony_reply(markers, &reply)),
+            None => content()?,
         };
         // Each choice reads its own reply, so each has its own reader.
         let matchers = (0..choices)
@@ -571,9 +575,9 @@ impl LlamaCpp {
         let ban_eog = require_tool_call && grammar.is_none();
         let nameable = nameable_tools(&callable, &obliged);
         let held = if !obliged.is_empty() {
-            harmony::Held::Whole
+            harmony::Held::Call
         } else if grammar.is_some() {
-            harmony::Held::Final
+            harmony::Held::Reply
         } else {
             harmony::Held::Nothing
         };
@@ -1661,7 +1665,11 @@ impl Output {
         }
         // A Harmony marker is read before anything else, because two of them end generation
         // and one of those completes a tool call.
-        if self.harmony.as_ref().is_some_and(|r| r.marks(token)) {
+        if self
+            .harmony
+            .as_ref()
+            .is_some_and(|r| r.marks(token, self.stops.held()))
+        {
             return self.mark(token, eog);
         }
         if eog {
@@ -2279,6 +2287,11 @@ impl StopMatcher {
         (emit, false)
     }
 
+    /// The text held back as the possible start of a stop sequence.
+    fn held(&self) -> &str {
+        &self.held
+    }
+
     fn finish(&mut self) -> String {
         std::mem::take(&mut self.held)
     }
@@ -2431,8 +2444,8 @@ fn harmony_call(
     markers: &harmony::Markers,
     tools: &[&Tool],
 ) -> std::result::Result<String, OpenAIError> {
-    let [start, channel, message, end, constrain] = markers.terminals();
-    let mut grammar = String::new();
+    let [_, channel, message, _, _] = markers.terminals();
+    let mut grammar = harmony_rules(markers);
     let mut calls = Vec::with_capacity(tools.len());
     for (i, tool) in tools.iter().enumerate() {
         let prefix = format!("tool{i}-");
@@ -2444,14 +2457,40 @@ fn harmony_call(
     grammar.push_str("call ::= ");
     grammar.push_str(&calls.join(" | "));
     grammar.push('\n');
-    // The text between markers holds no `<|`, so it cannot spell one either.
-    let _ = writeln!(grammar, "constrain ::= \" \" {constrain}? [A-Za-z0-9_-]+");
-    grammar.push_str("reasoning ::= ([^<] | \"<\" [^|])*\n");
     let _ = writeln!(
         grammar,
-        "root ::= ({channel} \"analysis\" {message} reasoning {end} {start} \"assistant\")? {channel} \"commentary to=functions.\" call"
+        "root ::= analysis? {channel} \"commentary to=functions.\" call"
     );
     Ok(grammar)
+}
+
+/// The grammar of a whole Harmony reply held to a `response_format`: analysis messages, then
+/// a final message whose body is `reply`'s JSON, as llama.cpp's server holds one. A preamble
+/// is ruled out, since its text would be content outside the schema.
+fn harmony_reply(markers: &harmony::Markers, reply: &str) -> String {
+    let [_, channel, message, _, _] = markers.terminals();
+    let mut grammar = harmony_rules(markers);
+    grammar.push_str(&prefix_rules(reply, "reply-"));
+    let _ = writeln!(
+        grammar,
+        "root ::= analysis* {channel} \"final\" constrain? {message} reply-root"
+    );
+    grammar
+}
+
+/// The rules both Harmony grammars share: an analysis message and the role header of the
+/// message after it, and a header's optional content type.
+fn harmony_rules(markers: &harmony::Markers) -> String {
+    let [start, channel, message, end, constrain] = markers.terminals();
+    let mut rules = String::new();
+    let _ = writeln!(
+        rules,
+        "analysis ::= {channel} \"analysis\" {message} reasoning {end} {start} \"assistant\""
+    );
+    // The text between markers holds no `<|`, so it cannot spell one either.
+    rules.push_str("reasoning ::= ([^<] | \"<\" [^|])*\n");
+    let _ = writeln!(rules, "constrain ::= \" \" {constrain}? [A-Za-z0-9_-]+");
+    rules
 }
 
 /// A tool's arguments schema: its parameters, or any object.
@@ -3326,8 +3365,12 @@ mod tests {
         let grammar = harmony_call(&HARMONY_MARKERS, &[&tool]).expect("the tool's schema converts");
         // the test vocabulary's markers are tokens 1 to 7, matched as tokens
         assert!(
-            grammar.ends_with(
-                "root ::= (<[2]> \"analysis\" <[3]> reasoning <[4]> <[1]> \"assistant\")? <[2]> \"commentary to=functions.\" call\n"
+            grammar.ends_with("root ::= analysis? <[2]> \"commentary to=functions.\" call\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.starts_with(
+                "analysis ::= <[2]> \"analysis\" <[3]> reasoning <[4]> <[1]> \"assistant\"\n"
             ),
             "{grammar}"
         );
@@ -3353,6 +3396,37 @@ mod tests {
             content_grammar("m", HARMONY, None, &[&tool], &[&tool]).expect("no grammar"),
             None
         );
+    }
+
+    #[test]
+    fn a_structured_harmony_reply_is_held_from_its_first_header() {
+        let reply = content_grammar("m", HARMONY, Some(&answer_schema()), &[], &[])
+            .expect("the schema converts")
+            .expect("a json_schema format has a grammar");
+        let grammar = harmony_reply(&HARMONY_MARKERS, &reply);
+        // analysis messages, then the final one: no preamble, whose text would be content
+        assert!(
+            grammar.ends_with("root ::= analysis* <[2]> \"final\" constrain? <[3]> reply-root\n"),
+            "{grammar}"
+        );
+        assert!(!grammar.contains("commentary"), "{grammar}");
+        assert_eq!(
+            grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
+            1,
+            "one start rule: {grammar}"
+        );
+    }
+
+    #[test]
+    fn a_harmony_call_ends_where_its_arguments_do_though_a_stop_sequence_holds_their_end() {
+        // `}x` may begin at the closing `}`, which is held back when `<|end|>` comes
+        let (mut out, rx) = harmony_output(&["f"], &["}x"], None);
+        let reply = "<|channel|>commentary to=functions.f<|message|>{}<|end|><|start|>assistant<|channel|>final<|message|>no<|return|>";
+        let (finish, _) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        out.finish(FinishReason::ToolCalls, 1)
+            .expect("the request succeeds");
+        assert_eq!(joined(sent(rx)), ["t:f({})".to_string()]);
     }
 
     #[test]

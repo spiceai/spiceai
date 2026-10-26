@@ -128,15 +128,15 @@ pub(crate) enum Mark {
     Done,
 }
 
-/// What part of a reply a grammar holds.
+/// What a grammar holds a reply to, as llama.cpp's server holds it: the whole reply, or none
+/// of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Held {
-    /// None of it.
     Nothing,
-    /// The final message, to a `response_format`'s schema.
-    Final,
-    /// All of it, to a call one of the tools a required call may name.
-    Whole,
+    /// Analysis messages, then a final message whose body is a `response_format`'s JSON.
+    Reply,
+    /// Any analysis, then a call to one of the tools a required call may name.
+    Call,
 }
 
 /// Reads one reply.
@@ -165,8 +165,9 @@ impl Reader {
         &self.markers
     }
 
-    /// Whether `token` is a marker here, rather than text of the body it is in.
-    pub(crate) fn marks(&self, token: Token) -> bool {
+    /// Whether `token` is a marker here, rather than text of the body it is in. `held` is the
+    /// body's text that has not reached the reader yet, as a stop sequence holds it back.
+    pub(crate) fn marks(&self, token: Token, held: &str) -> bool {
         let m = &self.markers;
         if token == m.done || token == m.call {
             return true;
@@ -175,8 +176,10 @@ impl Reader {
             Route::Header(_) => {
                 [m.start, m.channel, m.message, m.end, m.constrain].contains(&token)
             }
-            Route::Call { arguments, .. } => token == m.end && is_json(arguments),
-            Route::Content { last: true } if self.held == Held::Final => false,
+            Route::Call { arguments, .. } => {
+                token == m.end && is_json(&format!("{arguments}{held}"))
+            }
+            Route::Content { last: true } if self.held == Held::Reply => false,
             Route::Reasoning | Route::Content { .. } | Route::Dropped => token == m.end,
         }
     }
@@ -186,14 +189,9 @@ impl Reader {
         matches!(self.route, Route::Header(_))
     }
 
-    /// Whether the grammar holds the token that comes next: in the final message, a
-    /// `response_format`'s; anywhere, a required call's.
+    /// Whether a grammar holds the token that comes next.
     pub(crate) fn in_grammar(&self) -> bool {
-        match self.held {
-            Held::Nothing => false,
-            Held::Final => matches!(self.route, Route::Content { last: true }),
-            Held::Whole => true,
-        }
+        self.held != Held::Nothing
     }
 
     /// Reads `token`, a marker.
@@ -374,7 +372,7 @@ mod tests {
         let (mut reasoning, mut content) = (String::new(), String::new());
         for (token, text) in spell(reply) {
             if let Some(token) = token
-                && reader.marks(token)
+                && reader.marks(token, "")
             {
                 match reader.mark(token) {
                     Mark::Next => continue,
@@ -541,7 +539,7 @@ mod tests {
             read_as(
                 "<|channel|>final<|message|>{\"s\":\"<|end|>\"}<|return|>",
                 &[],
-                Held::Final
+                Held::Reply
             ),
             answer("", "{\"s\":\"<|end|>\"}")
         );
@@ -553,6 +551,29 @@ mod tests {
             ),
             answer("", "ab")
         );
+    }
+
+    #[test]
+    fn a_call_is_complete_with_the_text_a_stop_sequence_holds_back() {
+        // a stop sequence that may begin at `}` holds it back, yet the arguments it closes are
+        // complete, so the `<|end|>` after them ends the call
+        let mut reader = Reader::new(TEST_MARKERS, vec!["f".to_string()], Held::Nothing);
+        for (token, text) in spell("<|channel|>commentary to=functions.f<|message|>") {
+            match token {
+                Some(token) => {
+                    reader.mark(token);
+                }
+                None => {
+                    reader.text(&text);
+                }
+            }
+        }
+        reader.text("{");
+        assert!(
+            !reader.marks(TEST_MARKERS.end, ""),
+            "`{{` alone is not complete"
+        );
+        assert!(reader.marks(TEST_MARKERS.end, "}"));
     }
 
     #[test]
@@ -585,25 +606,18 @@ mod tests {
     }
 
     #[test]
-    fn only_the_final_message_is_held_to_a_response_format() {
-        let mut reader = Reader::new(TEST_MARKERS, Vec::new(), Held::Final);
-        assert!(!reader.in_grammar() && reader.in_header());
-        reader.mark(TEST_MARKERS.channel);
-        reader.text("commentary");
-        reader.mark(TEST_MARKERS.message);
-        assert!(!reader.in_grammar() && !reader.in_header(), "a preamble");
-        reader.mark(TEST_MARKERS.end);
-        reader.mark(TEST_MARKERS.start);
-        reader.text("assistant");
-        reader.mark(TEST_MARKERS.channel);
-        reader.text("final");
-        reader.mark(TEST_MARKERS.message);
-        assert!(reader.in_grammar());
-        let whole = Reader::new(TEST_MARKERS, Vec::new(), Held::Whole);
-        assert!(
-            whole.in_grammar(),
-            "a required call's grammar holds the whole reply"
-        );
+    fn a_grammar_holds_the_whole_reply_from_its_first_header() {
+        // a preamble before a structured final message would be content outside its schema
+        for held in [Held::Reply, Held::Call] {
+            let mut reader = Reader::new(TEST_MARKERS, Vec::new(), held);
+            assert!(reader.in_grammar() && reader.in_header());
+            reader.mark(TEST_MARKERS.channel);
+            reader.text("commentary");
+            reader.mark(TEST_MARKERS.message);
+            assert!(reader.in_grammar(), "{held:?} holds a preamble too");
+        }
+        let free = Reader::new(TEST_MARKERS, Vec::new(), Held::Nothing);
+        assert!(!free.in_grammar());
     }
 
     #[test]
