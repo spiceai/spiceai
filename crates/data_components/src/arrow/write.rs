@@ -723,6 +723,20 @@ impl MemSink {
             return keep_first_per_key(&batches, &keys);
         }
 
+        // The shared helper adds these working columns, and would overwrite a user column of the
+        // same name.
+        if let Some(field) = self
+            .schema
+            .fields()
+            .iter()
+            .find(|field| DEDUP_WORKING_COLUMNS.contains(&field.name().as_str()))
+        {
+            return Err(DataFusionError::Plan(format!(
+                "on_conflict upsert options cannot be used on a table with a column named '{}'",
+                field.name()
+            )));
+        }
+
         let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(pks.to_vec())]);
         validate_batch_with_constraints(batches, &constraints, &self.upsert_options)
             .await
@@ -735,6 +749,9 @@ impl MemSink {
             .collect()
     }
 }
+
+/// Columns `validate_batch_with_constraints` adds while resolving duplicates.
+const DEDUP_WORKING_COLUMNS: [&str; 2] = ["__row_num", "__max_row_num"];
 
 /// A [`RowConverter`] over the primary key columns `pks` of `schema`.
 fn primary_key_row_converter(schema: &SchemaRef, pks: &[usize]) -> Result<RowConverter> {
@@ -1202,12 +1219,32 @@ pub(crate) fn extract_primary_keys_str(
                 key.push('|');
             }
             // `String` as `fmt::Write` never fails; append Display output without a temp String.
-            let _ = std::fmt::Write::write_fmt(&mut key, format_args!("{val}"));
+            let _ = std::fmt::Write::write_fmt(&mut KeyPartWriter(&mut key), format_args!("{val}"));
         }
         keys.push(Some(key));
     }
 
     Ok(keys)
+}
+
+/// Appends one part of a composite key, escaping `\\` and the `|` delimiter so that distinct
+/// keys such as `("a|b", "c")` and `("a", "b|c")` never render alike.
+struct KeyPartWriter<'a>(&'a mut String);
+
+impl std::fmt::Write for KeyPartWriter<'_> {
+    fn write_str(&mut self, part: &str) -> fmt::Result {
+        if !part.contains(['|', '\\']) {
+            self.0.push_str(part);
+            return Ok(());
+        }
+        for c in part.chars() {
+            if c == '|' || c == '\\' {
+                self.0.push('\\');
+            }
+            self.0.push(c);
+        }
+        Ok(())
+    }
 }
 
 fn extract_constraint_keys_str(
@@ -1226,7 +1263,7 @@ fn extract_constraint_keys_str(
             if part_i > 0 {
                 key.push('|');
             }
-            let _ = std::fmt::Write::write_fmt(&mut key, format_args!("{val}"));
+            let _ = std::fmt::Write::write_fmt(&mut KeyPartWriter(&mut key), format_args!("{val}"));
         }
         keys.push(key);
     }
@@ -2347,6 +2384,45 @@ mod tests {
             sorted_rows(&table).await,
             rows(&[("a", "b|c"), ("a|b", "c")])
         );
+    }
+
+    #[test]
+    fn composite_keys_that_differ_never_render_alike() {
+        let (rb, _) = create_batch_with_string_columns(&[
+            ("a", vec!["a|b", "a", r"a\", r"a\|b"]),
+            ("b", vec!["c", "b|c", "|b", "c"]),
+        ]);
+        let keys = super::extract_primary_keys_str(&rb, &[0, 1]).expect("keys");
+        let distinct: HashSet<_> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len(), "{keys:?}");
+    }
+
+    #[tokio::test]
+    async fn upsert_dedup_refuses_a_column_named_like_its_working_columns() {
+        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion_table_providers::util::constraints::UpsertOptions;
+        let (_, schema) =
+            create_batch_with_string_columns(&[("id", vec![]), ("__max_row_num", vec![])]);
+        let mut table = MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+            .expect("mem table should be created");
+        table.constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+        let table = table
+            .with_on_conflict(OnConflict::try_from("upsert:id").expect("valid on_conflict"))
+            .with_upsert_options(UpsertOptions::default().with_last_write_wins(true));
+        let (rb, _) = create_batch_with_string_columns(&[
+            ("id", vec!["1", "1"]),
+            ("__max_row_num", vec!["x", "y"]),
+        ]);
+        let ctx = SessionContext::new();
+        let exec = Arc::new(MockExec::new(vec![Ok(rb)], schema));
+        let insertion = table
+            .insert_into(&ctx.state(), exec, InsertOp::Overwrite)
+            .await
+            .expect("insert plan");
+        let err = collect(insertion, ctx.task_ctx())
+            .await
+            .expect_err("a column the helper would overwrite is refused");
+        assert!(err.to_string().contains("__max_row_num"), "{err}");
     }
 
     #[tokio::test]
