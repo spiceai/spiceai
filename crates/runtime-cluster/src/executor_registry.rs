@@ -241,18 +241,41 @@ struct ExecutorProcesses {
 
 impl ExecutorProcesses {
     /// Whether process `process_id`, at `generation`, started before the known
-    /// process `other`: by the cluster's order when both have a generation,
-    /// else by id, as process ids sort by the creation time their host's clock read.
+    /// process `other`.
     fn precedes(&self, process_id: &str, generation: Option<u64>, other: &str) -> bool {
-        match (generation, self.generations.get(other)) {
-            (Some(generation), Some(other_generation)) => generation < *other_generation,
-            _ => process_id < other,
-        }
+        process_precedes(
+            (process_id, generation),
+            (other, self.generations.get(other).copied()),
+        )
     }
 
-    /// Whether the known process `process_id` started before the known process `other`.
-    fn is_older(&self, process_id: &str, other: &str) -> bool {
-        self.precedes(process_id, self.generations.get(process_id).copied(), other)
+    /// Whether process `process_id`, at `generation`, started before the
+    /// process that registered `endpoint`.
+    fn precedes_endpoint(
+        &self,
+        process_id: &str,
+        generation: Option<u64>,
+        endpoint: &FlightEndpoint,
+    ) -> bool {
+        process_precedes((process_id, generation), self.endpoint_process(endpoint))
+    }
+
+    /// Whether the process that registered `endpoint` started before the known
+    /// process `process_id`.
+    fn endpoint_precedes(&self, endpoint: &FlightEndpoint, process_id: &str) -> bool {
+        process_precedes(
+            self.endpoint_process(endpoint),
+            (process_id, self.generations.get(process_id).copied()),
+        )
+    }
+
+    fn endpoint_process<'a>(&self, endpoint: &'a FlightEndpoint) -> (&'a str, Option<u64>) {
+        (
+            &endpoint.process_id,
+            endpoint
+                .generation
+                .or_else(|| self.generations.get(&endpoint.process_id).copied()),
+        )
     }
 
     fn push_replaced(&mut self, process_id: String) {
@@ -278,6 +301,20 @@ struct FlightEndpoint {
     /// The process that registered the endpoint; empty for executors that send
     /// no process id.
     process_id: String,
+    /// The process's generation in the cluster's [`ExecutorProcessOrder`], if
+    /// known, so the endpoint is ordered before its process registers.
+    generation: Option<u64>,
+}
+
+/// Whether process `earlier` started before process `later`, each given by its
+/// id and its generation in the cluster's order: by the generations when both
+/// have one, else by id, as process ids sort by the creation time their host's
+/// clock read.
+fn process_precedes(earlier: (&str, Option<u64>), later: (&str, Option<u64>)) -> bool {
+    match (earlier.1, later.1) {
+        (Some(earlier), Some(later)) => earlier < later,
+        _ => earlier.0 < later.0,
+    }
 }
 
 /// Classifies a registration by the process it comes from and updates `seen`.
@@ -692,7 +729,7 @@ impl ExecutorRegistry {
             if let Some(seen) = processes.get(&executor_id)
                 && endpoints
                     .get(&executor_id)
-                    .is_some_and(|endpoint| seen.is_older(&endpoint.process_id, process_id))
+                    .is_some_and(|endpoint| seen.endpoint_precedes(endpoint, process_id))
             {
                 clients.remove(&executor_id);
                 endpoints.remove(&executor_id);
@@ -781,9 +818,13 @@ impl ExecutorRegistry {
             let processes = self.processes.lock();
             let mut endpoints = self.flight_sql_endpoints.write();
             let successor_registered = processes.get(executor_id).is_some_and(|seen| {
-                endpoints
-                    .get(executor_id)
-                    .is_some_and(|endpoint| seen.is_older(&process_id, &endpoint.process_id))
+                endpoints.get(executor_id).is_some_and(|endpoint| {
+                    seen.precedes_endpoint(
+                        &process_id,
+                        seen.generations.get(&process_id).copied(),
+                        endpoint,
+                    )
+                })
             });
             if !successor_registered {
                 clients.remove(executor_id);
@@ -841,14 +882,16 @@ impl ExecutorRegistry {
         let mut clients = self.flight_sql_clients.write().await;
         // Older than the process registered last (a replaced run or a refused
         // duplicate), or older than the process whose endpoint is registered.
-        let superseded = !process_id.is_empty() && {
+        let (superseded, generation) = if process_id.is_empty() {
+            (false, None)
+        } else {
             let processes = self.processes.lock();
             let unseen = ExecutorProcesses::default();
             let seen = processes.get(&executor_id).unwrap_or(&unseen);
             let generation = admission
                 .map(|admission| admission.generation)
                 .or_else(|| seen.generations.get(process_id).copied());
-            admission.is_some_and(|admission| admission.superseded)
+            let superseded = admission.is_some_and(|admission| admission.superseded)
                 || seen.replaced.iter().any(|replaced| replaced == process_id)
                 || seen
                     .current
@@ -859,8 +902,9 @@ impl ExecutorRegistry {
                     .read()
                     .get(&executor_id)
                     .is_some_and(|endpoint| {
-                        seen.precedes(process_id, generation, &endpoint.process_id)
-                    })
+                        seen.precedes_endpoint(process_id, generation, endpoint)
+                    });
+            (superseded, generation)
         };
         if superseded {
             return false;
@@ -870,6 +914,7 @@ impl ExecutorRegistry {
             FlightEndpoint {
                 address,
                 process_id: process_id.to_string(),
+                generation,
             },
         );
         clients.insert(executor_id, client);
@@ -1897,6 +1942,32 @@ mod tests {
                 dummy_flight_sql_client(),
             )
             .await;
+        assert!(registry.unregister("exec-a", earlier.connection).await);
+        assert!(registry.connected_executors().await.is_empty());
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50102"]
+        );
+    }
+
+    /// The same, when the next run's id sorts before the earlier run's, as when
+    /// its host's clock reads earlier.
+    #[tokio::test]
+    async fn an_earlier_connection_closing_keeps_a_successors_endpoint_whose_id_sorts_first() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+
+        let earlier = registry.register("exec-a".to_string(), "run-2", tx1).await;
+        assert!(
+            registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50102".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
         assert!(registry.unregister("exec-a", earlier.connection).await);
         assert!(registry.connected_executors().await.is_empty());
         assert_eq!(
