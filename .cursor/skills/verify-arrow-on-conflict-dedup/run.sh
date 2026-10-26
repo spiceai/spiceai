@@ -5,6 +5,7 @@ set -euo pipefail
 
 SPICED=${SPICED:-$(command -v spiced || true)}
 [[ -x "$SPICED" ]] || { echo "set SPICED to a spiced binary" >&2; exit 2; }
+SPICED=$(realpath "$SPICED")  # the script changes directory below
 HTTP=${HTTP:-127.0.0.1:18690}
 FLIGHT=${FLIGHT:-127.0.0.1:18691}
 METRICS=${METRICS:-127.0.0.1:18692}
@@ -53,6 +54,8 @@ PID=$!
 total=$(grep -cE '^    name: ' spicepod.yaml)
 for _ in $(seq 1 60); do
   sleep 2
+  # Never accept answers from another instance left on these ports.
+  kill -0 "$PID" 2>/dev/null || { echo "FAIL spiced exited early (log: $WORKDIR/spiced.log)"; tail -5 spiced.log >&2; exit 1; }
   st=$(curl -sf "http://$HTTP/v1/datasets?status=true" || true)
   done_count=$(grep -oE '"status":"(Ready|Error)"' <<<"$st" | wc -l || true)
   (( done_count >= total )) && break
