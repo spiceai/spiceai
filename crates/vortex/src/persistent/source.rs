@@ -305,7 +305,13 @@ impl FileSource for VortexSource {
             .map_or_else(|| Arc::new(DefaultPhysicalExprAdapterFactory), Arc::clone);
 
         let vortex_reader_factory = self.vortex_reader_factory.as_ref().map_or_else(
-            || Arc::new(DefaultVortexReaderFactory::new(object_store)),
+            || {
+                Arc::new(
+                    DefaultVortexReaderFactory::new(object_store).with_remote_io_wait(
+                        reads_remote_store(base_config.object_store_url.as_str()),
+                    ),
+                )
+            },
             Arc::clone,
         );
 
@@ -577,7 +583,12 @@ mod tests {
 
     #[test]
     fn only_remote_stores_overlap_split_io() {
-        for remote in ["s3://bucket/", "gs://bucket/", "abfss://c@a/", "http://host/"] {
+        for remote in [
+            "s3://bucket/",
+            "gs://bucket/",
+            "abfss://c@a/",
+            "http://host/",
+        ] {
             assert!(reads_remote_store(remote), "{remote}");
         }
         for local in ["file:///", "memory:///"] {

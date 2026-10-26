@@ -1135,7 +1135,7 @@ impl CayenneContext {
         // Maintenance writes and full-level delta writes inherit it; light
         // delta-encoding levels override it per write via
         // `write_format_with_strategy` (see `provider::delta_encoding`).
-        let mut vortex_session = VortexSession::default();
+        let mut vortex_session = super::io_wait_runtime::carry_ballista_vcore(VortexSession::default());
         if let Some(full_strategy) =
             super::delta_encoding::full_strategy_builder_for(&config.compression_strategy)
         {
