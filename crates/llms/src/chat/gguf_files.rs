@@ -210,7 +210,9 @@ pub fn quantizations(listing: &[ListedFile]) -> Vec<Quantization> {
         *in_folder.entry(dir.clone()).or_default() += 1;
     }
     let mut out = Vec::new();
-    let mut paths = Vec::new();
+    // Each quantization's names, most preferred first; the last, its first file's path, is
+    // unique in the repository.
+    let mut candidates = Vec::new();
     for (dir, stem, files) in complete {
         // A folder names the one quantization it holds; several in one folder go by their tags.
         let name = if !dir.is_empty() && in_folder.get(&dir) == Some(&1) {
@@ -223,24 +225,35 @@ pub fn quantizations(listing: &[ListedFile]) -> Vec<Quantization> {
             .iter()
             .map(|f| size.get(f).copied().unwrap_or(0))
             .sum();
-        paths.push(stem.trim_end_matches(".gguf").to_string());
+        candidates.push([
+            name.clone(),
+            stem.trim_end_matches(".gguf").to_string(),
+            files[0].to_string(),
+        ]);
         out.push(Quantization {
             name,
             files: files.into_iter().map(ToString::to_string).collect(),
             bytes,
         });
     }
-    // Two quantizations that would share a name, as one tag in two folders, go by their paths.
-    let mut uses: BTreeMap<String, usize> = BTreeMap::new();
-    for q in &out {
-        *uses.entry(q.name.to_ascii_lowercase()).or_default() += 1;
-    }
-    for (q, path) in out.iter_mut().zip(paths) {
-        if uses
-            .get(&q.name.to_ascii_lowercase())
-            .is_some_and(|&n| n > 1)
-        {
-            q.name = path;
+    // Quantizations that would share a name, as one tag in two folders, go by their paths: each
+    // takes its next name until none is shared, which its first file's path guarantees.
+    let mut level = vec![0; out.len()];
+    loop {
+        let mut uses: BTreeMap<String, usize> = BTreeMap::new();
+        for q in &out {
+            *uses.entry(q.name.to_ascii_lowercase()).or_default() += 1;
+        }
+        let mut renamed = false;
+        for ((q, names), at) in out.iter_mut().zip(&candidates).zip(&mut level) {
+            if *at + 1 < names.len() && uses.get(&q.name.to_ascii_lowercase()) > Some(&1) {
+                *at += 1;
+                q.name.clone_from(&names[*at]);
+                renamed = true;
+            }
+        }
+        if !renamed {
+            break;
         }
     }
     // Largest first; a stable tie-break by name keeps the order reproducible.
@@ -760,6 +773,34 @@ mod tests {
         );
     }
 
+    /// A path a collision falls back to that is also another quantization's folder: Copilot's
+    /// case on #15590.
+    fn fallback_meets_folder() -> Vec<ListedFile> {
+        listing(&[
+            ("Model-Q4_K_M.gguf", 4 * GB),
+            ("Other-Q4_K_M.gguf", 5 * GB),
+            ("Model-Q4_K_M/Third-Q8_0.gguf", 8 * GB),
+        ])
+    }
+
+    #[test]
+    fn a_fallback_name_never_takes_another_quantizations_name() {
+        let names: Vec<String> = quantizations(&fallback_meets_folder())
+            .into_iter()
+            .map(|q| q.name)
+            .collect();
+        let unique: BTreeSet<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+        assert_eq!(unique.len(), names.len(), "names {names:?}");
+        assert_eq!(
+            names,
+            [
+                "Model-Q4_K_M/Third-Q8_0",
+                "Other-Q4_K_M",
+                "Model-Q4_K_M.gguf"
+            ]
+        );
+    }
+
     /// Every quantization resolves, by the name it is listed and advertised under, to exactly
     /// its own files.
     #[test]
@@ -770,6 +811,7 @@ mod tests {
             ("qwen3", qwen3()),
             ("one_folder", one_folder()),
             ("merged_and_split", merged_and_split()),
+            ("fallback_meets_folder", fallback_meets_folder()),
             (
                 "two_folders",
                 listing(&[
