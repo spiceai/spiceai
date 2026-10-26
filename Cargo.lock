@@ -6511,6 +6511,7 @@ dependencies = [
  "native-tls",
  "num_cpus",
  "object_store 0.13.2",
+ "object_store_spawn",
  "opendal",
  "oracle",
  "parking_lot",
