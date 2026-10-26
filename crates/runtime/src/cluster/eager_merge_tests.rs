@@ -45,7 +45,7 @@ const ROWS: i32 = 10_000;
 
 /// A cluster scheduler's session over a fact (`fk` in `0..100`) and a dim
 /// whose keys 1 and 2 share one name, so `fk IN (1, 2)` groups 200 rows.
-fn scheduler_session(amounts: &[i64]) -> SessionContext {
+fn scheduler_session(amounts: &[i64]) -> datafusion::error::Result<SessionContext> {
     let df = DataFusionBuilder::new(
         status::RuntimeStatus::new(),
         Arc::new(AcceleratorEngineRegistry::default()),
@@ -68,8 +68,7 @@ fn scheduler_session(amounts: &[i64]) -> SessionContext {
                 1.5, 10_000,
             ))),
         ],
-    )
-    .expect("fact batch");
+    )?;
     let dim = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("dk", DataType::Int32, false),
@@ -85,10 +84,9 @@ fn scheduler_session(amounts: &[i64]) -> SessionContext {
                 }
             }))),
         ],
-    )
-    .expect("dim batch");
-    df.ctx.register_batch("fact", fact).expect("register fact");
-    df.ctx.register_batch("dim", dim).expect("register dim");
+    )?;
+    df.ctx.register_batch("fact", fact)?;
+    df.ctx.register_batch("dim", dim)?;
 
     // As the cluster session builder does: the local config made safe for
     // stages, and the cluster physical optimizer rules.
@@ -108,7 +106,7 @@ fn scheduler_session(amounts: &[i64]) -> SessionContext {
         .with_config(config)
         .with_physical_optimizer_rules(rules)
         .build();
-    SessionContext::new_with_state(state)
+    Ok(SessionContext::new_with_state(state))
 }
 
 fn zero_amounts() -> Vec<i64> {
@@ -196,7 +194,8 @@ async fn assert_stages_decode_to_the_planned_schemas(ctx: &SessionContext, sql: 
     // The merge must straddle a shuffle: its `Partial` ends one stage and its
     // final half starts the next.
     let partial_merge_stage = stages.iter().position(|stage| {
-        merge_modes(&(Arc::clone(stage) as Arc<dyn ExecutionPlan>)).contains(&AggregateMode::Partial)
+        merge_modes(&(Arc::clone(stage) as Arc<dyn ExecutionPlan>))
+            .contains(&AggregateMode::Partial)
     });
     let final_merge_stage = stages.iter().position(|stage| {
         merge_modes(&(Arc::clone(stage) as Arc<dyn ExecutionPlan>))
@@ -204,21 +203,23 @@ async fn assert_stages_decode_to_the_planned_schemas(ctx: &SessionContext, sql: 
             .any(|mode| matches!(mode, AggregateMode::Final | AggregateMode::FinalPartitioned))
     });
     assert!(
-        partial_merge_stage.is_some() && final_merge_stage.is_some() && partial_merge_stage != final_merge_stage,
+        partial_merge_stage.is_some()
+            && final_merge_stage.is_some()
+            && partial_merge_stage != final_merge_stage,
         "the merge's Partial ({partial_merge_stage:?}) and Final ({final_merge_stage:?}) must be in different stages:\n{rendered}"
     );
 
     let registry = executor_function_registry();
-    let state = ctx.state();
+    let session_state = ctx.state();
     let task_ctx = TaskContext::new(
         None,
         "eager-merge".to_string(),
-        state.config().clone(),
+        session_state.config().clone(),
         registry.scalar_functions.clone(),
         registry.higher_order_functions.clone(),
         registry.aggregate_functions.clone(),
-        registry.window_functions.clone(),
-        state.runtime_env().clone(),
+        registry.window_functions,
+        Arc::clone(session_state.runtime_env()),
     );
     let codec = BallistaPhysicalExtensionCodec::default();
     for stage in stages {
@@ -253,27 +254,33 @@ async fn rows(ctx: &SessionContext, sql: &str) -> Result<String, String> {
 /// Eager `COUNT` merges its partial counts with a `sum`.
 #[tokio::test]
 async fn eager_count_merge_decodes_on_executors_with_the_planned_state() {
-    let ctx = scheduler_session(&zero_amounts());
+    let ctx = scheduler_session(&zero_amounts()).expect("scheduler session");
     let sql = "SELECT d.name, COUNT(f.n) AS c FROM fact f JOIN dim d ON f.fk = d.dk \
                WHERE f.fk IN (1, 2) GROUP BY d.name";
     let plan = assert_stages_decode_to_the_planned_schemas(&ctx, sql).await;
     let rows = rows(&ctx, sql)
         .await
         .unwrap_or_else(|error| panic!("eager COUNT must run, got {error}\n{plan}"));
-    assert!(rows.contains("| g    | 200 |"), "COUNT over 200 rows must be 200\n{rows}\n{plan}");
+    assert!(
+        rows.contains("| g    | 200 |"),
+        "COUNT over 200 rows must be 200\n{rows}\n{plan}"
+    );
 }
 
 /// Eager `AVG(Float64)` merges both its sum and its count with a `sum`.
 #[tokio::test]
 async fn eager_float_avg_merge_decodes_on_executors_with_the_planned_state() {
-    let ctx = scheduler_session(&zero_amounts());
+    let ctx = scheduler_session(&zero_amounts()).expect("scheduler session");
     let sql = "SELECT d.name, AVG(f.x) AS a FROM fact f JOIN dim d ON f.fk = d.dk \
                WHERE f.fk IN (1, 2) GROUP BY d.name";
     let plan = assert_stages_decode_to_the_planned_schemas(&ctx, sql).await;
     let rows = rows(&ctx, sql)
         .await
         .unwrap_or_else(|error| panic!("eager AVG must run, got {error}\n{plan}"));
-    assert!(rows.contains("| g    | 1.5 |"), "AVG of 1.5s must be 1.5\n{rows}\n{plan}");
+    assert!(
+        rows.contains("| g    | 1.5 |"),
+        "AVG of 1.5s must be 1.5\n{rows}\n{plan}"
+    );
 }
 
 /// The rewrite must not cost checked `SUM` its overflow error.
@@ -285,7 +292,7 @@ async fn checked_sum_over_a_join_still_errors_on_overflow() {
             _ => 0,
         })
         .collect();
-    let ctx = scheduler_session(&amounts);
+    let ctx = scheduler_session(&amounts).expect("scheduler session");
     let sql = "SELECT d.name, SUM(f.amount) AS total, COUNT(f.n) AS c FROM fact f \
                JOIN dim d ON f.fk = d.dk WHERE f.fk IN (1, 2) GROUP BY d.name";
     let error = rows(&ctx, sql)
