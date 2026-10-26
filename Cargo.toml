@@ -301,7 +301,7 @@ datafusion-proto-common = "55.2.0"
 datafusion-pruning = "55.2.0"
 datafusion-spark = "55.2.0"
 datafusion-substrait = "55.2.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "0b5de49081426db5f4e06c286c682ec2629b0792" } # branch: lukim/duckdb-quote-pk-columns (spiceai/datafusion-table-providers#103, into spiceai-55)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "ba93c8c478c528026e8ad41e3a6fc134e96d262a" } # branch: lukim/duckdb-quote-pk-columns (spiceai/datafusion-table-providers#103, into spiceai-55)
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",
