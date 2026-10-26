@@ -29,13 +29,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::cluster_state::ClusterStateStore;
 
-/// Processes remembered per executor id, so a replaced process that is still
-/// running is recognized when it connects again.
-const PROCESSES_KEPT: usize = 9;
+/// How long a replaced process stays recorded, so that it is recognized if it
+/// is still running and connects again. A process dropped from the record is
+/// recognized by its id, which depends on its host's clock; recording processes
+/// this long means only a clock that far behind can make a new process look like
+/// a dropped one.
+const RETENTION: Duration = Duration::from_hours(24);
 
-/// How long an executor's entry outlives the last process that registered
-/// under it, while no process under it is connected.
-const ENTRY_RETENTION: Duration = Duration::from_hours(24);
+/// The most processes recorded per executor id, however recent, which bounds
+/// the record of an executor that keeps restarting.
+const PROCESSES_KEPT: usize = 1000;
 
 const KEY: &str = "executor_processes";
 
@@ -54,7 +57,8 @@ struct ExecutorEntry {
     /// When the last new process registered, by the recording scheduler's
     /// clock (milliseconds since the Unix epoch). Used only to remove entries.
     admitted_at_ms: u64,
-    /// The latest processes, oldest first.
+    /// The processes registered within [`RETENTION`], at most
+    /// [`PROCESSES_KEPT`] of them, and always the latest; oldest first.
     processes: Vec<AdmittedProcess>,
     /// The greatest id among processes no longer in `processes`. A process
     /// that is not recorded and whose id does not sort after it is one of them.
@@ -66,6 +70,10 @@ struct ExecutorEntry {
 struct AdmittedProcess {
     process_id: String,
     generation: u64,
+    /// When the process registered, by the recording scheduler's clock
+    /// (milliseconds since the Unix epoch).
+    #[serde(default)]
+    admitted_at_ms: u64,
 }
 
 /// Where a process stands in its executor's order.
@@ -112,8 +120,8 @@ impl ExecutorProcessOrder {
     /// the latest process when it registers for the first time.
     ///
     /// A new process also removes the entries of other executors whose last
-    /// process registered more than [`ENTRY_RETENTION`] before `now_ms`,
-    /// unless `is_connected` says a process under the id is connected.
+    /// process registered more than [`RETENTION`] before `now_ms`, unless
+    /// `is_connected` says a process under the id is connected.
     ///
     /// # Errors
     ///
@@ -125,7 +133,7 @@ impl ExecutorProcessOrder {
         now_ms: u64,
         is_connected: impl Fn(&str) -> bool,
     ) -> Result<Admission, ModifyError<Infallible>> {
-        let retention_ms = u64::try_from(ENTRY_RETENTION.as_millis()).unwrap_or(u64::MAX);
+        let retention_ms = u64::try_from(RETENTION.as_millis()).unwrap_or(u64::MAX);
         self.state
             .modify(KEY, &self.retry, |order| {
                 let mut order = order.unwrap_or_default();
@@ -173,15 +181,25 @@ impl ExecutorProcessOrder {
                 entry.processes.push(AdmittedProcess {
                     process_id: process_id.to_string(),
                     generation,
+                    admitted_at_ms: now_ms,
                 });
-                if entry.processes.len() > PROCESSES_KEPT {
-                    let forgotten = entry.processes.remove(0).process_id;
+                let expired = entry
+                    .processes
+                    .iter()
+                    .take_while(|process| {
+                        now_ms.saturating_sub(process.admitted_at_ms) > retention_ms
+                    })
+                    .count();
+                let forget = expired
+                    .max(entry.processes.len().saturating_sub(PROCESSES_KEPT))
+                    .min(entry.processes.len() - 1);
+                for forgotten in entry.processes.drain(..forget) {
                     if entry
                         .forgotten_through
                         .as_ref()
-                        .is_none_or(|through| forgotten > *through)
+                        .is_none_or(|through| forgotten.process_id > *through)
                     {
-                        entry.forgotten_through = Some(forgotten);
+                        entry.forgotten_through = Some(forgotten.process_id);
                     }
                 }
                 Ok(Change::Write(
@@ -246,7 +264,7 @@ mod tests {
     async fn idle_entries_are_removed_without_reusing_generations() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let order = order_over(&store);
-        let retention_ms = u64::try_from(ENTRY_RETENTION.as_millis()).expect("retention");
+        let retention_ms = u64::try_from(RETENTION.as_millis()).expect("retention");
 
         let old = admit(&order, "exec-a", "run-1").await;
         admit(&order, "exec-b", "run-1").await;
@@ -267,40 +285,59 @@ mod tests {
         assert!(!returning.superseded);
     }
 
-    /// Only the latest processes are remembered.
+    /// At most [`PROCESSES_KEPT`] processes are recorded, however recent.
     #[tokio::test]
-    async fn only_the_latest_processes_are_kept() {
+    async fn at_most_processes_kept_are_recorded() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let order = order_over(&store);
         for run in 0..=PROCESSES_KEPT {
-            admit(&order, "exec-a", &format!("run-{run}")).await;
+            admit(&order, "exec-a", &format!("run-{run:04}")).await;
         }
         let stored = order.state.get(KEY).await.expect("read").expect("stored");
-        let kept: Vec<_> = stored.executors["exec-a"]
-            .processes
-            .iter()
-            .map(|process| process.process_id.as_str())
-            .collect();
-        assert_eq!(kept.len(), PROCESSES_KEPT);
-        assert_eq!(kept.first(), Some(&"run-1"));
+        let entry = &stored.executors["exec-a"];
+        assert_eq!(entry.processes.len(), PROCESSES_KEPT);
+        assert_eq!(entry.processes[0].process_id, "run-0001");
+        assert_eq!(entry.forgotten_through.as_deref(), Some("run-0000"));
     }
 
-    /// A process that is no longer recorded is still known to be superseded
-    /// when it connects again, while a later process is still new.
+    /// A process dropped from the record after [`RETENTION`] is still
+    /// superseded when it connects again, while a later process is new.
     #[tokio::test]
     async fn a_forgotten_process_is_superseded() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let order = order_over(&store);
-        for run in 0..=PROCESSES_KEPT {
-            admit(&order, "exec-a", &format!("run-{run:02}")).await;
-        }
+        let retention_ms = u64::try_from(RETENTION.as_millis()).expect("retention");
+        admit(&order, "exec-a", "run-0").await;
+        let later_ms = 1_000 + retention_ms + 1;
+        let kept = order
+            .admit("exec-a", "run-1", later_ms, |_| true)
+            .await
+            .expect("admit");
 
-        let forgotten = admit(&order, "exec-a", "run-00").await;
+        let forgotten = admit(&order, "exec-a", "run-0").await;
         assert!(forgotten.superseded);
-        let oldest_kept = admit(&order, "exec-a", "run-01").await;
-        assert!(forgotten.generation < oldest_kept.generation);
+        assert!(forgotten.generation < kept.generation);
 
-        let later = admit(&order, "exec-a", "run-10").await;
-        assert!(!later.superseded);
+        let new = order
+            .admit("exec-a", "run-2", later_ms, |_| true)
+            .await
+            .expect("admit");
+        assert!(!new.superseded);
+    }
+
+    /// A replacement whose id sorts before those of recent processes, as when
+    /// its host's clock reads earlier, is new however many processes
+    /// registered recently.
+    #[tokio::test]
+    async fn a_new_process_sorting_before_recent_ones_is_new() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let order = order_over(&store);
+        let mut last = None;
+        for run in 10..30 {
+            last = Some(admit(&order, "exec-a", &format!("run-{run}")).await);
+        }
+        let replacement = admit(&order, "exec-a", "run-05").await;
+        assert!(!replacement.superseded);
+        assert!(replacement.generation > last.expect("admitted").generation);
     }
 }
