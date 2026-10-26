@@ -645,6 +645,16 @@ jobs:
           echo "cluster ${DATABRICKS_CLUSTER_ID} did not reach RUNNING"
           exit 1
 
+      # The image restores its database once, after a fixed sleep, and never retries;
+      # see .github/scripts/mssql_tpch_restore.sh.
+      - name: Wait for the SQL Server TPC-H database
+        if: ${{ contains(github.event.inputs.spicepod_path, 'mssql') }}
+        # The script gives up after ten minutes; this also bounds a hung docker call.
+        timeout-minutes: 15
+        env:
+          MSSQL_SA_PASSWORD: S3cretP@ssw0rd
+        run: bash .github/scripts/mssql_tpch_restore.sh "${{ job.services.mssql_tpch.id }}" tpch_sf1
+
       # `--disable-caching` sends `Cache-Control: no-cache` on the benchmark's Flight
       # connection. It is load-bearing: `runtime.caching.sql_results` is enabled by
       # default with a one-second `item_ttl`, and the harness runs one warmup query
