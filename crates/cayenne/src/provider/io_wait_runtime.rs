@@ -1,7 +1,7 @@
 // Copyright 2024-2026 The Spice.ai OSS Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Carries a Ballista task's vcore into Vortex scan and I/O tasks.
+//! Carries a `Ballista` task's vcore into `Vortex` scan and I/O tasks.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -46,11 +46,70 @@ impl Executor for BallistaCarryingExecutor {
     }
 }
 
-/// Configure a Vortex session to carry a Ballista task's vcore into spawned
-/// split and object-store tasks. Outside Ballista execution, this uses the
-/// current Tokio runtime without changing scheduling or permit accounting.
+/// Configure a `Vortex` session to carry a `Ballista` task's vcore into spawned
+/// split and object-store tasks. Outside `Ballista` execution, this uses the
+/// current `Tokio` runtime without changing scheduling or permit accounting.
 pub fn carry_ballista_vcore(session: VortexSession) -> VortexSession {
     static EXECUTOR: OnceLock<Arc<dyn Executor>> = OnceLock::new();
     let executor = EXECUTOR.get_or_init(|| Arc::new(BallistaCarryingExecutor));
     session.with_handle(Handle::new(Arc::downgrade(executor)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use ballista_core::vcore_permit::VcoreHook;
+    use ballista_core::vcore_permit::VcorePermit;
+    use datafusion::common::runtime::IoWaitExt;
+    use datafusion::common::runtime::IoWaitHookError;
+    use datafusion::common::runtime::set_io_wait_hook;
+    use tokio::sync::Semaphore;
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    async fn probe(carried: bool) -> (usize, u64) {
+        let vcores = Arc::new(Semaphore::new(1));
+        let permit = VcorePermit::new(Arc::clone(&vcores), Duration::from_millis(20), None);
+        permit.acquire().await.expect("acquire the test vcore");
+        let session = if carried {
+            carry_ballista_vcore(VortexSession::default())
+        } else {
+            VortexSession::default()
+        };
+        let (started, ready) = oneshot::channel();
+        let query = tokio::spawn(Arc::clone(&permit).run(async move {
+            session
+                .handle()
+                .spawn_io(async move {
+                    let _ = started.send(());
+                    tokio::time::sleep(Duration::from_millis(300))
+                        .io_wait()
+                        .await;
+                })
+                .await;
+        }));
+        ready.await.expect("the Vortex I/O task should start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let free_while_pending = vcores.available_permits();
+        query.await.expect("the carried I/O task should complete");
+        (
+            free_while_pending,
+            permit.stats().suspensions.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vortex_io_wait_lends_only_with_ballista_context() {
+        match set_io_wait_hook(&VcoreHook) {
+            Ok(()) | Err(IoWaitHookError::AlreadySet) => {}
+        }
+
+        assert_eq!(probe(false).await, (0, 0));
+        let (free_while_pending, suspensions) = probe(true).await;
+        assert_eq!(free_while_pending, 1);
+        assert!(suspensions > 0);
+    }
 }
