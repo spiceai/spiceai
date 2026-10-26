@@ -158,7 +158,7 @@ async fn test_location_metadata_preserves_custom_s3_endpoint() -> Result<(), any
 
     // Setup test data using object_store crate
     if let Err(e) = setup_test_data(&endpoint).await {
-        container.remove().await?;
+        container.cleanup().await;
         return Err(anyhow::anyhow!("Failed to setup test data: {e}"));
     }
 
@@ -180,7 +180,7 @@ async fn test_location_metadata_preserves_custom_s3_endpoint() -> Result<(), any
     let cloned_rt = Arc::clone(&runtime);
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-            container.remove().await?;
+            container.cleanup().await;
             return Err(anyhow::anyhow!("Timed out waiting for dataset to load"));
         }
         () = cloned_rt.load_components() => {}
@@ -210,7 +210,7 @@ async fn test_location_metadata_preserves_custom_s3_endpoint() -> Result<(), any
     };
 
     // Clean up container
-    container.remove().await?;
+    container.cleanup().await;
 
     // Now check the result
     let row_count = result.map_err(|e| {

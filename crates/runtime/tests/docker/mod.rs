@@ -112,18 +112,26 @@ impl RunningContainer {
         Ok(())
     }
 
+    /// Removes the container once a test is done with it. A removal that fails, such
+    /// as one timing out on a stalled daemon, is reported like a failed removal in
+    /// `Drop` instead of being returned: cleanup must not fail a scenario that
+    /// passed. `Drop` then tries the removal again. A test that removes the
+    /// container to simulate an outage needs the removal to succeed, so it calls
+    /// [`Self::remove`] instead.
+    pub async fn cleanup(&self) {
+        if let Err(e) = self.remove().await {
+            self.report_failed_removal(&e);
+        }
+    }
+
     /// Removes the container once a test's scenario has finished, and returns the
-    /// scenario's result. A removal that fails, such as one timing out on a stalled
-    /// daemon, is reported like a failed removal in `Drop` instead of being returned:
-    /// it must not replace the scenario's error, nor fail a scenario that passed.
-    /// `Drop` then tries the removal again.
+    /// scenario's result. A failed removal is reported as in [`Self::cleanup`], so it
+    /// cannot replace the scenario's error.
     pub async fn remove_after<T>(
         &self,
         scenario: Result<T, anyhow::Error>,
     ) -> Result<T, anyhow::Error> {
-        if let Err(e) = self.remove().await {
-            self.report_failed_removal(&e);
-        }
+        self.cleanup().await;
         scenario
     }
 

@@ -16,7 +16,10 @@ limitations under the License.
 
 use std::{
     process::Stdio,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -253,5 +256,16 @@ async fn a_failed_removal_keeps_the_scenario_result() -> anyhow::Result<()> {
         .await
         .expect_err("the scenario failed");
     assert_eq!(error.to_string(), "scenario failed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_cleanup_leaves_the_container_for_drop_to_remove() -> anyhow::Result<()> {
+    let container = unremovable()?;
+    container.cleanup().await;
+    assert!(
+        !container.removed.load(Ordering::Relaxed),
+        "a failed cleanup must not mark the container removed, or Drop skips its retry"
+    );
     Ok(())
 }
