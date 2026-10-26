@@ -408,36 +408,6 @@ impl SnapshotRefreshFixture {
             .and_then(serde_json::Value::as_i64))
     }
 
-    /// Wait until the current snapshot holds `rows` rows; returns its id.
-    async fn wait_for_snapshot_rows(&self, rows: u64, max_wait: Duration) -> Result<i64> {
-        let deadline = Instant::now() + max_wait;
-        loop {
-            let current = self.metadata_json().await?.and_then(|metadata| {
-                let dataset = metadata.get(DATASET_NAME)?;
-                let id = dataset.get("current-snapshot-id")?.as_i64()?;
-                let row_count = dataset
-                    .get("snapshots")?
-                    .as_array()?
-                    .iter()
-                    .find(|entry| entry["snapshot-id"].as_i64() == Some(id))?
-                    .get("snapshot-row-count")?
-                    .as_u64();
-                Some((id, row_count))
-            });
-            if let Some((id, Some(row_count))) = current
-                && row_count == rows
-            {
-                return Ok(id);
-            }
-            if Instant::now() >= deadline {
-                return Err(anyhow!(
-                    "timed out waiting for a current snapshot of {rows} rows; last observed (id, rows): {current:?}"
-                ));
-            }
-            sleep(Duration::from_millis(250)).await;
-        }
-    }
-
     async fn wait_for_snapshot_id(&self, minimum_id: i64, max_wait: Duration) -> Result<i64> {
         let deadline = Instant::now() + max_wait;
         loop {
@@ -639,7 +609,7 @@ async fn restart_over_partial_restore(fixture: &SnapshotRefreshFixture) -> Resul
     let writer = Arc::new(Runtime::builder().with_app(writer_app).build().await);
     load_runtime(Arc::clone(&writer)).await?;
     fixture
-        .wait_for_snapshot_rows(3, Duration::from_mins(1))
+        .wait_for_snapshot_id(0, Duration::from_mins(1))
         .await
         .context("waiting for the writer's first snapshot")?;
 
@@ -650,17 +620,24 @@ async fn restart_over_partial_restore(fixture: &SnapshotRefreshFixture) -> Resul
     drop(reader);
 
     fixture.write_source(MUTATED_CSV)?;
-    // The writer republishes unchanged data too, so wait for the mutated rows.
+    // The writer republishes unchanged data too, so a newer snapshot id alone
+    // can still hold the old rows. Once the writer serves the mutated rows, any
+    // later snapshot holds them.
+    wait_for_reader_swap(&writer, 5, Duration::from_mins(1)).await?;
+    let served_at = fixture
+        .current_snapshot_id()
+        .await?
+        .context("no snapshot is published")?;
     fixture
-        .wait_for_snapshot_rows(5, Duration::from_mins(1))
+        .wait_for_snapshot_id(served_at + 1, Duration::from_mins(1))
         .await
         .context("waiting for the writer's snapshot of the mutated source")?;
     // No later snapshot, so the reader restores exactly the current one.
     writer.shutdown().await;
     let next_id = fixture
-        .wait_for_snapshot_rows(5, Duration::ZERO)
-        .await
-        .context("reading the writer's last snapshot")?;
+        .current_snapshot_id()
+        .await?
+        .context("no snapshot is published")?;
     fixture.leave_partial_restore(next_id).await?;
 
     let reader = Arc::new(Runtime::builder().with_app(reader_app()).build().await);
