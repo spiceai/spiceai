@@ -285,6 +285,25 @@ impl TableProviderFactory for ArrowFactory {
     }
 }
 
+/// Reads the `on_conflict` upsert behaviour (`upsert_dedup` / `upsert_dedup_by_row_id`) that the
+/// accelerator API passes as the `upsert_remove_duplicates` / `upsert_last_write_wins` options.
+fn upsert_options_from(
+    options: &std::collections::HashMap<String, String>,
+) -> datafusion::error::Result<datafusion_table_providers::util::constraints::UpsertOptions> {
+    let flag = |name: &str| -> datafusion::error::Result<bool> {
+        options.get(name).map_or(Ok(false), |value| {
+            value.parse::<bool>().map_err(|e| {
+                DataFusionError::Configuration(format!("Invalid value '{value}' for {name}: {e}"))
+            })
+        })
+    };
+    Ok(
+        datafusion_table_providers::util::constraints::UpsertOptions::default()
+            .with_remove_duplicates(flag("upsert_remove_duplicates")?)
+            .with_last_write_wins(flag("upsert_last_write_wins")?),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1049,23 +1068,4 @@ mod tests {
             assert!(plan.contains("IndexedLookupExec"), "{index_type}: {plan}");
         }
     }
-}
-
-/// Reads the `on_conflict` upsert behaviour (`upsert_dedup` / `upsert_dedup_by_row_id`) that the
-/// accelerator API passes as the `upsert_remove_duplicates` / `upsert_last_write_wins` options.
-fn upsert_options_from(
-    options: &std::collections::HashMap<String, String>,
-) -> datafusion::error::Result<datafusion_table_providers::util::constraints::UpsertOptions> {
-    let flag = |name: &str| -> datafusion::error::Result<bool> {
-        options.get(name).map_or(Ok(false), |value| {
-            value.parse::<bool>().map_err(|e| {
-                DataFusionError::Configuration(format!("Invalid value '{value}' for {name}: {e}"))
-            })
-        })
-    };
-    Ok(
-        datafusion_table_providers::util::constraints::UpsertOptions::default()
-            .with_remove_duplicates(flag("upsert_remove_duplicates")?)
-            .with_last_write_wins(flag("upsert_last_write_wins")?),
-    )
 }
