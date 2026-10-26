@@ -44,7 +44,9 @@ use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::Instant;
 
+use crate::cluster_state::now_ms;
 use crate::correlated::{CorrelatedResponses, CorrelationError, send_correlated};
+use crate::executor_processes::{Admission, ExecutorProcessOrder};
 use crate::metadata::{PartitionKey, normalized_table_name, partition_key};
 use crate::{PartitionStore, PartitionValue, executor_selection, metrics};
 
@@ -232,6 +234,40 @@ struct ExecutorProcesses {
     current: Option<String>,
     /// Processes a later registration replaced, oldest first.
     replaced: VecDeque<String>,
+    /// The generation each of `current` and `replaced` has in the cluster's
+    /// [`ExecutorProcessOrder`]. A process the order could not be read for has none.
+    generations: HashMap<String, u64>,
+}
+
+impl ExecutorProcesses {
+    /// Whether process `process_id`, at `generation`, started before the known
+    /// process `other`: by the cluster's order when both have a generation,
+    /// else by id, as process ids sort by the creation time their host's clock read.
+    fn precedes(&self, process_id: &str, generation: Option<u64>, other: &str) -> bool {
+        match (generation, self.generations.get(other)) {
+            (Some(generation), Some(other_generation)) => generation < *other_generation,
+            _ => process_id < other,
+        }
+    }
+
+    /// Whether the known process `process_id` started before the known process `other`.
+    fn is_older(&self, process_id: &str, other: &str) -> bool {
+        self.precedes(process_id, self.generations.get(process_id).copied(), other)
+    }
+
+    fn push_replaced(&mut self, process_id: String) {
+        if self.replaced.len() == REPLACED_PROCESSES_KEPT
+            && let Some(forgotten) = self.replaced.pop_front()
+        {
+            self.generations.remove(&forgotten);
+        }
+        self.replaced.push_back(process_id);
+    }
+
+    fn is_known(&self, process_id: &str) -> bool {
+        self.current.as_deref() == Some(process_id)
+            || self.replaced.iter().any(|replaced| replaced == process_id)
+    }
 }
 
 /// An executor's `FlightSQL` endpoint.
@@ -245,10 +281,12 @@ struct FlightEndpoint {
 }
 
 /// Classifies a registration by the process it comes from and updates `seen`.
-/// `was_connected` says whether a connection is registered under the id.
+/// `admission` is where a process `seen` does not know stands in the cluster's
+/// order. `was_connected` says whether a connection is registered under the id.
 fn classify_registration(
     seen: &mut ExecutorProcesses,
     process_id: &str,
+    admission: Option<Admission>,
     was_connected: bool,
 ) -> ExecutorRegistration {
     if process_id.is_empty() {
@@ -258,24 +296,30 @@ fn classify_registration(
             ExecutorRegistration::New
         };
     }
-    // Process ids sort by creation time, so a process older than the one
-    // registered last is still running alongside it, whatever order they connect in.
-    if seen.replaced.iter().any(|replaced| replaced == process_id)
+    // A process older than the one registered last is still running alongside
+    // it, whatever order they connect in.
+    if seen.replaced.iter().any(|replaced| replaced == process_id) {
+        return ExecutorRegistration::Duplicate;
+    }
+    let generation = admission.map(|admission| admission.generation);
+    let superseded = admission.is_some_and(|admission| admission.superseded)
         || seen
             .current
             .as_deref()
-            .is_some_and(|current| process_id < current)
-    {
+            .is_some_and(|current| seen.precedes(process_id, generation, current));
+    if let Some(generation) = generation {
+        seen.generations.insert(process_id.to_string(), generation);
+    }
+    // A duplicate is remembered as replaced, so its endpoint is refused too.
+    if superseded {
+        seen.push_replaced(process_id.to_string());
         return ExecutorRegistration::Duplicate;
     }
     match seen.current.replace(process_id.to_string()) {
         None => ExecutorRegistration::New,
         Some(previous) if previous == process_id => ExecutorRegistration::Reconnected,
         Some(previous) => {
-            if seen.replaced.len() == REPLACED_PROCESSES_KEPT {
-                seen.replaced.pop_front();
-            }
-            seen.replaced.push_back(previous);
+            seen.push_replaced(previous);
             ExecutorRegistration::Restarted
         }
     }
@@ -436,6 +480,9 @@ pub struct ExecutorRegistry {
     /// Append-only log of DDL SQL statements applied to the cluster.
     ddl_log: Arc<RwLock<DdlLog>>,
 
+    /// The order executor processes registered in, shared by the schedulers.
+    process_order: Arc<ExecutorProcessOrder>,
+
     /// Scheduler's `<host>:<port>` identity, used as the `node_id` attribute on
     /// cluster metrics recorded from this registry. `None` when metrics
     /// shouldn't be emitted (e.g. tests, runtime hasn't propagated identity).
@@ -467,6 +514,9 @@ impl ExecutorRegistry {
         federated_partition_store: Arc<PartitionStore>,
         node_id: Option<Arc<str>>,
     ) -> Self {
+        let process_order = Arc::new(ExecutorProcessOrder::new(
+            accelerations_partition_store.cluster_state(),
+        ));
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             processes: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -479,6 +529,7 @@ impl ExecutorRegistry {
             executor_statistics: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             coverage: Arc::default(),
             ddl_log: Arc::new(RwLock::new(DdlLog::default())),
+            process_order,
             node_id,
         }
     }
@@ -596,13 +647,14 @@ impl ExecutorRegistry {
             pending_acks: connection.pending_acks(),
         };
         let connection_id = self.next_connection.fetch_add(1, Ordering::Relaxed);
+        let admission = self.admit(&executor_id, process_id).await;
 
         let mut connections = self.connections.write().await;
         let is_reconnect = connections.contains_key(&executor_id);
         let registration = {
             let mut processes = self.processes.lock();
             let seen = processes.entry(executor_id.clone()).or_default();
-            let registration = classify_registration(seen, process_id, is_reconnect);
+            let registration = classify_registration(seen, process_id, admission, is_reconnect);
             if registration != ExecutorRegistration::Duplicate {
                 seen.connection = Some(connection_id);
             }
@@ -635,10 +687,12 @@ impl ExecutorRegistry {
         // own endpoint.
         if registration == ExecutorRegistration::Restarted {
             let mut clients = self.flight_sql_clients.write().await;
+            let processes = self.processes.lock();
             let mut endpoints = self.flight_sql_endpoints.write();
-            if endpoints
-                .get(&executor_id)
-                .is_some_and(|endpoint| endpoint.process_id.as_str() < process_id)
+            if let Some(seen) = processes.get(&executor_id)
+                && endpoints
+                    .get(&executor_id)
+                    .is_some_and(|endpoint| seen.is_older(&endpoint.process_id, process_id))
             {
                 clients.remove(&executor_id);
                 endpoints.remove(&executor_id);
@@ -649,6 +703,41 @@ impl ExecutorRegistry {
             handles,
             registration,
             connection: connection_id,
+        }
+    }
+
+    /// Where `process_id` stands in the cluster's order of the processes under
+    /// `executor_id`, recording it when it is new. `None` for an empty process
+    /// id, a process this scheduler already knows, or when the order cannot be
+    /// read or written; the process is then ordered by its id.
+    async fn admit(&self, executor_id: &str, process_id: &str) -> Option<Admission> {
+        if process_id.is_empty()
+            || self
+                .processes
+                .lock()
+                .get(executor_id)
+                .is_some_and(|seen| seen.is_known(process_id))
+        {
+            return None;
+        }
+        let connected: HashSet<String> = self.connections.read().await.keys().cloned().collect();
+        match self
+            .process_order
+            .admit(
+                executor_id,
+                process_id,
+                now_ms().unwrap_or_default(),
+                |id| connected.contains(id),
+            )
+            .await
+        {
+            Ok(admission) => Some(admission),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to record the start of a process of executor {executor_id} in the cluster state, so it is ordered against the executor's other processes by its id, which depends on its host's clock: {err}"
+                );
+                None
+            }
         }
     }
 
@@ -689,10 +778,13 @@ impl ExecutorRegistry {
         // check above and its removal below.
         let successor_registered = {
             let mut clients = self.flight_sql_clients.write().await;
+            let processes = self.processes.lock();
             let mut endpoints = self.flight_sql_endpoints.write();
-            let successor_registered = endpoints
-                .get(executor_id)
-                .is_some_and(|endpoint| endpoint.process_id > process_id);
+            let successor_registered = processes.get(executor_id).is_some_and(|seen| {
+                endpoints
+                    .get(executor_id)
+                    .is_some_and(|endpoint| seen.is_older(&process_id, &endpoint.process_id))
+            });
             if !successor_registered {
                 clients.remove(executor_id);
                 endpoints.remove(executor_id);
@@ -736,7 +828,7 @@ impl ExecutorRegistry {
     /// `false`, inserting nothing, when a later process under the same id
     /// is newer than `process_id`, by its control stream or its endpoint: an
     /// earlier process's endpoint must not displace its successor's, whichever
-    /// arrives first. Process ids sort by creation time.
+    /// arrives first.
     pub async fn insert_flight_sql_client(
         &self,
         executor_id: String,
@@ -747,16 +839,21 @@ impl ExecutorRegistry {
         let mut clients = self.flight_sql_clients.write().await;
         // Older than the process registered last (a replaced run or a refused
         // duplicate), or older than the process whose endpoint is registered.
-        let superseded = !process_id.is_empty()
-            && (self.processes.lock().get(&executor_id).is_some_and(|seen| {
-                seen.current
+        let superseded = !process_id.is_empty() && {
+            let processes = self.processes.lock();
+            let unseen = ExecutorProcesses::default();
+            let seen = processes.get(&executor_id).unwrap_or(&unseen);
+            seen.replaced.iter().any(|replaced| replaced == process_id)
+                || seen
+                    .current
                     .as_deref()
-                    .is_some_and(|current| process_id < current)
-            }) || self
-                .flight_sql_endpoints
-                .read()
-                .get(&executor_id)
-                .is_some_and(|endpoint| endpoint.process_id.as_str() > process_id));
+                    .is_some_and(|current| seen.is_older(process_id, current))
+                || self
+                    .flight_sql_endpoints
+                    .read()
+                    .get(&executor_id)
+                    .is_some_and(|endpoint| seen.is_older(process_id, &endpoint.process_id))
+        };
         if superseded {
             return false;
         }
@@ -1609,8 +1706,12 @@ mod tests {
     use super::*;
 
     async fn make_registry() -> ExecutorRegistry {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let cs = Arc::new(ClusterStateStore::new(store, ""));
+        registry_over(&(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>)).await
+    }
+
+    /// A scheduler's registry over the shared state in `store`.
+    async fn registry_over(store: &Arc<dyn ObjectStore>) -> ExecutorRegistry {
+        let cs = Arc::new(ClusterStateStore::new(Arc::clone(store), ""));
         cs.bootstrap().await.expect("bootstrap");
         ExecutorRegistry::new(
             Arc::new(PartitionStore::accelerations(Arc::clone(&cs))),
@@ -1815,33 +1916,137 @@ mod tests {
         assert_eq!(registry.connected_executors().await, vec!["exec-a"]);
     }
 
-    /// An older process that connects after a newer one, for example to a
-    /// scheduler that started after both, is a duplicate, not a restart.
+    /// A process that started earlier but connects after a later one, for
+    /// example to a scheduler that started after both, is a duplicate, not a
+    /// restart. The schedulers share the order the processes first registered
+    /// in, which here is the reverse of their ids' order.
     #[tokio::test]
     async fn an_older_process_connecting_later_is_a_duplicate() {
-        let registry = make_registry().await;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let earlier_scheduler = registry_over(&store).await;
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
+        earlier_scheduler
+            .register("exec-a".to_string(), "run-2", tx1)
+            .await;
+        earlier_scheduler
+            .register("exec-a".to_string(), "run-1", tx2)
+            .await;
 
-        let newer = registry.register("exec-a".to_string(), "run-2", tx1).await;
-        let older = registry.register("exec-a".to_string(), "run-1", tx2).await;
+        let later_scheduler = registry_over(&store).await;
+        let (tx3, _rx3) = mpsc::channel(1);
+        let (tx4, _rx4) = mpsc::channel(1);
+        let newer = later_scheduler
+            .register("exec-a".to_string(), "run-1", tx3)
+            .await;
+        let older = later_scheduler
+            .register("exec-a".to_string(), "run-2", tx4)
+            .await;
 
         assert_eq!(newer.registration, ExecutorRegistration::New);
         assert_eq!(older.registration, ExecutorRegistration::Duplicate);
-        assert!(registry.is_current("exec-a", newer.connection));
+        assert!(later_scheduler.is_current("exec-a", newer.connection));
 
         // Its endpoint is refused too, even before the newer process registers one.
         assert!(
-            !registry
+            !later_scheduler
                 .insert_flight_sql_client(
                     "exec-a".to_string(),
                     "127.0.0.1:50101".to_string(),
+                    "run-2",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert!(later_scheduler.ready_executor_addresses_sync().is_empty());
+    }
+
+    /// A scheduler that starts after a process was replaced, and sees the
+    /// replaced process first, refuses it and its endpoint from the shared
+    /// order alone, then registers the later process.
+    #[tokio::test]
+    async fn a_replaced_process_connecting_first_to_a_new_scheduler_is_a_duplicate() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let earlier_scheduler = registry_over(&store).await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        earlier_scheduler
+            .register("exec-a".to_string(), "run-2", tx1)
+            .await;
+        earlier_scheduler
+            .register("exec-a".to_string(), "run-1", tx2)
+            .await;
+
+        let later_scheduler = registry_over(&store).await;
+        let (tx3, _rx3) = mpsc::channel(1);
+        let (tx4, _rx4) = mpsc::channel(1);
+        let replaced = later_scheduler
+            .register("exec-a".to_string(), "run-2", tx3)
+            .await;
+        assert_eq!(replaced.registration, ExecutorRegistration::Duplicate);
+        assert!(
+            !later_scheduler
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-2",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+
+        let live = later_scheduler
+            .register("exec-a".to_string(), "run-1", tx4)
+            .await;
+        assert_eq!(live.registration, ExecutorRegistration::New);
+        assert!(later_scheduler.is_current("exec-a", live.connection));
+    }
+
+    /// A process that replaces an executor is a restart even when its id sorts
+    /// before its predecessor's, as when it starts on a host whose clock reads
+    /// earlier. Its endpoint replaces the predecessor's, and the predecessor is
+    /// a duplicate if it connects again.
+    #[tokio::test]
+    async fn a_restart_whose_id_sorts_first_is_a_restart() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (tx3, _rx3) = mpsc::channel(1);
+
+        let predecessor = registry.register("exec-a".to_string(), "run-2", tx1).await;
+        assert!(
+            registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-2",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert!(registry.unregister("exec-a", predecessor.connection).await);
+
+        let replacement = registry.register("exec-a".to_string(), "run-1", tx2).await;
+        assert_eq!(replacement.registration, ExecutorRegistration::Restarted);
+        assert!(registry.is_current("exec-a", replacement.connection));
+        assert!(
+            registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50102".to_string(),
                     "run-1",
                     dummy_flight_sql_client(),
                 )
                 .await
         );
-        assert!(registry.ready_executor_addresses_sync().is_empty());
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50102"]
+        );
+
+        let returning = registry.register("exec-a".to_string(), "run-2", tx3).await;
+        assert_eq!(returning.registration, ExecutorRegistration::Duplicate);
+        assert!(registry.is_current("exec-a", replacement.connection));
     }
 
     /// An executor that sends no process id is registered as before: a second
