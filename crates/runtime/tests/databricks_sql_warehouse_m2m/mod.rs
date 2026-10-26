@@ -41,7 +41,6 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
     dataset
 }
 
-#[expect(clippy::expect_used)]
 fn get_params() -> Params {
     for var in [
         "NEW_DATABRICKS_HOST",

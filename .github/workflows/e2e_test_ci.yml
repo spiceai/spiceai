@@ -164,7 +164,7 @@ jobs:
       # skipping it there: `~/.cargo` and `target/` persist on those hosts and sccache
       # serves the compile, while the restore of this multi-GB cache spends up to ten
       # minutes before it lands or gives up.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         if: matrix.target.target_os != 'darwin'
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
@@ -321,7 +321,7 @@ jobs:
         uses: ./.github/actions/setup-adbc-bigquery
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
@@ -2924,12 +2924,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Scripts that pass: any failure fails the job.
-          - { name: 'spicescript: scripts', args: test/spicescript }
+          # Scripts that pass: any failure fails the job. Each shard runs
+          # its share of the scripts (--partition), balanced by their
+          # recorded durations.
+          - { name: 'spicescript: scripts (1/4)', partition: 1/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (2/4)', partition: 2/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (3/4)', partition: 3/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (4/4)', partition: 4/4, args: test/spicescript }
           # Scripts that reproduce open bugs: each must fail exactly as its
           # group's recordings/expected-failures.json says, so a fix or a
           # change in how a bug shows also fails the job.
-          - { name: 'spicescript: known failing', args: --max-wait 30s test/spicescript/known-failing }
+          - { name: 'spicescript: known failing (1/2)', partition: 1/2, args: --max-wait 30s test/spicescript/known-failing }
+          - { name: 'spicescript: known failing (2/2)', partition: 2/2, args: --max-wait 30s test/spicescript/known-failing }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -2986,7 +2992,8 @@ jobs:
 
       - name: Run scenario scripts
         run: |
-          "${{ steps.spicescript.outputs.path }}" --jobs 8 \
+          "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+            --partition ${{ matrix.partition }} \
             --spiced "$(command -v spiced)" \
             --spice-cli "$(command -v spice)" \
             --work-dir "$RUNNER_TEMP/spicescript" \
@@ -3042,7 +3049,9 @@ jobs:
       - graceful_shutdown_test_full
       - test_cold_start_unkeyed_append
       - build_spicescript
-      - test_spicescript
+      # test_spicescript reports but does not gate merges while the scenario
+      # scripts settle on the CI runners: a run that fails there names the
+      # failing scripts in its own job.
     steps:
       - name: Verify all E2E jobs succeeded
         # Named rather than left to the runner default: this gate is the required

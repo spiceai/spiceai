@@ -13,6 +13,8 @@ limitations under the License.
 use crate::AcceleratorEngineNotAvailableSnafu;
 use std::fmt::Display;
 
+/// The acceleration engines. Every engine but [`Engine::Cayenne`] is deprecated in v2.4
+/// and will be removed in v2.5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Engine {
     Arrow,

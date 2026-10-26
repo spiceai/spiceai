@@ -60,7 +60,6 @@ use crate::health::HealthMonitor;
 /// This is a self-contained benchmark that handles the full lifecycle:
 /// table creation, data insertion, Spice startup, ingestion measurement,
 /// optional verification, and telemetry emission.
-#[expect(clippy::too_many_lines)]
 pub async fn run_benchmark(args: &StreamingDynamodbArgs) -> Result<()> {
     let run_id = generate_run_id();
     let datasets = args.queryset.get_datasets();

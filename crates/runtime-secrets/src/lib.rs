@@ -293,10 +293,18 @@ impl Secrets {
     pub async fn load_from(&mut self, secrets: &[SpicepodSecret]) -> Result<()> {
         self.stores.clear();
 
+        // Restore trunk's non-overwriting export of the default `.env` /
+        // `.env.local` before any store initializes. AWS Secrets Manager
+        // (STS), Kubernetes, and other `std::env` readers need those values
+        // even when `env` is not first — or is absent. `file_path` stores
+        // stay private (they never export their own file).
+        stores::env::export_default_dotenv_without_overwrite();
+
         // Bootstrap env store used only to resolve `${ env:KEY }` /
         // `${ secrets:KEY }` references inside other stores' `params:`
         // blocks. Constructed once so `.env` files are loaded a single time
-        // for the whole secrets section.
+        // for the whole secrets section. Does not export: the prelude above
+        // already did.
         let bootstrap_env: Arc<dyn SecretStore> = load_default_store();
 
         let mut any_healthy_store_loaded = false;
@@ -338,7 +346,7 @@ impl Secrets {
             // its placeholder) authoritative over the implicit default.
             self.stores
                 .entry("env".to_string())
-                .or_insert_with(load_default_store);
+                .or_insert_with(load_default_store_exporting);
         }
 
         // Reverse the order of the secret stores to maintain the expected precedence order.
@@ -467,7 +475,10 @@ impl Secrets {
                 continue;
             }
             match store.get_secret(key).await {
-                Ok(Some(secret)) => return Ok(Some(secret)),
+                Ok(Some(secret)) => {
+                    tracing::debug!("Resolved secret `{key}` from store `{store_name}`");
+                    return Ok(Some(secret));
+                }
                 Ok(None) => any_healthy = true,
                 Err(e) => {
                     // Include the failure cause: when a later store resolves
@@ -900,6 +911,51 @@ pub async fn get_params_with_secrets(
     params_with_secrets
 }
 
+/// Injects secrets from spicepod `params` templates and deserializes them
+/// into `P`, carrying `${ store:key }` provenance into parse errors.
+///
+/// When any part of a value is secret-derived — including a fragment such
+/// as `1e${ env:SECRET }` — a parse failure returns
+/// [`runtime_parameters_typed::ParamsError::InvalidSecretValue`] instead of
+/// the parser's text, so a duration or enum parser cannot echo the secret.
+///
+/// # Errors
+///
+/// Returns [`runtime_parameters_typed::ParamsError`] when a required
+/// parameter is missing or a value cannot be parsed.
+#[expect(clippy::implicit_hasher)]
+pub async fn typed_params_from_templates<P: TypedParams>(
+    component_name: &str,
+    secrets: &Arc<RwLock<Secrets>>,
+    templates: &HashMap<String, String>,
+) -> runtime_parameters_typed::Result<P> {
+    let secret_sources = secret_sources_from_templates(templates);
+    let injected = get_params_with_secrets(Arc::clone(secrets), templates).await;
+    P::try_from_params_with_secret_sources(component_name, injected, secrets, &secret_sources).await
+}
+
+/// Secret-reference templates that appear in `params`, keyed by parameter name.
+///
+/// The map value is the original `${ store:key }` text (or a comma-separated
+/// list when a parameter interpolates several references). A parameter is
+/// recorded when **any** part of its value is secret-derived, including a
+/// fragment such as `1e${ env:SECRET }`. Parameters whose values contain no
+/// secret syntax are omitted.
+#[must_use]
+#[expect(clippy::implicit_hasher)]
+pub fn secret_sources_from_templates(params: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut sources = HashMap::new();
+    for (key, template) in params {
+        let refs: Vec<String> = SecretReplacementMatcher::new(template)
+            .map(|replacement| template[replacement.span.start..replacement.span.end].to_string())
+            .collect();
+        if !refs.is_empty() {
+            sources.insert(key.clone(), refs.join(", "));
+        }
+    }
+    sources
+}
+
 async fn spicepod_secret_store_type(
     store: &SpicepodSecret,
     bootstrap_env: &dyn SecretStore,
@@ -988,8 +1044,19 @@ fn secret_selector(from: &str) -> Option<&str> {
     }
 }
 
+/// Bootstrap env store used to expand `${ env:KEY }` inside other stores'
+/// `params:`. It reads `.env` / `.env.local` into a private map and does
+/// **not** export them — [`Secrets::load_from`] already exported the default
+/// dotenv files before the store loop.
 fn load_default_store() -> Arc<dyn SecretStore> {
     Arc::new(EnvSecretStoreBuilder::new().build())
+}
+
+/// Registered default env store (no `file_path`): load `.env` / `.env.local`
+/// and export them into the process environment without overwrite, so
+/// libraries that read `std::env` directly keep working.
+fn load_default_store_exporting() -> Arc<dyn SecretStore> {
+    Arc::new(EnvSecretStoreBuilder::new().export_to_process_env().build())
 }
 
 /// Loads the secret store from the provided secret store type.
@@ -1003,6 +1070,8 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
             let mut builder = EnvSecretStoreBuilder::new();
             if let Some(path) = config.file_path {
                 builder = builder.with_path(path);
+            } else {
+                builder = builder.export_to_process_env();
             }
             Ok(Arc::new(builder.build()) as Arc<dyn SecretStore>)
         }
@@ -1083,23 +1152,13 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
 mod tests {
     use async_trait::async_trait;
     use secrecy::ExposeSecret;
-    use tokio::sync::{Mutex, MutexGuard};
+    use tokio::sync::MutexGuard;
 
-    /// Global lock serializing any test that mutates process environment
-    /// variables. Required because `std::env::set_var`/`remove_var` are
-    /// `unsafe` on Rust 2024 — they are not sound to call concurrently
-    /// with any other thread reading or writing env vars. `cargo test`
-    /// runs tests in parallel by default, so without this lock two env
-    /// tests could step on each other and trip the safety contract.
-    ///
-    /// `tokio::sync::Mutex` (rather than `std::sync::Mutex`) because the
-    /// guard is held across `.await`s in the async test bodies — holding
-    /// a sync mutex across await would block other tasks on the same
-    /// runtime thread and clippy flags it as `await_holding_lock`.
-    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
-
+    /// Serializes tests that mutate the process environment. Shares the
+    /// lock with `stores::env` tests so a lib test and an env-store test
+    /// cannot race on `std::env`.
     pub(super) async fn lock_env() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().await
+        crate::stores::env::ENV_TEST_MUTEX.lock().await
     }
 
     struct MockClusterSecretExpander;
@@ -2143,7 +2202,14 @@ params:
             panic!("invalid auth_method should have been rejected");
         };
         let msg = err.to_string();
-        assert!(msg.contains("oauth"), "got {msg}");
+        assert!(
+            msg.contains("auth_method"),
+            "error must name the parameter; got {msg}"
+        );
+        assert!(
+            !msg.contains("oauth"),
+            "rejected values must not be echoed; got {msg}"
+        );
         assert!(
             msg.contains("service_principal") && msg.contains("managed_identity"),
             "error must list the allowed values; got {msg}"
@@ -2353,7 +2419,14 @@ params:
             panic!("invalid hashicorp_vault_auth_method should have been rejected");
         };
         let msg = err.to_string();
-        assert!(msg.contains("oauth"), "got {msg}");
+        assert!(
+            msg.contains("hashicorp_vault_auth_method"),
+            "error must name the parameter; got {msg}"
+        );
+        assert!(
+            !msg.contains("oauth"),
+            "rejected values must not be echoed; got {msg}"
+        );
         assert!(
             msg.contains("approle") && msg.contains("kubernetes"),
             "error must list the allowed values; got {msg}"
@@ -2604,5 +2677,427 @@ param3: ${ secrets:MY_VAR }
         // only the last occurrence is kept
         assert_eq!(refs.len(), 1);
         assert_eq!(refs.get("MY_VAR"), Some(&"secrets".to_string()));
+    }
+
+    #[test]
+    fn secret_sources_from_templates_keeps_original_reference_text() {
+        let params = std::collections::HashMap::from([
+            ("csv_has_header".to_string(), "${ env:PG_PW }".to_string()),
+            ("file_format".to_string(), "csv".to_string()),
+            (
+                "mixed".to_string(),
+                "user=${env:USER} host=${ secrets:HOST }".to_string(),
+            ),
+        ]);
+        let sources = super::secret_sources_from_templates(&params);
+        assert_eq!(
+            sources.get("csv_has_header").map(String::as_str),
+            Some("${ env:PG_PW }")
+        );
+        assert!(
+            !sources.contains_key("file_format"),
+            "literal values are not secret-derived"
+        );
+        assert_eq!(
+            sources.get("mixed").map(String::as_str),
+            Some("${env:USER}, ${ secrets:HOST }")
+        );
+    }
+
+    #[test]
+    fn secret_sources_from_templates_records_partial_interpolation() {
+        let params = std::collections::HashMap::from([(
+            "client_timeout".to_string(),
+            "1e${ env:SECRET }".to_string(),
+        )]);
+        let sources = super::secret_sources_from_templates(&params);
+        assert_eq!(
+            sources.get("client_timeout").map(String::as_str),
+            Some("${ env:SECRET }"),
+            "a secret fragment still marks the whole parameter secret-derived"
+        );
+    }
+
+    fn parse_echoing_timeout(raw: &str) -> Result<u64, String> {
+        if let Some(tail) = raw.strip_prefix("1e")
+            && tail.chars().all(|c| c.is_ascii_digit())
+        {
+            return Err(format!("Exponent magnitude {tail} exceeds maximum (20)"));
+        }
+        raw.parse::<u64>().map_err(|e| e.to_string())
+    }
+
+    /// Test fixture for partial secret interpolation through
+    /// [`super::typed_params_from_templates`].
+    #[derive(Debug, runtime_parameters_derive::TypedParams)]
+    #[params(prefix = "test")]
+    struct PartialSecretTimeoutParams {
+        /// Total request timeout.
+        #[expect(dead_code)]
+        #[param(runtime, parse_with = parse_echoing_timeout)]
+        client_timeout: Option<u64>,
+    }
+
+    #[tokio::test]
+    async fn typed_params_from_templates_partial_interpolation_does_not_echo_secret() {
+        let _env_guard = lock_env().await;
+        // Fixed and digit-free: the expected message names the key, so a random
+        // numeric suffix could itself contain the `1234` canary.
+        let key = "SPICE_TEST_PARTIAL_SECRET_TIMEOUT";
+        unsafe { std::env::set_var(key, "1234") };
+
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[])
+            .await
+            .expect("default env store should load");
+
+        let templates = std::collections::HashMap::from([(
+            "client_timeout".to_string(),
+            format!("1e${{ env:{key} }}"),
+        )]);
+        let source = format!("${{ env:{key} }}");
+        let err = super::typed_params_from_templates::<PartialSecretTimeoutParams>(
+            "test component",
+            &std::sync::Arc::new(tokio::sync::RwLock::new(secrets)),
+            &templates,
+        )
+        .await
+        .expect_err("1e1234 is not a valid timeout");
+        let message = err.to_string();
+        assert!(
+            !message.contains("1234"),
+            "secret-derived parse errors must not echo a secret substring: {message}"
+        );
+        assert!(
+            !message.contains("Exponent"),
+            "secret-derived parse errors must not surface parser text: {message}"
+        );
+        assert_eq!(
+            message,
+            format!("invalid value for `client_timeout` from {source}; expected a valid value")
+        );
+
+        unsafe { std::env::remove_var(key) };
+    }
+
+    fn write_env_file(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).expect("write env file");
+    }
+
+    struct CwdGuard {
+        prev: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(path: &std::path::Path) -> Self {
+            let prev = std::env::current_dir().expect("cwd");
+            std::env::set_current_dir(path).expect("chdir");
+            Self { prev }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
+
+    fn spicepod_env_store(
+        name: &str,
+        file_path: Option<&std::path::Path>,
+    ) -> spicepod::component::secret::Secret {
+        let params = file_path.map(|path| {
+            spicepod::param::Params::from_string_map(std::collections::HashMap::from([(
+                "file_path".to_string(),
+                path.display().to_string(),
+            )]))
+        });
+        spicepod::component::secret::Secret {
+            from: "env".to_string(),
+            name: name.to_string(),
+            description: None,
+            params,
+        }
+    }
+
+    /// Docs example: `[env, {from: env, name: custom, params: {file_path}}]`.
+    /// Last store wins for `${ secrets:KEY }`.
+    #[tokio::test]
+    async fn load_from_last_env_store_wins_for_secrets_sentinel() {
+        let _guard = lock_env().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let _cwd = CwdGuard::enter(temp_dir.path());
+        write_env_file(
+            &temp_dir.path().join(".env.local"),
+            "C1_LOAD_KEY=from_dotenv_local\n",
+        );
+        write_env_file(&temp_dir.path().join(".env"), "C1_LOAD_KEY=from_dotenv\n");
+        let custom = temp_dir.path().join("custom.env");
+        write_env_file(&custom, "C1_LOAD_KEY=from_custom\n");
+
+        unsafe {
+            std::env::remove_var("C1_LOAD_KEY");
+        }
+
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[
+                spicepod_env_store("env", None),
+                spicepod_env_store("custom", Some(&custom)),
+            ])
+            .await
+            .expect("load_from");
+
+        let value = secrets
+            .get_secret("C1_LOAD_KEY")
+            .await
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(
+            value.expose_secret(),
+            "from_custom",
+            "the last-declared env store must win for `${{ secrets:KEY }}`"
+        );
+
+        let custom_value = secrets
+            .get_secret_from_stores(
+                "C1_LOAD_KEY",
+                &std::collections::HashSet::from(["custom".to_string()]),
+            )
+            .await
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(
+            custom_value.expose_secret(),
+            "from_custom",
+            "`${{ custom:KEY }}` must resolve from the file_path store"
+        );
+
+        unsafe {
+            std::env::remove_var("C1_LOAD_KEY");
+        }
+    }
+
+    /// A spicepod that only declares a `file_path` store must not inherit
+    /// project `.env` / `.env.local` via the bootstrap store.
+    #[tokio::test]
+    async fn load_from_file_path_only_does_not_see_dotenv() {
+        let _guard = lock_env().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let _cwd = CwdGuard::enter(temp_dir.path());
+        write_env_file(
+            &temp_dir.path().join(".env.local"),
+            "C1_S8_KEY=from_dotenv_local\n",
+        );
+        let custom = temp_dir.path().join("custom.env");
+        write_env_file(&custom, "C1_S8_KEY=from_custom\n");
+
+        unsafe {
+            std::env::remove_var("C1_S8_KEY");
+        }
+
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[spicepod_env_store("custom", Some(&custom))])
+            .await
+            .expect("load_from");
+
+        let value = secrets
+            .get_secret_from_stores(
+                "C1_S8_KEY",
+                &std::collections::HashSet::from(["custom".to_string()]),
+            )
+            .await
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(
+            value.expose_secret(),
+            "from_custom",
+            "file_path-only configuration must return the custom file, not .env.local"
+        );
+
+        unsafe {
+            std::env::remove_var("C1_S8_KEY");
+        }
+    }
+
+    /// `${ custom:KEY }` with a process-env override still returns the file
+    /// value: a `file_path` store is isolated from the process environment.
+    #[tokio::test]
+    async fn load_from_file_path_store_beats_process_env() {
+        let _guard = lock_env().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let custom = temp_dir.path().join("custom.env");
+        write_env_file(&custom, "C1_S6_KEY=from_custom\n");
+
+        unsafe {
+            std::env::set_var("C1_S6_KEY", "from_process");
+        }
+
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[
+                spicepod_env_store("env", None),
+                spicepod_env_store("custom", Some(&custom)),
+            ])
+            .await
+            .expect("load_from");
+
+        let value = secrets
+            .get_secret_from_stores(
+                "C1_S6_KEY",
+                &std::collections::HashSet::from(["custom".to_string()]),
+            )
+            .await
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(
+            value.expose_secret(),
+            "from_custom",
+            "`${{ custom:KEY }}` must return the file_path value even when the process env differs"
+        );
+
+        unsafe {
+            std::env::remove_var("C1_S6_KEY");
+        }
+    }
+
+    #[cfg(feature = "aws-secrets-manager")]
+    fn spicepod_aws_store(name: &str, secret_name: &str) -> spicepod::component::secret::Secret {
+        spicepod::component::secret::Secret {
+            from: format!("aws_secrets_manager:{secret_name}"),
+            name: name.to_string(),
+            description: None,
+            params: Some(spicepod::param::Params::from_string_map(
+                std::collections::HashMap::from([("region".to_string(), "us-east-1".to_string())]),
+            )),
+        }
+    }
+
+    fn spicepod_kubernetes_store(
+        name: &str,
+        secret_name: &str,
+    ) -> spicepod::component::secret::Secret {
+        spicepod::component::secret::Secret {
+            from: format!("kubernetes:{secret_name}"),
+            name: name.to_string(),
+            description: None,
+            params: None,
+        }
+    }
+
+    /// Keys written to `.env` for the dotenv-export tests. Dummy markers only.
+    const DOTENV_EXPORT_KEY: &str = "SPICE_TEST_DOTENV_EXPORT_KEY";
+    const DOTENV_EXPORT_VALUE: &str = "from_dotenv";
+    const DOTENV_AWS_ACCESS_KEY_ID: &str = "SPICE_TEST_DOTENV_AWS_ACCESS_KEY_ID";
+    const DOTENV_AWS_SECRET_ACCESS_KEY: &str = "SPICE_TEST_DOTENV_AWS_SECRET_ACCESS_KEY";
+    const DOTENV_AWS_REGION: &str = "SPICE_TEST_DOTENV_AWS_REGION";
+
+    fn write_dotenv_export_files(dir: &std::path::Path) {
+        write_env_file(
+            &dir.join(".env"),
+            &format!(
+                "{DOTENV_EXPORT_KEY}={DOTENV_EXPORT_VALUE}\n\
+                 {DOTENV_AWS_ACCESS_KEY_ID}=from_dotenv_akid\n\
+                 {DOTENV_AWS_SECRET_ACCESS_KEY}=from_dotenv_sak\n\
+                 {DOTENV_AWS_REGION}=from_dotenv_region\n"
+            ),
+        );
+    }
+
+    fn clear_dotenv_export_vars() {
+        unsafe {
+            std::env::remove_var(DOTENV_EXPORT_KEY);
+            std::env::remove_var(DOTENV_AWS_ACCESS_KEY_ID);
+            std::env::remove_var(DOTENV_AWS_SECRET_ACCESS_KEY);
+            std::env::remove_var(DOTENV_AWS_REGION);
+        }
+    }
+
+    fn assert_dotenv_exported_to_process_env(context: &str) {
+        assert_eq!(
+            std::env::var(DOTENV_EXPORT_KEY).as_deref(),
+            Ok(DOTENV_EXPORT_VALUE),
+            "{context}: default `.env` must be exported to the process environment"
+        );
+        assert_eq!(
+            std::env::var(DOTENV_AWS_ACCESS_KEY_ID).as_deref(),
+            Ok("from_dotenv_akid"),
+            "{context}: AWS access-key marker from `.env` must be in process env"
+        );
+        assert_eq!(
+            std::env::var(DOTENV_AWS_SECRET_ACCESS_KEY).as_deref(),
+            Ok("from_dotenv_sak"),
+            "{context}: AWS secret-key marker from `.env` must be in process env"
+        );
+        assert_eq!(
+            std::env::var(DOTENV_AWS_REGION).as_deref(),
+            Ok("from_dotenv_region"),
+            "{context}: AWS region marker from `.env` must be in process env"
+        );
+    }
+
+    /// AWS listed before `env` must still see `.env` creds in process env
+    /// (STS / the AWS SDK default chain read `std::env` during init).
+    #[cfg(feature = "aws-secrets-manager")]
+    #[tokio::test]
+    async fn load_from_exports_dotenv_when_aws_is_listed_before_env() {
+        let _guard = lock_env().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let _cwd = CwdGuard::enter(temp_dir.path());
+        write_dotenv_export_files(temp_dir.path());
+        clear_dotenv_export_vars();
+
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[
+                spicepod_aws_store("aws", "test-secret"),
+                spicepod_env_store("env", None),
+            ])
+            .await
+            .expect("load_from must not abort when AWS init fails");
+
+        assert_dotenv_exported_to_process_env("aws-before-env");
+        clear_dotenv_export_vars();
+    }
+
+    /// A spicepod with only `aws_secrets_manager` still exports default `.env`.
+    #[cfg(feature = "aws-secrets-manager")]
+    #[tokio::test]
+    async fn load_from_exports_dotenv_when_only_aws_store() {
+        let _guard = lock_env().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let _cwd = CwdGuard::enter(temp_dir.path());
+        write_dotenv_export_files(temp_dir.path());
+        clear_dotenv_export_vars();
+
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[spicepod_aws_store("aws", "test-secret")])
+            .await
+            .expect("load_from must not abort when AWS init fails");
+
+        assert_dotenv_exported_to_process_env("aws-only");
+        clear_dotenv_export_vars();
+    }
+
+    /// A spicepod with only `kubernetes` still exports default `.env`.
+    #[tokio::test]
+    async fn load_from_exports_dotenv_when_only_kubernetes_store() {
+        let _guard = lock_env().await;
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let _cwd = CwdGuard::enter(temp_dir.path());
+        write_dotenv_export_files(temp_dir.path());
+        clear_dotenv_export_vars();
+
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[spicepod_kubernetes_store("k8s", "test-secret")])
+            .await
+            .expect("load_from must not abort when Kubernetes init fails");
+
+        assert_dotenv_exported_to_process_env("kubernetes-only");
+        clear_dotenv_export_vars();
     }
 }

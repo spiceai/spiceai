@@ -29,6 +29,10 @@ limitations under the License.
 //! family, so the surface needs only two runtimes between them.
 
 #![recursion_limit = "256"]
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
 
 // Accelerator engines are their own crates and self-register through a linkme slice. Each
 // integration test is a separate binary that links independently, and the linker drops an

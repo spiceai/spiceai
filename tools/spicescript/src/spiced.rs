@@ -32,6 +32,10 @@ use crate::docker::free_port;
 
 const ERROR_GRACE: Duration = Duration::from_secs(20);
 
+/// How long to wait, once `/v1/ready` has answered 200, for datasets still
+/// reported as loading.
+const SETTLE_AFTER_READY: Duration = Duration::from_secs(30);
+
 pub struct Spiced {
     pub binary: PathBuf,
     pub dir: PathBuf,
@@ -52,6 +56,8 @@ pub struct Spiced {
     tls_ca: Option<PathBuf>,
     /// Arguments passed to `spiced` after the endpoint flags.
     extra_args: Vec<String>,
+    /// The datasets the spicepod of the latest start declares.
+    declared_datasets: Vec<String>,
     /// Flight SQL clients kept by session name, for statements that share one.
     sessions: std::collections::HashMap<
         String,
@@ -95,6 +101,7 @@ impl Spiced {
             otel: free_port()?,
             child: None,
             flight_client: None,
+            declared_datasets: Vec::new(),
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
                 .build()?,
@@ -217,6 +224,7 @@ impl Spiced {
             bail!("spiced is already running");
         }
         std::fs::write(self.dir.join("spicepod.yaml"), spicepod_yaml)?;
+        self.declared_datasets = declared_datasets(spicepod_yaml);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -374,6 +382,7 @@ impl Spiced {
             if let Ok(r) = self.http_client.get(&url).send().await
                 && r.status().is_success()
             {
+                self.wait_loaded_after_ready().await;
                 return self.wait_flight(deadline, timeout).await;
             }
             // A dataset can report `Error` while it retries a transient
@@ -481,6 +490,36 @@ impl Spiced {
     pub async fn ready(&self) -> bool {
         let url = format!("{}://127.0.0.1:{}/v1/ready", self.scheme(), self.http);
         matches!(self.http_client.get(url).send().await, Ok(r) if r.status().is_success())
+    }
+
+    /// On loaded CI runners, `/v1/ready` has answered 200 before the
+    /// spicepod's datasets were registered (the runtime's own components were
+    /// ready, and the datasets not yet known), so a query found its table
+    /// missing. So once ready, wait up to [`SETTLE_AFTER_READY`] for every
+    /// declared dataset to be listed and loaded, and say so in the script's
+    /// output: that line is the evidence of readiness reported early.
+    async fn wait_loaded_after_ready(&self) {
+        let loading = not_yet_loaded(
+            &self.dataset_status().await.unwrap_or_default(),
+            &self.declared_datasets,
+        );
+        if loading.is_empty() {
+            return;
+        }
+        crate::runner::emit(&format!(
+            "   /v1/ready answered 200 while datasets were still loading: {}; waiting up to {SETTLE_AFTER_READY:?} for them",
+            loading.join(", ")
+        ));
+        let deadline = tokio::time::Instant::now() + SETTLE_AFTER_READY;
+        while tokio::time::Instant::now() < deadline
+            && !not_yet_loaded(
+                &self.dataset_status().await.unwrap_or_default(),
+                &self.declared_datasets,
+            )
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     async fn dataset_status(&self) -> Result<String> {
@@ -829,5 +868,74 @@ impl Drop for Spiced {
         if let Some(run) = &self.container {
             crate::cleanup::remove_if_tracked(&run.name);
         }
+    }
+}
+
+/// The names of the datasets a spicepod declares.
+fn declared_datasets(spicepod_yaml: &str) -> Vec<String> {
+    let Ok(spicepod) = yaml::from_str::<serde_json::Value>(spicepod_yaml) else {
+        return Vec::new();
+    };
+    spicepod
+        .get("datasets")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The datasets of `declared` that `/v1/datasets?status=true` (its body,
+/// `text`) does not list yet, then those it reports as not loaded:
+/// `Initializing` or `NotLoaded`.
+fn not_yet_loaded(text: &str, declared: &[String]) -> Vec<String> {
+    let list = match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Array(list)) => list,
+        _ => Vec::new(),
+    };
+    let listed: std::collections::BTreeSet<&str> = list
+        .iter()
+        .filter_map(|d| d.get("name").and_then(serde_json::Value::as_str))
+        .collect();
+    let missing = declared
+        .iter()
+        .filter(|name| !listed.contains(name.as_str()))
+        .cloned();
+    let loading = list
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.get("status").and_then(serde_json::Value::as_str),
+                Some("Initializing" | "NotLoaded")
+            )
+        })
+        .filter_map(|d| d.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_string);
+    missing.chain(loading).collect()
+}
+
+#[cfg(test)]
+mod not_yet_loaded_tests {
+    use super::{declared_datasets, not_yet_loaded};
+
+    #[test]
+    fn names_the_declared_datasets_not_listed_or_loaded_yet() {
+        let declared = declared_datasets(
+            "version: v1\nkind: Spicepod\nname: p\ndatasets:\n  - from: postgres:a\n    name: a\n  - from: postgres:u\n    name: u\n  - { from: 'postgres:b', name: b }\n",
+        );
+        assert_eq!(declared, ["a", "u", "b"]);
+        let text = r#"[
+            {"name": "a", "status": "Ready"},
+            {"name": "b", "status": "Initializing"},
+            {"name": "c", "status": "Error", "error_message": "x"},
+            {"name": "d", "status": "NotLoaded"},
+            {"name": "e", "status": "Refreshing"}
+        ]"#;
+        assert_eq!(not_yet_loaded(text, &declared), ["u", "b", "d"]);
+        // Nothing listed yet: every declared dataset is missing.
+        assert_eq!(not_yet_loaded("[]", &declared), ["a", "u", "b"]);
+        assert!(not_yet_loaded("[]", &[]).is_empty());
+        assert!(declared_datasets("not: [yaml").is_empty());
     }
 }

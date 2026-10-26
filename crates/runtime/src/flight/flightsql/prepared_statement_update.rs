@@ -24,7 +24,6 @@ use arrow_flight::{
     sql::{self, CommandPreparedStatementUpdate, DoPutPreparedStatementResult, ProstMessageExt},
 };
 use arrow_schema::SchemaRef;
-use postcard::{from_bytes, to_stdvec};
 use prost::Message;
 use std::sync::{Arc, LazyLock};
 use tokio_stream::{StreamExt, adapters::Peekable};
@@ -33,9 +32,9 @@ use tonic::{Request, Response, Status, Streaming};
 use arrow_tools::map_entries::MapEntriesNormalizer;
 
 use super::DecodableSchema;
+use super::prepared_statement_handle;
 use super::prepared_statement_query::{
-    PreparedStatement, decode_param_values, encode_single_row_parameters, error_to_status,
-    param_error_to_status,
+    PreparedStatement, decode_param_values, encode_single_row_parameters, param_error_to_status,
 };
 use crate::flight::is_auth_read_only;
 use crate::{
@@ -115,7 +114,7 @@ pub(crate) async fn do_get(
         query: sql,
         parameters,
         parameter_schema: _,
-    } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
+    } = prepared_statement_handle::open(&query.prepared_statement_handle)?;
 
     let parameters = decode_param_values(&parameters).map_err(param_error_to_status)?;
 
@@ -204,10 +203,9 @@ pub(crate) async fn do_put_update(
     let normalizer = MapEntriesNormalizer::for_schema(&schema);
     let parameters = encode_single_row_parameters(&mut decoder, &normalizer).await?;
 
-    let mut stmt: PreparedStatement =
-        from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
+    let mut stmt = prepared_statement_handle::open(&query.prepared_statement_handle)?;
     stmt.parameters = parameters;
-    let handle = to_stdvec(&stmt).map_err(error_to_status)?;
+    let handle = prepared_statement_handle::seal(&stmt)?;
 
     let result = DoPutPreparedStatementResult {
         prepared_statement_handle: Some(handle.into()),

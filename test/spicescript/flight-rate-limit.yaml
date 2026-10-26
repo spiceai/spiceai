@@ -1,0 +1,45 @@
+name: flight-rate-limit
+description: >
+  Flight DoPut is limited to 100 requests a minute by default: a burst of
+  100, refilled at that rate, so a quick run of 150 is refused partway
+  through saying so, while every write before the refusal is kept; with
+  runtime.flight.do_put_rate_limit_enabled false, 150 in a row are all
+  accepted.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  limited: {}
+  unlimited: { spicepod: { runtime: { flight: { do_put_rate_limit_enabled: false } } } }
+
+# DoPut requires an API key.
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: flight-rate-limit
+  runtime: { auth: { api-key: { enabled: true, keys: ['writer:rw'] } } }
+  datasets:
+    - from: postgres:public.items
+      name: items
+      params: ${sources.src.params}
+      access: read_write
+      acceleration: { enabled: true, engine: cayenne, mode: file, write_mode: acceleration, primary_key: id }
+
+defaults:
+  api-key: writer
+  compare-variants: false
+
+steps:
+  - source-exec: { src: "CREATE TABLE items (id bigint PRIMARY KEY, name text)" }
+  - start: {}
+  # 150 within about 30 s: more than the burst plus what refills meanwhile,
+  # however busy the machine.
+  - flight-put: { dataset: items, rows: [[1, one]], times: 150 }
+    expect-error: Too many requests
+    only: limited
+  - flight-put: { dataset: items, rows: [[1, one]], times: 150 }
+    only: unlimited
+  - query: SELECT id, name FROM items
+    expect: { rows: [['1', one]] }
