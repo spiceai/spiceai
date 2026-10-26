@@ -4,5 +4,8 @@
   "snapshots-object-store": 9,
   "snapshots-policies": 34,
   "snapshots-reader": 24,
+  "snapshots-reader-concurrent": 60,
+  "snapshots-reader-source-fallback": 55,
+  "snapshots-reader-without-source": 206,
   "snapshots-writer-lease": 52
 }
