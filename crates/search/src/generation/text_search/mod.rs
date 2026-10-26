@@ -40,12 +40,12 @@ use futures::Stream;
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
 use tantivy::{
-    DocAddress, Score, Searcher, TantivyError,
+    DocAddress, IndexReader, Score, Searcher, TantivyError,
     collector::TopDocs,
     query::{BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
     schema::{FieldType, OwnedValue},
-    tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer},
+    tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer, TokenizerManager},
 };
 
 use super::{CandidateGeneration, Result as GenerationResult};
@@ -195,7 +195,7 @@ impl Error {
 impl std::fmt::Debug for FullTextSearchFieldIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FullTextSearchFieldIndex")
-            .field("schema", self.reader.schema())
+            .field("schema", &self.index_schema)
             .field("field", &self.field)
             .field("primary_key", &self.primary_key)
             .field("type_hints", &self.type_hints)
@@ -206,8 +206,13 @@ impl std::fmt::Debug for FullTextSearchFieldIndex {
 /// A [`FullTextSearchFieldIndex`] performs a search on a [`tantivy::Index`]  for a single field of a table.
 #[derive(Clone)]
 pub struct FullTextSearchFieldIndex {
-    // These are components from a [`tantivy::Index`] required to perform a search on a  [`tantivy::Index`] at a given commit.
-    reader: tantivy::Searcher,
+    /// A reader, not a [`Searcher`], so an instance that outlives one query (for example, in a
+    /// cached logical plan) still searches the latest commit. Each search takes its own
+    /// [`Searcher`] when it executes.
+    reader: IndexReader,
+    /// Schema and tokenizers of the underlying [`tantivy::Index`]. These do not change between commits.
+    index_schema: tantivy::schema::Schema,
+    tokenizers: TokenizerManager,
 
     pub field: String,
     pub primary_key: Vec<String>,
@@ -222,20 +227,20 @@ pub struct FullTextSearchFieldIndex {
 }
 
 impl FullTextSearchFieldIndex {
-    pub fn try_new(
-        index_search: Searcher,
-        field: String,
-        primary_key: Vec<String>,
-    ) -> Result<Self> {
-        let stored_columns: HashSet<String> = index_search
-            .schema()
+    pub fn try_new(reader: IndexReader, field: String, primary_key: Vec<String>) -> Result<Self> {
+        let searcher = reader.searcher();
+        let index_schema = searcher.schema().clone();
+        let tokenizers = searcher.index().tokenizers().clone();
+        let stored_columns: HashSet<String> = index_schema
             .fields()
             .filter(|&(_, f)| f.is_stored())
             .map(|(_, f)| f.name().to_string())
             .collect();
 
         let fts = Self {
-            reader: index_search,
+            reader,
+            index_schema,
+            tokenizers,
             field,
             primary_key,
             stored_columns,
@@ -265,7 +270,7 @@ impl FullTextSearchFieldIndex {
     /// Schema is based on the [`tantivy::schema::Schema`] with `self.type_hints` applied.
     /// Field order follows the underlying tantivy schema (not the `HashSet` cache).
     fn schema(&self) -> Arc<Schema> {
-        let search_schema = self.reader.schema();
+        let search_schema = &self.index_schema;
         let fields = search_schema
             .fields()
             .filter_map(|(_, f)| {
@@ -337,15 +342,14 @@ impl FullTextSearchFieldIndex {
 
     fn query_parser(&self) -> QueryParser {
         let default_field = self
-            .reader
-            .schema()
+            .index_schema
             .find_field(self.field.as_str())
             .map(|(f, _)| vec![f])
             .unwrap_or_default();
         QueryParser::new(
-            self.reader.schema().clone(),
+            self.index_schema.clone(),
             default_field,
-            self.reader.index().tokenizers().clone(),
+            self.tokenizers.clone(),
         )
     }
 
@@ -355,7 +359,7 @@ impl FullTextSearchFieldIndex {
     /// classification stays in lockstep with what [`Self::translate_filters`] can actually build.
     #[must_use]
     pub fn classify_filters(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
-        let schema = self.reader.schema();
+        let schema = &self.index_schema;
         filters
             .iter()
             .map(|f| tantivy_datafusion_filter::classify_filter(schema, f))
@@ -372,7 +376,7 @@ impl FullTextSearchFieldIndex {
         &self,
         filters: &[Expr],
     ) -> Result<Vec<Box<dyn Query>>, DataFusionError> {
-        let schema = self.reader.schema();
+        let schema = &self.index_schema;
         filters
             .iter()
             .map(|f| {
@@ -403,6 +407,7 @@ impl FullTextSearchFieldIndex {
     /// large `limit` doesn't force every matched document's stored fields into memory at once.
     fn search_top_docs(
         &self,
+        searcher: &Searcher,
         literal: &str,
         filters: &[Box<dyn Query>],
         limit: usize,
@@ -426,22 +431,27 @@ impl FullTextSearchFieldIndex {
             Box::new(BooleanQuery::new(clauses))
         };
 
-        self.reader
+        searcher
             .search(&q, &TopDocs::with_limit(limit).order_by_score())
             .context(TextSearchSnafu)
     }
 
     /// Resolve a slice of scored hits' stored document contents into JSON. Kept separate from
-    /// [`Self::search_top_docs`] so callers can decode `hits` in bounded chunks.
-    fn hits_to_json(&self, hits: &[(Score, DocAddress)]) -> Result<Vec<Value>> {
+    /// [`Self::search_top_docs`] so callers can decode `hits` in bounded chunks. `searcher` must
+    /// be the one that produced `hits`: a [`DocAddress`] is only valid for its segments.
+    fn hits_to_json(
+        &self,
+        searcher: &Searcher,
+        hits: &[(Score, DocAddress)],
+    ) -> Result<Vec<Value>> {
         hits.iter()
             .map(|&(score, addr)| {
                 let doc: HashMap<tantivy::schema::Field, OwnedValue> =
-                    self.reader.doc(addr).context(TextSearchSnafu)?;
+                    searcher.doc(addr).context(TextSearchSnafu)?;
 
                 let mut doc_w_col_names = doc
                     .into_iter()
-                    .map(|(f, v)| (self.reader.schema().get_field_name(f), v))
+                    .map(|(f, v)| (self.index_schema.get_field_name(f), v))
                     // `HashSet<String>::contains` accepts `&str` via `Borrow<str>`.
                     .filter(|(name, _)| self.stored_columns.contains(*name))
                     .collect::<HashMap<_, _>>();
@@ -577,7 +587,11 @@ fn make_stream(
             return;
         }
 
-        // Share the searcher into the blocking tasks that run synchronous tantivy work
+        // Take the searcher when the query runs, not when it is planned, so that a cached plan
+        // sees the latest commit. Scoring and document lookups below all use this one searcher.
+        let searcher = fts.reader.searcher();
+
+        // Share the index into the blocking tasks that run synchronous tantivy work
         // (mmap/disk reads + scoring + stored-field decode) off the async runtime thread
         // (which also serves `/health`, `/v1/search`).
         let fts = std::sync::Arc::new(fts);
@@ -588,9 +602,10 @@ fn make_stream(
         // a single pass avoids that, and these lightweight (score, address) pairs are cheap to
         // hold in full even when `limit` is large, unlike the stored documents they address.
         let blocking_fts = std::sync::Arc::clone(&fts);
+        let blocking_searcher = searcher.clone();
         let query = query.clone();
         let top_docs = match tokio::task::spawn_blocking(move || {
-            blocking_fts.search_top_docs(query.as_str(), filters.as_slice(), limit)
+            blocking_fts.search_top_docs(&blocking_searcher, query.as_str(), filters.as_slice(), limit)
         }).await {
             Ok(Ok(h)) => h,
             Ok(Err(e)) => {
@@ -609,8 +624,9 @@ fn make_stream(
         // time, so memory stays bounded by the batch size rather than by `limit`.
         for chunk in top_docs.chunks(DEFAULT_BATCH_SIZE) {
             let blocking_fts = std::sync::Arc::clone(&fts);
+            let blocking_searcher = searcher.clone();
             let chunk = chunk.to_vec();
-            let hits = match tokio::task::spawn_blocking(move || blocking_fts.hits_to_json(&chunk)).await {
+            let hits = match tokio::task::spawn_blocking(move || blocking_fts.hits_to_json(&blocking_searcher, &chunk)).await {
                 Ok(Ok(h)) => h,
                 Ok(Err(e)) => {
                     yield Err(DataFusionError::Internal(e.to_string()));
