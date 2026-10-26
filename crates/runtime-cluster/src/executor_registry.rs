@@ -2002,6 +2002,34 @@ mod tests {
         assert!(later_scheduler.is_current("exec-a", live.connection));
     }
 
+    /// A process that has dropped out of the cluster's record, after many later
+    /// processes registered under its id, is still a duplicate when it connects.
+    #[tokio::test]
+    async fn a_process_dropped_from_the_record_is_a_duplicate() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let earlier_scheduler = registry_over(&store).await;
+        let mut receivers = Vec::new();
+        for run in 0..10 {
+            let (tx, rx) = mpsc::channel(1);
+            receivers.push(rx);
+            earlier_scheduler
+                .register("exec-a".to_string(), &format!("run-{run:02}"), tx)
+                .await;
+        }
+
+        let later_scheduler = registry_over(&store).await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let live = later_scheduler
+            .register("exec-a".to_string(), "run-09", tx1)
+            .await;
+        let forgotten = later_scheduler
+            .register("exec-a".to_string(), "run-00", tx2)
+            .await;
+        assert_eq!(forgotten.registration, ExecutorRegistration::Duplicate);
+        assert!(later_scheduler.is_current("exec-a", live.connection));
+    }
+
     /// A process that replaces an executor is a restart even when its id sorts
     /// before its predecessor's, as when it starts on a host whose clock reads
     /// earlier. Its endpoint replaces the predecessor's, and the predecessor is

@@ -56,6 +56,10 @@ struct ExecutorEntry {
     admitted_at_ms: u64,
     /// The latest processes, oldest first.
     processes: Vec<AdmittedProcess>,
+    /// The greatest id among processes no longer in `processes`. A process
+    /// that is not recorded and whose id does not sort after it is one of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    forgotten_through: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +140,20 @@ impl ExecutorProcessOrder {
                         superseded: position + 1 < entry.processes.len(),
                     }));
                 }
+                if let Some(entry) = order.executors.get(executor_id)
+                    && entry
+                        .forgotten_through
+                        .as_deref()
+                        .is_some_and(|forgotten| process_id <= forgotten)
+                {
+                    return Ok(Change::Keep(Admission {
+                        generation: entry
+                            .processes
+                            .first()
+                            .map_or(0, |oldest| oldest.generation.saturating_sub(1)),
+                        superseded: true,
+                    }));
+                }
                 order.executors.retain(|id, entry| {
                     id == executor_id
                         || is_connected(id)
@@ -149,6 +167,7 @@ impl ExecutorProcessOrder {
                     .or_insert_with(|| ExecutorEntry {
                         admitted_at_ms: now_ms,
                         processes: Vec::new(),
+                        forgotten_through: None,
                     });
                 entry.admitted_at_ms = now_ms;
                 entry.processes.push(AdmittedProcess {
@@ -156,7 +175,14 @@ impl ExecutorProcessOrder {
                     generation,
                 });
                 if entry.processes.len() > PROCESSES_KEPT {
-                    entry.processes.remove(0);
+                    let forgotten = entry.processes.remove(0).process_id;
+                    if entry
+                        .forgotten_through
+                        .as_ref()
+                        .is_none_or(|through| forgotten > *through)
+                    {
+                        entry.forgotten_through = Some(forgotten);
+                    }
                 }
                 Ok(Change::Write(
                     order,
@@ -257,5 +283,24 @@ mod tests {
             .collect();
         assert_eq!(kept.len(), PROCESSES_KEPT);
         assert_eq!(kept.first(), Some(&"run-1"));
+    }
+
+    /// A process that is no longer recorded is still known to be superseded
+    /// when it connects again, while a later process is still new.
+    #[tokio::test]
+    async fn a_forgotten_process_is_superseded() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let order = order_over(&store);
+        for run in 0..=PROCESSES_KEPT {
+            admit(&order, "exec-a", &format!("run-{run:02}")).await;
+        }
+
+        let forgotten = admit(&order, "exec-a", "run-00").await;
+        assert!(forgotten.superseded);
+        let oldest_kept = admit(&order, "exec-a", "run-01").await;
+        assert!(forgotten.generation < oldest_kept.generation);
+
+        let later = admit(&order, "exec-a", "run-10").await;
+        assert!(!later.superseded);
     }
 }
