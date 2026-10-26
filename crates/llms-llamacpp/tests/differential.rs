@@ -34,7 +34,7 @@ async fn local_gguf() -> PathBuf {
     llms::chat::hf_files::download_model(
         &format!("{MODEL}:{REVISION}"),
         &[FILE],
-        None,
+        llms::chat::hf_files::Budget::Unmeasured,
         llms::hf::HubParams::default(),
         "qwen3-0.6b",
     )

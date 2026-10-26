@@ -93,9 +93,10 @@ llms::register_local_chat_engine!(
     }
 );
 
-/// The memory llama.cpp's devices have free for a model, for choosing a quantization.
+/// The memory free for a model, for choosing a quantization: on llama.cpp's GPUs, or on a
+/// machine without one, the memory this process can still use.
 fn free_memory() -> Option<u64> {
-    llama_cpp::free_memory(Backend::get())
+    llama_cpp::gpu_free_memory(Backend::get()).or_else(runtime_resources::get_available_memory)
 }
 
 /// llama.cpp serves a model whose weights are all GGUF files: shards of one model, and an

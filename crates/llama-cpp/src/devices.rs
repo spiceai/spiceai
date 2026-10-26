@@ -18,11 +18,11 @@ limitations under the License.
 
 use crate::{Backend, sys};
 
-/// The memory, in bytes, free for a model on the devices llama.cpp places it on: its GPUs
-/// when it has any (a unified-memory GPU reports the memory it may use of the system's), and
-/// otherwise the CPU's. `None` when the registry reports no device or no memory.
+/// The memory, in bytes, free for a model on llama.cpp's GPUs (a unified-memory GPU reports the
+/// memory it may use of the system's). `None` without a GPU: the CPU device reports the
+/// machine's whole memory as free, whatever is in use.
 #[must_use]
-pub fn free_memory(_backend: &Backend) -> Option<u64> {
+pub fn gpu_free_memory(_backend: &Backend) -> Option<u64> {
     // SAFETY: the registry holds `count` devices, which it never frees.
     let count = unsafe { sys::ggml_backend_dev_count() };
     let devices: Vec<(sys::ggml_backend_dev_type, u64)> = (0..count)
@@ -46,14 +46,5 @@ pub fn free_memory(_backend: &Backend) -> Option<u64> {
         .filter(|(kind, _)| gpu(kind))
         .map(|(_, free)| free)
         .sum();
-    let free = if on_gpus > 0 {
-        on_gpus
-    } else {
-        devices
-            .iter()
-            .filter(|(kind, _)| *kind == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_CPU)
-            .map(|(_, free)| *free)
-            .sum()
-    };
-    (free > 0).then_some(free)
+    (on_gpus > 0).then_some(on_gpus)
 }

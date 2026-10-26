@@ -194,6 +194,17 @@ pub fn quantizations(listing: &[ListedFile]) -> Vec<Quantization> {
             complete.push((dir, stem, files));
         }
     }
+    // A quantization offered both merged and split (`M-Q4_K_M.gguf` beside its shards) is one
+    // quantization in two layouts: the merged file stands for it, and a shard's path still
+    // loads the series.
+    let merged: BTreeSet<(String, String)> = complete
+        .iter()
+        .filter(|(_, _, files)| shard(files[0]).is_none())
+        .map(|(dir, stem, _)| (dir.clone(), stem.trim_end_matches(".gguf").to_string()))
+        .collect();
+    complete.retain(|(dir, stem, files)| {
+        shard(files[0]).is_none() || !merged.contains(&(dir.clone(), stem.clone()))
+    });
     let mut in_folder: BTreeMap<String, usize> = BTreeMap::new();
     for (dir, _, _) in &complete {
         *in_folder.entry(dir.clone()).or_default() += 1;
@@ -699,6 +710,39 @@ mod tests {
         assert_eq!(pinned.weights, chosen.files);
     }
 
+    /// One quantization offered merged and split, beside another.
+    fn merged_and_split() -> Vec<ListedFile> {
+        listing(&[
+            ("M-Q4_K_M.gguf", 4 * GB),
+            ("M-Q4_K_M-00001-of-00002.gguf", 2 * GB),
+            ("M-Q4_K_M-00002-of-00002.gguf", 2 * GB),
+            ("M-Q8_0.gguf", 8 * GB),
+        ])
+    }
+
+    #[test]
+    fn a_quantization_offered_merged_and_split_is_one_quantization() {
+        let qs = quantizations(&merged_and_split());
+        assert_eq!(names(&qs), ["Q8_0", "Q4_K_M"]);
+        assert_eq!(qs[1].files, ["M-Q4_K_M.gguf"]);
+        let chosen = choose(&qs, 5 * GB).expect("Q4_K_M fits");
+        let pinned = resolve(&merged_and_split(), &[chosen.name.as_str()])
+            .expect("resolves")
+            .expect("names weights");
+        assert_eq!(pinned.weights, chosen.files);
+        // A shard's path still loads the split series.
+        let split = resolve(&merged_and_split(), &["M-Q4_K_M-00002-of-00002.gguf"])
+            .expect("resolves")
+            .expect("names weights");
+        assert_eq!(
+            split.weights,
+            [
+                "M-Q4_K_M-00001-of-00002.gguf",
+                "M-Q4_K_M-00002-of-00002.gguf"
+            ]
+        );
+    }
+
     #[test]
     fn a_tag_in_two_folders_goes_by_the_folders_and_a_shared_folder_name_by_the_paths() {
         let two_folders = listing(&[
@@ -725,6 +769,7 @@ mod tests {
             ("qwen38", qwen38()),
             ("qwen3", qwen3()),
             ("one_folder", one_folder()),
+            ("merged_and_split", merged_and_split()),
             (
                 "two_folders",
                 listing(&[

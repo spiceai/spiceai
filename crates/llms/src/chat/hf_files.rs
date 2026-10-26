@@ -52,10 +52,21 @@ pub struct Downloaded {
     pub gguf: Vec<String>,
 }
 
+/// What a model that names no GGUF files chooses its quantization by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Budget {
+    /// The memory free for the model, in bytes: the largest quantization whose weights fit it.
+    Free(u64),
+    /// No engine measures the memory, so only a repository's one quantization is chosen.
+    Unmeasured,
+    /// The model is split across machines, each of which would choose by its own memory, so
+    /// only a repository's one quantization is chosen: every machine must load the same files.
+    Split,
+}
+
 /// Downloads the files the model `model_id` (`org/name[:revision]`) loads from, for the model
-/// named `name`: the GGUF files `files` resolve to, or, when `files` names none, the largest
-/// GGUF quantization whose weights fit `memory` bytes (the memory the model may be placed in)
-/// or the files mistral.rs loads from a safetensors repository.
+/// named `name`: the GGUF files `files` resolve to, or, when `files` names none, the GGUF
+/// quantization `budget` chooses or the files mistral.rs loads from a safetensors repository.
 ///
 /// # Errors
 ///
@@ -64,7 +75,7 @@ pub struct Downloaded {
 pub async fn download_model(
     model_id: &str,
     files: &[&str],
-    memory: Option<u64>,
+    budget: Budget,
     hub: HubParams<'_>,
     name: &str,
 ) -> Result<Downloaded, DownloadError> {
@@ -79,7 +90,7 @@ pub async fn download_model(
         None => (model_id, None),
     };
     let snapshot = crate::hf::open_model(requester, repo, revision, hub).await?;
-    let gguf = resolve_gguf(&snapshot, files, memory, name, repo)?;
+    let gguf = resolve_gguf(&snapshot, files, budget, name, repo)?;
     let paths: Vec<&str> = gguf.iter().map(String::as_str).collect();
     let dir = download(&snapshot, &paths).await?;
     Ok(Downloaded { dir, gguf })
@@ -91,7 +102,7 @@ pub async fn download_model(
 fn resolve_gguf(
     snapshot: &Snapshot,
     files: &[&str],
-    memory: Option<u64>,
+    budget: Budget,
     name: &str,
     repo: &str,
 ) -> Result<Vec<String>, DownloadError> {
@@ -126,7 +137,7 @@ fn resolve_gguf(
     if quantizations.is_empty() || weights(&names).is_some() {
         return Ok(Vec::new());
     }
-    let chosen = choose_quantization(snapshot, &quantizations, memory, name, repo)?;
+    let chosen = choose_quantization(snapshot, &quantizations, budget, name, repo)?;
     let mut gguf = chosen.files.clone();
     gguf.extend(gguf_files::draft_head(&listing, &chosen.name));
     Ok(gguf)
@@ -137,7 +148,7 @@ fn resolve_gguf(
 fn choose_quantization<'q>(
     snapshot: &Snapshot,
     quantizations: &'q [Quantization],
-    memory: Option<u64>,
+    budget: Budget,
     name: &str,
     repo: &str,
 ) -> Result<&'q Quantization, DownloadError> {
@@ -148,19 +159,27 @@ fn choose_quantization<'q>(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let Some(memory) = memory else {
-        if let [only] = quantizations {
-            return Ok(only);
+    let memory = match budget {
+        Budget::Free(memory) => memory,
+        Budget::Unmeasured | Budget::Split => {
+            if let [only] = quantizations {
+                return Ok(only);
+            }
+            let why = if budget == Budget::Split {
+                "a model split across machines names its quantization, so that every machine loads the same weights"
+            } else {
+                "this build cannot measure the memory to choose one"
+            };
+            return Err(DownloadError::unusable(
+                snapshot,
+                format!(
+                    "it offers {} GGUF quantizations ({}) and {why}. Name one in the model's `files`, as `files: [{{path: {}}}]`",
+                    quantizations.len(),
+                    names(),
+                    quantizations.last().map_or("", |q| q.name.as_str())
+                ),
+            ));
         }
-        return Err(DownloadError::unusable(
-            snapshot,
-            format!(
-                "it offers {} GGUF quantizations ({}) and this build cannot measure the memory to choose one. Name one in the model's `files`, as `files: [{{path: {}}}]`",
-                quantizations.len(),
-                names(),
-                quantizations.last().map_or("", |q| q.name.as_str())
-            ),
-        ));
     };
     match gguf_files::choose(quantizations, gguf_files::weights_budget(memory)) {
         Ok(chosen) => {
@@ -184,7 +203,7 @@ fn choose_quantization<'q>(
         Err(smallest) => Err(DownloadError::unusable(
             snapshot,
             format!(
-                "none of its GGUF quantizations fits the {} of memory free for the model with room for the context{}. Serve it across machines with `nodes`, or name a quantization in the model's `files` to load it anyway: {}",
+                "none of its GGUF quantizations fits the {} of memory free for the model with room for the context{}. Name one in the model's `files` to load it anyway, across machines with `nodes` if one cannot hold it: {}",
                 gibibytes(memory),
                 smallest.map_or_else(String::new, |q| format!(
                     "; the smallest, {}, is {}",

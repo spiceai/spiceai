@@ -380,14 +380,15 @@ pub async fn create_hf_model(
     distributed: Option<DistributedConfig>,
     reasoning: ReasoningDefault<'_>,
 ) -> Result<Arc<dyn Chat>> {
-    // A model split across nodes may take every node's memory; a tensor split needs nodes of
-    // equal memory, so this node's measures each.
-    let nodes = distributed
-        .as_ref()
-        .map_or(1, |cfg| u64::try_from(cfg.world_size()).unwrap_or(1));
-    let memory = engine::free_memory().map(|free| free.saturating_mul(nodes));
+    // Every node of a split model loads its own copy of the weights, and each would choose by
+    // its own memory, so a split model takes only a repository's one quantization.
+    let budget = if distributed.is_some() {
+        hf_files::Budget::Split
+    } else {
+        engine::free_memory().map_or(hf_files::Budget::Unmeasured, hf_files::Budget::Free)
+    };
     let hf_files::Downloaded { dir, gguf } =
-        hf_files::download_model(model_id, files, memory, hub, reasoning.model_name)
+        hf_files::download_model(model_id, files, budget, hub, reasoning.model_name)
             .await
             .map_err(|error| Error::FailedToDownloadModel {
                 configuration: error.is_configuration_error(),

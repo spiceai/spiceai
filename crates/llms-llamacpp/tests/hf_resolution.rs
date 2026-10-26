@@ -20,7 +20,7 @@ limitations under the License.
 //! the load with nothing named, which takes the largest the machine holds (the 1.2 GB `BF16` on
 //! any machine with 6 GiB free).
 
-use llms::chat::hf_files::{Downloaded, download_model};
+use llms::chat::hf_files::{Budget, Downloaded, download_model};
 use llms::chat::{Chat, ReasoningDefault, create_hf_model};
 use llms::hf::HubParams;
 use serde_json::json;
@@ -34,8 +34,8 @@ const REPO: &str = "unsloth/Qwen3-0.6B-GGUF:50968a4468ef4233ed78cd7c3de230dd1d61
 /// `Q4_K_M` (397 MB) and the next larger, `UD-Q4_K_XL` (405 MB).
 const MEMORY_FOR_400_MB: u64 = ((4 << 30) + 400_000_000) * 10 / 9;
 
-async fn resolve(files: &[&str], memory: Option<u64>) -> Result<Downloaded, String> {
-    download_model(REPO, files, memory, HubParams::default(), "qwen3-0.6b-hf")
+async fn resolve(files: &[&str], budget: Budget) -> Result<Downloaded, String> {
+    download_model(REPO, files, budget, HubParams::default(), "qwen3-0.6b-hf")
         .await
         .map_err(|error| error.to_string())
 }
@@ -75,9 +75,11 @@ async fn load(files: &[&str]) -> std::sync::Arc<dyn Chat> {
 /// from it as from the file named exactly.
 #[tokio::test]
 async fn a_quantization_by_name_is_its_file() {
-    let by_name = resolve(&["Q4_K_M"], None).await.expect("Q4_K_M resolves");
+    let by_name = resolve(&["Q4_K_M"], Budget::Unmeasured)
+        .await
+        .expect("Q4_K_M resolves");
     assert_eq!(by_name.gguf, vec!["Qwen3-0.6B-Q4_K_M.gguf"]);
-    let by_file = resolve(&["Qwen3-0.6B-Q4_K_M.gguf"], None)
+    let by_file = resolve(&["Qwen3-0.6B-Q4_K_M.gguf"], Budget::Unmeasured)
         .await
         .expect("the file resolves");
     assert_eq!(by_file, by_name);
@@ -90,7 +92,7 @@ async fn a_quantization_by_name_is_its_file() {
 /// budget just under `UD-Q4_K_XL` takes `Q4_K_M`.
 #[tokio::test]
 async fn with_nothing_named_the_largest_that_fits_is_chosen() {
-    let chosen = resolve(&[], Some(MEMORY_FOR_400_MB))
+    let chosen = resolve(&[], Budget::Free(MEMORY_FOR_400_MB))
         .await
         .expect("a quantization fits");
     assert_eq!(chosen.gguf, vec!["Qwen3-0.6B-Q4_K_M.gguf"]);
@@ -99,7 +101,7 @@ async fn with_nothing_named_the_largest_that_fits_is_chosen() {
 /// What resolution cannot decide or find is named in the error, with the fix.
 #[tokio::test]
 async fn what_cannot_be_chosen_says_how_to_choose() {
-    let unmeasured = resolve(&[], None)
+    let unmeasured = resolve(&[], Budget::Unmeasured)
         .await
         .expect_err("no memory to choose by");
     assert!(
@@ -109,12 +111,23 @@ async fn what_cannot_be_chosen_says_how_to_choose() {
             ),
         "{unmeasured}"
     );
-    let too_small = resolve(&[], Some(4 << 30)).await.expect_err("nothing fits");
+    let split = resolve(&[], Budget::Split)
+        .await
+        .expect_err("a split model names its quantization");
     assert!(
-        too_small.contains("none of its GGUF quantizations fits the 4.0 GiB of memory free for the model with room for the context; the smallest, UD-IQ1_S, is 0.2 GB. Serve it across machines with `nodes`, or name a quantization in the model's `files` to load it anyway:"),
+        split.contains(
+            "and a model split across machines names its quantization, so that every machine loads the same weights. Name one in the model's `files`, as `files: [{path: UD-IQ1_S}]`"
+        ),
+        "{split}"
+    );
+    let too_small = resolve(&[], Budget::Free(4 << 30))
+        .await
+        .expect_err("nothing fits");
+    assert!(
+        too_small.contains("none of its GGUF quantizations fits the 4.0 GiB of memory free for the model with room for the context; the smallest, UD-IQ1_S, is 0.2 GB. Name one in the model's `files` to load it anyway, across machines with `nodes` if one cannot hold it:"),
         "{too_small}"
     );
-    let unknown = resolve(&["Q9_K"], None)
+    let unknown = resolve(&["Q9_K"], Budget::Unmeasured)
         .await
         .expect_err("no such quantization");
     assert!(
@@ -128,7 +141,7 @@ async fn what_cannot_be_chosen_says_how_to_choose() {
 #[tokio::test]
 async fn with_nothing_named_the_model_loads_on_this_machine() {
     let memory = llms::chat::engine::free_memory().expect("the llama.cpp engine measures memory");
-    let chosen = resolve(&[], Some(memory))
+    let chosen = resolve(&[], Budget::Free(memory))
         .await
         .expect("a quantization fits");
     assert_eq!(chosen.gguf.len(), 1, "{chosen:?}");

@@ -215,6 +215,22 @@ pub fn get_total_memory() -> u64 {
     get_container_memory_limit().unwrap_or_else(|| system.total_memory())
 }
 
+/// The memory this process can still use, in bytes: the system's available memory (free
+/// memory and what the kernel can reclaim), within a cgroup limit less this process's
+/// resident memory. `None` when the system reports none.
+#[must_use]
+pub fn get_available_memory() -> Option<u64> {
+    let mut system = System::new();
+    system.refresh_memory();
+    let available = system.available_memory();
+    let memory = get_container_memory_limit().map_or(available, |limit| {
+        limit
+            .saturating_sub(process_resident_memory_bytes().unwrap_or(0))
+            .min(available)
+    });
+    (memory > 0).then_some(memory)
+}
+
 /// Returns the host's total physical memory in bytes, IGNORING any cgroup/container
 /// limit.
 ///
@@ -329,7 +345,10 @@ impl Default for ResourceMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResidentMemory, parse_proc_status_resident, process_resident_memory};
+    use super::{
+        ResidentMemory, get_available_memory, get_host_memory, parse_proc_status_resident,
+        process_resident_memory,
+    };
 
     /// A real `/proc/self/status` excerpt, in the order and units the kernel
     /// writes them.
@@ -415,6 +434,18 @@ Threads:\t32
     /// Faulting in a known number of fresh heap bytes pins the units: the reading
     /// has to grow by about that many bytes, so a figure in kB or pages, or one
     /// scaled twice, misses the half-to-double window by a factor of 1024 or more.
+    /// The memory this process can still use is less than the machine has, since the system
+    /// and this process already use some: llama.cpp's CPU device reports the whole of it free.
+    #[test]
+    fn the_available_memory_is_less_than_the_total() {
+        let available = get_available_memory().expect("the system reports available memory");
+        assert!(
+            available < get_host_memory(),
+            "{available} available of {} total",
+            get_host_memory()
+        );
+    }
+
     #[test]
     fn the_live_reading_is_plausible() {
         const TOUCHED: u64 = 64 * 1024 * 1024;

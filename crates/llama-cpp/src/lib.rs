@@ -36,7 +36,7 @@ use std::sync::OnceLock;
 use snafu::Snafu;
 
 pub use context::{Batch, Context, ContextParams};
-pub use devices::free_memory;
+pub use devices::gpu_free_memory;
 pub use model::{Model, ModelParams, Vocab};
 pub use mtp::{Mtp, MtpParams};
 pub use sampler::Sampler;

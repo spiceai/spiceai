@@ -42,7 +42,7 @@ async fn a_model_whose_mtp_layer_does_not_load_decodes_without_drafting() {
     let downloaded = llms::chat::hf_files::download_model(
         &format!("{MODEL}:{REVISION}"),
         &[FILE],
-        None,
+        llms::chat::hf_files::Budget::Unmeasured,
         HubParams::default(),
         "qwen3.5",
     )
