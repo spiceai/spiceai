@@ -13,7 +13,7 @@ on:
       # resolves to the build of its release-branch commit. No result or explain-plan snapshot
       # is compared or written back, since those record this ref's answers and plans.
       spiced_ref:
-        description: 'Branch or tag whose spiced to benchmark, e.g. v2.3.3 or release/2.4; empty = trunk. Ignored when spiced_commit is set'
+        description: 'Branch or tag whose spiced to benchmark, e.g. v2.1.0 or release/2.4; empty = trunk. A release tag uses that release''s published binary. Ignored when spiced_commit is set'
         required: false
         type: string
         default: ''
@@ -250,7 +250,23 @@ jobs:
         run: |
           spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
+      # A release tag benchmarks the binary that release published, so a release of any age can
+      # be measured; branches and commits use the MinIO builds, which are kept only for recent
+      # commits.
+      - name: Resolve the spiced source
+        id: spiced_source
+        env:
+          SPICED_COMMIT_INPUT: ${{ github.event.inputs.spiced_commit }}
+          SPICED_REF: ${{ github.event.inputs.spiced_ref }}
+        run: |
+          if [ -z "${SPICED_COMMIT_INPUT}" ] && [[ "${SPICED_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "release=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "release=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Setup spiced
+        if: steps.spiced_source.outputs.release != 'true'
         uses: ./.github/actions/setup-spiced
         id: setup-spiced
         with:
@@ -258,8 +274,39 @@ jobs:
           ref: ${{ github.event.inputs.spiced_ref || 'refs/heads/trunk' }}
           with_odbc: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
 
+      - name: Install the released spiced
+        if: steps.spiced_source.outputs.release == 'true'
+        id: release-spiced
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE: ${{ github.event.inputs.spiced_ref }}
+          SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
+        run: |
+          set -euo pipefail
+          if [[ "${SPICEPOD_PATH}" == *odbc* ]]; then
+            echo "::error::Release binaries are built without ODBC; benchmark ${RELEASE} with ODBC from a commit or branch build instead"
+            exit 1
+          fi
+          api="https://api.github.com/repos/spiceai/spiceai"
+          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
+          asset="spiced_linux_x86_64.tar.gz"
+          digest="$(curl -fsSL "${auth[@]}" "${api}/releases/tags/${RELEASE}" \
+            | python3 -c 'import json,sys; print(next(a["digest"] for a in json.load(sys.stdin)["assets"] if a["name"] == sys.argv[1]))' "${asset}")"
+          case "${digest}" in
+            sha256:*) ;;
+            *) echo "::error::${RELEASE} has no ${asset} digest"; exit 1 ;;
+          esac
+          curl -fsSL --retry 3 -o "${asset}" "https://github.com/spiceai/spiceai/releases/download/${RELEASE}/${asset}"
+          echo "${digest#sha256:}  ${asset}" | sha256sum --check
+          tar -xzf "${asset}" spiced
+          sudo cp ./spiced /usr/local/bin/spiced
+          spiced --version
+          commit="$(curl -fsSL "${auth[@]}" "${api}/commits/${RELEASE}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
+          echo "SPICED_COMMIT=${commit}"
+          echo "SPICED_COMMIT=${commit}" >> "${GITHUB_OUTPUT}"
+
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}"
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
@@ -669,7 +716,7 @@ jobs:
           ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
           ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}
           SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
           SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
           SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
