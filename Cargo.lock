@@ -20547,7 +20547,7 @@ dependencies = [
 [[package]]
 name = "spiceai"
 version = "4.0.0"
-source = "git+https://github.com/spiceai/spice-rs.git?rev=4429f3956972c4c329ee406ac60b15ad6ae4a777#4429f3956972c4c329ee406ac60b15ad6ae4a777"
+source = "git+https://github.com/spiceai/spice-rs.git?rev=f53c2c1c96791bea14c37cee93cae38626d9cfbc#f53c2c1c96791bea14c37cee93cae38626d9cfbc"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -20571,6 +20571,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "webpki-roots 1.0.10",
  "winver",
 ]
 
