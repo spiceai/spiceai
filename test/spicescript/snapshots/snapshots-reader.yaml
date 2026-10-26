@@ -1,0 +1,76 @@
+name: snapshots-reader
+description: >
+  A reader with refresh_mode: snapshot follows a writer through the snapshot
+  store: it bootstraps from the writer's first snapshot and then serves each
+  newer one the writer publishes, not its own source's rows (its source keeps
+  the original rows). (A reader whose source table is missing never follows:
+  known-failing/other/snapshots-reader-without-source.yaml.) A cached answer stays
+  cached while its polls find no newer snapshot, and once it ages out
+  (`item_ttl`; a refresh does not clear the cache) the newer snapshot is
+  served.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  writer:
+    datasets: { t: { acceleration: { refresh_mode: full, snapshots: create_only } } }
+  reader:
+    datasets: { t: { acceleration: { refresh_mode: snapshot, snapshots: bootstrap_only, refresh_check_interval: 1s } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshots-reader
+  runtime:
+    caching:
+      sql_results: { enabled: true, item_ttl: 10s }
+  snapshots:
+    enabled: true
+    location: file://${instance.dir}/../shared-snapshots/
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file }
+
+defaults:
+  # The variants work together, so they run side by side.
+  run-variants: side-by-side
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text);
+        INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 200) i;
+  - start: { ready: false }
+  - query: SELECT count(*) AS n, sum(id) AS s FROM t
+    expect: { rows: [['200', '20100']] }
+    eventually: 60s
+    only: writer
+  - query: SELECT count(*) AS n, sum(id) AS s FROM t
+    expect: { rows: [['200', '20100']] }
+    eventually: 60s
+    only: reader
+
+  # Polls that find no newer snapshot keep the reader's cached answers.
+  - http: { method: POST, path: /v1/sql, body: SELECT count(*) AS n FROM t }
+    expect: { status: 200, headers: { results-cache-status: MISS }, body-contains: '200' }
+    only: reader
+  - http: { method: POST, path: /v1/sql, body: SELECT count(*) AS n FROM t }
+    expect: { status: 200, headers: { results-cache-status: HIT }, body-contains: '200' }
+    consistently: 5s
+    only: reader
+
+  - source-exec: { src: "DELETE FROM t WHERE id > 100; UPDATE t SET v = 'new' WHERE id <= 10" }
+    only: writer
+  - refresh: t
+    only: writer
+  - query: SELECT count(*) AS n, sum(id) AS s, count(*) FILTER (WHERE v = 'new') AS changed FROM t
+    expect: { rows: [['100', '5050', '10']] }
+    eventually: 60s
+    only: reader
+  - http: { method: POST, path: /v1/sql, body: SELECT count(*) AS n FROM t }
+    expect: { status: 200, body-contains: '100' }
+    only: reader

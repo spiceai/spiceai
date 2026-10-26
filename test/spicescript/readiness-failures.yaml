@@ -1,0 +1,73 @@
+name: readiness-failures
+description: >
+  A dataset that cannot load is reported in Error with a message naming the
+  table; it keeps the runtime from being ready unless the runtime is ready
+  `on_registration`, and the healthy dataset beside it serves either way. A
+  dataset whose source is down at its first start, or whose role may not yet
+  read the table, loads once the source lets it, without a restart.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  runtime-on-load: {}
+  runtime-on-registration:
+    spicepod: { runtime: { ready_state: on_registration } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: readiness-failures
+  datasets:
+    - from: postgres:public.t
+      name: healthy
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne }
+    - from: postgres:public.no_such_table
+      name: broken
+      params: ${sources.src.params}
+    - from: postgres:public.late
+      name: late
+      params:
+        $merge: ${sources.src.params}
+        pg_user: reader_${sources.src.namespace}
+        pg_pass: reader-secret
+      acceleration: { enabled: true, engine: cayenne, refresh_check_interval: 2s }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text);
+        INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 50) i;
+        CREATE TABLE late (id int PRIMARY KEY, v text);
+        INSERT INTO late SELECT i, 'late ' || i FROM generate_series(1, 20) i;
+        CREATE ROLE reader_${sources.src.namespace} LOGIN PASSWORD 'reader-secret';
+        GRANT CONNECT ON DATABASE ${sources.src.namespace} TO reader_${sources.src.namespace};
+        GRANT USAGE ON SCHEMA public TO reader_${sources.src.namespace};
+  # The reader role may not read `late` yet.
+  - start: { ready: false }
+  - query: SELECT * FROM healthy
+    oracle-sql: SELECT * FROM t
+    eventually: 30s
+  - assert-status: { dataset: broken, status: Error, message-contains: no_such_table }
+    eventually: 30s
+  - assert-status: { dataset: late, status: Error, message-contains: permission }
+    eventually: 30s
+  - assert-status: { dataset: healthy, ready: true }
+    eventually: 20s
+    only: runtime-on-registration
+  - assert-status: { dataset: healthy, ready: false }
+    consistently: 5s
+    only: runtime-on-load
+
+  # Granting the read lets the dataset load, without a restart.
+  - source-exec: { src: "GRANT SELECT ON late TO reader_${sources.src.namespace}" }
+  - query: SELECT * FROM late
+    oracle-sql: SELECT * FROM late
+    eventually: 120s
+  - assert-status: { dataset: late, status: Ready }
+    eventually: 30s

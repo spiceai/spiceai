@@ -11,6 +11,7 @@ autotests = false
 
 [dependencies]
 cpu-budget = { path = "../cpu-budget" }
+http-body-limit = { path = "../http-body-limit" }
 podswatcher = { path = "../podswatcher" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
 adbc_core = { workspace = true, optional = true }
@@ -201,7 +202,8 @@ search = { path = "../search", default-features = false, features = [
 ], optional = false }
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive", "rc"] }
-blake3 = { workspace = true, optional = true }
+serde_bytes.workspace = true
+blake3.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
@@ -311,7 +313,6 @@ connector-snowflake = { path = "../data-connectors/connector-snowflake" }
 connector-spark = { path = "../data-connectors/connector-spark" }
 connector-spiceai = { path = "../data-connectors/connector-spiceai" }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
-hf-hub = { workspace = true }
 insta = { workspace = true, features = ["json", "redactions"] }
 jsonpath-rust = "0.7.3"
 mongodb.workspace = true
@@ -336,7 +337,7 @@ tracing-subscriber.workspace = true
 yaml = { path = "../yaml" }
 
 [features]
-adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "dep:blake3", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 azure-keyvault = ["runtime-secrets/azure-keyvault"]
 hashicorp_vault = ["runtime-secrets/hashicorp_vault"]

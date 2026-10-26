@@ -28,14 +28,17 @@ limitations under the License.
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use http::{Request, Response};
 use iceberg::io::{FileRead, FileWrite};
 use opendal::{Buffer, Error, ErrorKind, HttpBody, HttpTransport, HttpTransporter, Result};
 use opendal_http_transport_reqwest::ReqwestTransport;
-use runtime_datafusion::url_table::{
-    ALLOW_PRIVATE_HOSTS_ENV, DNS_RESOLUTION_TIMEOUT, is_blocked_internal_hostname, is_internal_ip,
+use runtime_object_store::ssrf::{
+    ALLOW_PRIVATE_HOSTS_ENV, is_blocked_internal_hostname, is_internal_ip,
 };
+
+const DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 tokio::task_local! {
     static VENDED_HOSTS: VendedHosts;
@@ -231,19 +234,30 @@ fn classify(host: String, addrs: Vec<SocketAddr>) -> std::result::Result<Vec<Soc
     Ok(addrs)
 }
 
-/// Test answers for [`GuardedResolver`]: host → addresses, and whether those
-/// addresses are treated as public so a test can point a public name at a
-/// local fixture. Production builds always use the system resolver.
+/// A test answer for [`GuardedResolver`]: addresses, and whether they are
+/// treated as public so a test can point a public name at a local fixture.
 #[cfg(test)]
-type ResolverOverrides = std::collections::HashMap<String, (Vec<std::net::IpAddr>, bool)>;
+type ResolverAnswer = (Vec<std::net::IpAddr>, bool);
+
+/// Test answers per host, used in order; the last one repeats. Production
+/// builds always use the system resolver.
+#[cfg(test)]
+type ResolverOverrides =
+    std::collections::HashMap<String, std::collections::VecDeque<ResolverAnswer>>;
 
 #[cfg(test)]
 static RESOLVER_OVERRIDES: LazyLock<parking_lot::Mutex<ResolverOverrides>> =
     LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
-fn resolver_override(host: &str) -> Option<(Vec<std::net::IpAddr>, bool)> {
-    RESOLVER_OVERRIDES.lock().get(host).cloned()
+fn resolver_override(host: &str) -> Option<ResolverAnswer> {
+    let mut overrides = RESOLVER_OVERRIDES.lock();
+    let answers = overrides.get_mut(host)?;
+    if answers.len() > 1 {
+        answers.pop_front()
+    } else {
+        answers.front().cloned()
+    }
 }
 
 #[cfg(test)]
@@ -252,9 +266,14 @@ pub(super) fn set_resolver_override(
     addrs: Vec<std::net::IpAddr>,
     treat_as_public: bool,
 ) {
+    set_resolver_answers(host, vec![(addrs, treat_as_public)]);
+}
+
+#[cfg(test)]
+pub(super) fn set_resolver_answers(host: &str, answers: Vec<ResolverAnswer>) {
     RESOLVER_OVERRIDES
         .lock()
-        .insert(normalized_host(host), (addrs, treat_as_public));
+        .insert(normalized_host(host), answers.into());
 }
 
 #[cfg(test)]

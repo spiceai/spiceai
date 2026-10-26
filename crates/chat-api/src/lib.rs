@@ -88,12 +88,26 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// Downloading the model's files failed. The source names the file, the repository, the
+    /// cause and the fix, so it is the whole message.
+    #[snafu(display("{source}"))]
+    FailedToDownloadModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        /// Whether only a Spicepod change clears it (see [`Error::is_configuration_error`]).
+        configuration: bool,
+    },
+
     #[snafu(display(
         "Unsupported value for `model_type` parameter. {source}  Verify the `model_type` parameter, and try again"
     ))]
     UnsupportedModelType {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Architecture '{architecture}' in {file} is not supported by this Spice release. Upgrade Spice, or use a GGUF of a supported architecture: https://spiceai.org/docs/components/models#gguf-architectures"
+    ))]
+    UnsupportedArchitecture { architecture: String, file: String },
 
     #[snafu(display(
         "The specified model identifier '{model}' is not valid for the source '{model_source}'. Verify the model exists, and try again."
@@ -183,6 +197,7 @@ impl Error {
             | Self::LocalModelConfigNotFound { .. }
             | Self::LocalTokenizerNotFound { .. }
             | Self::UnsupportedModelType { .. }
+            | Self::UnsupportedArchitecture { .. }
             | Self::ModelNotProvided { .. }
             | Self::UnknownModelSource { .. }
             | Self::UnsupportedTaskForModel { .. }
@@ -193,6 +208,7 @@ impl Error {
             | Self::UnsafePickleWeight { .. }
             | Self::ModelParameterFailed { .. }
             | Self::ResponsesNotSupported { .. } => true,
+            Self::FailedToDownloadModel { configuration, .. } => *configuration,
             // A loader can wrap a configuration error, such as rejected pickle weights.
             Self::FailedToLoadModel { source } => source
                 .downcast_ref::<Self>()
@@ -234,6 +250,20 @@ impl ApiErrorKind {
     #[must_use]
     pub fn of(error: &ApiError) -> Option<Self> {
         Self::named(error.code.as_deref()).or_else(|| Self::named(error.r#type.as_deref()))
+    }
+
+    /// The error `type` that [`Self::of`] reads back as `self`, for a provider whose own
+    /// errors do not have the `OpenAI` shape.
+    #[must_use]
+    pub fn error_type(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request_error",
+            Self::Authentication => "authentication_error",
+            Self::PermissionDenied => "permission_error",
+            Self::NotFound => "not_found_error",
+            Self::RateLimited => "rate_limit_error",
+            Self::InsufficientQuota => "insufficient_quota",
+        }
     }
 
     fn named(name: Option<&str>) -> Option<Self> {
@@ -577,7 +607,28 @@ mod tests {
         ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest, FunctionCall,
     };
 
-    use super::{Chat, Error, Result, SqlGeneration, message_to_content};
+    use super::{ApiErrorKind, Chat, Error, Result, SqlGeneration, message_to_content};
+    use async_openai::error::ApiError;
+
+    #[test]
+    fn each_error_type_reads_back_as_its_kind() {
+        for kind in [
+            ApiErrorKind::InvalidRequest,
+            ApiErrorKind::Authentication,
+            ApiErrorKind::PermissionDenied,
+            ApiErrorKind::NotFound,
+            ApiErrorKind::RateLimited,
+            ApiErrorKind::InsufficientQuota,
+        ] {
+            let error = ApiError {
+                message: String::new(),
+                r#type: Some(kind.error_type().to_string()),
+                param: None,
+                code: None,
+            };
+            assert_eq!(ApiErrorKind::of(&error), Some(kind));
+        }
+    }
 
     /// A tool-call-only assistant turn, in the shape a client replays one.
     #[expect(deprecated)]

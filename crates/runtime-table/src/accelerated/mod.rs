@@ -76,6 +76,8 @@ pub mod checkpoint_primary_key;
 pub mod fallback_retention;
 pub use fallback_retention::{Error as FallbackRetentionKeepError, FallbackRetentionKeep};
 pub mod federation;
+pub(crate) mod index_rebuild;
+pub mod partition_scope;
 pub mod refresh;
 pub mod refresh_completion;
 pub mod refresh_task;
@@ -83,6 +85,7 @@ pub mod refresh_task_runner;
 pub mod retention;
 pub(crate) mod sink;
 pub mod snapshots;
+pub(crate) mod source_stall;
 pub(crate) mod superseded;
 pub mod synchronized_table;
 pub mod timestamp_metrics_utils;
@@ -91,11 +94,16 @@ pub mod write_back_worker;
 
 pub(crate) use write::WriteMode;
 
+pub use partition_scope::PartitionScope;
 pub use refresh_completion::{
     RefreshCompletion, RefreshCompletionOutcome, RefreshCompletionWaiter, RefreshRequestId,
 };
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;
+
+/// The `federated_source` of an accelerated view, whose status is reported as a
+/// view's even before its plan is built.
+pub const VIEW_FEDERATED_SOURCE: &str = "view";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -134,6 +142,16 @@ pub enum Error {
         loaded_id: u64,
     },
 
+    /// `refresh_mode: snapshot`: a newer snapshot is published but could not be loaded.
+    #[snafu(display(
+        "The snapshot published at '{location}' (id {published_id}) could not be loaded, so it is tried again at the next poll. Cause: {cause}. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+    ))]
+    SnapshotDownloadFailed {
+        location: String,
+        published_id: u64,
+        cause: String,
+    },
+
     #[snafu(display(
         "Failed to scan the dataset from the data connector: {}. Ensure the dataset configuration is valid, and try again.",
         format_datafusion_error(source)
@@ -165,6 +183,11 @@ pub enum Error {
         "Manual refresh is not supported for `append` mode. Only `full` refresh mode supports manual refreshes."
     ))]
     ManualRefreshIsNotSupported {},
+
+    #[snafu(display(
+        "Failed to reload the partitions this executor serves: the dataset's change stream has stopped."
+    ))]
+    ReloadWorkerStopped {},
 
     #[snafu(display(
         "A refresh must be triggered on the dataset '{parent_dataset}', which will propagate to this table."
@@ -247,6 +270,15 @@ pub enum Error {
 
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
     NoPrimaryKeysDefined { dataset_name: String },
+
+    #[snafu(display(
+        "Failed to rebuild the search index of dataset '{dataset_name}' from its acceleration, so the dataset is not loaded rather than answering searches from an incomplete index. Fix the cause below and restart; for details, visit: https://spiceai.org/docs/features/search/full-text-search. Cause: {}",
+        format_datafusion_error(source)
+    ))]
+    FailedToRebuildIndex {
+        dataset_name: String,
+        source: DataFusionError,
+    },
 
     #[snafu(transparent)]
     PkFilterExpr {
@@ -334,6 +366,10 @@ pub struct AcceleratedTable {
     change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
     federated: Arc<FederatedTable>,
     refresh_trigger: Option<mpsc::Sender<Option<RefreshOverrides>>>,
+    /// For a change-stream acceleration on a cluster executor: the partitions
+    /// it serves, and the trigger that reloads them after they change.
+    partition_scope: Option<Arc<PartitionScope>>,
+    reload_trigger: Option<mpsc::Sender<RefreshRequestId>>,
 
     // Async background tasks relevant to the accelerated table (i.e should be stopped when the table is dropped).
     pub handlers: parking_lot::Mutex<Vec<JoinHandle<()>>>,
@@ -478,6 +514,7 @@ pub struct Builder {
     ready_state: ReadyState,
     caching: Option<Arc<Caching>>,
     changes_stream: Option<ChangesStream>,
+    partition_scope: Option<Arc<PartitionScope>>,
     append_stream: Option<ChangesStream>,
     disable_federation: bool,
     write_to_accelerator_only: bool,
@@ -491,6 +528,8 @@ pub struct Builder {
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
+    /// See [`Builder::initial_status`].
+    initial_status: Option<status::ComponentStatus>,
     snapshot_creation_config: Option<SnapshotCreationConfig>,
     /// Per-dataset state for `RefreshMode::Snapshot`. Required when the
     /// refresh mode is Snapshot; ignored otherwise.
@@ -552,6 +591,7 @@ impl Builder {
             ready_state: ReadyState::default(),
             caching: None,
             changes_stream: None,
+            partition_scope: None,
             append_stream: None,
             checkpointer: None,
             synchronize_with: None,
@@ -561,6 +601,7 @@ impl Builder {
             write_back: false,
             write_back_deliverer: None,
             initial_load_complete: false,
+            initial_status: None,
             refresh_semaphore: None,
             snapshot_creation_config: None,
             snapshot_refresh_state: None,
@@ -763,6 +804,14 @@ impl Builder {
         self
     }
 
+    /// Set the partitions a cluster executor serves for the changes stream's
+    /// acceleration, which [`AcceleratedTable::trigger_reload`] then reloads after
+    /// they change. The changes stream itself has to be scoped by the caller.
+    pub fn partition_scope(&mut self, partition_scope: Arc<PartitionScope>) -> &mut Self {
+        self.partition_scope = Some(partition_scope);
+        self
+    }
+
     /// Set the append stream for the accelerated table
     pub fn append_stream(&mut self, append_stream: ChangesStream) -> &mut Self {
         self.append_stream = Some(append_stream);
@@ -840,6 +889,14 @@ impl Builder {
     /// This will allow the table to be marked as ready immediately.
     pub fn initial_load_complete(&mut self, initial_load_complete: bool) -> &mut Self {
         self.initial_load_complete = initial_load_complete;
+        self
+    }
+
+    /// The status the dataset reports once its existing acceleration can serve it. It is
+    /// applied when the refresher starts, after the dataset's search indexes are rebuilt from
+    /// that acceleration, so the dataset is never reported ready while the rebuild runs.
+    pub fn initial_status(&mut self, initial_status: status::ComponentStatus) -> &mut Self {
+        self.initial_status = Some(initial_status);
         self
     }
 
@@ -956,6 +1013,7 @@ impl Builder {
 
         let refresh_completion = RefreshCompletion::new();
 
+        let mut reload_trigger = None;
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
             RefreshMode::Append => {
@@ -1032,7 +1090,7 @@ impl Builder {
                             return AppendStreamRequiredSnafu.fail();
                         };
                         (
-                            refresh::AccelerationRefreshMode::Changes(append_stream),
+                            refresh::AccelerationRefreshMode::Changes(append_stream, None),
                             None,
                         )
                     }
@@ -1058,8 +1116,13 @@ impl Builder {
                 let Some(changes_stream) = self.changes_stream else {
                     return ExpectedChangesStreamSnafu.fail();
                 };
+                let reload_requests = self.partition_scope.as_ref().map(|_| {
+                    let (trigger, requests) = mpsc::channel::<RefreshRequestId>(8);
+                    reload_trigger = Some(trigger);
+                    requests
+                });
                 (
-                    refresh::AccelerationRefreshMode::Changes(changes_stream),
+                    refresh::AccelerationRefreshMode::Changes(changes_stream, reload_requests),
                     None,
                 )
             }
@@ -1118,7 +1181,9 @@ impl Builder {
                 .or(self.cpu_runtime.as_ref())
                 .cloned()
                 .unwrap_or_else(Handle::current);
-            let capacity = refresh_task::changes::cdc_config().prefetch_buffer;
+            let capacity =
+                refresh_task::changes::dataset_cdc_config(self.cdc_param_overrides.as_deref())
+                    .prefetch_buffer;
             let native = if let Some(engine) = &self.change_sink_engine {
                 engine
                     .change_sink(context.clone(), &runtime, capacity)
@@ -1184,6 +1249,7 @@ impl Builder {
         refresher.with_snapshot_refresh_state(self.snapshot_refresh_state);
         refresher.with_append_cursor_store(self.append_cursor_store);
         refresher.set_bootstrap_status(self.bootstrap_status);
+        refresher.set_initial_status(self.initial_status.clone());
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());
@@ -1486,6 +1552,8 @@ impl Builder {
             change_sink,
             federated: self.federated,
             refresh_trigger,
+            partition_scope: self.partition_scope,
+            reload_trigger,
             handlers: parking_lot::Mutex::new(handlers),
             initial_snapshot: parking_lot::Mutex::new(initial_snapshot),
             changes_drain: std::sync::OnceLock::new(),
@@ -1653,6 +1721,8 @@ impl AcceleratedTable {
         self.begin_changes_drain().wait().await
     }
 
+    /// `federated_source` names where the rows come from: the connector, or
+    /// [`VIEW_FEDERATED_SOURCE`] for an accelerated view.
     pub fn builder(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
@@ -1729,6 +1799,31 @@ impl AcceleratedTable {
         Ok(())
     }
 
+    /// Reloads the partitions a cluster executor serves for a change-stream
+    /// acceleration after they changed. The waiter it returns is answered by that
+    /// reload, not by changes the stream applies meanwhile.
+    ///
+    /// Returns `None` for an acceleration without a partition scope, which
+    /// refreshes through [`Self::trigger_refresh`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the change stream has stopped.
+    pub async fn trigger_reload(&self) -> Result<Option<RefreshCompletionWaiter>> {
+        let (Some(trigger), Some(completion)) =
+            (&self.reload_trigger, self.refresher.refresh_completion())
+        else {
+            return Ok(None);
+        };
+        let id = completion.issue();
+        let waiter = completion.waiter_for(id);
+        if trigger.send(id).await.is_err() {
+            completion.record_terminal_failure(id);
+            return ReloadWorkerStoppedSnafu.fail();
+        }
+        Ok(Some(waiter))
+    }
+
     #[must_use]
     pub fn get_federated_table(&self) -> Arc<FederatedTable> {
         Arc::clone(&self.federated)
@@ -1787,6 +1882,13 @@ impl AcceleratedTable {
     #[must_use]
     pub fn is_accelerator_only(&self) -> bool {
         matches!(self.write_mode, WriteMode::AcceleratorOnly)
+    }
+
+    /// Whether writes go to the federated source, from which the refresh
+    /// propagates them to the accelerator.
+    #[must_use]
+    pub fn is_write_through(&self) -> bool {
+        matches!(self.write_mode, WriteMode::WriteThrough)
     }
 
     /// Why `operation` is refused on this node, if it is: on a scheduler, a table whose
@@ -1913,6 +2015,13 @@ impl AcceleratedTable {
         &self,
         filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<()> {
+        if let Some(scope) = &self.partition_scope {
+            scope.set(
+                filters
+                    .clone()
+                    .unwrap_or_else(|| vec![datafusion_expr::lit(true)]),
+            );
+        }
         let mut refresh = self.refresh_params.write().await;
         if let Some(ref mut sql) = refresh.sql {
             sql.set_partition_filters(filters);

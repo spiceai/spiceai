@@ -20,9 +20,9 @@ limitations under the License.
 //! `DataFusion` evaluates the SQL predicate against the row
 //! [`crate::arrow::dynamodb_items_to_arrow`] converts the item into. The two
 //! disagree wherever the conversion does not carry an attribute over as it is:
-//! a map in a `Utf8` column becomes JSON, a number that does not parse as the
-//! column's type becomes NULL, a timestamp is stored as a string in whatever
-//! offset it was written with. A condition is therefore reported exact only
+//! a map in a `Utf8` column becomes JSON, a number that does not fit the
+//! column's type fails the conversion, a timestamp is stored as a string in
+//! whatever offset it was written with. A condition is therefore reported exact only
 //! where `DynamoDB` evaluates it as SQL does on every item, and otherwise
 //! widened to a superset that `DataFusion` filters again — never narrowed,
 //! which would drop rows the query should return. An item that unnesting
@@ -208,41 +208,9 @@ pub(crate) enum SortPredicate {
     Except(Vec<AttributeValue>),
 }
 
-/// How the column a sort key is read into compares the key's values, which a
-/// check of an item's key against a predicate has to follow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum KeyReading {
-    /// As stored: a string or a binary by its bytes, a number by its value.
-    #[default]
-    Stored,
-    /// As an `Int64` column reads a number: its value when that is an `i64`,
-    /// and NULL otherwise, which meets no predicate.
-    Integer,
-}
-
-impl KeyReading {
-    pub(crate) fn of(data_type: &DataType) -> Self {
-        if *data_type == DataType::Int64 {
-            Self::Integer
-        } else {
-            Self::Stored
-        }
-    }
-}
-
-/// Whether the key value `v`, read as `reading` says, meets `predicate`, when
-/// that can be decided.
-pub(crate) fn satisfies(
-    v: &AttributeValue,
-    predicate: &SortPredicate,
-    reading: KeyReading,
-) -> Option<bool> {
+/// Whether the key value `v` meets `predicate`, when that can be decided.
+pub(crate) fn satisfies(v: &AttributeValue, predicate: &SortPredicate) -> Option<bool> {
     use SortPredicate::{Between, Eq, Except, Lower, OneOf, Prefix, Upper};
-    if reading == KeyReading::Integer
-        && !matches!(v, AttributeValue::N(n) if n.parse::<i64>().is_ok())
-    {
-        return Some(false);
-    }
     Some(match predicate {
         Eq(w) => compare(v, w)? == Ordering::Equal,
         Lower(w, inclusive) => match compare(v, w)? {
@@ -270,7 +238,7 @@ pub(crate) fn satisfies(
             }
             false
         }
-        Except(values) => !satisfies(v, &OneOf(values.clone()), reading)?,
+        Except(values) => !satisfies(v, &OneOf(values.clone()))?,
     })
 }
 
@@ -916,8 +884,7 @@ impl<'a> Translator<'a> {
             Kind::Int64 => {
                 let v = out.value(AttributeValue::N(integer(value)?.to_string()));
                 // DynamoDB trims a number's zeros, so the items equal to `k` are
-                // the ones read as `k`; but a number that is not an integer reads
-                // as NULL, which any other comparison may still select.
+                // the ones read as `k`; other comparisons DataFusion checks again.
                 condition(format!("{path} {} {v}", cmp.symbol()), cmp == Cmp::Eq)
             }
             Kind::Float64 => {

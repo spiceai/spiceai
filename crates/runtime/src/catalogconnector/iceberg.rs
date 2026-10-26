@@ -1676,10 +1676,12 @@ mod tests {
         use super::super::{
             S3_ENDPOINT, STORAGE_ENDPOINT_PROPS, get_rest_catalog, vended_endpoint_refused_message,
             vended_endpoint_rewritten_message, vended_endpoints,
-            vended_transport::{clear_resolver_override, set_resolver_override},
+            vended_transport::{
+                clear_resolver_override, set_resolver_answers, set_resolver_override,
+            },
         };
         use std::collections::HashMap;
-        use std::net::{IpAddr, Ipv4Addr};
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
         use std::sync::Arc;
 
         use axum::{Json, Router, routing::get};
@@ -1786,7 +1788,11 @@ mod tests {
         }
 
         async fn start_listener(redirect_to: Option<String>) -> Sentinel {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            start_listener_on(SocketAddr::new(LOOPBACK, 0), redirect_to).await
+        }
+
+        async fn start_listener_on(bind: SocketAddr, redirect_to: Option<String>) -> Sentinel {
+            let listener = tokio::net::TcpListener::bind(bind)
                 .await
                 .expect("bind the sentinel listener");
             let addr = listener.local_addr().expect("read the sentinel address");
@@ -1886,6 +1892,13 @@ mod tests {
                     host: host.to_string(),
                 }
             }
+
+            fn answers(host: &str, answers: Vec<(Vec<IpAddr>, bool)>) -> Self {
+                set_resolver_answers(host, answers);
+                Self {
+                    host: host.to_string(),
+                }
+            }
         }
 
         impl Drop for ResolverOverride {
@@ -1972,6 +1985,36 @@ mod tests {
             assert_eq!(err.kind(), iceberg::ErrorKind::Unexpected, "{err}");
             assert_eq!(
                 *sentinel.requests.lock(),
+                vec!["GET /testbucket/warehouse/db/t/metadata/snap-1.avro HTTP/1.1".to_string()]
+            );
+        }
+
+        /// The first answer stands in for a public address; every later answer
+        /// is internal. A second lookup before the connection would reach the
+        /// internal listener on the same port.
+        #[tokio::test]
+        async fn catalog_vended_hostname_is_dialed_at_the_address_that_was_checked() {
+            let checked = start_sentinel().await;
+            let rebound = start_listener_on(
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), checked.port),
+                None,
+            )
+            .await;
+            let _dns = ResolverOverride::answers(
+                "rebind.vended.test",
+                vec![
+                    (vec![LOOPBACK], true),
+                    (vec![IpAddr::V6(Ipv6Addr::LOCALHOST)], false),
+                ],
+            );
+            let endpoint = format!("http://rebind.vended.test:{}", checked.port);
+            let catalog_uri = start_rest_catalog(&vended_config(&endpoint)).await;
+            let err = read_manifest_list(catalog_uri, HashMap::new())
+                .await
+                .expect_err("the sentinel answers 404");
+            assert_eq!(*rebound.requests.lock(), Vec::<String>::new(), "{err}");
+            assert_eq!(
+                *checked.requests.lock(),
                 vec!["GET /testbucket/warehouse/db/t/metadata/snap-1.avro HTTP/1.1".to_string()]
             );
         }

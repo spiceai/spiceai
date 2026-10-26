@@ -1016,6 +1016,21 @@ pub(crate) fn cdc_config_overlay(
     }
 }
 
+/// The CDC tunables one dataset runs with: the process-global [`CdcConfig`]
+/// with that dataset's `acceleration.params` `cdc_*` overrides layered on.
+/// Everything that sizes or paces a dataset's changes path reads this rather
+/// than [`cdc_config`], so a per-dataset override reaches every consumer.
+#[must_use]
+pub(crate) fn dataset_cdc_config(
+    dataset_params: Option<&std::collections::HashMap<String, String>>,
+) -> CdcConfig {
+    let base = cdc_config();
+    match dataset_params {
+        Some(params) => cdc_config_overlay(base, params),
+        None => base,
+    }
+}
+
 fn overlay_usize(
     params: &std::collections::HashMap<String, String>,
     key: &'static str,
@@ -1115,14 +1130,8 @@ impl RefreshTask {
         refresh_completion: Option<RefreshCompletion>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated::Result<()> {
-        // Effective CDC config = global (already env+default folded) with any
-        // per-dataset `cdc_*` overrides layered on top.
-        let mut effective = cdc_config();
-        if let Some(overrides) = self.cdc_param_overrides.as_ref() {
-            effective = cdc_config_overlay(effective, overrides);
-        }
         self.start_changes_stream_with_config(
-            effective,
+            dataset_cdc_config(self.cdc_param_overrides.as_deref()),
             refresh,
             changes_stream,
             caching,
@@ -1220,6 +1229,46 @@ impl RefreshTask {
             context.dataset_name,
         );
         true
+    }
+
+    /// Reload the partitions this executor serves after they changed, as one
+    /// atomic replacement through the partition-filtered full refresh — the same
+    /// path [`Self::rebuild_from_source`] takes. The change stream is already
+    /// scoped to the new partitions, and changes received during the reload
+    /// apply after it, so the acceleration converges on the new partitions.
+    ///
+    /// Returns `None` when the change stream must stop, and `Some(false)` when the
+    /// reload failed but streaming continues: the scheduler sends the partitions
+    /// again, which requests another reload.
+    async fn reload_served_partitions(&self, context: &mut ApplyContext<'_>) -> Option<bool> {
+        if !self.prepare_rebuild(context).await {
+            return None;
+        }
+        let mut refresh = context.refresh.read().await.clone();
+        refresh.mode = RefreshMode::Full;
+        if let Err(e) = self.run(refresh).await {
+            tracing::warn!(
+                "Failed to reload the partitions this executor serves for dataset {}, so it does not report them loaded and keeps streaming changes: {e}",
+                context.dataset_name,
+            );
+            return Some(false);
+        }
+        if let Some(cache_provider_ref) = context.caching
+            && let Some(cache_provider) = cache_provider_ref.upgrade()
+            && let Err(e) = cache_provider
+                .invalidate_for_refresh(context.dataset_name.clone())
+                .await
+        {
+            tracing::warn!(
+                "Failed to invalidate cached query plans and search results for dataset {} after reloading its partitions, so they may reflect the previous partitions until they expire: {e}",
+                context.dataset_name
+            );
+        }
+        tracing::info!(
+            "Dataset {}: reloaded the partitions this executor serves; resuming change streaming.",
+            context.dataset_name,
+        );
+        Some(true)
     }
 
     /// Replace the accelerator from a [`cdc::ChangeBatch::rebuild_from_this_batch`]
@@ -1927,12 +1976,9 @@ impl RefreshTask {
     /// without threading config through the write path. Floored at 1 so
     /// `chunks()` never sees a zero.
     fn cdc_delete_subbatch_max(&self) -> usize {
-        let base = cdc_config();
-        let effective = match self.cdc_param_overrides.as_ref() {
-            Some(overrides) => cdc_config_overlay(base, overrides),
-            None => base,
-        };
-        effective.delete_subbatch_max.max(1)
+        dataset_cdc_config(self.cdc_param_overrides.as_deref())
+            .delete_subbatch_max
+            .max(1)
     }
 }
 
@@ -3307,6 +3353,7 @@ mod tests {
     /// a test can pin `cdc_delete_subbatch_max` regardless of the process-global
     /// [`CdcConfig`].
     fn make_refresh_task_with_cdc_params(
+        name: &str,
         accelerator: Arc<dyn TableProvider>,
         cdc_params: std::collections::HashMap<String, String>,
     ) -> RefreshTask {
@@ -3318,7 +3365,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::common::TableReference::bare("test".to_string()),
+            datafusion::common::TableReference::bare(name.to_string()),
             federated,
             None,
             accelerator,
@@ -3659,6 +3706,7 @@ mod tests {
                 delete_plan_calls: Arc::clone(&delete_plan_calls),
             }) as Arc<dyn TableProvider>;
             let task = make_refresh_task_with_cdc_params(
+                "test",
                 provider,
                 std::collections::HashMap::from([(
                     "cdc_delete_subbatch_max".to_string(),
@@ -5081,6 +5129,125 @@ mod tests {
             initial_load_completed,
         )
         .await
+    }
+
+    // -- Per-dataset prefetch depth -------------------------------------------
+
+    /// A per-dataset `cdc_prefetch_buffer` that differs from the process-wide
+    /// value, so a queue sized from the process-wide value reads differently.
+    const DATASET_PREFETCH_BUFFER: u16 = 1024;
+
+    fn dataset_prefetch_params() -> std::collections::HashMap<String, String> {
+        assert_ne!(
+            cdc_config().prefetch_buffer,
+            usize::from(DATASET_PREFETCH_BUFFER),
+            "the per-dataset value must differ from the process-wide one, or the capacity cannot tell them apart"
+        );
+        std::collections::HashMap::from([(
+            "cdc_prefetch_buffer".to_string(),
+            DATASET_PREFETCH_BUFFER.to_string(),
+        )])
+    }
+
+    /// `dataset_acceleration_cdc_prefetch_buffer_capacity` as scraped for `dataset`.
+    fn scraped_prefetch_capacity(dataset: &str) -> Option<f64> {
+        super::super::test_prometheus_registry()
+            .gather()
+            .iter()
+            .filter(|family| family.name() == "dataset_acceleration_cdc_prefetch_buffer_capacity")
+            .flat_map(|family| family.get_metric().iter())
+            .find(|series| {
+                series
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "dataset" && label.value() == dataset)
+            })
+            .and_then(|series| {
+                series
+                    .get_gauge()
+                    .as_ref()
+                    .map(prometheus::proto::Gauge::value)
+            })
+    }
+
+    async fn wait_for_commits(log: &CommitLog, expected: &[i32]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let ids = log.ids().await;
+            if ids == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "expected commits {expected:?} within 10s, saw {ids:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A dataset's own `cdc_prefetch_buffer` sizes the queue its changes wait
+    /// in before the accelerator write, on the path `spiced` builds: an
+    /// accelerated table in `refresh_mode: changes` hands its change sink to
+    /// the refresher.
+    #[tokio::test]
+    async fn an_accelerated_tables_change_queue_takes_the_dataset_prefetch_buffer() {
+        use crate::accelerated::refresh::Refresh;
+        use crate::federated::FederatedTable;
+        use tokio::runtime::Handle;
+
+        let dataset = "dataset_prefetch_buffer_table";
+        let log = CommitLog::new();
+        let mut builder = crate::accelerated::Builder::new(
+            runtime_status::RuntimeStatus::new(),
+            datafusion::common::TableReference::bare(dataset),
+            Arc::new(FederatedTable::new_unchecked(make_mem_table())),
+            "mem_table".to_string(),
+            make_mem_table() as Arc<dyn TableProvider>,
+            Refresh::new(RefreshMode::Changes),
+            Handle::current(),
+        );
+        builder.changes_stream(make_changes_stream(vec![Ok(make_tracked_envelope(
+            1,
+            Arc::clone(&log),
+            false,
+        ))]));
+        builder.cdc_param_overrides(Some(Arc::new(dataset_prefetch_params())));
+        let _table = builder.build().await.expect("accelerated table builds");
+
+        wait_for_commits(&log, &[1]).await;
+        assert_eq!(
+            scraped_prefetch_capacity(dataset),
+            Some(f64::from(DATASET_PREFETCH_BUFFER))
+        );
+    }
+
+    /// The same, for a refresh task that builds its own change sink because
+    /// none was handed to it.
+    #[tokio::test]
+    async fn a_refresh_tasks_own_change_queue_takes_the_dataset_prefetch_buffer() {
+        let dataset = "dataset_prefetch_buffer_task";
+        let task = make_refresh_task_with_cdc_params(
+            dataset,
+            make_mem_table() as Arc<dyn TableProvider>,
+            dataset_prefetch_params(),
+        );
+        let log = CommitLog::new();
+        let stream =
+            make_changes_stream(vec![Ok(make_tracked_envelope(1, Arc::clone(&log), false))]);
+
+        run_changes_stream(&task, stream, None, Arc::new(AtomicBool::new(false)))
+            .await
+            .expect("start_changes_stream should succeed");
+
+        assert_eq!(
+            log.ids().await,
+            vec![1],
+            "the change must reach the accelerator"
+        );
+        assert_eq!(
+            scraped_prefetch_capacity(dataset),
+            Some(f64::from(DATASET_PREFETCH_BUFFER))
+        );
     }
 
     // -- Correctness: ordering ------------------------------------------------
@@ -7849,5 +8016,116 @@ mod tests {
             "each envelope builds once"
         );
         assert_eq!(log.ids().await, vec![1, 2, 3, 4]);
+    }
+
+    /// A partition update on a cluster executor reloads the partitions a change
+    /// stream serves: the acceleration is replaced through the partition-filtered
+    /// full refresh, and the waiter for that request is answered once it landed.
+    #[tokio::test]
+    async fn a_reload_request_replaces_the_acceleration_with_the_served_partitions() {
+        let dataset = "reload_served_partitions";
+        let schema = Arc::new(create_test_data_schema());
+        let federated = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(
+                    &[1, 2, 3, 4, 5, 6],
+                    &["a", "b", "c", "d", "e", "f"],
+                )]],
+            )
+            .expect("federated mem table"),
+        );
+        let accelerator = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&[5], &["no longer served"])]],
+            )
+            .expect("accelerator mem table"),
+        );
+        let task = make_refresh_task_with_source(
+            dataset,
+            federated as Arc<dyn TableProvider>,
+            Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+        );
+        let (trigger, requests) = tokio::sync::mpsc::channel(8);
+        *task.reload_requests.lock() = Some(requests);
+
+        let mut sql = crate::accelerated::refresh::RefreshSQL::new(
+            TableReference::bare(dataset),
+            crate::accelerated::refresh::RefreshSQLColumns::All,
+            vec![],
+            None,
+        );
+        sql.set_partition_filters(Some(vec![
+            datafusion::prelude::col("id").lt(datafusion::prelude::lit(4)),
+        ]));
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            sql: Some(sql),
+            ..Refresh::default()
+        }));
+        let completion = RefreshCompletion::new();
+        let (changes, source) =
+            tokio::sync::mpsc::channel::<Result<ChangeEnvelope, cdc::StreamError>>(1);
+        let running = tokio::spawn({
+            let completion = completion.clone();
+            async move {
+                task.start_changes_stream(
+                    refresh,
+                    tokio_stream::wrappers::ReceiverStream::new(source).boxed(),
+                    None,
+                    Some(completion),
+                    Arc::new(AtomicBool::new(true)),
+                )
+                .await
+            }
+        });
+
+        let id = completion.issue();
+        let waiter = completion.waiter_for(id);
+        trigger
+            .send(id)
+            .await
+            .expect("the change stream takes reload requests");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), waiter.wait())
+            .await
+            .expect("the reload must be answered");
+        assert_eq!(
+            outcome,
+            crate::accelerated::refresh_completion::RefreshCompletionOutcome::Answered
+        );
+
+        let batches = SessionContext::new()
+            .read_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>)
+            .expect("read accelerator")
+            .collect()
+            .await
+            .expect("collect accelerator");
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .expect("id")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "the acceleration must hold exactly the served partitions' rows"
+        );
+
+        drop(changes);
+        drop(trigger);
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the change stream ends once its source ends")
+            .expect("join")
+            .expect("the change stream ends cleanly");
     }
 }

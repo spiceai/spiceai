@@ -1,6 +1,14 @@
 version: v1
 kind: Spicepod
 name: s3-public[parquet]-federated
+
+# Each query runs several times in a row; with the results cache on, every
+# repeat after the first would time the cache instead of the query.
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+
 datasets:
   - from: s3://spiceai-public-datasets/tpch/customer/customer.parquet
     name: customer

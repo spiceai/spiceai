@@ -30,7 +30,6 @@ async-openai.workspace = true
 async-trait.workspace = true
 cache = { path = "../cache" }
 chunking = { path = "../chunking" }
-hf-hub = { workspace = true }
 runtime-rate-control = { path = "../runtime-rate-control" }
 snafu.workspace = true
 tokio.workspace = true

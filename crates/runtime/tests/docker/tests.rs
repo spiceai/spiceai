@@ -14,12 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{process::Stdio, time::Duration};
+use std::{
+    process::Stdio,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 
-use bollard::secret::HealthConfig;
+use bollard::{Docker, secret::HealthConfig};
+use parking_lot::RwLock;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
+    sync::Semaphore,
 };
 
 use super::{ContainerRunnerBuilder, RunningContainer};
@@ -221,5 +227,31 @@ async fn dropping_one_instance_preserves_its_peer() -> anyhow::Result<()> {
     )
     .await?;
     second.remove().await?;
+    Ok(())
+}
+
+/// A container on a daemon that refuses every request, so each removal of it fails.
+fn unremovable() -> anyhow::Result<RunningContainer> {
+    Ok(RunningContainer {
+        name: "unremovable".into(),
+        id: "unremovable".into(),
+        // Nothing listens on port 1, so the connection is refused at once.
+        docker: Docker::connect_with_http("http://127.0.0.1:1", 5, bollard::API_DEFAULT_VERSION)?,
+        ports: RwLock::default(),
+        removed: AtomicBool::new(false),
+        _permit: Arc::new(Semaphore::new(1)).try_acquire_owned()?,
+    })
+}
+
+#[tokio::test]
+async fn a_failed_removal_keeps_the_scenario_result() -> anyhow::Result<()> {
+    let container = unremovable()?;
+    assert!(container.remove().await.is_err(), "the removal must fail");
+    assert_eq!(container.remove_after(Ok::<_, anyhow::Error>(7)).await?, 7);
+    let error = container
+        .remove_after(Err::<(), _>(anyhow::anyhow!("scenario failed")))
+        .await
+        .expect_err("the scenario failed");
+    assert_eq!(error.to_string(), "scenario failed");
     Ok(())
 }

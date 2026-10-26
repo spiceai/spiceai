@@ -1,0 +1,108 @@
+# Known failing (#15543).
+name: mysql-cdc-shared-binlog-purged-status
+description: >
+  When the binlog that datasets sharing one MySQL connection would resume
+  from has been purged, every one of them reports the cause and the fix
+  (`mysql_replication_invalid_checkpoint_behavior`) in its status. Today the
+  dataset still attached when the shared binlog stream ends shows only
+  "shared mysql binlog stream terminated"; which dataset that is depends on
+  timing, so this fails on most runs rather than all.
+
+sources:
+  src: { kind: mysql }
+
+matrix:
+  engine: [cayenne, duckdb]
+
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-cdc-shared-binlog-purged-status
+  datasets:
+    - from: mysql:ta
+      name: a
+      params: { $merge: '${sources.src.params}' }
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+    - from: mysql:tb
+      name: b
+      params: { $merge: '${sources.src.params}' }
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+    - from: mysql:tc
+      name: c
+      params: { $merge: '${sources.src.params}' }
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE ta (id int PRIMARY KEY, v varchar(64));
+        CREATE TABLE tb (id int PRIMARY KEY, v varchar(64), n decimal(10, 2));
+        CREATE TABLE tc (id int PRIMARY KEY, v varchar(64));
+        INSERT INTO ta WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 200) SELECT i, CONCAT('a', i) FROM s;
+        INSERT INTO tb WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 200) SELECT i, CONCAT('b', i), i * 1.5 FROM s;
+        INSERT INTO tc WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 200) SELECT i, CONCAT('c', i) FROM s;
+  - start: {}
+  - query: SELECT * FROM a
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM tb
+    eventually: 60s
+  - query: SELECT * FROM c
+    oracle-sql: SELECT * FROM tc
+    eventually: 60s
+
+  - source-exec:
+      src: |
+        START TRANSACTION;
+        UPDATE ta SET v = 'a-upd' WHERE id % 10 = 0;
+        DELETE FROM tb WHERE id > 190;
+        INSERT INTO tc VALUES (201, 'c-new');
+        COMMIT;
+  - query: SELECT * FROM a
+    oracle-sql: SELECT * FROM ta
+    eventually: 30s
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM tb
+    eventually: 30s
+  - query: SELECT * FROM c
+    oracle-sql: SELECT * FROM tc
+    eventually: 30s
+
+  # A clean restart resumes from the binlog.
+  - stop: {}
+  - source-exec: { src: "INSERT INTO ta VALUES (300, 'while down'); UPDATE tb SET n = 0 WHERE id = 5; DELETE FROM tc WHERE id = 7" }
+  - start: {}
+  - query: SELECT * FROM a
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM tb
+    eventually: 60s
+  - query: SELECT * FROM c
+    oracle-sql: SELECT * FROM tc
+    eventually: 60s
+
+  # The binlog holding the changes made while Spice was down is purged before
+  # it returns: it rebuilds, and rows deleted meanwhile are gone.
+  - stop: {}
+  - source-exec:
+      src: |
+        DELETE FROM ta WHERE id <= 20;
+        UPDATE tb SET v = 'purged-gap' WHERE id <= 10;
+        DELETE FROM tc WHERE id > 150;
+        INSERT INTO tc VALUES (500, 'after purge');
+        FLUSH BINARY LOGS;
+        PURGE BINARY LOGS BEFORE NOW() + INTERVAL 1 SECOND;
+  - start: { ready: false }
+  - assert-status: { dataset: a, status: Error, message-contains: mysql_replication_invalid_checkpoint_behavior }
+    eventually: 60s
+  - assert-status: { dataset: b, status: Error, message-contains: mysql_replication_invalid_checkpoint_behavior }
+    eventually: 60s
+  - assert-status: { dataset: c, status: Error, message-contains: mysql_replication_invalid_checkpoint_behavior }
+    eventually: 60s

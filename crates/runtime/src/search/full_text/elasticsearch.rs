@@ -47,7 +47,7 @@ use runtime_parameters_typed::TypedParams as _;
 use runtime_search::store_params::elasticsearch::{
     ElasticsearchFtsConfig, ElasticsearchFtsParams, normalize_elasticsearch_prefix,
 };
-use runtime_secrets::Secrets;
+use runtime_secrets::{Secrets, get_params_with_secrets, secret_sources_from_templates};
 
 pub struct ElasticsearchFullTextConnector {
     inner_connector: Arc<dyn DataConnector>,
@@ -96,16 +96,16 @@ impl ElasticsearchFullTextConnector {
             .map(spicepod::param::Params::as_string_map)
             .unwrap_or_default();
 
-        // Resolve secrets for all params.
-        let resolved =
-            runtime_secrets::get_params_with_secrets(Arc::clone(&secrets), &raw_params).await;
-
+        let secret_sources =
+            normalize_elasticsearch_prefix(secret_sources_from_templates(&raw_params));
+        let resolved = get_params_with_secrets(Arc::clone(&secrets), &raw_params).await;
         let normalized = normalize_elasticsearch_prefix(resolved);
 
-        let params = ElasticsearchFtsParams::try_from_params(
+        let params = ElasticsearchFtsParams::try_from_params_with_secret_sources(
             &format!("Elasticsearch full-text search on dataset {}", dataset.name),
             normalized,
             &secrets,
+            &secret_sources,
         )
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
@@ -266,6 +266,10 @@ impl DataConnector for ElasticsearchFullTextConnector {
 
     fn supports_changes_stream(&self) -> bool {
         self.inner_connector.supports_changes_stream()
+    }
+
+    fn supports_partitioned_changes(&self) -> bool {
+        self.inner_connector.supports_partitioned_changes()
     }
 
     fn supports_durable_write_back_delivery(&self) -> bool {
