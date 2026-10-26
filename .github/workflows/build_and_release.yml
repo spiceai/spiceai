@@ -350,6 +350,14 @@ jobs:
       - name: Build spiced (models)
         if: matrix.target.target_os == 'darwin'
         working-directory: bin/spiced
+        env:
+          # Ahead-of-time Metal kernel compilation needs the Xcode Metal Toolchain, which
+          # is a separately downloaded component not every macOS runner carries; without
+          # it the mistralrs-paged-attn and mistralrs-quant build scripts die with "cannot
+          # execute tool 'metal'". Skipping the precompile makes the kernels build at
+          # runtime instead, as the metal builds in e2e_test_ci.yml, integration_llms.yml
+          # and integration_models.yml already do.
+          MISTRALRS_METAL_PRECOMPILE: 0
         run: cargo build --release --features release,models,metal --target-dir ../../target
 
       - name: tar binary (models,metal)
