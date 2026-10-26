@@ -18547,7 +18547,6 @@ dependencies = [
  "headers",
  "http 1.4.1",
  "opentelemetry 0.32.0",
- "percent-encoding",
  "regex",
  "runtime-auth",
  "sha2 0.10.9",
