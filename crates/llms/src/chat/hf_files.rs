@@ -24,6 +24,11 @@ limitations under the License.
 //! `model` or `consolidated` safetensors file, else sharded `pytorch_model-…` pickles — and
 //! every top-level JSON or Jinja file comes along, so a config the engine reads by name is
 //! there whichever it is.
+//!
+//! A GGUF model loads the files its `files` resolve to ([`gguf_files::resolve`]): exact
+//! files with their sibling shards, or a quantization by name with the repository's draft
+//! head. A GGUF repository named with no `files` loads the largest complete quantization that
+//! fits the memory the engine reports.
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -31,25 +36,38 @@ use std::sync::LazyLock;
 use huggingface_hub::{DownloadError, Requester, Snapshot};
 use regex::Regex;
 
+use crate::chat::gguf_files::{self, ListedFile, Quantization};
 use crate::hf::HubParams;
 
 use crate::hf::SAFETENSORS_INDEX as SAFETENSOR_INDEX;
 const DOCS_URL: &str = "https://spiceai.org/docs/components/models/huggingface";
 
+/// What a model loads, once downloaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Downloaded {
+    /// The snapshot directory the files are in.
+    pub dir: PathBuf,
+    /// The GGUF files the model loads, as repository paths in load order: the weights, shard 1
+    /// first, then a draft head. Empty for a model mistral.rs loads from safetensors.
+    pub gguf: Vec<String>,
+}
+
 /// Downloads the files the model `model_id` (`org/name[:revision]`) loads from, for the model
-/// named `name`, and returns the directory they are in: the GGUF files `gguf` names, or the
-/// files mistral.rs loads when it names none.
+/// named `name`: the GGUF files `files` resolve to, or, when `files` names none, the largest
+/// GGUF quantization whose weights fit `memory` bytes (the memory the model may be placed in)
+/// or the files mistral.rs loads from a safetensors repository.
 ///
 /// # Errors
 ///
-/// Returns an error if the repository or revision cannot be read, lacks a file the engine
-/// needs, or a download fails.
+/// Returns an error if the repository or revision cannot be read, `files` names something it
+/// lacks, no quantization fits, a file the engine needs is missing, or a download fails.
 pub async fn download_model(
     model_id: &str,
-    gguf: &[&str],
+    files: &[&str],
+    memory: Option<u64>,
     hub: HubParams<'_>,
     name: &str,
-) -> Result<PathBuf, DownloadError> {
+) -> Result<Downloaded, DownloadError> {
     let requester = Requester {
         kind: "model",
         name: name.to_string(),
@@ -61,7 +79,150 @@ pub async fn download_model(
         None => (model_id, None),
     };
     let snapshot = crate::hf::open_model(requester, repo, revision, hub).await?;
-    download(&snapshot, gguf).await
+    let gguf = resolve_gguf(&snapshot, files, memory, name, repo)?;
+    let paths: Vec<&str> = gguf.iter().map(String::as_str).collect();
+    let dir = download(&snapshot, &paths).await?;
+    Ok(Downloaded { dir, gguf })
+}
+
+/// The GGUF files a model loads from `snapshot`: those `files` resolve to, or with none named,
+/// the largest complete quantization whose weights fit `memory`, and its draft head. Empty for
+/// a repository that offers no GGUF quantization or that mistral.rs loads from safetensors.
+fn resolve_gguf(
+    snapshot: &Snapshot,
+    files: &[&str],
+    memory: Option<u64>,
+    name: &str,
+    repo: &str,
+) -> Result<Vec<String>, DownloadError> {
+    let listing: Vec<ListedFile> = snapshot
+        .files()
+        .map(|file| ListedFile {
+            path: file.path.clone(),
+            size: file.size,
+        })
+        .collect();
+    if let Some(resolved) = gguf_files::resolve(&listing, files)
+        .map_err(|error| DownloadError::unusable(snapshot, error.to_string()))?
+    {
+        if files.iter().any(|file| !is_gguf_path(file)) {
+            tracing::info!(
+                "Model '{name}' loads {} from Hugging Face repo '{repo}'{}.",
+                describe(resolved.quantization.as_deref(), resolved.weights.len()),
+                resolved
+                    .draft
+                    .as_ref()
+                    .map_or_else(String::new, |draft| format!(", drafting with '{draft}'"))
+            );
+        }
+        return Ok(resolved
+            .files()
+            .into_iter()
+            .map(ToString::to_string)
+            .collect());
+    }
+    let names: Vec<&str> = listing.iter().map(|file| file.path.as_str()).collect();
+    let quantizations = gguf_files::quantizations(&listing);
+    if quantizations.is_empty() || weights(&names).is_some() {
+        return Ok(Vec::new());
+    }
+    let chosen = choose_quantization(snapshot, &quantizations, memory, name, repo)?;
+    let mut gguf = chosen.files.clone();
+    gguf.extend(gguf_files::draft_head(&listing, &chosen.name));
+    Ok(gguf)
+}
+
+/// The quantization a model with no `files` loads: the only one, or the largest whose weights
+/// fit `memory` with room for the context.
+fn choose_quantization<'q>(
+    snapshot: &Snapshot,
+    quantizations: &'q [Quantization],
+    memory: Option<u64>,
+    name: &str,
+    repo: &str,
+) -> Result<&'q Quantization, DownloadError> {
+    let names = || {
+        quantizations
+            .iter()
+            .map(|q| format!("{} ({})", q.name, gigabytes(q.bytes)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let Some(memory) = memory else {
+        if let [only] = quantizations {
+            return Ok(only);
+        }
+        return Err(DownloadError::unusable(
+            snapshot,
+            format!(
+                "it offers {} GGUF quantizations ({}) and this build cannot measure the memory to choose one. Name one in the model's `files`, as `files: [{{path: {}}}]`",
+                quantizations.len(),
+                names(),
+                quantizations.last().map_or("", |q| q.name.as_str())
+            ),
+        ));
+    };
+    match gguf_files::choose(quantizations, gguf_files::weights_budget(memory)) {
+        Ok(chosen) => {
+            let larger = quantizations
+                .iter()
+                .rev()
+                .find(|q| q.bytes > chosen.bytes)
+                .map_or_else(String::new, |q| {
+                    format!("; {} ({}) does not", q.name, gigabytes(q.bytes))
+                });
+            tracing::info!(
+                "Model '{name}' loads {} ({}) from Hugging Face repo '{repo}', the largest of its {} complete GGUF quantizations whose weights fit the {} of memory free for it with room for the context{larger}. Pin it with `files: [{{path: {}}}]`.",
+                describe(Some(&chosen.name), chosen.files.len()),
+                gigabytes(chosen.bytes),
+                quantizations.len(),
+                gibibytes(memory),
+                chosen.name
+            );
+            Ok(chosen)
+        }
+        Err(smallest) => Err(DownloadError::unusable(
+            snapshot,
+            format!(
+                "none of its GGUF quantizations fits the {} of memory free for the model with room for the context{}. Serve it across machines with `nodes`, or name a quantization in the model's `files` to load it anyway: {}",
+                gibibytes(memory),
+                smallest.map_or_else(String::new, |q| format!(
+                    "; the smallest, {}, is {}",
+                    q.name,
+                    gigabytes(q.bytes)
+                )),
+                names()
+            ),
+        )),
+    }
+}
+
+/// `quantization UD-Q4_K_XL (6 files)`, or `3 files` when the files are no one quantization.
+fn describe(quantization: Option<&str>, files: usize) -> String {
+    let files = if files == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{files} files")
+    };
+    quantization.map_or_else(|| files.clone(), |q| format!("quantization {q} ({files})"))
+}
+
+fn is_gguf_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+}
+
+/// Bytes as the Hub shows a file's size, in decimal gigabytes.
+#[expect(clippy::cast_precision_loss, reason = "a size shown to one decimal")]
+fn gigabytes(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1e9)
+}
+
+/// Bytes of memory, in binary gibibytes.
+#[expect(clippy::cast_precision_loss, reason = "a size shown to one decimal")]
+fn gibibytes(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / f64::from(1u32 << 30))
 }
 
 /// mistral.rs's weight file patterns (`mistralrs-core/src/pipeline/paths.rs`).

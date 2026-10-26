@@ -42,6 +42,9 @@ pub struct LocalChatEngine {
     pub serves: fn(&[PathBuf]) -> bool,
     /// Loads the model from local weight files.
     pub load: LoadLocalModel,
+    /// The memory, in bytes, free on this node for a model on the devices the engine places
+    /// it on, for choosing a quantization that fits; `None` when the engine cannot tell.
+    pub free_memory: fn() -> Option<u64>,
 }
 
 #[linkme::distributed_slice]
@@ -53,6 +56,14 @@ pub fn engine_for(weights: &[PathBuf]) -> Option<&'static LocalChatEngine> {
     LOCAL_CHAT_ENGINES
         .iter()
         .find(|engine| (engine.serves)(weights))
+}
+
+/// The free memory the first registered engine that can measure it reports.
+#[must_use]
+pub fn free_memory() -> Option<u64> {
+    LOCAL_CHAT_ENGINES
+        .iter()
+        .find_map(|engine| (engine.free_memory)())
 }
 
 /// Registers a [`LocalChatEngine`] as the static `$name`.

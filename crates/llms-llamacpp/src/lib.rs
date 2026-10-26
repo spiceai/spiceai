@@ -89,8 +89,14 @@ llms::register_local_chat_engine!(
         name: "llama.cpp",
         serves: serves_weights,
         load: load_weights,
+        free_memory,
     }
 );
+
+/// The memory llama.cpp's devices have free for a model, for choosing a quantization.
+fn free_memory() -> Option<u64> {
+    llama_cpp::free_memory(Backend::get())
+}
 
 /// llama.cpp serves a model whose weights are all GGUF files: shards of one model, and an
 /// optional MTP draft head.

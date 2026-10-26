@@ -36,9 +36,7 @@ use snafu::ResultExt;
 use spicepod::component::model::ModelFileType;
 use spicepod::component::model::{Model, ModelSource};
 #[cfg(feature = "models")]
-use std::path::PathBuf;
-#[cfg(feature = "models")]
-use std::str::FromStr;
+use std::path::Path;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::sync::RwLock;
@@ -441,26 +439,25 @@ async fn huggingface(
         endpoint: params.hf_endpoint.as_deref(),
     };
 
-    // For GGUF models, we require user specify via `.files[].path`: the shards of a split
-    // GGUF, and an MTP draft head, are each listed.
-    let gguf_files = component
-        .find_all_file_path(ModelFileType::Weights)
-        .iter()
-        .filter_map(|p| {
-            let path = PathBuf::from_str(p.as_str()).ok()?;
-            path.extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
-                .then_some(path)
+    // The model's GGUF files, or a GGUF quantization by name (a path without an extension), as
+    // `files` lists them; the download resolves them against the repository, and with none
+    // chooses a GGUF repository's quantization.
+    let files: Vec<String> = component
+        .get_all_files()
+        .into_iter()
+        .filter(|file| {
+            let extension = Path::new(&file.path).extension();
+            match file.file_type() {
+                Some(ModelFileType::Weights) => {
+                    extension.is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+                }
+                None => extension.is_none(),
+                Some(_) => false,
+            }
         })
-        .collect::<Vec<_>>();
-
-    if !gguf_files.is_empty() {
-        tracing::debug!(
-            "For Huggingface model {}, the GGUF files {:?} will be downloaded and used.",
-            component.name,
-            gguf_files
-        );
-    }
+        .map(|file| file.path)
+        .collect();
+    let files: Vec<&str> = files.iter().map(String::as_str).collect();
 
     let chat_template_literal = params.chat_template.as_deref();
     let distributed = parse_distributed_config(
@@ -475,7 +472,7 @@ async fn huggingface(
     llms::chat::create_hf_model(
         &id,
         model_type,
-        &gguf_files,
+        &files,
         hub,
         chat_template_literal,
         distributed,

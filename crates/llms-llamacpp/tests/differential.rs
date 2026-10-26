@@ -34,11 +34,13 @@ async fn local_gguf() -> PathBuf {
     llms::chat::hf_files::download_model(
         &format!("{MODEL}:{REVISION}"),
         &[FILE],
+        None,
         llms::hf::HubParams::default(),
         "qwen3-0.6b",
     )
     .await
     .expect("the GGUF downloads")
+    .dir
     .join(FILE)
 }
 

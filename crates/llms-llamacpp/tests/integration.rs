@@ -56,7 +56,7 @@ pub(crate) async fn qwen3() -> Arc<dyn Chat> {
     llms::chat::create_hf_model(
         &format!("{MODEL}:{REVISION}"),
         None,
-        &file,
+        &[FILE],
         llms::hf::HubParams::default(),
         None,
         None,
@@ -74,11 +74,13 @@ pub(crate) async fn qwen3_gguf() -> PathBuf {
     llms::chat::hf_files::download_model(
         &format!("{MODEL}:{REVISION}"),
         &[FILE],
+        None,
         llms::hf::HubParams::default(),
         "qwen3-0.6b",
     )
     .await
     .expect("Qwen3-0.6B downloads")
+    .dir
     .join(FILE)
 }
 

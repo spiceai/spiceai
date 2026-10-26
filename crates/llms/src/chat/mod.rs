@@ -40,6 +40,8 @@ use async_openai::types::chat::{
 #[cfg(feature = "local_llm")]
 pub mod engine;
 #[cfg(feature = "local_llm")]
+pub mod gguf_files;
+#[cfg(feature = "local_llm")]
 pub mod hf_files;
 #[cfg(feature = "local_llm")]
 pub mod mistral;
@@ -360,9 +362,11 @@ use crate::hf::HubParams;
 /// the cache's snapshot directory: it never downloads anything itself.
 /// `model_type` is the type of model, if needed to be explicit. Often this can
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
-/// `gguf_files` are the GGUF files within the huggingface model repo to load the model from,
-///    in the order the model lists them: every shard, and any MTP draft head. A registered
-///    engine that serves them gets them all; mistral.rs loads the first.
+/// `files` are the model's `files`, as the Spicepod lists them: GGUF files within the repo,
+///    or a quantization by name (`UD-Q4_K_XL`), resolved against the repo
+///    ([`gguf_files::resolve`]); with none, a GGUF repo's largest quantization that fits the
+///    memory the engine reports. A registered engine that serves the GGUF files gets them all,
+///    every shard and any draft head; mistral.rs loads the first.
 /// `hub` is the model's `hf_token` and `hf_endpoint`.
 /// `distributed` optionally runs the model tensor-parallel across multiple nodes.
 /// `reasoning` names the model and its `reasoning_effort` default for the load-time check.
@@ -370,28 +374,28 @@ use crate::hf::HubParams;
 pub async fn create_hf_model(
     model_id: &str,
     model_type: Option<&str>,
-    gguf_files: &[PathBuf],
+    files: &[&str],
     hub: HubParams<'_>,
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
     reasoning: ReasoningDefault<'_>,
 ) -> Result<Arc<dyn Chat>> {
-    let gguf = gguf_files
-        .iter()
-        .map(|file| {
-            file.to_str().ok_or_else(|| Error::FailedToLoadModel {
-                source: format!("the GGUF path '{}' is not valid UTF-8", file.display()).into(),
-            })
-        })
-        .collect::<Result<Vec<&str>>>()?;
-    let dir = hf_files::download_model(model_id, &gguf, hub, reasoning.model_name)
-        .await
-        .map_err(|error| Error::FailedToDownloadModel {
-            configuration: error.is_configuration_error(),
-            source: Box::new(error),
-        })?;
+    // A model split across nodes may take every node's memory; a tensor split needs nodes of
+    // equal memory, so this node's measures each.
+    let nodes = distributed
+        .as_ref()
+        .map_or(1, |cfg| u64::try_from(cfg.world_size()).unwrap_or(1));
+    let memory = engine::free_memory().map(|free| free.saturating_mul(nodes));
+    let hf_files::Downloaded { dir, gguf } =
+        hf_files::download_model(model_id, files, memory, hub, reasoning.model_name)
+            .await
+            .map_err(|error| Error::FailedToDownloadModel {
+                configuration: error.is_configuration_error(),
+                source: Box::new(error),
+            })?;
+    let gguf_files: Vec<PathBuf> = gguf.iter().map(PathBuf::from).collect();
     if distributed.is_none()
-        && let Some(engine) = engine::engine_for(gguf_files)
+        && let Some(engine) = engine::engine_for(&gguf_files)
     {
         let weights: Vec<PathBuf> = gguf_files.iter().map(|file| dir.join(file)).collect();
         let template_file = hf_files::chat_template_file(&dir).await;
@@ -419,7 +423,7 @@ pub async fn create_hf_model(
     mistral::MistralLlama::from_snapshot(
         &dir,
         model_type,
-        gguf.first().copied(),
+        gguf.first().map(String::as_str),
         chat_template_literal,
         ring_config,
         reasoning,

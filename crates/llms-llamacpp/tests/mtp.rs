@@ -42,11 +42,13 @@ async fn a_model_whose_mtp_layer_does_not_load_decodes_without_drafting() {
     let downloaded = llms::chat::hf_files::download_model(
         &format!("{MODEL}:{REVISION}"),
         &[FILE],
+        None,
         HubParams::default(),
         "qwen3.5",
     )
     .await
-    .expect("Qwen3.5-0.8B downloads");
+    .expect("Qwen3.5-0.8B downloads")
+    .dir;
     let scratch = tempfile::tempdir().expect("a scratch directory");
     let gguf = fixture::copy_with_tensor(
         &downloaded.join(FILE),

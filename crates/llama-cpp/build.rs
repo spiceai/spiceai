@@ -210,12 +210,14 @@ fn bindings(root: &Path) {
         .clang_arg(format!("-I{}", root.join("include").display()))
         .clang_arg(format!("-I{}", root.join("ggml/include").display()))
         .allowlist_function("llama_.*")
+        .allowlist_function("ggml_backend_(reg|dev)_.*")
         .allowlist_function("spice_mtp_.*")
         .allowlist_function("spice_json_schema_to_grammar")
         .allowlist_function("spice_string_free")
         .allowlist_type("llama_.*")
         .allowlist_type("spice_mtp.*")
         .allowlist_type("ggml_log_level")
+        .allowlist_type("ggml_backend_dev_type")
         .allowlist_var("LLAMA_.*")
         // llama.cpp is C++ behind a C API, and an exception it does not catch would unwind
         // into Rust, which only an unwinding ABI allows. Rust then aborts where it would
