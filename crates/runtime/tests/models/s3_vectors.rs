@@ -850,11 +850,7 @@ pub(crate) mod search {
                 rt.shutdown().await;
                 drop(rt);
 
-                // Clean up container after test
-                running_container.remove().await.map_err(|e| {
-                    tracing::error!("running_container.remove: {e}");
-                    anyhow::Error::msg(e.to_string())
-                })?;
+                running_container.cleanup().await;
 
                 Ok(())
             })

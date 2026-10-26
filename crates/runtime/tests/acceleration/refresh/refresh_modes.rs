@@ -176,7 +176,7 @@ pub(crate) async fn refresh_matches_postgres_source(
             insert_labeled(&db_conn, instants.probe, -1, "not-refreshed").await?;
             assert_acceleration_held(engine, mode_name, &db_conn, &rt, &snapshot).await?;
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
