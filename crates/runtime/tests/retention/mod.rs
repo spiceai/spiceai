@@ -456,7 +456,7 @@ SET
                 "retention_sql should remove soft-deleted rows on refresh commit"
             );
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
 
             Ok(())
         })

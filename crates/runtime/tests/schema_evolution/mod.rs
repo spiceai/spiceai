@@ -134,7 +134,7 @@ async fn test_schema_evolution() -> Result<(), anyhow::Error> {
             let rt = Arc::new(initialize_runtime(port).await?);
             run_and_verify_query(&rt, sql, "test_schema_evolution_drop_table").await;
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
 
             if std::fs::metadata(DUCKDB_FILE_PATH).is_ok() {
                 std::fs::remove_file(DUCKDB_FILE_PATH).expect("should remove local database");
@@ -368,7 +368,7 @@ async fn test_schema_evolution_file_update_mode() -> Result<(), anyhow::Error> {
             );
             run_and_verify_query(&rt, sql, "test_schema_evolution_file_update_change_type").await;
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
 
             if std::fs::metadata(DUCKDB_FILE_UPDATE_PATH).is_ok() {
                 std::fs::remove_file(DUCKDB_FILE_UPDATE_PATH)
@@ -947,7 +947,7 @@ async fn test_schema_evolution_widening_duckdb_sync_all_columns() -> Result<(), 
             rt.shutdown().await;
             drop(rt);
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -1028,7 +1028,7 @@ async fn test_schema_evolution_widening_cayenne_sync_all_columns() -> Result<(),
             rt.shutdown().await;
             drop(rt);
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -1123,7 +1123,7 @@ async fn test_schema_evolution_append_new_columns_only() -> Result<(), anyhow::E
             rt.shutdown().await;
             drop(rt);
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await

@@ -185,10 +185,7 @@ async fn no_accel_collection_not_found_then_created_with_docs() -> Result<(), St
             .await
             .map_err(|e| e.to_string())?;
 
-            running_container
-                .remove()
-                .await
-                .map_err(|e| e.to_string())?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -255,10 +252,7 @@ async fn no_accel_empty_collection_then_docs_added() -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?;
 
-            running_container
-                .remove()
-                .await
-                .map_err(|e| e.to_string())?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -314,10 +308,7 @@ async fn no_accel_collection_with_documents_registers_immediately() -> Result<()
             .await
             .map_err(|e| e.to_string())?;
 
-            running_container
-                .remove()
-                .await
-                .map_err(|e| e.to_string())?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -386,7 +377,7 @@ async fn changes_accel_collection_not_found_then_created_with_docs() -> anyhow::
             .await?;
 
             rt.shutdown().await;
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -454,7 +445,7 @@ async fn changes_accel_empty_collection_then_docs_added() -> anyhow::Result<()> 
             .await?;
 
             rt.shutdown().await;
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -533,7 +524,7 @@ async fn changes_accel_collection_with_documents_snapshot_and_cdc() -> anyhow::R
             .await?;
 
             rt.shutdown().await;
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -618,10 +609,7 @@ async fn no_accel_declared_schema_collection_not_found_registers_immediately() -
             .await
             .map_err(|e| e.to_string())?;
 
-            running_container
-                .remove()
-                .await
-                .map_err(|e| e.to_string())?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -680,10 +668,7 @@ async fn no_accel_declared_schema_empty_collection_registers_immediately() -> Re
             .await
             .map_err(|e| e.to_string())?;
 
-            running_container
-                .remove()
-                .await
-                .map_err(|e| e.to_string())?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -749,10 +734,7 @@ async fn no_accel_declared_schema_collection_with_documents_uses_merged_schema()
             .await
             .map_err(|e| e.to_string())?;
 
-            running_container
-                .remove()
-                .await
-                .map_err(|e| e.to_string())?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -823,7 +805,7 @@ async fn changes_accel_declared_schema_collection_not_found_registers_immediatel
             .await?;
 
             rt.shutdown().await;
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -895,7 +877,7 @@ async fn changes_accel_declared_schema_empty_collection_registers_immediately() 
             .await?;
 
             rt.shutdown().await;
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -965,7 +947,7 @@ async fn changes_accel_declared_schema_collection_with_documents_uses_merged_sch
             assert!(applied, "CDC should apply new inserts");
 
             rt.shutdown().await;
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
