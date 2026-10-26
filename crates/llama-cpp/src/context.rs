@@ -28,6 +28,19 @@ use crate::{BatchFullSnafu, Error, Result, Token, sys};
 /// sliding-window caches, not the full-attention cache.
 const PARTIAL_ONLY: sys::llama_state_seq_flags = sys::LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
 
+/// How far a context's cache can be cut back from its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Truncation {
+    /// To any position: an attention cache, or a sliding-window cache kept at full size, as
+    /// llama.cpp keeps one by default.
+    Anywhere,
+    /// Only over the last few positions its rollback snapshots keep: a recurrent state with
+    /// snapshots for drafted tokens.
+    Bounded,
+    /// Not short of clearing it: a recurrent state without snapshots, or a compressed cache.
+    Never,
+}
+
 /// How a context is created.
 #[expect(
     clippy::struct_field_names,
@@ -150,6 +163,28 @@ impl Context<'_> {
     pub fn truncate(&mut self, from: i32) -> bool {
         // SAFETY: as above; -1 means "to the end".
         unsafe { sys::llama_memory_seq_rm(sys::llama_get_memory(self.raw.as_ptr()), 0, from, -1) }
+    }
+
+    /// How far this context's cache can be cut back, found as llama.cpp's server finds it: a
+    /// context that keeps rollback snapshots rolls back only over them; otherwise two tokens are
+    /// decoded into the emptied cache, and the second removed. Leaves the cache empty.
+    pub fn truncation(&mut self) -> Truncation {
+        // SAFETY: the context is live.
+        if unsafe { sys::llama_n_rs_seq(self.raw.as_ptr()) } > 0 {
+            return Truncation::Bounded;
+        }
+        self.clear();
+        let mut batch = Batch::new(2);
+        let truncated = batch.add(Token(0), 0, false).is_ok()
+            && batch.add(Token(0), 1, true).is_ok()
+            && self.decode(&batch).is_ok()
+            && self.truncate(1);
+        self.clear();
+        if truncated {
+            Truncation::Anywhere
+        } else {
+            Truncation::Never
+        }
     }
 
     /// Sequence 0's state that a truncation cannot restore, as llama.cpp's server saves a

@@ -132,24 +132,6 @@ impl Model {
         unsafe { sys::llama_model_n_layer_nextn(self.raw.as_ptr()) }
     }
 
-    /// Whether the model keeps a recurrent state (a Mamba or gated delta net layer, alone or
-    /// beside attention), which a cache truncation rolls back only over its last few tokens.
-    #[must_use]
-    pub fn has_recurrent_state(&self) -> bool {
-        // SAFETY: reads the loaded model's hyperparameters.
-        unsafe {
-            sys::llama_model_is_recurrent(self.raw.as_ptr())
-                || sys::llama_model_is_hybrid(self.raw.as_ptr())
-        }
-    }
-
-    /// How many tokens back the model's sliding-window layers attend; 0 when it has none.
-    #[must_use]
-    pub fn n_swa(&self) -> i32 {
-        // SAFETY: reads the loaded model's hyperparameters.
-        unsafe { sys::llama_model_n_swa(self.raw.as_ptr()) }
-    }
-
     /// The chat template the GGUF file carries, if any.
     #[must_use]
     pub fn chat_template(&self) -> Option<String> {

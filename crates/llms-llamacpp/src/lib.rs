@@ -59,7 +59,7 @@ use futures::Stream;
 use indexmap::IndexMap;
 use llama_cpp::{
     Backend, Batch, Context, ContextParams, DraftKind, Model, ModelParams, Mtp, MtpParams, Sampler,
-    Token, Vocab,
+    Token, Truncation, Vocab,
 };
 use mistralrs_core::reasoning_parsers::{
     TagReasoningContext,
@@ -913,7 +913,12 @@ fn serve(
         bos: piece(&model, vocab.bos()),
         eos: piece(&model, vocab.eos()),
     };
-    let mut cache = PromptCache::new(name, &model);
+    // How far the target's cache can be cut back decides whether reusing it needs checkpoints.
+    let truncation = match &mut decoder {
+        Decoder::Plain(context) => context.truncation(),
+        Decoder::Mtp(spec) => spec.target_mut().truncation(),
+    };
+    let mut cache = PromptCache::new(name, truncation);
     let loaded = Loaded {
         template: model.chat_template(),
         architecture: model.architecture(),
@@ -1224,23 +1229,19 @@ struct PromptCache {
     /// The tokens in the KV cache, in order: the last prompt, then the reply tokens decoded
     /// after it. Empty while a request runs, so one that fails leaves nothing to reuse.
     tokens: Vec<Token>,
-    /// Whether a truncated cache is still correct. A sliding-window cache may already have
-    /// dropped tokens that the positions just before the truncation attend to.
-    truncates: bool,
-    /// For a model with a recurrent state, which a truncation rolls back only a few tokens.
+    /// For a cache that cannot be cut back to any position, as a recurrent state or a
+    /// compressed cache cannot.
     checkpoints: Option<Checkpoints>,
     /// How many prompt tokens the last request read from the cache.
     reused: Arc<AtomicUsize>,
 }
 
 impl PromptCache {
-    fn new(name: &str, model: &Model) -> Self {
-        let truncates = model.n_swa() == 0;
+    fn new(name: &str, truncation: Truncation) -> Self {
         Self {
             model: name.to_string(),
             tokens: Vec::new(),
-            truncates,
-            checkpoints: (truncates && model.has_recurrent_state()).then(Checkpoints::default),
+            checkpoints: (truncation != Truncation::Anywhere).then(Checkpoints::default),
             reused: Arc::default(),
         }
     }
@@ -1251,16 +1252,12 @@ impl PromptCache {
     /// checkpoint within that prefix, and otherwise the cache is emptied.
     fn reuse<'m>(&mut self, target: &mut impl Target<'m>, tokens: &[Token]) -> usize {
         let cached = std::mem::take(&mut self.tokens);
-        let shared = if self.truncates {
-            let common = cached
-                .iter()
-                .zip(tokens)
-                .take_while(|(a, b)| a == b)
-                .count();
-            common.min(tokens.len().saturating_sub(1))
-        } else {
-            0
-        };
+        let common = cached
+            .iter()
+            .zip(tokens)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let shared = common.min(tokens.len().saturating_sub(1));
         // A checkpoint past the shared prefix holds the state of tokens this prompt lacks.
         if let Some(checkpoints) = &mut self.checkpoints {
             checkpoints.truncate(shared);

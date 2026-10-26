@@ -42,6 +42,9 @@ const EMPTY_THINK_TOKENS: usize = 4;
 /// engine's `CHECKPOINT_BEFORE_END`.
 const CHECKPOINT_BEFORE_END: usize = 4;
 
+/// unsloth's Gemma 3 270M at a pinned revision: sliding-window attention, small enough for CI.
+const GEMMA_FILE: &str = "gemma-3-270m-it-Q8_0.gguf";
+
 /// One request of the conversation, and what came of it.
 struct Turn {
     messages: Vec<Value>,
@@ -180,3 +183,28 @@ async fn a_recurrent_state_resumes_from_its_checkpoint() {
     })
     .await;
 }
+
+/// Gemma 3 270M attends over a 512-position sliding window in five of every six layers, and
+/// llama.cpp keeps that cache at full size, so a truncation leaves every window whole: each
+/// turn reuses everything it shares with the cache, as an attention cache does.
+#[tokio::test]
+async fn a_sliding_window_cache_reuses_the_shared_prompt() {
+    let gguf = llms::chat::hf_files::download_model(
+        "unsloth/gemma-3-270m-it-GGUF:c90975dbd40c0c7b275fefaae758c3415c906238",
+        &[GEMMA_FILE],
+        llms::hf::HubParams::default(),
+        "gemma-3-270m",
+    )
+    .await
+    .expect("Gemma 3 270M downloads")
+    .join(GEMMA_FILE);
+    // Gemma's template repeats a reply as it was generated, so a turn shares the last prompt and
+    // its reply: llama-server (`--swa-full`, the same full-size window) reports `cache_n`
+    // 0/40/65/87 on this conversation, and 0/15/59/83 with its default sliding window.
+    replies_as_from_an_empty_cache(&gguf, "gemma-3-270m-prefix-reuse", |prompts| {
+        assert_eq!(prompts, [20, 64, 88, 88], "the conversation's prompts");
+        vec![0, 40, 65, 87]
+    })
+    .await;
+}
+
