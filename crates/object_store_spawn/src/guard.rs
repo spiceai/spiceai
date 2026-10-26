@@ -97,6 +97,28 @@ impl DestinationGuard {
         }
     }
 
+    /// Resolves `host` with the system resolver and refuses it if any address it resolves to is
+    /// blocked, so a name that resolves to both a public and a blocked address is refused too.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lookup error, or a [`DestinationRefused`] when an address is blocked.
+    pub async fn resolve(
+        &self,
+        host: &str,
+    ) -> Result<Vec<SocketAddr>, Box<dyn StdError + Send + Sync>> {
+        let host = host.to_ascii_lowercase();
+        let addresses: Vec<SocketAddr> =
+            tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+        if addresses
+            .iter()
+            .any(|address| (self.blocks_address)(address.ip()))
+        {
+            return Err(Box::new(self.refused(host)));
+        }
+        Ok(addresses)
+    }
+
     fn refused(&self, target: impl Into<String>) -> DestinationRefused {
         DestinationRefused {
             target: target.into(),
@@ -194,25 +216,16 @@ pub(crate) fn build_client(
     builder.build().map_err(generic)
 }
 
-/// Resolves with the system resolver and refuses a host if any of its addresses is blocked,
-/// so a name that resolves to both a public and a blocked address cannot be used either.
+/// Resolves every host through [`DestinationGuard::resolve`].
 struct GuardedResolver {
     guard: DestinationGuard,
 }
 
 impl Resolve for GuardedResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().to_ascii_lowercase();
         let guard = self.guard.clone();
         Box::pin(async move {
-            let addresses: Vec<SocketAddr> =
-                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
-            if addresses
-                .iter()
-                .any(|address| (guard.blocks_address)(address.ip()))
-            {
-                return Err(Box::new(guard.refused(host)) as Box<dyn StdError + Send + Sync>);
-            }
+            let addresses = guard.resolve(name.as_str()).await?;
             Ok(Box::new(addresses.into_iter()) as Addrs)
         })
     }
