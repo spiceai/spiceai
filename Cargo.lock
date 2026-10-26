@@ -20790,6 +20790,7 @@ dependencies = [
  "arrow-flight",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bollard",
  "bytes",
  "chrono",
