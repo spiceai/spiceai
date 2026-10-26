@@ -1,0 +1,130 @@
+{
+  "schema-add-column-full-refresh": [
+    {
+      "run": "schema-add-column-full-refresh",
+      "who": "append-new-columns",
+      "key": "query: SELECT * FROM t",
+      "kind": "other",
+      "signature": "the oracle returned 4 columns (id, v, s, extra) but Spice returned 3 (id, v, s)",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "schema-add-column-full-refresh",
+      "who": "block",
+      "key": "refresh: t #2",
+      "kind": "status",
+      "signature": "refresh of 't' did not finish within <duration> (status: Ready)",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "schema-add-column-full-refresh",
+      "who": "block",
+      "key": "query: SELECT * FROM t #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"1002\\\"\", actual: \"\\\"1001\\\"\" }",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "schema-add-column-full-refresh",
+      "who": "sync-all-columns",
+      "key": "query: SELECT * FROM t",
+      "kind": "other",
+      "signature": "the oracle returned 4 columns (id, v, s, extra) but Spice returned 3 (id, v, s)",
+      "group": "schema-evolution"
+    }
+  ],
+  "schema-frozen-status": [
+    {
+      "run": "schema-frozen-status",
+      "who": "append-new-columns",
+      "key": "assert-status: {\"dataset\":\"cham\",\"message-contains\":\"age\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected status Error, saw status=Ready ready=true message=",
+      "varies": true,
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-frozen-status",
+      "who": "block",
+      "key": "assert-status: {\"dataset\":\"cham\",\"message-contains\":\"age\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected status Error, saw status=Ready ready=true message=",
+      "varies": true,
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-frozen-status",
+      "who": "sync-all-columns",
+      "key": "assert-status: {\"dataset\":\"cham\",\"message-contains\":\"age\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected status Error, saw status=Ready ready=true message=",
+      "varies": true,
+      "group": "schema-evolution",
+      "may-pass": true
+    }
+  ],
+  "schema-widen": [
+    {
+      "run": "schema-widen[refresh_mode=full]",
+      "who": "sync-all-columns",
+      "key": "refresh: t",
+      "kind": "error",
+      "signature": "refresh of 't' failed: Failed to fetch data from the data connector: External error: External error: Unable to cast column 1 'v' from Int64 to Int32: Cast error: Can't cast value 3000000001 to type Int32. Ensure the dataset source path and connector configuration are valid, and try again.",
+      "varies": true,
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-widen[refresh_mode=full]",
+      "who": "sync-all-columns",
+      "key": "query: SELECT * FROM t #2",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Failed to type the oracle's column 'v' as Int32: Cast error: Cannot cast string '3000000001' to value of Int32 type",
+      "varies": true,
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-widen[refresh_mode=full]",
+      "who": "sync-all-columns",
+      "key": "query: SELECT arrow_typeof(v) FROM t LIMIT 1",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"arrow_typeof(t.v)\", row_number: 1, expected: \"\\\"Int64\\\"\", actual: \"\\\"Int32\\\"\" }",
+      "varies": true,
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-widen[refresh_mode=changes]",
+      "who": "sync-all-columns",
+      "key": "start: {}",
+      "kind": "status",
+      "signature": "spiced not ready after <duration>",
+      "varies": true,
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-widen[refresh_mode=changes]",
+      "who": "block",
+      "key": "query: SELECT * FROM t #4",
+      "kind": "error",
+      "signature": "Acceleration not ready; loading initial data for t",
+      "pattern": "Acceleration not ready; loading initial data for t",
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-widen[refresh_mode=changes]",
+      "who": "append-new-columns",
+      "key": "query: SELECT * FROM t #4",
+      "kind": "error",
+      "signature": "Acceleration not ready; loading initial data for t",
+      "pattern": "Acceleration not ready; loading initial data for t",
+      "group": "schema-evolution",
+      "may-pass": true
+    }
+  ]
+}

@@ -1,0 +1,98 @@
+name: retention
+description: >
+  Time retention keeps rows newer than `retention_period` by the time column
+  (and, as it stands, removes rows with no time),
+  and `retention_sql` deletes the rows its predicate matches, leaving rows the
+  predicate cannot evaluate (NULL); both apply again after every full refresh
+  reloads the source's old rows; and a query that finds no rows in the
+  acceleration under `on_zero_results: use_source` does not bring the removed
+  rows back from the source.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  engine: [cayenne, duckdb, arrow]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: retention
+  datasets:
+    - from: postgres:public.events
+      name: by_time
+      params: ${sources.src.params}
+      time_column: ts
+      acceleration:
+        enabled: true
+        engine: '${matrix.engine}'
+        refresh_mode: full
+        retention_period: 30d
+        retention_check_enabled: true
+        retention_check_interval: 1s
+        on_zero_results: use_source
+    - from: postgres:public.events
+      name: by_sql
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: '${matrix.engine}'
+        refresh_mode: full
+        retention_sql: DELETE FROM by_sql WHERE kind = 'expired' OR v < 0
+        retention_check_enabled: true
+        retention_check_interval: 1s
+        on_zero_results: use_source
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE events (id int PRIMARY KEY, ts timestamp, kind text, v int);
+        INSERT INTO events SELECT i, now()::timestamp - (i % 90) * INTERVAL '1 day' - INTERVAL '1 hour',
+          CASE WHEN i % 5 = 0 THEN 'expired' WHEN i % 11 = 0 THEN NULL ELSE 'live' END,
+          CASE WHEN i % 7 = 0 THEN -i WHEN i % 13 = 0 THEN NULL ELSE i END
+          FROM generate_series(1, 900) i;
+        INSERT INTO events VALUES (901, NULL, 'live', 1), (902, now()::timestamp + INTERVAL '1 day', 'live', 2);
+  - start: {}
+
+  # Time retention also removes a row whose time is NULL, unlike retention_sql,
+  # which keeps a row its predicate cannot evaluate (an open question, asserted here
+  # as it stands).
+  - query: SELECT * FROM by_time
+    oracle-sql: SELECT * FROM events WHERE ts >= now()::timestamp - INTERVAL '30 days'
+    eventually: 30s
+  - query: SELECT * FROM by_sql
+    oracle-sql: SELECT * FROM events WHERE NOT coalesce(kind = 'expired' OR v < 0, false)
+    eventually: 30s
+  # Rows that retention removed do not come back through the fallback.
+  - query: SELECT * FROM by_time WHERE ts < now() - INTERVAL '30 days'
+    expect-empty: true
+    oracle-sql: SELECT * FROM events WHERE false
+  - query: SELECT * FROM by_sql WHERE kind = 'expired'
+    expect-empty: true
+    oracle-sql: SELECT * FROM events WHERE false
+  - query: SELECT count(*) FROM by_sql WHERE v < 0
+    expect: { rows: [["0"]] }
+  # The fallback is live: a row added at the source since the last refresh is
+  # not in the acceleration, so the query is answered from the source.
+  - source-exec: { src: "INSERT INTO events VALUES (2000, now()::timestamp, 'live', 2000)" }
+  - query: SELECT * FROM by_sql WHERE id = 2000
+    oracle-sql: SELECT * FROM events WHERE id = 2000
+
+  # A full refresh reloads the source's old rows; retention removes them again.
+  - source-exec: { src: "INSERT INTO events VALUES (1000, now()::timestamp - INTERVAL '200 days', 'expired', -5), (1001, now()::timestamp, 'live', 7), (1002, now()::timestamp, NULL, NULL)" }
+  - refresh: by_time
+  - refresh: by_sql
+  - query: SELECT * FROM by_time
+    oracle-sql: SELECT * FROM events WHERE ts >= now()::timestamp - INTERVAL '30 days'
+    eventually: 30s
+  - query: SELECT * FROM by_sql
+    oracle-sql: SELECT * FROM events WHERE NOT coalesce(kind = 'expired' OR v < 0, false)
+    eventually: 30s
+  - query: SELECT * FROM by_sql WHERE id = 1000
+    expect-empty: true
+    oracle-sql: SELECT * FROM events WHERE false

@@ -1,0 +1,76 @@
+name: maintained-aggregates
+description: >
+  A Cayenne acceleration with maintained aggregates (MIN, MAX, SUM, COUNT and
+  AVG by customer, and SUM and COUNT by region over a filter) answers
+  aggregate queries as PostgreSQL does: after the first load, and after inserts, updates and
+  deletes that retract a group's current minimum and maximum, reached by full
+  refresh and by change capture. (A matching query is not served from
+  maintained state: known-failing/cayenne/maintained-aggregates-served.yaml.)
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  full: {}
+  changes: { datasets: { orders: { acceleration: { refresh_mode: changes } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: maintained-aggregates
+  datasets:
+    - from: postgres:public.orders
+      name: orders
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        primary_key: id
+        maintained_aggregates:
+          - group_by: [customer_id]
+            aggregates:
+              - { function: min, column: amount }
+              - { function: max, column: amount }
+              - { function: sum, column: amount }
+              - { function: avg, column: amount }
+              - { function: count }
+          - group_by: [region]
+            filter_sql: amount > 50
+            aggregates:
+              - { function: sum, column: amount }
+              - { function: count }
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE orders (id bigint PRIMARY KEY, customer_id bigint NOT NULL, region text NOT NULL, amount bigint NOT NULL);
+        INSERT INTO orders SELECT g, g % 13, (ARRAY['us', 'eu', 'asia'])[g % 3 + 1], (g * 37) % 101 FROM generate_series(1, 2000) g;
+  - start: {}
+  - query: SELECT count(*) AS n FROM orders
+    eventually: 60s
+  - corpus: corpus/maintained-aggregates.sql
+
+  # Retract each group's current extremes, move rows between groups, add and
+  # remove rows.
+  - source-exec:
+      src: |
+        DELETE FROM orders o USING (SELECT customer_id, max(amount) AS m FROM orders GROUP BY customer_id) x
+          WHERE o.customer_id = x.customer_id AND o.amount = x.m;
+        DELETE FROM orders o USING (SELECT customer_id, min(amount) AS m FROM orders GROUP BY customer_id) x
+          WHERE o.customer_id = x.customer_id AND o.amount = x.m AND o.id % 2 = 0;
+        UPDATE orders SET customer_id = (customer_id + 1) % 13, amount = amount + 7 WHERE id % 11 = 0;
+        UPDATE orders SET region = 'eu' WHERE id % 7 = 0;
+        INSERT INTO orders SELECT g, g % 5, 'us', 1000 + g % 3 FROM generate_series(2001, 2100) g;
+  - refresh: orders
+    only: full
+  - query: SELECT count(*) AS n, sum(amount) AS s FROM orders
+    eventually: 60s
+  - corpus: corpus/maintained-aggregates.sql
