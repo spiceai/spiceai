@@ -118,10 +118,10 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `2e8b24f72e4dffb694fa2dbe3e1f9bd56ea528e7` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `08ea2819b2d6e721059a7142a4a98949afb48709` | `duckdb-brotli-cve` (TEMPORARY: spiceai/datafusion-table-providers#96) |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `4a2920746865562e604150fbee49eea6241c0b85` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `b04e89c594789bf3fcdc50791ee1626a6f38426d` | `backport-brotli-cve-1.4.4` (TEMPORARY: spiceai/duckdb-rs#53) (datafusion-table-providers pins this exact revision; the two move together) |
+| [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `a6b07b8b9625e552c502c3a7229fd4bb7725bd2e` | `spiceai-0.11.0-df-55` |
 | [llama.cpp](#llamacpp) | `1082d1983689a13315cdf2a80d9bd0bbdd572da2` | `spiceai-b11803` |
