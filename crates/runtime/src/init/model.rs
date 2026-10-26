@@ -140,7 +140,9 @@ impl Runtime {
             .collect::<HashMap<_, _>>();
         let params = get_params_with_secrets(self.secrets(), &p).await;
 
-        if matches!(source, Some(ModelSource::File)) {
+        // A node other than the first of a distributed model never reads the weights: the first
+        // reads them and sends each node its share, so the files need exist only there.
+        if matches!(source, Some(ModelSource::File)) && !is_distributed_worker(&p) {
             // Verify all referenced local files exist before attempting to load the model and determine its type.
             // Otherwise, we will fail to determine the model type and the error will be confusing.
             if let Err(err) = verify_local_files_exist(m) {
@@ -421,6 +423,17 @@ fn model_error<'a>(
         Some(crate::Error::UnableToInitializeLlm { source }) => source.downcast_ref(),
         _ => source.downcast_ref(),
     }
+}
+
+/// Whether this node holds a share of a distributed model for another node, which serves it.
+fn is_distributed_worker(params: &HashMap<String, String>) -> bool {
+    params
+        .get("distributed_backend")
+        .is_some_and(|backend| backend.trim() == "ring")
+        && params
+            .get("node_rank")
+            .and_then(|rank| rank.trim().parse::<usize>().ok())
+            .is_some_and(|rank| rank > 0)
 }
 
 fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {

@@ -18,9 +18,10 @@ limitations under the License.
 //! crates that implement them.
 //!
 //! An engine crate registers itself with [`register_local_chat_engine!`], and a binary
-//! that links the crate gets the engine; `llms` itself never depends on one. A single-node
-//! model is loaded by the first registered engine that serves its weight files, and by
-//! mistral.rs when none does. A model distributed over a ring always stays on mistral.rs.
+//! that links the crate gets the engine; `llms` itself never depends on one. A model is
+//! loaded by the first registered engine that serves its weight files, and by mistral.rs when
+//! none does. A model distributed over several nodes goes to that engine only when it serves
+//! distributed models ([`LocalChatEngine::distributed`]), and to mistral.rs's ring otherwise.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +41,9 @@ pub struct LocalChatEngine {
     /// Whether the engine serves a single-node model with these weight files. It sees file
     /// names only, so a remote model can be matched before its files are downloaded.
     pub serves: fn(&[PathBuf]) -> bool,
+    /// Whether the engine also serves a model split across several nodes, with the topology in
+    /// [`LocalModelOptions::distributed`].
+    pub distributed: bool,
     /// Loads the model from local weight files.
     pub load: LoadLocalModel,
 }

@@ -99,6 +99,17 @@ impl DistributedConfig {
     }
 }
 
+/// Refuses a distributed model in a build without multi-node inference, whichever engine
+/// would serve it.
+pub(crate) fn ensure_distributed_build() -> Result<(), ChatError> {
+    if !cfg!(feature = "distributed") {
+        return Err(ChatError::FailedToLoadModel {
+            source: "`distributed_backend: ring` was requested, but this build does not include multi-node distributed inference — a Spice enterprise feature (build with the `distributed` Cargo feature to enable it).".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Translate a [`DistributedConfig`] into a per-node mistral.rs ring topology,
 /// write it to a temp `RING_CONFIG` file, and point the `RING_CONFIG` env var at
 /// it. mistral.rs reads that env var while building the pipeline (there is no
@@ -111,11 +122,7 @@ pub(crate) fn configure_ring_distributed(
         DistributedBackend::Ring => {}
     }
 
-    if !cfg!(feature = "distributed") {
-        return Err(ChatError::FailedToLoadModel {
-            source: "`distributed_backend: ring` was requested, but this build does not include multi-node distributed inference — a Spice enterprise feature (build with the `distributed` Cargo feature to enable it).".into(),
-        });
-    }
+    ensure_distributed_build()?;
 
     if let Err((param, message)) = cfg.validate() {
         return Err(ChatError::InvalidParamValueError {

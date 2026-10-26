@@ -45,9 +45,9 @@ pub mod hf_files;
 pub mod mistral;
 pub mod nsql;
 #[cfg(feature = "local_llm")]
-use crate::chat::distributed::configure_ring_distributed;
-#[cfg(feature = "local_llm")]
 pub use crate::chat::distributed::{DistributedBackend, DistributedConfig};
+#[cfg(feature = "local_llm")]
+use crate::chat::distributed::{configure_ring_distributed, ensure_distributed_build};
 #[cfg(feature = "local_llm")]
 use indexmap::IndexMap;
 #[cfg(feature = "local_llm")]
@@ -384,21 +384,40 @@ pub async fn create_hf_model(
             })
         })
         .collect::<Result<Vec<&str>>>()?;
+    // A rank other than 0 of a model an engine serves across nodes never reads the weights (the
+    // head sends each rank its share), so it doesn't download them.
+    if let Some(cfg) = distributed.as_ref()
+        && cfg.node_rank > 0
+        && let Some(engine) = engine::engine_for(gguf_files)
+        && engine.distributed
+    {
+        ensure_distributed_build()?;
+        let options = LocalModelOptions {
+            reasoning,
+            distributed: Some(cfg),
+            ..LocalModelOptions::default()
+        };
+        return (engine.load)(gguf_files, options).await;
+    }
     let dir = hf_files::download_model(model_id, &gguf, hub, reasoning.model_name)
         .await
         .map_err(|error| Error::FailedToDownloadModel {
             configuration: error.is_configuration_error(),
             source: Box::new(error),
         })?;
-    if distributed.is_none()
-        && let Some(engine) = engine::engine_for(gguf_files)
+    if let Some(engine) = engine::engine_for(gguf_files)
+        && (distributed.is_none() || engine.distributed)
     {
+        if distributed.is_some() {
+            ensure_distributed_build()?;
+        }
         let weights: Vec<PathBuf> = gguf_files.iter().map(|file| dir.join(file)).collect();
         let template_file = hf_files::chat_template_file(&dir).await;
         let options = LocalModelOptions {
             chat_template_literal,
             chat_template_file: template_file.as_deref(),
             reasoning,
+            distributed: distributed.as_ref(),
             ..LocalModelOptions::default()
         };
         return (engine.load)(&weights, options).await;
@@ -447,6 +466,9 @@ pub struct LocalModelOptions<'a> {
     pub paged_attention: PagedAttentionMode,
     /// The model's name and `reasoning_effort` default, checked against its chat template.
     pub reasoning: ReasoningDefault<'a>,
+    /// The nodes the model is split across, for an engine that serves distributed models
+    /// ([`engine::LocalChatEngine::distributed`]); mistral.rs reads its ring from the environment.
+    pub distributed: Option<&'a DistributedConfig>,
 }
 
 /// A local model's Spicepod name and its `reasoning_effort` default. The loader checks the
@@ -469,17 +491,21 @@ pub async fn create_local_model(
     distributed: Option<DistributedConfig>,
     options: LocalModelOptions<'_>,
 ) -> Result<Arc<dyn Chat>> {
-    // A single-node model goes to a registered engine that serves its weights; a ring model
-    // stays on mistral.rs, whose tensor-parallel backend no other engine has a counterpart for.
-    if distributed.is_none() {
-        let weights = model_weights.iter().map(PathBuf::from).collect::<Vec<_>>();
-        if let Some(engine) = engine::engine_for(&weights) {
-            let options = LocalModelOptions {
-                chat_template_file: tokenizer_config.map(Path::new),
-                ..options
-            };
-            return (engine.load)(&weights, options).await;
+    // A model goes to a registered engine that serves its weights; a distributed one only when
+    // that engine serves distributed models, and to mistral.rs's ring otherwise.
+    let weights = model_weights.iter().map(PathBuf::from).collect::<Vec<_>>();
+    if let Some(engine) = engine::engine_for(&weights)
+        && (distributed.is_none() || engine.distributed)
+    {
+        if distributed.is_some() {
+            ensure_distributed_build()?;
         }
+        let options = LocalModelOptions {
+            chat_template_file: tokenizer_config.map(Path::new),
+            distributed: distributed.as_ref(),
+            ..options
+        };
+        return (engine.load)(&weights, options).await;
     }
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the
