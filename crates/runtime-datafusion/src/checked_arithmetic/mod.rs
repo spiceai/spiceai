@@ -31,7 +31,10 @@ mod sum;
 
 pub use analyzer::CheckedIntegerOverflow;
 pub use decomposability::complete_preaggregate_would_narrow_early;
-pub use eager::{CheckedEagerAggregation, install_checked_eager_aggregation};
+pub use eager::{
+    CheckedEagerAggregation, install_checked_eager_aggregation,
+    install_checked_eager_aggregation_for_distributed,
+};
 pub use op::{CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME};
 pub use single_distinct::{CheckedSingleDistinctToGroupBy, install_checked_single_distinct};
 pub use sum::CheckedSum;

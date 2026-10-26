@@ -2668,6 +2668,9 @@ fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
     cfg
 }
 
+#[cfg(all(test, not(windows)))]
+mod eager_merge_tests;
+
 #[cfg(test)]
 mod tests {
     use super::ClusterTlsConfig;
