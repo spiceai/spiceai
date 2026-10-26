@@ -1,0 +1,39 @@
+name: postgres-cdc-partitioned-table
+description: >
+  PostgreSQL CDC into Cayenne from a declaratively partitioned table: the
+  dataset names the parent and follows inserts, updates and deletes made in
+  its partitions, a row moving between partitions, and a partition attached
+  later.
+sources:
+  src: { kind: postgres }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-partitioned-table
+  datasets:
+    - from: postgres:public.m
+      name: m
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: '(region, id)', on_conflict: { '(region, id)': upsert } }
+defaults:
+  expect: { oracle: src }
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE m (region text NOT NULL, id int NOT NULL, v int, PRIMARY KEY (region, id)) PARTITION BY LIST (region);
+        CREATE TABLE m_eu PARTITION OF m FOR VALUES IN ('eu');
+        CREATE TABLE m_us PARTITION OF m FOR VALUES IN ('us');
+        INSERT INTO m SELECT CASE WHEN i % 2 = 0 THEN 'eu' ELSE 'us' END, i, i FROM generate_series(1, 100) i;
+  - start: {}
+  - query: SELECT * FROM m
+  - source-exec: { src: "INSERT INTO m VALUES ('eu', 1000, 1), ('us', 1001, 2); UPDATE m SET v = -1 WHERE id <= 10; DELETE FROM m WHERE id BETWEEN 50 AND 60" }
+  - query: SELECT * FROM m
+    eventually: 30s
+  # A row moving between partitions.
+  - source-exec: { src: "UPDATE m SET region = 'us' WHERE id = 2" }
+  - query: SELECT * FROM m
+    eventually: 30s
+  # A partition attached later.
+  - source-exec: { src: "CREATE TABLE m_ap PARTITION OF m FOR VALUES IN ('ap'); INSERT INTO m VALUES ('ap', 5000, 5)" }
+  - query: SELECT * FROM m
+    eventually: 30s

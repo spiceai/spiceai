@@ -1,0 +1,33 @@
+name: append-null-time
+description: >
+  Known failing (#15542): silent row loss. Append refresh reads rows newer than the
+  stored maximum of the time column, which a NULL never is: a row with a
+  NULL time present at the first load is loaded, one inserted afterwards
+  never is, and nothing is logged. The acceleration's rows then depend on
+  when it was built. Expected: the row loads, or the refresh reports that
+  rows with no time cannot be appended.
+sources:
+  src: { kind: postgres }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: append-null-time
+  datasets:
+    - from: postgres:public.events
+      name: events
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: append }
+defaults:
+  expect: { oracle: src }
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE events (id int NOT NULL, ts timestamptz);
+        INSERT INTO events VALUES (1, '2031-05-01 10:00Z'), (2, NULL);
+  - start: {}
+  - query: SELECT * FROM events
+  - source-exec: { src: "INSERT INTO events VALUES (3, NULL), (4, '2031-05-01 11:00Z')" }
+  - refresh: events
+  - query: SELECT * FROM events

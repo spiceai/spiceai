@@ -54,12 +54,17 @@ if ! [[ "${head_sha}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "::error::approve_bot_pr_runs.sh: '${head_sha}' is not a full commit SHA." >&2
   exit 2
 fi
-for value in "${branch}" "${repo}"; do
-  if ! [[ "${value}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
-    echo "::error::approve_bot_pr_runs.sh: '${value}' contains characters outside [A-Za-z0-9._/-]." >&2
-    exit 2
-  fi
-done
+# A branch may also carry `+`: the cluster bench names its branch after the
+# Spicepod path, and paths such as `mixed[duckdb[file]+sqlite[file]]` keep it.
+# `+` is inert inside a jq string, and `gh api -f` URL-encodes it for the query.
+if ! [[ "${branch}" =~ ^[A-Za-z0-9._/+-]+$ ]]; then
+  echo "::error::approve_bot_pr_runs.sh: branch '${branch}' contains characters outside [A-Za-z0-9._/+-]." >&2
+  exit 2
+fi
+if ! [[ "${repo}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+  echo "::error::approve_bot_pr_runs.sh: repository '${repo}' contains characters outside [A-Za-z0-9._/-]." >&2
+  exit 2
+fi
 
 # The query already narrows to the branch and SHA; the filter re-checks both so
 # a run the API returned for any other reason is never approved.

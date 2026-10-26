@@ -1,0 +1,87 @@
+# Known failing (#15547): a column widened at the source (int4 -> int8, with values only
+# int8 holds) is not adopted by sync_all_columns under full refresh until a
+# restart (the refresh fails with a cast error). Under CDC, block and
+# append_new_columns stop applying changes and keep serving with an Error
+# status; after a restart they sometimes serve nothing ("Acceleration not
+# ready"), when the restart decides to rebuild from the source and the rebuild
+# fails on the same cast. That depends on timing, so a pass of the CDC half
+# here does not rule it out.
+# Move this script to test/spicescript/ once it passes.
+name: schema-widen
+description: >
+  sync_all_columns adopts a column widened at the source, under full refresh
+  and CDC; block and append_new_columns, which cannot store the wider values,
+  report the error and keep serving the rows they hold, across a restart too.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  refresh_mode: [full, changes]
+
+variants:
+  block: {}
+  append-new-columns: { datasets: { t: { on_schema_change: append_new_columns } } }
+  sync-all-columns: { datasets: { t: { on_schema_change: sync_all_columns } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: schema-widen
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: '${matrix.refresh_mode}', primary_key: id, refresh_retry_max_attempts: 1 }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id integer PRIMARY KEY, v integer, s text); INSERT INTO t SELECT i, i, 's' || i FROM generate_series(1, 100) i" }
+  - start: {}
+  - query: SELECT * FROM t
+    id: before
+  - source-exec:
+      src:
+        - ALTER TABLE t ALTER COLUMN v TYPE bigint
+        - UPDATE t SET v = v + 3000000000 WHERE id <= 5
+  - refresh: t
+    when: { refresh_mode: full }
+    only: sync-all-columns
+  - refresh: { dataset: t, expect-error: true }
+    when: { refresh_mode: full }
+    only: [block, append-new-columns]
+  - query: SELECT * FROM t
+    eventually: 30s
+    only: sync-all-columns
+  - query: SELECT arrow_typeof(v) FROM t LIMIT 1
+    expect: { rows: [["Int64"]] }
+    eventually: 30s
+    only: sync-all-columns
+  # The other modes keep the registered schema and the rows they held, and say
+  # why they stopped updating.
+  - query: SELECT arrow_typeof(v) FROM t LIMIT 1
+    expect: { rows: [["Int32"]] }
+    only: [block, append-new-columns]
+  - assert-status: { dataset: t, status: Error, message-contains: Int32 }
+    eventually: 30s
+    only: [block, append-new-columns]
+  - query: SELECT * FROM t
+    expect: { same-as: before }
+    only: [block, append-new-columns]
+  - restart: { ready: false }
+  - wait-ready: {}
+    when: { refresh_mode: full }
+    only: sync-all-columns
+  - refresh: t
+    when: { refresh_mode: full }
+    only: sync-all-columns
+  - query: SELECT * FROM t
+    expect: { same-as: before }
+    eventually: 30s
+    only: [block, append-new-columns]
+  - query: SELECT * FROM t
+    eventually: 30s
+    only: sync-all-columns
