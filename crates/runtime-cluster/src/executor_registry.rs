@@ -46,7 +46,7 @@ use tokio::time::Instant;
 
 use crate::cluster_state::now_ms;
 use crate::correlated::{CorrelatedResponses, CorrelationError, send_correlated};
-use crate::executor_liveness::ExecutorLiveness;
+use crate::executor_liveness::{ExecutorLiveness, VIEW_RETENTION};
 use crate::executor_processes::{Admission, ExecutorProcessOrder};
 use crate::metadata::{PartitionKey, normalized_table_name, partition_key};
 use crate::{PartitionStore, PartitionValue, executor_selection, metrics};
@@ -220,11 +220,6 @@ pub struct Registered {
     /// [`ExecutorRegistry::unregister`].
     pub connection: u64,
 }
-
-/// How recently another scheduler must have published its connected executors
-/// for them to count as connected when deciding whether to remove an
-/// executor's process history. Generous, as a stale view only keeps history.
-const LIVENESS_FRESHNESS: std::time::Duration = std::time::Duration::from_mins(10);
 
 /// Replaced processes remembered per executor id, so a replaced process that is
 /// still running is recognized when it connects again.
@@ -764,14 +759,15 @@ impl ExecutorRegistry {
             return None;
         }
         let now_ms = now_ms().unwrap_or_default();
-        // An executor's history is removed only when no scheduler has it
-        // connected; when the other schedulers' views cannot be read, none is.
+        // An executor's history is removed only when no scheduler's kept view
+        // lists it, whatever the schedulers' publishing interval; when the views
+        // cannot be read, none is.
         let mut connected: HashSet<String> =
             self.connections.read().await.keys().cloned().collect();
         let others_known = match ExecutorLiveness::new(
             self.accelerations_partition_store.cluster_state(),
         )
-        .live_executors(now_ms, LIVENESS_FRESHNESS)
+        .live_executors(now_ms, VIEW_RETENTION)
         .await
         {
             Ok(live) => {
@@ -2204,8 +2200,10 @@ mod tests {
                 .await
                 .expect("admit");
         }
+        // Published 20 minutes ago, as by a scheduler whose publishing interval
+        // is longer than that.
         ExecutorLiveness::new(&cluster)
-            .publish("sched-b", vec!["exec-a".to_string()], now)
+            .publish("sched-b", vec!["exec-a".to_string()], now - 20 * 60_000)
             .await
             .expect("publish");
 
