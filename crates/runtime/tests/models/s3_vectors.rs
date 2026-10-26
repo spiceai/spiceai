@@ -850,7 +850,6 @@ pub(crate) mod search {
                 rt.shutdown().await;
                 drop(rt);
 
-                // Clean up container after test
                 running_container.cleanup().await;
 
                 Ok(())

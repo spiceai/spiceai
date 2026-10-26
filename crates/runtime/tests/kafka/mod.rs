@@ -139,7 +139,6 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
             rt.shutdown().await;
             drop(rt);
 
-            // Clean up container after test
             running_container.cleanup().await;
 
             Ok(())

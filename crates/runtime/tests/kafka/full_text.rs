@@ -82,7 +82,6 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
             rt.shutdown().await;
             drop(rt);
 
-            // Clean up container after test
             running_container.cleanup().await;
 
             Ok(())

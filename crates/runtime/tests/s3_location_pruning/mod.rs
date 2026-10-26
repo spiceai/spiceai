@@ -209,7 +209,6 @@ async fn test_location_metadata_preserves_custom_s3_endpoint() -> Result<(), any
         Err(e) => Err(e),
     };
 
-    // Clean up container
     container.cleanup().await;
 
     // Now check the result
