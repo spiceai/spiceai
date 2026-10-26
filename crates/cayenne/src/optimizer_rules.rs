@@ -917,8 +917,9 @@ fn try_rewrite_oversized_join(
         }
         // Aggregated CTE bodies (TPC-DS Q78/Q97) often report `Absent` row
         // counts. Skipping the rewrite then leaves a non-spillable hash table
-        // that exhausts the pool. Treat unknown size as oversized — except a
-        // same-schema self-join (TPC-DS Q4/Q11/Q74 `year_total` curr/prev).
+        // that exhausts the pool. Treat an unknown-size aggregate build as
+        // oversized — except one under a `HAVING` filter, and a same-schema
+        // self-join (TPC-DS Q4/Q11/Q74 `year_total` curr/prev).
         // Those joins are 1:1 on the grouping key; sort-merge was returning a
         // different LIMIT-100 customer set than hash join at SF-100.
         let Some(fire) = build_side_outgrows_pool_share(
@@ -1448,13 +1449,31 @@ fn input_is_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
 }
 
 /// Spill an unknown-size join when the **build** side (left) is an
-/// aggregate and this is not a CTE self-join. Used on the Cayenne path,
-/// where fact–dimension joins (Q13) build a Cayenne scan, not an aggregate,
-/// and must stay hash joins — sort-merge of those swapped Decimal/Utf8
-/// columns. Oracle Left/Right joins use [`should_spill_oracle_outer_join`]
-/// instead and are not gated on an aggregate build.
+/// unfiltered aggregate and this is not a CTE self-join. Used on the Cayenne
+/// path, where fact–dimension joins (Q13) build a Cayenne scan, not an
+/// aggregate, and must stay hash joins — sort-merge of those swapped
+/// Decimal/Utf8 columns. Oracle Left/Right joins use
+/// [`should_spill_oracle_outer_join`] instead and are not gated on an
+/// aggregate build.
 fn should_spill_unknown_size_join(hash_join: &HashJoinExec) -> bool {
-    !is_unknown_size_self_join(hash_join) && input_is_aggregate(hash_join.left())
+    !is_unknown_size_self_join(hash_join) && input_is_unfiltered_aggregate(hash_join.left())
+}
+
+/// Whether an input is an `AggregateExec` reached through unary wrappers other
+/// than a `FilterExec`. A filter over an aggregate is a `HAVING` clause, which
+/// keeps a small fraction of the groups (TPC-H Q18's `sum(l_quantity) > 300`
+/// keeps 624 of 15M orders at SF-10), so its hash table is not the
+/// pool-exhausting build side the unknown-size rewrite guards against. The
+/// coalesced sort-merge plan instead sorts the whole probe side on one thread.
+fn input_is_unfiltered_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.is::<AggregateExec>() {
+        return true;
+    }
+    if plan.is::<datafusion_physical_plan::filter::FilterExec>() {
+        return false;
+    }
+    let children = plan.children();
+    children.len() == 1 && input_is_unfiltered_aggregate(children[0])
 }
 
 /// `__test_reference` Q78 Left-joins file scans inside each CTE body
@@ -4653,6 +4672,58 @@ mod tests {
         assert!(
             optimized.is::<SortMergeJoinExec>(),
             "Absent build-side stats under a query memory pool must spill via sort-merge, not keep a non-spillable hash table"
+        );
+    }
+
+    #[test]
+    fn keeps_hash_join_for_absent_stats_having_filtered_aggregate_build() {
+        // TPC-H Q18: `orders` RightSemi-joined to `l_orderkey` groups that pass
+        // `HAVING sum(l_quantity) > 300`. The same build without the HAVING
+        // filter is the unknown-size aggregate the rewrite must still spill.
+        let lineitem_schema = channel_schema("l_orderkey", "l_quantity");
+        let orders_schema = channel_schema("o_orderkey", "o_custkey");
+        let grouped = grouped_count_over(
+            cayenne_file_exec_with_num_rows(&lineitem_schema, "lineitem.vortex", Precision::Absent),
+            "l_orderkey",
+        );
+        let having = Arc::new(
+            datafusion_physical_plan::filter::FilterExec::try_new(
+                datafusion_physical_expr::expressions::binary(
+                    col("cnt", grouped.schema().as_ref()).expect("count column"),
+                    datafusion::logical_expr::Operator::Gt,
+                    lit(300_i64),
+                    grouped.schema().as_ref(),
+                )
+                .expect("having predicate"),
+                Arc::clone(&grouped),
+            )
+            .expect("having filter"),
+        ) as Arc<dyn ExecutionPlan>;
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+        let semi_join = |build: Arc<dyn ExecutionPlan>| {
+            Arc::new(hash_join_with_join_type(
+                build,
+                cayenne_file_exec_with_num_rows(&orders_schema, "orders.vortex", Precision::Absent),
+                "l_orderkey",
+                "o_orderkey",
+                JoinType::RightSemi,
+                NullEquality::NullEqualsNothing,
+            )) as Arc<dyn ExecutionPlan>
+        };
+
+        let optimized = optimize_anti_join_sort_merge_with_config(semi_join(having), &config);
+        assert!(
+            optimized.is::<HashJoinExec>(),
+            "a HAVING-filtered aggregate build must stay a hash join, got:\n{}",
+            displayable(optimized.as_ref()).indent(true)
+        );
+
+        let optimized = optimize_anti_join_sort_merge_with_config(semi_join(grouped), &config);
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "an unfiltered unknown-size aggregate build must still spill, got:\n{}",
+            displayable(optimized.as_ref()).indent(true)
         );
     }
 
