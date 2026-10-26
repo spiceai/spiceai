@@ -930,7 +930,13 @@ fn try_rewrite_oversized_join(
             if !should_spill_unknown_size_join(hash_join) {
                 return Ok(None);
             }
-            return finish_sort_merge_rewrite(hash_join, true);
+            // A HAVING-filtered build keeps its partitions, but only where the
+            // coalesced rewrite applies, so the same joins spill either way.
+            let coalesced = finish_sort_merge_rewrite(hash_join, true)?;
+            if coalesced.is_none() || !input_is_filtered_aggregate(hash_join.left()) {
+                return Ok(coalesced);
+            }
+            return Ok(finish_sort_merge_rewrite(hash_join, false)?.or(coalesced));
         };
         fire
     } else {
@@ -1455,6 +1461,26 @@ fn input_is_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// instead and are not gated on an aggregate build.
 fn should_spill_unknown_size_join(hash_join: &HashJoinExec) -> bool {
     !is_unknown_size_self_join(hash_join) && input_is_aggregate(hash_join.left())
+}
+
+/// Whether an input is a `FilterExec` over an aggregate (a `HAVING` clause),
+/// through unary wrappers. Such a build side can keep anywhere from a handful
+/// of groups (TPC-H Q18 keeps 624 of 15M orders at SF-10) to all of them, so
+/// it still sort-merges, but keeps its partitions: coalescing would sort the
+/// whole probe side (all of Q18's `orders`) on one thread. Coalescing stays
+/// for unfiltered aggregate builds (TPC-DS Q78).
+fn input_is_filtered_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.is::<AggregateExec>() {
+        return false;
+    }
+    let children = plan.children();
+    if children.len() != 1 {
+        return false;
+    }
+    if plan.is::<datafusion_physical_plan::filter::FilterExec>() {
+        return input_is_aggregate(children[0]);
+    }
+    input_is_filtered_aggregate(children[0])
 }
 
 /// `__test_reference` Q78 Left-joins file scans inside each CTE body
@@ -4653,6 +4679,157 @@ mod tests {
         assert!(
             optimized.is::<SortMergeJoinExec>(),
             "Absent build-side stats under a query memory pool must spill via sort-merge, not keep a non-spillable hash table"
+        );
+    }
+
+    /// The `SortExec` inputs of the sort-merge join `plan` rewrote to, through
+    /// the partition-restoring wrapper a coalesced rewrite adds.
+    fn sort_merge_sort_inputs(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<dyn ExecutionPlan>> {
+        let smj = if plan.is::<SortMergeJoinExec>() {
+            Arc::clone(plan)
+        } else {
+            Arc::clone(plan.children().first().expect("wrapper must have a child"))
+        };
+        assert!(
+            smj.is::<SortMergeJoinExec>(),
+            "expected a sort-merge join, got:\n{}",
+            displayable(plan.as_ref()).indent(true)
+        );
+        smj.children()
+            .iter()
+            .map(|sort| {
+                assert!(sort.is::<SortExec>(), "sort-merge inputs must be SortExec");
+                Arc::clone(
+                    sort.children()
+                        .first()
+                        .expect("SortExec must have an input"),
+                )
+            })
+            .collect()
+    }
+
+    /// TPC-H Q18's build side, hash-partitioned 8 ways: the `l_orderkey`
+    /// groups, and the same groups under `HAVING sum(l_quantity) > 300`.
+    fn q18_aggregate_builds() -> (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) {
+        let lineitem_schema = channel_schema("l_orderkey", "l_quantity");
+        let grouped = hash_repartition(
+            grouped_count_over(
+                cayenne_file_exec_with_num_rows(
+                    &lineitem_schema,
+                    "lineitem.vortex",
+                    Precision::Absent,
+                ),
+                "l_orderkey",
+            ),
+            "l_orderkey",
+            8,
+        );
+        let having = Arc::new(
+            datafusion_physical_plan::filter::FilterExec::try_new(
+                datafusion_physical_expr::expressions::binary(
+                    col("cnt", grouped.schema().as_ref()).expect("count column"),
+                    datafusion::logical_expr::Operator::Gt,
+                    lit(300_i64),
+                    grouped.schema().as_ref(),
+                )
+                .expect("having predicate"),
+                Arc::clone(&grouped),
+            )
+            .expect("having filter"),
+        ) as Arc<dyn ExecutionPlan>;
+        (grouped, having)
+    }
+
+    /// `orders` RightSemi-joined to `build` on the order key, Partitioned 8 ways,
+    /// with an optional embedded output projection.
+    fn q18_semi_join(
+        build: Arc<dyn ExecutionPlan>,
+        projection: Option<Vec<usize>>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let orders = hash_repartition(
+            cayenne_file_exec_with_num_rows(
+                &channel_schema("o_orderkey", "o_custkey"),
+                "orders.vortex",
+                Precision::Absent,
+            ),
+            "o_orderkey",
+            8,
+        );
+        let on = vec![(
+            col("l_orderkey", &build.schema()).expect("build key"),
+            col("o_orderkey", &orders.schema()).expect("probe key"),
+        )];
+        Arc::new(
+            HashJoinExec::try_new(
+                build,
+                orders,
+                on,
+                None,
+                &JoinType::RightSemi,
+                projection,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .expect("hash join should be valid"),
+        )
+    }
+
+    #[test]
+    fn having_filtered_aggregate_build_sort_merges_without_coalescing() {
+        // The build can still be large, so it spills, but sorting each side on
+        // one thread made Q18 slow. The same build without the HAVING filter
+        // keeps coalescing (TPC-DS Q78).
+        let (grouped, having) = q18_aggregate_builds();
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized =
+            optimize_anti_join_sort_merge_with_config(q18_semi_join(having, None), &config);
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "a HAVING-filtered aggregate build must sort-merge in place, got:\n{}",
+            displayable(optimized.as_ref()).indent(true)
+        );
+        assert_eq!(optimized.output_partitioning().partition_count(), 8);
+        for input in sort_merge_sort_inputs(&optimized) {
+            assert!(
+                input.is::<RepartitionExec>()
+                    || input.is::<datafusion_physical_plan::filter::FilterExec>(),
+                "a HAVING-filtered build must sort each partition, got:\n{}",
+                displayable(optimized.as_ref()).indent(true)
+            );
+        }
+
+        let optimized =
+            optimize_anti_join_sort_merge_with_config(q18_semi_join(grouped, None), &config);
+        for input in sort_merge_sort_inputs(&optimized) {
+            assert!(
+                input.is::<CoalescePartitionsExec>(),
+                "an unfiltered unknown-size aggregate build must coalesce, got:\n{}",
+                displayable(optimized.as_ref()).indent(true)
+            );
+        }
+    }
+
+    #[test]
+    fn having_filtered_aggregate_build_stays_hash_join_where_coalesced_rewrite_declines() {
+        // Projecting away the probe key leaves the coalesced rewrite no
+        // partitioning to restore, so the join stays a hash join. Skipping the
+        // coalesce for a HAVING build must not start spilling it (TPC-DS
+        // Q23/Q34/Q47/Q57/Q73).
+        let (_, having) = q18_aggregate_builds();
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(
+            q18_semi_join(having, Some(vec![1])),
+            &config,
+        );
+        assert!(
+            optimized.is::<HashJoinExec>(),
+            "got:\n{}",
+            displayable(optimized.as_ref()).indent(true)
         );
     }
 
