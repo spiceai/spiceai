@@ -118,7 +118,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `2e8b24f72e4dffb694fa2dbe3e1f9bd56ea528e7` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `ba93c8c478c528026e8ad41e3a6fc134e96d262a` | `lukim/duckdb-quote-pk-columns` (spiceai/datafusion-table-providers#103, re-pin to `spiceai-55` once merged) |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `ba93c8c478c528026e8ad41e3a6fc134e96d262a` | `lukim/duckdb-quote-pk-columns` (TEMPORARY: spiceai/datafusion-table-providers#103) |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
