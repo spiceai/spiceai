@@ -229,7 +229,7 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_replace(s, '\\d', 'X') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 18, expected: \"\\\"xyX\\\"\", actual: \"\\\"xy١\\\"\" }",
+      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 18, expected: \"\\\"xyX\\\"\", actual: \"\\\"xy\u0661\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -283,9 +283,9 @@
     {
       "run": "builtins",
       "who": "variants",
-      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\1١') AS v FROM rx ORDER BY id",
+      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\1\u0661') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"\\\"\", actual: \"\\\"a١\\\"\" }",
+      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"\\\"\", actual: \"\\\"a\u0661\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -293,7 +293,7 @@
       "who": "variants",
       "key": "query: SELECT nth_value(customer, 2 ORDER BY customer) AS n FROM cust WHERE region = 'eu'",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"carol\\\"\", actual: \"\\\"Ångström\\\"\" }",
+      "signature": "federated vs arrow: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"carol\\\"\", actual: \"\\\"\u00c5ngstr\u00f6m\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -1077,9 +1077,9 @@
     {
       "run": "edge-values",
       "who": "sqlite",
-      "key": "query: SELECT id, position('語' IN s) AS p FROM e WHERE s IS NOT NULL",
+      "key": "query: SELECT id, position('\u8a9e' IN s) AS p FROM e WHERE s IS NOT NULL",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: strpos in SELECT `e`.`id`, strpos(`e`.`s`, '語') AS `p` FROM `e` WHERE `e`.`s` IS NOT NULL at offset 17\\\")\": code: 'Client specified an in",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: strpos in SELECT `e`.`id`, strpos(`e`.`s`, '\u8a9e') AS `p` FROM `e` WHERE `e`.`s` IS NOT NULL at offset 17\\\")\": code: 'Client specified an in",
       "group": "sqlite"
     },
     {
@@ -1303,38 +1303,6 @@
     {
       "run": "layout-coverage[refresh_mode=full]",
       "who": "duckdb",
-      "key": "query: SELECT count(*) FROM (SELECT b, count(*) AS n FROM t GROUP BY b) g",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"400\\\"\" }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) FROM (SELECT i % 5 AS k FROM t GROUP BY i % 5) g",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"10\\\"\", actual: \"\\\"400\\\"\" }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "duckdb",
-      "key": "query: SELECT k FROM (SELECT 1 AS k, sum(d) AS s FROM t) g",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 400 }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) FROM (SELECT b FROM (SELECT b, i FROM t WHERE i > 0) x GROUP BY b) y",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"182\\\"\" }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "duckdb",
       "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x #2",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata:",
@@ -1346,38 +1314,6 @@
       "key": "query: SELECT id, char_length(s) AS chars, octet_length(s) AS bytes FROM t WHERE s IS NOT NULL #2",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type ",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) FROM (SELECT b, count(*) AS n FROM t GROUP BY b) g #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"393\\\"\" }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) FROM (SELECT i % 5 AS k FROM t GROUP BY i % 5) g #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"10\\\"\", actual: \"\\\"393\\\"\" }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "duckdb",
-      "key": "query: SELECT k FROM (SELECT 1 AS k, sum(d) AS s FROM t) g #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 393 }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) FROM (SELECT b FROM (SELECT b, i FROM t WHERE i > 0) x GROUP BY b) y #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"182\\\"\" }",
       "group": "duckdb"
     },
     {
@@ -1439,30 +1375,6 @@
     {
       "run": "layout-coverage[refresh_mode=full]",
       "who": "sqlite",
-      "key": "query: SELECT count(*) FROM (SELECT b, count(*) AS n FROM t GROUP BY b) g",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"400\\\"\" }",
-      "group": "sqlite"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "sqlite",
-      "key": "query: SELECT count(*) FROM (SELECT i % 5 AS k FROM t GROUP BY i % 5) g",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"10\\\"\", actual: \"\\\"400\\\"\" }",
-      "group": "sqlite"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "sqlite",
-      "key": "query: SELECT count(*) FROM (SELECT b FROM (SELECT b, i FROM t WHERE i > 0) x GROUP BY b) y",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"182\\\"\" }",
-      "group": "sqlite"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "sqlite",
       "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x #2",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata:",
@@ -1514,30 +1426,6 @@
       "key": "query: SELECT id, abs(d), round(d, 1), floor(f), ceil(f) FROM t WHERE id < 50 #2",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: floor in SELECT `t`.`id`, abs(`t`.`d`), round(`t`.`d`, 1), floor(`t`.`f`), ceil(`t`.`f`",
-      "group": "sqlite"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "sqlite",
-      "key": "query: SELECT count(*) FROM (SELECT b, count(*) AS n FROM t GROUP BY b) g #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"393\\\"\" }",
-      "group": "sqlite"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "sqlite",
-      "key": "query: SELECT count(*) FROM (SELECT i % 5 AS k FROM t GROUP BY i % 5) g #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"10\\\"\", actual: \"\\\"393\\\"\" }",
-      "group": "sqlite"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=full]",
-      "who": "sqlite",
-      "key": "query: SELECT count(*) FROM (SELECT b FROM (SELECT b, i FROM t WHERE i > 0) x GROUP BY b) y #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"182\\\"\" }",
       "group": "sqlite"
     },
     {
@@ -1559,38 +1447,6 @@
     {
       "run": "layout-coverage[refresh_mode=changes]",
       "who": "duckdb",
-      "key": "query: SELECT count(*) FROM (SELECT b, count(*) AS n FROM t GROUP BY b) g",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"400\\\"\" }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) FROM (SELECT i % 5 AS k FROM t GROUP BY i % 5) g",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"10\\\"\", actual: \"\\\"400\\\"\" }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "duckdb",
-      "key": "query: SELECT k FROM (SELECT 1 AS k, sum(d) AS s FROM t) g",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 400 }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) FROM (SELECT b FROM (SELECT b, i FROM t WHERE i > 0) x GROUP BY b) y",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"182\\\"\" }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "duckdb",
       "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x #2",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata:",
@@ -1602,38 +1458,6 @@
       "key": "query: SELECT id, char_length(s) AS chars, octet_length(s) AS bytes FROM t WHERE s IS NOT NULL #2",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type ",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) FROM (SELECT b, count(*) AS n FROM t GROUP BY b) g #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"393\\\"\" }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) FROM (SELECT i % 5 AS k FROM t GROUP BY i % 5) g #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"10\\\"\", actual: \"\\\"393\\\"\" }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "duckdb",
-      "key": "query: SELECT k FROM (SELECT 1 AS k, sum(d) AS s FROM t) g #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 393 }",
-      "group": "duckdb"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) FROM (SELECT b FROM (SELECT b, i FROM t WHERE i > 0) x GROUP BY b) y #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"182\\\"\" }",
       "group": "duckdb"
     },
     {
@@ -1695,30 +1519,6 @@
     {
       "run": "layout-coverage[refresh_mode=changes]",
       "who": "sqlite",
-      "key": "query: SELECT count(*) FROM (SELECT b, count(*) AS n FROM t GROUP BY b) g",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"400\\\"\" }",
-      "group": "sqlite"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "sqlite",
-      "key": "query: SELECT count(*) FROM (SELECT i % 5 AS k FROM t GROUP BY i % 5) g",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"10\\\"\", actual: \"\\\"400\\\"\" }",
-      "group": "sqlite"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "sqlite",
-      "key": "query: SELECT count(*) FROM (SELECT b FROM (SELECT b, i FROM t WHERE i > 0) x GROUP BY b) y",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"182\\\"\" }",
-      "group": "sqlite"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "sqlite",
       "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x #2",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata:",
@@ -1770,30 +1570,6 @@
       "key": "query: SELECT id, abs(d), round(d, 1), floor(f), ceil(f) FROM t WHERE id < 50 #2",
       "kind": "error",
       "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: floor in SELECT `t`.`id`, abs(`t`.`d`), round(`t`.`d`, 1), floor(`t`.`f`), ceil(`t`.`f`",
-      "group": "sqlite"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "sqlite",
-      "key": "query: SELECT count(*) FROM (SELECT b, count(*) AS n FROM t GROUP BY b) g #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"393\\\"\" }",
-      "group": "sqlite"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "sqlite",
-      "key": "query: SELECT count(*) FROM (SELECT i % 5 AS k FROM t GROUP BY i % 5) g #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"10\\\"\", actual: \"\\\"393\\\"\" }",
-      "group": "sqlite"
-    },
-    {
-      "run": "layout-coverage[refresh_mode=changes]",
-      "who": "sqlite",
-      "key": "query: SELECT count(*) FROM (SELECT b FROM (SELECT b, i FROM t WHERE i > 0) x GROUP BY b) y #2",
-      "kind": "wrong-answer",
-      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"182\\\"\" }",
       "group": "sqlite"
     }
   ],
@@ -2243,7 +2019,7 @@
     {
       "run": "mysql-literals",
       "who": "federated",
-      "key": "query: SELECT id FROM m WHERE s IN ('a''b\"c_d%e', 'naïve') ORDER BY id",
+      "key": "query: SELECT id FROM m WHERE s IN ('a''b\"c_d%e', 'na\u00efve') ORDER BY id",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 1 }",
       "group": "federation-mysql"
@@ -2251,7 +2027,7 @@
     {
       "run": "mysql-literals",
       "who": "federated",
-      "key": "query: SELECT id FROM m WHERE s BETWEEN 'a''b\"c_d%e' AND 'naïve' ORDER BY id",
+      "key": "query: SELECT id FROM m WHERE s BETWEEN 'a''b\"c_d%e' AND 'na\u00efve' ORDER BY id",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 1 }",
       "group": "federation-mysql"
@@ -3390,7 +3166,7 @@
       "who": "federated",
       "key": "query: SELECT id, concat(s, '-', id) AS c1, s || '!' AS c2 FROM t WHERE id < 40",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"c2\", row_number: 1, expected: \"\\\"naïve!\\\"\", actual: \"\\\"0\\\"\" }",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"c2\", row_number: 1, expected: \"\\\"na\u00efve!\\\"\", actual: \"\\\"0\\\"\" }",
       "group": "federation-mysql"
     },
     {
@@ -4036,7 +3812,7 @@
     {
       "run": "surface",
       "who": "federated",
-      "key": "query: SELECT id, starts_with(s, 'Ga') AS sw, ends_with(s, 'é') AS ew FROM ev WHERE s IS NOT NULL",
+      "key": "query: SELECT id, starts_with(s, 'Ga') AS sw, ends_with(s, '\u00e9') AS ew FROM ev WHERE s IS NOT NULL",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function ends_with(text, unknown) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type ",
       "group": "federation-postgres"
@@ -4252,9 +4028,9 @@
     {
       "run": "surface",
       "who": "sqlite",
-      "key": "query: SELECT id, starts_with(s, 'Ga') AS sw, ends_with(s, 'é') AS ew FROM ev WHERE s IS NOT NULL",
+      "key": "query: SELECT id, starts_with(s, 'Ga') AS sw, ends_with(s, '\u00e9') AS ew FROM ev WHERE s IS NOT NULL",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: starts_with in SELECT `ev`.`id`, starts_with(`ev`.`s`, 'Ga') AS `sw`, ends_with(`ev`.`s`, 'é') AS `ew` FROM `ev` WHERE `ev`.`s` IS NOT NU",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: starts_with in SELECT `ev`.`id`, starts_with(`ev`.`s`, 'Ga') AS `sw`, ends_with(`ev`.`s`, '\u00e9') AS `ew` FROM `ev` WHERE `ev`.`s` IS NOT NU",
       "group": "sqlite"
     },
     {

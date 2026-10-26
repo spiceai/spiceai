@@ -95,4 +95,4 @@ steps:
   # `decimal-int` keeps clear of Cayenne refusing to filter its files on
   # arithmetic between a decimal and an integer
   # (known-failing/cayenne/cayenne-decimal-int-filter.yaml).
-  - tlp: { table: t, seed: 4, queries: 150, depth: 3, aggregate: d, oracle: src, avoid: [not, decimal-int] }
+  - tlp: { table: t, seed: 4, queries: 150, depth: 3, aggregate: d, oracle: src, avoid: [decimal-int] }
