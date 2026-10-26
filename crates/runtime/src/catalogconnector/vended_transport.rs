@@ -61,11 +61,17 @@ impl VendedHosts {
         })
     }
 
+    /// Compares the URL-parsed host, as `reqwest` dials it, so an IP literal
+    /// written another way (`0x01010101`) matches its vended `1.1.1.1`.
     fn guards(&self, uri: &http::Uri) -> bool {
-        uri.host().is_some_and(|host| {
-            let host = normalized_host(host);
-            self.hosts.iter().any(|guarded| *guarded == host)
-        })
+        url::Url::parse(&uri.to_string())
+            .ok()
+            .as_ref()
+            .and_then(url::Url::host_str)
+            .is_some_and(|host| {
+                let host = normalized_host(host);
+                self.hosts.iter().any(|guarded| *guarded == host)
+            })
     }
 }
 
@@ -340,4 +346,24 @@ impl HttpTransport for VendedStorageTransport {
 #[ctor::ctor(unsafe, priority = early)]
 fn install_vended_storage_transport() {
     HttpTransporter::install_default(VendedStorageTransport);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VendedHosts;
+
+    #[test]
+    fn a_vended_ip_literal_is_guarded_however_the_request_writes_it() {
+        let hosts =
+            VendedHosts::new("catalog 'ice'", vec!["1.1.1.1".to_string()]).expect("one host");
+        for uri in [
+            "http://1.1.1.1:9000/bucket/key",
+            "http://0x01010101:9000/bucket/key",
+            "http://16843009:9000/bucket/key",
+            "http://1.1.257:9000/bucket/key",
+        ] {
+            assert!(hosts.guards(&uri.parse().expect("valid URI")), "{uri}");
+        }
+        assert!(!hosts.guards(&"http://1.1.1.2:9000/bucket/key".parse().expect("valid URI")));
+    }
 }
