@@ -94,6 +94,37 @@ fn parse_pagination_max_pages(value: &str) -> Option<usize> {
     }
 }
 
+/// Resolves the hosts a redirect introduced through [`ssrf::redirect_destination_guard`], so a
+/// redirect cannot reach an internal address by name. The dataset's own host and a proxy's
+/// resolve unchecked.
+#[derive(Default)]
+struct RedirectHostResolver {
+    redirect_hosts: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// `host` as [`RedirectHostResolver`] keys it: `example.com.` and `example.com` name the same host.
+fn redirect_host_key(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+impl reqwest::dns::Resolve for RedirectHostResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let guarded = self
+            .redirect_hosts
+            .lock()
+            .contains(&redirect_host_key(&host));
+        Box::pin(async move {
+            let addresses: Vec<std::net::SocketAddr> = if guarded {
+                ssrf::redirect_destination_guard().resolve(&host).await?
+            } else {
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect()
+            };
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Https {
     params: Parameters,
@@ -972,25 +1003,37 @@ impl Https {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(90);
 
+        let origin_host = Url::parse(dataset.from.as_str())
+            .ok()
+            .and_then(|url| url.host_str().map(redirect_host_key));
+        let resolver = RedirectHostResolver::default();
+        let redirect_hosts = Arc::clone(&resolver.redirect_hosts);
+
         let mut builder = Client::builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(connect_timeout)
             .timeout(client_timeout)
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 const MAX_REDIRECTS: usize = 5;
                 if attempt.previous().len() >= MAX_REDIRECTS {
                     return attempt.error("too many redirects");
                 }
                 // SSRF defense-in-depth: refuse to follow a redirect to an
                 // internal target, with the same classifier URL tables use.
-                // Hostname redirects can't be DNS-resolved in this synchronous
-                // closure, so well-known internal names are rejected by literal
-                // match.
                 if ssrf::redirect_target_is_internal(attempt.url()) {
                     return attempt.error("redirect to a private address is not allowed");
                 }
+                // This closure cannot resolve DNS, so the resolver checks the
+                // addresses of each new host a redirect names.
+                if let Some(url::Host::Domain(host)) = attempt.url().host() {
+                    let host = redirect_host_key(host);
+                    if origin_host.as_deref() != Some(host.as_str()) {
+                        redirect_hosts.lock().insert(host);
+                    }
+                }
                 attempt.follow()
             }))
+            .dns_resolver(Arc::new(resolver))
             .pool_max_idle_per_host(pool_max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
 
@@ -4771,5 +4814,98 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             "the decoded response matches what was sent"
         );
         assert_eq!(made, 1);
+    }
+
+    /// Answer every request with `response` and count the requests.
+    async fn serve_fixed(response: String) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test server");
+        let port = listener.local_addr().expect("test server address").port();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (port, requests)
+    }
+
+    const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
+
+    /// `localhost.` resolves to a loopback address but, with its trailing dot, is not a
+    /// well-known internal name, so only the resolved address shows that the redirect reaches
+    /// an internal host.
+    #[tokio::test]
+    async fn a_redirect_to_a_name_that_resolves_to_loopback_is_refused() {
+        let (target_port, target_requests) = serve_fixed(OK_RESPONSE.to_string()).await;
+        let (origin_port, _) = serve_fixed(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://localhost.:{target_port}/data\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ))
+        .await;
+        let origin = format!("http://127.0.0.1:{origin_port}/data");
+        let connector = test_connector(Some("json")).await;
+        let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
+        let client = connector
+            .build_http_client(&dataset)
+            .await
+            .expect("build the HTTP client");
+
+        let error = client
+            .get(&origin)
+            .send()
+            .await
+            .expect_err("the redirect is refused");
+
+        let message =
+            std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
+                e.source()
+            })
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(": ");
+        assert!(
+            message.contains("Refused to connect to localhost."),
+            "unexpected error: {message}"
+        );
+        assert_eq!(
+            target_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the redirect target is never reached"
+        );
+    }
+
+    /// The operator chose the dataset's host, so its resolved address is not checked.
+    #[tokio::test]
+    async fn the_dataset_host_may_resolve_to_loopback() {
+        let (port, requests) = serve_fixed(OK_RESPONSE.to_string()).await;
+        let origin = format!("http://localhost.:{port}/data");
+        let connector = test_connector(Some("json")).await;
+        let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
+        let client = connector
+            .build_http_client(&dataset)
+            .await
+            .expect("build the HTTP client");
+
+        let response = client
+            .get(&origin)
+            .send()
+            .await
+            .expect("the origin answers");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

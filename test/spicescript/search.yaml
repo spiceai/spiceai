@@ -89,8 +89,8 @@ steps:
         INSERT INTO docs VALUES (500, 'fox fox fox fox fox fox fox fox fox fox fox fox', 12, 0);
         DELETE FROM docs WHERE id IN (4, 9);
   - refresh: docs
-  # Worded differently from the queries above: an identical text is answered
-  # from before the refresh (known-failing/search/text-search-stale-after-refresh.yaml).
+  # Worded differently from the queries above; text-search-stale-after-refresh.yaml
+  # covers the identical text asked before and after a refresh.
   - query: SELECT s.id FROM text_search(docs, 'fox') s ORDER BY s._score DESC, s.id LIMIT 20
     oracle-sql: SELECT id FROM docs WHERE fox > 0 AND body IS NOT NULL ORDER BY fox DESC, id LIMIT 20
     eventually: 30s
