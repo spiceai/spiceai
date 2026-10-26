@@ -71,12 +71,26 @@ pub(crate) fn command_line(pid: i32) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Stops what dead runners left behind under `work_dir`, and says what it did.
+/// Stops what dead runners left behind, and says what it did.
 pub fn reap(work_dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(work_dir) else {
-        return;
-    };
+    reap_with(work_dir, remove_docker_leftovers);
+}
+
+/// Stops the `spiced` processes dead runners left under `work_dir`, then runs
+/// `sweep` for their containers and networks. The sweep runs even when
+/// `work_dir` does not exist: a run with a fresh `--work-dir` still cleans up
+/// after one that was killed.
+fn reap_with(work_dir: &Path, sweep: impl FnOnce(i32)) {
     let me = i32::try_from(std::process::id()).unwrap_or(-1);
+    if let Ok(entries) = std::fs::read_dir(work_dir) {
+        stop_orphaned_spiced(entries, me);
+    }
+    sweep(me);
+}
+
+/// Stops each `spiced` whose pid file, under a dead runner's directory among
+/// `entries`, still names a live process.
+fn stop_orphaned_spiced(entries: std::fs::ReadDir, me: i32) {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(owner) = runner_pid(&name) else {
@@ -110,7 +124,6 @@ pub fn reap(work_dir: &Path) {
             let _ = std::fs::remove_file(&file);
         }
     }
-    remove_docker_leftovers(me);
 }
 
 /// Ids and runner pids of the containers (`kind` = `container`) or networks
@@ -174,6 +187,19 @@ fn remove_docker_where(owned: impl Fn(i32) -> bool, whose: &str) {
 #[cfg(test)]
 mod tests {
     use super::runner_pid;
+
+    #[test]
+    fn sweeps_docker_even_when_the_work_dir_does_not_exist() {
+        let missing =
+            std::env::temp_dir().join(format!("spicescript-reap-missing-{}", std::process::id()));
+        assert!(!missing.exists(), "{} exists", missing.display());
+        let mut swept_for = None;
+        super::reap_with(&missing, |me| swept_for = Some(me));
+        assert_eq!(
+            swept_for,
+            Some(i32::try_from(std::process::id()).expect("pid fits i32"))
+        );
+    }
 
     #[test]
     fn a_docker_listing_names_each_resources_runner() {

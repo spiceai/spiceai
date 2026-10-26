@@ -1,0 +1,83 @@
+name: mongodb-chaos
+description: >
+  A MongoDB collection followed by change streams into Cayenne stays equal to
+  the collection through faults: changes made while spiced is killed and
+  across a clean restart are all applied, each once, and the acceleration ends
+  equal to the same rows in PostgreSQL. (Keys are strings: resuming with a
+  numeric _id is known-failing/streaming-sources/mongodb-cdc-resume-numeric-id.yaml;
+  a replica-set restart is known-failing/streaming-sources/mongodb-cdc-source-restart.yaml.)
+
+sources:
+  mongo:
+    kind: docker
+    image: docker.io/library/mongo:8.0
+    ports: [27017]
+    command: [mongod, --replSet, rs0, --bind_ip_all]
+    ready: >-
+      mongosh --quiet --eval "try { rs.status(); db.hello().isWritablePrimary ? 1 : 0 } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}); 0 }" | grep -qx 1
+  ref: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mongodb-chaos
+  datasets:
+    - from: mongodb:t
+      name: t
+      params:
+        mongodb_connection_string: 'mongodb://127.0.0.1:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        change_stream_batch_max_duration: 100ms
+        change_stream_max_await_time: 100ms
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: _id }
+
+defaults:
+  expect: { oracle: ref }
+
+steps:
+  - source-exec:
+      mongo: >-
+        mongosh --quiet ${sources.mongo.namespace} --eval "
+          const docs = [];
+          for (let g = 1; g <= 500; g++) { docs.push({ _id: 'k' + g, n: NumberLong(g), v: NumberLong(g % 7), s: 'start' }); }
+          db.t.insertMany(docs);"
+  - source-exec:
+      ref: >-
+        CREATE TABLE t (_id text PRIMARY KEY, n bigint, v bigint, s text);
+        INSERT INTO t SELECT 'k' || g, g, g % 7, 'start' FROM generate_series(1, 500) g;
+  - start: {}
+  - query: SELECT _id, n, v, s FROM t
+    eventually: 60s
+  - background:
+      id: no-duplicates
+      query: SELECT count(*) - count(DISTINCT _id) AS duplicates FROM t
+      expect: { duplicates: '0' }
+
+  # Changed while spiced is down after a kill.
+  - kill-spiced: {}
+  - source-exec:
+      mongo: >-
+        mongosh --quiet ${sources.mongo.namespace} --eval "
+          const docs = [];
+          for (let g = 501; g <= 1000; g++) { docs.push({ _id: 'k' + g, n: NumberLong(g), v: NumberLong(g % 7), s: 'while down' }); }
+          db.t.insertMany(docs);
+          db.t.updateMany({ n: { \$lte: NumberLong(100) } }, { \$set: { s: 'updated while down' } });
+          db.t.deleteMany({ v: NumberLong(3), n: { \$gt: NumberLong(900) } });"
+  - source-exec:
+      ref: >-
+        INSERT INTO t SELECT 'k' || g, g, g % 7, 'while down' FROM generate_series(501, 1000) g;
+        UPDATE t SET s = 'updated while down' WHERE n <= 100;
+        DELETE FROM t WHERE v = 3 AND n > 900;
+  - start: {}
+  - query: SELECT _id, n, v, s FROM t
+    eventually: 60s
+
+  # A clean restart, then more.
+  - restart: {}
+  - source-exec:
+      mongo: >-
+        mongosh --quiet ${sources.mongo.namespace} --eval "db.t.deleteMany({ n: { \$lte: NumberLong(10) } });"
+  - source-exec:
+      ref: DELETE FROM t WHERE n <= 10;
+  - query: SELECT _id, n, v, s FROM t
+    eventually: 60s
+  - stop-background: { id: no-duplicates, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection', 'not ready'] }

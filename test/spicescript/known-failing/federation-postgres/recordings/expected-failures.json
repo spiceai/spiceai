@@ -1,0 +1,198 @@
+{
+  "postgres-timestamp-before-epoch": [
+    {
+      "run": "postgres-timestamp-before-epoch",
+      "who": "cayenne",
+      "key": "query: SELECT id, ts FROM p",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for p: Acceleration not ready; loading initial data for p",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-timestamp-before-epoch",
+      "who": "cayenne",
+      "key": "query: SELECT id, ts FROM p WHERE ts < TIMESTAMP '1970-01-01 00:00:00'",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for p: Acceleration not ready; loading initial data for p",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-timestamp-before-epoch",
+      "who": "duckdb",
+      "key": "query: SELECT id, ts FROM p",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for p: Acceleration not ready; loading initial data for p",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-timestamp-before-epoch",
+      "who": "duckdb",
+      "key": "query: SELECT id, ts FROM p WHERE ts < TIMESTAMP '1970-01-01 00:00:00'",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for p: Acceleration not ready; loading initial data for p",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-timestamp-before-epoch",
+      "who": "federated",
+      "key": "query: SELECT id, ts FROM p",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nFailed to build record batch: Invalid argument error: all columns in a record batch mus",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-timestamp-before-epoch",
+      "who": "federated",
+      "key": "query: SELECT id, ts FROM p WHERE ts < TIMESTAMP '1970-01-01 00:00:00'",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nFailed to build record batch: Invalid argument error: all columns in a record batch mus",
+      "group": "federation-postgres"
+    }
+  ],
+  "postgres-type-coverage": [
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_tsvector",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nThe field 'v' has an unsupported data type: tsvector.\\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_tsquery",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nThe field 'v' has an unsupported data type: tsquery.\\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-t",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_xml",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nThe field 'v' has an unsupported data type: xml.\\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-table",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_inet",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nThe field 'v' has an unsupported data type: inet.\\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-tabl",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_cidr",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nThe field 'v' has an unsupported data type: cidr.\\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-tabl",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_macaddr",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nThe field 'v' has an unsupported data type: macaddr.\\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-t",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_bit_4",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nThe field 'v' has an unsupported data type: bit.\\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-table",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_varbit",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nThe field 'v' has an unsupported data type: varbit.\\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-ta",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_int4range",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nThe field 'v' has an unsupported data type: int4range.\\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_daterange",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. table 'pg.public.t_daterange' not found: table 'pg.public.t_daterange' not found",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_box",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nThe field 'v' has an unsupported data type: box.\\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-table",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_circle",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nThe field 'v' has an unsupported data type: circle.\\nReport a bug to request support: https://github.com/datafusion-contrib/datafusion-ta",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_pg_lsn",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. table 'pg.public.t_pg_lsn' not found: table 'pg.public.t_pg_lsn' not found",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_timetz",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. table 'pg.public.t_timetz' not found: table 'pg.public.t_timetz' not found",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_posint",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. table 'pg.public.t_posint' not found: table 'pg.public.t_posint' not found",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_pair",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Query driver task panicked: task <n> panicked with message \\\"StructBuilder (Field { \\\\\\\"n\\\\\\\": nullable Int32 }, Field { \\\\\\\"s\\\\\\\": nullable Utf8 }) and field_builder with index 0 (Int32) are of unequal le",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_int_array",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nFailed to get a row value for _int4: error deserializing column 1\\nReport a bug to request support: https://github.com/datafusion-contrib",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-type-coverage",
+      "who": "default",
+      "key": "query: SELECT id, v FROM pg.public.t_text_array",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nFailed to get a row value for _text: error deserializing column 1\\nReport a bug to request support: https://github.com/datafusion-contrib",
+      "group": "federation-postgres"
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+name: iceberg-generated
+description: >
+  A 500,000-row generated Iceberg table answers a pruning-sensitive corpus
+  through Spice like DuckDB reading it: federated, accelerated by full refresh
+  into Cayenne and DuckDB, and by append refresh on its time column into
+  Cayenne; then again after a generated append adds a snapshot of newer rows.
+
+sources:
+  ice: { kind: iceberg }
+
+variants:
+  federated: {}
+  cayenne-full:
+    datasets: { facts: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
+  duckdb-full:
+    datasets: { facts: { acceleration: { enabled: true, engine: duckdb, mode: file, refresh_mode: full } } }
+  cayenne-append:
+    datasets:
+      facts:
+        time_column: ts
+        acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: append }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: iceberg-generated
+  datasets:
+    - from: 'iceberg:${sources.ice.catalog}/v1/namespaces/${sources.ice.namespace}/tables/facts'
+      name: facts
+      params: ${sources.ice.params}
+
+defaults:
+  expect: { oracle: ice }
+  query-timeout: 60s
+
+steps:
+  - generate:
+      ice: &facts
+        table: facts
+        rows: 500000
+        seed: 31
+        files: 4
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: grp, int: [1, 200] }
+          - { name: ts, timestamp: ['2024-01-01', '2024-12-31'] }
+          - { name: amount, decimal: { range: [0, 1000], scale: 2 } }
+          - { name: label, choice: [alpha, beta, gamma, delta] }
+          - { name: note, text: [3, 20], nulls: 0.2 }
+  - start: {}
+  - corpus: corpus/layout.sql
+
+  # A snapshot of newer rows.
+  - generate:
+      ice:
+        <<: *facts
+        rows: 20000
+        seed: 32
+        files: 1
+        mode: append
+        columns:
+          - { name: id, sequence: 1000001 }
+          - { name: grp, int: [1, 200] }
+          - { name: ts, timestamp: ['2025-01-01', '2025-01-31'] }
+          - { name: amount, decimal: { range: [0, 1000], scale: 2 } }
+          - { name: label, choice: [alpha, beta, gamma, delta] }
+          - { name: note, text: [3, 20], nulls: 0.2 }
+  - refresh: facts
+    only: [cayenne-full, duckdb-full, cayenne-append]
+  - corpus: corpus/layout.sql
+    eventually: 30s

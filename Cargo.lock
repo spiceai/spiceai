@@ -4868,6 +4868,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-object-store",
  "runtime-parameters",
+ "runtime-secrets",
  "secrecy",
  "serde_json",
  "snafu",
@@ -7433,7 +7434,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=f103fe809cc186168833632b9a0ee07ff40a9283#f103fe809cc186168833632b9a0ee07ff40a9283"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=4a2920746865562e604150fbee49eea6241c0b85#4a2920746865562e604150fbee49eea6241c0b85"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -8016,7 +8017,7 @@ checksum = "ab23e69df104e2fd85ee63a533a22d2132ef5975dc6b36f9f3e5a7305e4a8ed7"
 [[package]]
 name = "duckdb"
 version = "1.4.4"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=504debbf8269a76aef74daa2247b6296c2fe2290#504debbf8269a76aef74daa2247b6296c2fe2290"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9#40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9"
 dependencies = [
  "arrow",
  "calamine",
@@ -9996,7 +9997,6 @@ dependencies = [
  "indicatif 0.17.11",
  "libc",
  "log",
- "native-tls",
  "num_cpus",
  "rand 0.9.4",
  "reqwest 0.12.24",
@@ -11672,7 +11672,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libduckdb-sys"
 version = "1.4.4"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=504debbf8269a76aef74daa2247b6296c2fe2290#504debbf8269a76aef74daa2247b6296c2fe2290"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9#40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9"
 dependencies = [
  "cc",
  "flate2",
@@ -12019,7 +12019,6 @@ dependencies = [
  "futures",
  "google-genai",
  "governor",
- "hf-hub",
  "http 1.4.1",
  "huggingface-hub",
  "indexmap 2.14.0",
@@ -17742,7 +17741,6 @@ dependencies = [
  "governor",
  "graphql-parser",
  "headers-accept",
- "hf-hub",
  "http 1.4.1",
  "http-body 1.0.1",
  "http-body-limit",
@@ -20805,6 +20803,7 @@ dependencies = [
  "nix 0.30.1",
  "parking_lot",
  "parquet",
+ "rcgen",
  "regex",
  "reqwest 0.13.4",
  "result-compare",
@@ -23625,7 +23624,6 @@ dependencies = [
  "base64 0.22.1",
  "flate2",
  "log",
- "native-tls",
  "once_cell",
  "rustls",
  "rustls-pki-types",

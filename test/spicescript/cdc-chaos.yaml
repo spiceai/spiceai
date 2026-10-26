@@ -1,0 +1,149 @@
+name: cdc-chaos
+description: >
+  On one spiced, readers of Cayenne accelerations (full refresh and CDC) get
+  the right answer or an error, never a wrong one, while the spicepod is
+  reloaded with a dataset added and another changed, the source goes down
+  and a refresh fails, CDC transfers keep a total constant, and spiced is
+  restarted and killed. Afterwards every table matches its PostgreSQL or MySQL source.
+
+sources:
+  src: { kind: '${matrix.src}' }
+
+matrix:
+  src: [postgres, mysql]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cdc-chaos
+  datasets:
+    - &t
+      from: '${sources.src.from_prefix}t${sources.src.from_suffix}'
+      name: t
+      params: ${sources.src.table_params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+    - &acct
+      from: '${sources.src.from_prefix}acct${sources.src.from_suffix}'
+      name: acct
+      params: ${sources.src.table_params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+    - &other
+      from: '${sources.src.from_prefix}t${sources.src.from_suffix}'
+      name: other
+      params: ${sources.src.table_params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+
+defaults:
+  spiced-args: [--pods-watcher-enabled]
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  # d = 1..6000 sums to 18,003,000; 100 accounts hold 100,000 in all.
+  - generate:
+      src:
+        table: t
+        rows: 6000
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: d, sequence: 1 }
+          - { name: s, text: [1, 20] }
+  - generate:
+      src:
+        table: acct
+        rows: 100
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: bal, int: [1000, 1000] }
+  - start: {}
+
+  - background:
+      id: t-reader
+      concurrency: 2
+      query: SELECT count(*) AS n, sum(d) AS total FROM t
+      expect: { n: '6000', total: '18003000' }
+  - background:
+      id: acct-reader
+      concurrency: 2
+      query: SELECT count(*) AS n, sum(bal) AS total FROM acct
+      expect: { n: '100', total: '100000' }
+  # One atomic statement moves 1 between two random accounts.
+  - background:
+      id: transfers
+      source-exec:
+        src: &pg-transfer >-
+          WITH p AS (SELECT 1 + (random() * 99)::int AS a, 1 + (random() * 99)::int AS b)
+          UPDATE acct SET bal = bal + CASE WHEN acct.id = p.a THEN -1 ELSE 1 END
+          FROM p WHERE acct.id IN (p.a, p.b) AND p.a <> p.b
+      every: 20ms
+    when: { src: postgres }
+  - background:
+      id: transfers
+      source-exec:
+        src: &mysql-transfer >-
+          UPDATE acct a JOIN (SELECT 1 + FLOOR(RAND() * 100) AS x, 1 + FLOOR(RAND() * 100) AS y) p
+          ON a.id IN (p.x, p.y) AND p.x <> p.y
+          SET a.bal = a.bal + IF(a.id = p.x, -1, 1)
+      every: 20ms
+    when: { src: mysql }
+
+  # Reloads: a dataset added, then another's settings changed.
+  - edit-spicepod:
+      spicepod:
+        datasets:
+          - *t
+          - *acct
+          - *other
+          - { from: '${sources.src.from_prefix}t${sources.src.from_suffix}', name: added, params: '${sources.src.table_params}' }
+  - query: SELECT count(*) AS n FROM added
+    expect: { rows: [['6000']] }
+    eventually: 60s
+  - edit-spicepod:
+      datasets:
+        other: { acceleration: { refresh_sql: SELECT * FROM other WHERE id <= 10 } }
+  - query: SELECT count(*) AS n FROM other
+    expect: { rows: [['10']] }
+    eventually: 60s
+  - sleep: 5s
+
+  # The source down: a refresh fails, the acceleration keeps answering.
+  - stop-background: { id: transfers }
+  - stop-source: src
+  - refresh: t
+    expect-error: true
+  - query: SELECT count(*) AS n, sum(d) AS total FROM t
+    expect: { rows: [['6000', '18003000']] }
+  - sleep: 5s
+  - start-source: src
+  - background:
+      id: transfers2
+      source-exec: { src: *pg-transfer }
+      every: 20ms
+    when: { src: postgres }
+  - background:
+      id: transfers2
+      source-exec: { src: *mysql-transfer }
+      every: 20ms
+    when: { src: mysql }
+  - sleep: 10s
+
+  # Restarted, then killed and started.
+  - restart: {}
+  - sleep: 10s
+  - restart: { kill: KILL }
+  - sleep: 15s
+
+  - stop-background: { id: transfers2 }
+  - stop-background: { id: t-reader, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection'] }
+  - stop-background: { id: acct-reader, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection'] }
+  - query: SELECT * FROM t
+  - query: SELECT * FROM acct
+    eventually: 60s
+  - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM acct
+    expect: { rows: [['0']] }
+  - query: SELECT * FROM added
+    oracle-sql: SELECT * FROM t
+  - query: SELECT * FROM other
+    oracle-sql: SELECT * FROM t WHERE id <= 10

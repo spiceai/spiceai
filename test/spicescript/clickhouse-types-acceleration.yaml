@@ -1,0 +1,74 @@
+name: clickhouse-types-acceleration
+description: >
+  A ClickHouse table with the common types the literal matrix does not cover
+  (narrow and unsigned integers, Float32, FixedString, Date, DateTime, UUID,
+  Bool, Enum8, LowCardinality, arrays, IPv4), NULLs in each, answers through
+  Spice exactly as ClickHouse answers: federated, and accelerated into Arrow and
+  Cayenne, before and after rows are added at the source.
+
+sources:
+  src: { kind: clickhouse }
+
+variants:
+  federated: {}
+  arrow: arrow-memory
+  cayenne: cayenne-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: clickhouse-types-acceleration
+  datasets:
+    - from: clickhouse:t
+      name: t
+      params: ${sources.src.params}
+
+defaults:
+  cluster-partition-by: { '*': id }
+  also-http: true
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (
+          id Int32,
+          i8 Nullable(Int8), i16 Nullable(Int16), u8 Nullable(UInt8), u16 Nullable(UInt16), u32 Nullable(UInt32),
+          f32 Nullable(Float32),
+          fs Nullable(FixedString(4)),
+          d Nullable(Date), dts Nullable(DateTime('UTC')),
+          uid Nullable(UUID), b Nullable(Bool),
+          e Nullable(Enum8('red' = 1, 'green' = 2, 'blue' = 3)),
+          lc LowCardinality(Nullable(String)),
+          ai Array(Int32), astr Array(Nullable(String)),
+          ip Nullable(IPv4))
+        ENGINE = MergeTree ORDER BY id;
+        INSERT INTO t VALUES
+          (1, -128, -32768, 0, 0, 0, -3.4e38, 'abcd', '1970-01-01', '1970-01-01 00:00:00',
+           '00000000-0000-0000-0000-000000000000', false, 'red', 'x', [], [], '0.0.0.0'),
+          (2, 127, 32767, 255, 65535, 4294967295, 3.4e38, 'wxyz', '2149-06-06', '2106-02-07 06:28:15',
+           'ffffffff-ffff-ffff-ffff-ffffffffffff', true, 'blue', 'y', [-2147483648, 2147483647], ['a', NULL, ''], '255.255.255.255'),
+          (3, 0, 0, 1, 1, 1, 0.1, 'a\0\0\0', '2000-02-29', '2000-02-29 12:34:56',
+           '123e4567-e89b-12d3-a456-426614174000', true, 'green', 'x', [1, 2, 3], ['日本語'], '10.0.0.1'),
+          (4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, [], [NULL], NULL);
+  - start: {}
+  - query: SELECT id, i8, i16, u8, u16, u32 FROM t ORDER BY id
+  - query: SELECT id, f32 FROM t ORDER BY id
+  - query: SELECT id, fs FROM t ORDER BY id
+  - query: SELECT id, d, dts FROM t ORDER BY id
+  - query: SELECT id, uid, b, e, lc FROM t ORDER BY id
+  - query: SELECT id, ai, astr FROM t ORDER BY id
+  - query: SELECT id, ip FROM t ORDER BY id
+  - query: SELECT count(*) AS n, count(u32) AS u, sum(u16) AS s FROM t
+  - query: SELECT id FROM t WHERE b AND u8 > 0 ORDER BY id
+  - query: SELECT id FROM t WHERE d >= DATE '2000-01-01' ORDER BY id
+
+  - source-exec:
+      src: >-
+        INSERT INTO t VALUES (5, 1, 1, 1, 1, 1, 1.5, 'late', '2024-01-01', '2024-01-01 00:00:00',
+          '00000000-0000-0000-0000-000000000005', false, 'green', 'late', [5], ['late'], '192.168.0.5');
+  - refresh: t
+    except: federated
+  - query: SELECT id, i8, u32, f32, fs, d, dts, uid, b, e, lc FROM t ORDER BY id
+    eventually: 30s

@@ -1,0 +1,166 @@
+{
+  "append-iso-day": [
+    {
+      "run": "append-iso-day",
+      "who": "day-text-partition",
+      "key": "query: SELECT * FROM events #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-iso-day",
+      "who": "day-text-partition",
+      "key": "query: SELECT * FROM events #3",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 3 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-iso-day",
+      "who": "day-text-partition",
+      "key": "query: SELECT * FROM events #4",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 4 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-iso-day",
+      "who": "day-text-time-column",
+      "key": "refresh: events",
+      "kind": "other",
+      "signature": "refresh of 'events' failed: Failed to parse ISO8601 timestamp '2031-05-01' from time column",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-iso-day",
+      "who": "day-text-time-column",
+      "key": "query: SELECT * FROM events #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-iso-day",
+      "who": "day-text-time-column",
+      "key": "refresh: events #2",
+      "kind": "error",
+      "signature": "refresh of 'events' did not finish within <duration> (status: Error)",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-iso-day",
+      "who": "day-text-time-column",
+      "key": "query: SELECT * FROM events #3",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 2 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-iso-day",
+      "who": "day-text-time-column",
+      "key": "refresh: events #3",
+      "kind": "error",
+      "signature": "refresh of 'events' did not finish within <duration> (status: Error)",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-iso-day",
+      "who": "day-text-time-column",
+      "key": "query: SELECT * FROM events #4",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 2 }",
+      "group": "append-and-retention"
+    }
+  ],
+  "append-iso-offset": [
+    {
+      "run": "append-iso-offset",
+      "who": "keyed",
+      "key": "query: SELECT * FROM events #3",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 4 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-iso-offset",
+      "who": "zulu",
+      "key": "query: SELECT * FROM events #3",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 4 }",
+      "group": "append-and-retention"
+    }
+  ],
+  "append-negative-epoch": [
+    {
+      "run": "append-negative-epoch",
+      "who": "default",
+      "key": "refresh: old",
+      "kind": "other",
+      "signature": "refresh of 'old' failed: Integer time column value -133200000 is negative and cannot be used as a timestamp.",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-negative-epoch",
+      "who": "default",
+      "key": "query: SELECT * FROM old #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "append-and-retention"
+    }
+  ],
+  "append-null-time": [
+    {
+      "run": "append-null-time",
+      "who": "default",
+      "key": "query: SELECT * FROM events #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
+      "group": "append-and-retention"
+    }
+  ],
+  "append-same-time": [
+    {
+      "run": "append-same-time",
+      "who": "secs",
+      "key": "query: SELECT * FROM events #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-same-time",
+      "who": "tz",
+      "key": "query: SELECT * FROM events #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
+      "group": "append-and-retention"
+    }
+  ],
+  "retention-epoch-formats": [
+    {
+      "run": "retention-epoch-formats[format=unix_seconds]",
+      "who": "default",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "retention-epoch-formats[format=unix_millis]",
+      "who": "default",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "retention-epoch-formats[format=unix_nanos]",
+      "who": "default",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
+      "group": "append-and-retention"
+    }
+  ]
+}
