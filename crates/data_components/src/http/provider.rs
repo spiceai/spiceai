@@ -69,10 +69,13 @@ use util::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     /// Build with [`Error::http_request`].
-    #[snafu(display("HTTP request to {endpoint} failed: {source}"))]
+    #[snafu(display("HTTP request to {endpoint} failed: {source}{refusal}"))]
     HttpRequest {
         endpoint: String,
         source: reqwest::Error,
+        /// `": {reason}"` when a destination guard refused the request, which `source`'s
+        /// `Display` does not show; empty otherwise.
+        refusal: String,
     },
 
     #[snafu(display("HTTP client error ({status}): {message}"))]
@@ -279,9 +282,17 @@ impl Error {
     /// A transport failure on a request to `endpoint`. `reqwest::Error`'s `Display` appends
     /// the full request URL, so it is stripped and only [`endpoint_label`] is named.
     fn http_request(endpoint: &Url, source: reqwest::Error) -> Self {
+        let refusal = std::iter::successors(
+            Some(&source as &(dyn std::error::Error + 'static)),
+            |error| error.source(),
+        )
+        .find_map(|error| error.downcast_ref::<object_store_spawn::DestinationRefused>())
+        .map(|refused| format!(": {refused}"))
+        .unwrap_or_default();
         Error::HttpRequest {
             endpoint: endpoint_label(endpoint),
             source: source.without_url(),
+            refusal,
         }
     }
 }
