@@ -68,10 +68,7 @@ impl VendedHosts {
             .ok()
             .as_ref()
             .and_then(url::Url::host_str)
-            .is_some_and(|host| {
-                let host = normalized_host(host);
-                self.hosts.iter().any(|guarded| *guarded == host)
-            })
+            .is_some_and(|host| self.hosts.contains(&normalized_host(host)))
     }
 }
 
