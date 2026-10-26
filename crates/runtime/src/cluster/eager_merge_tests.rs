@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Wiring tests: a full [`DataFusionBuilder`] session errors on `BIGINT` overflow.
-
 //! Eager aggregation on a cluster scheduler adds merges whose `Partial` and
 //! `Final` can land in different stages. Executors decode `sum` by name to
 //! checked `SUM`, so every stage they decode must keep the schema the
@@ -25,7 +23,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema};
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 use ballista_scheduler::planner::{DefaultDistributedPlanner, DistributedPlanner};
 use datafusion::execution::TaskContext;
@@ -94,10 +92,21 @@ fn scheduler_session(amounts: &[i64]) -> SessionContext {
 
     // As the cluster session builder does: the local config made safe for
     // stages, and the cluster physical optimizer rules.
-    let config = apply_distributed_execution_config(df.ctx.copied_config().with_target_partitions(4));
+    let mut config =
+        apply_distributed_execution_config(df.ctx.copied_config().with_target_partitions(4));
+    // Ballista defaults to sort-merge joins; eager aggregation rewrites hash
+    // joins, which a cluster gets with `runtime.query.prefer_hash_join` or
+    // `SET datafusion.optimizer.prefer_hash_join = true`.
+    config.options_mut().optimizer.prefer_hash_join = true;
+    // The memory tables carry the NDV stats eager aggregation needs; drop
+    // only the guard that refuses to distribute them.
+    let rules = datafusion_and_cluster_physical_optimizers()
+        .into_iter()
+        .filter(|rule| rule.name() != "EnsureSerializableFileScanOptimizer")
+        .collect();
     let state = SessionStateBuilder::new_from_existing(df.ctx.state())
         .with_config(config)
-        .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
+        .with_physical_optimizer_rules(rules)
         .build();
     SessionContext::new_with_state(state)
 }
@@ -122,22 +131,34 @@ fn aggregate_above_a_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
     has_join(plan) && below_join(plan, false)
 }
 
-fn node_schemas(plan: &Arc<dyn ExecutionPlan>) -> Vec<(String, SchemaRef)> {
-    let mut out = vec![(plan.name().to_string(), plan.schema())];
+/// Each node's output fields as `(name, type)`. Nullability is left out:
+/// `datafusion-proto` does not carry an aggregate's overridden return field,
+/// so a decoded non-null `COUNT` merge reads back as nullable whichever `sum`
+/// decodes it. The state type is what must match across the shuffle.
+fn node_schemas(plan: &Arc<dyn ExecutionPlan>) -> Vec<(String, Vec<(String, DataType)>)> {
+    let fields = plan
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| (field.name().clone(), field.data_type().clone()))
+        .collect();
+    let mut out = vec![(plan.name().to_string(), fields)];
     for child in plan.children() {
         out.extend(node_schemas(child));
     }
     out
 }
 
-/// The aggregate modes in `plan` that sit above a join: the merge's halves.
+/// The modes of the aggregates in `plan` that group by `name`: the merge's
+/// halves (the pushed-down aggregate groups by the join key instead).
 fn merge_modes(plan: &Arc<dyn ExecutionPlan>) -> Vec<AggregateMode> {
-    fn has_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
-        plan.is::<HashJoinExec>() || plan.children().into_iter().any(has_join)
-    }
     let mut out = Vec::new();
     if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
-        && has_join(plan)
+        && aggregate
+            .group_expr()
+            .expr()
+            .iter()
+            .any(|(_, name)| name == "name")
     {
         out.push(*aggregate.mode());
     }
