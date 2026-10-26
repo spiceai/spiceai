@@ -8,10 +8,10 @@ on:
         description: 'spiced build commit'
         required: false
         type: string
-      # Benchmarks another release's spiced with this ref's testoperator and spec files. The
-      # newest commit within ten of the ref that has a MinIO build is used, so a release tag
-      # resolves to the build of its release-branch commit. No result or explain-plan snapshot
-      # is compared or written back, since those record this ref's answers and plans.
+      # Benchmarks another release's spiced with this ref's testoperator and spec files. A release
+      # tag installs the spiced_linux_x86_64.tar.gz that release published; a branch or other ref
+      # uses the newest commit within ten of it that has a MinIO build. No result or explain-plan
+      # snapshot is compared or written back, since those record this ref's answers and plans.
       spiced_ref:
         description: 'Branch or tag whose spiced to benchmark, e.g. v2.1.0 or release/2.4; empty = trunk. A release tag uses that release''s published binary. Ignored when spiced_commit is set'
         required: false
@@ -250,9 +250,8 @@ jobs:
         run: |
           spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
-      # A release tag benchmarks the binary that release published, so a release of any age can
-      # be measured; branches and commits use the MinIO builds, which are kept only for recent
-      # commits.
+      # A release tag benchmarks the binary that release published, so releases older than the
+      # MinIO builds (kept only for recent commits) can be measured.
       - name: Resolve the spiced source
         id: spiced_source
         env:
@@ -281,22 +280,29 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE: ${{ github.event.inputs.spiced_ref }}
           SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
+          SPICEPOD_FILE: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
           set -euo pipefail
           if [[ "${SPICEPOD_PATH}" == *odbc* ]]; then
             echo "::error::Release binaries are built without ODBC; benchmark ${RELEASE} with ODBC from a commit or branch build instead"
             exit 1
           fi
-          api="https://api.github.com/repos/spiceai/spiceai"
+          if grep -Eq '^[[:space:]]*engine:[[:space:]]*postgres[[:space:]]*$' "${SPICEPOD_FILE}"; then
+            echo "::error::Release binaries are built without the PostgreSQL accelerator; benchmark ${RELEASE} with it from a commit or branch build instead"
+            exit 1
+          fi
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
           auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
           asset="spiced_linux_x86_64.tar.gz"
-          digest="$(curl -fsSL "${auth[@]}" "${api}/releases/tags/${RELEASE}" \
-            | python3 -c 'import json,sys; print(next(a["digest"] for a in json.load(sys.stdin)["assets"] if a["name"] == sys.argv[1]))' "${asset}")"
+          release_asset="$(curl -fsSL "${auth[@]}" "${api}/releases/tags/${RELEASE}" \
+            | python3 -c 'import json,sys; a = next(a for a in json.load(sys.stdin)["assets"] if a["name"] == sys.argv[1]); print(a["id"], a["digest"])' "${asset}")"
+          read -r asset_id digest <<< "${release_asset}"
           case "${digest}" in
             sha256:*) ;;
             *) echo "::error::${RELEASE} has no ${asset} digest"; exit 1 ;;
           esac
-          curl -fsSL --retry 3 -o "${asset}" "https://github.com/spiceai/spiceai/releases/download/${RELEASE}/${asset}"
+          curl -fsSL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" \
+            -o "${asset}" "${api}/releases/assets/${asset_id}"
           echo "${digest#sha256:}  ${asset}" | sha256sum --check
           tar -xzf "${asset}" spiced
           sudo cp ./spiced /usr/local/bin/spiced
