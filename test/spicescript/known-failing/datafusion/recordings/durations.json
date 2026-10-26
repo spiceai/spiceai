@@ -1,5 +1,3 @@
 {
-  "case-mixed-widths": 4,
-  "flight-prepared-coalesce": 4,
-  "groupby-join-key-dependency": 4
+  "flight-prepared-coalesce": 4
 }

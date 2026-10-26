@@ -1249,7 +1249,8 @@ pub(crate) fn flight_sql_table_provider(
             schema,
             Arc::new(CookieStore::new()),
         )
-        .with_statistics(statistics),
+        .with_statistics(statistics)
+        .with_spice_sql(true),
     ) as Arc<dyn TableProvider>
 }
 
