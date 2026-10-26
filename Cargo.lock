@@ -7434,7 +7434,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=f103fe809cc186168833632b9a0ee07ff40a9283#f103fe809cc186168833632b9a0ee07ff40a9283"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=08ea2819b2d6e721059a7142a4a98949afb48709#08ea2819b2d6e721059a7142a4a98949afb48709"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -8017,7 +8017,7 @@ checksum = "ab23e69df104e2fd85ee63a533a22d2132ef5975dc6b36f9f3e5a7305e4a8ed7"
 [[package]]
 name = "duckdb"
 version = "1.4.4"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=504debbf8269a76aef74daa2247b6296c2fe2290#504debbf8269a76aef74daa2247b6296c2fe2290"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=b04e89c594789bf3fcdc50791ee1626a6f38426d#b04e89c594789bf3fcdc50791ee1626a6f38426d"
 dependencies = [
  "arrow",
  "calamine",
@@ -11672,7 +11672,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libduckdb-sys"
 version = "1.4.4"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=504debbf8269a76aef74daa2247b6296c2fe2290#504debbf8269a76aef74daa2247b6296c2fe2290"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=b04e89c594789bf3fcdc50791ee1626a6f38426d#b04e89c594789bf3fcdc50791ee1626a6f38426d"
 dependencies = [
  "cc",
  "flate2",
