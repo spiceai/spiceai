@@ -399,6 +399,12 @@ pub enum Action {
         source: String,
         sql: Vec<String>,
     },
+    Write {
+        source: String,
+        sql: Vec<String>,
+        mirror: String,
+        key: String,
+    },
     Refresh {
         dataset: String,
         expect_error: bool,
@@ -1285,6 +1291,7 @@ const ACTIONS: &[&str] = &[
     "pause-source",
     "unpause-source",
     "source-exec",
+    "write",
     "refresh",
     "query",
     "spice-exec",
@@ -1454,6 +1461,26 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
         "stop-source" => Action::StopSource(string_arg(&arg, name)?),
         "pause-source" => Action::PauseSource(string_arg(&arg, name)?),
         "unpause-source" => Action::UnpauseSource(string_arg(&arg, name)?),
+        "write" => {
+            let Value::Object(m) = arg else {
+                bail!("`write` takes a mapping of source name to SQL");
+            };
+            let (source, sql) = single_entry(m, "`write` takes exactly one source")?;
+            let sql = match sql {
+                Value::String(s) => vec![s],
+                v => serde_json::from_value(v).context("SQL must be a string or a list")?,
+            };
+            let mirror = opts
+                .string("mirror")?
+                .context("`write` requires `mirror`: a postgres source")?;
+            ensure!(source != mirror, "a write target cannot be its own mirror");
+            Action::Write {
+                source,
+                sql,
+                mirror,
+                key: opts.string("key")?.unwrap_or_else(|| "id".into()),
+            }
+        }
         "source-exec" => {
             let Value::Object(m) = arg else {
                 bail!("`source-exec` takes a mapping of source name to SQL");

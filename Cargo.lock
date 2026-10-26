@@ -20811,6 +20811,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqllogictest",
+ "sqlparser",
  "tokio",
  "tonic",
  "yaml",

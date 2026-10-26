@@ -34,7 +34,8 @@ secrecy.workspace = true
 reqwest.workspace = true
 result-compare = { path = "../../crates/result-compare" }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
+sqlparser.workspace = true
 sqllogictest = "0.29.1"
 tokio = { workspace = true, features = ["full"] }
 tonic.workspace = true

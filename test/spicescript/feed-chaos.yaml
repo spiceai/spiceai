@@ -1,0 +1,175 @@
+name: feed-chaos
+description: >
+  One mutation history follows Kafka append, MongoDB change streams, DynamoDB
+  Streams and PostgreSQL through Debezium's direct HTTP sink. Writes made
+  while running, while spiced is killed, after a source restart and after a
+  clean restart end equal to a PostgreSQL mirror. A background reader checks
+  that no key appears twice. Kafka append only receives inserts; LocalStack's
+  volatile tables are not restarted. MongoDB source-restart failures remain
+  visible (see known-failing/streaming-sources and #15544).
+
+sources:
+  src: { kind: '${matrix.src}' }
+  ref: { kind: postgres }
+  # Only the PostgreSQL combination uses this supervisor fixture. Source
+  # containers are declared once for a matrix; the others leave it idle.
+  dbz:
+    kind: docker
+    image: quay.io/debezium/server:3.1
+    host-network: true
+    command: [sleep, infinity]
+    ready: 'true'
+
+matrix:
+  src: [kafka, mongodb, dynamodb, postgres]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: feed-chaos
+  datasets:
+    - from: '${sources.src.from_prefix}t${sources.src.from_suffix}'
+      name: t
+      params: ${sources.src.table_params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: _id }
+
+variants:
+  kafka:
+    when: { src: kafka }
+    datasets: { t: { acceleration: { refresh_mode: append, primary_key: null } } }
+  mongodb:
+    when: { src: mongodb }
+    datasets:
+      t:
+        params: { change_stream_batch_max_duration: 100ms, change_stream_max_await_time: 100ms }
+  dynamodb:
+    when: { src: dynamodb }
+  debezium:
+    when: { src: postgres }
+    datasets:
+      t:
+        from: cdc:t
+        params: null
+        columns:
+          - { name: _id, type: text }
+          - { name: n, type: bigint }
+          - { name: v, type: bigint }
+          - { name: s, type: text }
+
+defaults:
+  expect: { oracle: ref }
+
+steps:
+  - source-exec: { ref: &table 'CREATE TABLE t (_id text PRIMARY KEY, n bigint, v bigint, s text)' }
+  - source-exec: { src: *table }
+    when: { src: postgres }
+  - source-exec: { src: 'ALTER TABLE t REPLICA IDENTITY FULL' }
+    when: { src: postgres }
+  - &write
+    write: { src: "INSERT INTO t SELECT 'k' || g, g, g % 7, 'start' FROM generate_series(1, 200) g" }
+    mirror: ref
+    key: _id
+  - start: {}
+  # Restart this process as a supervisor would, preserving its offsets file.
+  - source-exec:
+      dbz: &debezium >-
+        mkdir -p /tmp/${sources.src.namespace};
+        cd /debezium;
+        DEBEZIUM_SINK_TYPE=http
+        DEBEZIUM_SINK_HTTP_URL=http://${sources.dbz.host_from_container}:${instance.http_port}/v1/datasets/t/cdc
+        DEBEZIUM_SOURCE_CONNECTOR_CLASS=io.debezium.connector.postgresql.PostgresConnector
+        DEBEZIUM_SOURCE_OFFSET_STORAGE_FILE_FILENAME=/tmp/${sources.src.namespace}/offsets.dat
+        DEBEZIUM_SOURCE_OFFSET_FLUSH_INTERVAL_MS=0
+        DEBEZIUM_SOURCE_DATABASE_HOSTNAME=${sources.dbz.host_from_container}
+        DEBEZIUM_SOURCE_DATABASE_PORT=${sources.src.params.pg_port}
+        DEBEZIUM_SOURCE_DATABASE_USER=${sources.src.params.pg_user}
+        DEBEZIUM_SOURCE_DATABASE_PASSWORD=${sources.src.params.pg_pass}
+        DEBEZIUM_SOURCE_DATABASE_DBNAME=${sources.src.params.pg_db}
+        DEBEZIUM_SOURCE_TOPIC_PREFIX=${sources.src.namespace}
+        DEBEZIUM_SOURCE_TABLE_INCLUDE_LIST=public.t
+        DEBEZIUM_SOURCE_PLUGIN_NAME=pgoutput
+        DEBEZIUM_SOURCE_SLOT_NAME=dbz_${sources.src.namespace}
+        DEBEZIUM_SOURCE_PUBLICATION_NAME=dbz_${sources.src.namespace}
+        DEBEZIUM_FORMAT_VALUE=json
+        DEBEZIUM_FORMAT_VALUE_SCHEMAS_ENABLE=false
+        DEBEZIUM_FORMAT_KEY_SCHEMAS_ENABLE=false
+        QUARKUS_HTTP_PORT=${instance.port}
+        QUARKUS_LOG_FILE_ENABLE=false
+        nohup /debezium/run.sh >> /tmp/${sources.src.namespace}/debezium.log 2>&1 < /dev/null &
+        echo $! > /tmp/${sources.src.namespace}/pid
+    when: { src: postgres }
+  - query: &rows SELECT _id, n, v, s FROM t
+    eventually: 120s
+  - background:
+      id: no-duplicates
+      query: SELECT count(*) - count(DISTINCT _id) AS duplicates FROM t
+      expect: { duplicates: '0' }
+
+  # Changes while spiced is running. Kafka append is an insert-only history.
+  - <<: *write
+    write: { src: "INSERT INTO t SELECT 'k' || g, g, g % 7, 'while running' FROM generate_series(201, 300) g" }
+  - <<: *write
+    write:
+      src:
+        - "UPDATE t SET s = NULL, v = v + 1 WHERE n <= 50"
+        - "DELETE FROM t WHERE n BETWEEN 70 AND 80"
+    when: &changes { src: [mongodb, dynamodb, postgres] }
+  - query: *rows
+    eventually: 90s
+
+  - kill-spiced: {}
+  - <<: *write
+    write: { src: "INSERT INTO t SELECT 'k' || g, g, g % 7, 'while down' FROM generate_series(301, 400) g" }
+  - <<: *write
+    write:
+      src:
+        - "UPDATE t SET s = '' WHERE n <= 60"
+        - "DELETE FROM t WHERE n >= 380"
+    when: *changes
+  - start: {}
+  - source-exec: { dbz: &kill-debezium 'kill -9 $(cat /tmp/${sources.src.namespace}/pid)' }
+    when: { src: postgres }
+  - source-exec: { dbz: *debezium }
+    when: { src: postgres }
+  - query: *rows
+    eventually: 120s
+
+  # LocalStack loses its tables on restart; the other sources retain them.
+  - stop-source: src
+    when: &restartable { src: [kafka, mongodb, postgres] }
+  - start-source: src
+    when: *restartable
+  - <<: *write
+    write: { src: "INSERT INTO t SELECT 'k' || g, g, g % 7, 'source restarted' FROM generate_series(401, 500) g" }
+    when: *restartable
+  - <<: *write
+    write:
+      src:
+        - "UPDATE t SET s = 'updated after source restart' WHERE n <= 20"
+        - "DELETE FROM t WHERE n BETWEEN 450 AND 460"
+    when: { src: [mongodb, postgres] }
+  - source-exec: { dbz: *kill-debezium }
+    when: { src: postgres }
+  - source-exec: { dbz: *debezium }
+    when: { src: postgres }
+  - query: *rows
+    eventually: 90s
+    when: *restartable
+
+  - restart: {}
+  - source-exec: { dbz: *kill-debezium }
+    when: { src: postgres }
+  - source-exec: { dbz: *debezium }
+    when: { src: postgres }
+  - <<: *write
+    write: { src: "INSERT INTO t SELECT 'k' || g, g, g % 7, 'clean restart' FROM generate_series(501, 600) g" }
+  - <<: *write
+    write:
+      src:
+        - "UPDATE t SET s = 'final', v = v + 1 WHERE n <= 30"
+        - "DELETE FROM t WHERE n BETWEEN 560 AND 570"
+    when: *changes
+  - query: *rows
+    eventually: 120s
+  - stop-background: { id: no-duplicates, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection', 'not ready'] }
+  - query: *rows

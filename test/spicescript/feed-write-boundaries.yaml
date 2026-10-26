@@ -1,0 +1,19 @@
+name: feed-write-boundaries
+spicepod: {version: v1, kind: Spicepod, name: feed-write-boundaries}
+sources:
+  src: {kind: mongodb}
+  ref: {kind: postgres}
+description: >
+  PostgreSQL RETURNING row images preserve unsigned integer boundaries,
+  NULL, empty strings and booleans when applied through MongoDB's CLI.
+  Values above signed bigint must use Decimal128 rather than wrap as Long.
+steps:
+  - source-exec: {ref: 'CREATE TABLE t (_id text PRIMARY KEY, n numeric(38,0), s text, b boolean)'}
+  - write:
+      src: "INSERT INTO t VALUES ('a', 18446744073709551615, '', true), ('b', 9223372036854775808, NULL, false)"
+    mirror: ref
+    key: _id
+  - source-query:
+      src: >-
+        mongosh --quiet ${sources.src.namespace} --eval 'db.t.find().sort({_id:1}).forEach(d => print(d._id + ":" + d.n.toString() + ":" + JSON.stringify(d.s) + ":" + d.b))'
+    expect: {rows: [['a:18446744073709551615:"":true'], ['b:9223372036854775808:null:false']]}
