@@ -1,7 +1,6 @@
-# Known failing (#15547): after a refresh removes a document, text_search asked with
-# the same SQL text as before still answers with it (for at least 30 s, with
-# the SQL and search results caches disabled); the same search worded
-# differently answers correctly, as does vector_search with unchanged text.
+# After a refresh removes a document, text_search asked with the same SQL text
+# as before no longer answers with it, with the SQL and search results caches
+# disabled or enabled (#15392).
 name: text-search-stale-after-refresh
 description: >
   After a refresh, text_search answers from the refreshed rows whatever the
@@ -41,7 +40,7 @@ defaults:
 
 steps:
   - source-exec:
-      src: { file: ../../seed/search-postgres.sql }
+      src: { file: seed/search-postgres.sql }
   - start: { ready-timeout: 300s }
 
   - query: SELECT id FROM text_search(docs, 'dog')
