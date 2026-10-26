@@ -39,7 +39,7 @@ use std::{
         mpsc as std_mpsc,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_openai::{
@@ -133,6 +133,9 @@ const CHECKPOINT_BEFORE_END: usize = 4;
 
 /// The most checkpoints a model keeps; a newer one replaces the oldest.
 const MAX_CHECKPOINTS: usize = 4;
+
+/// The weight of the newest measurement in the smoothed checkpoint costs.
+const COST_SMOOTHING: f64 = 0.25;
 
 /// Draft tokens an MTP head proposes per step. Two measured fastest for Qwen3.8-Flash-Next
 /// on a DGX Spark: over eight prompts, 60.7 tok/s against 53.8 with one and 47.5 without a
@@ -1234,6 +1237,8 @@ struct PromptCache {
     checkpoints: Option<Checkpoints>,
     /// How many prompt tokens the last request read from the cache.
     reused: Arc<AtomicUsize>,
+    /// What saving a checkpoint costs against reading prompt tokens again.
+    cost: CheckpointCost,
 }
 
 impl PromptCache {
@@ -1243,6 +1248,7 @@ impl PromptCache {
             tokens: Vec::new(),
             checkpoints: (truncation != Truncation::Anywhere).then(Checkpoints::default),
             reused: Arc::default(),
+            cost: CheckpointCost::default(),
         }
     }
 
@@ -1293,16 +1299,32 @@ impl PromptCache {
         reused
     }
 
-    /// Where reading a prompt of `len` tokens from `start` on saves a checkpoint, if anywhere.
+    /// Where reading a prompt of `len` tokens from `start` on saves a checkpoint, if anywhere:
+    /// only where reading the tokens it covers again would cost the next request more than
+    /// saving it costs this one.
     fn checkpoint_at(&self, start: usize, len: usize) -> Option<usize> {
         let at = len.checked_sub(CHECKPOINT_BEFORE_END)?;
-        (self.checkpoints.is_some() && at > start).then_some(at)
+        (self.checkpoints.is_some() && at > start && self.cost.pays(at - start)).then_some(at)
     }
 
     fn save_checkpoint(&mut self, context: &Context<'_>, n_tokens: usize) {
         if let Some(checkpoints) = &mut self.checkpoints {
-            checkpoints.save(context, n_tokens);
+            let started = Instant::now();
+            if let Some(bytes) = checkpoints.save(context, n_tokens) {
+                let took = started.elapsed();
+                self.cost.saved(took);
+                tracing::debug!(
+                    "Model '{}' saved a {bytes}-byte checkpoint after {n_tokens} prompt tokens in {:.1} ms.",
+                    self.model,
+                    took.as_secs_f64() * 1000.0
+                );
+            }
         }
+    }
+
+    /// Records that reading `tokens` prompt tokens took `took`, checkpoint saves aside.
+    fn read(&mut self, tokens: usize, took: Duration) {
+        self.cost.read(tokens, took);
     }
 
     /// Records `tokens` as what the caches hold for the next request, after truncating them to
@@ -1329,15 +1351,15 @@ struct Checkpoint {
 
 impl Checkpoints {
     /// Saves `context`'s state after its first `n_tokens` tokens, which follow every earlier
-    /// checkpoint's.
-    fn save(&mut self, context: &Context<'_>, n_tokens: usize) {
-        let Some(state) = context.partial_state() else {
-            return;
-        };
+    /// checkpoint's, and returns its size in bytes; `None` when llama.cpp saves nothing.
+    fn save(&mut self, context: &Context<'_>, n_tokens: usize) -> Option<usize> {
+        let state = context.partial_state()?;
         if self.0.len() == MAX_CHECKPOINTS {
             self.0.remove(0);
         }
+        let bytes = state.len();
         self.0.push(Checkpoint { n_tokens, state });
+        Some(bytes)
     }
 
     /// Forgets every checkpoint after the first `n_tokens` tokens.
@@ -1358,6 +1380,49 @@ impl Checkpoints {
     fn clear(&mut self) {
         self.0.clear();
     }
+}
+
+/// What saving a checkpoint costs against reading prompt tokens again, smoothed over requests.
+/// On one machine a save copies the state in about a millisecond and always pays; split across
+/// machines it reads every recurrent tensor back from each of them, which can cost more than
+/// reading a short prompt again.
+#[derive(Debug, Default)]
+struct CheckpointCost {
+    /// Seconds a save takes.
+    save_s: Option<f64>,
+    /// Seconds a prompt token takes to read.
+    token_s: Option<f64>,
+}
+
+impl CheckpointCost {
+    /// Whether a checkpoint covering `tokens` more prompt tokens costs less to save than they
+    /// cost to read again. Until both have been measured, a checkpoint is saved.
+    fn pays(&self, tokens: usize) -> bool {
+        match (self.save_s, self.token_s) {
+            (Some(save), Some(per_token)) => count(tokens) * per_token >= save,
+            _ => true,
+        }
+    }
+
+    fn saved(&mut self, took: Duration) {
+        self.save_s = Some(smoothed(self.save_s, took.as_secs_f64()));
+    }
+
+    fn read(&mut self, tokens: usize, took: Duration) {
+        if tokens > 0 {
+            let per_token = took.as_secs_f64() / count(tokens);
+            self.token_s = Some(smoothed(self.token_s, per_token));
+        }
+    }
+}
+
+fn smoothed(old: Option<f64>, new: f64) -> f64 {
+    old.map_or(new, |old| old + COST_SMOOTHING * (new - old))
+}
+
+/// A token count as a float; counts past `u32::MAX` saturate, which no context reaches.
+fn count(tokens: usize) -> f64 {
+    f64::from(u32::try_from(tokens).unwrap_or(u32::MAX))
 }
 
 /// Tokenizes the prompt and decodes the part of it the cache does not already hold, returning
@@ -1389,11 +1454,16 @@ fn read_prompt<'m>(
     // follows exactly the tokens before it; without one, the first span is empty.
     let checkpoint = cache.checkpoint_at(start, tokens.len());
     let split = checkpoint.unwrap_or(start);
+    let started = Instant::now();
     decode_span(target, &mut batch, &tokens, start..split, stopping)?;
+    let mut read = started.elapsed();
     if let Some(at) = checkpoint {
         cache.save_checkpoint(target.context(), at);
     }
+    let resumed = Instant::now();
     decode_span(target, &mut batch, &tokens, split..tokens.len(), stopping)?;
+    read += resumed.elapsed();
+    cache.read(tokens.len() - start, read);
     Ok((tokens, batch))
 }
 
@@ -2386,6 +2456,32 @@ fn api_error(message: &str) -> OpenAIError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Measured on three DGX Sparks (GLM-5.3, the PR build): a 29-token prompt read in 270 ms,
+    /// and a checkpoint saved in 300 ms. A checkpoint is worth saving only over a prefix that
+    /// would take longer to read again than the save takes.
+    #[test]
+    fn a_checkpoint_is_saved_only_where_reading_its_tokens_again_costs_more() {
+        let mut cost = CheckpointCost::default();
+        assert!(cost.pays(1), "unmeasured, a checkpoint is saved");
+        cost.saved(Duration::from_millis(300));
+        assert!(
+            cost.pays(1),
+            "with the read cost unmeasured, a checkpoint is saved"
+        );
+        cost.read(29, Duration::from_millis(270));
+        assert!(
+            !cost.pays(25),
+            "25 tokens read again in 233 ms, under the 300 ms save"
+        );
+        assert!(cost.pays(33), "33 tokens read again in 307 ms, over it");
+        // A newer measurement moves the estimate a quarter of the way.
+        cost.saved(Duration::from_millis(100));
+        let save_s = cost.save_s.expect("a save was measured");
+        assert!((save_s - 0.25).abs() < 1e-9, "smoothed save {save_s} s");
+        assert!(cost.pays(27), "27 tokens in 251 ms, over the 250 ms save");
+        assert!(!cost.pays(26), "26 tokens in 242 ms, under it");
+    }
 
     fn weather_tool() -> Tool {
         let parameters = serde_json::from_value(serde_json::json!({
