@@ -1235,8 +1235,7 @@ async fn listing_table_scan_does_not_decode_a_replaced_object() -> Result<(), an
             }
             .await;
 
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
