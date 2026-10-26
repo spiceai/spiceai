@@ -236,3 +236,97 @@ async fn each_further_choice_reuses_the_prompt() {
     assert_eq!(texts[0], texts[1], "greedy choices are the same reply");
     assert_eq!(model.reused_prompt_tokens(), prompt_tokens - 1);
 }
+
+/// A template that renders each message's text and nothing else, so a prompt is exactly the text
+/// asked, and the next prompt can extend it by a single token.
+const RAW_TEMPLATE: &str = "{% for message in messages %}{{ message['content'] }}{% endfor %}";
+
+/// The greedy continuation of `text`, rendered as it stands, and how many tokens its prompt is.
+async fn continue_text(
+    model: &LlamaCpp,
+    name: &str,
+    text: &str,
+    max_tokens: u32,
+) -> (String, usize) {
+    let reply = model
+        .chat_request(request(json!({
+            "model": name,
+            "messages": [{ "role": "user", "content": text }],
+            "temperature": 0,
+            "max_tokens": max_tokens,
+        })))
+        .await
+        .expect("a reply");
+    let usage = reply.usage.expect("usage");
+    let content = reply.choices[0].message.content.clone().unwrap_or_default();
+    let prompt_tokens = usize::try_from(usage.prompt_tokens).expect("a prompt length fits");
+    (content, prompt_tokens)
+}
+
+/// A recurrent state rolls back only through snapshots of its last decode's tokens, which
+/// llama.cpp keeps for rejected drafts. Once a prompt that extends the cache by one token is
+/// read, rolling that token back would restore a snapshot from the decode before it, a state
+/// one token short. So the same prompt again restores the checkpoint saved before the shorter
+/// prompt's end, as llama.cpp's server does, and continues as it does from an empty cache.
+#[tokio::test]
+async fn a_recurrent_state_is_not_rolled_back_past_its_last_decode() {
+    let gguf = crate::mtp::qwen35_gguf().await;
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let template = dir.path().join("raw.jinja");
+    std::fs::write(&template, RAW_TEMPLATE).expect("the template is written");
+    let name = "qwen3.5-rollback";
+    let load = || async {
+        LlamaCpp::from(
+            std::slice::from_ref(&gguf),
+            LocalModelOptions {
+                chat_template_file: Some(&template),
+                reasoning: ReasoningDefault {
+                    model_name: name,
+                    effort: None,
+                },
+                ..LocalModelOptions::default()
+            },
+        )
+        .await
+        .expect("the model loads on llama.cpp")
+    };
+    // Rolled back by its last token instead, the repeat continues ' had a very long and very long
+    // tail', where an empty cache continues ' was born.'
+    let shorter = "Once upon a time, a dragon";
+    let longer = format!("{shorter} A");
+
+    let model = load().await;
+    let mut reused = Vec::new();
+    let (_, shorter_tokens) = continue_text(&model, name, shorter, 1).await;
+    reused.push(model.reused_prompt_tokens());
+    let (_, longer_tokens) = continue_text(&model, name, &longer, 1).await;
+    reused.push(model.reused_prompt_tokens());
+    assert_eq!(
+        longer_tokens,
+        shorter_tokens + 1,
+        "the longer prompt extends the shorter by one token"
+    );
+    let (warm, _) = continue_text(&model, name, &longer, 24).await;
+    reused.push(model.reused_prompt_tokens());
+    drop(model);
+
+    let fresh = load().await;
+    let (cold, _) = continue_text(&fresh, name, &longer, 24).await;
+    assert_eq!(
+        fresh.reused_prompt_tokens(),
+        0,
+        "a freshly loaded model reuses nothing"
+    );
+    eprintln!(
+        "reused {reused:?} of {shorter_tokens}/{longer_tokens}; warm {warm:?}; cold {cold:?}"
+    );
+    assert_eq!(
+        warm, cold,
+        "the continuation from the cache is the one from an empty cache"
+    );
+    assert_eq!(
+        reused,
+        [0, shorter_tokens, shorter_tokens - CHECKPOINT_BEFORE_END],
+        "the longer prompt reads only its new token, then its repeat resumes from the checkpoint"
+    );
+}

@@ -1248,8 +1248,9 @@ impl PromptCache {
 
     /// Readies `target` to read `tokens`, and returns how many of them its cache already holds:
     /// the longest prefix they share with the cache, short of the last token, whose logits the
-    /// request samples from. A model that cannot truncate its cache that far restores its latest
-    /// checkpoint within that prefix, and otherwise the cache is emptied.
+    /// request samples from. A cache that cannot be cut back to any position is used as it
+    /// stands only when the prompt extends it; otherwise it restores its latest checkpoint within
+    /// that prefix, and failing that, the cache is emptied.
     fn reuse<'m>(&mut self, target: &mut impl Target<'m>, tokens: &[Token]) -> usize {
         let cached = std::mem::take(&mut self.tokens);
         let common = cached
@@ -1262,7 +1263,12 @@ impl PromptCache {
         if let Some(checkpoints) = &mut self.checkpoints {
             checkpoints.truncate(shared);
         }
-        let reused = if shared > 0 && truncate_to(target, shared) {
+        // A recurrent state is never rolled back to a prompt prefix, as llama.cpp's server never
+        // rolls one back: its rollback snapshots serve rejected drafts, and a decode refreshes only
+        // as many of them as it has tokens, so after a shorter decode a rollback can restore a
+        // snapshot that predates it.
+        let truncates = self.checkpoints.is_none() || shared == cached.len();
+        let reused = if shared > 0 && truncates && truncate_to(target, shared) {
             shared
         } else if let Some(at) = self
             .checkpoints
