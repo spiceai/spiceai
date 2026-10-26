@@ -41,7 +41,7 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use datafusion::error::Result;
 use datafusion::execution::{FunctionRegistry, SessionState};
-use datafusion::logical_expr::AggregateUDF;
+use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
 
 use crate::checked_arithmetic::op::{checked_add_udf, checked_mul_udf, checked_sub_udf};
 
@@ -52,14 +52,34 @@ use crate::checked_arithmetic::op::{checked_add_udf, checked_mul_udf, checked_su
 ///
 /// Returns an error when a function cannot be registered on `state`.
 pub fn register_checked_arithmetic(state: &mut SessionState) -> Result<()> {
-    for udf in [checked_add_udf(), checked_sub_udf(), checked_mul_udf()] {
-        state.register_udf(Arc::clone(&udf))?;
+    for udf in checked_scalar_udfs() {
+        state.register_udf(udf)?;
     }
     replace_sum(state)
 }
 
+/// The scalar kernels the analyzer rewrites integer `+` / `-` / `*` into.
+///
+/// A registry that is not a [`SessionState`] (a cluster executor decodes task
+/// plans against its own) must hold these and [`checked_sum_udaf`] too, or a
+/// plan built on the scheduler decodes to different functions.
+#[must_use]
+pub fn checked_scalar_udfs() -> [Arc<ScalarUDF>; 3] {
+    [checked_add_udf(), checked_sub_udf(), checked_mul_udf()]
+}
+
+/// Checked integer `SUM`, registered under the built-in name `sum`.
+///
+/// Its partial state is `Decimal128(38, 0)` for integer input. A registry that
+/// resolves `sum` to the built-in instead produces `Int64` state, which no
+/// longer matches the schema the plan was serialized with.
+#[must_use]
+pub fn checked_sum_udaf() -> Arc<AggregateUDF> {
+    Arc::new(AggregateUDF::from(CheckedSum::new()))
+}
+
 fn replace_sum(state: &mut SessionState) -> Result<()> {
-    let udaf = Arc::new(AggregateUDF::from(CheckedSum::new()));
+    let udaf = checked_sum_udaf();
     if state.register_udaf(Arc::clone(&udaf)).is_ok() {
         return Ok(());
     }
