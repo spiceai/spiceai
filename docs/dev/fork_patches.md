@@ -105,10 +105,10 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `3af703dba0accdff5fdb0ae92ef12588e1dfe88a` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `b10ae96a0ad1c16a6d138d7aaa491b6ddbc12a91` | `spiceai-54` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `1c48bcf6c76e716fcf109f0c33ee3b64d58e9b9f` | `spiceai-54-release-2.3` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `76655d2ffc1b1e4dfc886de561759b70ead48b96` | `spiceai-1.4.4` |
+| [duckdb-rs](#duckdb-rs) | `320c6d1b974352aebc814f26b1dcddcc61f1629a` | `spiceai-1.4.4-release-2.3` |
 | [graph-rs-sdk](#graph-rs-sdk) | `af383410a9c86915263fbd1145b8becfc1e317b5` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `351d1bc7b6ac9a835397e248e9c687f305e947d1` | `spiceai-0.10.1-df-54` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
@@ -359,6 +359,7 @@ Upstream [duckdb/duckdb-rs](https://github.com/duckdb/duckdb-rs), branch
 | VSS (HNSW) extension statically linked (fork PR #37) | Vector search over a DuckDB accelerator fails, or silently falls back to a full scan | silent (query failure) | `crates/accelerators/accelerator-duckdb/src/lib.rs::bundled_duckdb_builds_an_hnsw_index_without_installing_vss` |
 | Bundled DuckDB version pinned to the release (fork PR #38) | Extension downloads resolve against a mismatched DuckDB version and fail | silent | covered by the two extension guards above |
 | Thrift `TEnumIterator::operator==` backport for macOS 27 (fork PR #47; upstream [duckdb/duckdb@fccde6aa](https://github.com/duckdb/duckdb/commit/fccde6aa1932f48dfa6282a916ea2477b57aa44d)) | Bundled DuckDB with Parquet fails to compile against the macOS 27 SDK: newer libc++ builds the Thrift enum maps with `iterator == end`, and the vendored Thrift header defined only `operator!=` | build (macOS 27) | **GAP** — the fork's own `crates/libduckdb-sys/tests/test_bundled_thrift.py` asserts it inside the fork and does not survive a re-cut of this pin |
+| Brotli decoder rejects an invalid block switch with `BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH` instead of decoding on with stale block-type state (fork PR #54; upstream [duckdb/duckdb#27791](https://github.com/duckdb/duckdb/pull/27791), a port of [google/brotli@0ed4268a](https://github.com/google/brotli/commit/0ed4268a4401abcb4472096340477cf4af7d1a2b)) | A malformed Brotli-compressed page in a Parquet file that DuckDB reads can write out of bounds in the decoder (CVE-2026-111497) | silent (memory corruption) | **GAP** — see [Open gaps](#open-gaps) |
 
 ## iceberg-rust
 
@@ -538,7 +539,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**38 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**39 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -626,3 +627,9 @@ without becoming a flaky timing test:
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
     cheap one exists); `async-openai` retry-after handling.
+
+**Security.** A lost patch here reopens a known vulnerability without a build or test failure:
+
+28. `duckdb-rs` Brotli decoder fix for CVE-2026-111497 (fork PR #54) — a malformed
+    Brotli page in a Parquet file that DuckDB reads can corrupt memory. A re-cut that
+    drops it still builds and decodes valid Brotli.
