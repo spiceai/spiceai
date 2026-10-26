@@ -1291,6 +1291,10 @@ impl DataFusionBuilder {
                 panic!("Unable to register Spark window function `{name}`: {e}");
             }
         }
+        super::output_reservation::reserve_argument_sized_outputs(
+            &mut state,
+            &query_runtime_env.memory_pool,
+        );
 
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
