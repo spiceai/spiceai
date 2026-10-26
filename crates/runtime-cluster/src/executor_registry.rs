@@ -46,6 +46,7 @@ use tokio::time::Instant;
 
 use crate::cluster_state::now_ms;
 use crate::correlated::{CorrelatedResponses, CorrelationError, send_correlated};
+use crate::executor_liveness::ExecutorLiveness;
 use crate::executor_processes::{Admission, ExecutorProcessOrder};
 use crate::metadata::{PartitionKey, normalized_table_name, partition_key};
 use crate::{PartitionStore, PartitionValue, executor_selection, metrics};
@@ -219,6 +220,11 @@ pub struct Registered {
     /// [`ExecutorRegistry::unregister`].
     pub connection: u64,
 }
+
+/// How recently another scheduler must have published its connected executors
+/// for them to count as connected when deciding whether to remove an
+/// executor's process history. Generous, as a stale view only keeps history.
+const LIVENESS_FRESHNESS: std::time::Duration = std::time::Duration::from_mins(10);
 
 /// Replaced processes remembered per executor id, so a replaced process that is
 /// still running is recognized when it connects again.
@@ -757,15 +763,33 @@ impl ExecutorRegistry {
         {
             return None;
         }
-        let connected: HashSet<String> = self.connections.read().await.keys().cloned().collect();
+        let now_ms = now_ms().unwrap_or_default();
+        // An executor's history is removed only when no scheduler has it
+        // connected; when the other schedulers' views cannot be read, none is.
+        let mut connected: HashSet<String> =
+            self.connections.read().await.keys().cloned().collect();
+        let others_known = match ExecutorLiveness::new(
+            self.accelerations_partition_store.cluster_state(),
+        )
+        .live_executors(now_ms, LIVENESS_FRESHNESS)
+        .await
+        {
+            Ok(live) => {
+                connected.extend(live);
+                true
+            }
+            Err(err) => {
+                tracing::debug!(
+                    "Failed to read the executors other schedulers have connected, so no executor's process history is removed: {err}"
+                );
+                false
+            }
+        };
         match self
             .process_order
-            .admit(
-                executor_id,
-                process_id,
-                now_ms().unwrap_or_default(),
-                |id| connected.contains(id),
-            )
+            .admit(executor_id, process_id, now_ms, |id| {
+                !others_known || connected.contains(id)
+            })
             .await
         {
             Ok(admission) => Some(admission),
@@ -2145,6 +2169,39 @@ mod tests {
             later_scheduler.ready_executor_addresses_sync(),
             ["127.0.0.1:50101"]
         );
+    }
+
+    /// A scheduler that has an executor connected to none of its own streams
+    /// keeps that executor's process history while another scheduler has it
+    /// connected, so a replaced process connecting later is still a duplicate.
+    #[tokio::test]
+    async fn history_of_an_executor_another_scheduler_has_connected_is_kept() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cluster = ClusterStateStore::new(Arc::clone(&store), "");
+        let now = now_ms().expect("clock");
+        let day_ago = now - 25 * 3_600_000;
+        let order = ExecutorProcessOrder::new(&cluster);
+        for run in ["run-0", "run-1"] {
+            order
+                .admit("exec-a", run, day_ago, |_| true)
+                .await
+                .expect("admit");
+        }
+        ExecutorLiveness::new(&cluster)
+            .publish("sched-b", vec!["exec-a".to_string()], now)
+            .await
+            .expect("publish");
+
+        let new_scheduler = registry_over(&store).await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        new_scheduler
+            .register("exec-b".to_string(), "run-0", tx1)
+            .await;
+        let replaced = new_scheduler
+            .register("exec-a".to_string(), "run-0", tx2)
+            .await;
+        assert_eq!(replaced.registration, ExecutorRegistration::Duplicate);
     }
 
     /// A process that replaces an executor is a restart even when its id sorts
