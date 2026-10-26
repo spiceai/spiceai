@@ -28,6 +28,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::util::column_reference::ColumnReference;
+use datafusion_table_providers::util::constraints::{UpsertOptions, validate_batch_with_constraints};
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::stream;
 use std::collections::{HashMap, HashSet};
@@ -102,6 +103,10 @@ pub struct MemTable {
 
     pub on_conflict: Option<OnConflict>,
 
+    /// How an [`OnConflict::Upsert`] resolves primary key duplicates within one write
+    /// (`upsert_dedup` / `upsert_dedup_by_row_id`).
+    upsert_options: UpsertOptions,
+
     /// Optional columns to sort by during insert operations.
     /// When specified, data is sorted before being written to improve
     /// zone map efficiency for range queries.
@@ -139,6 +144,7 @@ impl MemTable {
             column_defaults: HashMap::new(),
             sort_order: Arc::new(Mutex::new(vec![])),
             on_conflict: None,
+            upsert_options: UpsertOptions::default(),
             sort_columns: Vec::new(),
         })
     }
@@ -151,14 +157,25 @@ impl MemTable {
 
     #[must_use]
     pub fn with_on_conflict(mut self, on_conflict: OnConflict) -> Self {
-        if !matches!(on_conflict, OnConflict::Upsert(_)) {
+        if !matches!(on_conflict, OnConflict::Upsert(_) | OnConflict::DoNothing(_)) {
             tracing::warn!(
-                "In-memory tables only support Upsert on_conflict, but got: {on_conflict:?}. Setting will be ignored."
+                "In-memory tables only support on_conflict upsert or drop on the primary key, but got: {on_conflict:?}. Setting will be ignored."
             );
             return self;
         }
 
         self.on_conflict = Some(on_conflict);
+        self
+    }
+
+    /// Sets how an [`OnConflict::Upsert`] resolves rows that share a primary key within one write.
+    ///
+    /// * `remove_duplicates` (`upsert_dedup`): exact duplicate rows collapse to one; rows that share
+    ///   a primary key but differ elsewhere are still an error.
+    /// * `last_write_wins` (`upsert_dedup_by_row_id`): the last row for each primary key wins.
+    #[must_use]
+    pub fn with_upsert_options(mut self, upsert_options: UpsertOptions) -> Self {
+        self.upsert_options = upsert_options;
         self
     }
 
@@ -320,7 +337,10 @@ impl TableProvider for MemTable {
 
         // In-memory tables only support primary keys constraints. Support for `OnConflict` is limited to `Upsert` matching the primary key.
         // So we verify that the `on_conflict` and  the primary key matches
-        if let (Some(OnConflict::Upsert(on_conflict)), Some(pk)) = (&self.on_conflict, &primary_key)
+        if let (
+            Some(OnConflict::Upsert(on_conflict) | OnConflict::DoNothing(on_conflict)),
+            Some(pk),
+        ) = (&self.on_conflict, &primary_key)
         {
             self.verify_on_conflict_matches_primary_key(pk, on_conflict)?;
         }
@@ -331,6 +351,7 @@ impl TableProvider for MemTable {
             primary_key,
             self.schema(),
             self.on_conflict.clone(),
+            self.upsert_options.clone(),
             self.sort_columns.clone(),
         ));
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
@@ -605,6 +626,7 @@ struct MemSink {
     primary_key: Option<Vec<usize>>,
     schema: SchemaRef,
     on_conflict: Option<OnConflict>,
+    upsert_options: UpsertOptions,
 
     /// Optional columns to sort by before writing
     sort_columns: Vec<String>,
@@ -638,6 +660,7 @@ impl MemSink {
         primary_key: Option<Vec<usize>>,
         schema: SchemaRef,
         on_conflict: Option<OnConflict>,
+        upsert_options: UpsertOptions,
         sort_columns: Vec<String>,
     ) -> Self {
         Self {
@@ -650,9 +673,104 @@ impl MemSink {
             }),
             schema,
             on_conflict,
+            upsert_options,
             sort_columns,
         }
     }
+
+    /// Resolves primary key duplicates within one write as the configured `on_conflict` asks,
+    /// so the uniqueness check that follows only fails when the duplicates were not resolvable.
+    ///
+    /// `batches` must be in arrival order: `drop` keeps the first row per key and
+    /// `upsert_dedup_by_row_id` keeps the last.
+    async fn resolve_duplicates_in_write(
+        &self,
+        batches: Vec<RecordBatch>,
+        pks: &[usize],
+    ) -> Result<Vec<RecordBatch>> {
+        let resolves_duplicates = match &self.on_conflict {
+            Some(OnConflict::DoNothing(_)) => true,
+            Some(OnConflict::Upsert(_)) => {
+                self.upsert_options.remove_duplicates || self.upsert_options.last_write_wins
+            }
+            _ => false,
+        };
+        if !resolves_duplicates || matches!(self.overwrite, InsertOp::Replace) {
+            return Ok(batches);
+        }
+
+        // Common case: no duplicates, nothing to resolve.
+        let batch_refs: Vec<_> = batches.iter().collect();
+        let keys = primary_key_identifier(&batch_refs, pks)?;
+        let mut seen: HashSet<&str, std::hash::BuildHasherDefault<PrimaryKeyHasher>> =
+            HashSet::with_capacity_and_hasher(keys.len(), Default::default());
+        let has_duplicates = keys
+            .iter()
+            .flatten()
+            .any(|key| !seen.insert(key.as_str()));
+        if !has_duplicates {
+            return Ok(batches);
+        }
+
+        if matches!(self.on_conflict, Some(OnConflict::DoNothing(_))) {
+            return keep_first_per_key(&batches, &keys);
+        }
+
+        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(pks.to_vec())]);
+        validate_batch_with_constraints(batches, &constraints, &self.upsert_options)
+            .await
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?
+            .into_iter()
+            .map(|batch| {
+                arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&self.schema))
+                    .map_err(DataFusionError::from)
+            })
+            .collect()
+    }
+}
+
+/// Keeps the first row for each primary key in `batches` (in order). `keys` holds one key per
+/// row across `batches`; rows with a null key are kept so the null check can reject them.
+fn keep_first_per_key(batches: &[RecordBatch], keys: &[Option<String>]) -> Result<Vec<RecordBatch>> {
+    let mut seen: HashSet<&str, std::hash::BuildHasherDefault<PrimaryKeyHasher>> =
+        HashSet::with_capacity_and_hasher(keys.len(), Default::default());
+    let mut keys = keys.iter();
+    let mut kept = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let mask: BooleanArray = (&mut keys)
+            .take(batch.num_rows())
+            .map(|key| Some(key.as_deref().is_none_or(|key| seen.insert(key))))
+            .collect();
+        let filtered = filter_record_batch(batch, &mask)?;
+        if filtered.num_rows() > 0 {
+            kept.push(filtered);
+        }
+    }
+    Ok(kept)
+}
+
+/// Drops the rows of `batches` whose primary key is in `existing_keys` (`on_conflict: drop`
+/// keeps the stored row).
+fn drop_existing_keys<S: std::hash::BuildHasher>(
+    batches: Vec<RecordBatch>,
+    pks: &[usize],
+    existing_keys: &HashSet<String, S>,
+) -> Result<Vec<RecordBatch>> {
+    if existing_keys.is_empty() {
+        return Ok(batches);
+    }
+    let mut kept = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let mask: BooleanArray = extract_primary_keys_str(&batch, pks)?
+            .into_iter()
+            .map(|key| Some(key.is_none_or(|key| !existing_keys.contains(&key))))
+            .collect();
+        let filtered = filter_record_batch(&batch, &mask)?;
+        if filtered.num_rows() > 0 {
+            kept.push(filtered);
+        }
+    }
+    Ok(kept)
 }
 
 /// Check that all primary key ids are non-null and unique.
@@ -1323,10 +1441,8 @@ impl DataSink for MemSink {
     ) -> Result<u64> {
         let num_partitions = self.batches.len();
 
-        // Collect data into partitions (round-robin distribution)
-        let mut new_batches = vec![vec![]; num_partitions];
-        let mut i = 0;
-        let mut row_count = 0;
+        // Collect data in arrival order; duplicate resolution below depends on it.
+        let mut arrived = vec![];
         let mut data = data;
         while let Some(batch) = data
             .next()
@@ -1336,9 +1452,35 @@ impl DataSink for MemSink {
         {
             let batch = arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&self.schema))
                 .map_err(DataFusionError::from)?;
+            arrived.push(batch);
+        }
+
+        if let Some(ref pks) = self.primary_key {
+            arrived = self.resolve_duplicates_in_write(arrived, pks).await?;
+        }
+
+        let mut writable_targets: Vec<_> =
+            futures::future::join_all(self.batches.iter().map(|target| target.write())).await;
+
+        // `on_conflict: drop` keeps the stored row, so drop incoming rows whose key already exists.
+        if let (InsertOp::Append, Some(OnConflict::DoNothing(_)), Some(pks)) =
+            (self.overwrite, &self.on_conflict, &self.primary_key)
+        {
+            let existing: Vec<_> = writable_targets.iter().flat_map(|t| t.iter()).collect();
+            let existing_keys: HashSet<String, std::hash::BuildHasherDefault<PrimaryKeyHasher>> =
+                primary_key_identifier(&existing, pks)?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            arrived = drop_existing_keys(arrived, pks, &existing_keys)?;
+        }
+
+        // Distribute data into partitions (round-robin)
+        let mut new_batches = vec![vec![]; num_partitions];
+        let mut row_count = 0;
+        for (i, batch) in arrived.into_iter().enumerate() {
             row_count += batch.num_rows();
-            new_batches[i].push(batch);
-            i = (i + 1) % num_partitions;
+            new_batches[i % num_partitions].push(batch);
         }
 
         // Ensure new data has no primary key conflicts internally, and generate primary key ids for later comparison to existing partition data.
@@ -1375,9 +1517,6 @@ impl DataSink for MemSink {
             }
         }
 
-        let mut writable_targets: Vec<_> =
-            futures::future::join_all(self.batches.iter().map(|target| target.write())).await;
-
         for (target, mut batches) in writable_targets.iter_mut().zip(new_batches) {
             // Depending on [`InsertOp`], we may need to mutate the existing `target` before adding new data.
             match self.overwrite {
@@ -1389,8 +1528,10 @@ impl DataSink for MemSink {
                         //
                         // Once the colliding rows are gone nothing left can conflict, so only a
                         // plain append checks the existing keys against the new ones.
-                        if self.on_conflict.is_some() {
+                        if matches!(self.on_conflict, Some(OnConflict::Upsert(_))) {
                             filter_existing(&mut *target, &new_key_set, pks)?;
+                        } else if matches!(self.on_conflict, Some(OnConflict::DoNothing(_))) {
+                            // Incoming rows with existing keys were already dropped above.
                         } else {
                             for rb in &**target {
                                 ensure_primary_keys_absent(rb, pks, &new_key_set)?;
@@ -1954,6 +2095,170 @@ mod tests {
             )])),
             "the accepted unique constraint must be applied to the table"
         );
+    }
+
+    /// A two-partition `(id, v)` table with primary key `id` and the given `on_conflict`.
+    fn on_conflict_table(
+        on_conflict: &str,
+        upsert_options: datafusion_table_providers::util::constraints::UpsertOptions,
+    ) -> MemTable {
+        let (_, schema) = create_batch_with_string_columns(&[("id", vec![]), ("v", vec![])]);
+        let mut table = MemTable::try_new(schema, vec![vec![], vec![]])
+            .expect("mem table should be created");
+        table.constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+        table
+            .with_on_conflict(OnConflict::try_from(on_conflict).expect("valid on_conflict"))
+            .with_upsert_options(upsert_options)
+    }
+
+    /// Writes each `rows` slice as one incoming batch, in order.
+    async fn write_batches(
+        table: &MemTable,
+        op: datafusion::logical_expr::dml::InsertOp,
+        batches: &[&[(&str, &str)]],
+    ) -> Result<(), DataFusionError> {
+        let ctx = SessionContext::new();
+        let schema = table.schema();
+        let batches = batches
+            .iter()
+            .map(|rows| {
+                let (rb, _) = create_batch_with_string_columns(&[
+                    ("id", rows.iter().map(|(id, _)| *id).collect()),
+                    ("v", rows.iter().map(|(_, v)| *v).collect()),
+                ]);
+                Ok(rb)
+            })
+            .collect();
+        let exec = Arc::new(MockExec::new(batches, schema));
+        let insertion = table.insert_into(&ctx.state(), exec, op).await?;
+        collect(insertion, ctx.task_ctx()).await.map(|_| ())
+    }
+
+    async fn sorted_rows(table: &MemTable) -> Vec<(String, String)> {
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan");
+        let mut rows = vec![];
+        for rb in collect(plan, ctx.task_ctx()).await.expect("scan") {
+            let id = rb.column(0).as_any().downcast_ref::<StringArray>().expect("id");
+            let v = rb.column(1).as_any().downcast_ref::<StringArray>().expect("v");
+            for i in 0..rb.num_rows() {
+                rows.push((id.value(i).to_string(), v.value(i).to_string()));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    fn rows(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected
+            .iter()
+            .map(|(id, v)| ((*id).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn upsert_dedup_collapses_exact_duplicates_within_a_write() {
+        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion_table_providers::util::constraints::UpsertOptions;
+        let table = on_conflict_table(
+            "upsert:id",
+            UpsertOptions::default().with_remove_duplicates(true),
+        );
+        write_batches(
+            &table,
+            InsertOp::Overwrite,
+            &[&[("1", "a"), ("2", "b")], &[("1", "a")]],
+        )
+        .await
+        .expect("exact duplicates are collapsed, not rejected");
+        assert_eq!(sorted_rows(&table).await, rows(&[("1", "a"), ("2", "b")]));
+
+        // Appending exact duplicates of a new value upserts the stored row once.
+        write_batches(&table, InsertOp::Append, &[&[("1", "n")], &[("1", "n")]])
+            .await
+            .expect("exact duplicates are collapsed on append");
+        assert_eq!(sorted_rows(&table).await, rows(&[("1", "n"), ("2", "b")]));
+    }
+
+    #[tokio::test]
+    async fn upsert_dedup_rejects_rows_that_share_a_key_but_differ() {
+        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion_table_providers::util::constraints::UpsertOptions;
+        let table = on_conflict_table(
+            "upsert:id",
+            UpsertOptions::default().with_remove_duplicates(true),
+        );
+        let err = write_batches(
+            &table,
+            InsertOp::Overwrite,
+            &[&[("1", "x"), ("2", "b")], &[("1", "z")]],
+        )
+        .await
+        .expect_err("non-identical duplicates cannot be collapsed");
+        assert!(
+            err.to_string().contains("violates uniqueness"),
+            "expected a uniqueness error, got: {err}"
+        );
+        assert!(sorted_rows(&table).await.is_empty(), "nothing is written");
+    }
+
+    #[tokio::test]
+    async fn upsert_dedup_by_row_id_keeps_the_last_row_per_key() {
+        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion_table_providers::util::constraints::UpsertOptions;
+        let table = on_conflict_table(
+            "upsert:id",
+            UpsertOptions::default()
+                .with_remove_duplicates(true)
+                .with_last_write_wins(true),
+        );
+        // Three batches across two partitions: the last `1` arrives in the third batch.
+        write_batches(
+            &table,
+            InsertOp::Overwrite,
+            &[&[("1", "x"), ("2", "b")], &[("1", "y")], &[("1", "z")]],
+        )
+        .await
+        .expect("the last row per key wins");
+        assert_eq!(sorted_rows(&table).await, rows(&[("1", "z"), ("2", "b")]));
+    }
+
+    #[tokio::test]
+    async fn drop_keeps_the_first_row_per_key() {
+        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion_table_providers::util::constraints::UpsertOptions;
+        let table = on_conflict_table("drop:id", UpsertOptions::default());
+        write_batches(
+            &table,
+            InsertOp::Overwrite,
+            &[&[("1", "x"), ("2", "b")], &[("1", "y")], &[("1", "z")]],
+        )
+        .await
+        .expect("later duplicates are dropped");
+        assert_eq!(sorted_rows(&table).await, rows(&[("1", "x"), ("2", "b")]));
+
+        // On append the stored row wins over an incoming row with the same key.
+        write_batches(&table, InsertOp::Append, &[&[("2", "q"), ("3", "c")]])
+            .await
+            .expect("incoming rows with an existing key are dropped");
+        assert_eq!(
+            sorted_rows(&table).await,
+            rows(&[("1", "x"), ("2", "b"), ("3", "c")])
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_upsert_still_rejects_duplicates_within_a_write() {
+        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion_table_providers::util::constraints::UpsertOptions;
+        let table = on_conflict_table("upsert:id", UpsertOptions::default());
+        let err = write_batches(&table, InsertOp::Overwrite, &[&[("1", "a")], &[("1", "a")]])
+            .await
+            .expect_err("plain upsert keeps rejecting duplicates within a write");
+        assert_eq!(err.strip_backtrace(), "Execution error: Primary key values must be unique");
     }
 
     #[tokio::test]
