@@ -1,0 +1,46 @@
+name: cluster-shuffle
+description: >
+  A scheduler and three executors, each executor in a container of its own,
+  answer multi-stage `/v1/queries` jobs over Parquet in an object store as
+  Flight and the source do: a stage that reads another executor's shuffle
+  output fetches it over node mTLS.
+
+sources:
+  lake: { kind: rustfs }
+  pg: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-shuffle
+  datasets:
+    - from: s3://${sources.lake.bucket}/orders/
+      name: orders
+      params: { $merge: '${sources.lake.params}', file_format: parquet }
+
+defaults:
+  cluster: { executors: 3, containers: true }
+  also-async: true
+  expect: { oracle: pg }
+
+steps:
+  - generate:
+      lake:
+        table: orders
+        rows: 200000
+        seed: 11
+        files: 12
+        columns:
+          - { name: o_id, sequence: 1 }
+          - { name: cust, int: [1, 5000] }
+          - { name: status, choice: [O, F, P] }
+          - { name: total, decimal: { range: [0, 10000], scale: 2 } }
+    mirror: pg
+  - start: {}
+  - query: SELECT status, count(*) AS n, sum(total) AS total FROM orders GROUP BY status
+  - query: SELECT cust, count(*) AS n FROM orders GROUP BY cust ORDER BY n DESC, cust LIMIT 20
+  - query: |
+      SELECT o.status, count(*) AS n
+      FROM orders o
+      JOIN (SELECT cust FROM orders GROUP BY cust HAVING count(*) > 45) c ON o.cust = c.cust
+      GROUP BY o.status

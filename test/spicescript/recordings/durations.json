@@ -15,6 +15,7 @@
   "cluster-executors": 71,
   "cluster-scheduler-failover-empty": 98,
   "cluster-scheduler-restart": 93,
+  "cluster-shuffle": 33,
   "config-errors": 3,
   "conflict-batches": 17,
   "connector-errors": 44,
