@@ -1797,7 +1797,10 @@
       "properties": {
         "state_location": {
           "description": "Deprecated: set `runtime.state.location`, which keeps cluster state in its\n`cluster/` folder. Root URI for shared cluster state (see\n[`Runtime::scheduler_state`]).",
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "deprecated": true
         },
         "params": {
@@ -3187,7 +3190,7 @@
           "default": "auto"
         },
         "engine": {
-          "description": "The acceleration engine. Defaults to `cayenne`, or to `arrow` on Windows, where\nCayenne is not available.",
+          "description": "The acceleration engine. Defaults to `cayenne`, or to `arrow` on Windows, where\nCayenne is not available.\n\nEvery engine other than `cayenne` (`arrow`, `duckdb`, `sqlite`, `turso`, and\n`postgres`) is deprecated in v2.4 and will be removed in v2.5; a Spicepod that uses\none logs a warning at startup and on hot reload. Set `engine: cayenne`, or leave\n`engine` unset, then delete the old engine's acceleration files and snapshots. On\nWindows, run Spice in Docker or WSL to use Cayenne. See\n<https://spiceai.org/docs/components/data-accelerators/cayenne/migration>.",
           "type": [
             "string",
             "null"
@@ -4013,6 +4016,7 @@
           "default": true
         },
         "engine": {
+          "description": "The vector engine: `s3_vectors`, `elasticsearch`, or `duckdb`. The `duckdb` engine\nis deprecated in v2.4 and will be removed in v2.5; on a Cayenne acceleration, remove\nthe `vectors` block instead, since Cayenne indexes embedding columns itself. See\n<https://spiceai.org/docs/components/data-accelerators/cayenne/migration#migrating-the-duckdb-vector-engine>.",
           "type": [
             "string",
             "null"
@@ -8012,7 +8016,7 @@
       "type": "object",
       "properties": {
         "iceberg_metadata_path": {
-          "description": "The Iceberg metadata file to read the table from, as a path relative to the table root in `from` (for example, `/metadata/00003-8f2c.metadata.json`) or as a full URL. When set, the table is read from exactly this file, without a catalog. A version hint file (`/metadata/version-hint.text`) is read on every query instead, and names the metadata file to read.",
+          "description": "The Iceberg metadata file to read the table from, as a path relative to the table root in `from` (for example, `/metadata/00003-8f2c.metadata.json`) or as a full URL. When set, the table is read from exactly this file, without a catalog. A version hint file (`/metadata/version-hint.text`) is read on every query instead: it names the metadata file to read, or a version number from which the newest consecutive `v<N>.metadata.json` is read.",
           "type": "string"
         },
         "metadata_path": {
