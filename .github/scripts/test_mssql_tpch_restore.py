@@ -155,6 +155,18 @@ class MssqlTpchRestoreTest(unittest.TestCase):
         self.assertIn("::error::SQL Server did not accept connections within 1s.", proc.stdout)
         self.assertEqual(self.restores(calls), [])
 
+    def test_every_query_is_time_bounded(self):
+        proc, calls = self.run_restore(LOGIN_TIMEOUT, ["DOWN", "ONLINE"], MSSQL_RESTORE_TIMEOUT_SECONDS="120")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        execs = [c.split(" SQLCMDPASSWORD=")[0].split() for c in calls if c.startswith("exec")]
+        self.assertTrue(execs)
+        for args in execs:
+            self.assertIn("-t", args)
+            self.assertGreaterEqual(int(args[args.index("-t") + 1]), 1)
+        restore = next(a for a in execs if "RESTORE" in a)
+        # The restore gets what is left of the deadline, not an unbounded wait.
+        self.assertLessEqual(int(restore[restore.index("-t") + 1]), 120)
+
     def test_password_is_never_on_the_command_line(self):
         _, calls = self.run_restore(LOGIN_TIMEOUT, ["", "ONLINE"])
         self.assertTrue(calls)

@@ -12,8 +12,8 @@
 #
 # Usage: bash .github/scripts/mssql_tpch_restore.sh CONTAINER_ID DB_NAME
 # MSSQL_SA_PASSWORD is the sa password. MSSQL_RESTORE_TIMEOUT_SECONDS (default
-# 600) bounds the whole wait, and MSSQL_RESTORE_POLL_SECONDS (default 5) the pause
-# between checks.
+# 600) bounds the whole wait, and the restore's query timeout is what is left of
+# it. MSSQL_RESTORE_POLL_SECONDS (default 5) is the pause between checks.
 set -euo pipefail
 
 if [ "$#" -ne 2 ] || [ -z "$1" ] || [ -z "$2" ]; then
@@ -43,17 +43,26 @@ if ! [[ "$poll" =~ ^[0-9]+$ ]]; then
 fi
 deadline=$((SECONDS + timeout))
 
+# Runs one query with a query timeout of $1 seconds; `-l` bounds only the login.
 # The password travels in the environment, not on the command line.
 sqlcmd() {
+  local query_timeout="$1"
+  shift
   SQLCMDPASSWORD="$MSSQL_SA_PASSWORD" docker exec -e SQLCMDPASSWORD "$container" \
-    /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -l 5 -b -h -1 -W -d master "$@"
+    /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -l 5 -t "$query_timeout" -b -h -1 -W -d master "$@"
+}
+
+# Seconds left before the deadline, at least 1.
+remaining() {
+  local left=$((deadline - SECONDS))
+  echo $((left > 1 ? left : 1))
 }
 
 # Prints ONLINE, RESTORING, ... or nothing when the database does not exist or
 # SQL Server is not accepting connections yet.
 db_state() {
   local out
-  out="$(sqlcmd -Q "SET NOCOUNT ON; SELECT state_desc FROM sys.databases WHERE name = N'$db';" 2>/dev/null)" || return 0
+  out="$(sqlcmd 30 -Q "SET NOCOUNT ON; SELECT state_desc FROM sys.databases WHERE name = N'$db';" 2>/dev/null)" || return 0
   printf '%s' "$out" | tr -d '[:space:]'
 }
 
@@ -85,13 +94,13 @@ while :; do
 done
 
 echo "::warning::The image's restore of $db failed, most likely because SQL Server was not yet accepting connections when it ran. Restoring /data/$db.bak here."
-until sqlcmd -Q 'SELECT 1' >/dev/null 2>&1; do
+until sqlcmd 30 -Q 'SELECT 1' >/dev/null 2>&1; do
   if ((SECONDS >= deadline)); then
     give_up "SQL Server did not accept connections within ${timeout}s."
   fi
   sleep "$poll"
 done
-if ! sqlcmd -Q "RESTORE DATABASE [$db] FROM DISK = N'/data/$db.bak' WITH REPLACE"; then
+if ! sqlcmd "$(remaining)" -Q "RESTORE DATABASE [$db] FROM DISK = N'/data/$db.bak' WITH REPLACE"; then
   give_up "RESTORE DATABASE $db from /data/$db.bak failed."
 fi
 state="$(db_state)"

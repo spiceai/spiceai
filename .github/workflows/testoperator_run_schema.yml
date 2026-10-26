@@ -255,6 +255,8 @@ jobs:
       # see .github/scripts/mssql_tpch_restore.sh.
       - name: Wait for the SQL Server TPC-H database
         if: ${{ contains(github.event.inputs.spicepod_path, 'mssql') }}
+        # The script gives up after ten minutes; this also bounds a hung docker call.
+        timeout-minutes: 15
         env:
           MSSQL_SA_PASSWORD: S3cretP@ssw0rd
         run: bash .github/scripts/mssql_tpch_restore.sh "${{ job.services.mssql_tpch.id }}" tpch_sf1
