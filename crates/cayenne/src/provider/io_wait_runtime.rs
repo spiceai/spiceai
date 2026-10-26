@@ -80,20 +80,34 @@ mod tests {
             VortexSession::default()
         };
         let (started, ready) = oneshot::channel();
+        let (release, remote_response) = oneshot::channel();
         let query = tokio::spawn(Arc::clone(&permit).run(async move {
             session
                 .handle()
                 .spawn_io(async move {
                     let _ = started.send(());
-                    tokio::time::sleep(Duration::from_millis(300))
+                    // The channel controls when a remote response would arrive.
+                    remote_response
                         .io_wait()
-                        .await;
+                        .await
+                        .expect("release the I/O wait");
                 })
                 .await;
         }));
         ready.await.expect("the Vortex I/O task should start");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        if carried {
+            let lent = tokio::time::timeout(Duration::from_secs(5), async {
+                while vcores.available_permits() == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(lent.is_ok(), "the Vortex I/O wait should lend the vcore");
+        } else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let free_while_pending = vcores.available_permits();
+        release.send(()).expect("finish the I/O wait");
         query.await.expect("the carried I/O task should complete");
         (
             free_while_pending,
