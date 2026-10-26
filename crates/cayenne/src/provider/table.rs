@@ -21360,6 +21360,16 @@ impl CayenneTableProvider {
         Ok(total_passes > 0)
     }
 
+    /// Hold this table's compaction lock until the returned guard drops, so no
+    /// compaction pass commits meanwhile. A post-write pass that comes due while
+    /// it is held declines without spending the trigger, which leaves the next
+    /// [`Self::maybe_compact_small_files`] to run it. Test-only; must be dropped
+    /// before any call that takes the lock.
+    #[doc(hidden)]
+    pub async fn hold_compaction(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.compaction_lock).write_owned().await
+    }
+
     fn new_current_files_above_compaction_threshold(&self) -> bool {
         let cfg = self.context.compaction_picker_config();
         // `>=` matches the two schedulers that decide whether a pass is worth
