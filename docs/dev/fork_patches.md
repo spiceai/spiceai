@@ -115,10 +115,10 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `803080a22cf019e6e489ebaa5a7814325a58f91e` | `ben/query-type-and-grouping-contracts` |
+| [datafusion](#datafusion) | `24acf5c55766d18c6de8531a16df5a37989f36bd` | `ben/query-type-and-grouping-contracts` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
-| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `a9644a7bcb27499f3c2d5baf298cd8bf25d32629` | `ben/preserve-computed-projection-names` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `0563877256f9ac0df761b60eb66d902b5d47b818` | `ben/result-column-identity-and-union-scope` |
+| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `3d648adf14e2f8303aae9434706a6d1cd1a7b3b6` | `ben/preserve-computed-projection-names` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `b9cee5ae00f0f2fc57a72949e44d19c268770a7f` | `ben/result-column-identity-and-union-scope` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |

@@ -44,3 +44,11 @@ steps:
   - explain: SELECT id FROM lengths WHERE char_length(s) > 1
     contains: [VirtualExecutionPlan, character_length]
     only: federated
+  - query: SELECT id, CASE WHEN id = 1 THEN 0 ELSE length(s) END AS n FROM lengths ORDER BY id
+    oracle-sql: SELECT id, CASE WHEN id = 1 THEN 0 ELSE CHAR_LENGTH(s) END AS n FROM lengths ORDER BY id
+  - query: SELECT id, CASE length(s) WHEN 0 THEN 'empty' WHEN 1 THEN 'one' ELSE 'other' END AS size FROM lengths ORDER BY id
+    oracle-sql: SELECT id, CASE CHAR_LENGTH(s) WHEN 0 THEN 'empty' WHEN 1 THEN 'one' ELSE 'other' END AS size FROM lengths ORDER BY id
+  - query: SELECT id, CASE WHEN id = 1 THEN 0 ELSE length(b) END AS n FROM lengths ORDER BY id
+    oracle-sql: SELECT id, CASE WHEN id = 1 THEN 0 ELSE LENGTH(b) END AS n FROM lengths ORDER BY id
+  - query: SELECT id, CASE WHEN length(s) > 1 THEN length(s) END AS n FROM lengths ORDER BY id
+    oracle-sql: SELECT id, CASE WHEN CHAR_LENGTH(s) > 1 THEN CHAR_LENGTH(s) END AS n FROM lengths ORDER BY id
