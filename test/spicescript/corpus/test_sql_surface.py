@@ -2,6 +2,9 @@
 # Licensed under the Apache License, Version 2.0: https://www.apache.org/licenses/LICENSE-2.0
 """Guards for SQL documentation shapes that caused missing or malformed cases."""
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -30,6 +33,39 @@ class DocumentationInventoryTest(unittest.TestCase):
 
     def test_escape_case_uses_the_escape_clause(self):
         self.assertIn(" ESCAPE ", sql_surface.OPERATORS["LIKE ESCAPE"])
+
+    def test_last_known_failure_removes_script_and_check_rejects_leftovers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            suite = root / "test/spicescript"
+            shutil.copytree(sql_surface.HERE.parent, suite)
+            (root / "crates").symlink_to(sql_surface.HERE.parents[2] / "crates",
+                                         target_is_directory=True)
+            corpus = suite / "corpus"
+            script = suite / "known-failing/sql-protocols/sql-surface.yaml"
+            stale_script = script.read_text() if script.exists() else "steps: []\n"
+            script.write_text(stale_script)
+            (corpus / "sql-surface-known-failures.json").write_text("{}\n")
+            command = [sys.executable, str(corpus / "sql_surface.py")]
+
+            def run(*args):
+                return subprocess.run(command + list(args), capture_output=True, text=True)
+
+            generated = run()
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            self.assertFalse(script.exists())
+            checked = run("--check")
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+
+            script.write_text(stale_script)
+            checked = run("--check")
+            self.assertNotEqual(checked.returncode, 0)
+            self.assertIn(f"{script}: stale;", checked.stderr)
+            self.assertEqual(script.read_text(), stale_script)
+
+            regenerated = run()
+            self.assertEqual(regenerated.returncode, 0, regenerated.stderr)
+            self.assertFalse(script.exists())
 
 
 if __name__ == "__main__":

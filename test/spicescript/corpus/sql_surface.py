@@ -658,6 +658,7 @@ def main():
     known_cases = [case for case in cases if case[0] in known]
     write_or_check(HERE / "sql-surface.sql", generated_sql(passing_cases), args.check)
     write_or_check(HERE / "sql-surface-known.sql", generated_sql(known_cases), args.check)
+    known_script = HERE.parent / "known-failing/sql-protocols/sql-surface.yaml"
     if known_cases:
         # Use the identical input data and runtime settings as the main suite.
         main_script = (HERE.parent / "query-protocols.yaml").read_text()
@@ -667,7 +668,11 @@ def main():
                        "description: >\n  Generated documented-SQL cases with reproduced errors or schema mismatches.\n  These cases remain executable until their tracked failures are resolved.\n",
                        setup, flags=re.S)
         setup += "  - corpus: ../../corpus/sql-surface-known.sql\n    protocols: [flightsql, http]\n    expect: {}\n"
-        write_or_check(HERE.parent / "known-failing/sql-protocols/sql-surface.yaml", setup, args.check)
+        write_or_check(known_script, setup, args.check)
+    elif known_script.exists():
+        if args.check:
+            raise SystemExit(f"{known_script}: stale; run python3 {HERE / 'sql_surface.py'}")
+        known_script.unlink()
     write_or_check(HERE.parent / "sql-explain-protocols.yaml", explain_fixture(), args.check)
     write_or_check(HERE.parent / "sql-operator-values.yaml", operator_value_fixture(), args.check)
     write_or_check(HERE.parent / "known-failing/sql-protocols/operator-values.yaml", operator_value_fixture(True), args.check)
