@@ -109,7 +109,7 @@ impl AnalyzerRule for ExactFloatLiteralDecimalCast {
 fn rewrite_expr(expr: Expr) -> Transformed<Expr> {
     if let Expr::Cast(Cast { expr: inner, field }) | Expr::TryCast(TryCast { expr: inner, field }) =
         &expr
-        && let Expr::Literal(value, metadata) = inner.as_ref()
+        && let Expr::Literal(value, metadata) = without_identity_float_cast(inner)
     {
         let data_type = field.data_type();
         let token_spelling = metadata
@@ -137,6 +137,27 @@ fn rewrite_expr(expr: Expr) -> Transformed<Expr> {
         }
         expr => Transformed::no(expr),
     }
+}
+
+/// `expr` with a cast of a float literal to its own type removed.
+///
+/// Such a cast leaves the value unchanged, so the literal under it still spells
+/// the decimal the outer cast is after. Flight SQL wraps each bound `$N` as
+/// `CAST($N AS DOUBLE)` to type the placeholder, and without this the bound
+/// float would take the binary cast that the bare `$1` of HTTP and SQL does not.
+fn without_identity_float_cast(expr: &Expr) -> &Expr {
+    if let Expr::Cast(Cast { expr: inner, field }) | Expr::TryCast(TryCast { expr: inner, field }) =
+        expr
+        && matches!(
+            field.data_type(),
+            DataType::Float16 | DataType::Float32 | DataType::Float64
+        )
+        && let Expr::Literal(value, _) = inner.as_ref()
+        && value.data_type() == *field.data_type()
+    {
+        return inner;
+    }
+    expr
 }
 
 fn has_spelling(metadata: &FieldMetadata) -> bool {
@@ -1018,6 +1039,30 @@ mod tests {
                 .await;
                 assert_eq!(count, 1, "$1 = {value}, scale {scale}");
             }
+        }
+    }
+
+    /// Flight SQL binds `$1` as `CAST($1 AS DOUBLE)`. Casting a float to its own
+    /// type keeps its value, so the bound float still casts through its spelling.
+    #[tokio::test]
+    async fn decimal_column_matches_a_bound_float_parameter_under_an_identity_cast() {
+        for scale in [2_i8, 4, 6, 15] {
+            for value in [12_345_678.90_f64, 4.07] {
+                let count = count_matches(
+                    "SELECT count(*) FROM t WHERE dec = CAST($1 AS DOUBLE)",
+                    Some(vec![ScalarValue::Float64(Some(value))]),
+                    scale,
+                )
+                .await;
+                assert_eq!(count, 1, "CAST($1 AS DOUBLE) = {value}, scale {scale}");
+            }
+            let count = count_matches(
+                "SELECT count(*) FROM t WHERE dec = CAST($1 AS FLOAT)",
+                Some(vec![ScalarValue::Float32(Some(4.07))]),
+                scale,
+            )
+            .await;
+            assert_eq!(count, 1, "CAST($1 AS FLOAT) = 4.07f32, scale {scale}");
         }
     }
 }
