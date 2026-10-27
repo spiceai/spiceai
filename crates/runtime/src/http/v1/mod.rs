@@ -630,7 +630,7 @@ impl StreamedBody {
 /// `vnd.spiceai.sql.v1+json`.
 enum BodyEncoder {
     Json {
-        writer: arrow_json::Writer<Vec<u8>, JsonArray>,
+        writer: arrow_json::Writer<Vec<u8>, arrow_json::writer::JsonArray>,
         /// The `vnd.spiceai.sql.v1+json` object around the array, if any.
         envelope: Option<VndEnvelope>,
         rows: usize,
