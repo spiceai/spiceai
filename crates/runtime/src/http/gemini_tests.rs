@@ -341,6 +341,59 @@ async fn models_are_listed_in_the_gemini_api_shape() {
     );
 }
 
+/// A model's name is opaque: one named `models/qwen` is listed, fetched and answered as
+/// itself, apart from one named `qwen`, by the resource name its listing gives.
+#[tokio::test]
+async fn a_model_named_like_a_resource_name_keeps_its_own_name() {
+    let seen = Seen::default();
+    let endpoint = start_provider(&seen).await;
+    let routes = runtime_with(vec![
+        model("qwen", "openai:gpt-4o", &endpoint, &[]),
+        model("models/qwen", "openai:gpt-4o-mini", &endpoint, &[]),
+    ])
+    .await;
+    taken(&seen);
+
+    let (status, body) = get(&routes, "/v1beta/models").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed: Vec<(&Value, &Value)> = body["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .map(|model| (&model["name"], &model["displayName"]))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (&json!("models/models/qwen"), &json!("models/qwen")),
+            (&json!("models/qwen"), &json!("qwen")),
+        ]
+    );
+
+    let (status, body) = get(&routes, "/v1beta/models/models/qwen").await;
+    assert_eq!(
+        (status, &body["name"]),
+        (StatusCode::OK, &json!("models/models/qwen"))
+    );
+
+    for (path, provider_model) in [
+        ("/v1beta/models/qwen:generateContent", "gpt-4o"),
+        ("/v1beta/models/models/qwen:generateContent", "gpt-4o-mini"),
+    ] {
+        let (status, _, body) = send(&routes, path, &[], &ping()).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        let received = taken(&seen);
+        assert_eq!(
+            received
+                .iter()
+                .map(|r| (r.path.as_str(), &r.body["model"]))
+                .collect::<Vec<_>>(),
+            [("/v1/chat/completions", &json!(provider_model))],
+            "{path}"
+        );
+    }
+}
+
 /// `/v1/models` reports each model's window and output cap as its provider's model API
 /// does, and that `/v1/responses` serves every chat model: an Anthropic model by
 /// translation through its chat.

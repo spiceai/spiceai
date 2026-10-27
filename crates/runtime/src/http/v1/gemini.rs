@@ -334,7 +334,7 @@ pub(crate) async fn get_model(
     Extension(models): Extension<GeminiModels>,
     Path(model): Path<String>,
 ) -> Response {
-    let model = model.strip_prefix("models/").unwrap_or(&model);
+    let model = model.as_str();
     let chat = models.chat.read().await.get(model).map(Arc::clone);
     if let Some(chat) = chat {
         return Json(model_listing(model, chat.token_limits().await)).into_response();
@@ -400,8 +400,7 @@ pub(crate) async fn post(
     body: Bytes,
 ) -> Response {
     let context = RequestContext::current(AsyncMarker::new().await);
-    let path = path.strip_prefix("models/").unwrap_or(&path);
-    let (model, method) = match model_and_method(path) {
+    let (model, method) = match model_and_method(&path) {
         Ok(found) => found,
         Err(error) => return error_response(&error),
     };

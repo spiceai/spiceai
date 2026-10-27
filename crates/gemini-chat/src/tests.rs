@@ -1353,7 +1353,8 @@ async fn function_calls_round_trip_through_the_history() {
     );
 }
 
-/// The model is named by the URL, `models/{model}`, and a stream asks for its usage.
+/// The model is the one the URL names, as it is named, even a name like a resource name; and a
+/// stream asks for its usage.
 #[tokio::test]
 async fn the_model_comes_from_the_url_and_a_stream_asks_for_usage() {
     let chat = ScriptedChat::new(
@@ -1370,7 +1371,7 @@ async fn the_model_comes_from_the_url_and_a_stream_asks_for_usage() {
         .generate("models/qwen", request.clone())
         .await
         .expect("an answer");
-    assert_eq!(answer.model_version.as_deref(), Some("qwen"));
+    assert_eq!(answer.model_version.as_deref(), Some("models/qwen"));
     let streamed: Vec<_> = gemini
         .generate_stream("qwen", request)
         .await
@@ -1381,7 +1382,7 @@ async fn the_model_comes_from_the_url_and_a_stream_asks_for_usage() {
     assert_eq!(
         chat.requests(),
         [
-            json!({"model": "qwen", "messages": [{"role": "user", "content": "ping"}]}),
+            json!({"model": "models/qwen", "messages": [{"role": "user", "content": "ping"}]}),
             json!({"model": "qwen", "messages": [{"role": "user", "content": "ping"}], "stream": true, "stream_options": {"include_usage": true}}),
         ]
     );
@@ -1412,7 +1413,7 @@ async fn a_chat_model_failure_is_answered_with_an_error_of_its_kind() {
 async fn counting_tokens_is_refused() {
     let chat = ScriptedChat::new(None, Vec::new());
     let error = GeminiChat::new(Arc::clone(&chat) as Arc<dyn Chat>)
-        .count_tokens("models/qwen", CountTokensRequest::default())
+        .count_tokens("qwen", CountTokensRequest::default())
         .await
         .expect_err("no tokenizer");
     assert_eq!(
@@ -1424,12 +1425,19 @@ async fn counting_tokens_is_refused() {
     assert_eq!(chat.requests(), Vec::<Value>::new());
 }
 
+/// A model's ID is opaque: one named like a resource name is listed apart from the model whose
+/// resource name it looks like.
 #[test]
 fn a_model_is_listed_by_its_resource_name() {
     let unknown = chat_api::TokenLimits::default();
-    let expected = json!({"name": "models/qwen", "displayName": "qwen", "supportedGenerationMethods": ["generateContent"]});
-    assert_eq!(wire(&model_listing("qwen", unknown)), expected);
-    assert_eq!(wire(&model_listing("models/qwen", unknown)), expected);
+    assert_eq!(
+        wire(&model_listing("qwen", unknown)),
+        json!({"name": "models/qwen", "displayName": "qwen", "supportedGenerationMethods": ["generateContent"]})
+    );
+    assert_eq!(
+        wire(&model_listing("models/qwen", unknown)),
+        json!({"name": "models/models/qwen", "displayName": "models/qwen", "supportedGenerationMethods": ["generateContent"]})
+    );
 }
 
 /// The window is shared between the prompt and the answer, so the prompt's limit is what

@@ -43,11 +43,6 @@ pub struct GeminiChat {
     chat: Arc<dyn Chat>,
 }
 
-/// The model's ID, as the URL names it: `{id}`, or `models/{id}`.
-fn model_id(model: &str) -> &str {
-    model.strip_prefix("models/").unwrap_or(model)
-}
-
 impl GeminiChat {
     #[must_use]
     pub fn new(chat: Arc<dyn Chat>) -> Self {
@@ -66,7 +61,6 @@ impl GeminiChat {
         model: &str,
         request: GenerateContentRequest,
     ) -> Result<GenerateContentResponse, GeminiError> {
-        let model = model_id(model);
         let completion = self
             .chat
             .chat_request(request::chat_request(model, request, false)?)
@@ -88,7 +82,6 @@ impl GeminiChat {
         model: &str,
         request: GenerateContentRequest,
     ) -> Result<GenerateContentStream, GeminiError> {
-        let model = model_id(model);
         let chunks = self
             .chat
             .chat_stream(request::chat_request(model, request, true)?)
@@ -113,7 +106,6 @@ impl GeminiChat {
         model: &str,
         _request: CountTokensRequest,
     ) -> Result<CountTokensResponse, GeminiError> {
-        let model = model_id(model);
         Err(GeminiError::invalid_argument(format!(
             "Model '{model}' serves the Gemini API by translating requests into chat completions, which cannot count tokens: counts are specific to the model's tokenizer. The `usageMetadata` of a `generateContent` response counts its prompt. See: {}",
             request::DOCS
@@ -126,7 +118,6 @@ impl GeminiChat {
 /// answer's cap when the model has one, and `outputTokenLimit` that cap.
 #[must_use]
 pub fn model_listing(id: &str, limits: chat_api::TokenLimits) -> Model {
-    let id = model_id(id);
     let input = limits.context_window.map(|window| {
         limits
             .max_output_tokens
