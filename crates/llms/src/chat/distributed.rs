@@ -58,6 +58,9 @@ pub struct DistributedConfig {
     pub node_rank: usize,
     /// Ordered node addresses (host or IP); index == rank, length == world size.
     pub nodes: Vec<String>,
+    /// Whether spiced runs with `--allow-insecure-connections`. An engine that connects the
+    /// nodes without authentication serves the model only when this is set.
+    pub allow_insecure_connections: bool,
 }
 
 impl DistributedConfig {
@@ -212,6 +215,7 @@ mod tests {
             backend: DistributedBackend::Ring,
             node_rank,
             nodes: (0..n).map(|i| format!("10.0.0.{i}")).collect(),
+            allow_insecure_connections: false,
         }
     }
 

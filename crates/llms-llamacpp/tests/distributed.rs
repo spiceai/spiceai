@@ -24,9 +24,11 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use async_openai::error::OpenAIError;
 use llms::chat::{
-    Chat, DistributedBackend, DistributedConfig, LocalModelOptions, ReasoningDefault,
+    Chat, DistributedBackend, DistributedConfig, Error, LocalModelOptions, ReasoningDefault,
 };
 use serde_json::json;
 
@@ -35,11 +37,17 @@ use crate::{FILE, MODEL, REVISION, request};
 /// Set in rank 1's environment: there `rank_one` lends the GPU instead of returning.
 const RANK_ONE: &str = "SPICE_LLAMACPP_TEST_RANK_ONE";
 
-fn topology(node_rank: usize) -> DistributedConfig {
+/// Set in the environment of the process `rank_two_of_three` runs in.
+const RANK_TWO: &str = "SPICE_LLAMACPP_TEST_RANK_TWO";
+
+/// `world` nodes on this machine, as spiced sees them with `--allow-insecure-connections`,
+/// which a model split over llama.cpp RPC needs.
+fn topology(node_rank: usize, world: usize) -> DistributedConfig {
     DistributedConfig {
         backend: DistributedBackend::Ring,
         node_rank,
-        nodes: vec!["127.0.0.1".to_string(), "127.0.0.1".to_string()],
+        nodes: vec!["127.0.0.1".to_string(); world],
+        allow_insecure_connections: true,
     }
 }
 
@@ -55,19 +63,171 @@ fn options(distributed: Option<&DistributedConfig>) -> LocalModelOptions<'_> {
 }
 
 /// Rank 1, run only by `a_model_split_across_two_ranks_answers_as_on_one` in a process of
-/// its own: rank 1's load lends this machine's GPU and never completes, so this pends until
-/// that test kills it. Without `RANK_ONE` it does nothing.
+/// its own: rank 1's load lends this machine's GPU, which stays served after the load, so this
+/// pends until that test kills it. Without `RANK_ONE` it does nothing.
 #[tokio::test]
 async fn rank_one() {
     if std::env::var_os(RANK_ONE).is_none() {
         return;
     }
-    let cfg = topology(1);
+    let cfg = topology(1, 2);
     // rank 1 never reads the weights; the head sends them
     let weights = [PathBuf::from(FILE)];
     let engine = llms::chat::engine::engine_for(&weights).expect("a .gguf goes to llama.cpp");
-    let error = (engine.load)(&weights, options(Some(&cfg))).await.err();
-    panic!("rank 1 stopped lending its GPU: {error:?}");
+    let _share = (engine.load)(&weights, options(Some(&cfg)))
+        .await
+        .expect("rank 1 lends its GPU");
+    std::future::pending::<()>().await;
+}
+
+/// Rank 2 of three, run only by `a_rank_other_than_0_loads_its_share_and_names_the_head` in a
+/// process of its own, as the GPU a process serves is the process's own. Without `RANK_TWO` it
+/// does nothing.
+#[tokio::test]
+async fn rank_two_of_three() {
+    if std::env::var_os(RANK_TWO).is_none() {
+        return;
+    }
+    let cfg = topology(2, 3);
+    let weights = [PathBuf::from(FILE)];
+    let engine = llms::chat::engine::engine_for(&weights).expect("a .gguf goes to llama.cpp");
+    // no head ever reaches this rank, and its load still finishes
+    let share = tokio::time::timeout(
+        Duration::from_secs(60),
+        (engine.load)(&weights, options(Some(&cfg))),
+    )
+    .await
+    .expect("rank 2's load finishes without waiting for the head")
+    .expect("rank 2 lends its GPU");
+
+    share.health().await.expect("a lent GPU's share is healthy");
+    std::net::TcpStream::connect("127.0.0.1:12347")
+        .expect("rank 2 serves its GPU at port 12345 + 2");
+    let refusal = share
+        .chat_request(request(json!({
+            "model": "qwen3",
+            "messages": [{ "role": "user", "content": "What is the capital of France?" }],
+        })))
+        .await
+        .expect_err("rank 2 serves no requests");
+    let OpenAIError::ApiError(refusal) = refusal else {
+        panic!("rank 2 refuses with an API error: {refusal:?}");
+    };
+    assert_eq!(
+        refusal.message,
+        "Model 'qwen3-0.6b' is served by the first machine in 'nodes' (127.0.0.1); this machine holds part of it."
+    );
+    assert_eq!(refusal.r#type.as_deref(), Some("invalid_request_error"));
+}
+
+/// A rank other than 0 finishes loading once it serves its GPU: a load that never finished
+/// kept every model the Spicepod lists after it from loading.
+#[tokio::test]
+async fn a_rank_other_than_0_loads_its_share_and_names_the_head() {
+    let status = Command::new(std::env::current_exe().expect("the test binary's path"))
+        .args(["--exact", "distributed::rank_two_of_three", "--nocapture"])
+        .env(RANK_TWO, "1")
+        .status()
+        .expect("rank 2 runs");
+    assert!(status.success(), "rank 2's checks failed: {status}");
+}
+
+/// Neither the head nor another rank serves or reaches a GPU over llama.cpp RPC unless spiced
+/// runs with `--allow-insecure-connections`, as the connections between them are not
+/// authenticated. The refusal comes before either one listens or connects, so it is quick.
+#[tokio::test]
+async fn a_split_model_needs_insecure_connections_allowed() {
+    let weights = [local_gguf().await];
+    let engine = llms::chat::engine::engine_for(&weights).expect("a .gguf goes to llama.cpp");
+    for rank in [0, 1] {
+        let cfg = DistributedConfig {
+            allow_insecure_connections: false,
+            ..topology(rank, 2)
+        };
+        let Err(error) = tokio::time::timeout(
+            Duration::from_secs(10),
+            (engine.load)(&weights, options(Some(&cfg))),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("rank {rank} is refused before it serves or reaches a GPU")) else {
+            panic!("rank {rank} loaded without `--allow-insecure-connections`");
+        };
+        assert!(
+            matches!(&error, Error::InsecureConnectionsNotAllowed { model } if model == "qwen3-0.6b"),
+            "rank {rank}: {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "Model 'qwen3-0.6b' is split across nodes over connections that are neither authenticated nor encrypted, so it loads only when spiced runs with `--allow-insecure-connections`. Start spiced with `--allow-insecure-connections` on every node in `nodes`, and only on a trusted private network: any host that reaches a node's GPU server can use that GPU.",
+            "rank {rank}"
+        );
+        // only restarting spiced with the flag clears it, so the runtime does not retry it
+        assert!(error.is_configuration_error(), "rank {rank}");
+    }
+}
+
+/// A GGUF holding only a header that names `arch`, as a model's first shard starts.
+fn header_only(dir: &std::path::Path, name: &str, arch: &str) -> PathBuf {
+    let string = |bytes: &mut Vec<u8>, text: &str| {
+        let len = u64::try_from(text.len()).expect("a short string");
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(text.as_bytes());
+    };
+    let mut bytes = b"GGUF".to_vec();
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    string(&mut bytes, "general.architecture");
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    string(&mut bytes, arch);
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("the GGUF is written");
+    path
+}
+
+/// A model split across nodes goes to llama.cpp only when llama.cpp splits its architecture
+/// by tensor, which every node decides from the first shard's header: `glm-dsa`, which it
+/// cannot split, stays on mistral.rs's ring, as it was before llama.cpp served split models.
+#[tokio::test]
+async fn only_an_architecture_llama_cpp_splits_is_split_by_it() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let glm = [
+        header_only(dir.path(), "GLM-UD-Q2_K_XL-00001-of-00002.gguf", "glm-dsa"),
+        dir.path().join("GLM-UD-Q2_K_XL-00002-of-00002.gguf"),
+    ];
+    let qwen = [header_only(dir.path(), "Qwen3-Q8_0.gguf", "qwen3")];
+    let engine = llms::chat::engine::engine_for(&qwen).expect("a .gguf goes to llama.cpp");
+    assert_eq!(engine.name, "llama.cpp");
+
+    assert!(
+        !engine.splits_weights(&glm).await,
+        "glm-dsa stays on the ring"
+    );
+    assert!(
+        engine.splits_weights(&qwen).await,
+        "qwen3 is split by llama.cpp"
+    );
+    // a rank without the weights cannot be a ring member, which reads them on every node
+    let absent = [dir.path().join("absent-00001-of-00002.gguf")];
+    assert!(
+        engine.splits_weights(&absent).await,
+        "a rank without the weights"
+    );
+}
+
+/// A rank other than 0 of a Hugging Face model reads the first shard's architecture from the
+/// Hub with a range read, so it decides as the head does without downloading the weights.
+#[tokio::test]
+async fn a_rank_reads_the_architecture_from_the_hub() {
+    let arch = llms::chat::hf_files::model_architecture(
+        "unsloth/Qwen3-0.6B-GGUF:50968a4468ef4233ed78cd7c3de230dd1d61a56b",
+        &["Qwen3-0.6B-Q6_K.gguf"],
+        llms::hf::HubParams::default(),
+        "qwen3-0.6b",
+    )
+    .await
+    .expect("the header is read");
+    assert_eq!(arch.as_deref(), Some("qwen3"));
 }
 
 /// A `tracing` writer into a shared buffer.
@@ -137,8 +297,8 @@ async fn a_model_split_across_two_ranks_answers_as_on_one() {
     let weights = [gguf];
     let engine = llms::chat::engine::engine_for(&weights).expect("a .gguf goes to llama.cpp");
     assert!(
-        engine.distributed,
-        "the llama.cpp engine serves distributed models"
+        engine.splits_weights(&weights).await,
+        "the llama.cpp engine splits Qwen3 across nodes"
     );
 
     let single: Arc<dyn Chat> = (engine.load)(&weights, options(None))
@@ -154,7 +314,7 @@ async fn a_model_split_across_two_ranks_answers_as_on_one() {
             .spawn()
             .expect("rank 1 starts"),
     );
-    let cfg = topology(0);
+    let cfg = topology(0, 2);
     // the head waits for rank 1 to serve its GPU before it loads; its log says what it split
     // the model across, which a load that fell back to one node would not
     let log = Arc::new(Mutex::new(Vec::<u8>::new()));

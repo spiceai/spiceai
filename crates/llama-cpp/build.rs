@@ -158,15 +158,18 @@ fn index_libraries(dir: &Path, found: &mut BTreeMap<String, PathBuf>) {
     }
 }
 
-/// Compiles the C interfaces to llama.cpp's C++ speculative decoding and JSON-schema
-/// conversion. They go on the link line before the libraries they call.
+/// Compiles the C interfaces to llama.cpp's C++ speculative decoding, JSON-schema conversion
+/// and architecture table. They go on the link line before the libraries they call.
 fn compile_shim(root: &Path) {
     cc::Build::new()
         .cpp(true)
         .std("c++17")
         .file("shim/spice_mtp.cpp")
         .file("shim/spice_grammar.cpp")
+        .file("shim/spice_split.cpp")
         .include("shim")
+        // `spice_split.cpp` reads llama.cpp's internal architecture table.
+        .include(root.join("src"))
         .include(root.join("include"))
         .include(root.join("common"))
         .include(root.join("ggml/include"))
@@ -233,6 +236,7 @@ fn bindings(root: &Path) {
         .allowlist_function("ggml_backend_load_all")
         .allowlist_function("spice_mtp_.*")
         .allowlist_function("spice_dflash_kind")
+        .allowlist_function("spice_arch_splits_by_tensor")
         .allowlist_function("spice_json_schema_to_grammar")
         .allowlist_function("spice_string_free")
         .allowlist_type("llama_.*")
