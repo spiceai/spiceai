@@ -19,7 +19,7 @@ limitations under the License.
 
 use arrow::datatypes::DataType;
 use datafusion::{
-    logical_expr::{Expr, Operator, binary_expr, cast, lit},
+    logical_expr::{Expr, Operator, binary_expr, cast, lit, try_cast},
     prelude::{and, ident},
     scalar::ScalarValue,
 };
@@ -73,7 +73,7 @@ fn convert_timestamp_expr(
         // front of it is a superset of the rows it selects, written so every engine
         // compares it the same way, and is what a scan can push down.
         TimestampFormat::Iso8601(string_type) => {
-            let exact = instant_comparison(time_column, timestamp_in_nanos, op);
+            let exact = iso8601_instant_comparison(time_column, timestamp_in_nanos, op);
             match iso8601_text_superset(time_column, string_type, timestamp_in_nanos, op) {
                 Some(superset) => and(superset, exact),
                 None => exact,
@@ -131,6 +131,50 @@ fn instant_comparison(time_column: &str, timestamp_in_nanos: u128, op: Operator)
             None,
         ),
     )
+}
+
+/// `col op <timestamp_in_nanos>` for an ISO 8601 string column, over every
+/// year it can spell.
+///
+/// A `Timestamp(ns)` spans only 1677–2262, so casting a sentinel such as
+/// `9999-12-31T23:59:59Z` to it fails the whole filter. The comparison is made
+/// in microseconds instead (±262,000 years), whose cast floors the instant, and
+/// only a value within the bound's microsecond is compared in nanoseconds; that
+/// value is in nanosecond range, and `TRY_CAST` leaves every other row NULL there
+/// rather than failing. For `>`: `us > floor(b) OR (us = floor(b) AND ns > b)`.
+#[expect(clippy::cast_possible_truncation)]
+fn iso8601_instant_comparison(time_column: &str, timestamp_in_nanos: u128, op: Operator) -> Expr {
+    let bound = timestamp_in_nanos as i64;
+    let bound_micros = bound.div_euclid(1_000);
+    let micros = || {
+        cast(
+            ident(time_column),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        )
+    };
+    let micros_bound = || {
+        Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(bound_micros), None),
+            None,
+        )
+    };
+    let within_bound_micro = || {
+        binary_expr(micros(), Operator::Eq, micros_bound()).and(binary_expr(
+            try_cast(
+                ident(time_column),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            ),
+            op,
+            Expr::Literal(ScalarValue::TimestampNanosecond(Some(bound), None), None),
+        ))
+    };
+    let strict = match op {
+        Operator::Gt | Operator::GtEq => Operator::Gt,
+        Operator::Lt | Operator::LtEq => Operator::Lt,
+        Operator::Eq => return within_bound_micro(),
+        _ => return instant_comparison(time_column, timestamp_in_nanos, op),
+    };
+    binary_expr(micros(), strict, micros_bound()).or(within_bound_micro())
 }
 
 /// A text comparison that every ISO 8601 value satisfying
@@ -605,7 +649,7 @@ mod tests {
             &DataType::Utf8,
             None,
             1_620_000_000_000_000_000,
-            "timestamp >= Utf8(\"2021-05-02\") AND CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
+            "timestamp >= Utf8(\"2021-05-02\") AND (CAST(timestamp AS Timestamp(µs)) > TimestampMicrosecond(1620000000000000, None) OR CAST(timestamp AS Timestamp(µs)) = TimestampMicrosecond(1620000000000000, None) AND TRY_CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None))",
         );
     }
 
@@ -721,6 +765,9 @@ mod tests {
     const TS_STRICT: &str =
         "CAST(ts AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)";
 
+    /// Expected high-water-mark comparison for an ISO 8601 string column named `ts`.
+    const ISO_STRICT: &str = "CAST(ts AS Timestamp(µs)) > TimestampMicrosecond(1620000000000000, None) OR CAST(ts AS Timestamp(µs)) = TimestampMicrosecond(1620000000000000, None) AND TRY_CAST(ts AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)";
+
     /// Build the high-water-mark filter for a single column of `data_type`.
     fn high_water_mark_expr(data_type: &DataType) -> String {
         let format = data_type_to_timestamp_format(data_type, None).expect("format resolves");
@@ -766,7 +813,7 @@ mod tests {
         assert_eq!(high_water_mark_expr(&timestamp), TS_STRICT);
         assert_eq!(
             high_water_mark_expr(&DataType::Utf8),
-            format!("ts >= Utf8(\"2021-05-02\") AND {TS_STRICT}")
+            format!("ts >= Utf8(\"2021-05-02\") AND ({ISO_STRICT})")
         );
     }
 
@@ -1008,6 +1055,45 @@ mod tests {
                     surviving_iso_rows(&data_type, &values, &bounded),
                     surviving_iso_rows(&data_type, &values, &exact),
                     "{data_type} {op}: {bounded}"
+                );
+            }
+        }
+    }
+
+    /// A year the nanosecond range cannot hold still compares, and a value within
+    /// the cutoff's microsecond is still compared to the nanosecond.
+    #[test]
+    fn iso_comparison_spans_every_spellable_year_at_nanosecond_precision() {
+        let in_range = [
+            Some("2021-05-02T23:59:59.999999999Z"),
+            Some("2021-05-03T00:00:00Z"),
+            Some("2021-05-03T00:00:00.000000001Z"),
+            Some("2021-05-03T00:00:00.000000999Z"),
+            Some("2021-05-03T00:00:00.000001Z"),
+            Some("2021-05-03T09:00:00.000000001+09:00"),
+        ];
+        let mut values = in_range.to_vec();
+        values.extend([Some("9999-12-31T23:59:59Z"), Some("0001-01-01T00:00:00Z")]);
+        for data_type in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            for op in [Operator::Gt, Operator::GtEq, Operator::Lt, Operator::LtEq] {
+                let filter = iso_converter(&data_type).convert(TS_NANOS, op);
+                let mut expected = surviving_iso_rows(
+                    &data_type,
+                    &in_range,
+                    &instant_comparison("ts", TS_NANOS, op),
+                );
+                expected.push(Some(
+                    if matches!(op, Operator::Gt | Operator::GtEq) {
+                        "9999-12-31T23:59:59Z"
+                    } else {
+                        "0001-01-01T00:00:00Z"
+                    }
+                    .to_string(),
+                ));
+                assert_eq!(
+                    surviving_iso_rows(&data_type, &values, &filter),
+                    expected,
+                    "{data_type} {op}: {filter}"
                 );
             }
         }

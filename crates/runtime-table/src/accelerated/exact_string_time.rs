@@ -56,7 +56,8 @@ pub(crate) const MAX_PINNED_VALUES_PER_DELETE: usize = 10_000;
 /// timestamp is replaced with the strings `DataFusion` selects for it out of
 /// `table`'s current rows.
 ///
-/// Only `AND` and `OR` are looked through. Under them a delete keeps a row
+/// Only `AND` and `OR` are looked through, and only above a subexpression over
+/// more than one column. Under them a delete keeps a row
 /// exactly when the predicate is TRUE, and both are monotone in each operand,
 /// so a replacement that is TRUE on exactly the rows the comparison is TRUE on
 /// selects the same rows, whether the comparison was FALSE or NULL on the rest.
@@ -148,8 +149,8 @@ pub(crate) async fn pin_string_time_comparisons(
     Ok(vec![replace(expr, &replacements)?])
 }
 
-/// A boolean subexpression to pin: everything below the `AND`/`OR` that combine
-/// it, referencing one string column it parses as a timestamp.
+/// A boolean subexpression to pin: the largest one below the `AND`/`OR` that
+/// combine it that references only the string column it parses as a timestamp.
 #[derive(Debug)]
 struct Atom {
     expr: Expr,
@@ -163,6 +164,21 @@ struct Pinned {
 }
 
 fn collect_atoms(expr: &Expr, schema: &SchemaRef, atoms: &mut Vec<Atom>) {
+    let Some(column) = string_column_cast_to_timestamp(expr, schema) else {
+        return;
+    };
+    // The largest subexpression over that one column is pinned whole: one scan,
+    // and the comparison is evaluated together with the text bound and
+    // nanosecond tie-break the converter writes around it.
+    if expr.column_refs().len() == 1 {
+        if !atoms.iter().any(|atom| &atom.expr == expr) {
+            atoms.push(Atom {
+                expr: expr.clone(),
+                column,
+            });
+        }
+        return;
+    }
     if let Expr::BinaryExpr(BinaryExpr {
         left,
         op: Operator::And | Operator::Or,
@@ -173,22 +189,10 @@ fn collect_atoms(expr: &Expr, schema: &SchemaRef, atoms: &mut Vec<Atom>) {
         collect_atoms(right, schema, atoms);
         return;
     }
-    let Some(column) = string_column_cast_to_timestamp(expr, schema) else {
-        return;
-    };
-    if expr.column_refs().len() != 1 {
-        tracing::warn!(
-            "[retention] '{expr}' parses '{}' as a timestamp but references other columns too; it is left as written",
-            column.name
-        );
-        return;
-    }
-    if !atoms.iter().any(|atom| &atom.expr == expr) {
-        atoms.push(Atom {
-            expr: expr.clone(),
-            column,
-        });
-    }
+    tracing::warn!(
+        "[retention] '{expr}' parses '{}' as a timestamp but references other columns too; it is left as written",
+        column.name
+    );
 }
 
 /// The string column a `CAST`/`TRY_CAST` to a timestamp inside `expr` reads,
