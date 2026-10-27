@@ -601,6 +601,64 @@ async fn a_dataset_whose_source_refuses_reads_at_startup_loads_once_the_source_i
     .await
 }
 
+/// A Spicepod change to an accelerated dataset whose source is down cannot load the
+/// new configuration. The dataset loads it once the source is reachable again.
+#[tokio::test]
+async fn a_dataset_changed_while_its_source_is_down_loads_once_the_source_is_reachable()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let source = UnreachableSource::new("changed-while-down", 7);
+    source.refuse_reads_instead_of_connecting();
+    source.register().await;
+    source.bring_up();
+
+    let app = |refresh_check_interval: &str| {
+        let mut dataset = SpicepodDataset::new(format!("{}://orders", source.prefix), "orders");
+        dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+            enabled: true,
+            engine: Some("arrow".to_string()),
+            refresh_check_interval: Some(refresh_check_interval.to_string()),
+            ..Default::default()
+        });
+        AppBuilder::new("source_unavailable")
+            .with_dataset(dataset)
+            .build()
+    };
+    configure_test_datafusion();
+    let rt = Arc::new(Runtime::builder().with_app(app("30s")).build().await);
+    let loader = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.load_components().await }
+    });
+    let ready = wait_until_true(Duration::from_secs(30), || async {
+        run_query(&rt, "SELECT COUNT(*) FROM orders").await.is_ok()
+    })
+    .await;
+    assert!(ready, "the dataset must load while its source is up");
+
+    source.take_down();
+    assert!(Arc::clone(&rt).apply_app(Arc::new(app("60s"))).await);
+    assert!(
+        run_query(&rt, "SELECT COUNT(*) FROM orders").await.is_err(),
+        "the new configuration cannot load while the source is down"
+    );
+
+    source.bring_up();
+    let queryable = wait_until_true(Duration::from_secs(30), || async {
+        run_query(&rt, "SELECT COUNT(*) FROM orders").await.is_ok()
+    })
+    .await;
+    assert!(
+        queryable,
+        "the dataset must load once its source is reachable; status {:?}",
+        dataset_status(&rt, "orders")
+    );
+
+    loader.abort();
+    rt.shutdown().await;
+    Ok(())
+}
+
 /// Accelerated datasets whose acceleration is already on disk when the runtime
 /// starts with the source down or slow (#14610).
 #[cfg(feature = "duckdb")]
