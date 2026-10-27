@@ -6,6 +6,10 @@ goals, the milestones, the key decisions and the alternatives behind them. The
 how Cayenne works today where this changes it, and the details, with the
 measurements and model checks behind them.
 
+These documents and the protocol model capture the current direction: complete
+enough to build toward, and expected to change. Implementation will update the
+design and the model together.
+
 ---
 
 # What and why

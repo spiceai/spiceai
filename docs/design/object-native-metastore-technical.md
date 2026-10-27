@@ -456,7 +456,7 @@ the one after record `a`. A batch is named by its first record's commit number.
   reclaimable, and readers never clip one. This is a simplification, not a
   safety rule: a clipped alternative, in which a batch above the floor stays
   listed and readers skip its records at or below the floor, was also
-  model-checked safe, and was not adopted because it complicates the decoder.
+  model-checked safe, and is not proposed because it complicates the decoder.
 - **The batch index is bounded by the checkpoint cadence.** A checkpoint moves
   the floor and trims the index. The writer checkpoints before the index
   would push the head past its budget.
@@ -1031,7 +1031,7 @@ Tables that go away have one line.
     (`use-starting-sequence-number`), so deletes before it no longer apply to
     the outputs, and a delete that applies to no live file is dangling
     (`remove-dangling-deletes`). The model found it equivalent for one-row
-    files (`delete-coverage-iceberg`). It is not adopted because it changes
+    files (`delete-coverage-iceberg`). It is not proposed because it changes
     the `seq` stamped on compaction outputs, which Cayenne's visibility code
     reads; `applied_through` adds a field instead.
 - **Derived or rebuilt:**
