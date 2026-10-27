@@ -118,6 +118,15 @@ async fn rank_two_of_three() {
         "Model 'qwen3-0.6b' is served by the first machine in 'nodes' (127.0.0.1); this machine holds part of it."
     );
     assert_eq!(refusal.r#type.as_deref(), Some("invalid_request_error"));
+
+    // the share is the engine's to return: loaded as a model of its own, a rank is refused
+    let Err(own) = llms_llamacpp::LlamaCpp::from(&weights, options(Some(&cfg))).await else {
+        panic!("rank 2 loaded a model of its own");
+    };
+    assert_eq!(
+        own.to_string(),
+        "Failed to load the model. An error occurred: Model 'qwen3-0.6b' is a share held for the first node in `nodes` on this node (rank 2), so it loads through the engine, not as a model of its own. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    );
 }
 
 /// A rank other than 0 finishes loading once it serves its GPU: a load that never finished

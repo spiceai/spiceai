@@ -305,11 +305,21 @@ impl LlamaCpp {
     ///
     /// When a weight file is missing, llama.cpp cannot load the model or its MTP head, the
     /// model has no chat template or writes Harmony replies, or `reasoning_effort` is one
-    /// its chat template refuses.
-    ///
-    /// A distributed model loads here only on rank 0, the head, which serves it; another rank
-    /// holds a share ([`distributed::lend_gpu`]).
-    async fn from(weights: &[PathBuf], options: LocalModelOptions<'_>) -> Result<Self> {
+    /// its chat template refuses, or `options` makes this node a rank other than 0 of a
+    /// distributed model: such a rank serves no model of its own, and the engine's `load`
+    /// returns the share it holds for the head instead.
+    pub async fn from(weights: &[PathBuf], options: LocalModelOptions<'_>) -> Result<Self> {
+        if let Some(cfg) = options.distributed
+            && cfg.node_rank > 0
+        {
+            return Err(ChatError::FailedToLoadModel {
+                source: format!(
+                    "Model '{}' is a share held for the first node in `nodes` on this node (rank {}), so it loads through the engine, not as a model of its own.",
+                    options.reasoning.model_name, cfg.node_rank
+                )
+                .into(),
+            });
+        }
         for weight in weights {
             if !weight.exists() {
                 return Err(ChatError::LocalModelNotFound {
