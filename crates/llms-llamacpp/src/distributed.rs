@@ -351,8 +351,13 @@ pub(crate) async fn reach_ranks(cfg: &DistributedConfig, name: &str) -> Result<V
                 Some(attempt) => attempts[rank] = Some(attempt),
                 None => {
                     let at = endpoint.clone();
+                    // llama.cpp's server takes one connection at a time with a backlog of one,
+                    // and its client aborts the process when it cannot connect. Another rank's
+                    // server is probed first; the head's own is already known to listen, and a
+                    // probe right before the connection could fill that backlog.
+                    let probe = rank > 0;
                     attempts[rank] = Some(tokio::task::spawn_blocking(move || {
-                        listening(&at)
+                        (!probe || listening(&at))
                             .then(|| rpc::connect(Backend::get(), &at).ok())
                             .flatten()
                     }));
