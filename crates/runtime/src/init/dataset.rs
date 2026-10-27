@@ -1328,10 +1328,15 @@ impl Runtime {
             &checkpoint_schema,
             resolved_refresh_mode,
         );
-        let federated_table = FederatedTable::new_deferred(
-            Arc::new(ds.spec.clone()),
+        let refresh_source =
+            ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds));
+        // Snapshot refreshes report snapshot-store failures. The original source
+        // remains available for federation without changing the reader's status.
+        let refresh_source = if resolved_refresh_mode == RefreshMode::Snapshot {
+            refresh_source
+        } else {
             crate::dataconnector::refresh_source::ReportingRefreshSource::new_arc(
-                ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds)),
+                refresh_source,
                 Arc::clone(&ds),
                 Arc::clone(&self.status),
                 match reason {
@@ -1341,11 +1346,17 @@ impl Runtime {
                     } => Some(*configuration_error),
                     SourceUnavailable::NotContacted => None,
                 },
-            ),
+            )
+        };
+        let federated_table = FederatedTable::new_deferred(
+            Arc::new(ds.spec.clone()),
+            refresh_source,
             checkpoint_schema,
             self.status.shutdown_token(),
         );
-        reason.log_serving_from_acceleration(&ds.name);
+        if resolved_refresh_mode != RefreshMode::Snapshot {
+            reason.log_serving_from_acceleration(&ds.name);
+        }
         (ds, federated_table)
     }
 
