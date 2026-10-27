@@ -20,10 +20,11 @@ use std::time::{Duration, Instant};
 
 use runtime_api_types::v1::{ComponentStatus, ModelInfo, ModelListResponse};
 
+use super::agent::{Agent, RequestedModel};
 use crate::context::RuntimeContext;
 use crate::error::{
     CodingAgentModelFailedSnafu, CodingAgentModelNotFoundSnafu, CodingAgentModelTimeoutSnafu,
-    CodingAgentNoModelsSnafu, InvalidResponseSnafu, Result, UnauthorizedSnafu,
+    CodingAgentNoModelsSnafu, InvalidResponseSnafu, InvalidUsageSnafu, Result, UnauthorizedSnafu,
 };
 
 /// How long the runtime has to finish loading the agent's model. Generous,
@@ -46,6 +47,8 @@ pub(crate) struct Selection {
     /// rather than through a translation into chat completions, which cannot
     /// carry every Messages feature (deferred tool loading, for one).
     pub native_messages: bool,
+    /// The context window of each model in `available` that reports one.
+    pub context_windows: std::collections::HashMap<String, u64>,
 }
 
 /// Whether the runtime serves `model`'s Messages API natively: only a model
@@ -96,16 +99,20 @@ fn readiness(model: &ModelInfo) -> Readiness {
 /// is no terminal to make it on.
 pub(crate) async fn select(
     ctx: &RuntimeContext,
-    requested: Option<&str>,
+    agent: Agent,
+    requested: &RequestedModel,
     interactive: bool,
 ) -> Result<Selection> {
     let deadline = Instant::now() + LOAD_BUDGET;
     let mut next_progress = Instant::now() + PROGRESS_INTERVAL;
     loop {
         let models = list(ctx).await?;
-        match decide(&models, requested) {
+        if let Some(message) = misspelled_model(agent, requested, &models) {
+            return Err(InvalidUsageSnafu { message }.build());
+        }
+        match decide(&models, requested.spice_model()) {
             Decision::Ready(selection) => return Ok(selection),
-            Decision::Choose(available) => return choose(available, interactive),
+            Decision::Choose(available) => return choose(available, interactive, agent),
             Decision::Wait(waiting) => {
                 if Instant::now() >= deadline {
                     return Err(CodingAgentModelTimeoutSnafu {
@@ -148,6 +155,10 @@ fn decide(models: &[ModelInfo], requested: Option<&str>) -> Decision {
             .iter()
             .all(|model| serves_messages_natively(model));
     let ready: Vec<String> = ready_models.iter().map(|model| model.id.clone()).collect();
+    let context_windows: std::collections::HashMap<String, u64> = ready_models
+        .iter()
+        .filter_map(|model| Some((model.id.clone(), model.context_window?)))
+        .collect();
 
     if let Some(requested) = requested {
         let Some(model) = models.iter().find(|model| model.id == requested) else {
@@ -164,6 +175,7 @@ fn decide(models: &[ModelInfo], requested: Option<&str>) -> Decision {
                 model: requested.to_string(),
                 available: ready,
                 native_messages,
+                context_windows,
             }),
             Readiness::Loading => Decision::Wait(vec![requested.to_string()]),
             Readiness::Failed(message) => Decision::Fail(
@@ -206,12 +218,35 @@ fn decide(models: &[ModelInfo], requested: Option<&str>) -> Decision {
             model: only.clone(),
             available: ready.clone(),
             native_messages,
+            context_windows,
         }),
         _ => Decision::Choose(Choices {
             available: ready,
             native_messages,
+            context_windows,
         }),
     }
+}
+
+/// What to tell a user whose model option names a Spice model without the
+/// provider the agent requires, which the agent would not read as that model.
+fn misspelled_model(
+    agent: Agent,
+    requested: &RequestedModel,
+    models: &[ModelInfo],
+) -> Option<String> {
+    let RequestedModel::AgentOwned(value) = requested else {
+        return None;
+    };
+    let model = agent.without_provider(value)?;
+    models.iter().any(|listed| listed.id == model).then(|| {
+        format!(
+            "{} names a model with its provider, so '{value}' names no Spice model. Rerun with `spice {} {}`.",
+            agent.display_name(),
+            agent.command(),
+            agent.model_argument(model)
+        )
+    })
 }
 
 /// Ready models for the user to choose between.
@@ -219,17 +254,26 @@ fn decide(models: &[ModelInfo], requested: Option<&str>) -> Decision {
 struct Choices {
     available: Vec<String>,
     native_messages: bool,
+    context_windows: std::collections::HashMap<String, u64>,
 }
 
-fn choose(choices: Choices, interactive: bool) -> Result<Selection> {
+fn choose(choices: Choices, interactive: bool, agent: Agent) -> Result<Selection> {
     let Choices {
         available,
         native_messages,
+        context_windows,
     } = choices;
     if !interactive {
-        return Err(crate::error::InvalidUsageSnafu {
+        let example = available.first().map_or_else(String::new, |model| {
+            format!(
+                ", as in `spice {} {}`",
+                agent.command(),
+                agent.model_argument(model)
+            )
+        });
+        return Err(InvalidUsageSnafu {
             message: format!(
-                "The Spice runtime serves several models ({}). Choose one with --model.",
+                "The Spice runtime serves several models ({}). Choose one{example}.",
                 available.join(", ")
             ),
         }
@@ -250,6 +294,7 @@ fn choose(choices: Choices, interactive: bool) -> Result<Selection> {
         model: available[index].clone(),
         available,
         native_messages,
+        context_windows,
     })
 }
 
@@ -302,6 +347,7 @@ mod tests {
             error: None,
             error_message: None,
             metadata: None,
+            context_window: None,
         }
     }
 
@@ -321,6 +367,7 @@ mod tests {
                 model: "qwen".to_string(),
                 available: vec!["qwen".to_string()],
                 native_messages: false,
+                context_windows: std::collections::HashMap::new(),
             }
         );
     }
@@ -342,6 +389,23 @@ mod tests {
     }
 
     #[test]
+    fn the_windows_the_runtime_reports_are_kept_for_the_ready_models() {
+        let mut sized = model("qwen", Some(ComponentStatus::Ready));
+        sized.context_window = Some(40_960);
+        let mut loading = model("big", Some(ComponentStatus::Initializing));
+        loading.context_window = Some(1_000_000);
+        let selection = ready(decide(
+            &[sized, loading, model("gpt", Some(ComponentStatus::Ready))],
+            Some("qwen"),
+        ));
+        assert_eq!(
+            selection.context_windows,
+            std::collections::HashMap::from([("qwen".to_string(), 40_960)]),
+            "a model reporting no window, or not ready, contributes none"
+        );
+    }
+
+    #[test]
     fn several_ready_models_need_a_choice() {
         let models = [
             model("qwen", Some(ComponentStatus::Ready)),
@@ -351,10 +415,58 @@ mod tests {
             panic!("two ready models must need a choice");
         };
         assert_eq!(choices.available, vec!["qwen", "gpt"]);
-        let error = choose(choices, false).expect_err("no terminal to choose on");
+        let error = choose(choices, false, Agent::Codex).expect_err("no terminal to choose on");
         assert_eq!(
             error.to_string(),
-            "Invalid argument: The Spice runtime serves several models (qwen, gpt). Choose one with --model."
+            "Invalid argument: The Spice runtime serves several models (qwen, gpt). Choose one, as in `spice codex --model qwen`."
+        );
+        // In the spelling of the agent's own model option.
+        let Decision::Choose(choices) = decide(&models, None) else {
+            panic!("two ready models must need a choice");
+        };
+        let error = choose(choices, false, Agent::OpenCode).expect_err("no terminal to choose on");
+        assert_eq!(
+            error.to_string(),
+            "Invalid argument: The Spice runtime serves several models (qwen, gpt). Choose one, as in `spice opencode -m spice/qwen`."
+        );
+    }
+
+    #[test]
+    fn a_spice_model_named_without_its_provider_is_refused_with_the_fix() {
+        let models = [
+            model("qwen", Some(ComponentStatus::Ready)),
+            model("gpt", Some(ComponentStatus::Initializing)),
+        ];
+        let owned = |value: &str| RequestedModel::AgentOwned(value.to_string());
+        assert_eq!(
+            misspelled_model(Agent::OpenCode, &owned("qwen"), &models).as_deref(),
+            Some(
+                "OpenCode names a model with its provider, so 'qwen' names no Spice model. Rerun with `spice opencode -m spice/qwen`."
+            )
+        );
+        // A model still loading is a Spice model too.
+        assert_eq!(
+            misspelled_model(Agent::Pi, &owned("gpt:high"), &models).as_deref(),
+            Some(
+                "pi names a model with its provider, so 'gpt:high' names no Spice model. Rerun with `spice pi --model spice/gpt`."
+            )
+        );
+        // Not a Spice model, another provider's model, or an agent that takes bare names.
+        assert_eq!(
+            misspelled_model(Agent::OpenCode, &owned("llama"), &models),
+            None
+        );
+        assert_eq!(
+            misspelled_model(Agent::OpenCode, &owned("anthropic/qwen"), &models),
+            None
+        );
+        assert_eq!(
+            misspelled_model(Agent::Codex, &owned("qwen"), &models),
+            None
+        );
+        assert_eq!(
+            misspelled_model(Agent::OpenCode, &RequestedModel::Unspecified, &models),
+            None
         );
     }
 
@@ -392,6 +504,7 @@ mod tests {
                 model: "qwen".to_string(),
                 available: vec!["qwen".to_string()],
                 native_messages: false,
+                context_windows: std::collections::HashMap::new(),
             }
         );
     }

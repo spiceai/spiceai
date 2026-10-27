@@ -49,7 +49,8 @@ use snafu::ResultExt;
 
 use crate::context::RuntimeContext;
 use crate::error::{
-    CodingAgentRuntimeLockSnafu, CodingAgentRuntimeStartSnafu, CodingAgentRuntimeStateSnafu, Result,
+    CodingAgentRuntimeElsewhereSnafu, CodingAgentRuntimeLockSnafu, CodingAgentRuntimeStartSnafu,
+    CodingAgentRuntimeStateSnafu, InterruptedSnafu, Result,
 };
 
 /// How long a started runtime has to start answering `/health`. It normally
@@ -70,6 +71,10 @@ const LOG_TAIL_BYTES: u64 = 4096;
 pub(crate) struct StartedRuntime {
     pub pid: u32,
     pub executable: PathBuf,
+    /// The endpoint it was started at: what another spelling of its address
+    /// that does not reach it is told to use.
+    #[serde(default)]
+    pub endpoint: String,
 }
 
 /// The files that coordinate the sessions using one endpoint.
@@ -95,13 +100,30 @@ impl SessionFiles {
     }
 }
 
-/// A file name for an endpoint: its host and port, with anything a file name
-/// should not carry replaced.
+/// A file name for the address an endpoint names: its host and port.
+///
+/// Every name for this machine — `localhost`, `127.0.0.1`, `[::1]`,
+/// `0.0.0.0` — is one host, `localhost`, so sessions that spell one runtime's
+/// address differently coordinate as the sessions of one runtime.
 fn endpoint_key(endpoint: &str) -> String {
-    let address = endpoint
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .trim_end_matches('/');
+    let address = match reqwest::Url::parse(endpoint) {
+        Ok(url) => match (url.host_str(), url.port_or_known_default()) {
+            (Some(host), Some(port)) => {
+                let host = if is_this_machine(host) {
+                    "localhost"
+                } else {
+                    host
+                };
+                format!("{host}:{port}")
+            }
+            _ => endpoint.to_string(),
+        },
+        Err(_) => endpoint
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_end_matches('/')
+            .to_string(),
+    };
     address
         .chars()
         .map(|c| {
@@ -112,6 +134,28 @@ fn endpoint_key(endpoint: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Whether `host`, as a parsed URL spells it (lowercase, IPv6 in brackets),
+/// names this machine: a loopback or unspecified address, or `localhost` and
+/// its subdomains.
+fn is_this_machine(host: &str) -> bool {
+    match host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+    {
+        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Err(_) => host == "localhost" || host.ends_with(".localhost"),
+    }
+}
+
+/// Run `step` unless Ctrl-C comes first, which nothing has to be undone for.
+async fn interruptible<T>(step: impl Future<Output = Result<T>>) -> Result<T> {
+    tokio::select! {
+        result = step => result,
+        _ = tokio::signal::ctrl_c() => InterruptedSnafu.fail(),
+    }
 }
 
 /// Where the runtime an agent uses came from.
@@ -137,10 +181,15 @@ impl RuntimeLease {
     /// Join the sessions using the runtime at the context's endpoint, starting
     /// the runtime for the Spicepod in the current directory if none is serving.
     ///
+    /// Ctrl-C ends it with [`Error::Interrupted`](crate::error::Error::Interrupted),
+    /// having stopped a runtime it was starting, so it must not be cancelled by
+    /// dropping it instead.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the coordination files cannot be used, or when a
-    /// runtime has to be started and fails to start serving.
+    /// Returns an error when the coordination files cannot be used, when a
+    /// runtime has to be started and fails to start serving, or when another
+    /// session's runtime holds the address but does not answer at this endpoint.
     pub async fn acquire(ctx: &RuntimeContext) -> Result<Self> {
         let run_dir = ctx.spice_runtime_dir().join("run");
         std::fs::create_dir_all(&run_dir).context(CodingAgentRuntimeLockSnafu {
@@ -149,18 +198,35 @@ impl RuntimeLease {
         let files = SessionFiles::for_endpoint(&run_dir, ctx.http_endpoint());
 
         let start = open_lock(&files.start_lock)?;
-        lock_exclusive_reporting_wait(&start, &files.start_lock, ctx.http_endpoint()).await?;
+        interruptible(lock_exclusive_reporting_wait(
+            &start,
+            &files.start_lock,
+            ctx.http_endpoint(),
+        ))
+        .await?;
 
+        // Whether another session is using the runtime, asked while this one
+        // holds the start lock, which every session joining or leaving takes.
         let sessions = open_lock(&files.sessions_lock)?;
-        lock_shared(&sessions, &files.sessions_lock).await?;
-
-        let origin = match prepare_runtime(ctx, &files).await {
-            Ok(origin) => origin,
-            Err(error) => {
-                // Unlocks happen on drop; nothing was started that outlives us.
-                return Err(error);
+        let alone = match sessions.try_lock() {
+            Ok(()) => {
+                sessions.unlock().context(CodingAgentRuntimeLockSnafu {
+                    path: files.sessions_lock.clone(),
+                })?;
+                true
+            }
+            Err(std::fs::TryLockError::WouldBlock) => false,
+            Err(std::fs::TryLockError::Error(source)) => {
+                return Err(source).context(CodingAgentRuntimeLockSnafu {
+                    path: files.sessions_lock.clone(),
+                });
             }
         };
+        interruptible(lock_shared(&sessions, &files.sessions_lock)).await?;
+
+        // On an error the locks are released on drop, and nothing outlives
+        // this session: a runtime that fails to start is stopped.
+        let origin = prepare_runtime(ctx, &files, alone).await?;
         drop(start);
 
         Ok(Self {
@@ -226,7 +292,13 @@ impl RuntimeLease {
 }
 
 /// Use the runtime already serving at the context's endpoint, or start one.
-async fn prepare_runtime(ctx: &RuntimeContext, files: &SessionFiles) -> Result<Origin> {
+///
+/// `alone` is whether no other session is using the runtime at this address.
+async fn prepare_runtime(
+    ctx: &RuntimeContext,
+    files: &SessionFiles,
+    alone: bool,
+) -> Result<Origin> {
     let recorded = read_state(&files.state)?;
     if is_healthy(ctx).await {
         if let Some(started) = &recorded
@@ -240,10 +312,18 @@ async fn prepare_runtime(ctx: &RuntimeContext, files: &SessionFiles) -> Result<O
     }
 
     if let Some(started) = recorded {
-        // Recorded by a session that no longer exists — no session holds a
-        // lease, or this one could not have joined alone to find it unhealthy —
-        // so a live process is a runtime nobody is waiting on any more.
         if process::is_runtime(&started) {
+            // Alive but not answering here: another spelling of this address
+            // reaches it, and the sessions using it through that one need it.
+            snafu::ensure!(
+                alone,
+                CodingAgentRuntimeElsewhereSnafu {
+                    endpoint: ctx.http_endpoint().to_string(),
+                    started_at: started.endpoint.clone(),
+                }
+            );
+            // Recorded by a session that no longer exists, so nobody is
+            // waiting on it any more.
             process::stop(started.pid, SHUTDOWN_BUDGET).await;
         }
         remove_state(&files.state)?;
@@ -255,7 +335,7 @@ async fn prepare_runtime(ctx: &RuntimeContext, files: &SessionFiles) -> Result<O
 
 async fn start_runtime(ctx: &RuntimeContext, files: &SessionFiles) -> Result<()> {
     ctx.ensure_local_runtime_supported()?;
-    let resolved = crate::runtime_launcher::resolve_or_install(ctx).await?;
+    let resolved = interruptible(crate::runtime_launcher::resolve_or_install(ctx)).await?;
     let mut command = ctx.get_run_cmd(&resolved, &[], None)?;
 
     let log = File::create(&files.log).context(CodingAgentRuntimeLockSnafu {
@@ -293,20 +373,24 @@ async fn start_runtime(ctx: &RuntimeContext, files: &SessionFiles) -> Result<()>
     let started = StartedRuntime {
         pid: child.id(),
         executable: resolved.path().to_path_buf(),
+        endpoint: ctx.http_endpoint().to_string(),
     };
     write_state(&files.state, &started)?;
 
-    let deadline = Instant::now() + HEALTH_BUDGET;
-    loop {
-        if is_healthy(ctx).await {
+    let serving = tokio::select! {
+        serving = wait_until_serving(ctx, &mut child) => serving,
+        _ = tokio::signal::ctrl_c() => Serving::Interrupted,
+    };
+    match serving {
+        Serving::Yes => {
             // The child is deliberately not waited on: it outlives this
             // session whenever another one is still using it.
             drop(child);
-            return Ok(());
+            Ok(())
         }
-        if let Ok(Some(status)) = child.try_wait() {
+        Serving::Exited(status) => {
             remove_state(&files.state)?;
-            return Err(CodingAgentRuntimeStartSnafu {
+            Err(CodingAgentRuntimeStartSnafu {
                 endpoint: ctx.http_endpoint().to_string(),
                 log: files.log.clone(),
                 detail: format!(
@@ -314,12 +398,12 @@ async fn start_runtime(ctx: &RuntimeContext, files: &SessionFiles) -> Result<()>
                     log_tail(&files.log)
                 ),
             }
-            .build());
+            .build())
         }
-        if Instant::now() >= deadline {
+        Serving::TimedOut => {
             process::stop(started.pid, SHUTDOWN_BUDGET).await;
             remove_state(&files.state)?;
-            return Err(CodingAgentRuntimeStartSnafu {
+            Err(CodingAgentRuntimeStartSnafu {
                 endpoint: ctx.http_endpoint().to_string(),
                 log: files.log.clone(),
                 detail: format!(
@@ -328,7 +412,44 @@ async fn start_runtime(ctx: &RuntimeContext, files: &SessionFiles) -> Result<()>
                     log_tail(&files.log)
                 ),
             }
-            .build());
+            .build())
+        }
+        Serving::Interrupted => {
+            // No agent will use it, and no other session can have joined it:
+            // they wait on the start lock this session holds.
+            tracing::info!("Stopping the Spice runtime it was starting...");
+            process::stop(started.pid, SHUTDOWN_BUDGET).await;
+            remove_state(&files.state)?;
+            InterruptedSnafu.fail()
+        }
+    }
+}
+
+/// How a runtime that was launched came out of starting.
+enum Serving {
+    /// It answers `/health`.
+    Yes,
+    /// It exited first.
+    Exited(std::process::ExitStatus),
+    /// It did not answer within [`HEALTH_BUDGET`].
+    TimedOut,
+    /// Ctrl-C came first.
+    Interrupted,
+}
+
+/// Wait for the launched runtime to answer `/health`, to exit, or to run out of
+/// [`HEALTH_BUDGET`].
+async fn wait_until_serving(ctx: &RuntimeContext, child: &mut std::process::Child) -> Serving {
+    let deadline = Instant::now() + HEALTH_BUDGET;
+    loop {
+        if is_healthy(ctx).await {
+            return Serving::Yes;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Serving::Exited(status);
+        }
+        if Instant::now() >= deadline {
+            return Serving::TimedOut;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -456,9 +577,9 @@ mod process {
     #[cfg(unix)]
     use std::time::Instant;
 
-    use super::StartedRuntime;
     #[cfg(unix)]
     use super::POLL_INTERVAL;
+    use super::StartedRuntime;
 
     /// Whether `started` still names a running runtime: the PID is alive and
     /// its executable is the one recorded, so a PID the system has since
@@ -571,26 +692,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn each_endpoint_gets_its_own_files() {
+    fn every_spelling_of_one_address_gets_the_same_files() {
         let files =
             SessionFiles::for_endpoint(Path::new("/home/u/.spice/run"), "http://127.0.0.1:8090");
         assert_eq!(
             files.sessions_lock,
-            PathBuf::from("/home/u/.spice/run/127.0.0.1_8090.sessions.lock")
+            PathBuf::from("/home/u/.spice/run/localhost_8090.sessions.lock")
         );
         assert_eq!(
             files.start_lock,
-            PathBuf::from("/home/u/.spice/run/127.0.0.1_8090.start.lock")
+            PathBuf::from("/home/u/.spice/run/localhost_8090.start.lock")
         );
         assert_eq!(
             files.state,
-            PathBuf::from("/home/u/.spice/run/127.0.0.1_8090.json")
+            PathBuf::from("/home/u/.spice/run/localhost_8090.json")
         );
         assert_eq!(
             files.log,
-            PathBuf::from("/home/u/.spice/run/127.0.0.1_8090.log")
+            PathBuf::from("/home/u/.spice/run/localhost_8090.log")
         );
-        assert_eq!(endpoint_key("http://[::1]:9000/"), "___1__9000");
+        for spelling in [
+            "http://localhost:8090",
+            "http://LocalHost:8090/",
+            "http://[::1]:8090",
+            "http://0.0.0.0:8090",
+            "http://127.0.0.2:8090",
+            "http://spice.localhost:8090",
+            "https://localhost:8090",
+        ] {
+            assert_eq!(endpoint_key(spelling), "localhost_8090", "{spelling}");
+        }
+        // Another port, or another machine, is another runtime.
+        assert_eq!(endpoint_key("http://localhost:9000"), "localhost_9000");
+        assert_eq!(
+            endpoint_key("http://Spice.Internal:8090"),
+            "spice.internal_8090"
+        );
+        assert_eq!(endpoint_key("http://10.0.0.5:8090"), "10.0.0.5_8090");
+        assert_eq!(endpoint_key("http://[fd00::1]:8090"), "_fd00__1__8090");
+        // A port left out is the scheme's.
+        assert_eq!(endpoint_key("http://localhost"), "localhost_80");
+        // An endpoint that is not a URL is still a file name.
+        assert_eq!(endpoint_key("not a url/"), "not_a_url");
     }
 
     #[test]
@@ -635,6 +778,7 @@ mod tests {
         let started = StartedRuntime {
             pid: 42,
             executable: PathBuf::from("/bin/spiced"),
+            endpoint: String::from("http://127.0.0.1:8090"),
         };
         write_state(&path, &started).expect("write state");
         assert_eq!(read_state(&path).expect("read state"), Some(started));

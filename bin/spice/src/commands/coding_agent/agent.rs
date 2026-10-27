@@ -27,6 +27,7 @@ limitations under the License.
 //! no agent's config file is edited, and anything an agent has to read from
 //! disk is written to a directory that is removed when the agent exits.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -207,6 +208,34 @@ impl Agent {
         }
     }
 
+    /// The argument that starts the agent on the Spice model `model`, in the
+    /// spelling its model option takes.
+    pub(crate) fn model_argument(self, model: &str) -> String {
+        match self {
+            Self::OpenCode => format!("-m {PROVIDER_ID}/{model}"),
+            Self::Pi => format!("--model {PROVIDER_ID}/{model}"),
+            _ => format!("--model {model}"),
+        }
+    }
+
+    /// The model a `--model` value names when the user left out the provider
+    /// the agent's model option requires: `qwen` for `-m qwen`, which `OpenCode`
+    /// and pi do not read as a Spice model.
+    pub(crate) fn without_provider(self, value: &str) -> Option<&str> {
+        match self {
+            Self::OpenCode | Self::Pi if !value.contains('/') => Some(self.model_id(value)),
+            _ => None,
+        }
+    }
+
+    /// `model` without the `:<thinking>` level pi accepts after a model.
+    fn model_id(self, model: &str) -> &str {
+        match (self, model.rsplit_once(':')) {
+            (Self::Pi, Some((model, level))) if PI_THINKING_LEVELS.contains(&level) => model,
+            _ => model,
+        }
+    }
+
     /// The Spice model a user's `--model` value names, or `None` when it names
     /// something the agent resolves itself.
     fn spice_model_of(self, value: &str) -> Option<String> {
@@ -214,13 +243,7 @@ impl Agent {
             // `provider/model` (pi adds an optional `:<thinking>` level).
             Self::OpenCode | Self::Pi => {
                 let model = value.strip_prefix(&format!("{PROVIDER_ID}/"))?;
-                let model = match (self, model.rsplit_once(':')) {
-                    (Self::Pi, Some((model, level))) if PI_THINKING_LEVELS.contains(&level) => {
-                        model
-                    }
-                    _ => model,
-                };
-                Some(model.to_string())
+                Some(self.model_id(model).to_string())
             }
             // Claude Code's aliases resolve to the Spice model through the
             // `ANTHROPIC_DEFAULT_*_MODEL` variables, so they name no model of
@@ -251,8 +274,8 @@ pub(crate) enum RequestedModel {
     Unspecified,
     /// The option names something the agent resolves itself — an alias, or
     /// another provider's model — so there is no Spice model to check, but no
-    /// model option may be added either.
-    AgentOwned,
+    /// model option may be added either. Holds the value as the user gave it.
+    AgentOwned(String),
     /// The option names this Spice model.
     Spice(String),
 }
@@ -263,7 +286,7 @@ impl RequestedModel {
     pub fn spice_model(&self) -> Option<&str> {
         match self {
             Self::Spice(model) => Some(model),
-            Self::Unspecified | Self::AgentOwned => None,
+            Self::Unspecified | Self::AgentOwned(_) => None,
         }
     }
 
@@ -299,9 +322,13 @@ pub(crate) fn requested_model(agent: Agent, args: &[OsString]) -> RequestedModel
             } else {
                 continue;
             };
-            return match value.and_then(|value| agent.spice_model_of(&value)) {
+            let Some(value) = value else {
+                // The option ends the arguments, so the agent reports it.
+                return RequestedModel::AgentOwned(String::new());
+            };
+            return match agent.spice_model_of(&value) {
                 Some(model) => RequestedModel::Spice(model),
-                None => RequestedModel::AgentOwned,
+                None => RequestedModel::AgentOwned(value),
             };
         }
     }
@@ -327,9 +354,16 @@ pub(crate) struct Backend<'a> {
     /// Whether the user named the model with the agent's own option, in which
     /// case no model option is added: the agent would refuse it twice.
     pub model_given: bool,
+    /// The context window of each of [`Self::models`] that the runtime reports one for.
+    pub context_windows: &'a HashMap<String, u64>,
 }
 
 impl Backend<'_> {
+    /// The context window of the model the agent starts on, when the runtime reports it.
+    fn start_window(&self) -> Option<u64> {
+        self.context_windows.get(self.model).copied()
+    }
+
     fn token(&self) -> &str {
         self.api_key.unwrap_or(PLACEHOLDER_TOKEN)
     }
@@ -441,6 +475,11 @@ fn claude_code(backend: &Backend<'_>) -> Launch {
         // differs between versions, so it would only cost a cache miss.
         ("CLAUDE_CODE_ATTRIBUTION_HEADER", os("0")),
     ];
+    if let Some(window) = backend.start_window() {
+        // Claude Code otherwise assumes 200k tokens for a model id it does not recognize,
+        // and compacts — or overflows — at the wrong point.
+        env.push(("CLAUDE_CODE_MAX_CONTEXT_TOKENS", os(window.to_string())));
+    }
     if !backend.native_messages {
         // Tool search defers tools with `defer_loading`, which a Messages
         // request translated into a chat completion cannot carry: the runtime
@@ -491,6 +530,12 @@ fn codex(backend: &Backend<'_>) -> Launch {
     // `--model` overrides instead of colliding with.
     args.push(os("-c"));
     args.push(os(format!("model={}", toml_string(backend.model))));
+    if let Some(window) = backend.start_window() {
+        // Codex sizes its auto-compaction by it, and otherwise falls back to a default for
+        // a model it has no metadata for.
+        args.push(os("-c"));
+        args.push(os(format!("model_context_window={window}")));
+    }
     Launch {
         args,
         env,
@@ -516,7 +561,13 @@ fn copilot(backend: &Backend<'_>) -> Launch {
             ("COPILOT_PROVIDER_WIRE_API", os("completions")),
             ("COPILOT_PROVIDER_API_KEY", os(backend.token())),
             ("COPILOT_MODEL", os(backend.model)),
-        ],
+        ]
+        .into_iter()
+        .chain(backend.start_window().map(|window| {
+            // Copilot otherwise falls back to a default for a model id it does not know.
+            ("COPILOT_PROVIDER_MAX_PROMPT_TOKENS", os(window.to_string()))
+        }))
+        .collect(),
         env_remove: COPILOT_ENV_REMOVE.to_vec(),
         files: Vec::new(),
         prepare: None,
@@ -578,6 +629,9 @@ fn grok(backend: &Backend<'_>, scratch: &Path) -> Launch {
 
 /// `OpenCode` reads an inline JSON config from `OPENCODE_CONFIG_CONTENT`, which
 /// is merged over the user's global and project configs.
+///
+/// No context window is given: a model's `limit` requires an `output` limit
+/// beside `context`, and the runtime reports none to give it.
 fn opencode(backend: &Backend<'_>) -> Launch {
     let models: serde_json::Map<String, serde_json::Value> = backend
         .models
@@ -629,8 +683,9 @@ fn pi(backend: &Backend<'_>, scratch: &Path) -> Launch {
                 "reasoning": false,
                 "input": ["text"],
                 "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                // pi's own defaults for a model it has no catalog entry for.
-                "contextWindow": 128_000,
+                // The runtime's window when it reports one; else pi's own default for a
+                // model it has no catalog entry for, as is its 16k answer limit.
+                "contextWindow": backend.context_windows.get(model).copied().unwrap_or(128_000),
                 "maxTokens": 16_384,
             })
         })
@@ -723,6 +778,9 @@ mod tests {
         vec!["qwen".to_string(), "gpt".to_string()]
     }
 
+    static NO_WINDOWS: std::sync::LazyLock<HashMap<String, u64>> =
+        std::sync::LazyLock::new(HashMap::new);
+
     fn backend<'a>(models: &'a [String], api_key: Option<&'a str>) -> Backend<'a> {
         Backend {
             endpoint: ENDPOINT,
@@ -731,6 +789,7 @@ mod tests {
             models,
             native_messages: false,
             model_given: false,
+            context_windows: &NO_WINDOWS,
         }
     }
 
@@ -1067,12 +1126,27 @@ mod tests {
         // Another provider's model is the agent's business: nothing to validate.
         assert_eq!(
             requested(Agent::OpenCode, &["-m", "anthropic/claude"]),
-            RequestedModel::AgentOwned
+            RequestedModel::AgentOwned("anthropic/claude".to_string())
         );
         assert_eq!(
             requested(Agent::ClaudeCode, &["--model", "opus[1m]"]),
-            RequestedModel::AgentOwned
+            RequestedModel::AgentOwned("opus[1m]".to_string())
         );
+    }
+
+    #[test]
+    fn a_model_without_the_provider_its_agent_needs_is_recognized() {
+        assert_eq!(Agent::OpenCode.without_provider("qwen"), Some("qwen"));
+        assert_eq!(Agent::Pi.without_provider("qwen:high"), Some("qwen"));
+        assert_eq!(Agent::Pi.without_provider("qwen3:4b"), Some("qwen3:4b"));
+        assert_eq!(Agent::OpenCode.without_provider("spice/qwen"), None);
+        assert_eq!(Agent::OpenCode.without_provider("anthropic/claude"), None);
+        // Every other agent takes a bare model.
+        assert_eq!(Agent::Codex.without_provider("qwen"), None);
+
+        assert_eq!(Agent::OpenCode.model_argument("qwen"), "-m spice/qwen");
+        assert_eq!(Agent::Pi.model_argument("qwen"), "--model spice/qwen");
+        assert_eq!(Agent::Codex.model_argument("qwen"), "--model qwen");
     }
 
     #[test]
@@ -1095,6 +1169,57 @@ mod tests {
         assert!(
             args_of(&launch(Agent::Codex, &given, Path::new("/scratch")))
                 .contains(&r#"model="qwen""#.to_string())
+        );
+    }
+
+    #[test]
+    fn a_reported_context_window_reaches_each_agent_that_takes_one() {
+        let models = models();
+        let windows = HashMap::from([("qwen".to_string(), 40_960), ("gpt".to_string(), 400_000)]);
+        let mut sized = backend(&models, None);
+        sized.context_windows = &windows;
+        let scratch = Path::new("/scratch");
+
+        let claude = env_of(&launch(Agent::ClaudeCode, &sized, scratch));
+        assert!(
+            claude.contains(&("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "40960".to_string())),
+            "{claude:?}"
+        );
+        let codex = args_of(&launch(Agent::Codex, &sized, scratch));
+        assert!(
+            codex.contains(&"model_context_window=40960".to_string()),
+            "{codex:?}"
+        );
+        let copilot = env_of(&launch(Agent::CopilotCli, &sized, scratch));
+        assert!(
+            copilot.contains(&("COPILOT_PROVIDER_MAX_PROMPT_TOKENS", "40960".to_string())),
+            "{copilot:?}"
+        );
+        // pi takes one per model.
+        let pi = launch(Agent::Pi, &sized, scratch);
+        assert!(
+            pi.files[0].contents.contains(r#""contextWindow":40960"#),
+            "{}",
+            pi.files[0].contents
+        );
+        assert!(
+            pi.files[0].contents.contains(r#""contextWindow":400000"#),
+            "{}",
+            pi.files[0].contents
+        );
+
+        // Without a reported window, nothing is said: the agents keep their own defaults.
+        let unsized_claude = env_of(&launch(Agent::ClaudeCode, &backend(&models, None), scratch));
+        assert!(
+            !unsized_claude
+                .iter()
+                .any(|(key, _)| *key == "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+        );
+        let unsized_codex = args_of(&launch(Agent::Codex, &backend(&models, None), scratch));
+        assert!(
+            !unsized_codex
+                .iter()
+                .any(|arg| arg.starts_with("model_context_window"))
         );
     }
 

@@ -533,7 +533,9 @@ pub(crate) fn routes(
             .route(v1::gemini::MODELS_PATH, get(v1::gemini::list_models))
             .route(
                 v1::gemini::MODEL_PATH,
-                get(v1::gemini::get_model).post(v1::gemini::post).layer(ModelContextLayer),
+                get(v1::gemini::get_model)
+                    .post(v1::gemini::post)
+                    .layer(ModelContextLayer),
             )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route(

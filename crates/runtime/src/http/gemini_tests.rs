@@ -125,7 +125,12 @@ async fn a_streamed_answer_is_sent_as_server_sent_events() {
     let events = sse_events(&body);
     let text: String = events
         .iter()
-        .flat_map(|(_, data)| data["candidates"][0]["content"]["parts"].as_array().cloned().unwrap_or_default())
+        .flat_map(|(_, data)| {
+            data["candidates"][0]["content"]["parts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
         .filter_map(|part| part["text"].as_str().map(str::to_string))
         .collect();
     assert_eq!(text, "pong");
@@ -140,8 +145,13 @@ async fn a_streamed_answer_is_sent_as_server_sent_events() {
     );
 
     // Without `alt=sse`, the same stream is one JSON array.
-    let (status, _, body) =
-        send(&routes, "/v1beta/models/gpt:streamGenerateContent", &[], &ping()).await;
+    let (status, _, body) = send(
+        &routes,
+        "/v1beta/models/gpt:streamGenerateContent",
+        &[],
+        &ping(),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let responses = parsed(&body);
     assert!(
@@ -165,7 +175,8 @@ async fn a_function_call_reaches_the_client_as_a_function_call_part() {
             "parameters": {"type": "OBJECT", "properties": {"city": {"type": "STRING"}}, "required": ["city"]}
         }]}]
     });
-    let (status, _, body) = send(&routes, "/v1beta/models/gpt:generateContent", &[], &request).await;
+    let (status, _, body) =
+        send(&routes, "/v1beta/models/gpt:generateContent", &[], &request).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let body = parsed(&body);
     let parts = body["candidates"][0]["content"]["parts"]
@@ -184,8 +195,7 @@ async fn a_function_call_reaches_the_client_as_a_function_call_part() {
     let tools = received[0].body["tools"].as_array().expect("chat tools");
     assert_eq!(tools[0]["function"]["name"], "get_weather");
     assert_eq!(
-        tools[0]["function"]["parameters"]["properties"]["city"]["type"],
-        "string",
+        tools[0]["function"]["parameters"]["properties"]["city"]["type"], "string",
         "Gemini's schema types are translated to JSON Schema's"
     );
 }
@@ -196,8 +206,13 @@ async fn errors_are_in_the_gemini_api_error_body() {
     let endpoint = start_provider(&seen).await;
     let routes = runtime_with(vec![model("gpt", "openai:gpt-4o", &endpoint, &[])]).await;
 
-    let (status, _, body) =
-        send(&routes, "/v1beta/models/missing:generateContent", &[], &ping()).await;
+    let (status, _, body) = send(
+        &routes,
+        "/v1beta/models/missing:generateContent",
+        &[],
+        &ping(),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(
         parsed(&body),
@@ -234,7 +249,10 @@ async fn a_request_without_a_valid_api_key_is_refused_with_the_gemini_error_body
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     let body = parsed(&body);
     assert_eq!(
-        (body["error"]["code"].as_u64(), body["error"]["status"].as_str()),
+        (
+            body["error"]["code"].as_u64(),
+            body["error"]["status"].as_str()
+        ),
         (Some(401), Some("UNAUTHENTICATED")),
         "{body}"
     );
@@ -272,9 +290,15 @@ async fn models_are_listed_in_the_gemini_api_shape() {
     assert_eq!(names, ["models/claude", "models/gpt"]);
 
     let (status, body) = get(&routes, "/v1beta/models/gpt").await;
-    assert_eq!((status, &body["name"]), (StatusCode::OK, &json!("models/gpt")));
+    assert_eq!(
+        (status, &body["name"]),
+        (StatusCode::OK, &json!("models/gpt"))
+    );
     let (status, body) = get(&routes, "/v1beta/models/missing").await;
-    assert_eq!((status, &body["error"]["status"]), (StatusCode::NOT_FOUND, &json!("NOT_FOUND")));
+    assert_eq!(
+        (status, &body["error"]["status"]),
+        (StatusCode::NOT_FOUND, &json!("NOT_FOUND"))
+    );
 }
 
 /// A provider without a Responses API of its own answers `/v1/responses` through its chat:
@@ -313,7 +337,10 @@ async fn a_model_without_a_native_responses_api_answers_it_through_its_chat() {
         .collect();
     assert_eq!(text, "pong");
     assert_eq!(
-        taken(&seen).iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+        taken(&seen)
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect::<Vec<_>>(),
         ["/v1/messages"],
         "the chat of an Anthropic model calls Anthropic's Messages API"
     );

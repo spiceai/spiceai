@@ -952,6 +952,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::CodingAgentPrepare { .. } => "coding_agent_prepare_failed",
         spice::error::Error::CodingAgentFile { .. } => "coding_agent_file",
         spice::error::Error::CodingAgentRuntimeStart { .. } => "runtime_start_failed",
+        spice::error::Error::CodingAgentRuntimeElsewhere { .. } => "runtime_endpoint_mismatch",
         spice::error::Error::CodingAgentRuntimeLock { .. } => "runtime_lock",
         spice::error::Error::CodingAgentRuntimeState { .. } => "runtime_state",
         spice::error::Error::CodingAgentModelFailed { .. } => "model_load_failed",

@@ -78,4 +78,9 @@ pub struct ModelInfo {
     /// Optional metadata fields, included when requested via query parameters
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ModelMetadata>,
+
+    /// The most tokens one request can hold, prompt and answer together: a local model's
+    /// context size, or what a hosted model's provider reports. Absent when it is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }

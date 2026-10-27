@@ -849,6 +849,12 @@ impl Runtime {
         self.llm_runtime_stores.capabilities()
     }
 
+    /// Each chat model's context window, by model name, for the models that report one.
+    #[must_use]
+    pub fn model_context_windows(&self) -> Arc<RwLock<HashMap<String, u64>>> {
+        self.llm_runtime_stores.context_windows()
+    }
+
     pub async fn responses_supported_model_names(&self) -> HashSet<String> {
         let capabilities = self.llm_runtime_stores.capabilities();
         let capabilities = capabilities.read().await;

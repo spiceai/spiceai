@@ -142,6 +142,24 @@ impl RouterModel {
 
 #[async_trait::async_trait]
 impl Chat for RouterModel {
+    /// The smallest window of the models it routes between, since a request may reach any
+    /// of them; `None` when one of them reports none.
+    async fn context_window(&self) -> Option<u64> {
+        let routed: Vec<Arc<dyn Chat>> = {
+            let models = self.models.read().await;
+            self.models_cfg
+                .iter()
+                .map(|config| models.get(&config.from()).map(Arc::clone))
+                .collect::<Option<Vec<_>>>()?
+        };
+        let mut smallest: Option<u64> = None;
+        for model in routed {
+            let window = model.context_window().await?;
+            smallest = Some(smallest.map_or(window, |current| current.min(window)));
+        }
+        smallest
+    }
+
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,

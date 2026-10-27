@@ -119,10 +119,9 @@ pub async fn execute(ctx: &RuntimeContext, agent: Agent, args: &CodingAgentArgs)
     );
     let program = find_agent(agent)?;
 
-    let lease = tokio::select! {
-        lease = RuntimeLease::acquire(ctx) => lease?,
-        _ = tokio::signal::ctrl_c() => return InterruptedSnafu.fail(),
-    };
+    // Not raced against Ctrl-C here: acquiring handles it, stopping a runtime
+    // it was starting, which dropping it midway would leave running.
+    let lease = RuntimeLease::acquire(ctx).await?;
     if *lease.origin() == Origin::AlreadyRunning {
         tracing::info!(
             "Using the Spice runtime already serving at {}",
@@ -174,7 +173,7 @@ async fn prepare_agent(
     interactive: bool,
 ) -> Result<Prepared> {
     let model_given = requested.given();
-    let selection = models::select(ctx, requested.spice_model(), interactive).await?;
+    let selection = models::select(ctx, agent, &requested, interactive).await?;
 
     let scratch = tempfile::Builder::new()
         .prefix(&format!("spice-{}-", agent.command()))
@@ -187,6 +186,7 @@ async fn prepare_agent(
         models: &selection.available,
         native_messages: selection.native_messages,
         model_given,
+        context_windows: &selection.context_windows,
     };
     let launch = agent::launch(agent, &backend, scratch.path());
     process::write_files(&launch.files)?;

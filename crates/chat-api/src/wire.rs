@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! The chat types serialize every unset token-count detail as `null` —
 //! `"prompt_tokens_details": {"audio_tokens": null, "cached_tokens": 13}`. The
-//! OpenAI API never sends `null` there: it reports a count or leaves the field
+//! `OpenAI` API never sends `null` there: it reports a count or leaves the field
 //! out. Clients that deserialize usage into integer fields, such as Grok Build,
 //! reject the whole response over it, so a count nobody reported is omitted
 //! instead. It is never replaced with `0`, which would claim a measurement.

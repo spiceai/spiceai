@@ -45,6 +45,7 @@ use tracing_futures::Instrument;
 
 use crate::streaming_utils::generate_stream_id;
 
+pub mod model_info;
 pub mod streaming_utils;
 pub mod wire;
 
@@ -596,6 +597,19 @@ pub trait Chat: Sync + Send {
             usage: None,
             service_tier: None,
         })
+    }
+
+    /// The most tokens one request can hold, prompt and answer together, when the model
+    /// reports it: a local model's context size, or a hosted model's from its provider's
+    /// model metadata. `None` when it is not known — never an estimate, since a client sizes
+    /// its context management by it.
+    ///
+    /// Asked once, when the model loads, and may call the provider.
+    ///
+    /// A type that wraps another `Chat` must forward this to the model it wraps: the default
+    /// answers `None`, which would hide the inner model's window.
+    async fn context_window(&self) -> Option<u64> {
+        None
     }
 }
 

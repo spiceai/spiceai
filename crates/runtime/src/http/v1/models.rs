@@ -185,6 +185,8 @@ pub(crate) async fn get(
         HashSet::default()
     };
 
+    let context_windows = rt.model_context_windows();
+    let context_windows = context_windows.read().await.clone();
     let mut models = match app.read().await.as_ref() {
         Some(a) => a
             .models
@@ -218,6 +220,7 @@ pub(crate) async fn get(
                     error,
                     error_message,
                     metadata: generate_metadata(&m.name, &metadata_keys, &responses_models),
+                    context_window: context_windows.get(&m.name).copied(),
                 }
             })
             .collect::<Vec<OpenAIModel>>(),
@@ -261,6 +264,7 @@ pub(crate) async fn get(
             error,
             error_message,
             metadata: generate_metadata(name, &metadata_keys, &responses_models),
+            context_window: None,
         })
     }));
 
@@ -286,7 +290,11 @@ pub(crate) async fn get(
 fn convert_details_to_csv(models: &[OpenAIModel]) -> Result<String, Box<dyn std::error::Error>> {
     let mut w = Writer::from_writer(vec![]);
     for d in models {
-        let _ = w.serialize(d);
+        // The context window is reported in JSON only: CSV takes its columns from the first
+        // row, so a field some models have and others lack would misalign the rest.
+        let mut row = d.clone();
+        row.context_window = None;
+        let _ = w.serialize(row);
     }
     w.flush()?;
     Ok(String::from_utf8(w.into_inner()?)?)

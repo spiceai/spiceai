@@ -149,6 +149,8 @@ pub struct LlamaCpp {
     special: SpecialTokens,
     reasoning_support: ReasoningSupport,
     counter: AtomicUsize,
+    /// See [`Loaded::context_window`].
+    context_window: u32,
 }
 
 /// A model's chat template: one, or named ones from a `tokenizer_config.json`, which a request
@@ -168,6 +170,8 @@ struct Loaded {
     /// `general.architecture`, as the GGUF names it.
     architecture: Option<String>,
     special: SpecialTokens,
+    /// The context llama.cpp created, in tokens: what one request can hold.
+    context_window: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -376,6 +380,7 @@ impl LlamaCpp {
             special: loaded.special,
             reasoning_support,
             counter: AtomicUsize::new(0),
+            context_window: loaded.context_window,
         })
     }
 
@@ -496,6 +501,11 @@ impl LlamaCpp {
 impl Chat for LlamaCpp {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         None
+    }
+
+    /// The context llama.cpp runs the model with: `context_length`, or the default.
+    async fn context_window(&self) -> Option<u64> {
+        (self.context_window > 0).then_some(u64::from(self.context_window))
     }
 
     async fn health(&self) -> Result<()> {
@@ -811,6 +821,7 @@ fn serve(
             return;
         }
     };
+    let context_window = context.n_ctx();
     let head = draft_model.as_ref().or(drafts_itself.then_some(&model));
     let mut decoder = match head {
         None => Decoder::Plain(context),
@@ -831,6 +842,7 @@ fn serve(
         template: model.chat_template(),
         architecture: model.architecture(),
         special,
+        context_window,
     };
     // Ruled out while a required tool call is outstanding.
     let eog = vocab.eog_tokens();

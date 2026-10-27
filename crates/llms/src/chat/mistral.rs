@@ -815,6 +815,13 @@ impl Chat for MistralLlama {
         Ok(())
     }
 
+    /// The longest sequence mistral.rs runs the model with: it refuses a longer prompt.
+    async fn context_window(&self) -> Option<u64> {
+        // Only one model runs in this pipeline.
+        let length = self.pipeline.max_sequence_length(None).ok()??;
+        u64::try_from(length).ok().filter(|window| *window > 0)
+    }
+
     async fn stream<'a>(
         &self,
         prompt: String,

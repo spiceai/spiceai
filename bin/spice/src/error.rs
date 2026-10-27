@@ -357,6 +357,14 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Failed to use the Spice runtime at {endpoint}, so the coding agent was not started: another `spice` session is using the runtime it started at {started_at}, which does not answer at {endpoint}. Rerun with `--http-endpoint {started_at}`, or use another port. See: https://spiceai.org/docs/cli"
+    ))]
+    CodingAgentRuntimeElsewhere {
+        endpoint: String,
+        started_at: String,
+    },
+
+    #[snafu(display(
         "Failed to coordinate the Spice runtime with other `spice` sessions through '{}': {source}",
         path.display()
     ))]

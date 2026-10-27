@@ -36,11 +36,11 @@ use runtime_tls::TlsConfig;
 
 #[cfg(feature = "openapi")]
 pub use routes::get_api_doc;
-#[cfg(feature = "mcp")]
-mod mcp_transport;
 #[cfg(test)]
 #[cfg(feature = "models")]
 mod gemini_tests;
+#[cfg(feature = "mcp")]
+mod mcp_transport;
 #[cfg(test)]
 #[cfg(feature = "models")]
 mod messages_tests;

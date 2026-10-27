@@ -33,6 +33,12 @@ use super::{ChatBackend, Openai, responses_adapter};
 
 #[async_trait]
 impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
+    /// The window the endpoint's model listing reports: none from `OpenAI` itself, but the
+    /// servers compatible with it (vLLM, the llama.cpp server, LM Studio, gateways) list it.
+    async fn context_window(&self) -> Option<u64> {
+        crate::model_info::listed_context_window(self.client.config(), &self.model).await
+    }
+
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         // Only use structured output schema for OpenAI, not openai compatible.
         if self.supports_structured_output() {

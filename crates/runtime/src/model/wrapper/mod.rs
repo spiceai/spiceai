@@ -315,6 +315,10 @@ impl ChatWrapper {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl Chat for ChatWrapper {
+    async fn context_window(&self) -> Option<u64> {
+        self.chat.context_window().await
+    }
+
     /// Expect `captured_output` to be instrumented by the underlying chat model (to not reopen/parse streams). i.e.
     /// ```rust
     /// tracing::info!(target: "task_history", captured_output = %chat_output)

@@ -57,6 +57,11 @@ use async_trait::async_trait;
 
 #[async_trait]
 impl Chat for Anthropic {
+    /// The `max_input_tokens` Anthropic's Models API reports for the model.
+    async fn context_window(&self) -> Option<u64> {
+        crate::model_info::retrieved_context_window(self.client.config(), &self.model).await
+    }
+
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         Some(&StructuredOutputSqlGeneration {})
     }

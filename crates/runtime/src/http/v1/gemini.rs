@@ -39,8 +39,8 @@ use axum::{
 };
 use futures::StreamExt;
 use gemini_api::{
-    CountTokensRequest, GeminiError, GeminiStatus, GenerateContentRequest,
-    GenerateContentResponse, GenerateContentStream, ListModelsResponse,
+    CountTokensRequest, GeminiError, GeminiStatus, GenerateContentRequest, GenerateContentResponse,
+    GenerateContentStream, ListModelsResponse,
 };
 use gemini_chat::{GeminiChat, model_listing};
 use model_capabilities::{Capability, CapabilityStore, Refusal, require};
@@ -564,9 +564,9 @@ mod tests {
         assert_eq!(body["error"]["code"], 400);
         assert_eq!(body["error"]["status"], "INVALID_ARGUMENT");
         assert!(
-            body["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.starts_with("The request body is not a valid request")),
+            body["error"]["message"].as_str().is_some_and(
+                |message| message.starts_with("The request body is not a valid request")
+            ),
             "{body}"
         );
 
@@ -582,9 +582,21 @@ mod tests {
 
     #[test]
     fn a_layers_http_status_reads_as_its_gemini_status() {
-        assert_eq!(status_of(StatusCode::UNAUTHORIZED), GeminiStatus::Unauthenticated);
-        assert_eq!(status_of(StatusCode::PAYLOAD_TOO_LARGE), GeminiStatus::InvalidArgument);
-        assert_eq!(status_of(StatusCode::SERVICE_UNAVAILABLE), GeminiStatus::Unavailable);
-        assert_eq!(status_of(StatusCode::INTERNAL_SERVER_ERROR), GeminiStatus::Internal);
+        assert_eq!(
+            status_of(StatusCode::UNAUTHORIZED),
+            GeminiStatus::Unauthenticated
+        );
+        assert_eq!(
+            status_of(StatusCode::PAYLOAD_TOO_LARGE),
+            GeminiStatus::InvalidArgument
+        );
+        assert_eq!(
+            status_of(StatusCode::SERVICE_UNAVAILABLE),
+            GeminiStatus::Unavailable
+        );
+        assert_eq!(
+            status_of(StatusCode::INTERNAL_SERVER_ERROR),
+            GeminiStatus::Internal
+        );
     }
 }
