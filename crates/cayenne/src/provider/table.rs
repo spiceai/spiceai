@@ -2479,6 +2479,10 @@ pub struct CayenneTableProvider {
     /// Parsed per-file PK blooms of the cold manifest, probed by point lookups to
     /// skip cold files. Shared across writer clones like the manifest.
     cold_pk_blooms: Arc<super::cold_pk_prune::ColdPkBloomCache>,
+    /// Decoded per-file statistics of the cold manifest, so a scan decodes each
+    /// cold file's persisted statistics once rather than on every query. Shared
+    /// across writer clones like the manifest.
+    cold_file_statistics: Arc<super::cold_file_stats::ColdFileStatisticsCache>,
     /// Test-only seam fired just before a pass publishes, so a test can commit a
     /// snapshot replacement (overwrite/promotion) inside the exact window the
     /// pass's overwrite guard defends: between the catalog CAS commit and the
@@ -10586,6 +10590,7 @@ impl CayenneTableProvider {
             current_sorted_snapshot: Arc::new(ArcSwap::from_pointee(None)),
             cold_manifest: Arc::new(ArcSwap::from_pointee(None)),
             cold_pk_blooms: Arc::default(),
+            cold_file_statistics: Arc::default(),
             mem_checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             mem_tier_publish_locks: (0..mem_tier_shards)
                 .map(|_| tokio::sync::Mutex::new(()))
@@ -12986,6 +12991,7 @@ impl CayenneTableProvider {
             // clone's scans resolve against.
             cold_manifest: Arc::clone(&self.cold_manifest),
             cold_pk_blooms: Arc::clone(&self.cold_pk_blooms),
+            cold_file_statistics: Arc::clone(&self.cold_file_statistics),
             mem_checkpoint_lock: Arc::clone(&self.mem_checkpoint_lock),
             // Shared across clones so EVERY writer serializes on the one publish
             // lock (the seq-ordering invariant requires a single lock per table).
@@ -40250,6 +40256,8 @@ impl CayenneTableProvider {
             self.cold_pk_blooms.trim(&cold_files);
         }
 
+        self.cold_file_statistics.trim(&cold_files);
+
         let table_name = self.table_metadata.table_name.clone();
         let mut object_store_url: Option<ListingTableUrl> = None;
         let mut kept: Vec<PartitionedFile> = Vec::with_capacity(cold_files.len());
@@ -40270,11 +40278,10 @@ impl CayenneTableProvider {
                 u64::try_from(file.file_size_bytes).unwrap_or(0),
             );
             let mut part_file = PartitionedFile::from(object_meta);
-            if let Some(stats) = crate::stats::statistics_from_persisted_blob(
-                &file.statistics_blob,
-                &file_statistics_schema,
-                file.row_count,
-            ) {
+            if let Some(stats) = self
+                .cold_file_statistics
+                .statistics_for(file, &file_statistics_schema)
+            {
                 part_file = part_file.with_statistics(stats);
             }
             if let Some(ref predicate) = listing_pruning_predicate
