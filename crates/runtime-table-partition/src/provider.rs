@@ -106,12 +106,6 @@ pub struct PartitionTableProvider {
 }
 
 impl PartitionTableProvider {
-    /// The creator this table makes its partitions with.
-    #[must_use]
-    pub fn creator(&self) -> &Arc<dyn PartitionCreator> {
-        &self.creator
-    }
-
     /// Checks if a filter expression contains or references any of the partition expressions.
     /// This is used to identify filters that can be used for partition pruning.
     fn filter_contains_any_partition_expr(
