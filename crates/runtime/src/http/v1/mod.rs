@@ -359,7 +359,7 @@ async fn query_stream_to_http_response(
     };
 
     let account = EgressAccount::register(&memory_pool, "http_egress");
-    let body = match record_batch_body(kind, first, data_stream, account) {
+    let body = match record_batch_body(kind, first.as_ref(), data_stream, account) {
         Ok(body) => body,
         Err(e) => return encoding_error_response(&e),
     };
@@ -546,7 +546,7 @@ async fn query_raw_stream_to_http_response(
     };
 
     let account = EgressAccount::register(&memory_pool, "http_egress");
-    let body = match record_batch_body(kind, first, data_stream, account) {
+    let body = match record_batch_body(kind, first.as_ref(), data_stream, account) {
         Ok(body) => body,
         Err(e) => return encoding_error_response(&e),
     };
@@ -630,7 +630,7 @@ impl StreamedBody {
 /// `vnd.spiceai.sql.v1+json`.
 enum BodyEncoder {
     Json {
-        writer: arrow_json::Writer<Vec<u8>, arrow_json::writer::JsonArray>,
+        writer: Box<arrow_json::Writer<Vec<u8>, arrow_json::writer::JsonArray>>,
         /// The `vnd.spiceai.sql.v1+json` object around the array, if any.
         envelope: Option<VndEnvelope>,
         rows: usize,
@@ -651,7 +651,7 @@ impl BodyEncoder {
     fn new(kind: StreamedBody, schema: Option<&arrow::datatypes::Schema>) -> std::io::Result<Self> {
         match kind {
             StreamedBody::JsonArray => Ok(Self::Json {
-                writer: json_array_writer(),
+                writer: Box::new(json_array_writer()),
                 envelope: None,
                 rows: 0,
             }),
@@ -666,14 +666,14 @@ impl BodyEncoder {
         schema: Option<&arrow::datatypes::Schema>,
         sql: Option<String>,
     ) -> std::io::Result<Self> {
-        let mut writer = json_array_writer();
+        let mut writer = Box::new(json_array_writer());
         // `row_count` is only known at the end, so it follows `data`; the keys
         // of a JSON object are unordered.
         let out = writer.get_mut();
         out.extend_from_slice(br#"{"schema":"#);
         match schema {
             Some(schema) => {
-                serde_json::to_writer(&mut *out, schema).map_err(std::io::Error::other)?
+                serde_json::to_writer(&mut *out, schema).map_err(std::io::Error::other)?;
             }
             None => out.extend_from_slice(b"{}"),
         }
@@ -741,15 +741,15 @@ impl BodyEncoder {
 /// body breaks off.
 fn record_batch_body<S, B>(
     kind: StreamedBody,
-    first: Option<B>,
+    first: Option<&B>,
     mut rest: S,
     account: Arc<EgressAccount>,
-) -> std::io::Result<impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>
+) -> std::io::Result<impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + use<S, B>>
 where
     S: Stream<Item = Result<B, datafusion::error::DataFusionError>> + Send + Unpin + 'static,
     B: SqlJsonBatch,
 {
-    let first = first.as_ref().map(SqlJsonBatch::as_record_batch);
+    let first = first.map(SqlJsonBatch::as_record_batch);
     let mut encoder = BodyEncoder::new(kind, first.map(|batch| batch.schema_ref().as_ref()))?;
     let head = match first {
         Some(batch) => encoder.encode(batch)?,
@@ -999,10 +999,7 @@ fn arrow_to_vnd_sql_json_v1(
     meta: ResponseMetadata,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let schema = data.first().map(RecordBatch::schema);
-    if schema
-        .as_deref()
-        .is_some_and(|schema| schema_has_union_columns(schema))
-    {
+    if schema.as_deref().is_some_and(schema_has_union_columns) {
         return arrow_to_vnd_sql_json_v1_via_value(data, meta);
     }
 
@@ -1662,7 +1659,7 @@ mod tests {
             ));
 
             let mut body = std::pin::pin!(
-                record_batch_body(StreamedBody::JsonArray, first, rest, account)
+                record_batch_body(StreamedBody::JsonArray, first.as_ref(), rest, account)
                     .expect("an Int64/Utf8 batch encodes")
             );
             let mut streamed = Vec::new();
