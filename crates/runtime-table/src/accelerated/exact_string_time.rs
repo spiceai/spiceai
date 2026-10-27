@@ -408,7 +408,7 @@ mod tests {
                 .expect("pin");
             assert_eq!(
                 selected(&table, &predicates).await,
-                selected(&table, &[expr.clone()]).await,
+                selected(&table, std::slice::from_ref(&expr)).await,
                 "{expr} -> {predicates:?}"
             );
         }
