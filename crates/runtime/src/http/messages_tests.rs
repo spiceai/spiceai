@@ -40,13 +40,13 @@ use crate::{Runtime, config::Config};
 
 /// A request a mock provider received.
 #[derive(Clone, Debug)]
-struct Received {
-    path: String,
-    headers: HeaderMap,
-    body: Value,
+pub(super) struct Received {
+    pub(super) path: String,
+    pub(super) headers: HeaderMap,
+    pub(super) body: Value,
 }
 
-type Seen = Arc<Mutex<Vec<Received>>>;
+pub(super) type Seen = Arc<Mutex<Vec<Received>>>;
 
 fn record(seen: &Seen, path: &str, headers: HeaderMap, body: &Value) {
     seen.lock().expect("seen lock").push(Received {
@@ -258,7 +258,7 @@ async fn openai_chat(
     .into_response()
 }
 
-async fn start_provider(seen: &Seen) -> String {
+pub(super) async fn start_provider(seen: &Seen) -> String {
     let app = Router::new()
         .route("/v1/messages", post(anthropic))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
@@ -272,7 +272,7 @@ async fn start_provider(seen: &Seen) -> String {
     format!("http://{address}")
 }
 
-fn model(name: &str, from: &str, endpoint: &str, extra: &[(&str, &str)]) -> Model {
+pub(super) fn model(name: &str, from: &str, endpoint: &str, extra: &[(&str, &str)]) -> Model {
     let mut model = Model::new(from, name);
     let params: Vec<(&str, String)> = match from.split(':').next() {
         Some("anthropic") => vec![
@@ -295,7 +295,7 @@ fn model(name: &str, from: &str, endpoint: &str, extra: &[(&str, &str)]) -> Mode
     model
 }
 
-async fn runtime_with(models: Vec<Model>) -> Router {
+pub(super) async fn runtime_with(models: Vec<Model>) -> Router {
     runtime_with_cors(models, &CorsConfig::default()).await
 }
 
@@ -305,7 +305,7 @@ async fn runtime_with_cors(models: Vec<Model>, cors: &CorsConfig) -> Router {
 
 /// A runtime whose routes accept only requests carrying `api_key`, as `runtime.auth.api_key`
 /// configures.
-async fn runtime_with_api_key(models: Vec<Model>, api_key: &str) -> Router {
+pub(super) async fn runtime_with_api_key(models: Vec<Model>, api_key: &str) -> Router {
     let auth =
         runtime_auth::api_key::ApiKeyAuth::new(vec![ApiKey::parse_str(&format!("{api_key}:rw"))]);
     runtime_with_options(
@@ -345,7 +345,7 @@ async fn runtime_with_options(
 }
 
 /// What a route answered: the status, the headers, and the body.
-async fn send(
+pub(super) async fn send(
     routes: &Router,
     path: &str,
     headers: &[(&str, &str)],
@@ -380,7 +380,7 @@ async fn send(
 }
 
 /// The events of an SSE body, as (name, data) pairs.
-fn sse_events(body: &str) -> Vec<(String, Value)> {
+pub(super) fn sse_events(body: &str) -> Vec<(String, Value)> {
     body.split("\n\n")
         .filter(|block| block.lines().any(|line| line.starts_with("data:")))
         .map(|block| {
@@ -405,7 +405,7 @@ fn header_of<'a>(received: &'a Received, name: &str) -> Option<&'a str> {
         .and_then(|value| value.to_str().ok())
 }
 
-fn taken(seen: &Seen) -> Vec<Received> {
+pub(super) fn taken(seen: &Seen) -> Vec<Received> {
     std::mem::take(&mut *seen.lock().expect("seen lock"))
 }
 

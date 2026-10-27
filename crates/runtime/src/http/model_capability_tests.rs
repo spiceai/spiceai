@@ -483,6 +483,9 @@ impl Path {
             Path::Responses => {
                 if capabilities.has(Capability::Responses) {
                     vec!["/v1/responses"]
+                } else if capabilities.has(Capability::Chat) {
+                    // A provider without a Responses API is answered through its chat.
+                    vec![chat]
                 } else {
                     vec![]
                 }

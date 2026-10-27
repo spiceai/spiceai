@@ -452,9 +452,13 @@ fn remove_state(path: &Path) -> Result<()> {
 
 /// Identifying and stopping a recorded runtime process.
 mod process {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    #[cfg(unix)]
+    use std::time::Instant;
 
-    use super::{POLL_INTERVAL, StartedRuntime};
+    use super::StartedRuntime;
+    #[cfg(unix)]
+    use super::POLL_INTERVAL;
 
     /// Whether `started` still names a running runtime: the PID is alive and
     /// its executable is the one recorded, so a PID the system has since
@@ -483,6 +487,7 @@ mod process {
     /// how it was invoked — ran `executable`. The runtime is always started by
     /// its absolute path, so a process the system later gave the same PID would
     /// have to have been started from that exact file to be taken for it.
+    #[cfg(any(unix, test))]
     pub(super) fn command_runs_executable(command: &str, executable: &std::path::Path) -> bool {
         let Some(path) = executable.to_str().filter(|path| !path.is_empty()) else {
             return false;

@@ -9199,6 +9199,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "gemini-api"
+version = "2.4.0-unstable"
+dependencies = [
+ "futures",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "gemini-chat"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-openai",
+ "async-trait",
+ "chat-api",
+ "futures",
+ "gemini-api",
+ "insta",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "gemm"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17387,6 +17412,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e061d1b48cb8d38042de4ae0a7a6401009d6143dc80d2e2d6f31f0bdd6470c7"
 
 [[package]]
+name = "responses-chat"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-openai",
+ "async-trait",
+ "chat-api",
+ "futures",
+ "insta",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "result-compare"
 version = "2.4.0-unstable"
 dependencies = [
@@ -17738,6 +17778,8 @@ dependencies = [
  "flight_client",
  "fundu",
  "futures",
+ "gemini-api",
+ "gemini-chat",
  "gethostname",
  "globset",
  "governor",
@@ -17798,6 +17840,7 @@ dependencies = [
  "regex",
  "repl",
  "reqwest 0.13.4",
+ "responses-chat",
  "rmcp",
  "rstest 0.26.1",
  "runtime-acceleration",

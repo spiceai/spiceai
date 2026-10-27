@@ -40,6 +40,9 @@ pub use routes::get_api_doc;
 mod mcp_transport;
 #[cfg(test)]
 #[cfg(feature = "models")]
+mod gemini_tests;
+#[cfg(test)]
+#[cfg(feature = "models")]
 mod messages_tests;
 #[cfg(test)]
 #[cfg(feature = "models")]

@@ -106,6 +106,7 @@ Common workflows:
   Manage data:    spice dataset add ...  |  spice catalog add ...  |  spice refresh ...
   Models & AI:    spice model add ...    |  spice chat   |  spice search  |  spice nsql
   Inspect:        spice status  |  spice datasets  |  spice models  |  spice pods
+  Coding agents:  spice claude  |  spice codex  |  spice opencode  |  ... (Spice as the model backend)
   Deploy:         spice cloud login  |  spice cloud deploy
 
 Run `spice <command> --help` for details on any command.

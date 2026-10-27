@@ -23,7 +23,11 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
-use crate::{Runtime, model::LLMResponsesModelStore, status::RuntimeStatus};
+use crate::{
+    Runtime,
+    model::{LLMResponsesModelStore, ResponsesViaChat},
+    status::RuntimeStatus,
+};
 use llms::responses::Responses;
 use model_capabilities::{Capability, Refusal, require};
 
@@ -45,17 +49,7 @@ fn extract_text(resp: &OpenAIResponse) -> String {
 /// The response to a request naming a model that has no Responses API handler.
 fn responses_refusal(model_id: &str, refusal: &Refusal, status: &RuntimeStatus) -> Response {
     match refusal {
-        Refusal::Unsupported(capabilities) if capabilities.has(Capability::Chat) => {
-            let provider = capabilities.provider().short_name();
-            openai_error_to_response(OpenAIError::ApiError(ApiError {
-                message: format!(
-                    "Model '{model_id}' uses provider '{provider}' which does not support the OpenAI Responses API. Use /v1/chat/completions for this model or configure a model provider that supports Responses."
-                ),
-                r#type: Some("invalid_request_error".to_string()),
-                param: Some("model".to_string()),
-                code: Some("invalid_request_error".to_string()),
-            }))
-        }
+        // A chat model never reaches here: it is answered through its chat completions.
         Refusal::Unsupported(capabilities) => {
             let provider = capabilities.provider();
             openai_error_to_response(OpenAIError::ApiError(ApiError {
@@ -217,6 +211,21 @@ pub(crate) async fn post(
         };
         let model = match model {
             Ok(model) => model,
+            // A chat model whose provider has no Responses API of its own serves it by
+            // translation through its chat completions.
+            Err(Refusal::Unsupported(capabilities)) if capabilities.has(Capability::Chat) => {
+                let chat = {
+                    let capabilities = rt.model_capabilities();
+                    let capabilities = capabilities.read().await;
+                    let chat_models = rt.completion_llms();
+                    let chat_models = chat_models.read().await;
+                    require(&capabilities, &*chat_models, &model_id, Capability::Chat)
+                };
+                match chat {
+                    Ok(chat) => Arc::new(ResponsesViaChat::new(chat)) as Arc<dyn Responses>,
+                    Err(refusal) => return responses_refusal(&model_id, &refusal, &rt.status()),
+                }
+            }
             Err(refusal) => return responses_refusal(&model_id, &refusal, &rt.status()),
         };
 
