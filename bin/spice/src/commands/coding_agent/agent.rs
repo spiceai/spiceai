@@ -766,11 +766,15 @@ struct PiCost {
     cache_write: u32,
 }
 
-/// The Antigravity CLI's LLM gateway mode: it skips Google sign-in, lists the
-/// models it is given, and sends each request to the gateway as a Gemini API
-/// `models/{model}:streamGenerateContent` call. Unlike its Gemini API key
-/// mode, the gateway needs no `modelProvider` entry in the user's
-/// `settings.json`.
+/// The Antigravity CLI's LLM gateway mode: it skips Google sign-in, discovers
+/// the gateway's models from its `GET /v1beta/models` listing, and sends each
+/// request to the gateway as a Gemini API `models/{model}:streamGenerateContent`
+/// call. Unlike its Gemini API key mode, the gateway needs no `modelProvider`
+/// entry in the user's `settings.json`.
+///
+/// The models are left to that discovery. A model named in
+/// `AGY_LLM_GATEWAY_MODELS` instead is sent no tool declarations, so the agent
+/// could only chat, never read or edit a file.
 fn antigravity(backend: &Backend<'_>) -> Launch {
     let args = if backend.model_given {
         Vec::new()
@@ -784,10 +788,10 @@ fn antigravity(backend: &Backend<'_>) -> Launch {
             ("AGY_LLM_GATEWAY_URL", os(backend.endpoint)),
             // Sent as `Authorization: Bearer`.
             ("AGY_LLM_GATEWAY_API_KEY", os(backend.token())),
-            ("AGY_LLM_GATEWAY_MODELS", os(backend.models.join(","))),
         ],
-        // Headers for another gateway, which Spice has no use for.
-        env_remove: vec!["AGY_LLM_GATEWAY_HEADERS"],
+        // Headers for another gateway, which Spice has no use for, and a model
+        // list that would name another gateway's models and turn tools off.
+        env_remove: vec!["AGY_LLM_GATEWAY_HEADERS", "AGY_LLM_GATEWAY_MODELS"],
         files: Vec::new(),
         prepare: None,
     }
@@ -1115,8 +1119,13 @@ mod tests {
             vec![
                 ("AGY_LLM_GATEWAY_URL", ENDPOINT.to_string()),
                 ("AGY_LLM_GATEWAY_API_KEY", "spice".to_string()),
-                ("AGY_LLM_GATEWAY_MODELS", "qwen,gpt".to_string()),
             ]
+        );
+        // The CLI discovers the runtime's models itself: one it is told about
+        // is sent no tools.
+        assert_eq!(
+            launch.env_remove,
+            vec!["AGY_LLM_GATEWAY_HEADERS", "AGY_LLM_GATEWAY_MODELS"]
         );
     }
 
