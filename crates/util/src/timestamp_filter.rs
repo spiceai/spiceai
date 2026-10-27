@@ -857,6 +857,7 @@ mod tests {
         use datafusion::arrow::compute::{cast, filter_record_batch};
         use datafusion::common::DFSchema;
         use datafusion::logical_expr::execution_props::ExecutionProps;
+        use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
         use datafusion::physical_expr::create_physical_expr;
 
         let schema = Arc::new(Schema::new(vec![Field::new("ts", data_type.clone(), true)]));
@@ -865,8 +866,13 @@ mod tests {
         let batch =
             RecordBatch::try_new(Arc::clone(&schema), vec![column]).expect("batch should build");
         let df_schema = DFSchema::try_from(Arc::clone(&schema)).expect("schema converts");
-        let physical = create_physical_expr(filter, &df_schema, &ExecutionProps::new())
-            .expect("filter should plan without a type error");
+        let physical = create_physical_expr(
+            filter,
+            &df_schema,
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )
+        .expect("filter should plan without a type error");
         let mask = physical
             .evaluate(&batch)
             .and_then(|v| v.into_array(batch.num_rows()))

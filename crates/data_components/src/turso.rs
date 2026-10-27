@@ -129,7 +129,8 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{
         Expr, LogicalPlan, TableProviderFilterPushDown, TableType, dml::InsertOp,
-        execution_props::ExecutionProps, expr_rewriter::unnormalize_col, utils::conjunction,
+        execution_props::ExecutionProps, expr_rewriter::unnormalize_col,
+        physical_planning_context::PhysicalPlanningContext, utils::conjunction,
     },
     physical_expr::{EquivalenceProperties, create_physical_expr},
     physical_plan::{
@@ -1808,7 +1809,7 @@ impl TursoDeletionSink {
 
     /// Deletes the rows the filters select, evaluating them with `DataFusion`: reads
     /// each row's `rowid` and the columns the filters reference, then deletes the
-    /// selected `rowid`s. Runs in one transaction, so the rows read are the rows
+    /// selected `rowid`s (by a name no column shadows; see [`hidden_rowid_name`]). Runs in one transaction, so the rows read are the rows
     /// deleted.
     async fn delete_rows_selected_by_datafusion(
         &self,
@@ -1835,10 +1836,17 @@ impl TursoDeletionSink {
             &predicate,
             &DFSchema::try_from(projected.as_ref().clone())?,
             &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
         )?;
 
+        let rowid = hidden_rowid_name(&self.schema).ok_or_else(|| {
+            format!(
+                "{} has columns named rowid, _rowid_ and oid, so no name reaches the row identifier a filtered delete needs",
+                self.table_name
+            )
+        })?;
         let table = quote_identifier(&self.table_name);
-        let mut select = String::from("SELECT rowid");
+        let mut select = format!("SELECT {rowid}");
         for field in projected.fields() {
             select.push_str(", ");
             select.push_str(&quote_identifier(field.name()));
@@ -1894,13 +1902,26 @@ impl TursoDeletionSink {
                 .join(", ");
             deleted += conn
                 .execute(
-                    &format!("DELETE FROM {table} WHERE rowid IN ({rowids})"),
+                    &format!("DELETE FROM {table} WHERE {rowid} IN ({rowids})"),
                     (),
                 )
                 .await?;
         }
         Ok(deleted)
     }
+}
+
+/// A name for the table's hidden row identifier that no column of `schema` shadows.
+///
+/// `rowid`, `_rowid_` and `oid` all name the row identifier unless a column takes
+/// the name (compared case-insensitively); a shadowed name resolves to the column.
+fn hidden_rowid_name(schema: &Schema) -> Option<&'static str> {
+    ["rowid", "_rowid_", "oid"].into_iter().find(|name| {
+        !schema
+            .fields()
+            .iter()
+            .any(|field| field.name().eq_ignore_ascii_case(name))
+    })
 }
 
 /// Whether `expr` casts a column that `is_string_column` accepts to a timestamp.
@@ -1943,8 +1964,8 @@ fn plan_casts_string_column_to_timestamp(plan: &LogicalPlan) -> bool {
             node.inputs().iter().any(|input| {
                 input
                     .schema()
-                    .field_from_column(column)
-                    .is_ok_and(|field| field.data_type().is_string())
+                    .qualified_field_from_column(column)
+                    .is_ok_and(|(_, field)| field.data_type().is_string())
             }) || matches!(
                 node,
                 LogicalPlan::TableScan(scan) if is_string_field(&scan.source.schema(), &column.name)
@@ -3682,6 +3703,64 @@ mod tests {
         assert_eq!(
             delete_and_list_survivors(&pool, &schema, filter).await,
             (1, vec![2]),
+        );
+    }
+
+    /// A user column named `rowid` does not stand in for the row identifier: rows
+    /// that share its value on both sides of the cutoff keep the live one.
+    #[tokio::test]
+    async fn retention_delete_ignores_a_user_column_named_rowid() {
+        let pool = Arc::new(
+            TursoConnectionPool::new(":memory:")
+                .await
+                .expect("in-memory Turso pool should be created"),
+        );
+        let conn = pool
+            .connect()
+            .await
+            .expect("Turso connection should be created");
+        for sql in [
+            "CREATE TABLE events (\"RowId\" INTEGER, id INTEGER, ts TEXT)",
+            "INSERT INTO events VALUES (7, 1, '2021-05-02T00:00:00Z'), (7, 2, '2021-05-04T00:00:00Z')",
+        ] {
+            conn.execute(sql, ())
+                .await
+                .expect("fixture statement should execute");
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("RowId", DataType::Int64, true),
+            Field::new("id", DataType::Int64, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]));
+        let filter = iso_filter(
+            1_620_000_000_000_000_000,
+            datafusion::logical_expr::Operator::Lt,
+        );
+        assert_eq!(
+            delete_and_list_survivors(&pool, &schema, filter).await,
+            (1, vec![2]),
+        );
+    }
+
+    #[test]
+    fn the_row_identifier_name_avoids_shadowing_columns() {
+        let schema = |names: &[&str]| {
+            Schema::new(
+                names
+                    .iter()
+                    .map(|name| Field::new(*name, DataType::Int64, true))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(hidden_rowid_name(&schema(&["id"])), Some("rowid"));
+        assert_eq!(hidden_rowid_name(&schema(&["ROWID"])), Some("_rowid_"));
+        assert_eq!(
+            hidden_rowid_name(&schema(&["rowid", "_ROWID_"])),
+            Some("oid")
+        );
+        assert_eq!(
+            hidden_rowid_name(&schema(&["rowid", "_rowid_", "Oid"])),
+            None
         );
     }
 
