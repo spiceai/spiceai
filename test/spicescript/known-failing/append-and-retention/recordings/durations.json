@@ -1,0 +1,8 @@
+{
+  "append-iso-day": 36,
+  "append-iso-offset": 6,
+  "append-negative-epoch": 6,
+  "append-null-time": 5,
+  "append-same-time": 6,
+  "retention-epoch-formats": 57
+}

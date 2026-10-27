@@ -1,4 +1,4 @@
-# Known failing where DataFusion runs the query (Arrow, Cayenne): grouping a
+# Known failing (#15541) where DataFusion runs the query (Arrow, Cayenne): grouping a
 # DISTINCT over a one-to-many join treats the "one" side's primary key as
 # determining the other side's columns, so the optimizer drops them from an
 # outer GROUP BY and merges groups. Sent to PostgreSQL, the same SQL is right.

@@ -169,6 +169,15 @@ out="$(run_subject "$BRANCH" "abc123")"; rc=$?
 expect_eq "exit code" "$rc" 2
 expect_eq "approved runs" "$(approved)" ""
 
+begin "approves on a branch named after a Spicepod path with '+'"
+PLUS_BRANCH='testoperator-cluster-snapshot-update/123-accelerated-file-parquet-mixed-duckdb-file-+sqlite-file-.yaml'
+listing 1 \
+  "$(run_json 10 action_required "$SHA" "$REPO" 'github-actions[bot]' pull_request "$PLUS_BRANCH")" \
+  "$(run_json 11 action_required "$SHA" "$REPO" 'github-actions[bot]' pull_request "$BRANCH")"
+out="$(run_subject "$PLUS_BRANCH" "$SHA")"; rc=$?
+expect_eq "exit code" "$rc" 0
+expect_eq "approved runs" "$(approved)" "10"
+
 begin "rejects a branch that could break out of the filter's quotes"
 listing 1 "$(run_json 10 action_required)"
 out="$(run_subject 'x" or true or "' "$SHA")"; rc=$?

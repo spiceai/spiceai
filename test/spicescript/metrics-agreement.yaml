@@ -1,0 +1,108 @@
+name: metrics-agreement
+description: >
+  What the runtime reports agrees with what ran: after a known workload (7
+  queries on an accelerated table and 4 on a federated one over Flight, 2
+  failing queries, 3 over HTTP, 2 refreshes of 500 rows), the query, Flight,
+  HTTP and refresh counters each moved by exactly that much, nothing is left
+  running, and runtime.task_history records each query and refresh once,
+  with its error when it failed.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: metrics-agreement
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+    - from: postgres:public.t
+      name: f
+      params: ${sources.src.params}
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+
+steps:
+  - source-exec:
+      src: CREATE TABLE t (id int PRIMARY KEY, v int); INSERT INTO t SELECT i, i FROM generate_series(1, 500) i;
+  - start: {}
+  - mark-metrics: before
+  # The workload: 7 queries on the accelerated table and 4 on the federated
+  # one over Flight, 2 that fail, 3 over HTTP, and 2 refreshes.
+  - query: SELECT count(*) AS agree_t FROM t
+    expect: { rows: [['500']] }
+  - query: SELECT count(*) AS agree_t FROM t
+    expect: { rows: [['500']] }
+  - query: SELECT count(*) AS agree_t FROM t
+    expect: { rows: [['500']] }
+  - query: SELECT count(*) AS agree_t FROM t
+    expect: { rows: [['500']] }
+  - query: SELECT count(*) AS agree_t FROM t
+    expect: { rows: [['500']] }
+  - query: SELECT count(*) AS agree_t FROM t
+    expect: { rows: [['500']] }
+  - query: SELECT count(*) AS agree_t FROM t
+    expect: { rows: [['500']] }
+  - query: SELECT count(*) AS agree_f FROM f
+    expect: { rows: [['500']] }
+  - query: SELECT count(*) AS agree_f FROM f
+    expect: { rows: [['500']] }
+  - query: SELECT count(*) AS agree_f FROM f
+    expect: { rows: [['500']] }
+  - query: SELECT count(*) AS agree_f FROM f
+    expect: { rows: [['500']] }
+  - query: SELECT * FROM agree_missing
+    expect-error: true
+  - query: SELECT * FROM agree_missing
+    expect-error: true
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain }, body: 'SELECT count(*) AS agree_http FROM t' }
+    expect: { status: 200, body-contains: '500' }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain }, body: 'SELECT count(*) AS agree_http FROM t' }
+    expect: { status: 200, body-contains: '500' }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain }, body: 'SELECT count(*) AS agree_http FROM t' }
+    expect: { status: 200, body-contains: '500' }
+  - refresh: t
+  - refresh: t
+
+  # Every counter moved by exactly what ran.
+  - wait-metric: { name: query_duration_ms_count, labels: { datasets: t, protocol: flight }, increased-by: 7, since: before, timeout: 30s }
+  - wait-metric: { name: query_duration_ms_count, labels: { datasets: f, protocol: flight }, increased-by: 4, since: before, timeout: 30s }
+  - wait-metric: { name: query_duration_ms_count, labels: { tags: error, protocol: flight }, increased-by: 2, since: before, timeout: 30s }
+  - wait-metric: { name: query_duration_ms_count, labels: { datasets: t, protocol: http }, increased-by: 3, since: before, timeout: 30s }
+  - wait-metric: { name: query_execution_duration_ms_count, labels: { datasets: t, protocol: flight }, increased-by: 7, since: before, timeout: 30s }
+  - wait-metric: { name: flight_requests, labels: { method: do_get, command: sql_query }, increased-by: 11, since: before, timeout: 30s }
+  - wait-metric: { name: http_requests_total, labels: { method: POST, path: /v1/sql, status: '200' }, increased-by: 3, since: before, timeout: 30s }
+  - wait-metric: { name: dataset_acceleration_refresh_duration_ms_count, labels: { dataset: t, mode: full }, increased-by: 2, since: before, timeout: 30s }
+  - wait-metric: { name: dataset_acceleration_refresh_processed_rows, labels: { dataset: t }, increased-by: 1000, since: before, timeout: 30s }
+  - wait-metric: { name: dataset_acceleration_refresh_rows_written, labels: { dataset: t }, increased-by: 1000, since: before, timeout: 30s }
+  - wait-metric: { name: query_active_count, labels: { protocol: flight }, below: 1, timeout: 30s }
+
+  # Task history records each of them once.
+  - query: SELECT count(*) AS n FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT count(*) AS agree_t FROM t'
+    expect: { rows: [['7']] }
+    eventually: 60s
+  - query: SELECT count(*) AS n FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT count(*) AS agree_f FROM f'
+    expect: { rows: [['4']] }
+    eventually: 60s
+  - query: SELECT count(*) AS n FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT count(*) AS agree_http FROM t'
+    expect: { rows: [['3']] }
+    eventually: 60s
+  - query: >-
+      SELECT count(*) AS n, count(error_message) AS errors FROM runtime.task_history
+      WHERE task = 'sql_query' AND input = 'SELECT * FROM agree_missing'
+    expect: { rows: [['2', '2']] }
+    eventually: 60s
+  - query: SELECT count(*) AS n FROM runtime.task_history WHERE task = 'acceleration_refresh' AND input = 't'
+    expect: { rows: [['3']] }
+    eventually: 60s
+  - query: >-
+      SELECT count(*) AS n FROM runtime.task_history
+      WHERE task = 'sql_query' AND input = 'SELECT count(*) AS agree_t FROM t'
+      AND end_time >= start_time AND execution_duration_ms >= 0 AND error_message IS NULL
+    expect: { rows: [['7']] }
+    eventually: 60s

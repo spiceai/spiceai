@@ -816,6 +816,16 @@ fn serve(
             (model, false)
         }
     };
+    // This engine decodes one token after another with a decoder alone. An encoder-decoder
+    // model's decoder aborts the process when no encoder pass ran, and a diffusion model
+    // decodes nothing, so both are refused while they load.
+    if model.has_encoder() || model.is_diffusion() {
+        let _ = ready.send(Err(ChatError::UnsupportedArchitecture {
+            architecture: model.architecture().unwrap_or_default(),
+            file: file_name(path),
+        }));
+        return;
+    }
     let draft_model = match draft.map(|d| {
         // A DFlash or DSpark drafter says so in its header; any other draft file is an MTP head.
         let kind = DraftKind::dflash_of(d).unwrap_or(DraftKind::Mtp);

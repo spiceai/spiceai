@@ -28,6 +28,7 @@ indexmap = { workspace = true, features = ["serde"] }
 nix = { workspace = true, features = ["signal"] }
 parking_lot.workspace = true
 parquet = { workspace = true, features = ["arrow"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 regex.workspace = true
 secrecy.workspace = true
 reqwest.workspace = true
