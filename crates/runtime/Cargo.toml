@@ -98,6 +98,7 @@ indexmap.workspace = true
 itertools.workspace = true
 logos.workspace = true
 opendal.workspace = true
+opendal-http-transport-reqwest = "0.58.2"
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
@@ -146,7 +147,7 @@ prost.workspace = true
 rand.workspace = true
 rayon = { workspace = true }
 regex.workspace = true
-reqwest = { workspace = true, features = ["stream"] }
+reqwest.workspace = true
 rmcp = { workspace = true, optional = true, features = [
     "client",
     "server",
@@ -312,7 +313,6 @@ connector-snowflake = { path = "../data-connectors/connector-snowflake" }
 connector-spark = { path = "../data-connectors/connector-spark" }
 connector-spiceai = { path = "../data-connectors/connector-spiceai" }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
-hf-hub = { workspace = true }
 insta = { workspace = true, features = ["json", "redactions"] }
 jsonpath-rust = "0.7.3"
 mongodb.workspace = true

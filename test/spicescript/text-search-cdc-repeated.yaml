@@ -1,0 +1,59 @@
+# The change-capture form of text-search-stale-after-refresh.yaml: a
+# text_search asked once before a document arrives through change capture
+# finds it when asked again with the identical text (#15392).
+name: text-search-cdc-repeated
+description: >
+  A text_search over a change-captured Cayenne dataset, asked again with the
+  identical text after a document arrives, finds it.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: text-search-cdc-repeated
+  embeddings:
+    - from: model2vec:minishlab/potion-base-2M
+      name: potion
+  datasets:
+    - from: postgres:public.docs
+      name: docs
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+      columns:
+        - name: body
+          full_text_search: { enabled: true, row_id: [id] }
+          embeddings: [{ from: potion, row_id: [id] }]
+    - from: postgres:public.docs
+      name: docs_cdc
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+      columns:
+        - name: body
+          full_text_search: { enabled: true, row_id: [id] }
+          embeddings: [{ from: potion, row_id: [id] }]
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: { file: seed/search-postgres.sql }
+  - start: { ready-timeout: 300s }
+
+  - query: SELECT q.id FROM text_search(docs_cdc, 'unicorn') q
+    expect: { rows: [] }
+    expect-empty: true
+  - source-exec:
+      src: INSERT INTO docs VALUES (500, 'unicorn unicorn stone stone stone stone stone stone stone stone stone stone', 0, 0)
+  - query: SELECT count(*) AS n FROM docs_cdc WHERE id = 500
+    expect: { rows: [['1']] }
+    eventually: 60s
+  # Another wording finds it...
+  - query: SELECT r.id FROM text_search(docs_cdc, 'unicorn') r
+    expect: { rows: [['500']] }
+  # ...the identical text does not.
+  - query: SELECT q.id FROM text_search(docs_cdc, 'unicorn') q
+    expect: { rows: [['500']] }
+    eventually: 30s

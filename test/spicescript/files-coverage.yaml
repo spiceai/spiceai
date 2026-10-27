@@ -1,0 +1,92 @@
+name: files-coverage
+description: >
+  Tables read from Parquet and CSV files answer the extended corpus and
+  ternary logic partitioning as PostgreSQL answers them over the same
+  generated rows: read in place, and accelerated into Cayenne and DuckDB.
+
+sources:
+  lake: { kind: files }
+  ref: { kind: postgres }
+
+matrix:
+  format: [parquet, csv]
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+  duckdb: duckdb-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: files-coverage
+  datasets:
+    - from: 'file://${sources.lake.path}/t/'
+      name: t
+      params: { file_format: '${matrix.format}' }
+    - from: 'file://${sources.lake.path}/u/'
+      name: u
+      params: { file_format: '${matrix.format}' }
+
+defaults:
+  expect: { oracle: ref }
+  compare-variants: false
+
+steps:
+  # CSV cannot tell an empty string from NULL, so its text has no empty strings.
+  - generate:
+      lake:
+        table: t
+        rows: 400
+        seed: 31
+        primary-key: id
+        format: '${matrix.format}'
+        files: 2
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: i, int: [-50, 50], nulls: 0.1 }
+          - { name: big, bigint: [0, 10000000000] }
+          - { name: d, decimal: { range: [-100, 100], scale: 2 } }
+          - { name: f, float: [0, 50] }
+          - { name: s, choice: [apple, Apple, APPLE, banana, "O'Brien", naïve, '', under_score, b], nulls: 0.1 }
+          - { name: dt, date: ['2024-01-01', '2024-12-31'] }
+          - { name: ts, timestamp: ['2024-01-01', '2024-12-31'] }
+          - { name: b, bool: 0.33 }
+    mirror: ref
+    when: { format: parquet }
+  - generate:
+      lake:
+        table: t
+        rows: 400
+        seed: 31
+        primary-key: id
+        format: '${matrix.format}'
+        files: 2
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: i, int: [-50, 50], nulls: 0.1 }
+          - { name: big, bigint: [0, 10000000000] }
+          - { name: d, decimal: { range: [-100, 100], scale: 2 } }
+          - { name: f, float: [0, 50] }
+          - { name: s, choice: [apple, Apple, APPLE, banana, "O'Brien", naïve, under_score, b], nulls: 0.1 }
+          - { name: dt, date: ['2024-01-01', '2024-12-31'] }
+          - { name: ts, timestamp: ['2024-01-01', '2024-12-31'] }
+          - { name: b, bool: 0.33 }
+    mirror: ref
+    when: { format: csv }
+  - generate:
+      lake:
+        table: u
+        rows: 150
+        seed: 32
+        primary-key: id
+        format: '${matrix.format}'
+        files: 2
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: t_id, int: [1, 440] }
+          - { name: label, choice: [red, blue, green] }
+    mirror: ref
+  - start: {}
+  - corpus: corpus/queries-extended.sql
+  - tlp: { table: t, seed: 2, queries: 200, depth: 3, aggregate: d, oracle: ref, avoid: [not] }

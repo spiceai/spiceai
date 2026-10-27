@@ -24,7 +24,7 @@ const ES_IMAGE: &str = "docker.elastic.co/elasticsearch/elasticsearch:8.17.0";
 
 /// Starts a single-node Elasticsearch container with security disabled.
 ///
-/// Returns the [`RunningContainer`] handle — drop or call `.remove()` to clean up.
+/// Returns the [`RunningContainer`] handle — drop or call `.cleanup()` to clean up.
 pub(super) async fn start_elasticsearch_docker_container() -> Result<RunningContainer, anyhow::Error>
 {
     // ES images are only available from the official Elastic registry, not the

@@ -1,0 +1,128 @@
+name: retention-fallback
+description: >
+  With `on_zero_results: use_source`, a row retention removed from the
+  acceleration does not come back from the source, while a row the
+  acceleration never loaded (excluded by refresh_sql) and retention would keep
+  does: under retention_sql applied at write time (no scheduled check,
+  Arrow), time retention applied at scan time with and without a scheduled
+  check (Cayenne), and both policies at once, NULL times and flags included
+  (DuckDB).
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: retention-fallback
+  datasets:
+    # Both policies: soft-deleted rows and rows older than an hour go.
+    - from: postgres:public.c
+      name: c
+      params: ${sources.src.params}
+      time_column: ts
+      acceleration:
+        enabled: true
+        engine: duckdb
+        on_zero_results: use_source
+        refresh_sql: SELECT * FROM c WHERE id <= 4
+        refresh_data_window: 10000d
+        retention_sql: DELETE FROM c WHERE deleted = true
+        retention_period: 1h
+        retention_check_enabled: true
+        retention_check_interval: 200ms
+    # retention_sql applied as rows are written, with no scheduled check.
+    - from: postgres:public.e
+      name: a
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: arrow
+        on_zero_results: use_source
+        refresh_sql: SELECT * FROM a WHERE id != 3
+        retention_sql: DELETE FROM a WHERE id = 2
+        retention_check_enabled: false
+    # Time retention at scan time, without and with a scheduled check.
+    - from: postgres:public.e
+      name: k1
+      params: ${sources.src.params}
+      time_column: ts
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: memory
+        refresh_mode: full
+        on_zero_results: use_source
+        refresh_sql: SELECT * FROM k1 WHERE id != 3
+        refresh_data_window: 10000d
+        retention_period: 1h
+        retention_check_enabled: false
+    - from: postgres:public.e
+      name: k2
+      params: ${sources.src.params}
+      time_column: ts
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: memory
+        refresh_mode: full
+        on_zero_results: use_source
+        refresh_sql: SELECT * FROM k2 WHERE id != 3
+        refresh_data_window: 10000d
+        retention_period: 1h
+        retention_check_enabled: true
+        retention_check_interval: 15s
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE c (id int PRIMARY KEY, ts timestamp, deleted boolean);
+        INSERT INTO c VALUES
+          (1, now()::timestamp, false), (2, now()::timestamp - INTERVAL '2 hours', false),
+          (3, now()::timestamp, true), (4, now()::timestamp - INTERVAL '2 hours', true),
+          (5, NULL, false), (6, now()::timestamp, NULL), (7, now()::timestamp, true),
+          (8, now()::timestamp - INTERVAL '2 hours', false);
+        CREATE TABLE e (id int PRIMARY KEY, ts timestamp);
+        INSERT INTO e VALUES (1, now()::timestamp), (2, now()::timestamp - INTERVAL '2 hours'), (3, now()::timestamp);
+  - start: {}
+
+  # Combined: only id 1 stays loaded; of the rows never loaded, those neither
+  # policy deletes (a NULL time or flag included) fall back.
+  - query: SELECT id FROM c WHERE id <= 4
+    expect: { rows: [['1']] }
+    eventually: 30s
+  - query: SELECT id FROM c WHERE id = 2
+    expect-empty: true
+    expect: { rows: [] }
+  - query: SELECT id FROM c WHERE id = 3
+    expect-empty: true
+    expect: { rows: [] }
+  - query: SELECT id FROM c WHERE id >= 5 ORDER BY id
+    expect: { rows: [['5'], ['6']] }
+
+  # Write-time retention_sql: id 2 is never kept, id 3 was never loaded.
+  - query: SELECT id FROM a WHERE id = 2
+    expect-empty: true
+    expect: { rows: [] }
+  - query: SELECT id FROM a WHERE id = 3
+    expect: { rows: [['3']] }
+  - query: SELECT id FROM a WHERE id = 1
+    expect: { rows: [['1']] }
+
+  # Scan-time time retention hides the expired id 2; id 3 falls back.
+  - query: SELECT id FROM k1 WHERE id = 2
+    expect-empty: true
+    expect: { rows: [] }
+  - query: SELECT id FROM k1 WHERE id = 3
+    expect: { rows: [['3']] }
+  - query: SELECT id FROM k2 WHERE id = 2
+    expect-empty: true
+    expect: { rows: [] }
+  - query: SELECT id FROM k2 WHERE id = 3
+    expect: { rows: [['3']] }
+  - query: SELECT id FROM k2 WHERE id = 1
+    expect: { rows: [['1']] }

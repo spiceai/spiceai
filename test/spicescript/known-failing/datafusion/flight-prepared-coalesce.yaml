@@ -1,4 +1,4 @@
-# Known failing (no issue filed yet): over a Cayenne acceleration, a Flight
+# Known failing (#15541): over a Cayenne acceleration, a Flight
 # SQL prepared statement with a parameter in a projected COALESCE fails
 # server-side with "Cannot cast string 'name 1' to value of UInt64 type";
 # federated it answers, and so does the same query with HTTP parameters.
