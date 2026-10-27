@@ -27,6 +27,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+mod archive;
 mod docx;
 mod pdf;
 mod pdfium;

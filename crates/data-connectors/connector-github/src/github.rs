@@ -1751,7 +1751,7 @@ impl GithubRestClient {
             // Extract only .txt files from the root of the ZIP
             for i in 0..zip.len() {
                 let mut file = zip.by_index(i)?;
-                let file_name = file.name().to_string();
+                let file_name = file.name()?.into_owned();
 
                 // Only process .txt files in the root (no directory separator)
                 if std::path::Path::new(&file_name)
