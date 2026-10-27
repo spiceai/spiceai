@@ -549,6 +549,8 @@ def operator_value_fixture(known_only=False):
             continue
         steps.append({"query": f"SELECT {expression} AS value", "protocols": ["flightsql", "http"],
                       "expect": {"rows": [[expected]]}})
+    if known_only and len(steps) == 1:
+        return None
     return json.dumps({"name": "sql-operator-values-known" if known_only else "sql-operator-values", "description": "Documented operator semantics checked against literal expected values over both protocols.",
                        "spicepod": {"version": "v1", "kind": "Spicepod", "name": "sql-operator-values"},
                        "steps": steps}, indent=2) + "\n"
@@ -584,6 +586,12 @@ def explain_fixture():
 
 
 def write_or_check(path, text, check):
+    if text is None:
+        if path.exists():
+            if check:
+                raise SystemExit(f"{path}: stale; run python3 {HERE / 'sql_surface.py'}")
+            path.unlink()
+        return
     if check:
         if not path.exists() or path.read_text() != text:
             raise SystemExit(f"{path}: stale; run python3 {HERE / 'sql_surface.py'}")
@@ -669,10 +677,8 @@ def main():
                        setup, flags=re.S)
         setup += "  - corpus: ../../corpus/sql-surface-known.sql\n    protocols: [flightsql, http]\n    expect: {}\n"
         write_or_check(known_script, setup, args.check)
-    elif known_script.exists():
-        if args.check:
-            raise SystemExit(f"{known_script}: stale; run python3 {HERE / 'sql_surface.py'}")
-        known_script.unlink()
+    else:
+        write_or_check(known_script, None, args.check)
     write_or_check(HERE.parent / "sql-explain-protocols.yaml", explain_fixture(), args.check)
     write_or_check(HERE.parent / "sql-operator-values.yaml", operator_value_fixture(), args.check)
     write_or_check(HERE.parent / "known-failing/sql-protocols/operator-values.yaml", operator_value_fixture(True), args.check)
