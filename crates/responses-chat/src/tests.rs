@@ -1677,6 +1677,45 @@ async fn interleaved_tool_calls_stream_one_item_at_a_time() {
     assert_eq!(response.get("usage"), None, "the chunks reported no usage");
 }
 
+/// A function's name is a delta like its arguments: a provider may stream it in pieces, and
+/// every event that names the call names the whole of it.
+#[tokio::test]
+async fn a_function_name_streamed_in_pieces_is_whole_in_the_call() {
+    let events = stream_of(
+        vec![
+            call(0, Some("call_1"), Some("read_"), ""),
+            call(0, None, Some("file"), "{\"path\":"),
+            call(0, None, None, "\"a.rs\"}"),
+            finish("tool_calls"),
+        ],
+        &json!({"model": "gpt", "input": "Read a.rs.", "tools": [{"type": "function", "name": "read_file"}]}),
+    )
+    .await;
+    let response = well_formed(&events);
+    let names: Vec<&Value> = events
+        .iter()
+        .filter_map(|event| match event["type"].as_str() {
+            Some("response.output_item.added" | "response.output_item.done") => {
+                Some(&event["item"]["name"])
+            }
+            Some("response.function_call_arguments.done") => Some(&event["name"]),
+            _ => None,
+        })
+        .chain(
+            response["output"]
+                .as_array()
+                .expect("output")
+                .iter()
+                .map(|item| &item["name"]),
+        )
+        .collect();
+    assert_eq!(names, [&json!("read_file"); 4], "{events:?}");
+    assert_eq!(
+        response["output"][0]["arguments"],
+        json!("{\"path\":\"a.rs\"}")
+    );
+}
+
 #[tokio::test]
 async fn text_around_tool_calls_is_its_own_message_in_order() {
     let body = json!({"model": "gpt", "input": "Read a.rs.", "tools": [{"type": "function", "name": "read_file"}]});
@@ -1895,6 +1934,15 @@ async fn a_stream_the_response_cannot_carry_fails_it() {
             ],
             "Model 'gpt' streamed more arguments for a tool call after they were a whole JSON value, so the call cannot be streamed. Send the request without `stream`.",
             json!(["function_call"]),
+        ),
+        (
+            vec![
+                call(0, Some("call_1"), Some("read_file"), "{\"path\":"),
+                call(0, None, Some("_v2"), "\"a.rs\"}"),
+                finish("tool_calls"),
+            ],
+            "Model 'gpt' streamed more of a tool call's name after the call started, so the call cannot be streamed. Send the request without `stream`.",
+            json!([]),
         ),
     ];
     for (chunks, message, done_items) in cases {

@@ -24,13 +24,14 @@ limitations under the License.
 //! API streams them: `response.output_item.added`, its deltas, then `response.output_item.done`.
 //! Text and a function call's arguments reach the client as the model writes them. A custom
 //! tool's input is given once its call is whole, since the model writes it as the string inside
-//! the JSON arguments of a function call.
+//! the JSON arguments of a function call. A model may write a tool's name in pieces too, so a
+//! call's item is added once its arguments start, something follows it, or the completion ends.
 //!
 //! A model may interleave the argument chunks of its parallel tool calls, or write text in the
 //! middle of them. What starts while the open item is a call whose arguments are not yet a whole
 //! JSON value is held back, in the order it started, and given once the open call's arguments
-//! are whole, or once the completion ends. A call continued after its item ended cannot be
-//! streamed, so it fails the Response.
+//! are whole, or once the completion ends. A call continued after its item ended, or more of its
+//! name after its item was added, cannot be streamed, so it fails the Response.
 //!
 //! The completion's usage comes in a chunk of its own after the last choice, so the Response
 //! ends when the chunks do. Chunks that end before the completion finished, or an error from
@@ -342,8 +343,21 @@ impl Translator {
     fn tool_call(&mut self, call: ChatCompletionMessageToolCallChunk) -> Result<(), OpenAIError> {
         let (name, arguments) = call
             .function
-            .map(|function| (function.name, function.arguments.unwrap_or_default()))
+            .map(|function| {
+                (
+                    function.name.unwrap_or_default(),
+                    function.arguments.unwrap_or_default(),
+                )
+            })
             .unwrap_or_default();
+        let started = matches!(&self.open, Some(Open::Call(open)) if open.chat_index == call.index)
+            || self.done_calls.contains(&call.index);
+        if started && !name.is_empty() {
+            return Err(server_error(format!(
+                "Model '{}' streamed more of a tool call's name after the call started, so the call cannot be streamed. Send the request without `stream`.",
+                self.context.model
+            )));
+        }
         if let Some(Open::Call(open)) = &mut self.open
             && open.chat_index == call.index
         {
@@ -366,12 +380,16 @@ impl Translator {
             return self.advance(false);
         }
         if let Some(Pending::Call {
-            arguments: held, ..
+            function,
+            arguments: held,
+            ..
         }) = self.held.iter_mut().find(|pending| {
             matches!(pending, Pending::Call { chat_index, .. } if *chat_index == call.index)
         }) {
+            // A name is a delta like the arguments, which a provider may split.
+            function.push_str(&name);
             held.push_str(&arguments);
-            return Ok(());
+            return self.advance(false);
         }
         if self.done_calls.contains(&call.index) {
             if arguments.trim().is_empty() {
@@ -382,16 +400,16 @@ impl Translator {
                 self.context.model
             )));
         }
-        let Some(function) = name.filter(|name| !name.is_empty()) else {
+        if name.is_empty() {
             return Err(server_error(format!(
                 "Model '{}' streamed a tool call without the tool's name.",
                 self.context.model
             )));
-        };
+        }
         self.held.push_back(Pending::Call {
             chat_index: call.index,
             call_id: call.id.filter(|id| !id.is_empty()).unwrap_or_else(call_id),
-            function,
+            function: name,
             arguments,
         });
         self.advance(false)
@@ -407,6 +425,14 @@ impl Translator {
                     at_end || (!self.held.is_empty() && is_whole(&call.arguments))
                 }
                 None => {
+                    // A call's item names its tool, so it waits for the whole name: until its
+                    // arguments start, something follows it, or the completion ends.
+                    if !at_end
+                        && self.held.len() == 1
+                        && matches!(self.held.front(), Some(Pending::Call { arguments, .. }) if arguments.is_empty())
+                    {
+                        return Ok(());
+                    }
                     let Some(next) = self.held.pop_front() else {
                         return Ok(());
                     };

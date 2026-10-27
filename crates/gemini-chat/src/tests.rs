@@ -1110,6 +1110,31 @@ async fn a_tool_call_stream_gives_each_function_call_whole_at_the_end() {
     );
 }
 
+/// A function's name is a delta like its arguments: a provider may stream it in pieces, and the
+/// call names the whole of it.
+#[tokio::test]
+async fn a_function_name_streamed_in_pieces_is_whole_in_the_call() {
+    let items = streamed(vec![
+        Ok(tool_call_chunk(0, Some("call_1"), Some("get_"), "")),
+        Ok(tool_call_chunk(0, None, Some("weather"), "{\"city\":")),
+        Ok(tool_call_chunk(0, None, None, "\"Paris\"}")),
+        Ok(finish_chunk("tool_calls")),
+    ])
+    .await;
+    let names: Vec<&Value> = items
+        .iter()
+        .flat_map(|item| {
+            item["candidates"][0]["content"]["parts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|part| part.get("functionCall"))
+        .map(|call| &call["name"])
+        .collect();
+    assert_eq!(names, [&json!("get_weather")], "{items:?}");
+}
+
 #[tokio::test]
 async fn a_chat_stream_error_ends_the_stream() {
     let items = streamed(vec![

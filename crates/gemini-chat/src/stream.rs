@@ -87,10 +87,9 @@ impl Translator {
                 streamed.id = id;
             }
             if let Some(function) = call.function {
-                if let Some(name) = function.name.filter(|name| !name.is_empty())
-                    && streamed.name.is_empty()
-                {
-                    streamed.name = name;
+                // A name is a delta like the arguments, which a provider may split.
+                if let Some(name) = function.name {
+                    streamed.name.push_str(&name);
                 }
                 if let Some(arguments) = function.arguments {
                     streamed.arguments.push_str(&arguments);
