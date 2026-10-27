@@ -183,6 +183,7 @@ jobs:
       HAS_ANTHROPIC_SECRET: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY != '' }}
       HAS_XAI_SECRET: ${{ secrets.SPICE_SECRET_XAI_API_KEY != '' }}
       HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
+      HAS_TYPESAFE_SECRET: ${{ secrets.TYPESAFE_API_KEY != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -430,6 +431,14 @@ jobs:
         run: |
           unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::provider_answers_decisions.*xai/)'
+
+      - name: Run TypeSafe decisions tests
+        if: ${{ !cancelled() && env.HAS_TYPESAFE_SECRET == 'true' }}
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -E 'test(/decisions::provider_answers_decisions.*typesafe/)'
 
       - name: Run decisions routing test
         if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' }}
