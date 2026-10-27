@@ -46,6 +46,7 @@ use tracing_futures::Instrument;
 use crate::streaming_utils::generate_stream_id;
 
 pub mod streaming_utils;
+pub mod wire;
 
 #[derive(Debug, Snafu)]
 // Selectors are `pub`: provider crates construct e.g. `FailedToRunModelSnafu` across the

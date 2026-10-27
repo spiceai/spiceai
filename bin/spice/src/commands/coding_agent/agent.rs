@@ -68,8 +68,8 @@ pub(crate) struct Install {
     /// when `PATH` has none — installers that write to a directory a fresh
     /// shell has not yet put on `PATH`.
     pub home_fallbacks: &'static [&'static str],
-    /// The command that installs the agent.
-    pub command: &'static str,
+    /// How to install the agent, as a sentence.
+    pub instructions: &'static str,
     /// The agent's install documentation.
     pub docs: &'static str,
 }
@@ -122,25 +122,25 @@ impl Agent {
             Self::Antigravity => Install {
                 binaries: &["agy"],
                 home_fallbacks: &[".local/bin/agy"],
-                command: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+                instructions: "Install it with `curl -fsSL https://antigravity.google/cli/install.sh | bash`.",
                 docs: "https://antigravity.google/docs/install/",
             },
             Self::ClaudeCode => Install {
                 binaries: &["claude"],
                 home_fallbacks: &[".local/bin/claude", ".claude/local/claude"],
-                command: "curl -fsSL https://claude.ai/install.sh | bash",
+                instructions: "Install it with `curl -fsSL https://claude.ai/install.sh | bash`.",
                 docs: "https://code.claude.com/docs/en/setup",
             },
             Self::Codex => Install {
                 binaries: &["codex"],
                 home_fallbacks: &[".local/bin/codex"],
-                command: "npm install -g @openai/codex",
+                instructions: "Install it with `npm install -g @openai/codex`.",
                 docs: "https://developers.openai.com/codex/cli",
             },
             Self::CopilotCli => Install {
                 binaries: &["copilot"],
                 home_fallbacks: &[".local/bin/copilot"],
-                command: "npm install -g @github/copilot",
+                instructions: "Install it with `npm install -g @github/copilot`.",
                 docs: "https://docs.github.com/en/copilot/how-tos/copilot-cli",
             },
             // Only Cursor's local-agent build accepts a model endpoint; the
@@ -149,25 +149,25 @@ impl Agent {
             Self::Cursor => Install {
                 binaries: &["cursor-agent-local", "agent-local"],
                 home_fallbacks: &[".local/bin/cursor-agent-local", ".local/bin/agent-local"],
-                command: "curl https://cursor.com/install -fsS | bash",
+                instructions: "Cursor's public CLI cannot use another model endpoint, so install its local-agent build instead: download `agent-cli-local-package.tar.gz` for your platform from Cursor's downloads, extract it, and put its `cursor-agent-local` on PATH.",
                 docs: "https://cursor.com/docs/cli/overview",
             },
             Self::Grok => Install {
                 binaries: &["grok"],
                 home_fallbacks: &[".grok/bin/grok"],
-                command: "curl -fsSL https://x.ai/cli/install.sh | bash",
+                instructions: "Install it with `curl -fsSL https://x.ai/cli/install.sh | bash`.",
                 docs: "https://docs.x.ai/build/overview",
             },
             Self::OpenCode => Install {
                 binaries: &["opencode"],
                 home_fallbacks: &[".opencode/bin/opencode"],
-                command: "curl -fsSL https://opencode.ai/install | bash",
+                instructions: "Install it with `curl -fsSL https://opencode.ai/install | bash`.",
                 docs: "https://opencode.ai/docs/",
             },
             Self::Pi => Install {
                 binaries: &["pi"],
                 home_fallbacks: &[".local/bin/pi"],
-                command: "curl -fsSL https://pi.dev/install.sh | sh",
+                instructions: "Install it with `curl -fsSL https://pi.dev/install.sh | sh`.",
                 docs: "https://pi.dev",
             },
         }
@@ -200,8 +200,10 @@ impl Agent {
     /// the Spice model with these, exactly as they would without Spice.
     const fn model_options(self) -> &'static [&'static str] {
         match self {
-            Self::Antigravity | Self::ClaudeCode | Self::CopilotCli | Self::Pi => &["--model"],
-            Self::Codex | Self::Cursor | Self::Grok | Self::OpenCode => &["--model", "-m"],
+            Self::Antigravity | Self::ClaudeCode | Self::CopilotCli | Self::Cursor | Self::Pi => {
+                &["--model"]
+            }
+            Self::Codex | Self::Grok | Self::OpenCode => &["--model", "-m"],
         }
     }
 
@@ -663,8 +665,11 @@ fn pi(backend: &Backend<'_>, scratch: &Path) -> Launch {
     }
 }
 
-/// The Antigravity CLI reaches models only through the Gemini API, pointed at
-/// another host with `GOOGLE_GEMINI_BASE_URL`.
+/// The Antigravity CLI's LLM gateway mode: it skips Google sign-in, lists the
+/// models it is given, and sends each request to the gateway as a Gemini API
+/// `models/{model}:streamGenerateContent` call. Unlike its Gemini API key
+/// mode, the gateway needs no `modelProvider` entry in the user's
+/// `settings.json`.
 fn antigravity(backend: &Backend<'_>) -> Launch {
     let args = if backend.model_given {
         Vec::new()
@@ -674,10 +679,14 @@ fn antigravity(backend: &Backend<'_>) -> Launch {
     Launch {
         args,
         env: vec![
-            ("GOOGLE_GEMINI_BASE_URL", os(backend.endpoint)),
-            ("GEMINI_API_KEY", os(backend.token())),
+            // The root: the CLI appends `/v1beta/models/...` itself.
+            ("AGY_LLM_GATEWAY_URL", os(backend.endpoint)),
+            // Sent as `Authorization: Bearer`.
+            ("AGY_LLM_GATEWAY_API_KEY", os(backend.token())),
+            ("AGY_LLM_GATEWAY_MODELS", os(backend.models.join(","))),
         ],
-        env_remove: vec!["GOOGLE_API_KEY"],
+        // Headers for another gateway, which Spice has no use for.
+        env_remove: vec!["AGY_LLM_GATEWAY_HEADERS"],
         files: Vec::new(),
         prepare: None,
     }
@@ -983,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_reaches_the_gemini_api_at_the_runtime_root() {
+    fn antigravity_uses_its_llm_gateway_mode_at_the_runtime_root() {
         let models = models();
         let launch = launch(
             Agent::Antigravity,
@@ -994,8 +1003,9 @@ mod tests {
         assert_eq!(
             env_of(&launch),
             vec![
-                ("GOOGLE_GEMINI_BASE_URL", ENDPOINT.to_string()),
-                ("GEMINI_API_KEY", "spice".to_string()),
+                ("AGY_LLM_GATEWAY_URL", ENDPOINT.to_string()),
+                ("AGY_LLM_GATEWAY_API_KEY", "spice".to_string()),
+                ("AGY_LLM_GATEWAY_MODELS", "qwen,gpt".to_string()),
             ]
         );
     }

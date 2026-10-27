@@ -304,12 +304,12 @@ pub enum Error {
     CloudConnectProject { message: String },
 
     #[snafu(display(
-        "Failed to start {agent}: it is not installed (no `{binary}` on PATH). Install it with `{install}`, then rerun `spice {command}`. See: {docs}"
+        "Failed to start {agent}: it is not installed (no `{binary}` on PATH). {instructions} Then rerun `spice {command}`. See: {docs}"
     ))]
     CodingAgentNotInstalled {
         agent: &'static str,
         binary: String,
-        install: &'static str,
+        instructions: &'static str,
         command: &'static str,
         docs: &'static str,
     },

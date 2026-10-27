@@ -233,7 +233,7 @@ fn find_agent(agent: Agent) -> Result<PathBuf> {
     CodingAgentNotInstalledSnafu {
         agent: agent.display_name(),
         binary: install.binaries.join("` or `"),
-        install: install.command,
+        instructions: install.instructions,
         command: agent.command(),
         docs: install.docs,
     }
@@ -328,14 +328,14 @@ mod tests {
         let error = CodingAgentNotInstalledSnafu {
             agent: "Claude Code",
             binary: "claude",
-            install: "curl -fsSL https://claude.ai/install.sh | bash",
+            instructions: "Install it with `curl -fsSL https://claude.ai/install.sh | bash`.",
             command: "claude",
             docs: "https://code.claude.com/docs/en/setup",
         }
         .build();
         assert_eq!(
             error.to_string(),
-            "Failed to start Claude Code: it is not installed (no `claude` on PATH). Install it with `curl -fsSL https://claude.ai/install.sh | bash`, then rerun `spice claude`. See: https://code.claude.com/docs/en/setup"
+            "Failed to start Claude Code: it is not installed (no `claude` on PATH). Install it with `curl -fsSL https://claude.ai/install.sh | bash`. Then rerun `spice claude`. See: https://code.claude.com/docs/en/setup"
         );
     }
 

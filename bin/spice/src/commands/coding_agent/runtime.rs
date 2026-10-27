@@ -465,13 +465,13 @@ mod process {
             return false;
         }
         let Ok(output) = std::process::Command::new("ps")
-            .args(["-o", "comm=", "-p", &started.pid.to_string()])
+            .args(["-o", "command=", "-p", &started.pid.to_string()])
             .output()
         else {
             return false;
         };
         let command = String::from_utf8_lossy(&output.stdout);
-        command_names_executable(command.trim(), &started.executable)
+        command_runs_executable(command.trim(), &started.executable)
     }
 
     #[cfg(not(unix))]
@@ -479,15 +479,20 @@ mod process {
         false
     }
 
-    /// Whether `ps -o comm=` output names `executable`. macOS reports the full
-    /// path; Linux reports the file name, truncated to 15 bytes.
-    pub(super) fn command_names_executable(command: &str, executable: &std::path::Path) -> bool {
-        let reported = command.rsplit('/').next().unwrap_or_default();
-        let Some(name) = executable.file_name().and_then(|name| name.to_str()) else {
+    /// Whether a `ps -o command=` line — the process's arguments, starting with
+    /// how it was invoked — ran `executable`. The runtime is always started by
+    /// its absolute path, so a process the system later gave the same PID would
+    /// have to have been started from that exact file to be taken for it.
+    pub(super) fn command_runs_executable(command: &str, executable: &std::path::Path) -> bool {
+        let Some(path) = executable.to_str().filter(|path| !path.is_empty()) else {
             return false;
         };
-        !reported.is_empty()
-            && (reported == name || (reported.len() >= 15 && name.starts_with(reported)))
+        let invoked = |line: &str| line == path || line.starts_with(&format!("{path} "));
+        // Directly, or as the script an interpreter was given first.
+        invoked(command)
+            || command
+                .split_once(' ')
+                .is_some_and(|(_, rest)| invoked(rest))
     }
 
     /// Whether `pid` is still running.
@@ -586,23 +591,35 @@ mod tests {
     #[test]
     fn a_reused_pid_is_not_taken_for_the_runtime() {
         let spiced = Path::new("/home/u/.spice/bin/spiced");
-        // macOS reports the whole path, Linux the (possibly truncated) name.
-        assert!(process::command_names_executable(
-            "/home/u/.spice/bin/spiced",
+        assert!(process::command_runs_executable(
+            "/home/u/.spice/bin/spiced --pods-watcher-enabled --http 127.0.0.1:8090",
             spiced
         ));
-        assert!(process::command_names_executable("spiced", spiced));
-        assert!(process::command_names_executable(
-            "spiced-a5720dc8",
-            Path::new("/opt/spiced-a5720dc85d")
-        ));
-        // A short name is a different program, not a truncation.
-        assert!(!process::command_names_executable("spice", spiced));
-        assert!(!process::command_names_executable(
-            "/usr/bin/python3",
+        // A runtime started through an interpreter, as a script with a shebang is.
+        assert!(process::command_runs_executable(
+            "/usr/bin/python3 /home/u/.spice/bin/spiced --http 127.0.0.1:8090",
             spiced
         ));
-        assert!(!process::command_names_executable("", spiced));
+        // A different program, or the same name from another directory, is not it.
+        assert!(!process::command_runs_executable(
+            "/usr/bin/python3 -m http.server",
+            spiced
+        ));
+        assert!(!process::command_runs_executable(
+            "/opt/other/spiced --http 127.0.0.1:8090",
+            spiced
+        ));
+        // Not the program's path when it appears only as a later argument.
+        assert!(!process::command_runs_executable(
+            "/usr/bin/vim notes --file /home/u/.spice/bin/spiced",
+            spiced
+        ));
+        assert!(!process::command_runs_executable("", spiced));
+        // A home directory with a space in it.
+        assert!(process::command_runs_executable(
+            "/Users/A B/.spice/bin/spiced --http 127.0.0.1:8090",
+            Path::new("/Users/A B/.spice/bin/spiced")
+        ));
     }
 
     #[test]

@@ -172,7 +172,17 @@ pub(crate) async fn post(
                                 }
                                 tracing::info!(target: "task_history", parent: &span_clone,  id = %response.id, "labels");
 
-                            Json(response).into_response()
+                            match llms::chat::wire::chat_completion_json(&response) {
+                                Ok(response) => Json(response).into_response(),
+                                Err(e) => {
+                                    tracing::error!("Failed to serialize chat completion: {e}");
+                                    (
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        format!("Failed to serialize the chat completion: {e}"),
+                                    )
+                                        .into_response()
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::error!(target: "task_history", parent: &span_clone, "{e}");
@@ -336,10 +346,17 @@ fn create_sse_response(
                             chat_output.push_str(intermediate_chat_output);
                         }
 
-                    yield Ok::<Event, Infallible>(Event::default().json_data(resp).unwrap_or_else(|e| {
-                        tracing::error!("Failed to serialize chat completion message: {e}");
-                        to_openai_error_event(e.to_string())
-                    }));
+                    let event = match llms::chat::wire::chat_completion_json(&resp) {
+                        Ok(chunk) => Event::default().json_data(chunk).unwrap_or_else(|e| {
+                            tracing::error!("Failed to serialize chat completion message: {e}");
+                            to_openai_error_event(e.to_string())
+                        }),
+                        Err(e) => {
+                            tracing::error!("Failed to serialize chat completion message: {e}");
+                            to_openai_error_event(e.to_string())
+                        }
+                    };
+                    yield Ok::<Event, Infallible>(event);
                 },
                 Err(e) => {
                     tracing::error!("Error encountered in chat completion stream: {e}");

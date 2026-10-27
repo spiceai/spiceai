@@ -1680,3 +1680,392 @@ mod env_vars {
             .success();
     }
 }
+
+// ============================================================================
+// Coding agent tests (`spice claude`, `spice codex`, ...)
+// ============================================================================
+
+/// The real `spice` binary launching stub agents against stub runtimes: what
+/// reaches the agent, and what happens to the runtime around it.
+#[cfg(unix)]
+mod coding_agents {
+    use super::*;
+    use std::fmt::Write as _;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    const MODELS: &str = r#"{"object":"list","data":[{"id":"qwen","object":"model","owned_by":"openai:qwen3","status":"Ready"}]}"#;
+
+    /// How long a stub gets to reach the state a test waits for; only an upper
+    /// bound on something that normally takes milliseconds.
+    const BUDGET: Duration = Duration::from_secs(30);
+
+    /// A runtime the user started, answering `/health` and `/v1/models` from a
+    /// thread of this process. Returns its endpoint.
+    fn user_runtime() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the stub runtime");
+        let port = listener.local_addr().expect("stub runtime address").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Ok(reader) = stream.try_clone() else {
+                    continue;
+                };
+                let mut reader = BufReader::new(reader);
+                let mut request = String::new();
+                if reader.read_line(&mut request).is_err() {
+                    continue;
+                }
+                let mut header = String::new();
+                while reader.read_line(&mut header).is_ok_and(|n| n > 0) && header != "\r\n" {
+                    header.clear();
+                }
+                let path = request.split_whitespace().nth(1).unwrap_or_default();
+                let (status, body) = if path == "/health" {
+                    ("200 OK", "ok")
+                } else if path.starts_with("/v1/models") {
+                    ("200 OK", MODELS)
+                } else {
+                    ("404 Not Found", "")
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn write_executable(path: &Path, script: &str) {
+        fs::create_dir_all(path.parent().expect("a parent")).expect("create the directory");
+        fs::write(path, script).expect("write the script");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("make it executable");
+    }
+
+    /// An agent that records its arguments, then `vars` from its environment,
+    /// one per line, and exits with `code`.
+    fn stub_agent(bin: &Path, name: &str, record: &Path, vars: &[&str], code: i32) {
+        let mut script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+            record.display()
+        );
+        for var in vars {
+            let _ = writeln!(
+                script,
+                "printf '{var}=%s\\n' \"${{{var}-<unset>}}\" >> '{}'",
+                record.display()
+            );
+        }
+        let _ = writeln!(script, "exit {code}");
+        write_executable(&bin.join(name), &script);
+    }
+
+    /// `spice` with a private home (for `~/.spice/run`) and only `bin` and the
+    /// system directories on `PATH`.
+    fn agent_cmd(home: &Path, bin: &Path) -> Command {
+        let mut cmd = spice_cmd();
+        cmd.env("HOME", home)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env_remove("SPICE_API_KEY")
+            .timeout(BUDGET);
+        cmd
+    }
+
+    #[test]
+    fn claude_code_reaches_the_running_runtime_with_every_argument_unchanged() {
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin, record) = (
+            dir.path().join("home"),
+            dir.path().join("bin"),
+            dir.path().join("record"),
+        );
+        stub_agent(
+            &bin,
+            "claude",
+            &record,
+            &[
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+            ],
+            3,
+        );
+
+        agent_cmd(&home, &bin)
+            .env("ANTHROPIC_API_KEY", "sk-ant-vendor-key")
+            .args([
+                "--http-endpoint",
+                &endpoint,
+                "claude",
+                "--resume",
+                "a b",
+                "-v",
+                "--model",
+                "qwen",
+            ])
+            .assert()
+            .code(3);
+
+        assert_eq!(
+            fs::read_to_string(&record).expect("the agent ran"),
+            format!(
+                "--resume\na b\n-v\n--model\nqwen\nANTHROPIC_BASE_URL={endpoint}\nANTHROPIC_MODEL=qwen\nANTHROPIC_AUTH_TOKEN=spice\nANTHROPIC_API_KEY=<unset>\n"
+            ),
+            "the agent's own arguments arrive unchanged, and the vendor key never reaches it"
+        );
+        // A runtime spice did not start is left running.
+        assert!(
+            std::net::TcpStream::connect(endpoint.trim_start_matches("http://")).is_ok(),
+            "the user's runtime must still be serving"
+        );
+    }
+
+    #[test]
+    fn codex_gets_its_provider_before_the_users_arguments() {
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin, record) = (
+            dir.path().join("home"),
+            dir.path().join("bin"),
+            dir.path().join("record"),
+        );
+        stub_agent(&bin, "codex", &record, &[], 0);
+
+        agent_cmd(&home, &bin)
+            .args([
+                "--http-endpoint",
+                &endpoint,
+                "codex",
+                "--yolo",
+                "exec",
+                "hi",
+            ])
+            .assert()
+            .success();
+
+        assert_eq!(
+            fs::read_to_string(&record).expect("the agent ran"),
+            format!(
+                "-c\nmodel_provider=\"spice\"\n-c\nmodel_providers.spice.name=\"Spice\"\n-c\nmodel_providers.spice.base_url=\"{endpoint}/v1\"\n-c\nmodel_providers.spice.wire_api=\"responses\"\n-c\nmodel=\"qwen\"\n--yolo\nexec\nhi\n"
+            )
+        );
+    }
+
+    #[test]
+    fn an_unknown_model_is_refused_before_the_agent_starts() {
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin, record) = (
+            dir.path().join("home"),
+            dir.path().join("bin"),
+            dir.path().join("record"),
+        );
+        stub_agent(&bin, "codex", &record, &[], 0);
+
+        agent_cmd(&home, &bin)
+            .args(["--http-endpoint", &endpoint, "codex", "-m", "gpt-x"])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains(
+                "the Spice runtime has no model 'gpt-x'. Available models: qwen.",
+            ));
+        assert!(
+            !record.exists(),
+            "the agent must not start on a model the runtime lacks"
+        );
+    }
+
+    #[test]
+    fn a_missing_agent_says_how_to_install_it() {
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
+        fs::create_dir_all(&bin).expect("create bin");
+
+        agent_cmd(&home, &bin)
+            .args(["--http-endpoint", &endpoint, "grok"])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains(
+                "Failed to start Grok Build: it is not installed (no `grok` on PATH). Install it with `curl -fsSL https://x.ai/cli/install.sh | bash`. Then rerun `spice grok`.",
+            ));
+    }
+
+    /// `spice help claude` is the one way to read the command's own help, since
+    /// `--help` after the command is Claude Code's.
+    #[test]
+    fn the_commands_help_is_reached_through_spice_help() {
+        spice_cmd()
+            .args(["help", "claude"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "Every argument after `claude` is passed to Claude Code unchanged",
+            ));
+    }
+
+    /// A stub `spiced`: serves `/health` and `/v1/models` on the `--http`
+    /// address it is given, writes its PID, and exits on SIGTERM.
+    fn stub_runtime(path: &Path, pid_file: &Path) {
+        let python = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .expect("python3 is needed to stand in for the runtime");
+        write_executable(
+            path,
+            &format!(
+                r#"#!{python}
+import http.server, os, signal, sys
+args = sys.argv[1:]
+host, port = args[args.index("--http") + 1].rsplit(":", 1)
+open({pid_file:?}, "w").write(str(os.getpid()))
+MODELS = {MODELS:?}.encode()
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"ok" if self.path == "/health" else MODELS if self.path.startswith("/v1/models") else b""
+        self.send_response(200 if body else 404)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+signal.signal(signal.SIGTERM, lambda *args: os._exit(0))
+http.server.ThreadingHTTPServer((host, int(port)), Handler).serve_forever()
+"#,
+                python = python.display(),
+                pid_file = pid_file.display().to_string(),
+            ),
+        );
+    }
+
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + BUDGET;
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn serving(address: &str) -> bool {
+        std::net::TcpStream::connect(address).is_ok()
+    }
+
+    fn free_address() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address").to_string();
+        drop(listener);
+        address
+    }
+
+    /// A spawned `spice` session, killed with its agent if the test fails
+    /// before it exits on its own.
+    struct Session(std::process::Child);
+
+    impl Session {
+        fn wait(&mut self) -> std::process::ExitStatus {
+            self.0.wait().expect("wait for the session")
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    /// Two agents share the runtime the first one started: it outlives the
+    /// first agent, and the second one stops it.
+    #[test]
+    fn a_started_runtime_is_shared_and_stopped_by_the_last_agent_to_exit() {
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin, app) = (
+            dir.path().join("home"),
+            dir.path().join("bin"),
+            dir.path().join("app"),
+        );
+        fs::create_dir_all(&app).expect("create the app directory");
+        let spiced = dir.path().join("runtime").join("spiced");
+        let pid_file = dir.path().join("spiced.pid");
+        stub_runtime(&spiced, &pid_file);
+        // An agent that says it is running, then waits to be told to exit.
+        write_executable(
+            &bin.join("pi"),
+            &format!(
+                "#!/bin/sh\ntouch '{d}/started-'\"$SESSION\"\nwhile [ -d '{d}' ] && [ ! -e '{d}/exit-'\"$SESSION\" ]; do sleep 0.05; done\n",
+                d = dir.path().display()
+            ),
+        );
+        let address = free_address();
+        let session = |name: &str| {
+            Session(
+                std::process::Command::new(assert_cmd::cargo::cargo_bin!("spice"))
+                    .current_dir(&app)
+                    .env("HOME", &home)
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                    .env("SPICED_PATH", &spiced)
+                    .env("SESSION", name)
+                    .env_remove("SPICE_API_KEY")
+                    .args(["--http-endpoint", &format!("http://{address}"), "pi"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("start spice pi"),
+            )
+        };
+        let started = |name: &str| dir.path().join(format!("started-{name}"));
+        let release = |name: &str| {
+            fs::write(dir.path().join(format!("exit-{name}")), "").expect("release the agent")
+        };
+
+        let mut first = session("first");
+        wait_for("the first agent", || started("first").exists());
+        assert!(serving(&address), "the first session started the runtime");
+        let mut second = session("second");
+        wait_for("the second agent", || started("second").exists());
+
+        release("first");
+        assert!(first.wait().success());
+        assert!(
+            serving(&address),
+            "the runtime outlives the first agent while the second still uses it"
+        );
+
+        release("second");
+        assert!(second.wait().success());
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .expect("the runtime wrote its PID")
+            .trim()
+            .parse()
+            .expect("a PID");
+        wait_for("the runtime to stop", || {
+            !serving(&address) && !process_exists(pid)
+        });
+        assert!(
+            !home
+                .join(".spice/run")
+                .join(format!("{}.json", address.replace(':', "_")))
+                .exists(),
+            "the record of the stopped runtime is removed"
+        );
+    }
+
+    /// Whether a signal could be sent to `pid`, without sending one.
+    fn process_exists(pid: i32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
