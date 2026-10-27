@@ -49,6 +49,92 @@ mod flight_prepared_statements {
             .await
     }
 
+    /// A bound parameter must reach the query with its own Arrow type: a
+    /// zone-aware timestamp keeps its zone and unit (it used to be cast to the
+    /// zone-less nanosecond `TIMESTAMP`, so it matched the wrong rows of a
+    /// zoned column), and a `Float64` compared to a `DECIMAL` matches the
+    /// decimal it spells (it used to go through a binary float cast).
+    #[tokio::test]
+    async fn bound_timestamp_and_float_params_keep_their_arrow_type() -> Result<(), anyhow::Error> {
+        use arrow::array::{Float64Array, TimestampMicrosecondArray};
+        use arrow::datatypes::{DataType, TimeUnit};
+
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                let (channel, _df) = start_spice_test_app(None, None, None).await?;
+                let mut client = FlightSqlServiceClient::new(channel);
+
+                // 2026-03-08T10:30:00Z, the same instant as the row it is
+                // compared to, which is stored in America/Los_Angeles.
+                const INSTANT_MICROS: i64 = 1_772_965_800_000_000;
+                let utc = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+                let timestamp = create_param_batch(
+                    vec![("$1", utc, false)],
+                    vec![Arc::new(
+                        TimestampMicrosecondArray::from(vec![INSTANT_MICROS]).with_timezone("UTC"),
+                    ) as ArrayRef],
+                )?;
+                let results = execute_parameterized_query(
+                    &mut client,
+                    "SELECT arrow_typeof($1) AS bound_type, \
+                     $1 = arrow_cast(1772965800000000, 'Timestamp(µs, \"America/Los_Angeles\")') AS same_instant",
+                    timestamp,
+                )
+                .await?;
+                let batch = results.first().expect("one batch");
+                let bound_type = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("arrow_typeof is Utf8")
+                    .value(0)
+                    .to_string();
+                assert_eq!(
+                    bound_type,
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())).to_string(),
+                    "the bound timestamp lost its zone or unit"
+                );
+                let same_instant = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("comparison is Boolean")
+                    .value(0);
+                assert!(
+                    same_instant,
+                    "a UTC parameter must equal the same instant stored in another zone"
+                );
+
+                let float = create_param_batch(
+                    vec![("$1", DataType::Float64, false)],
+                    vec![Arc::new(Float64Array::from(vec![12_345_678.90])) as ArrayRef],
+                )?;
+                let results = execute_parameterized_query(
+                    &mut client,
+                    "SELECT count(*) AS matches FROM (VALUES (CAST('12345678.90' AS DECIMAL(10, 2)))) AS v(d) WHERE d = $1",
+                    float,
+                )
+                .await?;
+                let matches = results
+                    .first()
+                    .expect("one batch")
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("count is Int64")
+                    .value(0);
+                assert_eq!(
+                    matches, 1,
+                    "a Float64 parameter of 12345678.90 must match DECIMAL(10, 2) 12345678.90"
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
     /// The schema `GetFlightInfo` advertises for a prepared statement with
     /// bound parameters must match the `DoGet` stream, including for output
     /// columns derived from a parameter (ADBC and arrow-go reject a mismatch
