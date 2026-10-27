@@ -1392,7 +1392,10 @@ async fn test_cancelled_plain_append_does_not_wedge_after_compaction_impl(
     let name = "cancelled_plain_append";
     let (table, ctx) = setup_table_with_aggressive_compaction(&fixture, name).await;
 
-    // Committed appends that give compaction small files to merge.
+    // Committed appends that give compaction small files to merge. Holding the
+    // compaction lock makes their post-write passes decline without spending
+    // the trigger, so the explicit pass below is the one that moves the snapshot.
+    let compaction_hold = table.hold_compaction().await;
     for batch_idx in 0..4_i64 {
         append_batch(&table, large_batch(1 + batch_idx * ROWS, ROWS)).await?;
     }
@@ -1442,6 +1445,7 @@ async fn test_cancelled_plain_append_does_not_wedge_after_compaction_impl(
     }
 
     // Move the current snapshot.
+    drop(compaction_hold);
     assert!(
         table.maybe_compact_small_files().await?,
         "compaction must run so the current snapshot moves"
@@ -1514,7 +1518,7 @@ async fn count_star(ctx: &SessionContext, table_name: &str) -> usize {
 async fn append_batch(
     provider: &CayenneTableProvider,
     batch: RecordBatch,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> datafusion_common::Result<()> {
     let ctx = SessionContext::new();
     let schema = Arc::clone(batch.schema_ref());
     let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
