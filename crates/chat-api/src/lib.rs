@@ -599,18 +599,30 @@ pub trait Chat: Sync + Send {
         })
     }
 
-    /// The most tokens one request can hold, prompt and answer together, when the model
-    /// reports it: a local model's context size, or a hosted model's from its provider's
-    /// model metadata. `None` when it is not known — never an estimate, since a client sizes
-    /// its context management by it.
+    /// The model's token limits, as far as it reports them: a local model's context size,
+    /// or what a hosted model's provider reports in its model metadata. Each limit is `None`
+    /// when it is not known — never an estimate, since a client sizes its context management
+    /// and its answers by them.
     ///
-    /// Asked once, when the model loads, and may call the provider.
+    /// Asked when the model loads and each time `/v1/models` lists it. A hosted model reads
+    /// its provider's model metadata once per endpoint and keeps it, so only the first call
+    /// may wait on the provider.
     ///
     /// A type that wraps another `Chat` must forward this to the model it wraps: the default
-    /// answers `None`, which would hide the inner model's window.
-    async fn context_window(&self) -> Option<u64> {
-        None
+    /// answers no limits, which would hide the inner model's.
+    async fn token_limits(&self) -> TokenLimits {
+        TokenLimits::default()
     }
+}
+
+/// A model's token limits. Each is `None` when the model or its provider does not report it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenLimits {
+    /// The most tokens one request can hold, prompt and answer together.
+    pub context_window: Option<u64>,
+    /// The most tokens one answer can hold, where the provider or engine enforces such a
+    /// cap. Never derived from the context window.
+    pub max_output_tokens: Option<u64>,
 }
 
 #[cfg(test)]

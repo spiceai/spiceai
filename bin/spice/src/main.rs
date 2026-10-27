@@ -326,6 +326,14 @@ enum Commands {
     )]
     Pi(coding_agent::CodingAgentArgs),
 
+    #[command(
+        about = coding_agent::orca::about(),
+        long_about = coding_agent::orca::long_about(),
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
+    Orca(coding_agent::CodingAgentArgs),
+
     // ── Auth, cluster, and Spice Cloud ───────────────────────────────────────
     Login(login::LoginArgs),
 
@@ -338,6 +346,25 @@ enum Commands {
 
     /// Open the Spice.ai community Slack to share feedback
     Feedback(feedback::FeedbackArgs),
+}
+
+impl Commands {
+    /// The arguments of a coding agent's command, or of `orca`: all of them are
+    /// the program's own.
+    fn coding_agent_args(&self) -> Option<&coding_agent::CodingAgentArgs> {
+        match self {
+            Self::Agy(args)
+            | Self::Claude(args)
+            | Self::Codex(args)
+            | Self::Copilot(args)
+            | Self::Cursor(args)
+            | Self::Grok(args)
+            | Self::Opencode(args)
+            | Self::Pi(args)
+            | Self::Orca(args) => Some(args),
+            _ => None,
+        }
+    }
 }
 
 fn main() {
@@ -383,11 +410,15 @@ fn main() {
     // subscriber writes to stdout, so stdout's terminal-ness decides colour:
     // the builder default would honour `NO_COLOR` but still paint a redirected
     // stdout, and this is the same decision the CLI's own painted output uses.
+    //
+    // A coding agent's stdout is the agent's own — `spice claude -p … | jq` reads
+    // what Claude Code printed — so spice's messages go to stderr there too.
+    let agent_stdout = cli.command.coding_agent_args().is_some();
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .without_time();
-    if json_stdout {
+    if json_stdout || agent_stdout {
         subscriber
             .with_ansi(ansi_colors::colors_enabled_for(ansi_colors::Target::Stderr))
             .with_writer(std::io::stderr)
@@ -525,11 +556,13 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
     normalized
 }
 
-/// Whether `name` is a coding agent's subcommand or alias.
+/// Whether `name` is a coding agent's subcommand or alias, or `orca`, whose
+/// arguments are all Orca's in the same way.
 fn is_coding_agent_command(name: &str) -> bool {
-    coding_agent::Agent::ALL
-        .iter()
-        .any(|agent| agent.command() == name)
+    name == "orca"
+        || coding_agent::Agent::ALL
+            .iter()
+            .any(|agent| agent.command() == name)
 }
 
 fn normalize_direct_shortcut_args(
@@ -809,6 +842,7 @@ fn apply_machine_mode(command: &mut Commands) {
         | Commands::Grok(_)
         | Commands::Opencode(_)
         | Commands::Pi(_)
+        | Commands::Orca(_)
         | Commands::Feedback(_) => {}
     }
 }
@@ -951,8 +985,11 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::CodingAgentLaunch { .. } => "coding_agent_launch_failed",
         spice::error::Error::CodingAgentPrepare { .. } => "coding_agent_prepare_failed",
         spice::error::Error::CodingAgentFile { .. } => "coding_agent_file",
+        spice::error::Error::CodingAgentConfigConflict { .. } => "coding_agent_config_conflict",
         spice::error::Error::CodingAgentRuntimeStart { .. } => "runtime_start_failed",
         spice::error::Error::CodingAgentRuntimeElsewhere { .. } => "runtime_endpoint_mismatch",
+        spice::error::Error::CodingAgentNoSpicepod { .. } => "no_spicepod",
+        spice::error::Error::CodingAgentOtherSpicepod { .. } => "runtime_spicepod_mismatch",
         spice::error::Error::CodingAgentRuntimeLock { .. } => "runtime_lock",
         spice::error::Error::CodingAgentRuntimeState { .. } => "runtime_state",
         spice::error::Error::CodingAgentModelFailed { .. } => "model_load_failed",
@@ -1028,6 +1065,7 @@ fn is_json_output(cmd: &mut Commands) -> bool {
         | Commands::Grok(_)
         | Commands::Opencode(_)
         | Commands::Pi(_)
+        | Commands::Orca(_)
         | Commands::Feedback(_) => false,
     }
 }
@@ -1219,6 +1257,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         Commands::Grok(args) => run_coding_agent(&ctx, coding_agent::Agent::Grok, &args)?,
         Commands::Opencode(args) => run_coding_agent(&ctx, coding_agent::Agent::OpenCode, &args)?,
         Commands::Pi(args) => run_coding_agent(&ctx, coding_agent::Agent::Pi, &args)?,
+        Commands::Orca(args) => exit_with(coding_agent::orca::execute(&ctx, &args))?,
         Commands::Completions(args) => {
             completions::execute(&args, &mut Cli::command());
         }
@@ -1236,17 +1275,22 @@ fn run_cli(cli: Cli) -> Result<()> {
 }
 
 /// Run a coding agent, and exit with its code when it fails.
-///
-/// The agent's code is this command's code, the way a wrapper such as `time`
-/// or `sudo` reports it: a script sees what the agent reported.
 fn run_coding_agent(
     ctx: &RuntimeContext,
     agent: coding_agent::Agent,
     args: &coding_agent::CodingAgentArgs,
 ) -> Result<()> {
+    exit_with(coding_agent::execute(ctx, agent, args))
+}
+
+/// Run a coding agent or Orca, and exit with its code when it fails.
+///
+/// The program's code is this command's code, the way a wrapper such as
+/// `time` or `sudo` reports it: a script sees what the program reported.
+fn exit_with(run: impl std::future::Future<Output = Result<i32>>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
-    let code = rt.block_on(coding_agent::execute(ctx, agent, args))?;
+    let code = rt.block_on(run)?;
     if code != 0 {
         drop(rt);
         std::process::exit(code);
@@ -2019,20 +2063,13 @@ mod tests {
         );
     }
 
-    fn agent_args(command: Commands) -> Vec<String> {
-        let args = match command {
-            Commands::Agy(args)
-            | Commands::Claude(args)
-            | Commands::Codex(args)
-            | Commands::Copilot(args)
-            | Commands::Cursor(args)
-            | Commands::Grok(args)
-            | Commands::Opencode(args)
-            | Commands::Pi(args) => args.args,
-            _ => panic!("not a coding agent command"),
-        };
-        args.into_iter()
-            .map(|arg| arg.into_string().expect("UTF-8 argument"))
+    fn agent_args(command: &Commands) -> Vec<String> {
+        command
+            .coding_agent_args()
+            .expect("a coding agent command")
+            .args
+            .iter()
+            .map(|arg| arg.to_str().expect("UTF-8 argument").to_string())
             .collect()
     }
 
@@ -2060,11 +2097,11 @@ mod tests {
         // the separator, before any argument it has read as the agent's.
         let cli = parse_normalized(&["spice", "grok", "-v", "--resume"]);
         assert_eq!(cli.verbose, 0, "-v right after `grok` is Grok's");
-        assert_eq!(agent_args(cli.command), ["-v", "--resume"]);
+        assert_eq!(agent_args(&cli.command), ["-v", "--resume"]);
         let cli = parse_normalized(&["spice", "pi", "--", "--help"]);
-        assert_eq!(agent_args(cli.command), ["--", "--help"]);
+        assert_eq!(agent_args(&cli.command), ["--", "--help"]);
         let cli = parse_normalized(&["spice", "claude", "--version"]);
-        assert_eq!(agent_args(cli.command), ["--version"]);
+        assert_eq!(agent_args(&cli.command), ["--version"]);
 
         let cli = parse_normalized(&[
             "spice",
@@ -2079,7 +2116,7 @@ mod tests {
             "-m",
         ]);
         assert_eq!(
-            agent_args(cli.command),
+            agent_args(&cli.command),
             [
                 "--yolo",
                 "-v",
@@ -2105,7 +2142,7 @@ mod tests {
         ]);
         assert_eq!(cli.verbose, 1);
         assert_eq!(cli.http_endpoint.as_deref(), Some("http://127.0.0.1:9000"));
-        assert_eq!(agent_args(cli.command), ["--continue"]);
+        assert_eq!(agent_args(&cli.command), ["--continue"]);
     }
 
     #[test]
@@ -2123,7 +2160,7 @@ mod tests {
             assert_eq!(expected.command(), name);
             let cli = parse_normalized(&["spice", name]);
             assert!(
-                agent_args(cli.command).is_empty(),
+                agent_args(&cli.command).is_empty(),
                 "`spice {name}` passes no arguments"
             );
         }
@@ -2131,6 +2168,33 @@ mod tests {
             coding_agent::Agent::ALL.len(),
             8,
             "a new agent needs a row above"
+        );
+    }
+
+    /// `spice orca serve --port 6768` is `orca serve --port 6768`, options
+    /// spelled like spice's own included.
+    #[test]
+    fn every_argument_after_orca_is_orcas() {
+        let cli = parse_normalized(&["spice", "orca"]);
+        assert!(agent_args(&cli.command).is_empty());
+        let cli = parse_normalized(&[
+            "spice",
+            "--http-endpoint",
+            "http://127.0.0.1:9000",
+            "orca",
+            "serve",
+            "--port",
+            "6768",
+            "-v",
+            "--help",
+            "--api-key",
+            "x",
+        ]);
+        assert_eq!(cli.http_endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+        assert_eq!(cli.verbose, 0, "-v after `orca` is Orca's");
+        assert_eq!(
+            agent_args(&cli.command),
+            ["serve", "--port", "6768", "-v", "--help", "--api-key", "x"]
         );
     }
 }

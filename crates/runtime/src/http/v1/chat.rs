@@ -426,6 +426,20 @@ fn evaluate_only_chat_response(model_id: &str) -> Response {
     }))
 }
 
+/// The HTTP status an `OpenAI` API error answers with.
+#[must_use]
+pub(crate) fn api_error_status(api_error: &async_openai::error::ApiError) -> StatusCode {
+    match ApiErrorKind::of(api_error) {
+        Some(ApiErrorKind::InvalidRequest) => StatusCode::BAD_REQUEST,
+        Some(ApiErrorKind::Authentication) => StatusCode::UNAUTHORIZED,
+        Some(ApiErrorKind::PermissionDenied) => StatusCode::FORBIDDEN,
+        Some(ApiErrorKind::NotFound) => StatusCode::NOT_FOUND,
+        Some(ApiErrorKind::InsufficientQuota) => StatusCode::PAYMENT_REQUIRED,
+        Some(ApiErrorKind::RateLimited) => StatusCode::TOO_MANY_REQUESTS,
+        None => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 /// Converts `OpenAI` errors to HTTP responses
 /// Preserve the original `OpenAI` error structure to maintain compatibility with `OpenAI` documentation
 #[must_use]
@@ -440,15 +454,7 @@ pub fn openai_error_to_response(e: OpenAIError) -> Response {
                 "code": api_error.code
             });
 
-            let status_code = match ApiErrorKind::of(&api_error) {
-                Some(ApiErrorKind::InvalidRequest) => StatusCode::BAD_REQUEST,
-                Some(ApiErrorKind::Authentication) => StatusCode::UNAUTHORIZED,
-                Some(ApiErrorKind::PermissionDenied) => StatusCode::FORBIDDEN,
-                Some(ApiErrorKind::NotFound) => StatusCode::NOT_FOUND,
-                Some(ApiErrorKind::InsufficientQuota) => StatusCode::PAYMENT_REQUIRED,
-                Some(ApiErrorKind::RateLimited) => StatusCode::TOO_MANY_REQUESTS,
-                None => StatusCode::INTERNAL_SERVER_ERROR,
-            };
+            let status_code = api_error_status(&api_error);
 
             (status_code, Json(error_response)).into_response()
         }

@@ -503,9 +503,13 @@ impl Chat for LlamaCpp {
         None
     }
 
-    /// The context llama.cpp runs the model with: `context_length`, or the default.
-    async fn context_window(&self) -> Option<u64> {
-        (self.context_window > 0).then_some(u64::from(self.context_window))
+    /// The context llama.cpp runs the model with: `context_length`, or the default. It caps
+    /// no answer below that.
+    async fn token_limits(&self) -> llms::chat::TokenLimits {
+        llms::chat::TokenLimits {
+            context_window: (self.context_window > 0).then_some(u64::from(self.context_window)),
+            max_output_tokens: None,
+        }
     }
 
     async fn health(&self) -> Result<()> {

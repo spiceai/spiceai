@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use snafu::ResultExt;
 
-use crate::error::{CodingAgentFileSnafu, Result};
+use crate::error::{CodingAgentConfigConflictSnafu, CodingAgentFileSnafu, Result};
 
 /// The token sent to a runtime that has no API key configured.
 ///
@@ -338,6 +338,220 @@ pub(crate) fn requested_model(agent: Agent, args: &[OsString]) -> RequestedModel
     RequestedModel::Unspecified
 }
 
+/// The user's arguments as the agent receives them: unchanged, except for
+/// Claude Code's `--settings`.
+///
+/// Claude Code reads one `--settings`, the last, so the user's own would
+/// replace the one that routes it to Spice. Each one the user gives is merged
+/// into the Spice settings file instead, in order, with Spice's routing
+/// variables applied last, and is not passed on.
+///
+/// # Errors
+///
+/// Returns an error when a `--settings` value is neither a JSON object nor a
+/// readable file holding one.
+pub(crate) fn user_arguments(
+    agent: Agent,
+    launch: &mut Launch,
+    args: &[OsString],
+) -> Result<Vec<OsString>> {
+    let Some(file) = (agent == Agent::ClaudeCode)
+        .then(|| {
+            launch
+                .files
+                .iter_mut()
+                .find(|file| file.path.ends_with(CLAUDE_CODE_SETTINGS))
+        })
+        .flatten()
+    else {
+        return Ok(args.to_vec());
+    };
+
+    let mut kept = Vec::with_capacity(args.len());
+    let mut given = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.to_str() {
+            // After `--`, Claude Code reads every argument as the prompt.
+            Some("--") => {
+                kept.push(arg.clone());
+                kept.extend(rest.by_ref().cloned());
+            }
+            Some("--settings") => match rest.next() {
+                Some(value) => given.push(value.clone()),
+                // Claude Code reports the missing value.
+                None => kept.push(arg.clone()),
+            },
+            Some(other) if other.starts_with("--settings=") => {
+                given.push(OsString::from(&other["--settings=".len()..]));
+            }
+            _ => kept.push(arg.clone()),
+        }
+    }
+    if given.is_empty() {
+        return Ok(args.to_vec());
+    }
+
+    let mut merged = serde_json::Map::new();
+    for value in &given {
+        for (key, value) in read_claude_code_settings(value)? {
+            match (merged.get_mut(&key), value) {
+                (Some(serde_json::Value::Object(env)), serde_json::Value::Object(more))
+                    if key == "env" =>
+                {
+                    env.extend(more);
+                }
+                (_, value) => {
+                    merged.insert(key, value);
+                }
+            }
+        }
+    }
+    let mut env = match merged.remove("env") {
+        Some(serde_json::Value::Object(env)) => env,
+        _ => serde_json::Map::new(),
+    };
+    env.extend(
+        claude_code_env(&launch.env, &launch.env_remove)
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), serde_json::Value::String(value))),
+    );
+    merged.insert("env".to_string(), serde_json::Value::Object(env));
+    file.contents = serde_json::to_string(&serde_json::Value::Object(merged))
+        .map_err(std::io::Error::other)
+        .context(CodingAgentFileSnafu {
+            path: file.path.clone(),
+        })?;
+    Ok(kept)
+}
+
+/// A Claude Code `--settings` value: a JSON object, or the path of a file
+/// holding one, as Claude Code itself accepts.
+fn read_claude_code_settings(
+    value: &std::ffi::OsStr,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let shown = value.to_string_lossy();
+    let invalid = |detail: String| crate::error::Error::InvalidUsage {
+        message: format!(
+            "Claude Code's `--settings` value '{shown}' {detail}, so spice cannot add the settings that route Claude Code to Spice. Pass a JSON object or the path of a settings file."
+        ),
+    };
+    let text = if shown.trim_start().starts_with('{') {
+        shown.to_string()
+    } else {
+        std::fs::read_to_string(value)
+            .map_err(|error| invalid(format!("is not a readable file ({error})")))?
+    };
+    match serde_json::from_str(&text) {
+        Ok(serde_json::Value::Object(settings)) => Ok(settings),
+        Ok(_) => Err(invalid("is not a JSON object".to_string())),
+        Err(error) => Err(invalid(format!("is not valid JSON ({error})"))),
+    }
+}
+
+/// A setting in an agent's own configuration that the agent applies over the
+/// endpoint `spice` gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigConflict {
+    pub file: PathBuf,
+    pub key: String,
+    pub value: String,
+}
+
+/// Refuse to start `agent` when a setting in its own configuration would
+/// send it, and the runtime key, somewhere other than the runtime at
+/// `endpoint`, and no variable or argument `spice` can give outranks it.
+///
+/// # Errors
+///
+/// Returns an error naming the setting and the file it is in.
+pub(crate) fn check_own_config(agent: Agent, endpoint: &str) -> Result<()> {
+    let conflict = match agent {
+        Agent::Grok => {
+            let home = std::env::var_os("GROK_HOME")
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|home| home.join(".grok")));
+            grok_config_conflict(
+                &openai_base_url(endpoint),
+                home.as_deref(),
+                Path::new("/etc/grok"),
+            )
+        }
+        Agent::Antigravity
+        | Agent::ClaudeCode
+        | Agent::Codex
+        | Agent::CopilotCli
+        | Agent::Cursor
+        | Agent::OpenCode
+        | Agent::Pi => None,
+    };
+    match conflict {
+        Some(conflict) => CodingAgentConfigConflictSnafu {
+            agent: agent.display_name(),
+            file: conflict.file,
+            key: conflict.key,
+            value: conflict.value,
+        }
+        .fail(),
+        None => Ok(()),
+    }
+}
+
+/// The first Grok Build setting that points it at another endpoint than the
+/// runtime at `openai_base_url`.
+///
+/// Grok Build reads `endpoints.models_base_url` and `endpoints.models_list_url`
+/// from its config files over `GROK_MODELS_BASE_URL`, and its `GROK_CONFIG`
+/// overlay cannot set either. The files are its user, managed and
+/// requirements configs, under `grok_home` (`GROK_HOME`, else `~/.grok`) and
+/// the system directory `system` (`/etc/grok`).
+fn grok_config_conflict(
+    openai_base_url: &str,
+    grok_home: Option<&Path>,
+    system: &Path,
+) -> Option<ConfigConflict> {
+    let user = grok_home.into_iter().flat_map(|home| {
+        ["config.toml", "managed_config.toml", "requirements.toml"].map(|name| home.join(name))
+    });
+    let system = ["managed_config.toml", "requirements.toml"].map(|name| system.join(name));
+    for file in user.chain(system) {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        // Grok reports a file it cannot parse itself.
+        let Ok(table) = text.parse::<toml::Table>() else {
+            continue;
+        };
+        let Some(endpoints) = table.get("endpoints").and_then(toml::Value::as_table) else {
+            continue;
+        };
+        for key in ["models_base_url", "models_list_url"] {
+            let Some(value) = endpoints
+                .get(key)
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            // Where this key points Grok at the runtime itself.
+            let runtime = match key {
+                "models_base_url" => openai_base_url.to_string(),
+                _ => format!("{openai_base_url}/models"),
+            };
+            if value.trim_end_matches('/') == runtime.trim_end_matches('/') {
+                continue;
+            }
+            return Some(ConfigConflict {
+                file,
+                key: format!("endpoints.{key}"),
+                value: value.to_string(),
+            });
+        }
+    }
+    None
+}
+
 /// What a Spice runtime offers an agent: where it is, how to authenticate, and
 /// which models it serves.
 #[derive(Debug, Clone, Copy)]
@@ -357,14 +571,37 @@ pub(crate) struct Backend<'a> {
     /// Whether the user named the model with the agent's own option, in which
     /// case no model option is added: the agent would refuse it twice.
     pub model_given: bool,
-    /// The context window of each of [`Self::models`] that the runtime reports one for.
-    pub context_windows: &'a HashMap<String, u64>,
+    /// The token limits of each of [`Self::models`] that the runtime reports any for.
+    pub limits: &'a HashMap<String, Limits>,
+}
+
+/// A model's token limits, as the runtime's `/v1/models` reports them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Limits {
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+}
+
+impl Limits {
+    /// What a prompt may hold: the window, less the answer's cap when it has one.
+    fn prompt_limit(self) -> Option<u64> {
+        let window = self.context_window?;
+        Some(
+            self.max_output_tokens
+                .filter(|output| *output < window)
+                .map_or(window, |output| window - output),
+        )
+    }
 }
 
 impl Backend<'_> {
-    /// The context window of the model the agent starts on, when the runtime reports it.
-    fn start_window(&self) -> Option<u64> {
-        self.context_windows.get(self.model).copied()
+    fn limits_of(&self, model: &str) -> Limits {
+        self.limits.get(model).copied().unwrap_or_default()
+    }
+
+    /// The token limits of the model the agent starts on.
+    fn start(&self) -> Limits {
+        self.limits_of(self.model)
     }
 
     fn token(&self) -> &str {
@@ -374,8 +611,13 @@ impl Backend<'_> {
     /// The OpenAI-compatible base URL, under which `/chat/completions`,
     /// `/responses` and `/models` are resolved.
     fn openai_base_url(&self) -> String {
-        format!("{}/v1", self.endpoint)
+        openai_base_url(self.endpoint)
     }
+}
+
+/// The OpenAI-compatible base URL of the runtime at `endpoint`.
+fn openai_base_url(endpoint: &str) -> String {
+    format!("{}/v1", endpoint.trim_end_matches('/'))
 }
 
 /// A file an agent reads, written before it starts.
@@ -440,7 +682,7 @@ const COPILOT_ENV_REMOVE: &[&str] = &[
 /// Returns an error when a file the agent reads cannot be serialized.
 pub(crate) fn launch(agent: Agent, backend: &Backend<'_>, scratch: &Path) -> Result<Launch> {
     Ok(match agent {
-        Agent::ClaudeCode => claude_code(backend),
+        Agent::ClaudeCode => claude_code(backend, scratch)?,
         Agent::Codex => codex(backend),
         Agent::CopilotCli => copilot(backend),
         Agent::Cursor => cursor(backend),
@@ -455,10 +697,46 @@ fn os(value: impl Into<OsString>) -> OsString {
     value.into()
 }
 
+/// Where in the session's directory Claude Code's settings are written.
+const CLAUDE_CODE_SETTINGS: &str = "claude/settings.json";
+
+/// Claude Code's settings for a session, passed with `--settings`.
+#[derive(serde::Serialize)]
+struct ClaudeCodeSettings {
+    env: std::collections::BTreeMap<&'static str, String>,
+}
+
+/// The `env` of a Claude Code session's settings: each variable `env_remove`
+/// names, empty, and each `env` sets — in its settings too, since Claude
+/// Code's own settings files outrank the environment it inherits. Sorted, so
+/// the file reads the same however serde orders maps.
+fn claude_code_env(
+    env: &[(&'static str, OsString)],
+    env_remove: &[&'static str],
+) -> std::collections::BTreeMap<&'static str, String> {
+    env_remove
+        .iter()
+        .map(|key| (*key, String::new()))
+        .chain(
+            env.iter()
+                .map(|(key, value)| (*key, value.to_string_lossy().into_owned())),
+        )
+        .collect()
+}
+
 /// Claude Code speaks the Anthropic Messages API, which the runtime serves on
 /// `/v1/messages`. `ANTHROPIC_BASE_URL` takes the root; Claude Code appends
 /// `/v1/...` itself.
-fn claude_code(backend: &Backend<'_>) -> Launch {
+///
+/// The variables are set in the environment and again in a settings file
+/// passed with `--settings`. Claude Code applies the `env` of its settings
+/// files over the environment it inherits, so an `ANTHROPIC_BASE_URL` in the
+/// user's or the project's settings would otherwise send every request, and
+/// the runtime key, elsewhere. Settings given with `--settings` take
+/// precedence over the user's, the project's and the local settings files, so
+/// the file also sets each variable cleared from the environment to empty,
+/// which keeps a vendor key or provider switch in those files from applying.
+fn claude_code(backend: &Backend<'_>, scratch: &Path) -> Result<Launch> {
     let model = backend.model;
     let mut env = vec![
         ("ANTHROPIC_BASE_URL", os(backend.endpoint)),
@@ -481,10 +759,15 @@ fn claude_code(backend: &Backend<'_>) -> Launch {
         // differs between versions, so it would only cost a cache miss.
         ("CLAUDE_CODE_ATTRIBUTION_HEADER", os("0")),
     ];
-    if let Some(window) = backend.start_window() {
+    if let Some(window) = backend.start().context_window {
         // Claude Code otherwise assumes 200k tokens for a model id it does not recognize,
         // and compacts — or overflows — at the wrong point.
         env.push(("CLAUDE_CODE_MAX_CONTEXT_TOKENS", os(window.to_string())));
+    }
+    if let Some(output) = backend.start().max_output_tokens {
+        // Claude Code otherwise asks for up to 32k tokens, which a provider with a lower cap
+        // refuses.
+        env.push(("CLAUDE_CODE_MAX_OUTPUT_TOKENS", os(output.to_string())));
     }
     if !backend.native_messages {
         // Tool search defers tools with `defer_loading`, which a Messages
@@ -493,13 +776,25 @@ fn claude_code(backend: &Backend<'_>) -> Launch {
         // loading every tool. Starting with every tool loaded skips the failures.
         env.push(("ENABLE_TOOL_SEARCH", os("false")));
     }
-    Launch {
-        args: Vec::new(),
+
+    let path = scratch.join(CLAUDE_CODE_SETTINGS);
+    let settings = ClaudeCodeSettings {
+        env: claude_code_env(&env, CLAUDE_CODE_ENV_REMOVE),
+    };
+    let contents = serde_json::to_string(&settings)
+        .map_err(std::io::Error::other)
+        .context(CodingAgentFileSnafu { path: path.clone() })?;
+    Ok(Launch {
+        args: vec![os("--settings"), path.clone().into_os_string()],
         env,
         env_remove: CLAUDE_CODE_ENV_REMOVE.to_vec(),
-        files: Vec::new(),
+        files: vec![LaunchFile {
+            path,
+            contents,
+            executable: false,
+        }],
         prepare: None,
-    }
+    })
 }
 
 /// Codex speaks only the Responses API (`wire_api = "chat"` was removed), so
@@ -536,7 +831,7 @@ fn codex(backend: &Backend<'_>) -> Launch {
     // `--model` overrides instead of colliding with.
     args.push(os("-c"));
     args.push(os(format!("model={}", toml_string(backend.model))));
-    if let Some(window) = backend.start_window() {
+    if let Some(window) = backend.start().context_window {
         // Codex sizes its auto-compaction by it, and otherwise falls back to a default for
         // a model it has no metadata for.
         args.push(os("-c"));
@@ -569,10 +864,19 @@ fn copilot(backend: &Backend<'_>) -> Launch {
             ("COPILOT_MODEL", os(backend.model)),
         ]
         .into_iter()
-        .chain(backend.start_window().map(|window| {
-            // Copilot otherwise falls back to a default for a model id it does not know.
-            ("COPILOT_PROVIDER_MAX_PROMPT_TOKENS", os(window.to_string()))
-        }))
+        // Copilot otherwise falls back to defaults for a model id it does not know.
+        .chain(
+            backend
+                .start()
+                .prompt_limit()
+                .map(|limit| ("COPILOT_PROVIDER_MAX_PROMPT_TOKENS", os(limit.to_string()))),
+        )
+        .chain(
+            backend
+                .start()
+                .max_output_tokens
+                .map(|output| ("COPILOT_PROVIDER_MAX_OUTPUT_TOKENS", os(output.to_string()))),
+        )
         .collect(),
         env_remove: COPILOT_ENV_REMOVE.to_vec(),
         files: Vec::new(),
@@ -636,13 +940,22 @@ fn grok(backend: &Backend<'_>, scratch: &Path) -> Launch {
 /// `OpenCode` reads an inline JSON config from `OPENCODE_CONFIG_CONTENT`, which
 /// is merged over the user's global and project configs.
 ///
-/// No context window is given: a model's `limit` requires an `output` limit
-/// beside `context`, and the runtime reports none to give it.
+/// A model's `limit` takes the window and the output cap together, so it is given
+/// only for a model the runtime reports both for.
 fn opencode(backend: &Backend<'_>) -> Launch {
     let models: serde_json::Map<String, serde_json::Value> = backend
         .models
         .iter()
-        .map(|model| (model.clone(), json!({ "name": model })))
+        .map(|model| {
+            let limits = backend.limits_of(model);
+            let entry = match limits.context_window.zip(limits.max_output_tokens) {
+                Some((context, output)) => {
+                    json!({ "name": model, "limit": { "context": context, "output": output } })
+                }
+                None => json!({ "name": model }),
+            };
+            (model.clone(), entry)
+        })
         .collect();
     let default_model = format!("{PROVIDER_ID}/{}", backend.model);
     let config = json!({
@@ -693,14 +1006,10 @@ fn pi(backend: &Backend<'_>, scratch: &Path) -> Result<Launch> {
                 reasoning: false,
                 input: ["text"],
                 cost: PiCost::default(),
-                // The runtime's window when it reports one; else pi's own default for a
-                // model it has no catalog entry for, as is its 16k answer limit.
-                context_window: backend
-                    .context_windows
-                    .get(model)
-                    .copied()
-                    .unwrap_or(128_000),
-                max_tokens: 16_384,
+                // The runtime's limits when it reports them; else pi's own defaults for a
+                // model it has no catalog entry for.
+                context_window: backend.limits_of(model).context_window.unwrap_or(128_000),
+                max_tokens: backend.limits_of(model).max_output_tokens.unwrap_or(16_384),
             })
             .collect(),
     };
@@ -813,8 +1122,9 @@ fn toml_string(value: &str) -> String {
     serde_json::Value::String(value.to_string()).to_string()
 }
 
-/// A single-quoted POSIX shell word.
-fn shell_quote(value: &str) -> String {
+/// `value` as one word in `sh`, `bash`, `zsh` and `fish`: single-quoted, with
+/// each single quote closed, escaped and reopened.
+pub(super) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
@@ -833,8 +1143,15 @@ mod tests {
         vec!["qwen".to_string(), "gpt".to_string()]
     }
 
-    static NO_WINDOWS: std::sync::LazyLock<HashMap<String, u64>> =
+    static NO_LIMITS: std::sync::LazyLock<HashMap<String, Limits>> =
         std::sync::LazyLock::new(HashMap::new);
+
+    fn limits(context_window: u64, max_output_tokens: Option<u64>) -> Limits {
+        Limits {
+            context_window: Some(context_window),
+            max_output_tokens,
+        }
+    }
 
     fn backend<'a>(models: &'a [String], api_key: Option<&'a str>) -> Backend<'a> {
         Backend {
@@ -844,7 +1161,7 @@ mod tests {
             models,
             native_messages: false,
             model_given: false,
-            context_windows: &NO_WINDOWS,
+            limits: &NO_LIMITS,
         }
     }
 
@@ -893,7 +1210,211 @@ mod tests {
         );
         // A vendor key or provider switch in the user's shell must not survive.
         assert_eq!(launch.env_remove, CLAUDE_CODE_ENV_REMOVE);
-        assert!(launch.args.is_empty() && launch.files.is_empty() && launch.prepare.is_none());
+        assert!(launch.prepare.is_none());
+
+        // The same variables again in settings that outrank the user's and the
+        // project's settings files, with every cleared variable set to empty.
+        assert_eq!(
+            args_of(&launch),
+            vec!["--settings", "/scratch/claude/settings.json"]
+        );
+        assert_eq!(launch.files.len(), 1);
+        assert_eq!(
+            launch.files[0].path,
+            PathBuf::from("/scratch/claude/settings.json")
+        );
+        assert!(!launch.files[0].executable);
+        assert_eq!(
+            launch.files[0].contents,
+            concat!(
+                r#"{"env":{"ANTHROPIC_API_KEY":"","ANTHROPIC_AUTH_TOKEN":"spice","#,
+                r#""ANTHROPIC_BASE_URL":"http://127.0.0.1:8090","#,
+                r#""ANTHROPIC_DEFAULT_FABLE_MODEL":"qwen","ANTHROPIC_DEFAULT_HAIKU_MODEL":"qwen","#,
+                r#""ANTHROPIC_DEFAULT_OPUS_MODEL":"qwen","ANTHROPIC_DEFAULT_SONNET_MODEL":"qwen","#,
+                r#""ANTHROPIC_MODEL":"qwen","ANTHROPIC_SMALL_FAST_MODEL":"","#,
+                r#""CLAUDE_CODE_ATTRIBUTION_HEADER":"0","#,
+                r#""CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1","#,
+                r#""CLAUDE_CODE_OAUTH_TOKEN":"","CLAUDE_CODE_SUBAGENT_MODEL":"qwen","#,
+                r#""CLAUDE_CODE_USE_ANTHROPIC_AWS":"","CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD":"","#,
+                r#""CLAUDE_CODE_USE_BEDROCK":"","CLAUDE_CODE_USE_FOUNDRY":"","#,
+                r#""CLAUDE_CODE_USE_GATEWAY":"","CLAUDE_CODE_USE_MANTLE":"","#,
+                r#""CLAUDE_CODE_USE_VERTEX":"","ENABLE_TOOL_SEARCH":"false"}}"#,
+            )
+        );
+    }
+
+    fn strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    /// A user's own `--settings` would replace the one routing Claude Code to
+    /// Spice, so it is merged into it: the user's keys stay, Spice's routing
+    /// variables win, and the flag is not passed on.
+    #[test]
+    fn a_users_claude_code_settings_are_merged_under_the_routing() {
+        let models = models();
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file = dir.path().join("mine.json");
+        std::fs::write(&file, r#"{"model":"opus","env":{"FROM_FILE":"1"}}"#)
+            .expect("write the user's settings");
+        let mut launch = super::launch(
+            Agent::ClaudeCode,
+            &backend(&models, None),
+            Path::new("/scratch"),
+        )
+        .expect("a launch plan");
+        let args = user_arguments(
+            Agent::ClaudeCode,
+            &mut launch,
+            &os_args(&[
+                "--settings",
+                r#"{"theme":"dark","env":{"ANTHROPIC_BASE_URL":"http://elsewhere","ANTHROPIC_API_KEY":"sk-ant","MINE":"x"}}"#,
+                "-p",
+                &format!("--settings={}", file.display()),
+                "hi",
+                "--",
+                "--settings",
+                "literal",
+            ]),
+        )
+        .expect("merge the settings");
+        assert_eq!(strings(&args), ["-p", "hi", "--", "--settings", "literal"]);
+        assert_eq!(
+            args_of(&launch),
+            vec!["--settings", "/scratch/claude/settings.json"]
+        );
+        let merged: serde_json::Value =
+            serde_json::from_str(&launch.files[0].contents).expect("the merged settings are JSON");
+        assert_eq!(merged["theme"], "dark");
+        assert_eq!(merged["model"], "opus");
+        assert_eq!(merged["env"]["MINE"], "x");
+        assert_eq!(merged["env"]["FROM_FILE"], "1");
+        assert_eq!(merged["env"]["ANTHROPIC_BASE_URL"], ENDPOINT);
+        assert_eq!(merged["env"]["ANTHROPIC_AUTH_TOKEN"], "spice");
+        assert_eq!(merged["env"]["ANTHROPIC_API_KEY"], "");
+    }
+
+    #[test]
+    fn arguments_without_claude_code_settings_pass_through_untouched() {
+        let models = models();
+        let mut launch = super::launch(
+            Agent::ClaudeCode,
+            &backend(&models, None),
+            Path::new("/scratch"),
+        )
+        .expect("a launch plan");
+        let before = launch.clone();
+        let args = os_args(&["-p", "hi", "--settings"]);
+        assert_eq!(
+            user_arguments(Agent::ClaudeCode, &mut launch, &args).expect("no merge"),
+            args
+        );
+        assert_eq!(launch, before);
+
+        let mut codex = super::launch(Agent::Codex, &backend(&models, None), Path::new("/scratch"))
+            .expect("a launch plan");
+        let args = os_args(&["--settings", "{}"]);
+        assert_eq!(
+            user_arguments(Agent::Codex, &mut codex, &args).expect("not Claude Code"),
+            args
+        );
+    }
+
+    #[test]
+    fn claude_code_settings_that_are_not_a_json_object_are_refused() {
+        let models = models();
+        let mut launch = super::launch(
+            Agent::ClaudeCode,
+            &backend(&models, None),
+            Path::new("/scratch"),
+        )
+        .expect("a launch plan");
+        let error = user_arguments(
+            Agent::ClaudeCode,
+            &mut launch,
+            &os_args(&["--settings", "[1]"]),
+        )
+        .expect_err("an array is not settings");
+        assert_eq!(
+            error.to_string(),
+            "Invalid argument: Claude Code's `--settings` value '[1]' is not a readable file (No such file or directory (os error 2)), so spice cannot add the settings that route Claude Code to Spice. Pass a JSON object or the path of a settings file."
+        );
+        let error = user_arguments(
+            Agent::ClaudeCode,
+            &mut launch,
+            &os_args(&["--settings", "{nope"]),
+        )
+        .expect_err("invalid JSON");
+        assert!(
+            error.to_string().starts_with(
+                "Invalid argument: Claude Code's `--settings` value '{nope' is not valid JSON ("
+            ),
+            "{error}"
+        );
+    }
+
+    /// Grok Build applies an endpoint in its own config over the one spice
+    /// gives it, so such a setting is found before Grok starts.
+    #[test]
+    fn a_grok_endpoint_in_its_own_config_is_found() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let home = dir.path().join("grok");
+        let system = dir.path().join("etc-grok");
+        std::fs::create_dir_all(&home).expect("create the Grok home");
+        std::fs::create_dir_all(&system).expect("create the system directory");
+        let spice = "http://127.0.0.1:8090/v1";
+        let find = || grok_config_conflict(spice, Some(&home), &system);
+
+        assert_eq!(find(), None, "no config");
+        std::fs::write(home.join("config.toml"), "[marketplace]\nx = true\n").expect("write");
+        assert_eq!(find(), None, "a config without endpoints");
+        std::fs::write(
+            home.join("config.toml"),
+            "[endpoints]\nmodels_base_url = \"http://127.0.0.1:8090/v1/\"\n",
+        )
+        .expect("write");
+        assert_eq!(find(), None, "an endpoint that is this runtime's");
+
+        std::fs::write(
+            home.join("config.toml"),
+            "endpoints.models_base_url = \"https://proxy.example/v1\"\n",
+        )
+        .expect("write");
+        assert_eq!(
+            find(),
+            Some(ConfigConflict {
+                file: home.join("config.toml"),
+                key: "endpoints.models_base_url".to_string(),
+                value: "https://proxy.example/v1".to_string(),
+            })
+        );
+
+        std::fs::write(home.join("config.toml"), "").expect("write");
+        std::fs::write(
+            system.join("requirements.toml"),
+            "endpoints = { models_list_url = \"https://list.example/models\" }\n",
+        )
+        .expect("write");
+        assert_eq!(
+            find(),
+            Some(ConfigConflict {
+                file: system.join("requirements.toml"),
+                key: "endpoints.models_list_url".to_string(),
+                value: "https://list.example/models".to_string(),
+            })
+        );
+        std::fs::write(
+            system.join("requirements.toml"),
+            "endpoints = { models_list_url = \"http://127.0.0.1:8090/v1/models\" }\n",
+        )
+        .expect("write");
+        assert_eq!(find(), None, "a listing that is this runtime's");
     }
 
     #[test]
@@ -1235,9 +1756,12 @@ mod tests {
     #[test]
     fn a_reported_context_window_reaches_each_agent_that_takes_one() {
         let models = models();
-        let windows = HashMap::from([("qwen".to_string(), 40_960), ("gpt".to_string(), 400_000)]);
+        let windows = HashMap::from([
+            ("qwen".to_string(), limits(40_960, None)),
+            ("gpt".to_string(), limits(400_000, None)),
+        ]);
         let mut sized = backend(&models, None);
-        sized.context_windows = &windows;
+        sized.limits = &windows;
         let scratch = Path::new("/scratch");
 
         let claude = env_of(&launch(Agent::ClaudeCode, &sized, scratch));
@@ -1280,6 +1804,79 @@ mod tests {
             !unsized_codex
                 .iter()
                 .any(|arg| arg.starts_with("model_context_window"))
+        );
+    }
+
+    /// A model's output cap reaches each agent that takes one, and narrows what Copilot
+    /// lets a prompt hold to what the cap leaves of the window.
+    #[test]
+    fn a_reported_output_cap_reaches_each_agent_that_takes_one() {
+        let models = models();
+        let windows = HashMap::from([
+            ("qwen".to_string(), limits(40_960, None)),
+            ("gpt".to_string(), limits(400_000, None)),
+        ]);
+        let capped_limits = HashMap::from([
+            ("qwen".to_string(), limits(40_960, Some(8_192))),
+            ("gpt".to_string(), limits(400_000, None)),
+        ]);
+        let mut capped = backend(&models, None);
+        capped.limits = &capped_limits;
+        let scratch = Path::new("/scratch");
+
+        let claude = env_of(&launch(Agent::ClaudeCode, &capped, scratch));
+        assert!(
+            claude.contains(&("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "8192".to_string())),
+            "{claude:?}"
+        );
+        let copilot = env_of(&launch(Agent::CopilotCli, &capped, scratch));
+        assert!(
+            copilot.contains(&("COPILOT_PROVIDER_MAX_PROMPT_TOKENS", "32768".to_string()))
+                && copilot.contains(&("COPILOT_PROVIDER_MAX_OUTPUT_TOKENS", "8192".to_string())),
+            "{copilot:?}"
+        );
+        let opencode = env_of(&launch(Agent::OpenCode, &capped, scratch));
+        let config: serde_json::Value =
+            serde_json::from_str(&opencode[0].1).expect("an inline config");
+        assert_eq!(
+            config["provider"]["spice"]["models"],
+            json!({
+                "qwen": {"name": "qwen", "limit": {"context": 40_960, "output": 8_192}},
+                // A window without a cap is not enough for OpenCode's `limit`.
+                "gpt": {"name": "gpt"},
+            })
+        );
+        let pi = launch(Agent::Pi, &capped, scratch);
+        assert!(
+            pi.files[0]
+                .contents
+                .contains(r#""contextWindow":40960,"maxTokens":8192"#),
+            "{}",
+            pi.files[0].contents
+        );
+        assert!(
+            pi.files[0]
+                .contents
+                .contains(r#""contextWindow":400000,"maxTokens":16384"#),
+            "pi's own answer limit for a model without a cap: {}",
+            pi.files[0].contents
+        );
+
+        // Without a cap, Claude Code keeps its own and Copilot's prompt limit is the window.
+        let mut uncapped = backend(&models, None);
+        uncapped.limits = &windows;
+        assert!(
+            !env_of(&launch(Agent::ClaudeCode, &uncapped, scratch))
+                .iter()
+                .any(|(key, _)| *key == "CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+        );
+        let copilot = env_of(&launch(Agent::CopilotCli, &uncapped, scratch));
+        assert!(
+            copilot.contains(&("COPILOT_PROVIDER_MAX_PROMPT_TOKENS", "40960".to_string()))
+                && !copilot
+                    .iter()
+                    .any(|(key, _)| *key == "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS"),
+            "{copilot:?}"
         );
     }
 

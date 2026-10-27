@@ -78,10 +78,16 @@ impl GeminiModels {
     }
 
     /// The models a Gemini API request can name, sorted by id.
-    async fn ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.chat.read().await.keys().cloned().collect();
-        ids.sort_unstable();
-        ids
+    async fn models(&self) -> Vec<(String, Arc<dyn llms::chat::Chat>)> {
+        let mut models: Vec<(String, Arc<dyn llms::chat::Chat>)> = self
+            .chat
+            .read()
+            .await
+            .iter()
+            .map(|(id, chat)| (id.clone(), Arc::clone(chat)))
+            .collect();
+        models.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        models
     }
 }
 
@@ -156,16 +162,41 @@ fn is_gemini_path(path: &str) -> bool {
     path == MODELS_PATH || path == MODEL_PATH || path.starts_with("/v1beta/models/")
 }
 
+/// Whether `req` is for a Gemini route: by the route it matched, else by its path.
+fn is_gemini_request(req: &Request<Body>) -> bool {
+    req.extensions().get::<MatchedPath>().map_or_else(
+        || is_gemini_path(req.uri().path()),
+        |path| is_gemini_path(path.as_str()),
+    )
+}
+
+/// The header Google's SDKs, the Gemini CLI and Google's REST examples send the API key in.
+const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
+
+/// What a Gemini route answers a request without a valid runtime API key, naming every
+/// header the key is read from.
+const UNAUTHENTICATED_MESSAGE: &str = "Missing or invalid API key. Send the runtime API key in `x-goog-api-key`, `X-API-Key`, or `Authorization: Bearer`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimeauth";
+
+/// Middleware for the Gemini routes that accepts the runtime API key in `x-goog-api-key`,
+/// as Google's clients send it, by handing it to API key authentication as `X-API-Key`. It
+/// runs in front of authentication, and a request that already carries `X-API-Key` keeps
+/// it. Other routes do not read the header.
+pub(crate) async fn accept_google_api_key(mut req: Request<Body>, next: Next) -> Response {
+    if is_gemini_request(&req)
+        && !req.headers().contains_key("x-api-key")
+        && let Some(key) = req.headers().get(GOOGLE_API_KEY_HEADER).cloned()
+    {
+        req.headers_mut().insert("x-api-key", key);
+    }
+    next.run(req).await
+}
+
 /// Middleware for the Gemini routes that re-encodes errors from the layers in front of the
 /// handlers (API key auth, the mTLS gate, the body limit, shutdown, extractor rejections) as
 /// the Gemini API's error body, which Gemini clients read on every error response. Other
 /// routes, successes, and responses already in that body pass through unchanged.
 pub(crate) async fn encode_layer_errors(req: Request<Body>, next: Next) -> Response {
-    let is_gemini = req.extensions().get::<MatchedPath>().map_or_else(
-        || is_gemini_path(req.uri().path()),
-        |path| is_gemini_path(path.as_str()),
-    );
-    if !is_gemini {
+    if !is_gemini_request(&req) {
         return next.run(req).await;
     }
     let response = next.run(req).await;
@@ -180,7 +211,11 @@ pub(crate) async fn encode_layer_errors(req: Request<Body>, next: Next) -> Respo
         .await
         .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
         .unwrap_or_default();
-    let message = if text.is_empty() {
+    let message = if status == StatusCode::UNAUTHORIZED
+        && (text.is_empty() || text.eq_ignore_ascii_case("unauthorized"))
+    {
+        UNAUTHENTICATED_MESSAGE.to_string()
+    } else if text.is_empty() {
         status
             .canonical_reason()
             .unwrap_or("Request failed")
@@ -264,11 +299,10 @@ fn text_of(response: &GenerateContentResponse) -> String {
 ))]
 pub(crate) async fn list_models(Extension(models): Extension<GeminiModels>) -> Response {
     let listed = ListModelsResponse {
-        models: models
-            .ids()
+        models: super::models::token_limits_of(models.models().await)
             .await
             .iter()
-            .map(|id| model_listing(id))
+            .map(|(id, limits)| model_listing(id, *limits))
             .collect(),
         ..ListModelsResponse::default()
     };
@@ -301,8 +335,9 @@ pub(crate) async fn get_model(
     Path(model): Path<String>,
 ) -> Response {
     let model = model.strip_prefix("models/").unwrap_or(&model);
-    if models.chat.read().await.contains_key(model) {
-        return Json(model_listing(model)).into_response();
+    let chat = models.chat.read().await.get(model).map(Arc::clone);
+    if let Some(chat) = chat {
+        return Json(model_listing(model, chat.token_limits().await)).into_response();
     }
     error_response(&GeminiError::not_found(format!(
         "Model '{model}' not found."

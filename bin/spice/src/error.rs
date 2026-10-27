@@ -340,6 +340,17 @@ pub enum Error {
         detail: String,
     },
 
+    #[snafu(display(
+        "Failed to start {agent}: '{}' sets `{key}` to '{value}', which {agent} applies over the endpoint spice gives it, so its requests and the runtime key would go there instead of to Spice. Remove `{key}` from that file to run {agent} on Spice. See: https://spiceai.org/docs/cli",
+        file.display()
+    ))]
+    CodingAgentConfigConflict {
+        agent: &'static str,
+        file: PathBuf,
+        key: String,
+        value: String,
+    },
+
     #[snafu(display("Failed to write '{}' for the coding agent: {source}", path.display()))]
     CodingAgentFile {
         path: PathBuf,
@@ -354,6 +365,29 @@ pub enum Error {
         endpoint: String,
         log: PathBuf,
         detail: String,
+    },
+
+    #[snafu(display(
+        "Failed to start the Spice runtime for {agent}: there is no spicepod.yaml in '{}', and no Spice runtime answers at {endpoint}. Run `spice {command}` in your Spicepod's directory, start a runtime there with `spice run`, or create a Spicepod here with `spice init` and add a model with `spice model add my-model --from openai:gpt-4o-mini`. See: https://spiceai.org/docs/cli",
+        dir.display()
+    ))]
+    CodingAgentNoSpicepod {
+        agent: &'static str,
+        command: &'static str,
+        dir: PathBuf,
+        endpoint: String,
+    },
+
+    #[snafu(display(
+        "Failed to start {agent}: the Spice runtime at {endpoint} serves the Spicepod '{served}', not '{local}' in this directory. Stop that runtime, or start one for this Spicepod on another port with `spice --http-endpoint {} {command}`. To use the running one anyway, pass `--http-endpoint {endpoint}`. See: https://spiceai.org/docs/cli",
+        next_port(endpoint)
+    ))]
+    CodingAgentOtherSpicepod {
+        agent: &'static str,
+        command: &'static str,
+        endpoint: String,
+        served: String,
+        local: String,
     },
 
     #[snafu(display(
@@ -380,7 +414,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to start the coding agent: the Spice runtime has no model '{model}'. Available models: {available}. Pass one of them with --model, or add the model to spicepod.yaml. See: https://spiceai.org/docs/components/models"
+        "Failed to start the coding agent: the Spice runtime has no model '{model}'. Available models: {available}. Pass one of them with --model, or add the model to the Spicepod the runtime serves. See: https://spiceai.org/docs/components/models"
     ))]
     CodingAgentModelNotFound { model: String, available: String },
 
@@ -559,6 +593,19 @@ pub async fn read_response(
             source,
         }),
     }
+}
+
+/// `endpoint` on the next port, for a second runtime beside the one there.
+#[must_use]
+pub fn next_port(endpoint: &str) -> String {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|mut url| {
+            let port = url.port_or_known_default()?.checked_add(1)?;
+            url.set_port(Some(port)).ok()?;
+            Some(url.as_str().trim_end_matches('/').to_string())
+        })
+        .unwrap_or_else(|| "http://127.0.0.1:8091".to_string())
 }
 
 #[cfg(test)]

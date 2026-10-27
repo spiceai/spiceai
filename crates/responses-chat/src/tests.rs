@@ -417,6 +417,24 @@ fn agent_tools() -> Value {
 }
 
 #[test]
+fn the_hosted_tools_left_out_are_named() {
+    let translated = translate(&json!({"model": "gpt", "input": "hi", "tools": agent_tools()}))
+        .expect("a translatable request");
+    assert_eq!(
+        translated.left_out_tools,
+        [
+            "web_search",
+            "file_search",
+            "code_interpreter",
+            "image_generation",
+            "mcp",
+            "local_shell",
+            "computer_use_preview"
+        ]
+    );
+}
+
+#[test]
 fn tools_become_functions_and_hosted_tools_are_left_out() {
     let chat = chat(&json!({"model": "gpt", "input": "hi", "tools": agent_tools()}));
     assert_eq!(
@@ -810,10 +828,19 @@ fn a_completion_becomes_a_response() {
         &full_usage(),
     );
     let response = response(answer, &context(&agent_request())).expect("a response");
+    let offered: Vec<Value> = agent_tools()
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter(|tool| {
+            ["function", "namespace", "custom"].contains(&tool["type"].as_str().unwrap_or_default())
+        })
+        .cloned()
+        .collect();
     assert_eq!(
         json_of(&response)["tools"],
-        json_of(&typed(&agent_request()).tools),
-        "the Response repeats the request's tools, the hosted ones too"
+        json_of(&typed(&json!({"model": "gpt", "input": "hi", "tools": offered})).tools),
+        "the Response repeats the tools the model was offered, and none of the hosted ones it never saw"
     );
 
     let mut body = normalized(&json_of(&response));

@@ -25,6 +25,7 @@ limitations under the License.
 
 mod agent;
 mod models;
+pub mod orca;
 mod process;
 mod runtime;
 
@@ -41,7 +42,7 @@ use crate::error::{
     CodingAgentCloudUnsupportedSnafu, CodingAgentNotInstalledSnafu,
     CodingAgentUnsupportedBuildSnafu, InterruptedSnafu, Result,
 };
-use runtime::{Origin, RuntimeLease};
+use runtime::RuntimeLease;
 
 /// The arguments of a coding-agent command: all of them are the agent's.
 ///
@@ -75,16 +76,21 @@ pub fn long_about(agent: Agent) -> String {
     let command = agent.command();
     let binary = agent.install().binaries[0];
     let model = agent.model_example();
+    let build = agent
+        .unsupported_build()
+        .map(|(_, explanation)| format!("\n{explanation}\n"))
+        .unwrap_or_default();
     format!(
         "Run {name} with the Spice runtime as its model backend.
 
 Every argument after `{command}` is passed to {name} unchanged: `spice {command} ARGS` \
 runs `{binary} ARGS`, with {name} pointed at the Spice runtime. Options for spice \
 itself, such as --http-endpoint or --api-key, go before `{command}`.
-
+{build}
 spice uses the runtime already serving at the HTTP endpoint (http://127.0.0.1:8090, \
 or --http-endpoint), or starts one for the Spicepod in the current directory, and \
-waits for its models to load. {name} starts on the model its own `{model}` option \
+waits for its models to load. A runtime at the default endpoint must serve the Spicepod \
+in the current directory, if there is one; pass --http-endpoint to use another. {name} starts on the model its own `{model}` option \
 names, or on the runtime's only model (with several, spice asks which), and every \
 model the runtime serves is available to it. {name}'s own configuration files are \
 not changed.
@@ -118,39 +124,26 @@ pub async fn execute(ctx: &RuntimeContext, agent: Agent, args: &CodingAgentArgs)
         }
     );
     let program = find_agent(agent)?;
+    agent::check_own_config(agent, ctx.http_endpoint())?;
 
     // Not raced against Ctrl-C here: acquiring handles it, stopping a runtime
     // it was starting, which dropping it midway would leave running.
-    let lease = RuntimeLease::acquire(ctx).await?;
-    if *lease.origin() == Origin::AlreadyRunning {
-        tracing::info!(
-            "Using the Spice runtime already serving at {}",
-            ctx.http_endpoint()
-        );
-    }
+    let lease = RuntimeLease::acquire(ctx, agent.display_name(), agent.command()).await?;
 
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let requested = agent::requested_model(agent, &args.args);
     // Interruptible until the agent starts: waiting on a model can take as
     // long as a download. From then on Ctrl-C is the agent's to interpret.
     let prepared = tokio::select! {
-        prepared = prepare_agent(ctx, agent, &program, requested, interactive) => prepared,
+        prepared = prepare_agent(ctx, agent, &program, requested, &args.args, interactive) => prepared,
         _ = tokio::signal::ctrl_c() => InterruptedSnafu.fail(),
     };
     let result = match prepared {
-        Ok(prepared) => prepared.run(agent, &program, &args.args).await,
+        Ok(prepared) => prepared.run(agent, &program).await,
         Err(error) => Err(error),
     };
 
-    let stopped = lease.release().await;
-    match stopped {
-        Ok(true) => tracing::debug!("Stopped the Spice runtime at {}", ctx.http_endpoint()),
-        Ok(false) => {}
-        Err(error) => tracing::warn!(
-            "Failed to stop the Spice runtime at {}, so it may still be running. Stop it manually if so. Cause: {error}",
-            ctx.http_endpoint()
-        ),
-    }
+    lease.finish(ctx.http_endpoint()).await;
     result
 }
 
@@ -158,18 +151,22 @@ pub async fn execute(ctx: &RuntimeContext, agent: Agent, args: &CodingAgentArgs)
 struct Prepared {
     model: String,
     launch: agent::Launch,
+    /// The user's arguments, as the agent receives them after the launch's own.
+    user_args: Vec<OsString>,
     /// Holds the files the agent reads; removed when this is dropped.
     scratch: tempfile::TempDir,
 }
 
 /// Choose the model, and write and run whatever the agent needs first.
 ///
-/// `requested` is what the user's own model option named.
+/// `requested` is what the user's own model option named, and `user_args`
+/// every argument they gave the agent.
 async fn prepare_agent(
     ctx: &RuntimeContext,
     agent: Agent,
     program: &Path,
     requested: agent::RequestedModel,
+    user_args: &[OsString],
     interactive: bool,
 ) -> Result<Prepared> {
     let model_given = requested.given();
@@ -186,27 +183,30 @@ async fn prepare_agent(
         models: &selection.available,
         native_messages: selection.native_messages,
         model_given,
-        context_windows: &selection.context_windows,
+        limits: &selection.limits,
     };
-    let launch = agent::launch(agent, &backend, scratch.path())?;
+    let mut launch = agent::launch(agent, &backend, scratch.path())?;
+    let user_args = agent::user_arguments(agent, &mut launch, user_args)?;
     process::write_files(&launch.files)?;
     process::prepare(agent.display_name(), program, &launch).await?;
     Ok(Prepared {
         model: selection.model,
         launch,
+        user_args,
         scratch,
     })
 }
 
 impl Prepared {
     /// Run the agent with the terminal until it exits.
-    async fn run(self, agent: Agent, program: &Path, user_args: &[OsString]) -> Result<i32> {
+    async fn run(self, agent: Agent, program: &Path) -> Result<i32> {
         tracing::info!(
             "Starting {} with Spice model '{}'",
             agent.display_name(),
             self.model
         );
-        let status = process::run(agent.display_name(), program, &self.launch, user_args).await?;
+        let status =
+            process::run(agent.display_name(), program, &self.launch, &self.user_args).await?;
         // Removed here rather than left to the caller, which exits the process
         // with the agent's code and so would skip the removal.
         drop(self.scratch);
@@ -218,11 +218,17 @@ impl Prepared {
 fn find_agent(agent: Agent) -> Result<PathBuf> {
     let install = agent.install();
     let home = dirs::home_dir();
-    if let Some(found) = find_program(install.binaries, install.home_fallbacks, home.as_deref()) {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    if let Some(found) = find_program(
+        &path,
+        install.binaries,
+        install.home_fallbacks,
+        home.as_deref(),
+    ) {
         return Ok(found);
     }
     if let Some((binaries, explanation)) = agent.unsupported_build()
-        && find_program(binaries, &[], home.as_deref()).is_some()
+        && find_program(&path, binaries, &[], home.as_deref()).is_some()
     {
         return CodingAgentUnsupportedBuildSnafu {
             agent: agent.display_name(),
@@ -240,24 +246,58 @@ fn find_agent(agent: Agent) -> Result<PathBuf> {
     .fail()
 }
 
-/// The first of `binaries` on `PATH`, else the first of `home_fallbacks` under
-/// `home` that exists.
+/// The first of `binaries` on the search path `path`, else the first of
+/// `home_fallbacks` under `home` that exists.
 fn find_program(
+    path: &std::ffi::OsStr,
     binaries: &[&str],
     home_fallbacks: &[&str],
     home: Option<&Path>,
 ) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let extensions = cfg!(windows)
+        .then(|| std::env::var("PATHEXT").unwrap_or_else(|_| DEFAULT_PATHEXT.to_string()));
+    find_program_with(path, binaries, home_fallbacks, home, extensions.as_deref())
+}
+
+/// The extensions Windows runs a command by when `PATHEXT` is unset.
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+/// [`find_program`], where on Windows a command is a file named with one of
+/// `extensions` (`PATHEXT`), as `cmd` resolves it: an installer's
+/// extensionless file there is a shell script for other shells, which cannot
+/// be started.
+fn find_program_with(
+    path: &std::ffi::OsStr,
+    binaries: &[&str],
+    home_fallbacks: &[&str],
+    home: Option<&Path>,
+    extensions: Option<&str>,
+) -> Option<PathBuf> {
+    let named = |base: PathBuf| -> Vec<PathBuf> {
+        match extensions {
+            None => vec![base],
+            Some(extensions) => extensions
+                .split(';')
+                .map(str::trim)
+                .filter(|extension| !extension.is_empty())
+                .map(|extension| {
+                    let mut file = base.clone().into_os_string();
+                    file.push(extension.to_ascii_lowercase());
+                    PathBuf::from(file)
+                })
+                .collect(),
+        }
+    };
     let on_path = binaries.iter().find_map(|binary| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(binary))
+        std::env::split_paths(path)
+            .flat_map(|dir| named(dir.join(binary)))
             .find(|candidate| is_executable(candidate))
     });
     on_path.or_else(|| {
         let home = home?;
         home_fallbacks
             .iter()
-            .map(|relative| home.join(relative))
+            .flat_map(|relative| named(home.join(relative)))
             .find(|candidate| is_executable(candidate))
     })
 }
@@ -299,11 +339,44 @@ mod tests {
         executable(&installed);
         assert_eq!(
             find_program(
+                std::ffi::OsStr::new(""),
                 &["spice-test-no-such-binary"],
                 &[".grok/bin/grok"],
                 Some(home.path())
             ),
             Some(installed)
+        );
+    }
+
+    /// On Windows a command is found by its `PATHEXT` extension, as a shell
+    /// finds it; an extensionless file beside it, such as npm's shim for other
+    /// shells, is not one.
+    #[test]
+    fn a_windows_install_is_found_by_its_extension() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let bin = dir.path().join("npm");
+        executable(&bin.join("codex"));
+        executable(&bin.join("codex.cmd"));
+        executable(&dir.path().join(".local/bin/claude.exe"));
+        let windows = Some(".COM;.EXE;.BAT;.CMD");
+        assert_eq!(
+            find_program_with(bin.as_os_str(), &["codex"], &[], None, windows),
+            Some(bin.join("codex.cmd"))
+        );
+        assert_eq!(
+            find_program_with(
+                std::ffi::OsStr::new(""),
+                &["claude"],
+                &[".local/bin/claude"],
+                Some(dir.path()),
+                windows
+            ),
+            Some(dir.path().join(".local/bin/claude.exe"))
+        );
+        assert_eq!(
+            find_program_with(bin.as_os_str(), &["codex"], &[], None, None),
+            Some(bin.join("codex")),
+            "elsewhere the command is the file of its own name"
         );
     }
 
@@ -315,6 +388,7 @@ mod tests {
         std::fs::write(&path, "not a program").expect("write the file");
         assert_eq!(
             find_program(
+                std::ffi::OsStr::new(""),
                 &["spice-test-no-such-binary"],
                 &[".local/bin/pi"],
                 Some(home.path())
@@ -353,5 +427,13 @@ mod tests {
             );
             assert!(help.starts_with(&format!("Run {} with", agent.display_name())));
         }
+        // Cursor's public CLI cannot use Spice, which its help says up front.
+        assert!(
+            long_about(Agent::Cursor)
+                .contains("only Cursor's local-agent build (`cursor-agent-local`) can"),
+            "{}",
+            long_about(Agent::Cursor)
+        );
+        assert!(!long_about(Agent::Codex).contains("local-agent build"));
     }
 }

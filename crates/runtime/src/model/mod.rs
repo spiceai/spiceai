@@ -60,8 +60,6 @@ pub struct LlmRuntimeStores {
     evaluate_models: Arc<RwLock<EvaluateModelStore>>,
     rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
     capabilities: Arc<RwLock<CapabilityStore>>,
-    /// Each chat model's context window, for the models that report one.
-    context_windows: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 impl Default for LlmRuntimeStores {
@@ -73,7 +71,6 @@ impl Default for LlmRuntimeStores {
             evaluate_models: Arc::new(RwLock::new(HashMap::new())),
             rate_controllers: Arc::new(RwLock::new(HashMap::new())),
             capabilities: Arc::new(RwLock::new(HashMap::new())),
-            context_windows: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -111,13 +108,6 @@ impl LlmRuntimeStores {
     #[must_use]
     pub fn capabilities(&self) -> Arc<RwLock<CapabilityStore>> {
         Arc::clone(&self.capabilities)
-    }
-
-    /// Each chat model's context window, by model name, for the models that report one
-    /// ([`llms::chat::Chat::context_window`], asked when the model loads).
-    #[must_use]
-    pub fn context_windows(&self) -> Arc<RwLock<HashMap<String, u64>>> {
-        Arc::clone(&self.context_windows)
     }
 }
 

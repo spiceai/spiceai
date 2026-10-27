@@ -16,11 +16,12 @@ limitations under the License.
 
 //! Which of the runtime's models an agent starts on, once it can serve.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use runtime_api_types::v1::{ComponentStatus, ModelInfo, ModelListResponse};
 
-use super::agent::{Agent, RequestedModel};
+use super::agent::{Agent, Limits, RequestedModel};
 use crate::context::RuntimeContext;
 use crate::error::{
     CodingAgentModelFailedSnafu, CodingAgentModelNotFoundSnafu, CodingAgentModelTimeoutSnafu,
@@ -47,8 +48,8 @@ pub(crate) struct Selection {
     /// rather than through a translation into chat completions, which cannot
     /// carry every Messages feature (deferred tool loading, for one).
     pub native_messages: bool,
-    /// The context window of each model in `available` that reports one.
-    pub context_windows: std::collections::HashMap<String, u64>,
+    /// The token limits of each model in `available` that reports any.
+    pub limits: HashMap<String, Limits>,
 }
 
 /// Whether the runtime serves `model`'s Messages API natively: only a model
@@ -103,16 +104,54 @@ pub(crate) async fn select(
     requested: &RequestedModel,
     interactive: bool,
 ) -> Result<Selection> {
+    let settled = settle(
+        ctx,
+        requested.spice_model(),
+        |models| match misspelled_model(agent, requested, models) {
+            Some(message) => InvalidUsageSnafu { message }.fail(),
+            None => Ok(()),
+        },
+    )
+    .await?;
+    match settled {
+        Settled::Ready(selection) => Ok(selection),
+        Settled::Choose(choices) => choose(choices, interactive, agent),
+    }
+}
+
+/// Wait until no model is still loading and at least one is ready: what a
+/// launcher that starts many agents, each choosing its own model, waits on.
+///
+/// # Errors
+///
+/// Returns an error when the runtime rejects the request, has no model, every
+/// model fails to load, or loading takes longer than the budget.
+pub(crate) async fn wait_until_ready(ctx: &RuntimeContext) -> Result<()> {
+    settle(ctx, None, |_| Ok(())).await.map(drop)
+}
+
+/// What the runtime's models came to once none the agent waits on is loading.
+enum Settled {
+    Ready(Selection),
+    Choose(Choices),
+}
+
+/// Poll the runtime's models, checking each listing with `check`, until
+/// [`decide`] stops waiting, reporting progress, and failing once loading
+/// outlasts [`LOAD_BUDGET`].
+async fn settle(
+    ctx: &RuntimeContext,
+    requested: Option<&str>,
+    check: impl Fn(&[ModelInfo]) -> Result<()>,
+) -> Result<Settled> {
     let deadline = Instant::now() + LOAD_BUDGET;
     let mut next_progress = Instant::now() + PROGRESS_INTERVAL;
     loop {
         let models = list(ctx).await?;
-        if let Some(message) = misspelled_model(agent, requested, &models) {
-            return Err(InvalidUsageSnafu { message }.build());
-        }
-        match decide(&models, requested.spice_model()) {
-            Decision::Ready(selection) => return Ok(selection),
-            Decision::Choose(available) => return choose(available, interactive, agent),
+        check(&models)?;
+        match decide(&models, requested) {
+            Decision::Ready(selection) => return Ok(Settled::Ready(selection)),
+            Decision::Choose(choices) => return Ok(Settled::Choose(choices)),
             Decision::Wait(waiting) => {
                 if Instant::now() >= deadline {
                     return Err(CodingAgentModelTimeoutSnafu {
@@ -155,9 +194,16 @@ fn decide(models: &[ModelInfo], requested: Option<&str>) -> Decision {
             .iter()
             .all(|model| serves_messages_natively(model));
     let ready: Vec<String> = ready_models.iter().map(|model| model.id.clone()).collect();
-    let context_windows: std::collections::HashMap<String, u64> = ready_models
+    let limits: HashMap<String, Limits> = ready_models
         .iter()
-        .filter_map(|model| Some((model.id.clone(), model.context_window?)))
+        .map(|model| {
+            let limits = Limits {
+                context_window: model.context_window,
+                max_output_tokens: model.max_output_tokens,
+            };
+            (model.id.clone(), limits)
+        })
+        .filter(|(_, limits)| *limits != Limits::default())
         .collect();
 
     if let Some(requested) = requested {
@@ -175,7 +221,7 @@ fn decide(models: &[ModelInfo], requested: Option<&str>) -> Decision {
                 model: requested.to_string(),
                 available: ready,
                 native_messages,
-                context_windows,
+                limits,
             }),
             Readiness::Loading => Decision::Wait(vec![requested.to_string()]),
             Readiness::Failed(message) => Decision::Fail(
@@ -218,12 +264,12 @@ fn decide(models: &[ModelInfo], requested: Option<&str>) -> Decision {
             model: only.clone(),
             available: ready.clone(),
             native_messages,
-            context_windows,
+            limits,
         }),
         _ => Decision::Choose(Choices {
             available: ready,
             native_messages,
-            context_windows,
+            limits,
         }),
     }
 }
@@ -254,14 +300,14 @@ fn misspelled_model(
 struct Choices {
     available: Vec<String>,
     native_messages: bool,
-    context_windows: std::collections::HashMap<String, u64>,
+    limits: HashMap<String, Limits>,
 }
 
 fn choose(choices: Choices, interactive: bool, agent: Agent) -> Result<Selection> {
     let Choices {
         available,
         native_messages,
-        context_windows,
+        limits,
     } = choices;
     if !interactive {
         let example = available.first().map_or_else(String::new, |model| {
@@ -294,7 +340,7 @@ fn choose(choices: Choices, interactive: bool, agent: Agent) -> Result<Selection
         model: available[index].clone(),
         available,
         native_messages,
-        context_windows,
+        limits,
     })
 }
 
@@ -348,6 +394,7 @@ mod tests {
             error_message: None,
             metadata: None,
             context_window: None,
+            max_output_tokens: None,
         }
     }
 
@@ -367,7 +414,7 @@ mod tests {
                 model: "qwen".to_string(),
                 available: vec!["qwen".to_string()],
                 native_messages: false,
-                context_windows: std::collections::HashMap::new(),
+                limits: HashMap::new(),
             }
         );
     }
@@ -399,9 +446,15 @@ mod tests {
             Some("qwen"),
         ));
         assert_eq!(
-            selection.context_windows,
-            std::collections::HashMap::from([("qwen".to_string(), 40_960)]),
-            "a model reporting no window, or not ready, contributes none"
+            selection.limits,
+            HashMap::from([(
+                "qwen".to_string(),
+                Limits {
+                    context_window: Some(40_960),
+                    max_output_tokens: None,
+                }
+            )]),
+            "a model reporting no limit, or not ready, contributes none"
         );
     }
 
@@ -504,7 +557,7 @@ mod tests {
                 model: "qwen".to_string(),
                 available: vec!["qwen".to_string()],
                 native_messages: false,
-                context_windows: std::collections::HashMap::new(),
+                limits: HashMap::new(),
             }
         );
     }
@@ -517,7 +570,7 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            "Failed to start the coding agent: the Spice runtime has no model 'gpt'. Available models: qwen. Pass one of them with --model, or add the model to spicepod.yaml. See: https://spiceai.org/docs/components/models"
+            "Failed to start the coding agent: the Spice runtime has no model 'gpt'. Available models: qwen. Pass one of them with --model, or add the model to the Spicepod the runtime serves. See: https://spiceai.org/docs/components/models"
         );
     }
 

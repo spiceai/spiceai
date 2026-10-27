@@ -185,8 +185,7 @@ pub(crate) async fn get(
         HashSet::default()
     };
 
-    let context_windows = rt.model_context_windows();
-    let context_windows = context_windows.read().await.clone();
+    let limits = chat_token_limits(&rt).await;
     let mut models = match app.read().await.as_ref() {
         Some(a) => a
             .models
@@ -220,7 +219,10 @@ pub(crate) async fn get(
                     error,
                     error_message,
                     metadata: generate_metadata(&m.name, &metadata_keys, &responses_models),
-                    context_window: context_windows.get(&m.name).copied(),
+                    context_window: limits.get(&m.name).and_then(|limits| limits.context_window),
+                    max_output_tokens: limits
+                        .get(&m.name)
+                        .and_then(|limits| limits.max_output_tokens),
                 }
             })
             .collect::<Vec<OpenAIModel>>(),
@@ -238,9 +240,14 @@ pub(crate) async fn get(
     } else {
         HashMap::default()
     };
-    let worker_registry = rt.workers.read().await;
-    models.extend(worker_registry.iter().filter_map(|(name, worker)| {
-        Arc::clone(worker).as_model()?;
+    let routers: Vec<(String, Arc<dyn llms::chat::Chat>)> = {
+        let worker_registry = rt.workers.read().await;
+        worker_registry
+            .iter()
+            .filter_map(|(name, worker)| Some((name.clone(), Arc::clone(worker).as_model()?)))
+            .collect()
+    };
+    models.extend(token_limits_of(routers).await.iter().map(|(name, limits)| {
         let status = worker_statuses.get(name).cloned();
         let error = status.as_ref().and_then(|s| {
             if s.is_error() {
@@ -255,7 +262,7 @@ pub(crate) async fn get(
         let error_message = status
             .as_ref()
             .and_then(|s| s.error_message().map(String::from));
-        Some(OpenAIModel {
+        OpenAIModel {
             id: name.clone(),
             object: "model".to_string(),
             owned_by: "spiceai".to_string(),
@@ -264,8 +271,9 @@ pub(crate) async fn get(
             error,
             error_message,
             metadata: generate_metadata(name, &metadata_keys, &responses_models),
-            context_window: None,
-        })
+            context_window: limits.context_window,
+            max_output_tokens: limits.max_output_tokens,
+        }
     }));
 
     match params.format {
@@ -287,13 +295,38 @@ pub(crate) async fn get(
     }
 }
 
+/// Each loaded chat model's token limits, by model name. A hosted model's come from the
+/// copy of its provider's model listing kept since it loaded, so this calls no provider.
+async fn chat_token_limits(rt: &Runtime) -> HashMap<String, llms::chat::TokenLimits> {
+    let chat_models: Vec<(String, Arc<dyn llms::chat::Chat>)> = {
+        let llms = rt.completion_llms();
+        let llms = llms.read().await;
+        llms.iter()
+            .map(|(name, chat)| (name.clone(), Arc::clone(chat)))
+            .collect()
+    };
+    token_limits_of(chat_models).await.into_iter().collect()
+}
+
+/// The token limits of each of `models`, read concurrently, in the order given.
+pub(crate) async fn token_limits_of(
+    models: Vec<(String, Arc<dyn llms::chat::Chat>)>,
+) -> Vec<(String, llms::chat::TokenLimits)> {
+    futures::future::join_all(models.into_iter().map(|(name, chat)| async move {
+        let limits = chat.token_limits().await;
+        (name, limits)
+    }))
+    .await
+}
+
 fn convert_details_to_csv(models: &[OpenAIModel]) -> Result<String, Box<dyn std::error::Error>> {
     let mut w = Writer::from_writer(vec![]);
     for d in models {
-        // The context window is reported in JSON only: CSV takes its columns from the first
+        // The token limits are reported in JSON only: CSV takes its columns from the first
         // row, so a field some models have and others lack would misalign the rest.
         let mut row = d.clone();
         row.context_window = None;
+        row.max_output_tokens = None;
         let _ = w.serialize(row);
     }
     w.flush()?;

@@ -1401,9 +1401,36 @@ async fn counting_tokens_is_refused() {
 
 #[test]
 fn a_model_is_listed_by_its_resource_name() {
+    let unknown = chat_api::TokenLimits::default();
     let expected = json!({"name": "models/qwen", "displayName": "qwen", "supportedGenerationMethods": ["generateContent"]});
-    assert_eq!(wire(&model_listing("qwen")), expected);
-    assert_eq!(wire(&model_listing("models/qwen")), expected);
+    assert_eq!(wire(&model_listing("qwen", unknown)), expected);
+    assert_eq!(wire(&model_listing("models/qwen", unknown)), expected);
+}
+
+/// The window is shared between the prompt and the answer, so the prompt's limit is what
+/// the answer's cap leaves of it.
+#[test]
+fn a_model_is_listed_with_its_token_limits() {
+    let limits = |context_window, max_output_tokens| chat_api::TokenLimits {
+        context_window,
+        max_output_tokens,
+    };
+    assert_eq!(
+        wire(&model_listing(
+            "claude",
+            limits(Some(200_000), Some(64_000))
+        )),
+        json!({"name": "models/claude", "displayName": "claude", "inputTokenLimit": 136_000, "outputTokenLimit": 64_000, "supportedGenerationMethods": ["generateContent"]})
+    );
+    assert_eq!(
+        wire(&model_listing("qwen", limits(Some(32_768), None))),
+        json!({"name": "models/qwen", "displayName": "qwen", "inputTokenLimit": 32_768, "supportedGenerationMethods": ["generateContent"]})
+    );
+    // A cap reported as large as the window leaves the prompt the whole window.
+    assert_eq!(
+        wire(&model_listing("odd", limits(Some(8_192), Some(8_192))))["inputTokenLimit"],
+        8_192
+    );
 }
 
 /// A chunk with neither text nor a choice adds no response; the usage it carries reaches the

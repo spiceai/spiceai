@@ -16,6 +16,8 @@ limitations under the License.
 
 //! What a provider's model listing says about a model.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 /// The names providers and OpenAI-compatible servers report a model's context window
@@ -50,14 +52,65 @@ pub fn context_window_of(model: &Value) -> Option<u64> {
         .or_else(|| positive(model.pointer("/meta/n_ctx")))
 }
 
-/// The model `id` in a model listing (`{"data": [...]}`), when it lists it.
+/// The names providers and OpenAI-compatible servers report a model's output cap under, in
+/// a model object of their `/models` listing:
+///
+/// - `max_output_tokens`: a common gateway spelling;
+/// - `max_completion_tokens`: `OpenRouter`'s `top_provider`, and gateways modeled on it;
+/// - `outputTokenLimit`: the Gemini API.
+///
+/// Anthropic's `max_tokens` is read by its provider alone: elsewhere the name can mean a
+/// request default rather than a cap.
+const MAX_OUTPUT_FIELDS: [&str; 3] = [
+    "max_output_tokens",
+    "max_completion_tokens",
+    "outputTokenLimit",
+];
+
+/// The output cap `model`, one model object of a provider's model listing, reports: the
+/// first of [`MAX_OUTPUT_FIELDS`] that holds a positive integer, then `OpenRouter`'s
+/// `top_provider.max_completion_tokens`. `None` when it reports none.
 #[must_use]
-pub fn listed_model<'a>(listing: &'a Value, id: &str) -> Option<&'a Value> {
-    listing
-        .get("data")?
-        .as_array()?
+pub fn max_output_tokens_of(model: &Value) -> Option<u64> {
+    MAX_OUTPUT_FIELDS
         .iter()
-        .find(|model| model.get("id").and_then(Value::as_str) == Some(id))
+        .find_map(|field| positive(model.get(field)))
+        .or_else(|| positive(model.pointer("/top_provider/max_completion_tokens")))
+}
+
+/// The context window and output cap `model`, one model object of a provider's model
+/// listing, reports.
+#[must_use]
+pub fn token_limits_of(model: &Value) -> crate::TokenLimits {
+    crate::TokenLimits {
+        context_window: context_window_of(model),
+        max_output_tokens: max_output_tokens_of(model),
+    }
+}
+
+/// Anthropic's Models API: `max_input_tokens` is the window and `max_tokens` the most one
+/// answer can hold.
+#[must_use]
+pub fn anthropic_token_limits_of(model: &Value) -> crate::TokenLimits {
+    crate::TokenLimits {
+        context_window: positive(model.get("max_input_tokens")),
+        max_output_tokens: positive(model.get("max_tokens")),
+    }
+}
+
+/// The token limits of each model a model listing (`{"data": [...]}`) lists, by its `id`.
+#[must_use]
+pub fn listed_token_limits(listing: &Value) -> HashMap<String, crate::TokenLimits> {
+    listing
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model.get("id")?.as_str()?;
+            Some((id.to_string(), token_limits_of(model)))
+        })
+        .collect()
 }
 
 /// A token count: a positive integer, or a string of one, as some servers send.
@@ -124,16 +177,63 @@ mod tests {
     }
 
     #[test]
-    fn the_listed_model_is_found_by_id() {
+    fn an_output_cap_is_read_only_where_a_provider_reports_one() {
+        for (model, expected) in [
+            (json!({"id": "m", "max_output_tokens": 8_192}), Some(8_192)),
+            // OpenRouter.
+            (
+                json!({"id": "m", "context_length": 200_000, "top_provider": {"context_length": 200_000, "max_completion_tokens": 64_000}}),
+                Some(64_000),
+            ),
+            // The Gemini API.
+            (
+                json!({"name": "models/m", "inputTokenLimit": 1_048_576, "outputTokenLimit": 65_536}),
+                Some(65_536),
+            ),
+            // A request default some servers list under `max_tokens` is not a cap.
+            (json!({"id": "m", "max_tokens": 4_096}), None),
+            // vLLM and the llama.cpp server cap nothing beyond the window.
+            (json!({"id": "m", "max_model_len": 131_072}), None),
+        ] {
+            assert_eq!(max_output_tokens_of(&model), expected, "{model}");
+        }
+        assert_eq!(
+            anthropic_token_limits_of(
+                &json!({"id": "claude", "max_input_tokens": 200_000, "max_tokens": 64_000})
+            ),
+            crate::TokenLimits {
+                context_window: Some(200_000),
+                max_output_tokens: Some(64_000),
+            }
+        );
+    }
+
+    #[test]
+    fn each_listed_model_is_found_by_id() {
         let listing = json!({"object": "list", "data": [
             {"id": "a", "context_length": 1},
-            {"id": "b", "context_length": 2},
+            {"id": "b", "context_length": 2, "max_output_tokens": 1},
+            {"context_length": 3},
         ]});
         assert_eq!(
-            listed_model(&listing, "b").and_then(context_window_of),
-            Some(2)
+            listed_token_limits(&listing),
+            HashMap::from([
+                (
+                    "a".to_string(),
+                    crate::TokenLimits {
+                        context_window: Some(1),
+                        max_output_tokens: None,
+                    }
+                ),
+                (
+                    "b".to_string(),
+                    crate::TokenLimits {
+                        context_window: Some(2),
+                        max_output_tokens: Some(1),
+                    }
+                ),
+            ])
         );
-        assert!(listed_model(&listing, "c").is_none());
-        assert!(listed_model(&json!({"models": []}), "a").is_none());
+        assert!(listed_token_limits(&json!({"models": []})).is_empty());
     }
 }

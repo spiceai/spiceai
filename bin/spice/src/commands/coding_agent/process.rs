@@ -88,8 +88,10 @@ pub(crate) async fn prepare(agent: &str, program: &Path, launch: &Launch) -> Res
     let Some(args) = &launch.prepare else {
         return Ok(());
     };
+    // Ctrl-C while it runs drops this wait, and the step must end with it.
     let output = command(program, launch, args)
         .stdin(Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .context(CodingAgentLaunchSnafu {
@@ -261,6 +263,7 @@ impl Received {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn stub(dir: &Path, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
@@ -329,6 +332,62 @@ mod tests {
                 && message.contains(" login` exited with exit status: 3: Not signed in."),
             "{message}"
         );
+    }
+
+    /// Ctrl-C while an agent prepares drops the wait on its preparation step,
+    /// which must not leave the step running after the session has ended.
+    #[tokio::test]
+    async fn a_preparation_whose_wait_is_dropped_is_stopped() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let pid_file = dir.path().join("pid");
+        let program = stub(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        );
+        let mut prepared = launch();
+        prepared.prepare = Some(vec![OsString::from("login")]);
+
+        let started = async {
+            while !std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n')) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            result = prepare("Stub", &program, &prepared) => {
+                panic!("the preparation finished on its own: {result:?}")
+            }
+            () = started => {}
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("read the PID")
+            .trim()
+            .parse()
+            .expect("a PID");
+
+        let running = || {
+            let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
+            // An exited process its parent has not reaped yet answers the check too.
+            let zombie = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .is_ok_and(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .starts_with('Z')
+                });
+            alive && !zombie
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while running() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the preparation step {pid} still runs after its wait was dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[test]

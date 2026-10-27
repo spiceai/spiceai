@@ -551,7 +551,6 @@ pub(crate) fn routes(
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
-            .layer(Extension(rt.responses_llms()))
             .layer(Extension(v1::messages::MessagesModels {
                 messages: rt.messages_llms(),
                 chat: rt.completion_llms(),
@@ -675,6 +674,9 @@ pub(crate) fn routes(
     if let Some(auth_layer) = auth_layer {
         tracing::info!("Enabled API key authentication on HTTP routes");
         authenticated_router = authenticated_router.route_layer(auth_layer);
+        // In front of authentication: the Gemini routes also take the key in `x-goog-api-key`.
+        authenticated_router = authenticated_router
+            .route_layer(middleware::from_fn(v1::gemini::accept_google_api_key));
     }
 
     // mTLS route gate. Wired onto the authenticated router *before* the

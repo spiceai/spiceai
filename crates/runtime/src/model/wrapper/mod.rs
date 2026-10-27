@@ -315,8 +315,8 @@ impl ChatWrapper {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl Chat for ChatWrapper {
-    async fn context_window(&self) -> Option<u64> {
-        self.chat.context_window().await
+    async fn token_limits(&self) -> llms::chat::TokenLimits {
+        self.chat.token_limits().await
     }
 
     /// Expect `captured_output` to be instrumented by the underlying chat model (to not reopen/parse streams). i.e.

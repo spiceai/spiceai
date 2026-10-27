@@ -49,8 +49,9 @@ use snafu::ResultExt;
 
 use crate::context::RuntimeContext;
 use crate::error::{
-    CodingAgentRuntimeElsewhereSnafu, CodingAgentRuntimeLockSnafu, CodingAgentRuntimeStartSnafu,
-    CodingAgentRuntimeStateSnafu, InterruptedSnafu, Result,
+    CodingAgentNoSpicepodSnafu, CodingAgentOtherSpicepodSnafu, CodingAgentRuntimeElsewhereSnafu,
+    CodingAgentRuntimeLockSnafu, CodingAgentRuntimeStartSnafu, CodingAgentRuntimeStateSnafu,
+    InterruptedSnafu, Result,
 };
 
 /// How long a started runtime has to start answering `/health`. It normally
@@ -158,28 +159,24 @@ async fn interruptible<T>(step: impl Future<Output = Result<T>>) -> Result<T> {
     }
 }
 
-/// Where the runtime an agent uses came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Origin {
-    /// This session started it.
-    Started,
-    /// It was already serving: started by another `spice <agent>` session, or
-    /// by the user.
-    AlreadyRunning,
-}
-
 /// This session's claim on the runtime at one endpoint. Releasing it stops the
 /// runtime when this is the last session using a runtime a session started.
 #[derive(Debug)]
 pub(crate) struct RuntimeLease {
     files: SessionFiles,
     sessions: File,
-    origin: Origin,
 }
 
 impl RuntimeLease {
     /// Join the sessions using the runtime at the context's endpoint, starting
     /// the runtime for the Spicepod in the current directory if none is serving.
+    /// `name` and `command` are the product and `spice` command the session
+    /// runs, for what it reports.
+    ///
+    /// A runtime already serving at the default endpoint must serve the
+    /// Spicepod in the current directory, if there is one: models from another
+    /// project's would answer instead. At an endpoint the user named, the
+    /// runtime is used whichever Spicepod it serves, and that is said.
     ///
     /// Ctrl-C ends it with [`Error::Interrupted`](crate::error::Error::Interrupted),
     /// having stopped a runtime it was starting, so it must not be cancelled by
@@ -188,9 +185,15 @@ impl RuntimeLease {
     /// # Errors
     ///
     /// Returns an error when the coordination files cannot be used, when a
-    /// runtime has to be started and fails to start serving, or when another
-    /// session's runtime holds the address but does not answer at this endpoint.
-    pub async fn acquire(ctx: &RuntimeContext) -> Result<Self> {
+    /// runtime has to be started and there is no Spicepod to start it for or it
+    /// fails to start serving, when the runtime serving at the default endpoint
+    /// serves another Spicepod, or when another session's runtime holds the
+    /// address but does not answer at this endpoint.
+    pub async fn acquire(
+        ctx: &RuntimeContext,
+        name: &'static str,
+        command: &'static str,
+    ) -> Result<Self> {
         let run_dir = ctx.spice_runtime_dir().join("run");
         std::fs::create_dir_all(&run_dir).context(CodingAgentRuntimeLockSnafu {
             path: run_dir.clone(),
@@ -226,19 +229,22 @@ impl RuntimeLease {
 
         // On an error the locks are released on drop, and nothing outlives
         // this session: a runtime that fails to start is stopped.
-        let origin = prepare_runtime(ctx, &files, alone).await?;
+        prepare_runtime(ctx, &files, alone, name, command).await?;
         drop(start);
 
-        Ok(Self {
-            files,
-            sessions,
-            origin,
-        })
+        Ok(Self { files, sessions })
     }
 
-    #[must_use]
-    pub fn origin(&self) -> &Origin {
-        &self.origin
+    /// [`Self::release`], reporting a runtime that could not be stopped: how a
+    /// session ends once what it started has exited.
+    pub async fn finish(self, endpoint: &str) {
+        match self.release().await {
+            Ok(true) => tracing::debug!("Stopped the Spice runtime at {endpoint}"),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                "Failed to stop the Spice runtime at {endpoint}, so it may still be running. Stop it manually if so. Cause: {error}"
+            ),
+        }
     }
 
     /// Leave the sessions using this runtime, stopping it when this was the
@@ -250,11 +256,7 @@ impl RuntimeLease {
     ///
     /// Returns an error when the coordination files cannot be used.
     pub async fn release(self) -> Result<bool> {
-        let Self {
-            files,
-            sessions,
-            origin: _,
-        } = self;
+        let Self { files, sessions } = self;
         // Taking the start lock first serializes this check against a session
         // that is joining, which holds it until its shared lease is taken.
         let start = open_lock(&files.start_lock)?;
@@ -298,7 +300,9 @@ async fn prepare_runtime(
     ctx: &RuntimeContext,
     files: &SessionFiles,
     alone: bool,
-) -> Result<Origin> {
+    name: &'static str,
+    command: &'static str,
+) -> Result<()> {
     let recorded = read_state(&files.state)?;
     if is_healthy(ctx).await {
         if let Some(started) = &recorded
@@ -308,7 +312,7 @@ async fn prepare_runtime(
             // runtime nobody here started.
             remove_state(&files.state)?;
         }
-        return Ok(Origin::AlreadyRunning);
+        return check_served_spicepod(ctx, name, command).await;
     }
 
     if let Some(started) = recorded {
@@ -329,14 +333,143 @@ async fn prepare_runtime(
         remove_state(&files.state)?;
     }
 
-    start_runtime(ctx, files).await?;
-    Ok(Origin::Started)
+    // A runtime started without a Spicepod serves nothing, and every request
+    // to it fails with `App not initialized`.
+    snafu::ensure!(
+        crate::manifest::existing_spicepod_path(ctx.app_dir()).is_some(),
+        CodingAgentNoSpicepodSnafu {
+            agent: name,
+            command,
+            dir: ctx.app_dir().clone(),
+            endpoint: ctx.http_endpoint().to_string(),
+        }
+    );
+    start_runtime(ctx, files).await
+}
+
+/// Which Spicepod the runtime already serving at an endpoint serves, against
+/// the one in the current directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServedSpicepod {
+    /// The runtime does not say.
+    Unknown,
+    /// The Spicepod it serves: this directory's, or the only one there is.
+    Named(String),
+    /// Another Spicepod than the one in this directory.
+    Other { served: String, local: String },
+}
+
+/// `served` names the Spicepods the runtime reports, and is empty when it
+/// reports none.
+fn compare_spicepods(local: Option<&str>, served: &[String]) -> ServedSpicepod {
+    let Some(first) = served.first() else {
+        return ServedSpicepod::Unknown;
+    };
+    match local {
+        None => ServedSpicepod::Named(first.clone()),
+        Some(local) if served.iter().any(|name| name == local) => {
+            ServedSpicepod::Named(local.to_string())
+        }
+        Some(local) => ServedSpicepod::Other {
+            served: first.clone(),
+            local: local.to_string(),
+        },
+    }
+}
+
+/// Say which Spicepod the runtime serves, and refuse one serving another
+/// project's Spicepod at the default endpoint.
+async fn check_served_spicepod(
+    ctx: &RuntimeContext,
+    name: &'static str,
+    command: &'static str,
+) -> Result<()> {
+    let endpoint = ctx.http_endpoint();
+    let served = served_spicepods(ctx).await;
+    let local = local_spicepod_name(ctx.app_dir());
+    match compare_spicepods(local.as_deref(), &served) {
+        ServedSpicepod::Unknown => {
+            tracing::info!("Using the Spice runtime already serving at {endpoint}");
+        }
+        ServedSpicepod::Named(spicepod) => tracing::info!(
+            "Using the Spice runtime already serving the Spicepod '{spicepod}' at {endpoint}"
+        ),
+        ServedSpicepod::Other { served, local } if ctx.http_endpoint_chosen() => tracing::info!(
+            "Using the Spice runtime already serving the Spicepod '{served}' at {endpoint}, not the Spicepod '{local}' in this directory, since --http-endpoint names it"
+        ),
+        ServedSpicepod::Other { served, local } => {
+            return CodingAgentOtherSpicepodSnafu {
+                agent: name,
+                command,
+                endpoint: endpoint.to_string(),
+                served,
+                local,
+            }
+            .fail();
+        }
+    }
+    Ok(())
+}
+
+/// The names of the Spicepods the runtime reports: none when it does not
+/// answer with them.
+async fn served_spicepods(ctx: &RuntimeContext) -> Vec<String> {
+    let Ok(response) = ctx.get("/v1/spicepods").await else {
+        return Vec::new();
+    };
+    if !response.status().is_success() {
+        return Vec::new();
+    }
+    response
+        .json::<Vec<crate::commands::pods::SpicepodStatus>>()
+        .await
+        .map(|spicepods| {
+            spicepods
+                .into_iter()
+                .filter_map(|spicepod| spicepod.name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The name of the Spicepod in `dir`, when there is one that names itself.
+fn local_spicepod_name(dir: &Path) -> Option<String> {
+    let path = crate::manifest::existing_spicepod_path(dir)?;
+    let spicepod = crate::manifest::read_spicepod_value(&path).ok()?;
+    spicepod.get("name")?.as_str().map(str::to_string)
+}
+
+/// The address `spiced` listens for Flight on unless told otherwise.
+const DEFAULT_FLIGHT_ADDRESS: &str = "127.0.0.1:50051";
+
+/// The arguments that give a runtime started here a Flight address it can
+/// bind: none while `default` is free, else a free port. A runtime that cannot
+/// bind its Flight address does not start, and another runtime — such as the
+/// one serving another project's Spicepod, beside which `--http-endpoint`
+/// starts this one — holds the default. Coding agents use only the HTTP
+/// endpoint.
+fn flight_args(default: &str) -> Vec<String> {
+    if std::net::TcpListener::bind(default).is_ok() {
+        return Vec::new();
+    }
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map_or_else(
+            |_| Vec::new(),
+            |address| vec!["--flight".to_string(), address.to_string()],
+        )
 }
 
 async fn start_runtime(ctx: &RuntimeContext, files: &SessionFiles) -> Result<()> {
     ctx.ensure_local_runtime_supported()?;
     let resolved = interruptible(crate::runtime_launcher::resolve_or_install(ctx)).await?;
-    let mut command = ctx.get_run_cmd(&resolved, &[], None)?;
+    let flight = flight_args(DEFAULT_FLIGHT_ADDRESS);
+    if let [_, address] = flight.as_slice() {
+        tracing::info!(
+            "Another process listens on the Spice runtime's default Flight address {DEFAULT_FLIGHT_ADDRESS}, so the runtime started for this session listens for Flight on {address}"
+        );
+    }
+    let mut command = ctx.get_run_cmd(&resolved, &flight, None)?;
 
     let log = File::create(&files.log).context(CodingAgentRuntimeLockSnafu {
         path: files.log.clone(),
@@ -690,6 +823,84 @@ mod process {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_runtime_is_compared_with_the_spicepod_in_this_directory() {
+        let served = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            compare_spicepods(Some("b"), &served(&[])),
+            ServedSpicepod::Unknown
+        );
+        assert_eq!(
+            compare_spicepods(Some("b"), &served(&["a", "b"])),
+            ServedSpicepod::Named("b".to_string()),
+            "this directory's Spicepod, served beside a dependency"
+        );
+        assert_eq!(
+            compare_spicepods(None, &served(&["a"])),
+            ServedSpicepod::Named("a".to_string())
+        );
+        assert_eq!(
+            compare_spicepods(Some("b"), &served(&["a"])),
+            ServedSpicepod::Other {
+                served: "a".to_string(),
+                local: "b".to_string()
+            }
+        );
+    }
+
+    /// A runtime started beside another listens for Flight on a port of its
+    /// own, since one that cannot bind its Flight address does not start.
+    #[test]
+    fn a_runtime_started_beside_another_gets_a_flight_port_of_its_own() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let held_address = held.local_addr().expect("its address").to_string();
+        let args = flight_args(&held_address);
+        let [flag, address] = args.as_slice() else {
+            panic!("expected `--flight <address>`, got {args:?}");
+        };
+        assert_eq!(flag, "--flight");
+        assert_ne!(address, &held_address);
+        assert!(
+            std::net::TcpListener::bind(address.as_str()).is_ok(),
+            "the address given is free: {address}"
+        );
+    }
+
+    #[test]
+    fn a_second_runtime_is_suggested_on_the_next_port() {
+        use crate::error::next_port;
+        assert_eq!(next_port("http://127.0.0.1:8090"), "http://127.0.0.1:8091");
+        assert_eq!(next_port("http://localhost:9000/"), "http://localhost:9001");
+        assert_eq!(next_port("not a url"), "http://127.0.0.1:8091");
+    }
+
+    #[test]
+    fn the_refusals_name_the_fix() {
+        let other = CodingAgentOtherSpicepodSnafu {
+            agent: "Claude Code",
+            command: "claude",
+            endpoint: "http://127.0.0.1:8090",
+            served: "proj-a",
+            local: "proj-b",
+        }
+        .build();
+        assert_eq!(
+            other.to_string(),
+            "Failed to start Claude Code: the Spice runtime at http://127.0.0.1:8090 serves the Spicepod 'proj-a', not 'proj-b' in this directory. Stop that runtime, or start one for this Spicepod on another port with `spice --http-endpoint http://127.0.0.1:8091 claude`. To use the running one anyway, pass `--http-endpoint http://127.0.0.1:8090`. See: https://spiceai.org/docs/cli"
+        );
+        let none = CodingAgentNoSpicepodSnafu {
+            agent: "Codex CLI",
+            command: "codex",
+            dir: PathBuf::from("/src/app"),
+            endpoint: "http://127.0.0.1:8090",
+        }
+        .build();
+        assert_eq!(
+            none.to_string(),
+            "Failed to start the Spice runtime for Codex CLI: there is no spicepod.yaml in '/src/app', and no Spice runtime answers at http://127.0.0.1:8090. Run `spice codex` in your Spicepod's directory, start a runtime there with `spice run`, or create a Spicepod here with `spice init` and add a model with `spice model add my-model --from openai:gpt-4o-mini`. See: https://spiceai.org/docs/cli"
+        );
+    }
 
     #[test]
     fn every_spelling_of_one_address_gets_the_same_files() {

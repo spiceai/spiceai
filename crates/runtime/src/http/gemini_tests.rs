@@ -27,8 +27,11 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+use spicepod::component::worker::{LoadBalanceParams, RouterConfig, Worker};
+
 use super::messages_tests::{
-    Seen, model, runtime_with, runtime_with_api_key, send, sse_events, start_provider, taken,
+    Seen, model, runtime_with, runtime_with_api_key, runtime_with_workers, send, sse_events,
+    start_provider, taken,
 };
 
 async fn get(routes: &Router, path: &str) -> (StatusCode, Value) {
@@ -258,6 +261,11 @@ async fn a_request_without_a_valid_api_key_is_refused_with_the_gemini_error_body
     );
     assert!(taken(&seen).is_empty(), "the model is never called");
 
+    assert_eq!(
+        body["error"]["message"],
+        "Missing or invalid API key. Send the runtime API key in `x-goog-api-key`, `X-API-Key`, or `Authorization: Bearer`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimeauth"
+    );
+
     // The Antigravity CLI's gateway mode sends the key as a bearer token.
     let (status, _, body) = send(
         &routes,
@@ -267,6 +275,34 @@ async fn a_request_without_a_valid_api_key_is_refused_with_the_gemini_error_body
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Google's SDKs and the Gemini CLI send it in `x-goog-api-key`.
+    let (status, _, body) = send(
+        &routes,
+        "/v1beta/models/gpt:generateContent",
+        &[("x-goog-api-key", "spice-key")],
+        &ping(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, body) = send(
+        &routes,
+        "/v1beta/models/gpt:generateContent",
+        &[("x-goog-api-key", "wrong-key")],
+        &ping(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // Only the Gemini routes read it.
+    let (status, _, body) = send(
+        &routes,
+        "/v1/chat/completions",
+        &[("x-goog-api-key", "spice-key")],
+        &json!({"model": "gpt", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 }
 
 #[tokio::test]
@@ -291,14 +327,56 @@ async fn models_are_listed_in_the_gemini_api_shape() {
 
     let (status, body) = get(&routes, "/v1beta/models/gpt").await;
     assert_eq!(
-        (status, &body["name"]),
-        (StatusCode::OK, &json!("models/gpt"))
+        (status, body),
+        (
+            StatusCode::OK,
+            json!({"name": "models/gpt", "displayName": "gpt", "inputTokenLimit": 111_616, "outputTokenLimit": 16_384, "supportedGenerationMethods": ["generateContent"]})
+        ),
+        "the prompt's limit is the window less the answer's cap"
     );
     let (status, body) = get(&routes, "/v1beta/models/missing").await;
     assert_eq!(
         (status, &body["error"]["status"]),
         (StatusCode::NOT_FOUND, &json!("NOT_FOUND"))
     );
+}
+
+/// `/v1/models` reports each model's window and output cap as its provider's model API
+/// does, and that `/v1/responses` serves every chat model: an Anthropic model by
+/// translation through its chat.
+#[tokio::test]
+async fn models_report_their_token_limits_and_that_responses_serves_them() {
+    let seen = Seen::default();
+    let endpoint = start_provider(&seen).await;
+    let routes = runtime_with(vec![
+        model("gpt", "openai:gpt-4o", &endpoint, &[]),
+        model("claude", "anthropic:claude-sonnet-5", &endpoint, &[]),
+    ])
+    .await;
+
+    let (status, body) = get(&routes, "/v1/models?metadata_fields=supports_responses_api").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed = |id: &str| {
+        body["data"]
+            .as_array()
+            .expect("data")
+            .iter()
+            .find(|model| model["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} is listed: {body}"))
+    };
+    for (id, window, output) in [("gpt", 128_000, 16_384), ("claude", 200_000, 64_000)] {
+        let model = listed(id);
+        assert_eq!(
+            (
+                &model["context_window"],
+                &model["max_output_tokens"],
+                &model["metadata"]["supports_responses_api"]
+            ),
+            (&json!(window), &json!(output), &json!(true)),
+            "{model}"
+        );
+    }
 }
 
 /// A provider without a Responses API of its own answers `/v1/responses` through its chat:
@@ -362,6 +440,66 @@ async fn a_model_without_a_native_responses_api_answers_it_through_its_chat() {
     let (name, completed) = events.last().expect("an event");
     assert_eq!(name, "response.completed", "{body}");
     assert_eq!(completed["response"]["status"], "completed");
+}
+
+/// A router worker serves chat completions without a model of its own, so `/v1/responses`
+/// answers it through them too, and lists it as served.
+#[tokio::test]
+async fn a_router_worker_answers_responses_through_its_chat() {
+    let seen = Seen::default();
+    let endpoint = start_provider(&seen).await;
+    let worker = Worker {
+        name: "router".to_string(),
+        description: None,
+        params: std::collections::HashMap::new(),
+        load_balance: Some(LoadBalanceParams {
+            routing: vec![RouterConfig::RoundRobin {
+                from: "claude".to_string(),
+            }],
+        }),
+        cron: None,
+        sql: None,
+    };
+    let routes = runtime_with_workers(
+        vec![model("claude", "anthropic:claude-sonnet-5", &endpoint, &[])],
+        vec![worker],
+    )
+    .await;
+    taken(&seen);
+
+    let (status, _, body) = send(
+        &routes,
+        "/v1/responses",
+        &[],
+        &json!({"model": "router", "input": "ping"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body = parsed(&body);
+    assert_eq!(body["status"], "completed", "{body}");
+    assert_eq!(
+        taken(&seen)
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect::<Vec<_>>(),
+        ["/v1/messages"],
+        "the router's chat reached its model"
+    );
+
+    let (status, listed) = get(&routes, "/v1/models?metadata_fields=supports_responses_api").await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let entry = listed["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .find(|model| model["id"] == "router")
+        .cloned()
+        .unwrap_or_else(|| panic!("the router is listed: {listed}"));
+    assert_eq!(
+        entry["metadata"]["supports_responses_api"],
+        json!(true),
+        "{entry}"
+    );
 }
 
 /// Previously refused, a feature that only a native Responses API can carry is still refused,

@@ -20,9 +20,9 @@ use std::time::SystemTime;
 
 use crate::anthropic::types::{EffortLevel, OutputConfig, OutputFormat};
 use crate::anthropic::types_stream::MessageCreateStreamResponse;
-use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
 use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
+use crate::chat::{Chat, TokenLimits};
 use async_openai::error::{ApiError, OpenAIError};
 use async_openai::traits::RequestOptionsBuilder;
 use async_openai::types::chat::{
@@ -57,9 +57,9 @@ use async_trait::async_trait;
 
 #[async_trait]
 impl Chat for Anthropic {
-    /// The `max_input_tokens` Anthropic's Models API reports for the model.
-    async fn context_window(&self) -> Option<u64> {
-        crate::model_info::retrieved_context_window(self.client.config(), &self.model).await
+    /// The `max_input_tokens` and `max_tokens` Anthropic's Models API reports for the model.
+    async fn token_limits(&self) -> TokenLimits {
+        crate::model_info::retrieved_token_limits(self.client.config(), &self.model).await
     }
 
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {

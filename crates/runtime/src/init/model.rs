@@ -251,16 +251,10 @@ impl Runtime {
         };
 
         if let Some(chat) = chat {
-            // Asked once, here: a hosted model's window comes from its provider's model API,
-            // which `/v1/models` must not call on every listing.
-            let window = chat.chat.context_window().await;
-            let context_windows = self.model_context_windows();
-            let mut windows = context_windows.write().await;
-            match window {
-                Some(window) => windows.insert(m.name.clone(), window),
-                None => windows.remove(&m.name),
-            };
-            drop(windows);
+            // Read before the model is ready, so the first `/v1/models` that lists it as
+            // ready reports its limits too. A hosted model's come from its provider's model
+            // API, read once per endpoint and kept, so `/v1/models` reads the kept copy.
+            let _ = chat.chat.token_limits().await;
             let completion_llms = self.completion_llms();
             completion_llms
                 .write()
@@ -328,9 +322,6 @@ impl Runtime {
         let mut rc_map = model_rate_controllers.write().await;
         rc_map.remove(&m.name);
         drop(rc_map);
-
-        let context_windows = self.model_context_windows();
-        context_windows.write().await.remove(&m.name);
 
         tracing::info!("Model [{}] has been unloaded", m.name);
         let source_str = m.get_source().map(|s| s.to_string()).unwrap_or_default();

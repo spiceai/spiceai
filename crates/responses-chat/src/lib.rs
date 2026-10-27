@@ -21,11 +21,13 @@ limitations under the License.
 //! the completion back: a [`Response`] ([`response::response`]), or its stream of events
 //! ([`stream::response_stream`]).
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
 
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{CreateResponse, Response, ResponseStream};
 use chat_api::Chat;
+use parking_lot::Mutex;
 
 pub mod request;
 pub mod response;
@@ -52,6 +54,7 @@ impl ChatResponses {
     pub async fn create(&self, mut request: CreateResponse) -> Result<Response, OpenAIError> {
         request.stream = None;
         let translated = request::chat_request(request)?;
+        report_left_out_tools(&translated.chat.model, &translated.left_out_tools);
         let completion = self.chat.chat_request(translated.chat).await?;
         response::response(completion, &translated.context)
     }
@@ -69,8 +72,36 @@ impl ChatResponses {
     ) -> Result<ResponseStream, OpenAIError> {
         request.stream = Some(true);
         let translated = request::chat_request(request)?;
+        report_left_out_tools(&translated.chat.model, &translated.left_out_tools);
         let chunks = self.chat.chat_stream(translated.chat).await?;
         Ok(stream::response_stream(chunks, translated.context))
+    }
+}
+
+/// The hosted tools reported for each model, so each is reported once rather than on every
+/// request that offers it.
+static REPORTED_LEFT_OUT: LazyLock<Mutex<HashMap<String, HashSet<&'static str>>>> =
+    LazyLock::new(Default::default);
+
+/// Say, once per model and tool, that a hosted tool a request offered was not offered to the
+/// model: the request is answered without it.
+fn report_left_out_tools(model: &str, left_out: &[&'static str]) {
+    if left_out.is_empty() {
+        return;
+    }
+    let mut reported = REPORTED_LEFT_OUT.lock();
+    if !reported.contains_key(model) {
+        reported.insert(model.to_string(), HashSet::new());
+    }
+    let Some(reported) = reported.get_mut(model) else {
+        return;
+    };
+    for tool in left_out {
+        if reported.insert(tool) {
+            tracing::warn!(
+                "Model '{model}' answers /v1/responses through its chat completions, which cannot run the hosted tool `{tool}`, so requests that offer it are answered without it. To use hosted tools, use a model whose provider serves the Responses API itself. See: https://spiceai.org/docs/components/models"
+            );
+        }
     }
 }
 

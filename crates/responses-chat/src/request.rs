@@ -90,6 +90,9 @@ pub(crate) const CUSTOM_INPUT: &str = "input";
 pub struct Translated {
     pub chat: CreateChatCompletionRequest,
     pub context: ResponseContext,
+    /// The `type` of each hosted tool the request offered, which the chat model is not
+    /// offered: see the module documentation.
+    pub left_out_tools: Vec<&'static str>,
 }
 
 /// The Responses API tool a function the model is offered stands for.
@@ -280,6 +283,11 @@ pub fn chat_request(request: CreateResponse) -> Result<Translated, OpenAIError> 
     for tool in tools.iter().flatten() {
         append_tool(&model, tool, &mut names, &mut chat_tools)?;
     }
+    let left_out_tools: Vec<&'static str> = tools
+        .iter()
+        .flatten()
+        .filter_map(hosted_tool_type)
+        .collect();
     let offers_tools = !chat_tools.is_empty();
     let chat_tool_choice = match tool_choice
         .as_ref()
@@ -333,10 +341,17 @@ pub fn chat_request(request: CreateResponse) -> Result<Translated, OpenAIError> 
     };
     Ok(Translated {
         chat,
+        left_out_tools,
         context: ResponseContext {
             model,
             instructions,
-            tools: tools.unwrap_or_default(),
+            // The tools the model was offered: a Response does not list a hosted tool it
+            // never saw.
+            tools: tools
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|tool| hosted_tool_type(tool).is_none())
+                .collect(),
             tool_choice: tool_choice.unwrap_or(ToolChoiceParam::Mode(ToolChoiceOptions::Auto)),
             parallel_tool_calls: parallel_tool_calls.unwrap_or(true),
             temperature,
@@ -858,6 +873,27 @@ fn append_tool(
         | Tool::WebSearchPreview20250311(_)
         | Tool::ApplyPatch => Ok(()),
     }
+}
+
+/// The `type` of `tool` when it is a hosted tool, one a chat completion cannot run.
+fn hosted_tool_type(tool: &Tool) -> Option<&'static str> {
+    Some(match tool {
+        Tool::Function(_) | Tool::Custom(_) | Tool::Namespace(_) => return None,
+        Tool::FileSearch(_) => "file_search",
+        Tool::ComputerUsePreview(_) => "computer_use_preview",
+        Tool::WebSearch(_) => "web_search",
+        Tool::WebSearch20250826(_) => "web_search_2025_08_26",
+        Tool::Mcp(_) => "mcp",
+        Tool::CodeInterpreter(_) => "code_interpreter",
+        Tool::ImageGeneration(_) => "image_generation",
+        Tool::LocalShell => "local_shell",
+        Tool::Shell(_) => "shell",
+        Tool::Computer(_) => "computer",
+        Tool::ToolSearch(_) => "tool_search",
+        Tool::WebSearchPreview(_) => "web_search_preview",
+        Tool::WebSearchPreview20250311(_) => "web_search_preview_2025_03_11",
+        Tool::ApplyPatch => "apply_patch",
+    })
 }
 
 fn named_function(name: String) -> ChatCompletionToolChoiceOption {

@@ -17,7 +17,9 @@ limitations under the License.
 use crate::chat::{LocalModelOptions, PagedAttentionMode, ReasoningDefault, message_to_mistral};
 use crate::streaming_utils::create_stream_response_with_timestamp;
 
-use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
+use super::{
+    Chat, Error as ChatError, FailedToRunModelSnafu, Result, TokenLimits, nsql::SqlGeneration,
+};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::chat::{
@@ -816,10 +818,19 @@ impl Chat for MistralLlama {
     }
 
     /// The longest sequence mistral.rs runs the model with: it refuses a longer prompt.
-    async fn context_window(&self) -> Option<u64> {
+    async fn token_limits(&self) -> TokenLimits {
         // Only one model runs in this pipeline.
-        let length = self.pipeline.max_sequence_length(None).ok()??;
-        u64::try_from(length).ok().filter(|window| *window > 0)
+        let context_window = self
+            .pipeline
+            .max_sequence_length(None)
+            .ok()
+            .flatten()
+            .and_then(|length| u64::try_from(length).ok())
+            .filter(|window| *window > 0);
+        TokenLimits {
+            context_window,
+            max_output_tokens: None,
+        }
     }
 
     async fn stream<'a>(

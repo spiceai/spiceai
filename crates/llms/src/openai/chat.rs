@@ -15,9 +15,9 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use crate::chat::Chat;
 use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
 use crate::chat::nsql::{SqlGeneration, json::JsonSchemaSqlGeneration};
+use crate::chat::{Chat, TokenLimits};
 use async_openai::config::Config;
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
@@ -33,10 +33,10 @@ use super::{ChatBackend, Openai, responses_adapter};
 
 #[async_trait]
 impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
-    /// The window the endpoint's model listing reports: none from `OpenAI` itself, but the
-    /// servers compatible with it (vLLM, the llama.cpp server, LM Studio, gateways) list it.
-    async fn context_window(&self) -> Option<u64> {
-        crate::model_info::listed_context_window(self.client.config(), &self.model).await
+    /// The limits the endpoint's model listing reports: none from `OpenAI` itself, but the
+    /// servers compatible with it (vLLM, the llama.cpp server, LM Studio, gateways) list them.
+    async fn token_limits(&self) -> TokenLimits {
+        crate::model_info::listed_token_limits(self.client.config(), &self.model).await
     }
 
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {

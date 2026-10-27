@@ -121,13 +121,25 @@ impl GeminiChat {
     }
 }
 
-/// The listing of the model `id` in `GET /v1beta/models`.
+/// The listing of the model `id` in `GET /v1beta/models`, with its token limits: the
+/// Gemini API's `inputTokenLimit` is what a prompt may hold, which is the window less the
+/// answer's cap when the model has one, and `outputTokenLimit` that cap.
 #[must_use]
-pub fn model_listing(id: &str) -> Model {
+pub fn model_listing(id: &str, limits: chat_api::TokenLimits) -> Model {
     let id = model_id(id);
+    let input = limits.context_window.map(|window| {
+        limits
+            .max_output_tokens
+            .filter(|output| *output < window)
+            .map_or(window, |output| window - output)
+    });
     Model {
         name: format!("models/{id}"),
         display_name: Some(id.to_string()),
+        input_token_limit: input.and_then(|limit| u32::try_from(limit).ok()),
+        output_token_limit: limits
+            .max_output_tokens
+            .and_then(|limit| u32::try_from(limit).ok()),
         supported_generation_methods: vec![GENERATE_CONTENT.to_string()],
         ..Model::default()
     }

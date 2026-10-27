@@ -12058,6 +12058,7 @@ dependencies = [
  "mistralrs",
  "mistralrs-core",
  "model2vec-rs",
+ "parking_lot",
  "paste",
  "rand 0.10.1",
  "regex",
@@ -17416,10 +17417,12 @@ dependencies = [
  "chat-api",
  "futures",
  "insta",
+ "parking_lot",
  "rand 0.10.1",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -20509,6 +20512,7 @@ dependencies = [
  "test-framework",
  "time",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "urlencoding",
