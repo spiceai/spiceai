@@ -183,7 +183,9 @@ pub use runtime_table::table_provider_with_spicepod_metadata;
 pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
-pub(crate) mod sql_depth_guard;
+pub(crate) use runtime_query_engine::sql_depth_guard;
+#[cfg(test)]
+mod sql_depth_guard_tests;
 pub(crate) mod sql_validator;
 pub mod tool_udf;
 pub mod udf;
@@ -510,7 +512,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' (optionally with 'partition_by') or 'cayenne' instead."
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
     ))]
     UnsupportedDistributedAccelerationEngine {
         dataset_name: String,
@@ -9086,6 +9088,12 @@ mod tests {
                     Err(Error::UnsupportedDistributedAccelerationEngine { .. })
                 ),
                 "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+            // The fix it names is the engine that stays: `arrow` is deprecated, and
+            // Cayenne partitions only in file mode.
+            assert_eq!(
+                result.expect_err("duckdb is rejected").to_string(),
+                "Failed to create an accelerated table for dataset my_dataset: the 'duckdb' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
             );
         }
 

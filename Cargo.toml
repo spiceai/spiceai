@@ -30,6 +30,7 @@ members = [
     "crates/document_parse",
     "crates/dotenv",
     "crates/duration-parse",
+    "crates/http-body-limit",
     "crates/dynamodb-streams",
     "crates/event_stream",
     "crates/flight_client",
@@ -39,6 +40,8 @@ members = [
     "crates/hash-index",
     "crates/huggingface-hub",
     "crates/key-index",
+    "crates/llama-cpp",
+    "crates/llms-llamacpp",
     "crates/llms",
     "crates/chat-api",
     "crates/embed-api",
@@ -299,7 +302,7 @@ datafusion-proto-common = "55.2.0"
 datafusion-pruning = "55.2.0"
 datafusion-spark = "55.2.0"
 datafusion-substrait = "55.2.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "f103fe809cc186168833632b9a0ee07ff40a9283" } # branch: spiceai-55
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "4a2920746865562e604150fbee49eea6241c0b85" } # branch: spiceai-55
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",
@@ -325,7 +328,6 @@ graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "25bc483
 graphql-parser = "0.4.0"
 hashbrown = "0.17.1"
 hex = "0.4.3"
-hf-hub = { version = "0.4", features = ["tokio"] }
 http = "1.3.1"
 httpdate = "1.0"
 humantime = "2.1.0"
@@ -517,14 +519,14 @@ flatbuffers = "25.2.10"
 # Vortex tagged releases publish version 0.1.0 in their Cargo.toml, not the actual release version,
 # so we specify git deps here directly. The [patch.crates-io] entries below exist to override
 # transitive vortex dependencies pulled in by other patched crates.
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
+vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-io = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7", features = ["tokio"] } # branch: spiceai-55 (vortex 0.86.1)
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
+vortex-io = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6", features = ["tokio"] } # branch: spiceai-55 (vortex 0.86.1)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
 
 x509-certificate = "0.25.0"
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "4429f3956972c4c329ee406ac60b15ad6ae4a777" } # branch: trunk (arrow 59.3)
@@ -630,6 +632,12 @@ datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev 
 # and derive output. See vendor/mysql-common-derive/README.md.
 mysql-common-derive = { path = "vendor/mysql-common-derive" }
 
+# Local vendored fork of `tantivy-query-grammar` 0.26.0 (path: vendor/tantivy-query-grammar)
+# whose strict query parser returns a parse error, instead of panicking, on a `*` it reads as an
+# exists query with no field (`a *(b)`, `- *`): quickwit-oss/tantivy#3031. A full-text search
+# with such a query failed with a 500. See vendor/tantivy-query-grammar/README.md.
+tantivy-query-grammar = { path = "vendor/tantivy-query-grammar" }
+
 # Dependencies on crates.io `backoff` 0.4 resolve to the workspace crate.
 backoff = { path = "crates/backoff" }
 
@@ -648,7 +656,7 @@ candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "16ac28606464d742b6837de4a51f41011c3f6dc0" } # branch: spiceai-0.27 (Delta Kernel 0.27.1)
 delta_kernel_default_engine = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "16ac28606464d742b6837de4a51f41011c3f6dc0" } # branch: spiceai-0.27 (Delta Kernel 0.27.1)
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "504debbf8269a76aef74daa2247b6296c2fe2290" } # branch: spiceai-1.4.4 (DuckDB v1.4.4, arrow 59; must match the rev datafusion-table-providers pins, or cargo resolves two copies of duckdb)
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9" } # branch: spiceai-1.4.4 (DuckDB v1.4.4, arrow 59; must match the rev datafusion-table-providers pins, or cargo resolves two copies of duckdb)
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
@@ -681,9 +689,9 @@ arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" } # branch: spiceai-59 (arrow 59.3.0)
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "045a425f71507d1150bfeeeb5834e43429cb5011" }      # branch: spiceai-59 (arrow 59.3.0)
 
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)

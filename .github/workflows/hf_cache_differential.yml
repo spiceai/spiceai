@@ -1,0 +1,65 @@
+---
+name: Hugging Face cache differential
+
+# Downloads files from ten public Hugging Face Hub repositories with Spice's client and with the
+# `hf` CLI, the reference, and checks that the two caches hold the same bytes, match the Hub's
+# checksums, and read each other offline (scripts/hf_cache_differential.sh). It runs when the
+# client or the check changes, and weekly, because the Hub changes without a change here.
+on:
+  pull_request:
+    paths:
+      - 'crates/huggingface-hub/**'
+      - 'scripts/hf_cache_differential.sh'
+      - '.github/workflows/hf_cache_differential.yml'
+  schedule:
+    - cron: '0 6 * * 1' # Mondays at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hf-cache-differential-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  differential:
+    name: Spice's Hugging Face cache against the hf CLI
+    # The check builds and runs the change's code on persistent self-hosted runners in a public
+    # repository, so a pull request from a fork or from Dependabot runs it only once a maintainer
+    # dispatches it.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]')
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      # The dev runner image has no C toolchain, and rustc links through cc.
+      - uses: ./.github/actions/setup-cc
+      # The dev runner image has python3 but no pip.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install the hf CLI
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/hf-cli"
+          "$RUNNER_TEMP/hf-cli/bin/python" -m pip install 'huggingface_hub==2.2.0'
+          echo "$RUNNER_TEMP/hf-cli/bin" >> "$GITHUB_PATH"
+      - name: Compare Spice's cache with the hf CLI's
+        run: scripts/hf_cache_differential.sh "$RUNNER_TEMP/hf_cache_differential"
+      # The tools' output for each repository; the caches themselves are gigabytes.
+      - name: Upload the tools' output
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: hf-cache-differential
+          path: |
+            ${{ runner.temp }}/hf_cache_differential/*.out
+            ${{ runner.temp }}/hf_cache_differential/*.err
+          if-no-files-found: ignore

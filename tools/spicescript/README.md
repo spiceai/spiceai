@@ -51,10 +51,12 @@ target/debug/spicescript --jobs 4 \
 # Start on a release and upgrade in place to the build under test at each `upgrade` step:
 target/debug/spicescript --from $HOME/.spice/bin/spiced \
   --spiced dev=target/release/spiced test/spicescript/postgres-upgrade.yaml
-# Every instance as a scheduler with one executor (node mTLS from cluster-pki/):
+# Every instance as a scheduler with one executor, over node mTLS:
 target/debug/spicescript --cluster test/spicescript/query-coverage.yaml
 # Known-failing scripts of one group, without waiting out every limit:
 target/debug/spicescript --max-wait 20s test/spicescript/known-failing/clickhouse
+# One matrix combination and one variant of a script:
+target/debug/spicescript --matrix src=clickhouse --variant cayenne test/spicescript/full-refresh-chaos.yaml
 # Parse only:
 target/debug/spicescript --check test/spicescript
 ```
@@ -74,6 +76,8 @@ DuckDB CLI matching Spice's embedded DuckDB into `~/.cache/spicescript/`
 | `--partition I/N` | Run only share I of N (1-based), for splitting a suite across CI jobs. Scripts go longest first, by recorded duration, to the share with the least work so far, so every job computes the same split and the shares take about as long. |
 | `--record-durations` | Write each script's run time to `recordings/durations.json` beside it. A script without a recorded duration is refused unless this is set, so a new script gets one when it's added. Record from a `--jobs 1` run. |
 | `--max-wait DURATION` | Cap every wait (`eventually`, readiness, refreshes) at this length. For known-failing scripts, which otherwise wait out every limit. |
+| `--matrix KEY=VALUE` | Choose which **runs** happen: only the matrix combinations with this value of a key under `matrix:` (as `${matrix.KEY}` prints it), such as `src=clickhouse`; repeat a key for several values. Scripts without the key or any of the values are skipped. Expected failures of the combinations left out are neither required to fail nor dropped by `--record-failures`. |
+| `--variant NAME` | Choose which **instances** start in each run: only this name under `variants:`, such as `cayenne`; repeat it for several. Scripts with none of them are skipped. Expected failures of the variants left out, and of comparisons between variants (the run compares a different set), are neither required to fail nor dropped by `--record-failures`. Neither option combines with `--record-durations`. |
 | `--work-dir DIR` | Where instances keep their spicepods, data and `spiced.log` (default `target/spicescript`). |
 | `--keep` | Leave source containers running after the run, for debugging. |
 | `--spice-cli PATH` | The `spice` CLI that `spice` steps run. |
@@ -101,7 +105,7 @@ matrix:                              # every combination is a separate run: ${ma
 variants:                            # instances that must give identical answers
   federated: { datasets: { '*': { acceleration: null } } }
   cayenne: {}
-  duckdb: duckdb-file                # a preset: every dataset accelerated by DuckDB, file mode
+  duckdb: duckdb-file                # a shared variant from variants.yaml: DuckDB, file mode
 spicepod:                            # the spicepod, as YAML
   version: v1
   kind: Spicepod
@@ -137,6 +141,21 @@ rows into a database to have an oracle (`generate: … mirror: <source>`).
 
 ### Instances, variants and the matrix
 
+A script has two axes, and they mean different things:
+
+| | `matrix:` | `variants:` |
+| --- | --- | --- |
+| What it varies | the setup: a source, a format, a mode | the spicepod: an engine, a refresh mode, a setting |
+| What one value gets | a separate **run**, with its own sources and containers | an **instance** (`spiced`) within each run, sharing that run's sources |
+| Compared? | no: each run is checked on its own | yes: every variant of a run must give the same answers |
+| Placeholder / step filter | `${matrix.<key>}`, `when:` | `${variant.name}`, `only:` / `except:` |
+| Ledger `run` / `who` | `name[key=value,…]` | the variant's name |
+| Select from the command line | `--matrix KEY=VALUE` | `--variant NAME` |
+
+Use the matrix when the sources themselves differ (PostgreSQL vs MySQL); use
+variants when the same sources are read in different ways (Cayenne vs Arrow),
+so their answers can be compared with each other.
+
 A run is every `--spiced` binary crossed with every variant, separately for
 each matrix combination. Each instance has its own ports, working directory,
 `SPICE_INSTANCE_ID`, and its own database inside each source. Writes must
@@ -150,9 +169,14 @@ set `env:`, and `when: { <matrix key>: <value> }` to exist only in some
 combinations. Variants run in alphabetical order, and the first is the one the
 others are compared with.
 
-A variant may be a word instead of a patch: `federated` (the spicepod as
-written), `<engine>`, or `<engine>-memory` / `<engine>-file`, which sets
-`acceleration: { enabled: true, engine, mode }` on every dataset.
+A variant may name a shared variant instead of writing the patch:
+`cayenne: cayenne-file`. Shared variants are defined, each as its full patch, in
+the `variants.yaml` in the script's directory or the nearest directory above it
+([`test/spicescript/variants.yaml`](../../test/spicescript/variants.yaml) for the
+suite): `federated` (the spicepod as written), and an engine and mode that set
+`acceleration: { enabled: true, engine, mode }` on every dataset, such as
+`cayenne-file`, `duckdb-memory` or `arrow`. A name the file does not define
+fails `--check`. A variant used by one script only is written in that script.
 
 `$merge: '${…}'` spreads a mapping placeholder into a mapping, with the
 mapping's own keys winning: `params: { $merge: '${sources.lake.params}',
@@ -161,7 +185,7 @@ file_format: parquet }`.
 **Placeholders**: `${sources.<name>.<field>}`, `${matrix.<key>}`,
 `${variant.name}`, `${instance.name}`, `${instance.dir}`, `${instance.port}`
 (a free port for the script's own use), `${instance.http_port}` (the port
-`spiced` serves HTTP on, for a container that posts to it), `${script.dir}`.
+`spiced` serves HTTP on, for a container that posts to it), `${script.dir}`, `${pki.dir}` (this run's node mTLS CA and certificates: `ca.crt`, `scheduler.crt`/`.key`, `executor.crt`/`.key`, generated when the run starts).
 Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 
 ### Steps
@@ -227,7 +251,9 @@ top-level `ORDER BY … LIMIT`, with ties at the cutoff allowed and floats withi
 0.1%.
 
 - **Timing.** None checks once; `eventually: 30s` retries until it matches;
-  `consistently: 10s` must match on every attempt for the whole time.
+  `consistently: 10s` must match on every attempt for the whole time. On a
+  `corpus`, `eventually` is one limit for all its queries, counted from the
+  first: each retries until then, and one reached after it gets one attempt.
 - **Empty answers.** `expect-empty: true` is required for an empty answer.
 - **Errors.** `expect-error: true` or `"<text>"` expects a rejection.
 - **Prepared statements.** `parameters: [...]` runs the query as a Flight SQL
@@ -236,9 +262,9 @@ top-level `ORDER BY … LIMIT`, with ties at the cutoff allowed and floats withi
 Defaults (`defaults:`):
 - **Expectations and timing:** `expect`, `eventually`, `query-timeout` (default 120 s), `ready-timeout`.
 - **Comparing variants:** `compare-variants: false` turns off agreement between variants; `compare-to: <variant>` compares every variant with one.
-- **Protocols and auth:** `also-http: true` also asks every query over HTTP JSON and requires the same answer; `api-key`; `tls: { ca }`.
+- **Protocols and auth:** `also-http: true` also asks every query over HTTP JSON and requires the same answer; `also-async: true` also runs every query as a `/v1/queries` job (a distributed job on a cluster) and requires the same answer; `api-key`; `tls: { ca }`.
 - **Running spiced:** `spiced-args`, `executor-args`.
-- **Clusters:** `cluster: { executors, spare }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs.
+- **Clusters:** `cluster: { executors, spare, containers }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs. `containers: true` runs each executor in a container of its own on the host's network (Linux only; elsewhere the script is skipped), with the work and script directories mounted. Each executor writes shuffle output to its own `/tmp`, so a stage reads another executor's output over the network, as on separate hosts; a spicepod that sets `runtime.query.temp_directory` to a shared path undoes this, since an executor reads a peer's shuffle file from disk wherever its path exists.
 - **Scheduling:**
   - `exclusive: true` runs the script alone, its instances one after another;
   - `run-variants: side-by-side` runs variants that work together (a snapshot writer and its reader) a step at a time, as one job.
@@ -320,6 +346,10 @@ A run fails on:
   out of `known-failing/`;
 - an entry with no group.
 
+When a run fails before its steps (a source or instance that did not start),
+its listed checks may never have run: they are reported in one line as not
+run, not as fixed. Fix the setup failure; don't re-record from that run.
+
 `--record-failures` writes the ledger from a run, keeping the group and
 `may-pass` of entries that are still there. A new entry's group is the
 generated query's defect labels, else its `known-failing/<group>/`
@@ -355,7 +385,7 @@ fails anywhere.
 | `runner/api.rs` | Refreshes, the `spice` CLI, HTTP steps, source queries. |
 | `runner/generators.rs` | TLP, random queries, sqllogictest. |
 | `runner/cluster.rs` | Scheduler and executors: arguments, readiness, spicepod changes. |
-| `spiced.rs` | One `spiced` process: start, readiness, stop, Flight and HTTP clients. |
+| `spiced.rs` | One `spiced` process, or container: start, readiness, stop, Flight and HTTP clients. |
 | `source/` | One module per source kind; `mod.rs` holds the `Source` trait. |
 | `docker.rs` | Containers on fixed host ports, so a restarted container keeps its address. |
 | `ledger.rs` | Expected failures: recording, signatures, judging a run against them. |

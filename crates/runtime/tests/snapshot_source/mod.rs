@@ -390,8 +390,7 @@ async fn reads_replicated_snapshots_in_the_engine_that_created_them() -> Result<
             let (rustfs, container) = start_rustfs(REPLICATED).await?;
             let result = replicated_snapshots_scenario(rustfs, &modules, &orders).await;
             remove_local_copies(&[&modules, &orders]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -505,8 +504,7 @@ async fn waits_for_the_first_snapshot_to_be_published() -> Result<()> {
             let (rustfs, container) = start_rustfs(FIRST_SNAPSHOT).await?;
             let result = first_snapshot_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -642,8 +640,7 @@ async fn loads_a_snapshot_dataset_that_a_reload_adds() -> Result<()> {
             let (rustfs, container) = start_rustfs(RELOAD).await?;
             let result = reload_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -691,8 +688,7 @@ async fn a_moved_dataset_never_serves_the_previous_locations_rows() -> Result<()
             let (rustfs, container) = start_rustfs(MOVED).await?;
             let result = moved_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -776,8 +772,7 @@ async fn refuses_snapshots_of_a_publisher_that_stores_some_columns() -> Result<(
             let (rustfs, container) = start_rustfs(PROJECTED).await?;
             let result = projected_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -865,8 +860,7 @@ async fn a_replaced_snapshot_dataset_stops_waiting_for_its_snapshot() -> Result<
             let (rustfs, container) = start_rustfs(REPLACED).await?;
             let result = replaced_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -1025,8 +1019,7 @@ async fn a_replaced_snapshot_dataset_waits_for_its_in_progress_restore() -> Resu
             let (rustfs, container) = start_rustfs(RESTORE_HELD).await?;
             let result = restore_held_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -1145,8 +1138,7 @@ async fn restores_cayenne_snapshots_to_the_paths_the_dataset_sets() -> Result<()
             let (rustfs, container) = start_rustfs(CUSTOM_PATHS).await?;
             let result = custom_paths_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -1223,8 +1215,7 @@ async fn a_reader_reclaims_the_snapshot_directories_a_reload_supersedes() -> Res
             let (rustfs, container) = start_rustfs(RECLAIM).await?;
             let result = reclaim_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -1435,8 +1426,7 @@ async fn refuses_cayenne_paths_for_another_engines_snapshots() -> Result<()> {
             let (rustfs, container) = start_rustfs(OTHER_ENGINE_PATHS).await?;
             let result = other_engine_paths_scenario(rustfs, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
@@ -1542,6 +1532,34 @@ async fn wait_for_a_skipped_fetch(labels: &[(&str, &str)], deadline: Duration) -
     wait_for_metric(FETCHES_SKIPPED, labels, before + 1.0, deadline).await
 }
 
+/// `metadata` with a newer current snapshot of `dataset`: a copy of the entry of snapshot
+/// `copy_of` (the current one when `None`) under the next id, changed by `edit`.
+fn with_newer_snapshot(
+    metadata: &[u8],
+    dataset: &str,
+    copy_of: Option<u64>,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> Result<Vec<u8>> {
+    let mut metadata: serde_json::Value = serde_json::from_slice(metadata)?;
+    let current_id = metadata[dataset]["current-snapshot-id"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("metadata names a current snapshot"))?;
+    let copy_of = copy_of.unwrap_or(current_id);
+    let snapshots = metadata[dataset]["snapshots"]
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("metadata lists snapshots"))?;
+    let mut newer = snapshots
+        .iter()
+        .find(|entry| entry["snapshot-id"].as_u64() == Some(copy_of))
+        .cloned()
+        .ok_or_else(|| anyhow!("metadata lists snapshot {copy_of}"))?;
+    newer["snapshot-id"] = serde_json::json!(current_id + 1);
+    edit(&mut newer);
+    snapshots.push(newer);
+    metadata[dataset]["current-snapshot-id"] = serde_json::json!(current_id + 1);
+    Ok(serde_json::to_vec(&metadata)?)
+}
+
 /// `modules` still serves the 5 rows of the loaded snapshot and is `Ready`.
 async fn assert_serving_loaded_snapshot(
     reader: &Arc<Runtime>,
@@ -1574,13 +1592,11 @@ async fn counts_the_polls_that_cannot_advance_to_the_published_snapshot() -> Res
             let (rustfs, container) = start_rustfs(METRICS).await?;
             let result = metrics_scenario(rustfs, &container, &modules).await;
             remove_local_copies(&[&modules]);
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }
 
-#[expect(clippy::float_cmp)] // counters are whole numbers
 async fn metrics_scenario(
     rustfs: Rustfs,
     container: &RunningContainer,
@@ -1590,6 +1606,7 @@ async fn metrics_scenario(
     let with_reason = |reason| [snapshot_mode[0], snapshot_mode[1], ("reason", reason)];
     let not_found = with_reason("snapshot_not_found");
     let older = with_reason("snapshot_older_than_loaded");
+    let download_failed = with_reason("snapshot_download_failed");
     let other = with_reason("other");
     let errors = |labels: &[(&str, &str)]| count(REFRESH_ERRORS, labels);
 
@@ -1659,11 +1676,28 @@ async fn metrics_scenario(
     wait_for_metric(REFRESH_ERRORS, &older, 2.0, Duration::from_secs(30)).await?;
     assert_serving_loaded_snapshot(&reader, &table, modules).await?;
 
+    // A newer snapshot fails verification: counted at once.
+    let broken = with_newer_snapshot(&metadata, modules, None, |entry| {
+        entry["snapshot-checksum"] = serde_json::json!("0".repeat(64));
+    })?;
+    reader_bucket.put(&metadata_key, broken.into()).await?;
+    wait_for_metric(
+        REFRESH_ERRORS,
+        &download_failed,
+        2.0,
+        Duration::from_secs(30),
+    )
+    .await?;
+    assert_serving_loaded_snapshot(&reader, &table, modules).await?;
+
     // The current snapshot is published again.
-    reader_bucket.put(&metadata_key, metadata.into()).await?;
+    reader_bucket
+        .put(&metadata_key, metadata.clone().into())
+        .await?;
     wait_for_a_skipped_fetch(&snapshot_mode, Duration::from_secs(30)).await?;
     let not_found_count = errors(&not_found);
     let older_count = errors(&older);
+    let download_failed_count = errors(&download_failed);
 
     // The store is unreachable. The client retries each read ten times and the metadata
     // read retries that three times, so the failure surfaces after about 100 s.
@@ -1677,6 +1711,35 @@ async fn metrics_scenario(
     assert_serving_loaded_snapshot(&reader, &table, modules).await?;
     assert_eq!(errors(&not_found), not_found_count);
     assert_eq!(errors(&older), older_count);
+    assert_eq!(errors(&download_failed), download_failed_count);
+
+    // A newer snapshot's file arrives after its metadata: loaded, not counted. It copies the
+    // first snapshot's 3 rows, so the load shows in the rows served.
+    let mut first = None;
+    let late = with_newer_snapshot(&metadata, modules, Some(0), |entry| {
+        first = entry["snapshot"].as_str().map(str::to_string);
+        entry["snapshot"] = serde_json::json!(format!("{}.late", first.as_deref().unwrap_or("")));
+    })?;
+    let first = first.ok_or_else(|| anyhow!("the first snapshot names its file"))?;
+    let first_key = first
+        .strip_prefix(&format!("s3://{WRITER_BUCKET}/"))
+        .ok_or_else(|| anyhow!("snapshot '{first}' is in the writer's bucket"))?
+        .to_string();
+    reader_bucket.put(&metadata_key, late.into()).await?;
+    // The file arrives after its metadata.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    reader_bucket
+        .copy(
+            &ObjectPath::from(first_key.as_str()),
+            &ObjectPath::from(format!("{first_key}.late")),
+        )
+        .await?;
+    wait_for_rows(&reader, modules, 3).await?;
+    assert_eq!(
+        errors(&download_failed),
+        download_failed_count,
+        "a snapshot file that arrives late is not a failure"
+    );
 
     // No refresh series of the dataset is without a mode (the writer's carry `full`).
     assert!(

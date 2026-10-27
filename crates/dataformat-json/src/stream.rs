@@ -5466,6 +5466,12 @@ mod tests {
     }
 
     /// One push of many small elements must not copy the tail once per element.
+    ///
+    /// Copying the tail per element makes the single 2 MiB push quadratic,
+    /// while 4 KiB pushes cap each copy at the chunk. The whole-body push is
+    /// therefore timed against the chunked one on the same host rather than
+    /// against a fixed budget, which a contended runner misses. The fastest of
+    /// three rounds per size drops stalls caused by other load.
     #[test]
     fn push_reader_does_not_copy_the_tail_once_per_element() {
         let elem = br#"{"id":1},"#;
@@ -5478,7 +5484,7 @@ mod tests {
         }
         body.push(b']');
         let expected_rows = (body.len() - 1) / elem.len();
-        for chunk_size in [body.len(), 4096] {
+        let push_all = |chunk_size: usize| {
             let mut adapter = ArrayToNdjsonPush::new();
             let started = std::time::Instant::now();
             for chunk in body.chunks(chunk_size) {
@@ -5486,11 +5492,6 @@ mod tests {
             }
             adapter.finish().expect("finish");
             let elapsed = started.elapsed();
-            assert!(
-                elapsed < std::time::Duration::from_secs(2),
-                "chunk size {chunk_size} took {elapsed:?}"
-            );
-            eprintln!("2 MiB chunk_size={chunk_size} elapsed={elapsed:?}");
             let ReadResult::Ready(rows) = adapter.try_read() else {
                 panic!("expected all rows before end of stream");
             };
@@ -5502,7 +5503,19 @@ mod tests {
             );
             assert!(matches!(adapter.try_read(), ReadResult::Eof));
             assert_eq!(adapter.buffered_len(), 0);
+            elapsed
+        };
+        let mut whole = std::time::Duration::MAX;
+        let mut chunked = std::time::Duration::MAX;
+        for _ in 0..3 {
+            whole = whole.min(push_all(body.len()));
+            chunked = chunked.min(push_all(4096));
         }
+        eprintln!("2 MiB whole push={whole:?} 4 KiB pushes={chunked:?}");
+        assert!(
+            whole < chunked * 10,
+            "one 2 MiB push took {whole:?}, more than 10x the {chunked:?} of 4 KiB pushes"
+        );
     }
 
     mod file_jsonl_tests {

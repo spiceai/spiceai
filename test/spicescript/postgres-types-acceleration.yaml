@@ -1,0 +1,123 @@
+name: postgres-types-acceleration
+description: >
+  A Postgres table with every common scalar and array type, NULLs in each,
+  answers through Spice exactly as Postgres answers: federated, and
+  accelerated by full and append refresh into every engine with a
+  `refresh_sql` filter, a refresh that overrides that filter, and rows appended
+  at the source. Overrides go through the refresh API and the `spice` CLI. The
+  log reports no errors.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  federated: {}
+  arrow: arrow-memory
+  duckdb: duckdb-file
+  sqlite: sqlite-file
+  cayenne: cayenne-file
+  turso: turso-file
+  duckdb-memory: duckdb-memory
+  sqlite-memory: sqlite-memory
+  turso-memory: turso-memory
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-types-acceleration
+  datasets:
+    - from: postgres:test_postgresql_table
+      name: full_t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: false
+        refresh_sql: SELECT * FROM full_t WHERE int2_column IS NULL OR int2_column != 10
+    - from: postgres:test_postgresql_table
+      name: append_t
+      params: ${sources.src.params}
+      time_column: timestamp_column
+      acceleration:
+        enabled: false
+        refresh_mode: append
+        refresh_check_interval: 2s
+        refresh_sql: SELECT * FROM append_t WHERE int2_column IS NULL OR int2_column != 10
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': int4_column }
+  # Every answer also comes back over HTTP as JSON, the same as over Flight.
+  also-http: true
+  expect: { oracle: src }
+  # The federated variant reads every row; the accelerations only the
+  # `refresh_sql` rows.
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: { file: ../scripts/setup-data-postgresql.sql }
+  - start: {}
+
+  - query: SELECT * FROM full_t
+    oracle-sql: SELECT * FROM test_postgresql_table
+    only: federated
+  - query: SELECT * FROM full_t
+    oracle-sql: SELECT * FROM test_postgresql_table WHERE int2_column IS NULL OR int2_column != 10
+    except: federated
+  - query: SELECT * FROM append_t
+    oracle-sql: SELECT * FROM test_postgresql_table WHERE int2_column IS NULL OR int2_column != 10
+    eventually: 30s
+    except: federated
+
+  # A refresh that overrides the dataset's refresh_sql.
+  - refresh: { dataset: full_t, refresh-sql: SELECT * FROM full_t WHERE int2_column = 10 }
+    except: federated
+  - query: SELECT * FROM full_t
+    oracle-sql: SELECT * FROM test_postgresql_table WHERE int2_column = 10
+    eventually: 30s
+    except: federated
+  # The same through the `spice` CLI.
+  - spice: [refresh, full_t, --refresh-sql, SELECT * FROM full_t WHERE int2_column IS NULL]
+    output-contains: Dataset refresh triggered
+    except: federated
+  - query: SELECT * FROM full_t
+    oracle-sql: SELECT * FROM test_postgresql_table WHERE int2_column IS NULL
+    eventually: 30s
+    except: federated
+  # A LIMIT keeps unspecified rows, so only their number is checked.
+  - spice: [refresh, full_t, --refresh-sql, SELECT * FROM full_t LIMIT 2]
+    output-contains: Dataset refresh triggered
+    except: federated
+  - query: SELECT count(*) FROM full_t
+    expect: { rows: [["2"]] }
+    eventually: 30s
+    except: federated
+  # An override applies to its own refresh; the next one uses the dataset's
+  # refresh_sql again.
+  - refresh: full_t
+    except: federated
+  - query: SELECT * FROM full_t
+    oracle-sql: SELECT * FROM test_postgresql_table WHERE int2_column IS NULL OR int2_column != 10
+    eventually: 30s
+    except: federated
+
+  # Rows appended at the source arrive by append refresh, through its filter.
+  - source-exec:
+      src: >
+        INSERT INTO test_postgresql_table (int2_column, int4_column, text_column, timestamp_column, int4_array_column)
+        VALUES (11, 11, 'appended', CURRENT_TIMESTAMP + INTERVAL '1 hour', ARRAY[11]),
+               (10, 10, 'filtered out', CURRENT_TIMESTAMP + INTERVAL '1 hour', NULL)
+  - query: SELECT * FROM append_t
+    oracle-sql: SELECT * FROM test_postgresql_table WHERE int2_column IS NULL OR int2_column != 10
+    eventually: 30s
+    except: federated
+  - query: SELECT * FROM append_t
+    oracle-sql: SELECT * FROM test_postgresql_table
+    only: federated
+
+  - assert-log: { clean: true }
+    except: turso-memory
+  # The in-memory Turso accelerator sometimes reports a write-write conflict on
+  # an append refresh; the refresh is retried and the queries above check the
+  # rows it lands.
+  - assert-log: { clean: true, allow: ['Failed to (load data for|refresh) dataset append_t \(postgres\): Failed to refresh dataset from the data connector: External error: Write-write conflict\.'] }
+    only: turso-memory

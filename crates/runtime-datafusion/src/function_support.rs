@@ -154,7 +154,7 @@ fn duckdb_function_support() -> FunctionSupport {
 }
 
 /// Whether `DuckDB` evaluates this non-function expression node the way
-/// `DataFusion` does: neither the casts the dialect refuses
+/// `DataFusion` does: neither the casts or decimal `/` the dialect refuses
 /// ([`crate::dialect::duckdb_can_evaluate_expression`]) nor a decimal `avg`.
 ///
 /// `DuckDB`'s `avg` over a `DECIMAL` answers a `DOUBLE`, which carries about
@@ -163,7 +163,8 @@ fn duckdb_function_support() -> FunctionSupport {
 /// back cast to that type, so at TPC-H scale it reads one unit high in the
 /// last place, and for a large `DECIMAL(38, 2)` it is wrong in the integer
 /// digits. A decimal `avg` therefore stays local (issue #14492). `DuckDB`'s
-/// decimal `sum` is exact and keeps its pushdown.
+/// decimal `sum` is exact and keeps its pushdown. A decimal `/` is refused
+/// by the dialect for the same `DOUBLE` reason.
 #[must_use]
 pub fn duckdb_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
     crate::dialect::duckdb_can_evaluate_expression(expr, schema)
@@ -474,6 +475,11 @@ pub fn sqlite_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) ->
                 .get_type(schema.unwrap_or_else(|| DFSchema::empty_ref()))
                 .is_ok_and(|from| sqlite_cast_is_faithful(&from, to))
         }
+        // `SQLite` stores a decimal as a `REAL` and computes `/` in floating
+        // point, so a decimal `/` stays local for the same reason `DuckDB`'s
+        // does ([`crate::dialect::divides_a_decimal`]). Integer `/` is
+        // integer division and keeps its pushdown.
+        Expr::BinaryExpr(_) => !crate::dialect::divides_a_decimal(expr, schema),
         _ => true,
     }
 }
@@ -1272,6 +1278,81 @@ mod tests {
         }
     }
 
+    /// A scan of `t` projecting `expr`.
+    fn plan_dividing(expr: Expr) -> LogicalPlan {
+        decimal_scan()
+            .project(vec![expr])
+            .expect("project")
+            .build()
+            .expect("build plan")
+    }
+
+    /// Regression: `DuckDB` evaluates decimal `/` as a `DOUBLE` (the dialect
+    /// unparses every `Divide` as `//`), so a decimal `/` stays local on the
+    /// connector, the accelerator and `DuckLake`. Integer `/` and float `/`
+    /// keep their pushdown, including the integer-division rewrite (#3155).
+    #[test]
+    fn duckdb_keeps_decimal_division_local() {
+        for (route, support) in [
+            ("duckdb", deny_spice_functions_for_duckdb_table_providers()),
+            (
+                "ducklake",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+        ] {
+            for refused in [
+                col("dec") / lit(3_i64),
+                col("i") / col("dec"),
+                (col("dec") / lit(3_i64)).gt(lit(0)),
+            ] {
+                assert!(
+                    !pushes(&plan_dividing(refused.clone()), &support),
+                    "{refused} must stay local on {route}"
+                );
+            }
+            for allowed in [
+                col("i") / lit(2_i64),
+                col("f") / lit(2.0_f64),
+                lit(7_i64) / lit(2_i64),
+                col("dec") + lit(1_i64),
+                col("dec") * lit(3_i64),
+            ] {
+                assert!(
+                    pushes(&plan_dividing(allowed.clone()), &support),
+                    "{allowed} must keep its {route} pushdown"
+                );
+            }
+        }
+    }
+
+    /// Regression: `SQLite` computes decimal `/` in `REAL`, so it stays local.
+    /// Integer `/` and float `/` keep their pushdown.
+    #[test]
+    fn sqlite_keeps_decimal_division_local() {
+        let support = deny_spice_functions_for_sqlite_table_providers();
+        for refused in [
+            col("dec") / lit(3_i64),
+            col("i") / col("dec"),
+            (col("dec") / lit(3_i64)).gt(lit(0)),
+        ] {
+            assert!(
+                !pushes(&plan_dividing(refused.clone()), &support),
+                "{refused} must stay local on SQLite"
+            );
+        }
+        for allowed in [
+            col("i") / lit(2_i64),
+            col("f") / lit(2.0_f64),
+            lit(7_i64) / lit(2_i64),
+            col("dec") + lit(1_i64),
+        ] {
+            assert!(
+                pushes(&plan_dividing(allowed.clone()), &support),
+                "{allowed} must keep its SQLite pushdown"
+            );
+        }
+    }
+
     /// An aggregate whose operand type cannot be read is refused, not assumed
     /// to be a non-decimal.
     #[test]
@@ -1291,6 +1372,22 @@ mod tests {
         ));
         assert!(super::duckdb_can_evaluate_expression(
             &sum(col("dec")),
+            None
+        ));
+        assert!(!super::duckdb_can_evaluate_expression(
+            &(col("dec") / lit(3_i64)),
+            None
+        ));
+        assert!(!super::sqlite_can_evaluate_expression(
+            &(col("dec") / lit(3_i64)),
+            None
+        ));
+        assert!(super::duckdb_can_evaluate_expression(
+            &(lit(7_i64) / lit(2_i64)),
+            None
+        ));
+        assert!(super::sqlite_can_evaluate_expression(
+            &(lit(7_i64) / lit(2_i64)),
             None
         ));
     }

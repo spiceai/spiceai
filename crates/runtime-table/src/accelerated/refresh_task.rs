@@ -756,7 +756,8 @@ impl RefreshTask {
                     Arc::new(ProviderChangeSinkBackend::new(context)),
                     util::session_state::session_context(),
                     &Handle::current(),
-                    changes::cdc_config().prefetch_buffer,
+                    changes::dataset_cdc_config(self.cdc_param_overrides.as_deref())
+                        .prefetch_buffer,
                 )
             })
             .await
@@ -915,11 +916,15 @@ impl RefreshTask {
         // previously-materialized rows (issue #11353). When an override is present, bypass the
         // skip check and reset the provider's cached version so the *next* plain refresh
         // re-materializes the full source instead of skipping against the narrowed data. A reload
-        // reads the source whether or not it changed, so it skips the check.
+        // reads the source whether or not it changed, so it skips the check and resets the cached
+        // version too: the rows it writes no longer match it.
+        // The source whose skip check found it changed. The version it saw is recorded as
+        // loaded only once this refresh writes its rows.
+        let mut checked_source = None;
         if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
             let table_provider = self.federated.table_provider().await;
 
-            if refresh.override_sql_raw.is_some() {
+            if refresh.override_sql_raw.is_some() || refresh.reload {
                 data_components::refresh_skip::reset_refresh_skip_state_for_table_provider(
                     table_provider.as_ref(),
                 )
@@ -950,6 +955,7 @@ impl RefreshTask {
                         );
                     }
                 }
+                checked_source = Some(table_provider);
             }
         }
 
@@ -1103,6 +1109,12 @@ impl RefreshTask {
 
         if let Some(cursor) = append_cursor_to_save {
             self.save_append_cursor(&cursor).await;
+        }
+        if let Some(source) = checked_source {
+            data_components::refresh_skip::commit_refresh_skip_state_for_table_provider(
+                source.as_ref(),
+            )
+            .await;
         }
 
         Ok(RefreshOutcome::Refreshed)
@@ -2195,6 +2207,25 @@ impl RefreshTask {
                     location: state.manager.snapshot_location().to_string(),
                     published_id,
                     loaded_id,
+                };
+                return Ok(self
+                    .keep_serving_loaded_snapshot(&error, loaded_id, dataset_metrics_label_sets)
+                    .await);
+            }
+            Ok(SnapshotPoll {
+                outcome:
+                    SnapshotPollOutcome::DownloadFailed {
+                        published_id,
+                        loaded_id,
+                        cause,
+                        ..
+                    },
+                ..
+            }) => {
+                let error = super::Error::SnapshotDownloadFailed {
+                    location: state.manager.snapshot_location().to_string(),
+                    published_id,
+                    cause,
                 };
                 return Ok(self
                     .keep_serving_loaded_snapshot(&error, loaded_id, dataset_metrics_label_sets)
@@ -4059,6 +4090,9 @@ pub fn refresh_error_reason(error: &super::Error) -> &'static str {
         super::Error::SnapshotOlderThanLoaded { .. } => {
             metrics::REFRESH_ERROR_REASON_SNAPSHOT_OLDER_THAN_LOADED
         }
+        super::Error::SnapshotDownloadFailed { .. } => {
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_DOWNLOAD_FAILED
+        }
         _ if error_chain_matches(error, looks_like_generation_change) => {
             metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
         }
@@ -4916,6 +4950,21 @@ mod tests {
         assert_eq!(
             older.to_string(),
             "The snapshot published at 's3://bucket/snapshots/' (id 0) is older than the loaded snapshot (id 3), so it was not loaded. Publish a newer snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+        );
+
+        let download_failed = super::super::Error::SnapshotDownloadFailed {
+            location: "s3://bucket/snapshots/".to_string(),
+            published_id: 4,
+            cause: "Snapshot s3://bucket/snapshots/a.db checksum mismatch. expected=00 actual=ff"
+                .to_string(),
+        };
+        assert_eq!(
+            refresh_error_reason(&download_failed),
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_DOWNLOAD_FAILED
+        );
+        assert_eq!(
+            download_failed.to_string(),
+            "The snapshot published at 's3://bucket/snapshots/' (id 4) could not be loaded, so it is tried again at the next poll. Cause: Snapshot s3://bucket/snapshots/a.db checksum mismatch. expected=00 actual=ff. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
         );
     }
 

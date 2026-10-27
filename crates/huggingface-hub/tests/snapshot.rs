@@ -199,6 +199,103 @@ async fn downloads_into_the_layout_huggingface_hub_reads() {
     assert!(!repo.join("snapshots").join(C1).join("onnx").exists());
 }
 
+/// Every directory the cache creates under its root is `0755` and every file in it `0644`,
+/// whatever the umask Spice runs under, so a cache one account fills can be read by another
+/// and written only by its owner. The root, and `HF_HOME` above it, are `0755` narrowed by the
+/// umask when the cache creates them: their mode decides who else can read the cache.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_cache_is_0755_and_0644_under_its_root_whatever_the_umask() {
+    use nix::sys::stat::{Mode, umask};
+
+    crate::require_process_per_test("it sets the process umask");
+    let files = model_files();
+    let (config, onnx) = (files[0].1.etag(), files[3].1.etag());
+    let expected = |root_mode: &str| {
+        let mut expected = vec![
+            (".".to_string(), root_mode),
+            ("hub".to_string(), root_mode),
+            ("hub/.locks".to_string(), "0755"),
+            ("hub/.locks/models--o--m".to_string(), "0755"),
+            (format!("hub/.locks/models--o--m/{config}.lock"), "0644"),
+            (format!("hub/.locks/models--o--m/{onnx}.lock"), "0644"),
+            ("hub/models--o--m".to_string(), "0755"),
+            ("hub/models--o--m/blobs".to_string(), "0755"),
+            (format!("hub/models--o--m/blobs/{config}"), "0644"),
+            (format!("hub/models--o--m/blobs/{onnx}"), "0644"),
+            ("hub/models--o--m/refs".to_string(), "0755"),
+            ("hub/models--o--m/refs/main".to_string(), "0644"),
+            ("hub/models--o--m/snapshots".to_string(), "0755"),
+            (format!("hub/models--o--m/snapshots/{C1}"), "0755"),
+            (format!("hub/models--o--m/snapshots/{C1}/onnx"), "0755"),
+        ];
+        expected.sort();
+        expected
+            .into_iter()
+            .map(|(path, mode)| (path, mode.to_string()))
+            .collect::<Vec<_>>()
+    };
+
+    let mut caches = vec![];
+    for (name, mask) in [
+        ("077", Mode::S_IRWXG | Mode::S_IRWXO),
+        ("000", Mode::empty()),
+    ] {
+        let fixture = Fixture::new().await;
+        fixture.mock.commit(MODEL, C1, files.clone());
+        fixture.mock.branch(MODEL, "main", C1);
+
+        let previous = umask(mask);
+        let downloaded = fixture
+            .open(None, &[])
+            .await
+            .download(&["config.json", "onnx/model.onnx"])
+            .await;
+        umask(previous);
+        downloaded.expect("the files download");
+        caches.push((name, modes_under(&fixture.home.path().join("hf"))));
+    }
+    assert_eq!(
+        caches,
+        vec![("077", expected("0700")), ("000", expected("0755"))],
+        "each umask's cache, as (path, mode)"
+    );
+}
+
+/// Every entry under `root` but symlinks, as its path relative to `root` (`.` for `root`
+/// itself) and its permission bits in octal, in path order.
+#[cfg(unix)]
+fn modes_under(root: &Path) -> Vec<(String, String)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut entries = vec![];
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path).expect("an entry of the cache");
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            pending.extend(
+                std::fs::read_dir(&path)
+                    .expect("a directory of the cache")
+                    .map(|entry| entry.expect("a directory entry").path()),
+            );
+        }
+        let relative = path.strip_prefix(root).expect("a path under the root");
+        let name = if relative.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            relative.display().to_string()
+        };
+        entries.push((
+            name,
+            format!("{:04o}", metadata.permissions().mode() & 0o777),
+        ));
+    }
+    entries.sort();
+    entries
+}
+
 #[tokio::test]
 async fn a_second_load_downloads_nothing() {
     let fixture = Fixture::new().await;
@@ -674,6 +771,86 @@ async fn a_component_spice_loads_once_says_to_restart() {
 }
 
 #[tokio::test]
+async fn open_paths_describes_only_the_files_named() {
+    // A component that reads one file of a repository looks at that file, and never lists a
+    // repository that may hold many. Warm, it costs one request: the answer that names the
+    // commit.
+    let fixture = Fixture::new().await;
+    fixture.mock.commit(MODEL, C1, model_files());
+    fixture.mock.branch(MODEL, "main", C1);
+    let open = |paths: &'static [&'static str]| {
+        let fixture = &fixture;
+        async move {
+            Snapshot::open_paths(
+                fixture.settings(&[]).await,
+                requester(),
+                RepoId::new(RepoType::Model, "o", "m").expect("a valid repository"),
+                None,
+                paths,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the snapshot opens: {e}"))
+        }
+    };
+    let requests = |fixture: &Fixture| -> Vec<String> {
+        fixture
+            .mock
+            .seen()
+            .into_iter()
+            .map(|seen| seen.path)
+            .collect()
+    };
+
+    let snapshot = open(&["tokenizer.json", "absent.json"]).await;
+    assert_eq!(snapshot.commit(), C1);
+    assert_eq!(
+        snapshot
+            .files()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tokenizer.json"]
+    );
+    let paths = snapshot
+        .download(&["tokenizer.json"])
+        .await
+        .unwrap_or_else(|e| panic!("the file downloads: {e}"));
+    assert_eq!(
+        std::fs::read_to_string(&paths[0]).expect("the file"),
+        "{\"version\":\"1.0\"}"
+    );
+    let cold = requests(&fixture);
+    assert!(
+        cold.iter()
+            .any(|path| path.starts_with("/o/m/resolve/main/tokenizer.json"))
+            && cold.iter().any(|path| path.contains("/paths-info/"))
+            && !cold.iter().any(|path| path.contains("/tree/")),
+        "{cold:#?}"
+    );
+    // A file the repository does not have is named when it is downloaded.
+    let error = snapshot
+        .download(&["absent.json"])
+        .await
+        .expect_err("the repository has no such file");
+    assert_eq!(
+        error.to_string(),
+        "Failed to download model 'test' from Hugging Face repo 'o/m' (revision 'main'): the repo has no 'absent.json'. See: https://spiceai.org/docs/components/models/huggingface"
+    );
+
+    // Warm: one request names the commit, and the cached file is used as it is.
+    fixture.mock.clear_seen();
+    let warm = open(&["tokenizer.json"]).await;
+    let located = warm
+        .download(&["tokenizer.json"])
+        .await
+        .unwrap_or_else(|e| panic!("the cached file loads: {e}"));
+    assert_eq!(located, paths);
+    assert_eq!(
+        requests(&fixture),
+        vec!["/o/m/resolve/main/tokenizer.json".to_string()]
+    );
+}
+
+#[tokio::test]
 async fn a_missing_revision_does_not_fall_back_to_the_cache() {
     let fixture = Fixture::new().await;
     fixture.mock.commit(MODEL, C1, model_files());
@@ -835,6 +1012,7 @@ async fn a_connection_failure_keeps_its_kind_through_the_revision_cache() {
             huggingface_hub::HubConfig {
                 endpoint: url::Url::parse(&format!("http://{closed}")).expect("a URL"),
                 token: None,
+                token_scope: huggingface_hub::settings::TokenScope::Any,
             },
             tokio::runtime::Handle::current(),
         )

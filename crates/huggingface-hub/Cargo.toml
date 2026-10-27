@@ -50,6 +50,9 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["fs"] }
+
 [[test]]
 name = "integration"
 path = "tests/integration.rs"

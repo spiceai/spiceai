@@ -1,0 +1,102 @@
+name: index-equivalence
+description: >
+  A Cayenne lookup index never changes an answer: point, IN and OR lookups
+  return the same rows with and without the index, and match Postgres, after a
+  full refresh and while CDC moves rows between keys and deletes them. The
+  indexed variant must show that the index served the lookup.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  refresh_mode: [full, changes]
+
+variants:
+  baseline: {}
+  indexed:
+    datasets: { orders: { acceleration: { indexes: { o_custkey: enabled } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: index-equivalence
+  datasets:
+    - from: postgres:public.orders
+      name: orders
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: ${matrix.refresh_mode}
+        primary_key: o_id
+        on_conflict: { o_id: upsert }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE orders (
+          o_id      bigint PRIMARY KEY,
+          o_custkey integer,
+          o_status  text,
+          o_total   numeric(12, 2)
+        );
+        INSERT INTO orders
+          SELECT i, CASE WHEN i % 1000 = 0 THEN NULL ELSE i % 997 END,
+                 (ARRAY['O', 'F', 'P'])[1 + i % 3], (i % 10007) / 100.0
+          FROM generate_series(1, 60000) AS i;
+  - start: {}
+  - query: SELECT count(*), count(o_custkey), sum(o_total) FROM orders
+    eventually: 60s
+
+  - query: SELECT * FROM orders WHERE o_custkey = 42
+  - query: SELECT * FROM orders WHERE o_custkey IN (1, 42, 996, 5000)
+  - query: SELECT * FROM orders WHERE o_custkey = 7 OR o_custkey = 8
+  - query: SELECT * FROM orders WHERE o_custkey = 42 AND o_status = 'F'
+  - query: SELECT * FROM orders WHERE o_custkey = 123456
+    expect-empty: true
+  - query: SELECT * FROM orders WHERE o_custkey IS NULL
+  - query: SELECT o_custkey, count(*) FROM orders WHERE o_custkey BETWEEN 40 AND 45 GROUP BY o_custkey ORDER BY o_custkey NULLS LAST
+
+  - explain: SELECT * FROM orders WHERE o_custkey = 42
+    contains: "lookup_index=o_custkey"
+    only: indexed
+  - explain: SELECT * FROM orders WHERE o_custkey = 42
+    omits: "lookup_index=o_custkey"
+    only: baseline
+
+  # Move rows between keys, delete some, add new ones.
+  - source-exec:
+      src:
+        - UPDATE orders SET o_custkey = 42 WHERE o_custkey = 43
+        - UPDATE orders SET o_custkey = 5000 WHERE o_id % 997 = 7
+        - UPDATE orders SET o_custkey = NULL WHERE o_custkey = 8
+        - DELETE FROM orders WHERE o_custkey = 1
+        - INSERT INTO orders SELECT i, 42, 'N', 1.00 FROM generate_series(100001, 100500) AS i
+  - refresh: orders
+    when: { refresh_mode: full }
+  - query: SELECT count(*), count(o_custkey), sum(o_total) FROM orders
+    eventually: 60s
+  - query: SELECT * FROM orders WHERE o_custkey = 42
+    eventually: 30s
+  - query: SELECT * FROM orders WHERE o_custkey = 43
+    expect-empty: true
+    eventually: 30s
+  - query: SELECT * FROM orders WHERE o_custkey IN (1, 42, 996, 5000)
+    eventually: 30s
+  - query: SELECT * FROM orders WHERE o_custkey = 9 OR o_custkey = 8 OR o_custkey = 5000
+    eventually: 30s
+  - query: SELECT * FROM orders WHERE o_custkey IS NULL
+    eventually: 30s
+
+  - restart: {}
+  - query: SELECT * FROM orders WHERE o_custkey IN (1, 42, 996, 5000)
+    eventually: 30s
+  - query: SELECT * FROM orders WHERE o_custkey = 8
+    expect-empty: true
+  - explain: SELECT * FROM orders WHERE o_custkey = 42
+    contains: "lookup_index=o_custkey"
+    only: indexed

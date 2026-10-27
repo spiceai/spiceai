@@ -112,6 +112,36 @@ impl RunningContainer {
         Ok(())
     }
 
+    /// Removes the container once a test is done with it. A removal that fails, such
+    /// as one timing out on a stalled daemon, is reported like a failed removal in
+    /// `Drop` instead of being returned: cleanup must not fail a scenario that
+    /// passed. `Drop` then tries the removal again. A test that removes the
+    /// container to simulate an outage needs the removal to succeed, so it calls
+    /// [`Self::remove`] instead.
+    pub async fn cleanup(&self) {
+        if let Err(e) = self.remove().await {
+            self.report_failed_removal(&e);
+        }
+    }
+
+    /// Removes the container once a test's scenario has finished, and returns the
+    /// scenario's result. A failed removal is reported as in [`Self::cleanup`], so it
+    /// cannot replace the scenario's error.
+    pub async fn remove_after<T>(
+        &self,
+        scenario: Result<T, anyhow::Error>,
+    ) -> Result<T, anyhow::Error> {
+        self.cleanup().await;
+        scenario
+    }
+
+    fn report_failed_removal(&self, e: &anyhow::Error) {
+        eprintln!(
+            "failed to remove test container {} ({}): {e}",
+            self.name, self.id
+        );
+    }
+
     pub async fn stop(&self) -> Result<(), anyhow::Error> {
         Ok(self.docker.stop_container(&self.id, None).await?)
     }
@@ -264,10 +294,7 @@ impl Drop for RunningContainer {
             });
         match removal.map(std::thread::JoinHandle::join) {
             Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(e))) => eprintln!(
-                "failed to remove test container {} ({}): {e}",
-                self.name, self.id
-            ),
+            Ok(Ok(Err(e))) => self.report_failed_removal(&e),
             Ok(Err(_)) => eprintln!(
                 "cleanup thread for test container {} ({}) panicked",
                 self.name, self.id
