@@ -11,7 +11,14 @@ HTTP=${HTTP:-127.0.0.1:18790}
 FLIGHT=${FLIGHT:-127.0.0.1:18791}
 METRICS=${METRICS:-127.0.0.1:18792}
 ROWS=1000
-WORKDIR=${WORKDIR:-$(mktemp -d /tmp/verify-unnest-cross-join-rows.XXXXXX)}
+# Only a directory this script created is removed on exit; a WORKDIR the caller names is kept.
+if [[ -n ${WORKDIR:-} ]]; then
+  mkdir -p "$WORKDIR"
+  OWN_WORKDIR=
+else
+  WORKDIR=$(mktemp -d /tmp/verify-unnest-cross-join-rows.XXXXXX)
+  OWN_WORKDIR=1
+fi
 cd "$WORKDIR"
 echo "spiced: $("$SPICED" --version 2>&1 | head -1)"
 echo "workdir: $WORKDIR"
@@ -36,7 +43,7 @@ PY
 
 "$SPICED" --http "$HTTP" --flight "$FLIGHT" --metrics "$METRICS" > spiced.log 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; [[ -n ${KEEP:-} ]] || rm -rf "$WORKDIR"' EXIT
+trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; [[ -n ${KEEP:-} || -z $OWN_WORKDIR ]] || rm -rf "$WORKDIR"' EXIT
 for _ in $(seq 120); do
   [[ $(grep -c "Dataset t_.* registered" spiced.log || true) -ge 3 ]] && break
   kill -0 $PID 2>/dev/null || { cat spiced.log; exit 1; }
