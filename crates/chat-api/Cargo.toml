@@ -41,5 +41,10 @@ tracing-futures.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
+# Prints latency percentiles itself, so it needs no benchmark harness.
+[[bench]]
+name = "wire"
+harness = false
+
 [lints]
 workspace = true

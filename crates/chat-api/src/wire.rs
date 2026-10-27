@@ -23,7 +23,8 @@ limitations under the License.
 //! reject the whole response over it, so a count nobody reported is omitted
 //! instead. It is never replaced with `0`, which would claim a measurement.
 
-use serde::Serialize;
+use async_openai::types::chat::CreateChatCompletionStreamResponse;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 /// The usage objects whose members are optional counts.
@@ -39,6 +40,41 @@ pub fn chat_completion_json<T: Serialize>(response: &T) -> serde_json::Result<Va
     let mut value = serde_json::to_value(response)?;
     omit_unreported_usage(&mut value);
     Ok(value)
+}
+
+/// A stream chunk as the JSON sent to a client: [`chat_completion_json`] when it
+/// carries usage, and otherwise the chunk itself, which has no usage to clean.
+/// A stream sends one of these per token, and only its last chunk carries usage,
+/// so the rest skip the intermediate [`Value`].
+///
+/// # Errors
+///
+/// Returns an error when a chunk that carries usage cannot be serialized.
+pub fn stream_chunk_json(
+    chunk: &CreateChatCompletionStreamResponse,
+) -> serde_json::Result<Wire<'_, CreateChatCompletionStreamResponse>> {
+    if chunk.usage.is_none() {
+        return Ok(Wire::AsIs(chunk));
+    }
+    chat_completion_json(chunk).map(Wire::Cleaned)
+}
+
+/// A response ready to serialize for a client: unchanged, or cleaned into JSON.
+#[derive(Debug)]
+pub enum Wire<'a, T> {
+    /// Serialized as it is: it has nothing to clean.
+    AsIs(&'a T),
+    /// Cleaned by [`chat_completion_json`].
+    Cleaned(Value),
+}
+
+impl<T: Serialize> Serialize for Wire<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::AsIs(response) => response.serialize(serializer),
+            Self::Cleaned(value) => value.serialize(serializer),
+        }
+    }
 }
 
 /// Remove the `null` counts from `value["usage"]`'s detail objects, and a
@@ -152,6 +188,51 @@ mod tests {
         assert_eq!(
             chat_completion_json(&chunk).expect("serialize")["usage"],
             json!({ "prompt_tokens": 14, "completion_tokens": 16, "total_tokens": 30 })
+        );
+    }
+
+    fn stream_chunk(usage: &Value) -> CreateChatCompletionStreamResponse {
+        serde_json::from_value(json!({
+            "id": "chatcmpl-abc", "object": "chat.completion.chunk", "created": 0, "model": "qwen",
+            "choices": [{"index": 0, "delta": {"content": " the"}, "finish_reason": null}],
+            "usage": usage,
+        }))
+        .expect("a stream chunk")
+    }
+
+    /// The shortcut for a chunk without usage writes exactly what cleaning it would.
+    #[test]
+    fn a_stream_chunk_is_sent_as_cleaning_it_would_send_it() {
+        for usage in [
+            Value::Null,
+            json!({"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+            json!({
+                "prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4,
+                "prompt_tokens_details": {"audio_tokens": null, "cached_tokens": 2},
+                "completion_tokens_details": {"reasoning_tokens": null},
+            }),
+        ] {
+            let chunk = stream_chunk(&usage);
+            let sent = serde_json::to_string(&stream_chunk_json(&chunk).expect("serialize"))
+                .expect("write");
+            let cleaned = serde_json::to_string(&chat_completion_json(&chunk).expect("clean"))
+                .expect("write");
+            assert_eq!(
+                serde_json::from_str::<Value>(&sent).expect("parse"),
+                serde_json::from_str::<Value>(&cleaned).expect("parse"),
+                "{usage}"
+            );
+        }
+        // And a chunk with usage is cleaned.
+        let chunk = stream_chunk(&json!({
+            "prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4,
+            "prompt_tokens_details": {"audio_tokens": null, "cached_tokens": 2},
+        }));
+        let sent =
+            serde_json::to_value(stream_chunk_json(&chunk).expect("serialize")).expect("write");
+        assert_eq!(
+            sent["usage"]["prompt_tokens_details"],
+            json!({"cached_tokens": 2})
         );
     }
 

@@ -346,7 +346,7 @@ fn create_sse_response(
                             chat_output.push_str(intermediate_chat_output);
                         }
 
-                    let event = match llms::chat::wire::chat_completion_json(&resp) {
+                    let event = match llms::chat::wire::stream_chunk_json(&resp) {
                         Ok(chunk) => Event::default().json_data(chunk).unwrap_or_else(|e| {
                             tracing::error!("Failed to serialize chat completion message: {e}");
                             to_openai_error_event(e.to_string())
