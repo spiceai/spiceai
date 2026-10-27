@@ -1497,7 +1497,7 @@ impl RefreshTask {
                 filters.push(window_filter(
                     converter,
                     get_timestamp(SystemTime::now() - period),
-                    refresh,
+                    &refresh,
                 ));
             }
         }
@@ -3531,12 +3531,7 @@ mod window_filter_tests {
     use util::timestamp_filter::{TimestampFilterConvert, TimestampFormat};
 
     fn converter() -> TimestampFilterConvert {
-        TimestampFilterConvert::new(
-            "ts".to_string(),
-            TimestampFormat::Timestamptz(None),
-            None,
-            None,
-        )
+        TimestampFilterConvert::new("ts".to_string(), TimestampFormat::Timestamp, None, None)
     }
 
     #[test]
