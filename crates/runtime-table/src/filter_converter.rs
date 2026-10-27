@@ -136,7 +136,7 @@ mod test {
             Field::new("timestamp", DataType::Utf8, false),
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
-            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
+            "timestamp >= Utf8(\"2021-05-02\") AND CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
         );
     }
 
