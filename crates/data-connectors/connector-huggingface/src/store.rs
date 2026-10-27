@@ -291,25 +291,15 @@ impl ObjectStore for HuggingFaceStore {
             .map_err(|e| store_error(location, e))?;
         // `list` advertises `TreeEntry::content_id` (the git oid, or the LFS
         // SHA-256). The download `ETag` is Hub `x-linked-etag`, a different
-        // identifier. If-Match of a listed generation is checked against the
-        // listing, which is the generation `list` returned.
-        let meta = if options.if_match.is_some() || options.if_none_match.is_some() {
-            let entry = file_entry(hub, &repo, commit, path, location).await?;
-            ObjectMeta {
-                location: location.clone(),
-                last_modified,
-                size: read.size,
-                e_tag: Some(entry.content_id().to_string()),
-                version: Some(commit.to_string()),
-            }
-        } else {
-            ObjectMeta {
-                location: location.clone(),
-                last_modified,
-                size: read.size,
-                e_tag: read.e_tag,
-                version: Some(commit.to_string()),
-            }
+        // identifier, so every read reports the listed one: a precondition on
+        // the `ETag` of any earlier `list`, `head`, or `get` then matches.
+        let entry = file_entry(hub, &repo, commit, path, location).await?;
+        let meta = ObjectMeta {
+            location: location.clone(),
+            last_modified,
+            size: read.size,
+            e_tag: Some(entry.content_id().to_string()),
+            version: Some(commit.to_string()),
         };
         options.check_preconditions(&meta)?;
         let stream_location = location.clone();
