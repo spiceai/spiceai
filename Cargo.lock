@@ -17769,6 +17769,7 @@ dependencies = [
  "object_store 0.13.2",
  "object_store_occ",
  "opendal",
+ "opendal-http-transport-reqwest",
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
  "opentelemetry-prometheus",
