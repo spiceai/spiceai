@@ -18,12 +18,12 @@ use bytes::Bytes;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use snafu::ResultExt;
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::{any::Any, collections::HashMap, sync::Arc};
-use zip::ZipArchive;
 
 use crate::{
     Document, DocumentParser, DocumentParserFactory, DocumentType, InternalParsingSnafu, Result,
+    archive::open_consistent_archive,
 };
 
 pub struct PptxParserFactory {}
@@ -61,12 +61,7 @@ impl DocumentParser for PptxParser {
         // legitimate slide.
         const MAX_SLIDE_BYTES: u64 = 64 * 1024 * 1024;
 
-        let cursor = Cursor::new(raw.clone());
-        let mut archive = ZipArchive::new(cursor)
-            .boxed()
-            .context(InternalParsingSnafu {
-                format: DocumentType::Pptx,
-            })?;
+        let mut archive = open_consistent_archive(raw, DocumentType::Pptx)?;
 
         // PPTX layout: slides live at `ppt/slides/slideN.xml`. Sort by
         // numeric suffix so the rendered text follows presentation order
@@ -74,11 +69,15 @@ impl DocumentParser for PptxParser {
         // slide10 before slide2). `file_names()` reads the central directory
         // without setting up per-entry decompression, so the enumeration pass
         // is cheap.
-        let mut slide_paths: Vec<String> = archive
-            .file_names()
-            .filter(|n| is_slide_path(n))
-            .map(String::from)
-            .collect();
+        let mut slide_paths: Vec<String> = Vec::new();
+        for name in archive.file_names() {
+            let name = name.boxed().context(InternalParsingSnafu {
+                format: DocumentType::Pptx,
+            })?;
+            if is_slide_path(&name) {
+                slide_paths.push(name.into_owned());
+            }
+        }
         slide_paths.sort_by_key(|p| slide_index(p).unwrap_or(usize::MAX));
 
         let mut slides: Vec<String> = Vec::with_capacity(slide_paths.len());
