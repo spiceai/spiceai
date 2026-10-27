@@ -513,7 +513,7 @@ uuid = "1"
 # verifier and `vstd` ship together, so this moves with `VERUS_VSTD_VERSION` in
 # `.github/workflows/verus_verify.yml`.
 vstd = "=0.0.0-2026-09-20-0158"
-wasmtime = { version = "47.0.3", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime = { version = "48.0.7", default-features = false, features = ["cranelift", "runtime", "std"] }
 wat = "1.248.0"
 
 flatbuffers = "25.2.10"
