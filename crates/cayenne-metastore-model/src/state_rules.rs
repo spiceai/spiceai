@@ -99,7 +99,7 @@ pub(crate) enum Action {
 }
 impl Protocol {
     fn state_name(&self, s: &State) -> usize {
-        if self.has("adopted") && !self.has("no-number") {
+        if self.has("design") && !self.has("no-number") {
             s.step
         } else {
             s.high
@@ -109,7 +109,7 @@ impl Protocol {
         let files = &n.files;
         n.tombstones.retain(|&(_, d)| {
             d > cutoff
-                || (self.has("adopted")
+                || (self.has("design")
                     && files.iter().any(|f| {
                         if self.has("no-cold") && f.cold {
                             return false;
@@ -147,7 +147,7 @@ impl Protocol {
         }
         // Compare the complete allocated range against the publication base.
         if record.iter().any(|r| {
-            r.3 <= if self.has("adopted") && !self.has("no-table-scope") {
+            r.3 <= if self.has("design") && !self.has("no-table-scope") {
                 s.table_high[r.0]
             } else {
                 s.high
@@ -303,7 +303,7 @@ impl Model for Protocol {
                 if s.files.iter().any(|f| f.cold) {
                     a.push(Action::Promote);
                 }
-                if self.has("adopted") && !s.tombstones.is_empty() {
+                if self.has("design") && !s.tombstones.is_empty() {
                     a.push(Action::Clear);
                 }
             }
@@ -378,7 +378,7 @@ impl Model for Protocol {
                 } else {
                     next.floor = state.step;
                     next.checkpoint = Some((state.step, state.keys));
-                    if self.has("adopted") && !self.has("no-refresh") {
+                    if self.has("design") && !self.has("no-refresh") {
                         next.index = if self.has("drop") {
                             None
                         } else {
@@ -461,7 +461,7 @@ impl Model for Protocol {
             Action::Scan => {
                 let mut keep = Self::retained(state, state.floor);
                 if let Some(v) = state.pin {
-                    if self.has("adopted") {
+                    if self.has("design") {
                         keep = Self::retained(state, v.min(state.floor));
                     } else {
                         keep.extend(&state.versions[v]);
@@ -491,7 +491,7 @@ impl Model for Protocol {
                 next.step += 1;
             }
             Action::Index => {
-                next.index = Some(if self.has("adopted") {
+                next.index = Some(if self.has("design") {
                     state.checkpoint.unwrap_or((0, [false; 2]))
                 } else {
                     (state.step, state.keys)
@@ -654,7 +654,7 @@ impl Model for Protocol {
                 Property::always(
                     "checkpoint index reference aligned",
                     |model, state: &State| {
-                        !model.has("adopted")
+                        !model.has("design")
                             || model.has("no-refresh")
                             || state.index.is_none_or(|(base, _)| base == state.floor)
                     },

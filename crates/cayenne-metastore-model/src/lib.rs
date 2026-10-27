@@ -31,7 +31,7 @@ pub struct Run {
     seed: Option<u64>,
     failure: &'static str,
 }
-/// All adopted-design runs, including safeguard-removal controls.
+/// All runs of the design, including safeguard-removal controls.
 #[must_use]
 pub fn runs() -> Vec<Run> {
     let mut declared = vec![
@@ -278,7 +278,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "delete-coverage-iceberg-no-cold",
             family: "state-rules",
-            mode: "coverage-adopted-iceberg-no-cold",
+            mode: "coverage-design-iceberg-no-cold",
             bound: 4,
             seed: None,
             failure: "I9 coverage equals serial oracle",
@@ -286,7 +286,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "pk-index-drop-no-refresh",
             family: "state-rules",
-            mode: "index-adopted-drop-no-refresh",
+            mode: "index-design-drop-no-refresh",
             bound: 3,
             seed: None,
             failure: "I8 recovered index equals full key set",
@@ -350,7 +350,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "naming",
             family: "state-rules",
-            mode: "identity-adopted",
+            mode: "identity-design",
             bound: 3,
             seed: None,
             failure: "",
@@ -358,7 +358,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "naming-no-commit-number",
             family: "state-rules",
-            mode: "identity-adopted-no-number",
+            mode: "identity-design-no-number",
             bound: 3,
             seed: None,
             failure: "state name determines physical state",
@@ -366,7 +366,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "table-seq",
             family: "state-rules",
-            mode: "tables-adopted",
+            mode: "tables-design",
             bound: 3,
             seed: None,
             failure: "",
@@ -374,7 +374,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "table-seq-no-table-scope",
             family: "state-rules",
-            mode: "tables-adopted-no-table-scope",
+            mode: "tables-design-no-table-scope",
             bound: 3,
             seed: None,
             failure: "per-table allocated record never refused",
@@ -382,7 +382,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "delete-coverage",
             family: "state-rules",
-            mode: "coverage-adopted",
+            mode: "coverage-design",
             bound: 4,
             seed: None,
             failure: "",
@@ -390,7 +390,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "delete-coverage-no-cold",
             family: "state-rules",
-            mode: "coverage-adopted-no-cold",
+            mode: "coverage-design-no-cold",
             bound: 4,
             seed: None,
             failure: "I9 coverage equals serial oracle",
@@ -398,7 +398,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "delete-coverage-iceberg",
             family: "state-rules",
-            mode: "coverage-adopted-iceberg",
+            mode: "coverage-design-iceberg",
             bound: 4,
             seed: None,
             failure: "",
@@ -406,7 +406,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "pins-low-water",
             family: "state-rules",
-            mode: "pins-adopted",
+            mode: "pins-design",
             bound: 3,
             seed: None,
             failure: "",
@@ -414,7 +414,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "pins-low-water-no-recheck",
             family: "state-rules",
-            mode: "pins-adopted-no-recheck",
+            mode: "pins-design-no-recheck",
             bound: 3,
             seed: None,
             failure: "I7 every active query readable",
@@ -422,7 +422,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "pins-low-water-past-active",
             family: "state-rules",
-            mode: "pins-adopted-no-active-low",
+            mode: "pins-design-no-active-low",
             bound: 3,
             seed: None,
             failure: "I7 every active query readable",
@@ -430,7 +430,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "pk-index-checkpoint",
             family: "state-rules",
-            mode: "index-adopted",
+            mode: "index-design",
             bound: 3,
             seed: None,
             failure: "",
@@ -438,7 +438,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "pk-index-checkpoint-no-refresh",
             family: "state-rules",
-            mode: "index-adopted-no-refresh",
+            mode: "index-design-no-refresh",
             bound: 3,
             seed: None,
             failure: "I8 recovered index equals full key set",
@@ -446,7 +446,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "pk-index-drop",
             family: "state-rules",
-            mode: "index-adopted-drop",
+            mode: "index-design-drop",
             bound: 3,
             seed: None,
             failure: "",
@@ -454,7 +454,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "delete-coverage-6-simulation-7",
             family: "state-rules",
-            mode: "coverage-adopted",
+            mode: "coverage-design",
             bound: 6,
             seed: Some(7),
             failure: "",
@@ -462,7 +462,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "delete-coverage-6-simulation-42",
             family: "state-rules",
-            mode: "coverage-adopted",
+            mode: "coverage-design",
             bound: 6,
             seed: Some(42),
             failure: "",
@@ -470,7 +470,7 @@ pub fn runs() -> Vec<Run> {
         Run {
             name: "delete-coverage-6-simulation-20261024",
             family: "state-rules",
-            mode: "coverage-adopted",
+            mode: "coverage-design",
             bound: 6,
             seed: Some(20_261_024),
             failure: "",

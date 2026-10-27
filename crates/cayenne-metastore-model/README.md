@@ -1,6 +1,8 @@
 # Cayenne metastore protocol model
 
-Manual Stateright 0.31.0 checks of the [adopted object-native metastore protocol](../../docs/design/object-native-metastore-technical.md).
+Manual Stateright 0.31.0 checks of the [object-native metastore design](../../docs/design/object-native-metastore-technical.md).
+The design and this model capture the current direction, not a frozen
+specification; both are updated as implementation teaches us more.
 It is a finite protocol abstraction, not the Spice engine or an object-store implementation.
 Lifecycle and coverage start with one live row per key, with two valid tier
 placements preserving warm-subset and cold-file witnesses. Live-row counts are
@@ -375,7 +377,7 @@ Every original declaration retains its bound, seed and expected outcome.
 All checkers use a 540-second watchdog. Incomplete budget probes establish no
 exhaustive outcome; sampled results mean no violation found, not exhaustive safety.
 
-The literal Prepare/maintenance reading is an expected unsafe run, not a claim that the specification has chosen it. `dataset-prepare-cutoff-cap` implements the adopted cap; `dataset-prepare-input-reservation` and `dataset-prepare-resolve-seq` are separate alternatives. Capping cutoffs delays delete application/clearing above the oldest unresolved sequence across that table; input reservations delay only rewrites containing reserved keys; fresh Resolve stamps require the normal rebase of a disjoint buffer whose stamps are now below the high-water mark. Abort applies no prepared mutation and changes no coverage; allocated sequence gaps remain.
+The literal Prepare/maintenance reading is an expected unsafe run, not a claim that the specification has chosen it. `dataset-prepare-cutoff-cap` implements the design's cap; `dataset-prepare-input-reservation` and `dataset-prepare-resolve-seq` are separate alternatives. Capping cutoffs delays delete application/clearing above the oldest unresolved sequence across that table; input reservations delay only rewrites containing reserved keys; fresh Resolve stamps require the normal rebase of a disjoint buffer whose stamps are now below the high-water mark. Abort applies no prepared mutation and changes no coverage; allocated sequence gaps remain.
 
 The projection run mechanically checks every enabled outgoing transition of each sampled three-participant state against each two-participant projection, allowing stutters. It uses bound 0, where the global helper witness is false. This is sampled transition evidence, not an exhaustive projection theorem or a proof for arbitrary participant counts, global liveness, or atomic cross-dataset reads.
 
