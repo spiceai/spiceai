@@ -960,7 +960,9 @@ pub trait DataAccelerator: Send + Sync {
     /// Perform the engine's maintenance after a snapshot was restored and
     /// `provider` serves it: after the initial provider is installed, and after
     /// each reload's replacement is swapped in — never before a swap, since the
-    /// replaced provider keeps serving if the swap is refused. The default does
+    /// replaced provider keeps serving if the swap is refused. An engine may record
+    /// `provider` here as the one a later restore into the same location must stop
+    /// first (see `SnapshotEngine::prepare_directory_restore`). The default does
     /// nothing.
     async fn maintain_after_snapshot_restore(
         &self,

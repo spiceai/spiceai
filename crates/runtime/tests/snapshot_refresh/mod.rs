@@ -158,6 +158,13 @@ async fn build_snapshot_store() -> Result<Arc<dyn ObjectStore>> {
         .with_region(SNAPSHOT_REGION)
         .with_client_options(ClientOptions::default());
 
+    // An S3-compatible store (e.g. RustFS) in place of AWS, for running locally.
+    if let Ok(endpoint) = env::var("AWS_SNAPSHOT_ENDPOINT") {
+        builder = builder
+            .with_allow_http(endpoint.starts_with("http://"))
+            .with_endpoint(endpoint);
+    }
+
     if let (Ok(key), Ok(secret)) = (
         env::var("AWS_SNAPSHOT_KEY"),
         env::var("AWS_SNAPSHOT_SECRET"),
@@ -356,6 +363,13 @@ impl SnapshotRefreshFixture {
                 "${secrets:AWS_SNAPSHOT_SECRET}".to_string(),
             );
         }
+        if let Ok(endpoint) = env::var("AWS_SNAPSHOT_ENDPOINT") {
+            params.insert(
+                "allow_http".to_string(),
+                endpoint.starts_with("http://").to_string(),
+            );
+            params.insert("s3_endpoint".to_string(), endpoint);
+        }
         Snapshots {
             enabled: true,
             location: Some(self.s3.location_uri()),
@@ -364,9 +378,8 @@ impl SnapshotRefreshFixture {
         }
     }
 
-    /// Read the current `current-snapshot-id` for this dataset from the
-    /// shared metadata file. Returns `None` if metadata is not yet written.
-    async fn current_snapshot_id(&self) -> Result<Option<i64>> {
+    /// The shared metadata file, or `None` if it is not yet written.
+    async fn metadata_json(&self) -> Result<Option<serde_json::Value>> {
         let metadata_path = ObjectPath::from(format!("{}/metadata.json", self.s3.prefix));
         let bytes = match self.s3.store.get(&metadata_path).await {
             Ok(get) => get
@@ -376,8 +389,17 @@ impl SnapshotRefreshFixture {
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(e) => return Err(anyhow::Error::from(e).context("getting metadata.json")),
         };
-        let metadata: serde_json::Value =
-            serde_json::from_slice(&bytes).context("parsing metadata.json")?;
+        Ok(Some(
+            serde_json::from_slice(&bytes).context("parsing metadata.json")?,
+        ))
+    }
+
+    /// Read the current `current-snapshot-id` for this dataset from the
+    /// shared metadata file. Returns `None` if metadata is not yet written.
+    async fn current_snapshot_id(&self) -> Result<Option<i64>> {
+        let Some(metadata) = self.metadata_json().await? else {
+            return Ok(None);
+        };
         let Some(dataset_entry) = metadata.get(DATASET_NAME) else {
             return Ok(None);
         };
@@ -449,6 +471,26 @@ id,name,score
 /// End-to-end scenario: writer creates snapshots; reader bootstraps and
 /// follows. Each per-engine `#[tokio::test]` calls this with its engine.
 async fn run_bootstrap_then_refresh_cycle(test_name: &str, engine: EngineKind) -> Result<()> {
+    run_scenario(test_name, engine, Scenario::BootstrapThenRefresh).await
+}
+
+/// A reader restarted over part of a snapshot that a killed restore left on
+/// disk serves that snapshot in full once it restores it, and keeps serving it
+/// after the sweeps the replaced instance armed at open come due.
+pub(crate) async fn run_restart_over_partial_restore(
+    test_name: &str,
+    engine: EngineKind,
+) -> Result<()> {
+    run_scenario(test_name, engine, Scenario::RestartOverPartialRestore).await
+}
+
+#[derive(Clone, Copy)]
+enum Scenario {
+    BootstrapThenRefresh,
+    RestartOverPartialRestore,
+}
+
+async fn run_scenario(test_name: &str, engine: EngineKind, scenario: Scenario) -> Result<()> {
     init_tracing(None);
     register_test_connectors().await;
 
@@ -456,7 +498,10 @@ async fn run_bootstrap_then_refresh_cycle(test_name: &str, engine: EngineKind) -
         .scope(async move {
             let fixture = SnapshotRefreshFixture::new(test_name, engine).await?;
             // Always attempt cleanup, even on test failure.
-            let result = run_inner(&fixture).await;
+            let result = match scenario {
+                Scenario::BootstrapThenRefresh => run_inner(&fixture).await,
+                Scenario::RestartOverPartialRestore => restart_over_partial_restore(&fixture).await,
+            };
             if let Err(cleanup_err) = fixture.s3.cleanup().await {
                 tracing::warn!(
                     test = test_name,
@@ -536,6 +581,193 @@ async fn run_inner(fixture: &SnapshotRefreshFixture) -> Result<()> {
     reader.shutdown().await;
     writer.shutdown().await;
     Ok(())
+}
+
+async fn restart_over_partial_restore(fixture: &SnapshotRefreshFixture) -> Result<()> {
+    let reader_app = || {
+        AppBuilder::new(format!("snapshot_reader_{}", fixture.engine.engine_name()))
+            .with_snapshots(fixture.snapshots_config())
+            .with_dataset(fixture.reader_dataset())
+            .build()
+    };
+    fixture.write_source(INITIAL_CSV)?;
+    // Rows in files rather than inlined in the metastore, so a snapshot carries data files.
+    let mut writer_dataset = fixture.writer_dataset();
+    if let Some(acceleration) = writer_dataset.acceleration.as_mut() {
+        let mut params = acceleration
+            .params
+            .as_ref()
+            .map(Params::as_string_map)
+            .unwrap_or_default();
+        params.insert("cayenne_inline_max_rows".to_string(), "0".to_string());
+        acceleration.params = Some(Params::from_string_map(params));
+    }
+    let writer_app = AppBuilder::new(format!("snapshot_writer_{}", fixture.engine.engine_name()))
+        .with_snapshots(fixture.snapshots_config())
+        .with_dataset(writer_dataset)
+        .build();
+    let writer = Arc::new(Runtime::builder().with_app(writer_app).build().await);
+    load_runtime(Arc::clone(&writer)).await?;
+    fixture
+        .wait_for_snapshot_id(0, Duration::from_mins(1))
+        .await
+        .context("waiting for the writer's first snapshot")?;
+
+    let reader = Arc::new(Runtime::builder().with_app(reader_app()).build().await);
+    load_runtime(Arc::clone(&reader)).await?;
+    wait_for_reader_swap(&reader, 3, Duration::from_mins(1)).await?;
+    reader.shutdown().await;
+    drop(reader);
+
+    fixture.write_source(MUTATED_CSV)?;
+    // The writer republishes unchanged data too, so a newer snapshot id alone
+    // can still hold the old rows. Once the writer serves the mutated rows, any
+    // later snapshot holds them.
+    wait_for_reader_swap(&writer, 5, Duration::from_mins(1)).await?;
+    let served_at = fixture
+        .current_snapshot_id()
+        .await?
+        .context("no snapshot is published")?;
+    fixture
+        .wait_for_snapshot_id(served_at + 1, Duration::from_mins(1))
+        .await
+        .context("waiting for the writer's snapshot of the mutated source")?;
+    // No later snapshot, so the reader restores exactly the current one.
+    writer.shutdown().await;
+    let next_id = fixture
+        .current_snapshot_id()
+        .await?
+        .context("no snapshot is published")?;
+    fixture.leave_partial_restore(next_id).await?;
+
+    let reader = Arc::new(Runtime::builder().with_app(reader_app()).build().await);
+    load_runtime(Arc::clone(&reader)).await?;
+    wait_for_reader_swap(&reader, 5, Duration::from_mins(1)).await?;
+    // The replaced instance's sweeps come due 5, 10 and 15 s after it opened.
+    let deadline = Instant::now() + Duration::from_secs(17);
+    while Instant::now() < deadline {
+        let observed = count_rows(&reader, "trips").await?;
+        if observed != 5 {
+            return Err(anyhow!(
+                "reader served {observed} rows of the restored snapshot's 5"
+            ));
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    assert_swap_sanity(&reader).await?;
+    // The replacement reclaimed the older snapshot's directory.
+    let dirs = snapshot_dirs(&fixture.reader_local_db.join(DATASET_NAME))?;
+    if dirs.len() != 1 {
+        return Err(anyhow!(
+            "reader should keep only the restored snapshot's directory, found {dirs:?}"
+        ));
+    }
+
+    reader.shutdown().await;
+    Ok(())
+}
+
+/// The snapshot directories under each table directory of `data_dir`.
+fn snapshot_dirs(data_dir: &std::path::Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for table in std::fs::read_dir(data_dir).context("listing the data dir")? {
+        let table = table?.path();
+        if !table.is_dir() {
+            continue;
+        }
+        for snapshot in std::fs::read_dir(&table).context("listing a table dir")? {
+            let snapshot = snapshot?.path();
+            let is_snapshot = snapshot
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| Uuid::parse_str(name).is_ok());
+            if snapshot.is_dir() && is_snapshot {
+                dirs.push(snapshot);
+            }
+        }
+    }
+    Ok(dirs)
+}
+
+impl SnapshotRefreshFixture {
+    /// Put the first half of snapshot `snapshot_id`'s data files into the
+    /// reader's data directory, as a reader killed while extracting it leaves
+    /// them.
+    async fn leave_partial_restore(&self, snapshot_id: i64) -> Result<()> {
+        use runtime_acceleration::snapshot::directory_archive::{
+            ExtractOptions, extract_archive_file_with_options,
+        };
+
+        let metadata = self
+            .metadata_json()
+            .await?
+            .context("metadata.json is not written")?;
+        let uri = metadata[DATASET_NAME]["snapshots"]
+            .as_array()
+            .and_then(|snapshots| {
+                snapshots
+                    .iter()
+                    .find(|entry| entry["snapshot-id"].as_i64() == Some(snapshot_id))
+            })
+            .and_then(|entry| entry["snapshot"].as_str())
+            .ok_or_else(|| anyhow!("snapshot {snapshot_id} is not in metadata.json"))?;
+        let key = uri
+            .strip_prefix(&format!("s3://{SNAPSHOT_BUCKET}/"))
+            .map_or_else(|| format!("{}/{uri}", self.s3.prefix), str::to_string);
+        let archive = self
+            .s3
+            .store
+            .get(&ObjectPath::from(key))
+            .await
+            .context("getting the snapshot archive")?
+            .bytes()
+            .await
+            .context("reading the snapshot archive")?;
+
+        let scratch = TempDir::new().context("scratch dir")?;
+        let tar = scratch.path().join("snapshot.tar");
+        std::fs::write(&tar, &archive).context("writing the snapshot archive")?;
+        let extracted = scratch.path().join("data");
+        extract_archive_file_with_options(
+            &tar,
+            scratch.path(),
+            ExtractOptions {
+                prefix_mappings: Some(vec![("data/".to_string(), extracted.clone())]),
+                ..ExtractOptions::skip_existing()
+            },
+        )
+        .await
+        .context("extracting the snapshot archive")?;
+
+        let mut files = files_under(&extracted)?;
+        files.retain(|file| file.extension().is_some_and(|ext| ext == "vortex"));
+        files.sort();
+        if files.is_empty() {
+            return Err(anyhow!("snapshot {snapshot_id} has no data files"));
+        }
+        let data_dir = self.reader_local_db.join(DATASET_NAME);
+        for file in &files[..files.len().div_ceil(2)] {
+            let target = data_dir.join(file.strip_prefix(&extracted)?);
+            std::fs::create_dir_all(target.parent().context("leftover parent")?)
+                .context("creating a leftover directory")?;
+            std::fs::copy(file, &target).context("copying a leftover data file")?;
+        }
+        Ok(())
+    }
+}
+
+/// Every file under `dir`.
+fn files_under(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
+        let path = entry?.path();
+        if path.is_dir() {
+            files.extend(files_under(&path)?);
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(files)
 }
 
 /// Verify that an INSERT against a snapshot-mode reader is rejected with a
