@@ -188,7 +188,7 @@ async fn prepare_agent(
         model_given,
         context_windows: &selection.context_windows,
     };
-    let launch = agent::launch(agent, &backend, scratch.path());
+    let launch = agent::launch(agent, &backend, scratch.path())?;
     process::write_files(&launch.files)?;
     process::prepare(agent.display_name(), program, &launch).await?;
     Ok(Prepared {
