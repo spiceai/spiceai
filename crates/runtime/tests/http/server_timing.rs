@@ -124,7 +124,8 @@ type BufferedCase = (
 );
 
 /// Every response whose body is complete before its head is sent carries the
-/// server time in the head — each buffered format, and the errors, which are
+/// server time in the head — `text/plain`, which sizes its columns from every
+/// row, and the errors, which are
 /// the responses a caller most wants timed. The value is a server measurement,
 /// so it can never exceed what the client itself waited.
 #[tokio::test]
@@ -135,16 +136,10 @@ async fn a_buffered_sql_response_carries_its_server_time_in_the_head() -> Result
         .scope(async {
             let (rt, base_url) = start().await?;
 
-            let cases: [BufferedCase; 5] = [
-                ("csv", "SELECT 1 AS n", Some("text/csv"), None, 200),
+            // `text/csv` and `vnd.spiceai.sql.v1+json` stream, so they are timed in
+            // `streamed_csv_and_vnd_json_send_their_server_time_as_a_trailer`.
+            let cases: [BufferedCase; 3] = [
                 ("plain", "SELECT 1 AS n", Some("text/plain"), None, 200),
-                (
-                    "vnd json",
-                    "SELECT 1 AS n",
-                    Some("application/vnd.spiceai.sql.v1+json"),
-                    None,
-                    200,
-                ),
                 (
                     "query error",
                     "SELECT * FROM no_such_table",
@@ -322,6 +317,74 @@ async fn a_streamed_sql_response_sends_its_server_time_as_a_trailer() -> Result<
             assert_eq!(header_line(&head, "trailer"), None, "nothing declared");
             assert_eq!(body, r#"[{"n":1}]"#, "the rows are unchanged");
             assert_eq!(trailers, "", "no trailer without `TE: trailers`");
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// `text/csv` and `vnd.spiceai.sql.v1+json` stream like `application/json`: with
+/// `TE: trailers` the head declares the total and the body ends with it, and
+/// without it neither the head nor the trailer section carries one.
+#[tokio::test]
+async fn streamed_csv_and_vnd_json_send_their_server_time_as_a_trailer() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let (rt, base_url) = start().await?;
+            let sql = "SELECT 1 AS n";
+            let host = base_url.trim_start_matches("http://");
+
+            let cases: [(&str, &str, &str); 2] = [
+                ("csv", "text/csv", "1"),
+                ("vnd json", "application/vnd.spiceai.sql.v1+json", r#""data":[{"n":1}]"#),
+            ];
+            for (case, accept, row) in cases {
+                let request = |te: &str| {
+                    format!(
+                        "POST /v1/sql HTTP/1.1\r\nHost: {host}\r\nContent-Type: text/plain\r\nAccept: {accept}\r\n{te}Connection: close\r\nContent-Length: {}\r\n\r\n{sql}",
+                        sql.len()
+                    )
+                };
+
+                let started = Instant::now();
+                let response = raw_http1(&base_url, &request("TE: trailers\r\n")).await;
+                let client_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let (head, body, trailers) = split_chunked(&response);
+                assert!(head.starts_with("http/1.1 200"), "{case}: status line: {head}");
+                assert_eq!(
+                    header_line(&head, "server-timing"),
+                    None,
+                    "{case}: no total in the head"
+                );
+                assert_eq!(
+                    header_line(&head, "trailer"),
+                    Some("server-timing"),
+                    "{case}: the head declares the trailer"
+                );
+                assert!(body.contains(row), "{case}: the rows are unchanged: {body}");
+                let server_ms = parse_total(header_line(&trailers, "server-timing").unwrap_or_else(
+                    || panic!("{case}: no `server-timing` trailer in `{trailers}`"),
+                ));
+                assert!(
+                    server_ms > 0.0 && server_ms <= client_ms,
+                    "{case}: the server time {server_ms} ms must be positive and within the \
+                     {client_ms} ms the client waited"
+                );
+
+                let response = raw_http1(&base_url, &request("")).await;
+                let (head, body, trailers) = split_chunked(&response);
+                assert_eq!(
+                    header_line(&head, "server-timing"),
+                    None,
+                    "{case}: no total in the head"
+                );
+                assert_eq!(header_line(&head, "trailer"), None, "{case}: nothing declared");
+                assert!(body.contains(row), "{case}: the rows are unchanged: {body}");
+                assert_eq!(trailers, "", "{case}: no trailer without `TE: trailers`");
+            }
 
             rt.shutdown().await;
             Ok(())
