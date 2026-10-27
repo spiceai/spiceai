@@ -15,11 +15,11 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### [v2.4](https://github.com/spiceai/spiceai/milestone/101) (October 2026)
+### [v2.5](https://github.com/spiceai/spiceai/milestone/102) (November 2026)
 
-**Focus:** Schema Registry, Write-Back Acceleration, Distributed Search, Enterprise Security, Compliance, & Governance.
+**Focus:** Schema Registry, Write-Back Acceleration, Distributed Search, Enterprise Security, Compliance, Governance, Extensibility, & Plugin Architecture.
 
-**DataFusion:** v56
+**DataFusion:** v57
 
 - **Schema Registry (Initial)**: Versioning and backward compatibility checks.
 - **Write-Back Acceleration DML**: Full UPDATE/DELETE DML on write-through accelerated tables.
@@ -28,13 +28,6 @@ To propose features or report issues, please [file an issue](https://github.com/
 - **Distributed Cayenne Catalog**: Cayenne catalog with full distributed query and acceleration support.
 - **Audit Logging**: Persistent, immutable query and access logs for compliance.
 - **Resource Quotas**: Per-user/tenant query limits and throttling.
-
-### [v2.5](https://github.com/spiceai/spiceai/milestone/102) (November 2026)
-
-**Focus:** Extensibility & Plugin Architecture.
-
-**DataFusion:** v57
-
 - **Extensible Middleware**: Pluggable extensions for dynamic customization.
 - **Search at 100B+ Row Scale**: Vector and full-text search benchmarked and tuned for hundred-billion-row deployments, including S3 Vectors throughput improvements.
 - **Unified Connector Rate Control**: Extend the runtime-wide rate-control surface from HTTP connectors to database and file/object-store connectors for consistent per-origin concurrency and request-rate limits.
