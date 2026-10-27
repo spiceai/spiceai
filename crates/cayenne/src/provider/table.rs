@@ -36,8 +36,8 @@ use super::constants::{
     LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
 };
 use super::delete::{
-    CaptureLocks, CayenneDeletionSink, DeleteScanSource, DeletionIdentifier,
-    DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,
+    CaptureLocks, CayenneDeletionSink, ColdDeletionFilterExec, ColdTombstones, DeleteScanSource,
+    DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,
     FileBasedDeletionSink, InsertRecordHandling, Int64PkDeletionFilterExec,
     KeyBasedDeletionFilterExec,
 };
@@ -1632,31 +1632,49 @@ struct ColdTierScan<'a> {
     /// A selective query scan (see `scan()`): read each surviving cold file
     /// whole, as the warm branch does.
     selective: bool,
-    /// Build one branch per distinct [`ColdTierFile::max_sequence`], so the
-    /// caller can apply each branch only the tombstones newer than its files.
-    /// Callers pass `true` whenever their captured deletion state holds any
-    /// tombstone; with none there is nothing to apply and one branch reads
-    /// every file.
+    /// Carry each file's [`ColdTierFile::max_sequence`] as a trailing constant
+    /// column ([`COLD_MAX_SEQUENCE_COLUMN`]), so the caller's
+    /// [`ColdDeletionFilterExec`] can apply each row only the tombstones newer
+    /// than its file. Callers set it exactly when some tombstone in their
+    /// captured deletion state is newer than some cold file
+    /// ([`cold_files_need_deletion_filter`]); otherwise no row can be hidden
+    /// and the scan is the plain one.
     ///
     /// [`ColdTierFile::max_sequence`]: crate::metadata::ColdTierFile::max_sequence
-    split_by_sequence: bool,
+    per_file_thresholds: bool,
 }
 
-/// One branch of the cold-tier scan: the files of the captured manifest that
-/// share one [`ColdTierFile::max_sequence`].
+/// Name of the constant per-file column a cold-tier scan built with
+/// [`ColdTierScan::per_file_thresholds`] carries: the file's
+/// `ColdTierFile::max_sequence`, as an `Int64` partition value. Never written to
+/// a file and stripped before the branch leaves the cold scan.
+const COLD_MAX_SEQUENCE_COLUMN: &str = "__cayenne_cold_max_sequence";
+
+/// The cold-tier scan: every surviving file of the captured manifest in one
+/// `DataSourceExec`.
 ///
-/// A promotion writes a cold file holding the table's live rows as of that
-/// sequence and never rewrites it, so a tombstone hides a row of it only when
-/// the tombstone is newer (`delete_sequence > max_sequence`): an older one was
-/// already applied when the file was written, and the key it names may have a
-/// live copy in exactly this file.
-///
-/// [`ColdTierFile::max_sequence`]: crate::metadata::ColdTierFile::max_sequence
+/// A promotion writes a cold file holding the table's live rows as of its
+/// `max_sequence` and never rewrites it, so a tombstone hides a row of it only
+/// when the tombstone is newer (`delete_sequence > max_sequence`): an older one
+/// was already applied when the file was written, and the key it names may have
+/// a live copy in exactly this file.
 struct ColdTierBranch {
-    /// The sequence every file in the branch was written at, or `None` when
-    /// the scan was not split by sequence (see [`ColdTierScan::split_by_sequence`]).
-    max_sequence: Option<i64>,
     plan: Arc<dyn ExecutionPlan>,
+    /// Index in `plan`'s output of [`COLD_MAX_SEQUENCE_COLUMN`] — always the last
+    /// column — when the scan was built with per-file thresholds.
+    max_sequence_column: Option<usize>,
+}
+
+/// Whether any tombstone in `deletion_snapshot` is newer than some of
+/// `cold_files` — the only case in which the cold branch needs a deletion
+/// filter (see [`ColdTierBranch`]).
+fn cold_files_need_deletion_filter(
+    deletion_snapshot: &PkDeletionSnapshot,
+    cold_files: &[crate::metadata::ColdTierFile],
+) -> bool {
+    deletion_snapshot
+        .max_sequence_number()
+        .is_some_and(|newest_delete| cold_files.iter().any(|f| f.max_sequence < newest_delete))
 }
 
 /// Which durable tombstones a warm-to-datalake promotion keeps; see
@@ -4007,6 +4025,7 @@ const PROTECTED_TIER_GROWTH: u64 = 8;
 /// bounding the per-pass read/write amplification regardless of how many
 /// same-tier runs have accumulated.
 const PROTECTED_MERGE_MAX_WIDTH: usize = 32;
+
 
 /// Bytes of merge input one protected-snapshot pass may select, per byte of the
 /// memory pool it accounts against.
@@ -15733,15 +15752,20 @@ impl CayenneTableProvider {
         // Skipped when `fold_cold` is false: the cold contribution is then
         // served by the `ColdPkExistence` bloom, avoiding this O(cold-rows)
         // object-store scan entirely.
-        let cold_branches = match cold_files.as_ref() {
-            Some(cold_files) => {
-                let has_tombstones = deleted_pk_i64
-                    .as_deref()
-                    .is_some_and(DeletionIndex::has_deletions)
-                    || deleted_row_keys
-                        .as_deref()
-                        .is_some_and(KeyDeletionIndex::has_deletions);
-                self.build_cold_tier_scan_plan(ColdTierScan {
+        // The same captured indices the warm passes above probe, in the shape the
+        // cold deletion filter takes.
+        let cold_deletions = match (&deleted_pk_i64, &deleted_row_keys) {
+            (Some(tombstones), _) => PkDeletionSnapshot::Int64Pk {
+                tombstones: Arc::clone(tombstones),
+            },
+            (None, Some(tombstones)) => PkDeletionSnapshot::RowConverterBased {
+                tombstones: Arc::clone(tombstones),
+            },
+            (None, None) => PkDeletionSnapshot::PositionBased,
+        };
+        let cold_plan = match cold_files.as_ref() {
+            Some(cold_files) => self
+                .build_cold_tier_scan_plan(ColdTierScan {
                     state: &ctx.state(),
                     projection: Some(&pk_projection),
                     filters: &[],
@@ -15751,35 +15775,38 @@ impl CayenneTableProvider {
                     file_statistics_schema: cold_statistics_schema,
                     cold_files: cold_files.as_slice(),
                     selective: false,
-                    split_by_sequence: has_tombstones,
+                    per_file_thresholds: cold_files_need_deletion_filter(
+                        &cold_deletions,
+                        cold_files.as_slice(),
+                    ),
                 })
                 .await?
-            }
-            None => Vec::new(),
+                .map(|branch| {
+                    self.apply_cold_deletion_filter(branch, &projected_pk_indices, &cold_deletions)
+                })
+                .transpose()?,
+            None => None,
         };
-        if !cold_branches.is_empty() {
+        if let Some(cold_plan) = cold_plan {
             let scan_start = Instant::now();
             let keys_before = keyset.len();
-            for branch in cold_branches {
-                let cold_stream =
-                    datafusion_physical_plan::execute_stream(branch.plan, ctx.task_ctx())?;
-                Self::process_stream_into_keyset(
-                    cold_stream,
-                    &self.pk_deletion_strategy,
-                    pk_indices,
-                    converter,
-                    &projected_pk_indices,
-                    deleted_pk_i64.as_deref(),
-                    deleted_row_keys.as_deref(),
-                    // Only deletions newer than the branch's files apply; an
-                    // unsplit branch applies them all.
-                    branch.max_sequence,
-                    &self.table_metadata.table_name,
-                    &mut keyset,
-                    &mut row_id_base,
-                )
-                .await?;
-            }
+            let cold_stream = datafusion_physical_plan::execute_stream(cold_plan, ctx.task_ctx())?;
+            // The cold deletion filter already hid every superseded row, each
+            // against its own file's cutoff, so nothing is filtered again here.
+            Self::process_stream_into_keyset(
+                cold_stream,
+                &self.pk_deletion_strategy,
+                pk_indices,
+                converter,
+                &projected_pk_indices,
+                None,
+                None,
+                None,
+                &self.table_metadata.table_name,
+                &mut keyset,
+                &mut row_id_base,
+            )
+            .await?;
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -40304,7 +40331,7 @@ impl CayenneTableProvider {
         })
     }
 
-    /// Build the cold object-store tier scan branches, or none when the cold
+    /// Build the cold object-store tier scan branch, or `Ok(None)` when the cold
     /// tier is disabled or empty (no added plan nodes — byte-identical to a
     /// warm-only scan).
     ///
@@ -40318,15 +40345,15 @@ impl CayenneTableProvider {
     ///
     /// A promotion's private session overrides `cold_files` entirely with its
     /// [`super::cold_partition::ColdScanFiles`] extension — see the override
-    /// below for why that is a replacement and not a filter. Each returned
-    /// branch is a Vortex `DataSourceExec`; the caller wraps it with the
-    /// key-based (`Ignore`) deletion filter for its [`ColdTierBranch::max_sequence`]
-    /// and unions it into the scan tree. With `split_by_sequence` unset every
-    /// surviving file is one branch, exactly as a single-generation manifest is.
+    /// below for why that is a replacement and not a filter. The returned plan
+    /// is a Vortex `DataSourceExec` over every surviving file; with
+    /// `per_file_thresholds` it also outputs each file's `max_sequence` as a
+    /// trailing constant column, which [`Self::apply_cold_deletion_filter`]
+    /// consumes and strips before the branch is unioned into the scan tree.
     async fn build_cold_tier_scan_plan(
         &self,
         scan: ColdTierScan<'_>,
-    ) -> datafusion_common::Result<Vec<ColdTierBranch>> {
+    ) -> datafusion_common::Result<Option<ColdTierBranch>> {
         let ColdTierScan {
             state,
             projection,
@@ -40337,11 +40364,11 @@ impl CayenneTableProvider {
             file_statistics_schema,
             cold_files,
             selective,
-            split_by_sequence,
+            per_file_thresholds,
         } = scan;
         // Cold tier disabled (no location) → no branch.
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         // Register the cold object store on THIS session's registry
@@ -40362,21 +40389,28 @@ impl CayenneTableProvider {
         let cold_files =
             super::cold_partition::cold_files_for_scan(cold_files, promotion_files.as_deref());
         // No early all-empty guard needed: the per-file loop skips zero-size
-        // files and a branch whose files all prune away is never built.
+        // files and the `object_store_url is None` / `kept.is_empty()` checks
+        // below both return `Ok(None)` when nothing survives.
 
         let base_schema =
             read_schema_override.unwrap_or_else(|| Arc::clone(&file_statistics_schema));
-        let options = Self::create_listing_options(
+        let mut options = Self::create_listing_options(
             self.context.file_format(),
             &self.pk_deletion_strategy,
             scan_config,
         );
+        // The cold tier is never partitioned (gated at config time), so the
+        // per-file threshold is the only partition column the scan can carry.
+        if per_file_thresholds {
+            options.listing.table_partition_cols =
+                vec![(COLD_MAX_SEQUENCE_COLUMN.to_string(), DataType::Int64)];
+        }
         let scan_schema = Self::snapshot_scan_schema(&base_schema, &options);
 
-        // Data-column pruning predicate (cold tier is never partitioned — gated
-        // at config time — so every filter is a data filter). Reuses the warm
-        // path's predicate + pruner; stats come from the persisted blob, so
-        // pruning costs no object-store round-trip.
+        // Data-column pruning predicate (every query filter is a data filter;
+        // none can name the threshold column). Reuses the warm path's predicate +
+        // pruner; stats come from the persisted blob, so pruning costs no
+        // object-store round-trip.
         let listing_pruning_predicate = if filters.is_empty() {
             None
         } else {
@@ -40398,181 +40432,199 @@ impl CayenneTableProvider {
             self.cold_pk_blooms.trim(&cold_files);
         }
 
+        let table_name = self.table_metadata.table_name.clone();
+        let mut object_store_url: Option<ListingTableUrl> = None;
+        let mut kept: Vec<PartitionedFile> = Vec::with_capacity(cold_files.len());
+        for file in &cold_files {
+            if file.file_size_bytes <= 0 {
+                continue;
+            }
+            // Absolute cold URL -> (object-store URL, bucket-relative path) — the
+            // same derivation DataFusion uses to resolve a file against a store.
+            // All cold files share one configured cold location, so the first
+            // file's object-store URL identifies the store for the whole branch.
+            let listing_url = ListingTableUrl::parse(&file.file_url)?;
+            if object_store_url.is_none() {
+                object_store_url = Some(listing_url.clone());
+            }
+            let object_meta = vortex_datafusion::synthetic_object_meta(
+                listing_url.prefix().clone(),
+                u64::try_from(file.file_size_bytes).unwrap_or(0),
+            );
+            let mut part_file = PartitionedFile::from(object_meta);
+            // Set before the statistics: `with_statistics` appends the partition
+            // column's exact min = max = value statistics from it.
+            if per_file_thresholds {
+                part_file.partition_values = vec![ScalarValue::Int64(Some(file.max_sequence))];
+            }
+            if let Some(stats) = crate::stats::statistics_from_persisted_blob(
+                &file.statistics_blob,
+                &file_statistics_schema,
+                file.row_count,
+            ) {
+                part_file = part_file.with_statistics(stats);
+            }
+            if let Some(ref predicate) = listing_pruning_predicate
+                && super::file_pruning::should_prune_partitioned_file(
+                    &part_file,
+                    &scan_schema,
+                    predicate,
+                )?
+            {
+                tracing::debug!(
+                    table = %table_name,
+                    file = %file.file_url,
+                    "Pruned cold-tier file at listing time via persisted footer statistics"
+                );
+                continue;
+            }
+            if let Some(probe) = &pk_probe
+                && !probe.may_match(&self.cold_pk_blooms, file)
+            {
+                tracing::debug!(
+                    table = %table_name,
+                    file = %file.file_url,
+                    "Pruned cold-tier file at listing time via its primary-key bloom filter"
+                );
+                continue;
+            }
+            kept.push(part_file);
+        }
+
+        let Some(table_url) = object_store_url else {
+            return Ok(None);
+        };
+        if kept.is_empty() {
+            // Every cold file pruned for this query.
+            return Ok(None);
+        }
+
         // Key-based deletion (cold tier is key-mode only) filters ABOVE the
         // Vortex scan, so a pushed row-count limit would under-deliver; suppress
         // it and rely on the outer GlobalLimitExec (mirror
-        // create_snapshot_scan_plan_with_config).
-        let scan_pushdown_limit =
-            if self.has_pending_deletions() && !self.pk_deletion_strategy.is_position_based() {
-                None
-            } else {
-                limit
-            };
-
-        // One group per promotion generation when the caller applies
-        // per-generation tombstones; one group otherwise. A `BTreeMap` keeps the
-        // branch order stable (oldest generation first).
-        let groups: Vec<(Option<i64>, Vec<&crate::metadata::ColdTierFile>)> = if split_by_sequence
+        // create_snapshot_scan_plan_with_config). A scan carrying per-file
+        // thresholds always has that filter above it.
+        let scan_pushdown_limit = if per_file_thresholds
+            || (self.has_pending_deletions() && !self.pk_deletion_strategy.is_position_based())
         {
-            let mut by_sequence: BTreeMap<i64, Vec<&crate::metadata::ColdTierFile>> =
-                BTreeMap::new();
-            for file in cold_files {
-                by_sequence.entry(file.max_sequence).or_default().push(file);
-            }
-            by_sequence
-                .into_iter()
-                .map(|(max_sequence, files)| (Some(max_sequence), files))
-                .collect()
+            None
         } else {
-            vec![(None, cold_files)]
+            limit
         };
-        // The branches share the session's partitions rather than each taking all
-        // of them, so a manifest of many generations does not multiply the
-        // union's partition count. One group keeps the whole budget.
-        let partitions = (options.target_partitions / groups.len().max(1)).max(1);
 
-        let table_name = self.table_metadata.table_name.clone();
-        let mut branches = Vec::with_capacity(groups.len());
-        for (max_sequence, files) in groups {
-            let mut object_store_url: Option<ListingTableUrl> = None;
-            let mut kept: Vec<PartitionedFile> = Vec::with_capacity(files.len());
-            for file in files {
-                if file.file_size_bytes <= 0 {
-                    continue;
-                }
-                // Absolute cold URL -> (object-store URL, bucket-relative path) — the
-                // same derivation DataFusion uses to resolve a file against a store.
-                // All cold files share one configured cold location, so the first
-                // file's object-store URL identifies the store for the whole branch.
-                let listing_url = ListingTableUrl::parse(&file.file_url)?;
-                if object_store_url.is_none() {
-                    object_store_url = Some(listing_url.clone());
-                }
-                let object_meta = vortex_datafusion::synthetic_object_meta(
-                    listing_url.prefix().clone(),
-                    u64::try_from(file.file_size_bytes).unwrap_or(0),
-                );
-                let mut part_file = PartitionedFile::from(object_meta);
-                if let Some(stats) = crate::stats::statistics_from_persisted_blob(
-                    &file.statistics_blob,
-                    &file_statistics_schema,
-                    file.row_count,
-                ) {
-                    part_file = part_file.with_statistics(stats);
-                }
-                if let Some(ref predicate) = listing_pruning_predicate
-                    && super::file_pruning::should_prune_partitioned_file(
-                        &part_file,
-                        &scan_schema,
-                        predicate,
-                    )?
-                {
-                    tracing::debug!(
-                        table = %table_name,
-                        file = %file.file_url,
-                        "Pruned cold-tier file at listing time via persisted footer statistics"
-                    );
-                    continue;
-                }
-                if let Some(probe) = &pk_probe
-                    && !probe.may_match(&self.cold_pk_blooms, file)
-                {
-                    tracing::debug!(
-                        table = %table_name,
-                        file = %file.file_url,
-                        "Pruned cold-tier file at listing time via its primary-key bloom filter"
-                    );
-                    continue;
-                }
-                kept.push(part_file);
+        // The threshold column follows every file column in the table schema, so
+        // it is appended to the projection and lands last in the output.
+        let threshold_index = base_schema.fields().len();
+        let (scan_projection, max_sequence_column) = match (projection, per_file_thresholds) {
+            (_, false) => (projection.cloned(), None),
+            (Some(projection), true) => {
+                let mut extended = projection.clone();
+                extended.push(threshold_index);
+                let column = projection.len();
+                (Some(extended), Some(column))
             }
+            (None, true) => (None, Some(threshold_index)),
+        };
 
-            let Some(table_url) = object_store_url else {
-                continue;
-            };
-            if kept.is_empty() {
-                // Every file of this group pruned for this query.
-                continue;
-            }
+        let file_groups = FileGroup::new(kept).split_files(options.target_partitions);
+        let (file_groups, statistics) =
+            compute_all_files_statistics(file_groups, Arc::clone(&scan_schema), true, false)?;
+        // A selective scan reads each surviving cold file whole, grouped the way
+        // the warm branch groups its files (`group_selective_scan_files`).
+        let file_groups = if selective {
+            group_selective_scan_files(file_groups, options.target_partitions)
+        } else {
+            file_groups
+        };
 
-            let file_groups = FileGroup::new(kept).split_files(partitions);
-            let (file_groups, statistics) =
-                compute_all_files_statistics(file_groups, Arc::clone(&scan_schema), true, false)?;
-            // A selective scan reads each surviving cold file whole, grouped the way
-            // the warm branch groups its files (`group_selective_scan_files`).
-            let file_groups = if selective {
-                group_selective_scan_files(file_groups, partitions)
-            } else {
-                file_groups
-            };
-
-            let mut file_source = options
-                .listing
-                .format
-                .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
-            if selective
-                && let Some(unsplit) = file_source.downcast_ref::<VortexSource>().map(|vs| {
-                    Arc::new(vs.clone().with_repartitioning(false)) as Arc<dyn FileSource>
-                })
-            {
-                file_source = unsplit;
-            }
-
-            let plan = options
-                .listing
-                .format
-                .create_physical_plan(
-                    state,
-                    FileScanConfigBuilder::new(table_url.object_store(), file_source)
-                        .with_file_groups(file_groups)
-                        .with_constraints(Constraints::default())
-                        .with_statistics(statistics)
-                        .with_projection_indices(projection.cloned())?
-                        .with_limit(scan_pushdown_limit)
-                        // Cold files are an unsorted internal union branch — never
-                        // advertise an ordering.
-                        .with_output_ordering(Vec::new())
-                        .build(),
-                )
-                .await?;
-            branches.push(ColdTierBranch { max_sequence, plan });
+        let mut file_source = options
+            .listing
+            .format
+            .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
+        if selective
+            && let Some(unsplit) = file_source
+                .downcast_ref::<VortexSource>()
+                .map(|vs| Arc::new(vs.clone().with_repartitioning(false)) as Arc<dyn FileSource>)
+        {
+            file_source = unsplit;
         }
-        Ok(branches)
+
+        let plan = options
+            .listing
+            .format
+            .create_physical_plan(
+                state,
+                FileScanConfigBuilder::new(table_url.object_store(), file_source)
+                    .with_file_groups(file_groups)
+                    .with_constraints(Constraints::default())
+                    .with_statistics(statistics)
+                    .with_projection_indices(scan_projection)?
+                    .with_limit(scan_pushdown_limit)
+                    // Cold files are an unsorted internal union branch — never
+                    // advertise an ordering.
+                    .with_output_ordering(Vec::new())
+                    .build(),
+            )
+            .await?;
+        Ok(Some(ColdTierBranch {
+            plan,
+            max_sequence_column,
+        }))
     }
 
-    /// Wrap one cold-tier branch with the key-based deletion filter its files
-    /// need: every tombstone for a branch that was not split by sequence, else
-    /// only the tombstones newer than the files' [`ColdTierBranch::max_sequence`].
+    /// Wrap the cold-tier branch with the deletion filter its files need and
+    /// strip the per-file threshold column, so the result has exactly the
+    /// columns the caller projected.
     ///
-    /// Cold files hold superseded data, so re-inserts never make a tombstoned
-    /// cold row visible (`Ignore`, as for protected snapshots): the re-inserted
-    /// copy lives in a newer tier or a newer cold file. A branch every tombstone
-    /// is at or below gets no filter at all, since it would remove nothing.
+    /// A branch built without per-file thresholds needs no filter: the caller
+    /// decided no tombstone is newer than any of its files
+    /// ([`cold_files_need_deletion_filter`]). Otherwise
+    /// [`ColdDeletionFilterExec`] applies each row only the tombstones newer
+    /// than its own file, with re-inserts ignored, as for protected snapshots:
+    /// the re-inserted copy lives in a newer tier or a newer cold file.
     fn apply_cold_deletion_filter(
         &self,
         branch: ColdTierBranch,
         pk_indices_in_projection: &[usize],
         deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        let Some(max_sequence) = branch.max_sequence else {
-            return self.apply_deletion_filter(
-                branch.plan,
-                pk_indices_in_projection,
-                deletion_snapshot,
-            );
-        };
-        if deletion_snapshot
-            .max_sequence_number()
-            .is_none_or(|max_delete_sequence| max_delete_sequence <= max_sequence)
-        {
+        let Some(threshold_column) = branch.max_sequence_column else {
             return Ok(branch.plan);
-        }
-        self.apply_partial_deletion_filter(
-            branch.plan,
-            pk_indices_in_projection,
-            max_sequence,
-            deletion_snapshot,
-        )
+        };
+        let tombstones = match deletion_snapshot {
+            PkDeletionSnapshot::Int64Pk { tombstones } => Some(ColdTombstones::Int64Pk {
+                tombstones: Arc::clone(tombstones),
+                pk_column_index: pk_indices_in_projection.first().copied().ok_or_else(|| {
+                    datafusion_common::DataFusionError::Internal(
+                        "Int64 PK strategy requires exactly one PK column index".to_string(),
+                    )
+                })?,
+            }),
+            PkDeletionSnapshot::RowConverterBased { tombstones } => {
+                let row_converter = self.pk_row_converter.as_ref().ok_or_else(|| {
+                    datafusion_common::DataFusionError::Internal(format!(
+                        "Table {} has key-based deletions but no primary-key row converter",
+                        self.table_metadata.table_name
+                    ))
+                })?;
+                Some(ColdTombstones::RowKeys {
+                    tombstones: Arc::clone(tombstones),
+                    pk_column_indices: pk_indices_in_projection.to_vec(),
+                    row_converter: Arc::clone(row_converter),
+                })
+            }
+            // The cold tier is key-mode only; nothing here can hide a cold row.
+            PkDeletionSnapshot::PositionBased => None,
+        };
+        let filtered: Arc<dyn ExecutionPlan> = match tombstones {
+            Some(tombstones) => Arc::new(ColdDeletionFilterExec::new(
+                branch.plan,
+                tombstones,
+                threshold_column,
+            )),
+            None => branch.plan,
+        };
+        self.create_projection_strip(filtered, threshold_column)
     }
 
     /// Resolve a snapshot's data files from the manifest (`cayenne_snapshot_file`)
@@ -42192,9 +42244,18 @@ impl CayenneTableProvider {
     /// deletes on the main scan path. Rows guaranteed hidden by the deletion
     /// index are expressed as `pk NOT IN (...)` so Vortex can prune chunks and
     /// listing can drop non-overlapping files before decode.
+    ///
+    /// The filter reaches every branch of the scan, the cold tier included, and
+    /// a cold file holds the live copy of a key whose newest delete is not newer
+    /// than the file. `newest_cold_sequence` — the highest `max_sequence` among
+    /// the scan's cold files, if it has any — therefore bounds the keys pushed:
+    /// only a key whose newest delete is newer than every cold file is hidden in
+    /// all of them by the cold deletion filter too, so excluding it from every
+    /// branch hides nothing that filter would keep.
     fn vortex_key_delete_pushdown_filter(
         &self,
         deletion_snapshot: &PkDeletionSnapshot,
+        newest_cold_sequence: Option<i64>,
     ) -> Option<Expr> {
         let PkDeletionSnapshot::Int64Pk { tombstones } = deletion_snapshot else {
             return None;
@@ -42212,6 +42273,7 @@ impl CayenneTableProvider {
             tombstones,
             InsertRecordHandling::Apply,
             None,
+            newest_cold_sequence,
             MAX_VORTEX_KEY_DELETE_PUSHDOWN,
         )
     }
@@ -42890,7 +42952,16 @@ impl CayenneTableProvider {
         let mem_tier_pruning_filters = scan_filters_owned.clone();
         if tombstone_pushdown == TombstonePushdown::Apply
             && let Some(tombstone_filter) =
-                self.vortex_key_delete_pushdown_filter(&deletion_snapshot)
+                self.vortex_key_delete_pushdown_filter(
+                    &deletion_snapshot,
+                    cold_files.as_ref().and_then(|files| {
+                        files
+                            .iter()
+                            .filter(|f| f.file_size_bytes > 0)
+                            .map(|f| f.max_sequence)
+                            .max()
+                    }),
+                )
         {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
@@ -43063,15 +43134,15 @@ impl CayenneTableProvider {
             lookup_index_explain = Some(explain);
         }
 
-        // Build the COLD object-store tier branches (storage-cascade bottom tier)
-        // from the CAPTURED manifest. Cold files hold OLD, superseded data, so they
-        // take the `Ignore`-re-inserts deletion treatment — the same camp as
-        // protected snapshots. Using the `Apply` variant here would resurrect a
-        // stale cold row for a key re-inserted after deletion. Each promotion
-        // generation applies only the tombstones newer than its files (see
-        // `ColdTierBranch`). No branch (disabled / empty / all-pruned) adds zero
-        // plan nodes.
-        let cold_plans: Vec<Arc<dyn ExecutionPlan>> = self
+        // Build the COLD object-store tier branch (storage-cascade bottom tier) from
+        // the CAPTURED manifest. Cold files hold OLD, superseded data, so they take
+        // the `Ignore`-re-inserts deletion treatment — the same camp as protected
+        // snapshots. Using the `Apply` variant here would resurrect a stale cold
+        // row for a key re-inserted after deletion. Each file applies only the
+        // tombstones newer than it (see `ColdTierBranch`), one scan for all of
+        // them. `Ok(None)` (disabled / empty / all-pruned) adds zero plan nodes.
+        let captured_cold_files = cold_files.as_ref().map_or(&[][..], |files| files.as_slice());
+        let cold_plan: Option<Arc<dyn ExecutionPlan>> = self
             .build_cold_tier_scan_plan(ColdTierScan {
                 state,
                 projection: effective_projection.as_ref(),
@@ -43080,12 +43151,12 @@ impl CayenneTableProvider {
                 scan_config: scan_listing_config,
                 read_schema_override: Some(Arc::clone(&read_schema)),
                 file_statistics_schema: Arc::clone(&file_statistics_schema),
-                cold_files: cold_files.as_ref().map_or(&[], |files| files.as_slice()),
+                cold_files: captured_cold_files,
                 selective: is_pk_selective_scan,
-                split_by_sequence: need_pk_deletion,
+                per_file_thresholds: need_pk_deletion
+                    && cold_files_need_deletion_filter(&deletion_snapshot, captured_cold_files),
             })
             .await?
-            .into_iter()
             .map(|branch| {
                 self.apply_cold_deletion_filter(
                     branch,
@@ -43093,7 +43164,7 @@ impl CayenneTableProvider {
                     &deletion_snapshot,
                 )
             })
-            .collect::<datafusion_common::Result<_>>()?;
+            .transpose()?;
 
         // Build a MemoryExec plan for the inlined data captured under the
         // read guard above (consistent with the deletion view used for the
@@ -43224,13 +43295,10 @@ impl CayenneTableProvider {
         // protected-snapshot arms above stay byte-identical. The cold branch is a
         // Vortex `DataSourceExec`, so FilterPushdown still pushes the scan
         // predicate into it and the redundant top FilterExec is still removed.
-        let plan: Arc<dyn ExecutionPlan> = if cold_plans.is_empty() {
-            plan
+        let plan: Arc<dyn ExecutionPlan> = if let Some(cold_exec) = cold_plan {
+            Self::union_skipping_empty(vec![plan, cold_exec])?
         } else {
-            let mut all_plans = Vec::with_capacity(cold_plans.len() + 1);
-            all_plans.push(plan);
-            all_plans.extend(cold_plans);
-            Self::union_skipping_empty(all_plans)?
+            plan
         };
 
         // Union inlined data if present
