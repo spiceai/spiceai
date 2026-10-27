@@ -1,11 +1,16 @@
 {
-  "snapshots": 6,
-  "snapshots-kill-during-upload": 65,
-  "snapshots-object-store": 9,
+  "snapshots": 5,
+  "snapshots-append-restore": 12,
+  "snapshots-cross-bucket-replication": 215,
+  "snapshots-index-restore": 11,
+  "snapshots-kill-during-upload": 97,
+  "snapshots-object-store": 8,
   "snapshots-policies": 34,
-  "snapshots-reader": 24,
+  "snapshots-reader": 20,
   "snapshots-reader-concurrent": 60,
+  "snapshots-reader-publication-failures": 217,
   "snapshots-reader-source-fallback": 55,
   "snapshots-reader-without-source": 206,
-  "snapshots-writer-lease": 52
+  "snapshots-source-replication": 32,
+  "snapshots-writer-lease": 71
 }
