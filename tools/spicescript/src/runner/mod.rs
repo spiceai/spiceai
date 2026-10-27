@@ -26,7 +26,7 @@ limitations under the License.
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -324,6 +324,8 @@ pub struct Options {
     /// The directory holding this run's node mTLS CA and certificates
     /// (`ca.crt`, `<role>.crt`, `<role>.key`), generated when it starts.
     pub pki: PathBuf,
+    /// `--log-capture`: where a script with a failure leaves its logs.
+    pub log_capture: Option<PathBuf>,
 }
 
 /// A failed check: where it ran, which step, and what went wrong.
@@ -486,8 +488,8 @@ struct Background {
 struct BackgroundStats {
     iterations: u64,
     latencies: Vec<Duration>,
-    /// Every failure's message, in order.
-    errors: Vec<String>,
+    /// Every failure's time and message, in order.
+    errors: Vec<(chrono::DateTime<chrono::Utc>, String)>,
 }
 
 impl Instance {
@@ -755,6 +757,12 @@ async fn run_combination(
     }
     .await;
 
+    if let Some(root) = &options.log_capture
+        && (result.is_err() || !report.failures.is_empty())
+    {
+        let dir = combination_capture_dir(&capture_dir(root, script), script, run_label);
+        capture_combination(&sources, run_id, &options.work_dir.join(run_id), &dir).await;
+    }
     if !options.keep {
         for src in sources.by_name.values() {
             if let Err(e) = src.remove().await {
@@ -763,6 +771,89 @@ async fn run_combination(
         }
     }
     result
+}
+
+/// `--log-capture`'s directory for a script: one per script, by name.
+pub fn capture_dir(root: &Path, script: &Script) -> PathBuf {
+    root.join(sanitize(&script.name))
+}
+
+/// A matrix combination's directory within its script's: the script's own
+/// for a script without a matrix, else one named by the combination's values.
+fn combination_capture_dir(script_dir: &Path, script: &Script, run_label: &str) -> PathBuf {
+    match run_label.strip_prefix(script.name.as_str()) {
+        Some("") | None => script_dir.to_path_buf(),
+        Some(combo) => script_dir.join(sanitize(combo).trim_matches('_')),
+    }
+}
+
+/// Saves what a failed combination leaves to read into `dir`: each source
+/// container's output as `<source>.log`, for a failure that may be the
+/// source's (a broker that never came back, a database that restarted into
+/// recovery), and from `work`, the run's directory, every instance's
+/// `spiced.log`, spicepod and sqllogictest reports at their paths there.
+/// A log that cannot be saved is a warning: the run's own failure is the one
+/// to report.
+async fn capture_combination(sources: &Sources, run_id: &str, work: &Path, dir: &Path) {
+    if let Err(e) = tokio::fs::create_dir_all(dir).await {
+        say!("warning: Failed to create {}: {e}", dir.display());
+        return;
+    }
+    // Containers are named `spicescript-<run id>-<source>[-<part>]`.
+    let prefix = format!("spicescript-{run_id}-");
+    for src in sources.by_name.values() {
+        for container in src.containers() {
+            let name = container
+                .name
+                .strip_prefix(&prefix)
+                .unwrap_or(&container.name);
+            let path = dir.join(format!("{}.log", sanitize(name)));
+            if let Err(e) = container.save_logs(&path).await {
+                say!("warning: {e:#}");
+            }
+        }
+    }
+    let (work, to) = (work.to_path_buf(), dir.to_path_buf());
+    match tokio::task::spawn_blocking(move || copy_instance_logs(&work, &work, &to)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => say!("warning: {e:#}"),
+        Err(e) => say!("warning: copying instance logs panicked: {e}"),
+    }
+    say!("   logs captured in {}", dir.display());
+}
+
+/// Copies the log-like files under `dir` (instance and executor
+/// `spiced.log`s, spicepods, sqllogictest reports) from `root` to `to`,
+/// keeping their paths below `root`; data files stay behind.
+fn copy_instance_logs(root: &Path, dir: &Path, to: &Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.is_dir() {
+            copy_instance_logs(root, &path, to)?;
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let wanted = name == "spiced.log"
+            || name == "spicepod.yaml"
+            || (name.starts_with("slt-") && path.extension().is_some_and(|x| x == "txt"));
+        if !wanted {
+            continue;
+        }
+        let target = to.join(path.strip_prefix(root)?);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&path, &target).with_context(|| {
+            format!("Failed to copy {} to {}", path.display(), target.display())
+        })?;
+    }
+    Ok(())
 }
 
 async fn create_instances(
