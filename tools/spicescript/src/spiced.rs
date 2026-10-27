@@ -19,7 +19,12 @@ limitations under the License.
 //! and replication slots again.
 
 use secrecy::SecretString;
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use arrow::array::RecordBatch;
@@ -77,6 +82,29 @@ pub struct ContainerRun {
     pub name: String,
     /// `docker run -v` specifications.
     pub volumes: Vec<String>,
+    /// A directory in one of `volumes` that the binary is copied to and
+    /// mounted from.
+    pub binary_dir: PathBuf,
+}
+
+/// The copies `staged_binary` has made, by the binary they copy.
+static STAGED_BINARIES: parking_lot::Mutex<BTreeMap<PathBuf, PathBuf>> =
+    parking_lot::Mutex::new(BTreeMap::new());
+
+/// A copy of `binary` in `dir`, made once per binary. A Docker daemon in a
+/// sidecar container sees only the paths it shares with the runner, so a
+/// mount of a binary outside them is an empty directory that fails to exec.
+fn staged_binary(binary: &Path, dir: &Path) -> Result<PathBuf> {
+    let mut staged = STAGED_BINARIES.lock();
+    if let Some(copy) = staged.get(binary) {
+        return Ok(copy.clone());
+    }
+    std::fs::create_dir_all(dir)?;
+    let copy = dir.join(format!("spiced-{}", staged.len()));
+    std::fs::copy(binary, &copy)
+        .with_context(|| format!("Failed to copy {} to {}", binary.display(), copy.display()))?;
+    staged.insert(binary.to_path_buf(), copy.clone());
+    Ok(copy)
 }
 
 /// Which API key a request presents.
@@ -273,7 +301,7 @@ impl Spiced {
         let _ = std::process::Command::new("docker")
             .args(["rm", "-f", &run.name])
             .output();
-        let binary = std::path::absolute(&self.binary)?;
+        let binary = staged_binary(&std::path::absolute(&self.binary)?, &run.binary_dir)?;
         let dir = std::path::absolute(&self.dir)?;
         let owner = std::fs::metadata(&dir)?;
         let mut command = Command::new("docker");

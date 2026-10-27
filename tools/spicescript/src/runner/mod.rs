@@ -915,6 +915,7 @@ async fn create_instances(
                             // certificates, which the image has none of.
                             "/etc/ssl/certs:/etc/ssl/certs:ro".to_string(),
                         ],
+                        binary_dir: work_dir.join(format!("bin-{}", std::process::id())),
                     });
                 }
                 executors.push(executor);
