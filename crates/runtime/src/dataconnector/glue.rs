@@ -19,10 +19,10 @@ use app::App;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::error::CredentialsError;
+use aws_sdk_credential_bridge::S3CredentialProvider;
 use aws_sdk_glue::{Client, error::DisplayErrorContext, types::Table};
 use aws_sdk_s3::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
-use aws_sdk_credential_bridge::S3CredentialProvider;
 use iceberg::{
     CatalogBuilder, NamespaceIdent, TableIdent,
     io::{S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION},
