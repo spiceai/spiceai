@@ -4015,6 +4015,90 @@ mod tests {
         }
     }
 
+    /// Regression test for the `spiceai/datafusion` fork's fold of a projection that
+    /// only renames a sorted projection's outputs (refs spiceai/spiceai#15290). A
+    /// Substrait plan names its root's outputs with a projection above everything
+    /// else, so an ordered, limited aggregate arrives as
+    /// `Projection -> Limit -> Sort -> Projection -> Aggregate`, and an ordered join
+    /// as `Projection -> Sort -> Projection -> Join`. Without the fix the unparser
+    /// leaves everything under the renaming projection in an unnamed derived table
+    /// that the outer `SELECT` still reads by `p.name` and by the aggregate's display
+    /// name, neither of which it exposes: `DuckDB` refuses the statement ("Referenced
+    /// table p not found"), and the `ORDER BY` sits where the outer query does not
+    /// have to keep it.
+    #[test]
+    fn a_projection_renaming_a_sorted_projection_keeps_its_order_by_at_the_top_level() {
+        use datafusion::functions_aggregate::expr_fn::sum;
+
+        let limited_aggregate = products_left_join_categories()
+            .aggregate(vec![col("p.name")], vec![sum(col("p.price"))])
+            .expect("aggregate")
+            .project(vec![col("p.name"), col("sum(p.price)")])
+            .expect("inner projection")
+            .sort(vec![col("sum(p.price)").sort(false, true)])
+            .expect("sort")
+            .limit(0, Some(10))
+            .expect("limit")
+            .project(vec![
+                col("p.name").alias("product_name"),
+                col("sum(p.price)").alias("revenue"),
+            ])
+            .expect("renaming projection")
+            .build()
+            .expect("build");
+        let sorted_join = products_left_join_categories()
+            .project(vec![col("p.name"), col("c.name")])
+            .expect("inner projection")
+            .sort(vec![col("p.name").sort(true, false)])
+            .expect("sort")
+            .project(vec![
+                col("p.name").alias("product_name"),
+                col("c.name").alias("category_name"),
+            ])
+            .expect("renaming projection")
+            .build()
+            .expect("build");
+
+        for (shape, plan, limited) in [
+            ("limited aggregate", &limited_aggregate, true),
+            ("sorted join", &sorted_join, false),
+        ] {
+            for (dialect_name, dialect) in federation_dialects() {
+                let sql = unparse_with(dialect_name, dialect.as_ref(), plan);
+                for relation in ["p", "c"] {
+                    assert!(
+                        !outer_select_reads_an_out_of_scope_relation(&sql, relation),
+                        "{dialect_name}/{shape}: the outer SELECT qualifies a column by \
+                         '{relation}', which a derived table below it hides: {sql}"
+                    );
+                }
+                let mut clauses = vec![" ORDER BY "];
+                if limited {
+                    clauses.push(" LIMIT 10");
+                }
+                for clause in clauses {
+                    assert!(
+                        sql.match_indices(clause)
+                            .any(|(at, _)| paren_depth_at(&sql, at) == 0),
+                        "{dialect_name}/{shape}: `{}` has to be on the outermost query, \
+                         which is what returns the rows: {sql}",
+                        clause.trim()
+                    );
+                }
+            }
+
+            #[cfg(feature = "duckdb")]
+            {
+                let sql = unparse_with("duckdb", &DuckDBDialect::new(), plan);
+                if let Err(error) = duckdb_binds(&sql) {
+                    panic!(
+                        "duckdb/{shape}: DuckDB refused the federated statement: {error}: {sql}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Regression test for `SchemaCastScanExec` forwarding its input's statistics
     /// through `DataFusion` 55's `StatisticsContext`, carried by the
     /// `spiceai/datafusion-federation` fork. 55 derives plan statistics through
