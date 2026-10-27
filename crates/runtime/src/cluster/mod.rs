@@ -997,9 +997,9 @@ impl ResolvedClusterConfig {
         self.config.role.as_ref()
     }
 
-    /// Returns the fully qualified URL that this node advertises to other cluster nodes.
-    fn node_advertise_url(&self) -> String {
-        let port = self.config.node_bind_address.port();
+    /// Returns the fully qualified URL that this node advertises to other
+    /// cluster nodes for its Flight service, which listens on `port`.
+    fn node_advertise_url(&self, port: u16) -> String {
         let protocol = if self.tls_enabled() { "https" } else { "http" };
         format!(
             "{}://{}:{}",
@@ -1357,6 +1357,9 @@ pub async fn initialize_cluster_executor(
             })?;
             (hostname, bind_addr.port())
         };
+
+    // Where schedulers reach this executor's Flight service.
+    let flight_url = rt.df.cluster_config.node_advertise_url(advertise_port);
 
     let executor_id = rt.df.cluster_config.instance_id().to_string();
     // Tells the scheduler this process apart from an earlier run under the same
@@ -1824,7 +1827,7 @@ pub async fn initialize_cluster_executor(
             loop {
                 match executor_request_initial_partitions(
                     cluster_client.clone(),
-                    rt.datafusion().cluster_config.node_advertise_url(),
+                    flight_url.clone(),
                     rt.datafusion().cluster_config.instance_id().to_string(),
                     process_id.clone(),
                     task_ctx.as_ref(),
@@ -1863,7 +1866,7 @@ pub async fn initialize_cluster_executor(
         };
         tracing::debug!(
             "For executor={:?}, initial accelerated table partitions={:?}",
-            rt.datafusion().cluster_config.node_advertise_url(),
+            flight_url,
             initial_partitions.clone()
         );
 
@@ -1872,7 +1875,7 @@ pub async fn initialize_cluster_executor(
         // its control stream reconnects, gets it over the control stream.
         if let Some(broadcaster) = rt.executor_outbound_broadcaster() {
             broadcaster
-                .announce_flight_endpoint(rt.datafusion().cluster_config.node_advertise_url())
+                .announce_flight_endpoint(flight_url.clone())
                 .await;
         }
         rt.set_partition_assignments(initial_partitions).await;

@@ -19,7 +19,12 @@ limitations under the License.
 //! and replication slots again.
 
 use secrecy::SecretString;
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use arrow::array::RecordBatch;
@@ -65,6 +70,8 @@ pub struct Spiced {
     >,
     /// Runs `spiced` in a container rather than as a local process.
     container: Option<ContainerRun>,
+    /// The `binary` last copied into `dir` for a container to run.
+    staged_from: Option<PathBuf>,
 }
 
 /// A container `spiced` runs in: on the host's network, so it serves on the
@@ -113,6 +120,7 @@ impl Spiced {
             extra_args: Vec::new(),
             sessions: std::collections::HashMap::new(),
             container: None,
+            staged_from: None,
         })
     }
 
@@ -229,13 +237,16 @@ impl Spiced {
             .create(true)
             .append(true)
             .open(self.log_path())?;
-        let mut command = match &self.container {
+        let mut command = match self.container.clone() {
             None => {
                 let mut command = Command::new(&self.binary);
                 command.current_dir(&self.dir).envs(&self.env);
                 command
             }
-            Some(run) => self.container_command(run)?,
+            Some(run) => {
+                let binary = self.stage_binary()?;
+                self.container_command(&run, &binary)?
+            }
         };
         let child = command
             .arg("--telemetry-enabled=false")
@@ -265,15 +276,39 @@ impl Spiced {
         Ok(())
     }
 
+    /// The binary a container runs: a copy of `binary` in this instance's
+    /// directory, made again only when `binary` changes.
+    ///
+    /// A `docker run -v` source is a path on the Docker daemon's filesystem,
+    /// which need not be this process's: under Docker-in-Docker the daemon
+    /// shares only the runner's work volume, and for a source it cannot see
+    /// it mounts an empty directory, so the container fails with
+    /// `exec /usr/local/bin/spiced failed: Permission denied`. The instance
+    /// directory is mounted into the container already, so the daemon sees
+    /// the copy wherever it sees the rest of the run.
+    fn stage_binary(&mut self) -> Result<PathBuf> {
+        let copy = std::path::absolute(self.dir.join("spiced.bin"))?;
+        if self.staged_from.as_ref() != Some(&self.binary) {
+            std::fs::copy(&self.binary, &copy).with_context(|| {
+                format!(
+                    "Failed to copy {} to {} for its container",
+                    self.binary.display(),
+                    copy.display()
+                )
+            })?;
+            self.staged_from = Some(self.binary.clone());
+        }
+        Ok(copy)
+    }
+
     /// `docker run` for `run`, in the foreground so that its output is the log
     /// and the signals `stop` sends reach `spiced`.
-    fn container_command(&self, run: &ContainerRun) -> Result<Command> {
+    fn container_command(&self, run: &ContainerRun, binary: &Path) -> Result<Command> {
         use std::os::unix::fs::MetadataExt;
         // A container left behind by an interrupted run would hold the name.
         let _ = std::process::Command::new("docker")
             .args(["rm", "-f", &run.name])
             .output();
-        let binary = std::path::absolute(&self.binary)?;
         let dir = std::path::absolute(&self.dir)?;
         let owner = std::fs::metadata(&dir)?;
         let mut command = Command::new("docker");
