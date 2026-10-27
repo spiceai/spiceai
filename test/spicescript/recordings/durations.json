@@ -125,5 +125,6 @@
   "tpch-oracles": 26,
   "unparse-pruned-aggregate": 11,
   "unparse-set-operations": 6,
-  "views": 11
+  "views": 11,
+  "unparse-aggregate-scopes": 3
 }
