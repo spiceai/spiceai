@@ -115,13 +115,13 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `2e44d4aeaa9bc289b5f3a0e94d2655b759437f9a` | `ben/query-type-and-grouping-contracts` |
+| [datafusion](#datafusion) | `7f887215833c82112d94188adb8855cda8a4e47e` | `ben/query-type-and-grouping-contracts` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
-| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `0285a1545346f67c1e9abe52883ba110e382106c` | `ben/preserve-computed-projection-names` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `fbed68d326ec522f2cfcb1c0bcdb89689fea352e` | `ben/result-column-identity-and-union-scope` |
+| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `a070abbc444970eb76d64721d4e440caf01a3e8e` | `ben/preserve-computed-projection-names` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `e83ddb50986e2c89b986bff01e1d3cc6c48731b4` | `ben/result-column-identity-and-union-scope` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
+| [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `a6b07b8b9625e552c502c3a7229fd4bb7725bd2e` | `spiceai-0.11.0-df-55` |
 | [llama.cpp](#llamacpp) | `1082d1983689a13315cdf2a80d9bd0bbdd572da2` | `spiceai-b11803` |
@@ -534,7 +534,9 @@ Upstream [duckdb/duckdb-rs](https://github.com/duckdb/duckdb-rs), branch
 `spiceai-1.4.4`: the previous line plus the arrow 59 bump (fork PR #49), the chrono
 write backport (fork PR #50) and the Rust 1.98.1 toolchain (fork PR #51), all below
 or build-only — every other row was re-confirmed present, unchanged, at the pinned
-revision. Against the previous pin, `8ee4307` (the head of `spiceai-1.4.4-patches-2`,
+revision. The current pin also includes the merged Brotli source backport at
+`b4360d03` (duckdb-rs commits `d7f1bcc` and `40a0ad2`), matching the table-provider
+fork. Against the earlier pin, `8ee4307` (the head of `spiceai-1.4.4-patches-2`,
 which #49 was squash-merged from), the only other source change is an equivalent
 `RecordBatch::try_from_iter(columns)` in `vtab/arrow.rs`.
 

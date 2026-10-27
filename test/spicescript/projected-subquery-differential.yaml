@@ -50,6 +50,13 @@ steps:
     expect: { rows: [[true]] }
   - query: SELECT count(c) > count(DISTINCT c) AS has_duplicate_probes FROM p
     expect: { rows: [[true]] }
+  # Consume the original name of an unnamed scalar-subquery output.
+  - query: SELECT (SELECT max(x) FROM b)
+    oracle-sql: SELECT max(x) AS "max(b.x)" FROM b
+  - query: SELECT q."max(b.x)" AS result FROM (SELECT (SELECT max(x) FROM b)) q
+    oracle-sql: SELECT max(x) AS result FROM b
+  - query: SELECT q."max(b.x)" + 1 AS result FROM (SELECT (SELECT max(x) FROM b)) q
+    oracle-sql: SELECT max(x) + 1 AS result FROM b
   # Local execution cannot lower these projected/scalar subquery forms yet.
   # Keep them federated; the filter forms below exercise all three variants.
   # Computed build output names, mark/semi/anti joins and grouped NOT.

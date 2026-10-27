@@ -27,3 +27,9 @@ steps:
   - query: SELECT t.id, u.id FROM t LEFT JOIN u ON t.id = u.t_id
   - query: SELECT t.id, u.id FROM t RIGHT JOIN u ON t.id = u.t_id
   - query: SELECT t.d, u.d FROM t LEFT JOIN u ON t.id = u.t_id
+  - query: SELECT (SELECT max(id) FROM t)
+    oracle-sql: SELECT max(id) AS "max(t.id)" FROM t
+  - query: SELECT q."max(t.id)" AS result FROM (SELECT (SELECT max(id) FROM t)) q
+    oracle-sql: SELECT max(id) AS result FROM t
+  - query: SELECT q."max(t.id)" + 1 AS result FROM (SELECT (SELECT max(id) FROM t)) q
+    oracle-sql: SELECT max(id) + 1 AS result FROM t
