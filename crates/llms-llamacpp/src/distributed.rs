@@ -293,31 +293,16 @@ impl Chat for Share {
     }
 }
 
-/// The address the head serves and reaches its own GPU at: the one this node sends from to
-/// reach rank 1. Between nodes on RDMA that address belongs to the RDMA NIC, so the head's
-/// own GPU is driven over the NIC's loopback like every other rank's GPU instead of over TCP
-/// on 127.0.0.1, which on DGX Sparks decoded GLM-5.3 3% slower. Loopback when this node has no
-/// route to rank 1 or reaches it from a loopback address.
-fn head_gpu_address(cfg: &DistributedConfig) -> String {
-    cfg.nodes
-        .get(1)
-        .and_then(|node| ipv4(node).ok())
-        .and_then(|peer| source_toward(&peer))
-        .unwrap_or_else(|| "127.0.0.1".to_string())
+/// The address the head serves and reaches its own GPU at: its own entry in `nodes`, as every
+/// rank serves at its own, so no GPU server listens on an interface `nodes` does not name.
+/// Between nodes on RDMA that address belongs to the RDMA NIC, so the head's own GPU is driven
+/// over the NIC's loopback like every other rank's GPU instead of over TCP on 127.0.0.1, which
+/// on DGX Sparks decoded GLM-5.3 3% slower.
+fn head_gpu_address(cfg: &DistributedConfig) -> Result<String> {
+    ipv4(&cfg.nodes[0])
 }
 
-/// The local IPv4 address this node's routes send from to reach `peer`. A UDP socket's
-/// connect only resolves the route; nothing is sent.
-fn source_toward(peer: &str) -> Option<String> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect((peer, RPC_PORT_BASE)).ok()?;
-    match socket.local_addr().ok()?.ip() {
-        IpAddr::V4(addr) if !addr.is_loopback() && !addr.is_unspecified() => Some(addr.to_string()),
-        _ => None,
-    }
-}
-
-/// The head serves its own GPU at the address it reaches rank 1 from, waits for every other rank
+/// The head serves its own GPU at its own `nodes` address, waits for every other rank
 /// to serve theirs, and returns all of them in rank order, for the model to be split across.
 pub(crate) async fn reach_ranks(cfg: &DistributedConfig, name: &str) -> Result<Vec<Device>> {
     ensure_insecure_allowed(cfg, name)?;
@@ -326,7 +311,7 @@ pub(crate) async fn reach_ranks(cfg: &DistributedConfig, name: &str) -> Result<V
         let (cfg, model) = (cfg.clone(), name.to_string());
         // Finding the head's address and starting its GPU server both block.
         tokio::task::spawn_blocking(move || {
-            let head_gpu = format!("{}:{}", head_gpu_address(&cfg), port(0)?);
+            let head_gpu = format!("{}:{}", head_gpu_address(&cfg)?, port(0)?);
             serve_gpus(&model, &head_gpu)?;
             Ok::<_, ChatError>(head_gpu)
         })
@@ -435,7 +420,23 @@ fn configure_comm(cfg: &DistributedConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::{host, served_by_head};
+    use super::{head_gpu_address, host, served_by_head};
+    use llms::chat::{DistributedBackend, DistributedConfig};
+
+    #[test]
+    fn the_head_serves_its_gpu_only_at_its_own_nodes_address() {
+        // rank 1 at a documentation address, which this node reaches through another interface
+        let cfg = DistributedConfig {
+            backend: DistributedBackend::Ring,
+            node_rank: 0,
+            nodes: vec!["127.0.0.1".to_string(), "192.0.2.1".to_string()],
+            allow_insecure_connections: true,
+        };
+        assert_eq!(
+            head_gpu_address(&cfg).expect("127.0.0.1 is an IPv4 address"),
+            "127.0.0.1"
+        );
+    }
 
     #[test]
     fn a_request_to_another_rank_names_the_node_that_serves_the_model() {
