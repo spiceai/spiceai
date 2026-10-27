@@ -2474,8 +2474,7 @@ impl<S> Drop for QueryTrackerStream<S> {
 
 /// The error a query is recorded with when its result stream is dropped
 /// before it ends.
-const ABANDONED_QUERY_MESSAGE: &str =
-    "Query was cancelled: the result stream was dropped before it was fully read \
+const ABANDONED_QUERY_MESSAGE: &str = "Query was cancelled: the result stream was dropped before it was fully read \
      (the client disconnected or stopped reading)";
 
 /// The task-history preview of a result batch: its first rows, as JSON.
@@ -5866,10 +5865,10 @@ mod tests {
                 .with_ansi(false)
                 .without_time()
                 .with_writer(move || WriteTo(Arc::clone(&writer)))
-                .with_filter(tracing_subscriber::filter::Targets::new().with_target(
-                    "runtime::datafusion::query::tracker",
-                    tracing::Level::TRACE,
-                )),
+                .with_filter(
+                    tracing_subscriber::filter::Targets::new()
+                        .with_target("runtime::datafusion::query::tracker", tracing::Level::TRACE),
+                ),
         );
         let _default = tracing::subscriber::set_default(subscriber);
 
