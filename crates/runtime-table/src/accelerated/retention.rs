@@ -52,6 +52,21 @@ fn strip_index_wrapper_layers(tbl: &Arc<dyn TableProvider>) -> Arc<dyn TableProv
     Arc::clone(peel_to(tbl, LayerWalk::RetentionDelete))
 }
 
+/// Whether `provider` (already peeled to its retention-delete target) evaluates a
+/// delete's filter with `DataFusion`: a Cayenne table, or a partitioned table whose
+/// partitions are Cayenne tables.
+fn deletes_evaluate_with_datafusion(provider: &Arc<dyn TableProvider>) -> bool {
+    let any = provider.as_any();
+    any.is::<cayenne::CayenneTableProvider>()
+        || any
+            .downcast_ref::<runtime_table_partition::provider::PartitionTableProvider>()
+            .is_some_and(|partitioned| {
+                (**partitioned.creator())
+                    .as_any()
+                    .is::<cayenne::CayennePartitionCreator>()
+            })
+}
+
 /// Resolves the index a retention delete should actually hit: for a compound (fallback-composed)
 /// index, only the primary/warm side — retention trims the local warm window and must not reach
 /// into the independently-managed secondary/fallback index's own lifecycle. `SearchIndex` itself
@@ -121,18 +136,24 @@ pub(crate) async fn apply_retention_filters_once(
         }
     }
 
-    // The accelerator renders the delete's filter into its own SQL, which parses a
+    let raw_accelerator = strip_index_wrapper_layers(accelerator);
+    // An accelerator that renders the delete's filter into its own SQL parses a
     // string time column differently than `DataFusion`; pin each such comparison to
-    // the strings `DataFusion` selects first (see `exact_string_time`).
-    let predicates = match pin_string_time_comparisons(accelerator, &ctx.state(), expr).await {
-        Ok(predicates) => predicates,
-        Err(e) => {
-            tracing::error!("[retention] Error running retention check: {e}");
-            return Err(e);
+    // the strings `DataFusion` selects first (see `exact_string_time`). Cayenne
+    // evaluates the filter with `DataFusion` itself, and its scans hide the rows its
+    // time retention expires, so pinning there would find nothing to delete.
+    let predicates = if deletes_evaluate_with_datafusion(&raw_accelerator) {
+        vec![expr]
+    } else {
+        match pin_string_time_comparisons(accelerator, &ctx.state(), expr).await {
+            Ok(predicates) => predicates,
+            Err(e) => {
+                tracing::error!("[retention] Error running retention check: {e}");
+                return Err(e);
+            }
         }
     };
 
-    let raw_accelerator = strip_index_wrapper_layers(accelerator);
     let mut num_records = 0;
     for predicate in predicates {
         let plan = match raw_accelerator
@@ -618,6 +639,87 @@ mod tests {
         assert_eq!(
             deleted, 2,
             "two fixture rows have deleted = true; the logged eviction count must be that number"
+        );
+    }
+
+    /// Cayenne's scans hide the rows its time retention expires. Retention must still
+    /// physically delete an expired ISO8601 string row there, which pinning the
+    /// comparison through such a scan would turn into a delete of nothing.
+    #[tokio::test]
+    async fn deletes_an_expired_string_time_row_from_a_cayenne_table_with_time_retention() {
+        use cayenne::metadata::{CreateTableOptions, VortexConfig};
+        use cayenne::{
+            CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog,
+            TimeRetentionFilterBuilder,
+        };
+        use datafusion::{datasource::memory::MemorySourceConfig, logical_expr::dml::InsertOp};
+        use util::timestamp_filter::{TimestampFilterConvert, data_type_to_timestamp_format};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = temp_dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
+                .expect("catalog"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Utf8, false),
+        ]));
+        let retention =
+            TimeRetentionFilterBuilder::try_new("ts", 86_400, &schema).expect("retention builder");
+        let ctx = SessionContext::new();
+        let cayenne = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_time_retention_filter_builder(retention)
+            .create(CreateTableOptions {
+                table_name: "string_time_retention".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: temp_dir.path().join("data").display().to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .expect("Cayenne table");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![
+                    "2021-05-01T00:00:00Z",
+                    "9999-01-01T00:00:00Z",
+                ])),
+            ],
+        )
+        .expect("batch");
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+            .expect("input");
+        let insert = cayenne
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .expect("insert plan");
+        collect(insert, ctx.task_ctx()).await.expect("insert");
+
+        let accelerator = Arc::new(cayenne) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+        let format = data_type_to_timestamp_format(&DataType::Utf8, None).expect("ISO8601");
+        let converter = TimestampFilterConvert::new("ts".to_string(), format, None, None);
+        let cutoff = refresh::get_timestamp(SystemTime::now() - Duration::from_secs(86_400));
+        let deleted = apply_retention_filters_once(
+            &TableReference::bare("string_time_retention"),
+            &accelerator,
+            &federated,
+            converter.convert(cutoff, Operator::Lt),
+            &Handle::current(),
+        )
+        .await
+        .expect("retention delete");
+
+        assert_eq!(
+            deleted, 1,
+            "the 2021 row is past the one-day retention and must be deleted, not only hidden"
         );
     }
 

@@ -34,5 +34,6 @@ tbl = pa.table({
 })
 import os; os.makedirs(out, exist_ok=True)
 pq.write_table(tbl, f'{out}/events.parquet')
-json.dump({'T0': T0.isoformat(), 'rows': len(rows)}, open(f'{out}/meta.json', 'w'))
+with open(f'{out}/meta.json', 'w') as f:
+    json.dump({'T0': T0.isoformat(), 'rows': len(rows)}, f)
 print('T0', T0.isoformat(), 'rows', len(rows))
