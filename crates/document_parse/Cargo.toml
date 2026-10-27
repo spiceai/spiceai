@@ -14,3 +14,4 @@ pdf-extract = { git = "https://github.com/spiceai/pdf-extract", rev = "3ca5e2c90
 snafu.workspace = true
 bytes.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+zip.workspace = true

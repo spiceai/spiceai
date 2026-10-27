@@ -318,6 +318,17 @@ vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "14aeae4
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "14aeae4a252f38c5ee70a76a95750544a06fe6bc" } # spiceai-52
 
 x509-certificate = "0.25.0"
+# Default features without `aes-crypto`, `lzma` and `xz`: they need digest 0.11
+# (hmac 0.13, sha2 0.11), which conflicts with the digest release candidate that
+# smb 0.11 pins through sspi 0.18.
+zip = { version = "9.1", default-features = false, features = [
+    "bzip2",
+    "deflate",
+    "deflate64",
+    "ppmd",
+    "time",
+    "zstd",
+] }
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", tag = "v3.1.0" }
 
 [profile.release-lto]

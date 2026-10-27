@@ -22,6 +22,7 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 
 use crate::{
     Document, DocumentParser, DocumentParserFactory, DocumentType, InternalParsingSnafu, Result,
+    archive::open_consistent_archive,
 };
 
 pub struct DocxParserFactory {}
@@ -51,6 +52,8 @@ impl DocxParser {
 
 impl DocumentParser for DocxParser {
     fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
+        // docx-rs opens the zip with its own reader; check the archive first.
+        open_consistent_archive(raw, DocumentType::Docx)?;
         let doc = read_docx(raw).boxed().context(InternalParsingSnafu {
             format: DocumentType::Docx,
         })?;
