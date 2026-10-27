@@ -2685,11 +2685,13 @@ impl Runtime {
         Ok(())
     }
 
+    /// Returns the datasets this diff loads, reloads or removes: the views that read
+    /// them hold the tables they planned against, or failed to find one.
     pub(crate) async fn apply_dataset_diff(
         self: Arc<Self>,
         current_app: &Arc<App>,
         new_app: &Arc<App>,
-    ) {
+    ) -> HashSet<ResolvedTableReference> {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
 
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
@@ -2728,7 +2730,14 @@ impl Runtime {
             .datasets
             .iter()
             .filter(|ds| !new_app.datasets.iter().any(|d| d.name == ds.name))
-            .filter_map(|ds| Dataset::parse_table_reference(&ds.name).ok());
+            .filter_map(|ds| Dataset::parse_table_reference(&ds.name).ok())
+            .collect::<Vec<_>>();
+        let reloaded: HashSet<ResolvedTableReference> = datasets_to_apply
+            .iter()
+            .map(|ds| ds.name.clone())
+            .chain(removed_datasets.iter().cloned())
+            .map(resolve_table_reference)
+            .collect();
         let mut still_loading = HashSet::new();
         for name in datasets_to_apply
             .iter()
@@ -3009,6 +3018,8 @@ impl Runtime {
                     .await;
             }
         }
+
+        reloaded
     }
 
     /// The load of a queued `localpod` dataset, followed by the loads of the `localpod` datasets
