@@ -115,10 +115,10 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `8558625a8cace92662a35323c5ccdb968115537f` | `ben/query-type-and-grouping-contracts` |
+| [datafusion](#datafusion) | `803080a22cf019e6e489ebaa5a7814325a58f91e` | `ben/query-type-and-grouping-contracts` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
-| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `0057db25692ed8da3b89616159530d114c628356` | `ben/preserve-computed-projection-names` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `f725b3e90bca81d2041346f49638ee9eaaab7314` | `ben/result-column-identity-and-union-scope` |
+| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `a9644a7bcb27499f3c2d5baf298cd8bf25d32629` | `ben/preserve-computed-projection-names` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `0563877256f9ac0df761b60eb66d902b5d47b818` | `ben/result-column-identity-and-union-scope` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
@@ -221,7 +221,7 @@ batches whose rows are slices of larger buffers. The pin adds SQL semantics fixe
 for [#15538](https://github.com/spiceai/spiceai/issues/15538) on top of #268:
 parenthesized IS and NOT operands, named scopes for renamed EXISTS inputs,
 preserved pruned aggregates, scan filters before projection, and character-counting
-MySQL string length. It also includes CASE result-type coercion, lossless unsigned
+MySQL string length. It also includes CASE result-type coercion, checked unsigned
 negation, and conservative aggregate functional dependencies from
 [fork PR #272](https://github.com/spiceai/datafusion/pull/272). These commits
 descend from #268's merge commit, so the
@@ -275,9 +275,10 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Unparser: nested IS and NOT predicates parenthesize their operands (#15538) | `(NOT x) IS NULL` selects different rows when emitted as `NOT x IS NULL`; MySQL rejects chained IS predicates; ClickHouse gives `NOT (x IS NULL) IS NULL` a different meaning from `NOT ((x IS NULL) IS NULL)` | silent (wrong data / query failure) | `crates/data_components/src/federation.rs::tests::is_predicate_unparsing_preserves_boolean_partitions`; real-engine guards: `test/spicescript/sql-predicate-precedence.yaml` and `test/spicescript/tlp.yaml`. In the fork, `test_unparser_preserves_is_predicate_operands` |
 | Unparser: renamed and computed projections keep named scopes for EXISTS input correlations (fork PRs #271 and #272) | INTERSECT/EXCEPT join keys cannot bind renamed output columns after projection replacement | query failure | `test/spicescript/unparse-set-operations.yaml`; fork `test_unparse_projected_set_operation_scopes` |
 | CASE type inference reads every result branch (fork PR #272) | Pre-analysis schemas can report Int32 while execution produces the common wider type | query failure | `test/spicescript/case-mixed-widths.yaml`; fork `issue_15538_case_schema_includes_all_result_branches` |
-| Unsigned negation widens losslessly, including UInt64 to Decimal128(20,0) (fork PR #272) | Negating ranking functions is rejected | query failure | `test/spicescript/case-mixed-widths.yaml`; fork `unsigned_negation_schema_has_a_lossless_signed_type` |
+| Unsigned negation returns a checked signed result; UInt64 returns Int64, accepting -2^63 and rejecting overflow (fork PR #272). Ranking results remain UInt64 | Negating ranking functions is rejected, or unsigned negation returns decimal instead of signed BIGINT | result type mismatch; query failure | `test/spicescript/unsigned-negation.yaml`, `test/spicescript/mysql-unsigned-negation.yaml`; fork signed-result schema and execution regressions |
 | Aggregate dependencies retain only proven group dependencies (fork PR #272) | DISTINCT over a join can make later grouping discard keys and merge groups | wrong data | `test/spicescript/groupby-join-key-dependency.yaml`; fork `issue_15538_aggregate_dependencies_do_not_invent_join_dependencies` |
 | Unparser: a projection reading no aggregate outputs keeps the aggregation in a derived table (#15538) | A pruned global aggregate returns its input's rows instead of one row, and a pruned grouped aggregate loses its groups | silent (wrong data) | `test/spicescript/unparse-pruned-aggregate.yaml`, including empty inputs, nested aggregates, `HAVING`, and `QUALIFY`; in the fork, `test_unparser_preserves_pruned_aggregate_rows` |
+| Unparser: aggregate scopes retain correlated subquery bindings and require uniquely addressable grouping outputs (fork PR #270) | Correlated projections lose their FROM binding; grouping sets hit internal grouping-id errors; qualified duplicate grouping names collide | query failure | `test/spicescript/unparse-aggregate-scopes.yaml`; fork `test_unparser_preserves_aggregate_projection_scope_guards` |
 | Unparser: scan filters apply before scan projection (#15538) | The SQL for a filtered INTERSECT or EXCEPT reads `right.id` outside a derived table that projects only the compared columns | silent (query failure) | `test/spicescript/unparse-set-operations.yaml`; in the fork, `test_unparser_preserves_filtered_set_operation_scope` |
 | MySQL dialect: Spark's `length` renders as `character_length` for strings and `length` for binary values (#15538) | Non-ASCII strings return byte counts, so `char_length('naïve')` returns 6 instead of 5 and filters select different rows | silent (wrong data) | `test/spicescript/mysql-string-length.yaml` checks Unicode, aliases, NULL, binary bytes, and the pushed SQL; in the fork, `test_unparser_preserves_mysql_length_units` |
 | Unparser: empty `Projection` emits `SELECT 1` | A projection with no expressions unparses to `SELECT FROM …`, which is not valid SQL, so the federated query fails outright | silent (query failure) | `…::an_empty_projection_does_not_unparse_to_an_empty_select_list` |

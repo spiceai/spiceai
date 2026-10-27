@@ -33,5 +33,3 @@ steps:
   - query: SELECT id, CASE WHEN id > 10 THEN a ELSE a + 1 END AS c FROM w
   - query: SELECT id, CASE WHEN id > 10 THEN a ELSE count(*) OVER (PARTITION BY a) END AS c FROM w
   - query: SELECT id, -rank() OVER (ORDER BY id) AS r FROM w
-  - query: SELECT -arrow_cast('18446744073709551615', 'UInt64') AS n
-    expect: { rows: [['-18446744073709551615']] }

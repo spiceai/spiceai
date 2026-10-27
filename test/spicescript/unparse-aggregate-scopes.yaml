@@ -1,0 +1,36 @@
+name: unparse-aggregate-scopes
+description: >
+  Aggregate projection scopes preserve correlated subquery references,
+  grouping sets and qualified duplicate grouping-column names.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  federated: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: unparse-aggregate-scopes
+  datasets:
+    - { from: 'postgres:public.e', name: e, params: '${sources.src.params}' }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: CREATE TABLE e (id int, v int); INSERT INTO e VALUES (1,10), (2,20), (3,10), (4,NULL), (5,10), (1,10);
+  - start: {}
+  - query: SELECT (SELECT e.v) AS v FROM e GROUP BY e.v
+  - query: SELECT (SELECT e.v + 1) AS v FROM e GROUP BY e.v
+  - query: SELECT (SELECT 42) AS k FROM e GROUP BY v
+  - query: SELECT (SELECT 42) AS k FROM (SELECT max(id) AS m FROM e WHERE id < 0) q
+  - query: SELECT 42 AS k FROM e GROUP BY ROLLUP(v)
+  - query: SELECT 42 AS k FROM e l JOIN e r ON l.v = r.v GROUP BY l.id, r.id
+  - query: SELECT count(*) AS n FROM (SELECT 42 AS k FROM e GROUP BY ROLLUP(v)) q
+  - query: SELECT count(*) AS n FROM (SELECT 42 AS k FROM e l JOIN e r ON l.v = r.v GROUP BY l.id, r.id) q
+  - query: SELECT 42 AS k FROM e GROUP BY CUBE(v)
+  - query: SELECT 42 AS k FROM e GROUP BY GROUPING SETS ((v), ())
