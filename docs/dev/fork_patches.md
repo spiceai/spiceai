@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `7f887215833c82112d94188adb8855cda8a4e47e` | `ben/query-type-and-grouping-contracts` |
+| [datafusion](#datafusion) | `7f887215833c82112d94188adb8855cda8a4e47e` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `a070abbc444970eb76d64721d4e440caf01a3e8e` | `ben/preserve-computed-projection-names` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `e83ddb50986e2c89b986bff01e1d3cc6c48731b4` | `ben/result-column-identity-and-union-scope` |
@@ -531,13 +531,10 @@ below. Both were re-confirmed at the pinned revision. All three crates are repla
 ## duckdb-rs
 
 Upstream [duckdb/duckdb-rs](https://github.com/duckdb/duckdb-rs), branch
-`spiceai-1.4.4`: the previous line plus the arrow 59 bump (fork PR #49), the chrono
-write backport (fork PR #50) and the Rust 1.98.1 toolchain (fork PR #51), all below
-or build-only — every other row was re-confirmed present, unchanged, at the pinned
-revision. The current pin also includes the merged Brotli source backport at
-`b4360d03` (duckdb-rs commits `d7f1bcc` and `40a0ad2`), matching the table-provider
-fork. Against the earlier pin, `8ee4307` (the head of `spiceai-1.4.4-patches-2`,
-which #49 was squash-merged from), the only other source change is an equivalent
+`spiceai-1.4.4`: includes the Arrow 59 bump (fork PR #49), the chrono write
+backport (fork PR #50), the Rust 1.98.1 toolchain (fork PR #51), and the merged
+Brotli source backport at `b4360d03` (duckdb-rs commits `d7f1bcc` and `40a0ad2`).
+The pin matches the table-provider fork. The Arrow 59 transition also uses
 `RecordBatch::try_from_iter(columns)` in `vtab/arrow.rs`.
 
 | Patch | What breaks if it is lost | Loss | Guard |
