@@ -59,6 +59,10 @@ mod flight_prepared_statements {
         use arrow::array::{Float64Array, TimestampMicrosecondArray};
         use arrow::datatypes::{DataType, TimeUnit};
 
+        // 2026-03-08T10:30:00Z, the same instant as the row it is compared to,
+        // which is stored in America/Los_Angeles.
+        const INSTANT_MICROS: i64 = 1_772_965_800_000_000;
+
         let _tracing = init_tracing(Some("integration=debug,info"));
 
         test_request_context()
@@ -66,9 +70,6 @@ mod flight_prepared_statements {
                 let (channel, _df) = start_spice_test_app(None, None, None).await?;
                 let mut client = FlightSqlServiceClient::new(channel);
 
-                // 2026-03-08T10:30:00Z, the same instant as the row it is
-                // compared to, which is stored in America/Los_Angeles.
-                const INSTANT_MICROS: i64 = 1_772_965_800_000_000;
                 let utc = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
                 let timestamp = create_param_batch(
                     vec![("$1", utc, false)],
