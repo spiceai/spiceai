@@ -56,11 +56,18 @@ pub(crate) const MAX_PINNED_VALUES_PER_DELETE: usize = 10_000;
 /// timestamp is replaced with the strings `DataFusion` selects for it out of
 /// `table`'s current rows.
 ///
-/// Returns the predicates to delete with, in order; the union of the rows they
-/// select is the rows `expr` selects. That is one predicate unless a single
-/// comparison selected more than [`MAX_PINNED_VALUES_PER_DELETE`] strings and
-/// sits under nothing but `AND`/`OR`: the predicate is then monotone in it, so
-/// each chunk of the strings can be deleted on its own.
+/// Only `AND` and `OR` are looked through. Under them a delete keeps a row
+/// exactly when the predicate is TRUE, and both are monotone in each operand,
+/// so a replacement that is TRUE on exactly the rows the comparison is TRUE on
+/// selects the same rows, whether the comparison was FALSE or NULL on the rest.
+/// Anything else — `NOT`, `IS NOT TRUE`, `NULLIF`, `CASE` — tells FALSE from
+/// NULL, so the whole subexpression containing it is pinned instead.
+///
+/// Returns the predicates to delete with; the union of the rows they select is
+/// the rows `expr` selects. That is one predicate unless a single comparison
+/// selected more than [`MAX_PINNED_VALUES_PER_DELETE`] strings: the predicate
+/// is then `(c AND a) OR b` for that comparison `c` (Kleene logic is a
+/// distributive lattice), so each chunk of the strings can be deleted on its own.
 ///
 /// A comparison that also references another column cannot be pinned to one
 /// column's strings; it is left as written.
@@ -76,21 +83,13 @@ pub(crate) async fn pin_string_time_comparisons(
 ) -> Result<Vec<Expr>> {
     let schema = table.schema();
     let mut atoms = Vec::new();
-    collect_atoms(&expr, &schema, true, &mut atoms);
+    collect_atoms(&expr, &schema, &mut atoms);
     if atoms.is_empty() {
         return Ok(vec![expr]);
     }
 
     let mut pinned = Vec::with_capacity(atoms.len());
-    for atom in &atoms {
-        let Some(at_null) = value_at_null(&atom.expr, &atom.column, &schema)? else {
-            tracing::warn!(
-                "[retention] '{}' does not fold to a constant for a NULL '{}'; it is left as written",
-                atom.expr,
-                atom.column.name
-            );
-            continue;
-        };
+    for atom in atoms {
         let rows = resolve_keys_matching_predicate(
             table,
             session,
@@ -100,9 +99,11 @@ pub(crate) async fn pin_string_time_comparisons(
         .await?;
         let mut seen = HashSet::new();
         let mut values = Vec::new();
+        let mut selected_a_null = false;
         if let Some(array) = rows.column_by_name(&atom.column.name) {
             for row in 0..array.len() {
                 if array.is_null(row) {
+                    selected_a_null = true;
                     continue;
                 }
                 let value = ScalarValue::try_from_array(array.as_ref(), row)?;
@@ -112,80 +113,81 @@ pub(crate) async fn pin_string_time_comparisons(
             }
         }
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        pinned.push((atom, at_null, values));
+        // Whether a NULL string satisfies it is a property of the expression; the
+        // stored rows answer only when it does not fold.
+        let selects_null =
+            true_at_null(&atom.expr, &atom.column, &schema)?.unwrap_or(selected_a_null);
+        pinned.push(Pinned {
+            atom,
+            values,
+            selects_null,
+        });
     }
 
-    let chunked = match pinned.as_slice() {
-        [(atom, _, values)] if atom.positive && values.len() > MAX_PINNED_VALUES_PER_DELETE => true,
-        _ => false,
-    };
-    if chunked {
-        let (atom, at_null, values) = &pinned[0];
+    if let [only] = pinned.as_slice()
+        && only.values.len() > MAX_PINNED_VALUES_PER_DELETE
+    {
         let mut predicates = Vec::new();
-        for (index, chunk) in values.chunks(MAX_PINNED_VALUES_PER_DELETE).enumerate() {
+        for (index, chunk) in only.values.chunks(MAX_PINNED_VALUES_PER_DELETE).enumerate() {
             // A NULL row is the chunks' common business; it rides on the first.
-            let at_null = if index == 0 { *at_null } else { AtNull::False };
-            let replacement = membership(&atom.column, chunk, at_null);
-            predicates.push(replace(expr.clone(), &atom.expr, &replacement)?);
+            let replacement = membership(&only.atom.column, chunk, index == 0 && only.selects_null);
+            predicates.push(replace(expr.clone(), &[(&only.atom.expr, replacement)])?);
         }
         return Ok(predicates);
     }
 
-    let mut expr = expr;
-    for (atom, at_null, values) in &pinned {
-        let replacement = membership(&atom.column, values, *at_null);
-        expr = replace(expr, &atom.expr, &replacement)?;
-    }
-    Ok(vec![expr])
+    let replacements: Vec<(&Expr, Expr)> = pinned
+        .iter()
+        .map(|p| {
+            (
+                &p.atom.expr,
+                membership(&p.atom.column, &p.values, p.selects_null),
+            )
+        })
+        .collect();
+    Ok(vec![replace(expr, &replacements)?])
 }
 
-/// A boolean subexpression to pin: everything below the `AND`/`OR`/`NOT` that
-/// combine it, referencing one string column it parses as a timestamp.
+/// A boolean subexpression to pin: everything below the `AND`/`OR` that combine
+/// it, referencing one string column it parses as a timestamp.
 #[derive(Debug)]
 struct Atom {
     expr: Expr,
     column: Column,
-    /// Whether the path from the root to it crosses only `AND` and `OR`.
-    positive: bool,
 }
 
-fn collect_atoms(expr: &Expr, schema: &SchemaRef, positive: bool, atoms: &mut Vec<Atom>) {
-    match expr {
-        Expr::BinaryExpr(BinaryExpr {
-            left,
-            op: Operator::And | Operator::Or,
-            right,
-        }) => {
-            collect_atoms(left, schema, positive, atoms);
-            collect_atoms(right, schema, positive, atoms);
-        }
-        Expr::Not(inner) => collect_atoms(inner, schema, false, atoms),
-        _ => {
-            let Some(column) = string_column_cast_to_timestamp(expr, schema) else {
-                return;
-            };
-            let columns = expr.column_refs();
-            if columns.len() != 1 {
-                tracing::warn!(
-                    "[retention] '{expr}' parses '{}' as a timestamp but references other columns too; it is left as written",
-                    column.name
-                );
-                return;
-            }
-            if atoms.iter().any(|atom| &atom.expr == expr) {
-                if !positive {
-                    for atom in atoms.iter_mut().filter(|atom| &atom.expr == expr) {
-                        atom.positive = false;
-                    }
-                }
-                return;
-            }
-            atoms.push(Atom {
-                expr: expr.clone(),
-                column,
-                positive,
-            });
-        }
+struct Pinned {
+    atom: Atom,
+    values: Vec<ScalarValue>,
+    selects_null: bool,
+}
+
+fn collect_atoms(expr: &Expr, schema: &SchemaRef, atoms: &mut Vec<Atom>) {
+    if let Expr::BinaryExpr(BinaryExpr {
+        left,
+        op: Operator::And | Operator::Or,
+        right,
+    }) = expr
+    {
+        collect_atoms(left, schema, atoms);
+        collect_atoms(right, schema, atoms);
+        return;
+    }
+    let Some(column) = string_column_cast_to_timestamp(expr, schema) else {
+        return;
+    };
+    if expr.column_refs().len() != 1 {
+        tracing::warn!(
+            "[retention] '{expr}' parses '{}' as a timestamp but references other columns too; it is left as written",
+            column.name
+        );
+        return;
+    }
+    if !atoms.iter().any(|atom| &atom.expr == expr) {
+        atoms.push(Atom {
+            expr: expr.clone(),
+            column,
+        });
     }
 }
 
@@ -226,17 +228,9 @@ fn is_string(data_type: &DataType) -> bool {
         || matches!(data_type, DataType::Dictionary(_, value) if value.is_string())
 }
 
-/// What a comparison answers for a row whose column is NULL.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AtNull {
-    True,
-    False,
-    Null,
-}
-
-/// What `atom` answers for a row whose `column` is NULL, or `None` if it does
-/// not fold to a constant.
-fn value_at_null(atom: &Expr, column: &Column, schema: &SchemaRef) -> Result<Option<AtNull>> {
+/// Whether `atom` is TRUE for a row whose `column` is NULL, or `None` if it
+/// does not fold to a constant.
+fn true_at_null(atom: &Expr, column: &Column, schema: &SchemaRef) -> Result<Option<bool>> {
     let data_type = schema.field_with_name(&column.name)?.data_type().clone();
     let null = ScalarValue::try_from(&data_type)?;
     let substituted = atom
@@ -249,17 +243,15 @@ fn value_at_null(atom: &Expr, column: &Column, schema: &SchemaRef) -> Result<Opt
         })?
         .data;
     match util::expr::simplify_expr(substituted, schema)? {
-        Expr::Literal(ScalarValue::Boolean(Some(true)), _) => Ok(Some(AtNull::True)),
-        Expr::Literal(ScalarValue::Boolean(Some(false)), _) => Ok(Some(AtNull::False)),
-        Expr::Literal(value, _) if value.is_null() => Ok(Some(AtNull::Null)),
+        Expr::Literal(ScalarValue::Boolean(value), _) => Ok(Some(value == Some(true))),
+        Expr::Literal(value, _) if value.is_null() => Ok(Some(false)),
         _ => Ok(None),
     }
 }
 
-/// `column IN (values)`, answering `at_null` for a NULL `column` so the
-/// replacement agrees with the comparison on NULL rows too — including under a
-/// `NOT`, where NULL and false part ways.
-fn membership(column: &Column, values: &[ScalarValue], at_null: AtNull) -> Expr {
+/// `column IN (values)`, plus the NULL rows when the comparison selects them.
+/// It is TRUE on exactly the rows the comparison is TRUE on.
+fn membership(column: &Column, values: &[ScalarValue], selects_null: bool) -> Expr {
     let column = Expr::Column(column.clone());
     let list = (!values.is_empty()).then(|| {
         column.clone().in_list(
@@ -270,32 +262,29 @@ fn membership(column: &Column, values: &[ScalarValue], at_null: AtNull) -> Expr 
             false,
         )
     });
-    match (list, at_null) {
-        // `IN` already answers NULL for a NULL operand.
-        (Some(list), AtNull::Null) => list,
-        (Some(list), AtNull::True) => column.is_null().or(list),
-        (Some(list), AtNull::False) => column.is_not_null().and(list),
-        (None, AtNull::True) => column.is_null(),
-        (None, AtNull::False) => Expr::Literal(ScalarValue::Boolean(Some(false)), None),
-        (None, AtNull::Null) => column
-            .is_null()
-            .and(Expr::Literal(ScalarValue::Boolean(None), None)),
+    match (list, selects_null) {
+        (Some(list), false) => list,
+        (Some(list), true) => column.is_null().or(list),
+        (None, true) => column.is_null(),
+        (None, false) => Expr::Literal(ScalarValue::Boolean(Some(false)), None),
     }
 }
 
-fn replace(expr: Expr, target: &Expr, replacement: &Expr) -> Result<Expr> {
+/// Replaces each target with its replacement in one top-down pass, so a target
+/// nested in another (`c` inside `NOT c`) is never rewritten before the outer
+/// one is matched.
+fn replace(expr: Expr, replacements: &[(&Expr, Expr)]) -> Result<Expr> {
     Ok(expr
-        .transform_down(|node| {
-            if &node == target {
-                Ok(Transformed::new(
+        .transform_down(
+            |node| match replacements.iter().find(|(target, _)| **target == node) {
+                Some((_, replacement)) => Ok(Transformed::new(
                     replacement.clone(),
                     true,
                     TreeNodeRecursion::Jump,
-                ))
-            } else {
-                Ok(Transformed::no(node))
-            }
-        })?
+                )),
+                None => Ok(Transformed::no(node)),
+            },
+        )?
         .data)
 }
 
@@ -305,7 +294,8 @@ mod tests {
     use arrow::array::{RecordBatch, StringArray};
     use arrow::datatypes::{Field, Schema, TimeUnit};
     use datafusion::datasource::MemTable;
-    use datafusion::prelude::{SessionContext, cast, col, lit};
+    use datafusion::functions::expr_fn::nullif;
+    use datafusion::prelude::{SessionContext, cast, col, lit, try_cast};
 
     const CUTOFF: i64 = 1_620_025_200_000_000_000; // 2021-05-03T07:00:00Z
 
@@ -389,8 +379,9 @@ mod tests {
         );
     }
 
-    /// NULL rows agree with the comparison under `NOT` and `IS NOT TRUE`, and a
-    /// text conjunct beside the comparison is kept.
+    /// The rewrite selects what the predicate does — NULL rows included — under
+    /// `NOT`, `IS NOT TRUE` and `NOT NULLIF(..)`, which tell FALSE from NULL, and
+    /// beside a text conjunct.
     #[tokio::test]
     async fn agrees_with_the_comparison_on_null_rows_and_beside_other_conjuncts() {
         let rows = [
@@ -405,6 +396,12 @@ mod tests {
             before_cutoff().is_not_true(),
             before_cutoff().or(col("ts").is_null()),
             col("ts").gt_eq(lit("2021-05-01")).and(before_cutoff()),
+            // Never TRUE inside, so pinning the inside alone would select every row.
+            Expr::Not(Box::new(nullif(before_cutoff(), lit(true)))),
+            // The same comparison bare and under `NOT`.
+            before_cutoff().or(Expr::Not(Box::new(before_cutoff())).and(col("ts").is_null())),
+            try_cast(col("ts"), DataType::Timestamp(TimeUnit::Nanosecond, None))
+                .lt(lit(ScalarValue::TimestampNanosecond(Some(CUTOFF), None))),
         ] {
             let predicates = pin_string_time_comparisons(&table, &ctx.state(), expr.clone())
                 .await
