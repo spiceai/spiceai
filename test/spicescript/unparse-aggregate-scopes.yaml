@@ -38,3 +38,7 @@ steps:
   - query: SELECT outer_e.id AS id, (SELECT outer_e.id FROM e HAVING count(*) > 0) AS correlated_id FROM e AS outer_e ORDER BY id
   - query: SELECT derived_aggregate_1.id AS id, (SELECT derived_aggregate_1.id FROM e WHERE id < 0 HAVING count(*) = 0) AS correlated_id FROM e AS derived_aggregate_1 ORDER BY id
   - query: SELECT derived_aggregate_1.id AS id, (SELECT derived_aggregate_1.id FROM e WHERE id < 0 HAVING count(*) > 0) AS correlated_id FROM e AS derived_aggregate_1 ORDER BY id
+  - query: SELECT count(*) AS n FROM (SELECT 42 AS k FROM e l JOIN e r ON l.v = r.v GROUP BY l.id, r.id LIMIT 1) q
+  - query: SELECT count(*) AS n FROM (SELECT 42 AS k FROM e GROUP BY ROLLUP(v) LIMIT 1) q
+  - query: SELECT outer_t.id AS id, (SELECT (SELECT outer_t.id AS k) FROM (SELECT max(e.id) AS m FROM e WHERE e.id >= 0) a) AS k FROM e AS outer_t ORDER BY id
+  - query: SELECT outer_t.id AS id, (SELECT (SELECT outer_t.id AS k) FROM (SELECT max(e.id) AS m FROM e WHERE e.id < 0) a) AS k FROM e AS outer_t ORDER BY id
