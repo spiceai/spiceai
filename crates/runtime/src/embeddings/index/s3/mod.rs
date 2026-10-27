@@ -39,11 +39,11 @@ use tokio::sync::RwLock;
 use crate::{
     dataconnector::parameters::aws::initiate_config_with_credentials,
     model::EmbeddingModelStore,
-    parameters::{ParameterSpec, Parameters},
+    parameters::{Diagnostics, ParameterSpec, Parameters},
 };
 use runtime_parameters_typed::TypedParams as _;
 use runtime_search::store_params::s3::{S3DistanceMetric, S3VectorsParams};
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_secrets::{Secrets, get_params_with_secrets, secret_sources_from_templates};
 use secrecy::ExposeSecret;
 mod client;
 mod metrics;
@@ -296,20 +296,24 @@ async fn get_store_params(
         .unwrap_or_default();
 
     let params_with_secrets = get_params_with_secrets(Arc::clone(&secrets), &params).await;
+    let secret_sources = secret_sources_from_templates(&params);
 
-    let typed = S3VectorsParams::try_from_params(
+    let typed = S3VectorsParams::try_from_params_with_secret_sources(
         "AWS S3 Vectors store",
         params_with_secrets.clone(),
         &secrets,
+        &secret_sources,
     )
     .await?;
 
-    let auth_params = Parameters::try_new(
+    let auth_params = Parameters::try_new_with_secret_sources(
         "AWS S3 Vectors store",
         params_with_secrets.into_iter().collect(),
         "s3_vectors",
         Arc::clone(&secrets),
         PARAMETERS,
+        Diagnostics::Report,
+        Some(secret_sources),
     )
     .await?;
 

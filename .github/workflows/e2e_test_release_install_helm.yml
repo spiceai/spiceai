@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       helm_version:
-        description: 'Helm version to test (e.g., v3.13.0, v3.14.0, or "latest")'
+        description: 'Helm CLI version to test (e.g., v3.13.0, v3.14.0, or "latest"); set the Spice version in chart_version'
         required: false
         default: 'latest'
         type: string
@@ -69,6 +69,70 @@ jobs:
           echo "OS: $(uname -s)"
           echo "Arch: $(uname -m)"
 
+      # Check the inputs and the image before installing anything, so a wrong input or an
+      # unpublished image fails here, named, instead of minutes later in `helm install`.
+      - name: Check the inputs and the image
+        id: chart-version
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HELM_VERSION: ${{ inputs.helm_version }}
+          CHART_VERSION: ${{ inputs.chart_version }}
+        run: |
+          set -euo pipefail
+
+          # helm_version picks the Helm CLI, and get-helm-3 installs a Helm 3 or later release.
+          # A Spice release number here (2.3.3) belongs in chart_version instead.
+          if [ -n "$HELM_VERSION" ] && [ "$HELM_VERSION" != "latest" ]; then
+            if ! [[ "$HELM_VERSION" =~ ^v?([0-9]+)\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || [ "${BASH_REMATCH[1]}" -lt 3 ]; then
+              echo "::error::helm_version '$HELM_VERSION' is not a Helm CLI release (v3.0.0 or later, such as v3.14.0). To test a Spice release, set chart_version to it and leave helm_version at 'latest'."
+              exit 1
+            fi
+            echo "helm_version=v${HELM_VERSION#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$CHART_VERSION" = "latest" ] || [ -z "$CHART_VERSION" ]; then
+            # Get latest release tag from GitHub
+            if ! RELEASE_VERSION=$(curl -fsS "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | jq -er '.tag_name | strings'); then
+              echo "::error::Could not read the latest release's tag from the GitHub API."
+              exit 1
+            fi
+            echo "Using latest release version: $RELEASE_VERSION"
+            # Image tags drop the release tag's 'v' prefix (v1.10.1 -> 1.10.1).
+            IMAGE_TAG="${RELEASE_VERSION#v}"
+            SOURCE=github-release
+          else
+            echo "Using specified version: $CHART_VERSION"
+            IMAGE_TAG="${CHART_VERSION}"
+            SOURCE=local
+          fi
+
+          # The chart deploys ghcr.io/spiceai/spiceai:$IMAGE_TAG. Without it the pod sits in
+          # ImagePullBackOff until `helm install --wait` times out with no named cause.
+          if ! GHCR_TOKEN=$(curl -fsS "https://ghcr.io/token?scope=repository:spiceai/spiceai:pull" | jq -er '.token | strings'); then
+            echo "::error::Could not get a pull token from ghcr.io, so the image tag could not be checked."
+            exit 1
+          fi
+          STATUS=$(curl -sS -o /dev/null -w '%{http_code}' -I \
+            -H "Authorization: Bearer $GHCR_TOKEN" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/spiceai/spiceai/manifests/$IMAGE_TAG") || STATUS=000
+          case "$STATUS" in
+            200) echo "Image ghcr.io/spiceai/spiceai:$IMAGE_TAG exists" ;;
+            404)
+              echo "::error::Image ghcr.io/spiceai/spiceai:$IMAGE_TAG does not exist, so the chart cannot start a pod. Publish the release's Docker image, or set chart_version to a version whose image is published."
+              exit 1
+              ;;
+            *)
+              echo "::error::Could not check whether ghcr.io/spiceai/spiceai:$IMAGE_TAG exists: ghcr.io answered HTTP $STATUS."
+              exit 1
+              ;;
+          esac
+
+          echo "version=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -93,20 +157,17 @@ jobs:
           kind version
 
       # Install Helm
-      - name: Install Helm (latest)
-        if: inputs.helm_version == 'latest' || inputs.helm_version == ''
+      # An empty helm_version installs the latest release.
+      - name: Install Helm
+        env:
+          HELM_VERSION: ${{ steps.chart-version.outputs.helm_version }}
         run: |
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-          helm version
-
-      - name: Install Helm (specific version)
-        if: inputs.helm_version != 'latest' && inputs.helm_version != ''
-        run: |
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash -s -- --version ${{ inputs.helm_version }}
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash -s -- ${HELM_VERSION:+--version "$HELM_VERSION"}
           helm version
 
       # Create kind cluster
       - name: Create kind cluster
+        id: kind
         run: |
           kind create cluster --name spice-test --wait 300s
           kubectl cluster-info --context kind-spice-test
@@ -116,33 +177,6 @@ jobs:
       - name: Wait for cluster ready
         run: |
           kubectl wait --for=condition=Ready nodes --all --timeout=300s
-
-      # Determine chart version to install
-      - name: Determine chart version
-        id: chart-version
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          CHART_VERSION="${{ inputs.chart_version }}"
-
-          if [ "$CHART_VERSION" = "latest" ] || [ -z "$CHART_VERSION" ]; then
-            # Get latest release tag from GitHub
-            RELEASE_VERSION=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | jq -r '.tag_name')
-            echo "Using latest release version: $RELEASE_VERSION"
-            # remove prefix 'v' from RELEASE_VERSION. (i.e. v1.10.1 -> 1.10.1).
-            # Models are included in the default image as of v2.0.0; there is no
-            # longer a separate `-models` image tag.
-            IMAGE_TAG="${RELEASE_VERSION#v}"
-            echo "version=${RELEASE_VERSION#v}" >> $GITHUB_OUTPUT
-            echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-            echo "source=github-release" >> $GITHUB_OUTPUT
-          else
-            echo "Using specified version: $CHART_VERSION"
-            IMAGE_TAG="${CHART_VERSION}"
-            echo "version=$CHART_VERSION" >> $GITHUB_OUTPUT
-            echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-            echo "source=local" >> $GITHUB_OUTPUT
-          fi
 
       # Package local chart (for testing unreleased versions or local chart)
       - name: Package local chart
@@ -202,7 +236,7 @@ jobs:
 
       # Check pod logs
       - name: Check pod logs
-        if: always()
+        if: always() && steps.kind.outcome == 'success'
         run: |
           echo "=== Pod Logs ==="
           kubectl logs -l app=spice-test -n spice-system --tail=100 || true
@@ -332,7 +366,7 @@ jobs:
 
       # Cleanup - Get final status before deletion
       - name: Get final status
-        if: always()
+        if: always() && steps.kind.outcome == 'success'
         run: |
           echo "=== Final Deployment Status ==="
           kubectl get all -n spice-system || true
@@ -343,7 +377,7 @@ jobs:
 
       # Cleanup - Uninstall Helm release
       - name: Uninstall Helm release
-        if: always()
+        if: always() && steps.kind.outcome == 'success'
         run: |
           helm uninstall spice-test -n spice-system || true
           kubectl delete namespace spice-system || true

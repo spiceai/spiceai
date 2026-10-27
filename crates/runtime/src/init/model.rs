@@ -435,7 +435,8 @@ fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "models"))]
+#[cfg(test)]
+#[cfg(feature = "models")]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};

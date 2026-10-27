@@ -48,6 +48,8 @@ mod checkpoint_sqlite;
 mod checkpoint_turso;
 #[cfg(feature = "duckdb")]
 mod cron;
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+mod decimal_division;
 #[cfg(feature = "duckdb")]
 mod duckdb_builtin_pushdown;
 #[cfg(any(feature = "duckdb", feature = "sqlite"))]
@@ -62,8 +64,14 @@ mod hash_index;
 mod localpod_sync;
 #[cfg(all(feature = "postgres-accel", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+mod pk_insert_semantics;
 #[cfg(feature = "sqlite")]
 mod sqlite_builtin_pushdown;
+#[cfg(any(feature = "sqlite", feature = "turso"))]
+mod sqlite_interval_arithmetic;
+#[cfg(feature = "sqlite")]
+mod sqlite_query_errors;
 
 #[cfg(not(target_os = "windows"))]
 mod newest_by_time;
@@ -182,6 +190,30 @@ pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Opt
         ));
     }
     None
+}
+
+/// A CSV file dataset, accelerated in memory by `engine` with full refreshes,
+/// or unaccelerated when `engine` is `None`.
+#[cfg(any(feature = "sqlite", feature = "turso"))]
+pub(crate) fn csv_dataset(
+    from: &str,
+    name: &str,
+    engine: Option<&str>,
+) -> spicepod::component::dataset::Dataset {
+    let mut dataset = spicepod::component::dataset::Dataset::new(from, name);
+    dataset.params = Some(Params::from_string_map(
+        vec![("file_format".to_string(), "csv".to_string())]
+            .into_iter()
+            .collect(),
+    ));
+    dataset.acceleration = engine.map(|engine| spicepod::acceleration::Acceleration {
+        enabled: true,
+        engine: Some(engine.to_string()),
+        mode: Mode::Memory,
+        refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
+        ..spicepod::acceleration::Acceleration::default()
+    });
+    dataset
 }
 
 /// Materializes the runtime's configured datasets — the [`Dataset`] values that

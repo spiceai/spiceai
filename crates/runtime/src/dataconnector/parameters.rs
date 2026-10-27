@@ -44,7 +44,8 @@ use crate::{
     dataaccelerator::spice_sys,
     parameters::Parameters,
 };
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_parameters::Diagnostics;
+use runtime_secrets::{Secrets, get_params_with_secrets, secret_sources_from_templates};
 
 use super::{ConnectorComponent, DATA_CONNECTOR_FACTORY_REGISTRY, DataConnectorError};
 use crate::dataconnector::{ODBC_DATACONNECTOR, SCYLLADB_DATACONNECTOR, SCYLLADB_FEATURE};
@@ -188,7 +189,7 @@ impl ConnectorParamsBuilder {
     ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         let name = self.connector.to_string();
         let mut unsupported_type_action = None;
-        let (params, prefix, parameters) = match &self.component {
+        let (params, prefix, parameters, secret_sources) = match &self.component {
             ConnectorComponent::Catalog(catalog) => {
                 let (prefix, parameters) = {
                     let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
@@ -208,6 +209,7 @@ impl ConnectorParamsBuilder {
                     get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await,
                     prefix,
                     parameters,
+                    secret_sources_from_templates(&catalog.params),
                 )
             }
             ConnectorComponent::Dataset(dataset) => {
@@ -241,16 +243,23 @@ impl ConnectorParamsBuilder {
 
                 let params = get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await;
 
-                (params, prefix, parameters)
+                (
+                    params,
+                    prefix,
+                    parameters,
+                    secret_sources_from_templates(&dataset.params),
+                )
             }
         };
 
-        let parameters = Parameters::try_new(
+        let parameters = Parameters::try_new_with_secret_sources(
             &format!("connector {name}"),
             params.into_iter().collect(),
             prefix,
             secrets,
             parameters,
+            Diagnostics::Report,
+            Some(secret_sources),
         )
         .await?;
 

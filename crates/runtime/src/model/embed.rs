@@ -32,15 +32,15 @@ use llms::bedrock::{
     },
 };
 use runtime_parameters_typed::TypedParams;
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_secrets::{Secrets, get_params_with_secrets, secret_sources_from_templates};
 
 use object_store::ObjectStoreExt;
 
 #[cfg(feature = "models")]
-use llms::embeddings::candle::{download_hf_file, tei::TeiEmbed};
+use llms::embeddings::candle::tei::TeiEmbed;
 use llms::embeddings::{Embed, Error as EmbedError};
 #[cfg(feature = "models")]
-use llms::model2vec::Model2Vec;
+use llms::model2vec::{Model2Vec, Model2VecOptions};
 use llms::openai::DEFAULT_EMBEDDING_MODEL;
 use llms::openai::embed::OpenaiEmbed;
 use secrecy::{ExposeSecret, SecretString};
@@ -97,17 +97,20 @@ pub async fn try_to_embedding(
             from: component.from.clone(),
         })?;
     let params = get_params_with_secrets(Arc::clone(&secrets), &string_params).await;
+    let secret_sources = secret_sources_from_templates(&string_params);
     let component_name = format!("embedding {}", component.name);
 
     match prefix {
         EmbeddingPrefix::Azure => {
-            let typed = embedding_params::azure::AzureEmbeddingParams::try_from_params(
-                &component_name,
-                params,
-                &secrets,
-            )
-            .await
-            .map_err(params_err)?;
+            let typed =
+                embedding_params::azure::AzureEmbeddingParams::try_from_params_with_secret_sources(
+                    &component_name,
+                    params,
+                    &secrets,
+                    &secret_sources,
+                )
+                .await
+                .map_err(params_err)?;
             azure(
                 model_id,
                 component.name.as_str(),
@@ -116,10 +119,11 @@ pub async fn try_to_embedding(
             )
         }
         EmbeddingPrefix::OpenAi => {
-            let typed = embedding_params::openai::OpenAiEmbeddingParams::try_from_params(
+            let typed = embedding_params::openai::OpenAiEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
@@ -134,13 +138,15 @@ pub async fn try_to_embedding(
         }
         #[cfg(feature = "models")]
         EmbeddingPrefix::File => {
-            let typed = embedding_params::file::FileEmbeddingParams::try_from_params(
-                &component_name,
-                params,
-                &secrets,
-            )
-            .await
-            .map_err(params_err)?;
+            let typed =
+                embedding_params::file::FileEmbeddingParams::try_from_params_with_secret_sources(
+                    &component_name,
+                    params,
+                    &secrets,
+                    &secret_sources,
+                )
+                .await
+                .map_err(params_err)?;
             file(
                 model_id.as_deref(),
                 component,
@@ -157,10 +163,11 @@ pub async fn try_to_embedding(
         EmbeddingPrefix::HuggingFace => {
             // Parsing loads an `hf_token` the Spicepod does not set from the secret stores.
             let token_in_spicepod = params.contains_key("hf_token");
-            let typed = embedding_params::huggingface::HuggingFaceEmbeddingParams::try_from_params(
+            let typed = embedding_params::huggingface::HuggingFaceEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
@@ -178,20 +185,22 @@ pub async fn try_to_embedding(
             from: "huggingface".to_string(),
         }),
         EmbeddingPrefix::Google => {
-            let typed = embedding_params::google::GoogleEmbeddingParams::try_from_params(
+            let typed = embedding_params::google::GoogleEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
             google(model_id, &typed, embeddings_cache.clone()).await
         }
         EmbeddingPrefix::Databricks => {
-            let typed = embedding_params::databricks::DatabricksEmbeddingParams::try_from_params(
+            let typed = embedding_params::databricks::DatabricksEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
@@ -205,10 +214,11 @@ pub async fn try_to_embedding(
         }
         #[cfg(feature = "bedrock")]
         EmbeddingPrefix::Bedrock => {
-            let typed = embedding_params::bedrock::BedrockEmbeddingParams::try_from_params(
+            let typed = embedding_params::bedrock::BedrockEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
@@ -220,14 +230,24 @@ pub async fn try_to_embedding(
         }),
         #[cfg(feature = "models")]
         EmbeddingPrefix::Model2Vec => {
-            let typed = embedding_params::model2vec::Model2VecEmbeddingParams::try_from_params(
+            // Parsing loads an `hf_token` the Spicepod does not set from the secret stores.
+            let token_in_spicepod = params.contains_key("hf_token");
+            let typed = embedding_params::model2vec::Model2VecEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
                 &secrets,
+                &secret_sources,
             )
             .await
             .map_err(params_err)?;
-            model2vec(model_id, &typed, embeddings_cache.clone())
+            model2vec(
+                &component.name,
+                model_id,
+                &typed,
+                token_in_spicepod,
+                embeddings_cache.clone(),
+            )
+            .await
         }
         #[cfg(not(feature = "models"))]
         EmbeddingPrefix::Model2Vec => Err(EmbedError::UnknownModelSource {
@@ -237,9 +257,11 @@ pub async fn try_to_embedding(
 }
 
 #[cfg(feature = "models")]
-fn model2vec(
+async fn model2vec(
+    name: &str,
     model_id: Option<String>,
     params: &embedding_params::model2vec::Model2VecEmbeddingParams,
+    token_in_spicepod: bool,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_id) = model_id else {
@@ -248,24 +270,24 @@ fn model2vec(
         });
     };
 
-    // `model2vec:` has no revision plumbing: `EmbeddingPrefix::Model2Vec` is a bare
-    // `strip_prefix`, so a trailing `:rev` stays glued to the model id, and
-    // `StaticModel::from_pretrained` takes no revision argument to hand it to. The id
-    // therefore reaches the Hub as part of the *repository name*, which 401s — a bare
-    // auth error for what is really an unsupported-configuration mistake (#12445).
+    // `model2vec:` takes no revision: `EmbeddingPrefix::Model2Vec` is a bare
+    // `strip_prefix`, so a trailing `:rev` stays glued to the model id, which then names
+    // a repository the Hub does not have — a bare not-found error for what is really an
+    // unsupported-configuration mistake (#12445).
     //
     // Say so instead. `pinned_revision` defers to the same regex the `huggingface:`
     // arm uses rather than splitting on the last ':', so the two agree about what a
     // revision is: only an `org/model:rev` shape has one, and a local path — the other
-    // thing `from_pretrained` accepts, including a Windows `C:/…` — passes through.
+    // thing `Model2Vec::load` accepts, including a Windows `C:/…` — passes through.
     //
-    // The `exists()` guard mirrors `from_pretrained`'s own precedence, which tries the
+    // The existence check mirrors `Model2Vec::load`'s own precedence, which tries the
     // id as a local path before treating it as a repo name. Without it, a directory
     // that happened to match the `org/model:rev` shape would be rejected here even
     // though the loader would have opened it — so this only ever rejects ids that
-    // really would have gone to the Hub and 401'd.
+    // really would have gone to the Hub.
+    let exists_locally = tokio::fs::try_exists(&model_id).await.unwrap_or(false);
     if let Some(revision) = pinned_revision(&model_id)
-        .filter(|_| !Path::new(&model_id).exists())
+        .filter(|_| !exists_locally)
         .map(ToString::to_string)
     {
         return Err(EmbedError::RevisionPinningUnsupported {
@@ -275,19 +297,28 @@ fn model2vec(
         });
     }
 
-    Model2Vec::from_params(
-        &model_id,
-        params.hf_token.as_ref().map(ExposeSecret::expose_secret),
-        params.normalize,
-        params.subfolder.as_deref(),
-        params.parallelism,
-        params.embed_max_token_length,
-        params.embed_custom_batch_size,
-    )
-    .map(|m| Arc::new(m.set_cache(embeddings_cache)) as Arc<dyn Embed>)
-    .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-        source: Box::new(e),
-    })
+    let hub = llms::hf::HubParams {
+        token: params.hf_token.as_ref(),
+        token_in_spicepod,
+        endpoint: params.hf_endpoint.as_deref(),
+    };
+    let options = Model2VecOptions {
+        normalize: params.normalize,
+        subfolder: params.subfolder.clone(),
+        parallelism: params.parallelism,
+        embed_max_token_length: params.embed_max_token_length,
+        embed_custom_batch_size: params.embed_custom_batch_size,
+    };
+    Model2Vec::load(name, &model_id, hub, options)
+        .await
+        .map(|m| Arc::new(m.set_cache(embeddings_cache)) as Arc<dyn Embed>)
+        .map_err(|e| match e {
+            // It names the model, the cause and the fix already.
+            EmbedError::FailedToDownloadModel { .. } => e,
+            e => EmbedError::FailedToInstantiateEmbeddingModel {
+                source: Box::new(e),
+            },
+        })
 }
 
 async fn google(
@@ -686,7 +717,7 @@ async fn openai(
             HashMap::default()
         };
 
-        let bytz = get_bytes_for_file(tokenizer_file.path.as_str(), &file_params)
+        let bytz = get_bytes_for_file(&component.name, tokenizer_file.path.as_str(), &file_params)
             .await
             .map_err(|source| EmbedError::FailedToCreateTokenizer { source })?;
 
@@ -702,15 +733,19 @@ async fn openai(
 ///   - Huggingface URLs, e.g. `<https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/blob/main/tokenizer.json>`.
 ///   - Huggingface `FssSpec`: `hf://[<repo_type_prefix>]<repo_id>[@<revision>]/<path/in/repo>`.
 async fn get_bytes_for_file(
+    component: &str,
     url: &str,
     params: &HashMap<String, SecretString>,
 ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(not(feature = "models"))]
-    let _ = params;
+    let _ = (component, params);
 
     #[cfg(feature = "models")]
     {
-        match url.split('/').collect_vec().as_slice() {
+        use llms::hf::RepoType;
+        let hf_token = params.get("hf_token");
+        let segments = url.split('/').collect_vec();
+        let (kind, org_id, model_id_revision, file) = match segments.as_slice() {
             [
                 "https:",
                 "",
@@ -722,62 +757,38 @@ async fn get_bytes_for_file(
                 file @ ..,
             ] => {
                 return get_file_from_hf(
-                    None,
-                    org_id,
-                    model_id,
+                    component,
+                    RepoType::Model,
+                    &format!("{org_id}/{model_id}"),
                     Some(branch),
-                    file.join("/").as_str(),
-                    params
-                        .get("hf_token")
-                        .map(secrecy::ExposeSecret::expose_secret),
+                    &file.join("/"),
+                    hf_token,
                 )
                 .await;
             }
             ["hf:", "", "datasets", org_id, model_id_revision, file @ ..] => {
-                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-
-                return get_file_from_hf(
-                    Some("datasets"),
-                    org_id,
-                    model_id,
-                    branch,
-                    file.join("/").as_str(),
-                    params
-                        .get("hf_token")
-                        .map(secrecy::ExposeSecret::expose_secret),
-                )
-                .await;
+                (RepoType::Dataset, *org_id, *model_id_revision, file)
             }
             ["hf:", "", "spaces", org_id, model_id_revision, file @ ..] => {
-                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-                return get_file_from_hf(
-                    Some("spaces"),
-                    org_id,
-                    model_id,
-                    branch,
-                    file.join("/").as_str(),
-                    params
-                        .get("hf_token")
-                        .map(secrecy::ExposeSecret::expose_secret),
-                )
-                .await;
+                (RepoType::Space, *org_id, *model_id_revision, file)
             }
             ["hf:", "", "models", org_id, model_id_revision, file @ ..]
             | ["hf:", "", org_id, model_id_revision, file @ ..] => {
-                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-                return get_file_from_hf(
-                    Some("models"),
-                    org_id,
-                    model_id,
-                    branch,
-                    file.join("/").as_str(),
-                    params
-                        .get("hf_token")
-                        .map(secrecy::ExposeSecret::expose_secret),
-                )
-                .await;
+                (RepoType::Model, *org_id, *model_id_revision, file)
             }
-            _ => {}
+            _ => (RepoType::Model, "", "", &[][..]),
+        };
+        if !org_id.is_empty() {
+            let (model_id, revision) = parse_model_id_w_revision(model_id_revision);
+            return get_file_from_hf(
+                component,
+                kind,
+                &format!("{org_id}/{model_id}"),
+                revision,
+                &file.join("/"),
+                hf_token,
+            )
+            .await;
         }
     }
 
@@ -808,28 +819,31 @@ fn parse_model_id_w_revision(model_w_revision: &str) -> (&str, Option<&str>) {
 
 #[cfg(feature = "models")]
 async fn get_file_from_hf(
-    repo_type: Option<&str>,
-    org_id: &str,
-    model_id: &str,
-    branch: Option<&str>,
+    component: &str,
+    kind: llms::hf::RepoType,
+    repo: &str,
+    revision: Option<&str>,
     file: &str,
-    hf_token: Option<&str>,
+    hf_token: Option<&SecretString>,
 ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-    match download_hf_file(
-        format!("{org_id}/{model_id}").as_str(),
-        branch,
-        repo_type,
-        file,
-        hf_token,
-    )
-    .await
-    {
-        Ok(path) => {
-            let bytz = fs::read(path).await.boxed()?;
-            Ok(bytz.into())
-        }
-        Err(e) => Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-            "Downloaded HF url, but failed to get local path. Error: {e:?}"
-        ))),
-    }
+    let requester = llms::hf::Requester {
+        kind: "embedding model",
+        name: component.to_string(),
+        docs_url: "https://spiceai.org/docs/components/embeddings",
+        // Spice loads an embedding model once.
+        retried: false,
+    };
+    let hub = llms::hf::HubParams {
+        token: hf_token,
+        // The file's own `hf_token`, never loaded from a secret store.
+        token_in_spicepod: true,
+        endpoint: None,
+    };
+    let snapshot = llms::hf::open_paths(requester, kind, repo, revision, hub, &[file]).await?;
+    let path = snapshot
+        .download(&[file])
+        .await?
+        .pop()
+        .ok_or("the download returned no file")?;
+    Ok(fs::read(path).await?.into())
 }

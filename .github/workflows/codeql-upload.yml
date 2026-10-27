@@ -89,6 +89,14 @@ jobs:
           # Events that load the analysis file from a merge commit can rewrite
           # it. Publish only when the blob at the scanned SHA is the default
           # branch's file. The runs API does not include default_branch.
+          #
+          # A queued pull request that edits the analysis file (a Dependabot
+          # bump of codeql-action, for one) always differs here, as does a batch
+          # cut before trunk last changed it. Its SARIF is still never
+          # published, but the run ends with a notice rather than a failure:
+          # the batch reaches trunk only by merging, the trunk push analyzes any
+          # code it changes with the trunk file, and an ejected batch never
+          # reaches a protected branch. Every other refusal here still fails.
           require_default_branch_workflow() {
             local scanned_ref="$1"
             local default_branch scanned_blob trusted_blob
@@ -104,8 +112,9 @@ jobs:
               exit 1
             fi
             if [[ "${scanned_blob}" != "${trusted_blob}" ]]; then
-              echo "::error::Refusing to upload SARIF: '${expected_path}' at '${scanned_ref}' does not match '${default_branch}', so the producer is not the trusted analysis workflow."
-              exit 1
+              echo "::notice::Not uploading SARIF: '${expected_path}' at '${scanned_ref}' does not match '${default_branch}', so the producer is not the trusted analysis workflow. Not a failure: once the batch merges, the ${default_branch} push analyzes any code it changes with the ${default_branch} file."
+              echo "skip=true" >> "${GITHUB_OUTPUT}"
+              exit 0
             fi
           }
 
@@ -168,6 +177,7 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
       - name: Download SARIF artifact
+        if: steps.source.outputs.skip != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: codeql-sarif-*
@@ -182,8 +192,9 @@ jobs:
       # longer exists. The next step decides whether a failure here is that.
       - name: Upload SARIF to code scanning
         id: upload
+        if: steps.source.outputs.skip != 'true'
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           sarif_file: sarif-results
           category: /language:rust

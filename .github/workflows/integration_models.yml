@@ -384,6 +384,13 @@ jobs:
           unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- local_embeddings_beta_requirements
 
+      # Embeddings come from a local stub, so no credentials are needed
+      - name: Run embedding filter and limit tests
+        if: ${{ !cancelled() }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- embedding_filter_limit
+
       - name: Run AI UDF with local model test
         if: ${{ !cancelled() && env.HAS_HF_SECRET == 'true' }}
         env:

@@ -1,0 +1,38 @@
+# Shared variants. A script names one in its `variants:` instead of writing the
+# patch (`cayenne: cayenne-file`); a name not defined here fails `--check`.
+# Each entry is a variant patch, shaped like one written in a script: `datasets`
+# patches datasets by name (`*` for all), `spicepod` patches the whole
+# spicepod, and `env` and `when` are as in a script. Scripts in the
+# directories below this one use this file too.
+
+# The spicepod as written.
+federated: {}
+
+arrow:
+  datasets: { '*': { acceleration: { enabled: true, engine: arrow } } }
+arrow-memory:
+  datasets: { '*': { acceleration: { enabled: true, engine: arrow, mode: memory } } }
+
+cayenne-file:
+  datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } }
+cayenne-memory:
+  datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: memory } } }
+
+duckdb:
+  datasets: { '*': { acceleration: { enabled: true, engine: duckdb } } }
+duckdb-file:
+  datasets: { '*': { acceleration: { enabled: true, engine: duckdb, mode: file } } }
+duckdb-memory:
+  datasets: { '*': { acceleration: { enabled: true, engine: duckdb, mode: memory } } }
+
+sqlite:
+  datasets: { '*': { acceleration: { enabled: true, engine: sqlite } } }
+sqlite-file:
+  datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: file } } }
+sqlite-memory:
+  datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: memory } } }
+
+turso-file:
+  datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: file } } }
+turso-memory:
+  datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: memory } } }

@@ -17,6 +17,8 @@ on:
       - 'crates/rerank-api/**'
       - 'crates/evaluate-api/**'
       - 'crates/evaluate-chat/**'
+      - 'crates/llms-llamacpp/**'
+      - 'crates/llama-cpp/**'
   merge_group:
     branches:
       - trunk
@@ -298,3 +300,33 @@ jobs:
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+  llama-cpp-engine:
+    name: llama.cpp engine (Qwen3-0.6B GGUF)
+    # The engine's model and differential tests download Qwen3-0.6B (639 MB), and its MTP
+    # tests Qwen3.5-0.8B (550 MB), from Hugging Face and run them; its no-network tests run
+    # in `make nextest`.
+    if: github.event_name != 'workflow_dispatch' || inputs.run != 'hosted'
+    runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
+    # Sized like the build job above: a cold cache rebuilds llama.cpp and mistral.rs.
+    timeout-minutes: 180
+    permissions: read-all
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up the C and C++ toolchain
+        uses: ./.github/actions/setup-cc
+
+      - name: Run the llama.cpp engine's model, differential, MTP and unsupported-architecture tests
+        env:
+          # Metal runners do not have `xcrun metal`
+          # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
+          MISTRALRS_METAL_PRECOMPILE: 0
+        run: |
+          cargo test -p llms-llamacpp --features metal --test integration -- model:: differential:: mtp:: unsupported::

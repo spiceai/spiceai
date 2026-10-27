@@ -16,6 +16,10 @@ limitations under the License.
 
 //! Turso data accelerator for high-performance local caching.
 //!
+//! The standalone `turso` accelerator is deprecated in v2.4 and scheduled for removal
+//! in v2.5: migrate accelerations to Cayenne (`engine: cayenne`). Turso as Cayenne's
+//! metastore is unaffected.
+//!
 //! This module provides acceleration capabilities using Turso (libSQL) as a local database
 //! for caching and accelerating query performance. It supports both in-memory and file-based
 //! acceleration modes.

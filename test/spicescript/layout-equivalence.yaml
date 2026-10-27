@@ -1,0 +1,97 @@
+name: layout-equivalence
+description: >
+  How Cayenne lays data out never changes an answer: sorted, sharded,
+  partitioned, indexed, and cold-tiered (to an S3-compatible bucket)
+  accelerations of the same generated table all answer a pruning-sensitive
+  corpus like the source, under full refresh and CDC, before and after
+  updates, deletes and inserts.
+
+sources:
+  src: { kind: postgres }
+  # The bucket a tiered variant moves cold data to.
+  lake: { kind: rustfs }
+
+matrix:
+  refresh_mode: [full, changes]
+
+variants:
+  baseline: {}
+  sorted:
+    datasets: { facts: { acceleration: { params: { cayenne_sort_columns: 'grp,ts' } } } }
+  sharded:
+    datasets: { facts: { acceleration: { params: { cayenne_shard_key_columns: grp } } } }
+  partitioned:
+    datasets: { facts: { acceleration: { partition_by: [{ bucket: 'bucket(8, id)' }] } } }
+  indexed:
+    datasets: { facts: { acceleration: { indexes: { grp: enabled } } } }
+  # The datalake tier takes changes or append refresh, not full.
+  tiered:
+    when: { refresh_mode: changes }
+    datasets:
+      facts:
+        acceleration:
+          params:
+            cayenne_datalake_location: 's3://${sources.lake.bucket}/lake'
+            cayenne_datalake_s3_auth: key
+            cayenne_datalake_s3_key: '${sources.lake.key}'
+            cayenne_datalake_s3_secret: '${sources.lake.secret}'
+            cayenne_datalake_s3_endpoint: '${sources.lake.endpoint}'
+            cayenne_datalake_s3_region: us-east-1
+            cayenne_cluster_by: grp
+            cayenne_datalake_warm_max_files: '1'
+            cayenne_datalake_tiering_check_interval_ms: '200'
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: layout-equivalence
+  datasets:
+    - from: postgres:public.facts
+      name: facts
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: '${matrix.refresh_mode}'
+        primary_key: id
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - generate:
+      src:
+        table: facts
+        rows: 300000
+        seed: 11
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: grp, int: [1, 200] }
+          - { name: ts, timestamp: ['2024-01-01', '2024-12-31'] }
+          - { name: amount, decimal: { range: [0, 1000], scale: 2 } }
+          - { name: label, choice: [alpha, beta, gamma, delta] }
+          - { name: note, text: [3, 20], nulls: 0.2 }
+  - start: {}
+  - corpus: corpus/layout.sql
+    eventually: 60s
+
+
+  - source-exec:
+      src:
+        - UPDATE facts SET grp = grp % 50 + 1, amount = amount + 1 WHERE id % 9 = 0
+        - DELETE FROM facts WHERE id % 13 = 0
+        - INSERT INTO facts SELECT id + 1000000, grp, ts + INTERVAL '1 day', amount, label, note FROM facts WHERE id % 17 = 0
+  - refresh: facts
+    when: { refresh_mode: full }
+  - corpus: corpus/layout.sql
+    eventually: 60s
+  # The indexed variant answered through its index.
+  - explain: SELECT * FROM facts WHERE grp = 17
+    contains: lookup_index=grp
+    only: indexed
+  # The tiered variant moved data to its bucket.
+  - assert-objects: { source: lake, prefix: lake, min: 1 }
+    eventually: 60s
+    only: tiered

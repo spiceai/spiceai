@@ -1,0 +1,38 @@
+name: surface
+description: >
+  Query surface beyond the extended corpus answers through Spice as PostgreSQL
+  answers it over the same rows, federated and on every acceleration engine:
+  time zones and daylight-saving changes, JSON, arrays and UNNEST, recursive
+  CTEs, large IN lists, math, strings, conditionals, window frames, grouping
+  sets, LATERAL and quantified subqueries.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  federated: {}
+  arrow: arrow
+  cayenne: cayenne-file
+  duckdb: duckdb-file
+  sqlite: sqlite-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: surface
+  datasets:
+    - { from: 'postgres:public.ev', name: ev, params: '${sources.src.params}' }
+    - { from: 'postgres:public.edges', name: edges, params: '${sources.src.params}' }
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  also-http: true
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: { file: seed/surface-postgres.sql }
+  - start: {}
+  - corpus: corpus/surface.sql

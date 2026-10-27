@@ -331,6 +331,15 @@ pub(crate) fn test_request_context() -> Arc<RequestContext> {
     Arc::clone(&TEST_REQUEST_CONTEXT)
 }
 
+/// `N` distinct free ports. Every listener stays bound until all `N` are picked, so the
+/// operating system cannot return the same port twice.
+pub(crate) fn free_ports<const N: usize>() -> [u16; N] {
+    let listeners: [std::net::TcpListener; N] = std::array::from_fn(|_| {
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port")
+    });
+    listeners.map(|listener| listener.local_addr().expect("local addr").port())
+}
+
 pub(crate) async fn run_query(
     rt: &Arc<Runtime>,
     query: &str,
@@ -357,9 +366,17 @@ pub(crate) async fn run_query(
 /// "nothing federated" and "the assertion could not be made" must not look the
 /// same to a caller asserting emptiness.
 pub(crate) fn pushed_down_sql(plan: &[RecordBatch]) -> Result<String, anyhow::Error> {
+    federated_sql(plan, "base_sql=")
+}
+
+/// The rest of each federated scan's line after `field` in an `EXPLAIN`, one
+/// per line. [`pushed_down_sql`] reads `base_sql=`; a test asserting what an
+/// executor's own rewrites send reads `rewritten_executor_sql=`, the last field
+/// on that line.
+pub(crate) fn federated_sql(plan: &[RecordBatch], field: &str) -> Result<String, anyhow::Error> {
     let rendered = to_pretty_display(plan)?.to_string();
     Ok(rendered
-        .split("base_sql=")
+        .split(field)
         .skip(1)
         .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
         .collect::<Vec<_>>()

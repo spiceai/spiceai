@@ -159,6 +159,7 @@ use change_generations::{
 };
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
+pub(crate) mod output_reservation;
 pub(crate) mod query_memory_pool;
 pub use runtime_datafusion::composed_catalog;
 // `error` and `refresh_sql` below are named throughout the runtime through these
@@ -183,7 +184,9 @@ pub use runtime_table::table_provider_with_spicepod_metadata;
 pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
-pub(crate) mod sql_depth_guard;
+pub(crate) use runtime_query_engine::sql_depth_guard;
+#[cfg(test)]
+mod sql_depth_guard_tests;
 pub(crate) mod sql_validator;
 pub mod tool_udf;
 pub mod udf;
@@ -510,7 +513,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' (optionally with 'partition_by') or 'cayenne' instead."
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
     ))]
     UnsupportedDistributedAccelerationEngine {
         dataset_name: String,
@@ -1390,6 +1393,7 @@ pub trait DatasetPlacement: std::fmt::Debug + Send + Sync {
 /// The verdict is point-in-time and does not survive into the side effect the
 /// caller then commits; closing that remaining window needs the side effect
 /// itself to carry a generation (#13746).
+#[derive(Clone)]
 pub struct TableInstance {
     table: TableReference,
     /// Held weakly on purpose. A `Weak` keeps the allocation open, so a dropped
@@ -1924,7 +1928,7 @@ impl DataFusion {
     /// action captured against the old one is about a table that is no longer
     /// there.
     #[must_use]
-    async fn table_instance_is_current(&self, instance: &TableInstance) -> bool {
+    pub(crate) async fn table_instance_is_current(&self, instance: &TableInstance) -> bool {
         let Some(captured) = instance.provider.as_ref() else {
             // Nothing resolved under the name when the instance was captured, so
             // there is no identity to compare against; the most the registry can
@@ -4163,6 +4167,7 @@ impl DataFusion {
         let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching)
             || (source.as_any().is::<SinkConnector>()
                 && !matches!(refresh_mode, RefreshMode::Snapshot));
+        let mut initial_status = None;
         if !initial_load_complete
             && let Ok(checkpoint) = dataset_checkpointer(
                 dataset,
@@ -4173,18 +4178,12 @@ impl DataFusion {
             .await
             && checkpoint.exists().await
         {
-            // For append refreshes that rely on a time column (i.e. file-based appends) that have
-            // snapshotting enabled, we delay readiness until the first refresh completes so that
-            // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
-            // Additionally, for CDC we let connector/stream to decide when dataset is ready.
+            // For CDC we let connector/stream to decide when dataset is ready.
             //
             // A dataset that reads snapshots (`file_format: snapshot`) is ready only once it
             // has restored a snapshot in this process: a copy left from an earlier run can be
             // arbitrarily old, or from a location the dataset no longer reads.
-            let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
-                && dataset.time_column.is_some()
-                && acceleration_settings.snapshot_behavior.bootstrap_enabled()
-                || matches!(refresh_mode, RefreshMode::Changes)
+            let delay_initial_ready = matches!(refresh_mode, RefreshMode::Changes)
                 || (dataset.is_snapshot_source()
                     && bootstrap_status.loaded_snapshot_id().is_none());
 
@@ -4200,13 +4199,16 @@ impl DataFusion {
                 // `Refreshing` itself when it starts.
                 let awaits_source = effective_ready_state == ReadyState::OnSchemaResolved
                     && source_table_provider.awaits_source();
-                let initial_status = if awaits_source {
+                //
+                // Reported when the refresher starts rather than here: the dataset's search
+                // indexes are rebuilt from the acceleration first, and it is not registered
+                // until they are, so reporting it ready now would let `/v1/ready` answer while
+                // queries against it still fail.
+                initial_status = Some(if awaits_source {
                     status::ComponentStatus::Initializing
                 } else {
                     status::ComponentStatus::Ready
-                };
-                self.runtime_status
-                    .update_dataset(&dataset.name, initial_status);
+                });
                 initial_load_complete = true;
             }
         }
@@ -4610,6 +4612,9 @@ impl DataFusion {
         }
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
+        if let Some(initial_status) = initial_status {
+            accelerated_table_builder.initial_status(initial_status);
+        }
 
         // Caching mode requires federation to be disabled so that queries go through
         // AcceleratedTable::scan to trigger the cache miss/hit logic
@@ -6495,12 +6500,33 @@ impl DataFusion {
 
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
-            // the tables are created. To handle this, wait until all tables are created.
+            // the tables are created. To handle this, wait until all tables are created,
+            // including tables only a subquery reads: a Spicepod change that replaces a
+            // dataset registers the views reading it again before the dataset is.
+            // A table function and `information_schema` are not catalog tables, and never
+            // exist.
+            let tables_read = {
+                let state = ctx.state();
+                let mut tables_read = dependent_table_names.clone();
+                for table in state
+                    .resolve_table_references(&statements[0])
+                    .unwrap_or_default()
+                {
+                    let is_table_function = table.schema().is_none()
+                        && state.table_functions().contains_key(table.table());
+                    let is_information_schema = table.schema() == Some("information_schema");
+                    if !is_table_function && !is_information_schema && !tables_read.contains(&table)
+                    {
+                        tables_read.push(table);
+                    }
+                }
+                tables_read
+            };
 
             let deadline = Instant::now() + Duration::from_mins(1);
             let mut unresolved_dependent_table: Option<TableReference> = None;
 
-            for dependent_table_name in &dependent_table_names {
+            for dependent_table_name in &tables_read {
                 let mut attempts = 0;
                 if unresolved_dependent_table.is_some() {
                     break;
@@ -6666,7 +6692,11 @@ impl DataFusion {
                 secrets,
             )
             .await?;
-        source.mark_registered();
+        let instance = match &registration {
+            Some((instance, _)) => instance.clone(),
+            None => self.capture_table_instance(&view.name).await,
+        };
+        source.mark_registered(instance);
         Ok(registration)
     }
 
@@ -7883,8 +7913,9 @@ async fn build_snapshot_refresh_state(
     let swappable_provider = SwappableTableProvider::new(initial_provider);
     let current_snapshot_id = std::sync::Arc::new(std::sync::Mutex::new(bootstrap_loaded_id));
     let source: Arc<dyn crate::dataaccelerator::AccelerationSource> = Arc::new(dataset.clone());
-    // The initial provider serves the restored snapshot; the engine may reclaim
-    // what an earlier process left that this snapshot no longer references.
+    // The initial provider serves the local snapshot, which may be older than the
+    // one the first refresh restores; the engine may reclaim what an earlier
+    // process left that this snapshot no longer references.
     accelerator
         .maintain_after_snapshot_restore(source.as_ref(), &swappable_provider.current())
         .await;
@@ -9080,6 +9111,12 @@ mod tests {
                     Err(Error::UnsupportedDistributedAccelerationEngine { .. })
                 ),
                 "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+            // The fix it names is the engine that stays: `arrow` is deprecated, and
+            // Cayenne partitions only in file mode.
+            assert_eq!(
+                result.expect_err("duckdb is rejected").to_string(),
+                "Failed to create an accelerated table for dataset my_dataset: the 'duckdb' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
             );
         }
 

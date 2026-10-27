@@ -377,11 +377,11 @@ impl CayenneStagedAppend {
             // publish), which finalizes via `apply_under_held_barrier` and holds
             // the lock across the coordinated commit. A single-table
             // current-snapshot append finalizes via `finish` → `apply_under_barrier`,
-            // which RE-ACQUIRES `write_lock` in `lock_current_snapshot_for_apply`:
-            // keeping the guard here would self-deadlock that re-acquire and block
-            // any concurrent staged append. Dropping it (it stays held through this
-            // method's WAL write, then releases when `self` is consumed) mirrors the
-            // pre-refactor behavior and the `write_cdc_pipelined` guard handling.
+            // which takes `write_lock` in `lock_current_snapshot_for_apply` via
+            // `acquire_or_share` (an outer UPDATE hold is reused; a local hold
+            // that is not in `write_lock_held` would still self-deadlock). Drop
+            // the local guard here so the non-UPDATE path can re-acquire, then
+            // release when `self` is consumed.
             write_guard: if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
                 None
             } else {
@@ -760,7 +760,9 @@ impl PreparedStagedAppend {
 
     async fn lock_current_snapshot_for_apply(&self) -> Option<OwnedMutexGuard<()>> {
         if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
-            Some(self.table.write_lock_arc().lock_owned().await)
+            // Autocommit UPDATE already holds `write_lock`. A second acquire
+            // deadlocks after Stage A. `acquire_or_share` reuses that hold.
+            Some(super::write_lock_held::acquire_or_share(&self.table.write_lock_arc()).await)
         } else {
             None
         }
@@ -769,6 +771,9 @@ impl PreparedStagedAppend {
     fn try_lock_current_snapshot_for_held_barrier(&self) -> Result<Option<OwnedMutexGuard<()>>> {
         if self.target_kind != StagingWalTargetKind::CurrentSnapshot || self.write_guard.is_some() {
             return Ok(None);
+        }
+        if super::write_lock_held::is_held() {
+            return Ok(Some(super::write_lock_held::dummy_owned_guard()));
         }
 
         self.table.write_lock_arc().try_lock_owned().map(Some).map_err(|_| Error::Internal {

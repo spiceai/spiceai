@@ -1,0 +1,50 @@
+name: config-errors
+description: >
+  A dataset with a configuration or connection mistake is reported in Error
+  with a message that names it and what is wrong — an unknown connector
+  (listing the known ones), an unreachable host, a rejected password, a
+  primary key, time column or partition naming no column, refresh_sql over
+  another table, a missing file, a missing table — while a healthy dataset
+  beside them serves.
+
+sources:
+  src: { kind: postgres }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: probe-config
+  datasets:
+    - { from: 'postgres:public.t', name: healthy, params: '${sources.src.params}' }
+    - { from: 'nosuchconnector:whatever', name: bad_connector }
+    - { from: 'postgres:public.t', name: bad_host, params: { $merge: '${sources.src.params}', pg_host: no-such-host.invalid } }
+    - { from: 'postgres:public.t', name: bad_password, params: { $merge: '${sources.src.params}', pg_pass: wrong } }
+    - { from: 'postgres:public.t', name: bad_pk, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, primary_key: nosuchcol } }
+    - { from: 'postgres:public.t', name: bad_time_column, params: '${sources.src.params}', time_column: nosuchcol, acceleration: { enabled: true, engine: cayenne, refresh_mode: append } }
+    - { from: 'postgres:public.t', name: bad_partition, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, partition_by: [nosuchcol] } }
+    - { from: 'postgres:public.t', name: bad_refresh_sql, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, refresh_sql: 'SELECT * FROM somewhere_else' } }
+    - { from: 'file:/no/such/file.parquet', name: bad_file }
+    - { from: 'postgres:public.no_such_table', name: bad_table, params: '${sources.src.params}' }
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a')" }
+  - start: { ready: false }
+  - query: SELECT * FROM healthy
+    expect: { rows: [['1', a]] }
+    eventually: 30s
+  - assert-status: { dataset: bad_connector, status: Error, message-contains: "Unknown data connector 'nosuchconnector'. Available: abfs" }
+    eventually: 30s
+  - assert-status: { dataset: bad_host, status: Error, message-contains: "Cannot connect to the dataset bad_host (postgres) on no-such-host.invalid" }
+    eventually: 30s
+  - assert-status: { dataset: bad_password, status: Error, message-contains: "Cannot connect to the dataset bad_password (postgres). Authentication failed. Ensure that the username and password are correctly configured" }
+    eventually: 30s
+  - assert-status: { dataset: bad_pk, status: Error, message-contains: "Failed to setup the dataset bad_pk (postgres). Unable to create dataset acceleration: Invalid configuration: Primary key column 'nosuchcol' was not found in the schema. Valid columns: id, v" }
+    eventually: 30s
+  - assert-status: { dataset: bad_time_column, status: Error, message-contains: "time_column 'nosuchcol' was not found in dataset bad_time_column" }
+    eventually: 30s
+  - assert-status: { dataset: bad_partition, status: Error, message-contains: "Failed to setup the dataset bad_partition (postgres)" }
+    eventually: 30s
+  - assert-status: { dataset: bad_refresh_sql, status: Error, message-contains: "Table name in refresh_sql should be bad_refresh_sql, is somewhere_else" }
+    eventually: 30s
+  - assert-status: { dataset: bad_file, status: Error, message-contains: "No data files are yet available for the dataset bad_file (file)" }
+    eventually: 30s
+  - assert-status: { dataset: bad_table, status: Error, message-contains: "Failed to load the dataset bad_table (postgres). The table, 'public.no_such_table', was not found." }
+    eventually: 30s

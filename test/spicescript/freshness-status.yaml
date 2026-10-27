@@ -1,0 +1,44 @@
+name: freshness-status
+description: >
+  /v1/datasets reports when each acceleration last refreshed and will refresh
+  next: a cron schedule's next tick (at the top of the hour for an hourly
+  cron), an interval's next check, and no next refresh for a dataset with no
+  schedule; a refresh that fails while the source is down reports the error
+  and the data stays served.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: freshness-status
+  datasets:
+    - { from: 'postgres:public.t', name: cron_hourly, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, refresh_cron: '0 0 * * * *' } }
+    - { from: 'postgres:public.t', name: every10s, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, refresh_check_interval: 10s } }
+    - { from: 'postgres:public.t', name: manual, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne } }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a'), (2, 'b')" }
+  - start: {}
+  - http: { path: '/v1/datasets?status=true' }
+    expect:
+      status: 200
+      body-matches:
+        - '"name":"cron_hourly"[^}]*"last_refresh":"\d{4}-\d\d-\d\dT[\d:.]+Z","next_refresh":"\d{4}-\d\d-\d\dT\d\d:00:0\d\.\d+Z"'
+        - '"name":"every10s"[^}]*"last_refresh":"[^"]+","next_refresh":"[^"]+"'
+        - '"name":"manual"[^}]*"last_refresh":"[^"]+"'
+      body-lacks: '"name":"manual"[^}]*"next_refresh"'
+
+  # A refresh that fails with the source down leaves the data served.
+  - query: SELECT id, v FROM cron_hourly
+    oracle-sql: SELECT id, v FROM t
+  - stop-source: src
+  - refresh: cron_hourly
+    expect-error: true
+  - assert-status: { dataset: cron_hourly, status: Error, message-contains: PostgreSQL connection failed }
+  - query: SELECT id, v FROM cron_hourly
+    expect: { rows: [['1', a], ['2', b]] }

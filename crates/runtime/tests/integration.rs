@@ -18,6 +18,10 @@ limitations under the License.
 // top-level future exceeds rustc's default 128-deep query limit. Matches the `recursion_limit`
 // the `runtime` crate itself and the sibling integration test crates set.
 #![recursion_limit = "256"]
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
 
 use arrow::{array::RecordBatch, util::display::FormatOptions};
 #[cfg(feature = "mysql")]

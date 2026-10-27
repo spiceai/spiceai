@@ -1,0 +1,59 @@
+name: iceberg-refresh
+description: >
+  An Iceberg table behind a REST catalog answers through Spice like DuckDB
+  reading the same table: federated and accelerated by full refresh into
+  Cayenne and DuckDB, after the first snapshot and after inserts, deletes and
+  updates add snapshots with delete files.
+
+sources:
+  ice: { kind: iceberg }
+
+variants:
+  federated: {}
+  cayenne:
+    datasets: { orders: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
+  duckdb:
+    datasets: { orders: { acceleration: { enabled: true, engine: duckdb, mode: file, refresh_mode: full } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: iceberg-refresh
+  datasets:
+    - from: 'iceberg:${sources.ice.catalog}/v1/namespaces/${sources.ice.namespace}/tables/orders'
+      name: orders
+      params: ${sources.ice.params}
+
+defaults:
+  expect: { oracle: ice }
+  query-timeout: 30s
+
+steps:
+  - source-exec:
+      ice: |
+        CREATE TABLE orders (id BIGINT, cust INTEGER, status VARCHAR, total DECIMAL(12, 2), placed TIMESTAMP, note VARCHAR);
+        INSERT INTO orders
+          SELECT i, i % 500, (['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 100000) / 100.0,
+                 TIMESTAMP '2024-01-01 00:00:00' + to_minutes(i * 37),
+                 CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END
+          FROM range(1, 50001) r(i);
+  - start: {}
+  - query: SELECT * FROM orders
+  - query: SELECT status, count(*), sum(total), min(placed), max(placed) FROM orders GROUP BY status
+  - query: SELECT * FROM orders WHERE cust = 42
+  - query: SELECT count(*), count(note) FROM orders WHERE placed >= TIMESTAMP '2024-02-01 00:00:00'
+
+  # New snapshots: an append, a delete and an update (delete files plus new rows).
+  - source-exec:
+      ice:
+        - INSERT INTO orders SELECT i, i % 500, 'N', 1.00, TIMESTAMP '2025-01-01 00:00:00', NULL FROM range(50001, 51001) r(i)
+        - DELETE FROM orders WHERE id % 7 = 0
+        - UPDATE orders SET total = total + 100 WHERE id % 11 = 0
+  - refresh: orders
+    only: [cayenne, duckdb]
+  - query: SELECT * FROM orders
+    eventually: 30s
+  - query: SELECT status, count(*), sum(total), min(placed), max(placed) FROM orders GROUP BY status
+    eventually: 30s
+  - query: SELECT * FROM orders WHERE cust = 42
+    eventually: 30s

@@ -1,0 +1,103 @@
+name: ducklake-refresh
+description: >
+  A DuckLake table answers through Spice like DuckDB reading the same lake:
+  federated and accelerated by full refresh into Cayenne and DuckDB, after a
+  bulk load and after small inserts, deletes and updates (which DuckLake may
+  keep in its catalog rather than in data files). Rows inserted through Spice
+  reach the lake, and the accelerations keep serving while the lake's catalog
+  is down.
+
+sources:
+  lake: { kind: ducklake }
+
+variants:
+  federated:
+    datasets: { orders: { access: read_write } }
+  cayenne:
+    datasets: { orders: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
+  duckdb:
+    datasets: { orders: { acceleration: { enabled: true, engine: duckdb, mode: file, refresh_mode: full } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: ducklake-refresh
+  datasets:
+    - from: ducklake:main.orders
+      name: orders
+      params: ${sources.lake.params}
+
+defaults:
+  expect: { oracle: lake }
+  query-timeout: 30s
+
+steps:
+  - source-exec:
+      lake: |
+        CREATE TABLE orders (id BIGINT, cust INTEGER, status VARCHAR, total DECIMAL(12, 2), placed TIMESTAMP, note VARCHAR);
+        INSERT INTO orders
+          SELECT i, i % 500, (['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 100000) / 100.0,
+                 TIMESTAMP '2024-01-01 00:00:00' + to_minutes(i * 37),
+                 CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END
+          FROM range(1, 50001) r(i);
+  - start: {}
+  - query: SELECT * FROM orders
+  - query: SELECT status, count(*), sum(total), min(placed), max(placed) FROM orders GROUP BY status
+  - query: SELECT * FROM orders WHERE cust = 42
+  - query: SELECT count(*), count(note) FROM orders WHERE placed >= TIMESTAMP '2024-02-01 00:00:00'
+
+  # Small changes, one snapshot each.
+  - source-exec:
+      lake:
+        - INSERT INTO orders VALUES (60001, 1, 'N', 1.00, TIMESTAMP '2025-01-01 00:00:00', NULL), (60002, 2, 'N', 2.00, TIMESTAMP '2025-01-02 00:00:00', 'small')
+        - DELETE FROM orders WHERE id IN (5, 6, 60001)
+        - UPDATE orders SET total = total + 100, note = 'updated' WHERE id IN (7, 60002)
+  - refresh: orders
+    only: [cayenne, duckdb]
+  - query: SELECT * FROM orders
+    eventually: 30s
+  - query: SELECT * FROM orders WHERE id IN (5, 6, 7, 60001, 60002)
+    eventually: 30s
+
+  # Bulk changes.
+  - source-exec:
+      lake:
+        - INSERT INTO orders SELECT i, i % 500, 'B', 3.00, TIMESTAMP '2025-02-01 00:00:00', NULL FROM range(70001, 80001) r(i)
+        - DELETE FROM orders WHERE id % 7 = 0
+        - UPDATE orders SET total = total + 1 WHERE id % 11 = 0
+  - refresh: orders
+    only: [cayenne, duckdb]
+  - query: SELECT * FROM orders
+    eventually: 30s
+  - query: SELECT status, count(*), sum(total), min(placed), max(placed) FROM orders GROUP BY status
+    eventually: 30s
+
+  # Written through Spice, read back by DuckDB; the accelerated instances get
+  # the same rows at the source, so every instance still answers alike.
+  - spice-exec: "INSERT INTO orders VALUES (90001, 9, 'S', 9.99, TIMESTAMP '2025-03-01 12:00:00', 'via spice'), (90002, 9, 'S', NULL, NULL, NULL)"
+    only: federated
+  - source-exec:
+      lake: "INSERT INTO orders VALUES (90001, 9, 'S', 9.99, TIMESTAMP '2025-03-01 12:00:00', 'via spice'), (90002, 9, 'S', NULL, NULL, NULL)"
+    only: [cayenne, duckdb]
+  - refresh: orders
+    only: [cayenne, duckdb]
+  - query: SELECT * FROM orders WHERE id > 90000
+    eventually: 30s
+  - query: SELECT count(*) FROM orders WHERE id > 90000
+    expect: { rows: [["2"]] }
+
+  # The catalog goes away: the accelerations keep serving what they hold.
+  - query: SELECT * FROM orders
+    only: [cayenne, duckdb]
+    id: before-outage
+  - stop-source: lake
+  - query: SELECT * FROM orders
+    expect: { same-as: before-outage }
+    consistently: 5s
+    only: [cayenne, duckdb]
+  - query: SELECT count(*) FROM orders
+    expect-error: true
+    only: federated
+  - start-source: lake
+  - query: SELECT * FROM orders
+    eventually: 60s

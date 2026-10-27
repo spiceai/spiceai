@@ -212,8 +212,8 @@ async fn vault_token_auth_resolves_pg_password() -> Result<(), anyhow::Error> {
 
             assert_orders_query(&rt).await?;
 
-            vault.remove().await?;
-            pg.remove().await?;
+            vault.cleanup().await;
+            pg.cleanup().await;
             Ok(())
         })
         .await
@@ -293,8 +293,8 @@ async fn vault_approle_auth_resolves_pg_password() -> Result<(), anyhow::Error> 
 
             assert_orders_query(&rt).await?;
 
-            vault.remove().await?;
-            pg.remove().await?;
+            vault.cleanup().await;
+            pg.cleanup().await;
             Ok(())
         })
         .await

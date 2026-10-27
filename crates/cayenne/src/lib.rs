@@ -78,6 +78,15 @@ pub mod __bench_clustering {
     pub use crate::provider::clustering::cluster_keys;
 }
 
+/// In-memory segment statistics pruning, re-exported for benchmarks only. Not a stable API.
+#[doc(hidden)]
+pub mod __bench_segment_pruning {
+    pub use crate::provider::file_pruning::{
+        build_listing_pruning_predicate, should_prune_statistics, statistics_from_record_batches,
+        statistics_may_match,
+    };
+}
+
 /// Returns whether Cayenne can encode `data_type` as a clustering dimension.
 ///
 /// This is exposed for accelerator configuration validation so unsupported
