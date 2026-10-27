@@ -17,7 +17,6 @@ futures.workspace = true
 headers = "0.4"
 http.workspace = true
 opentelemetry.workspace = true
-percent-encoding.workspace = true
 regex.workspace = true
 runtime-auth = { path = "../runtime-auth" }
 sha2.workspace = true
