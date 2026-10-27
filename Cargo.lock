@@ -572,7 +572,7 @@ dependencies = [
  "strum_macros 0.27.2",
  "thiserror 2.0.18",
  "uuid 1.23.2",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -843,7 +843,7 @@ dependencies = [
  "arrow-select",
  "flatbuffers",
  "lz4_flex 0.13.1",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -1492,6 +1492,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a49e05797ca52e312a0c658938b7d00693ef037799ef7187678f212d7684cf"
 dependencies = [
  "debug_unsafe",
+]
+
+[[package]]
+name = "atoi_simd"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3cdb3708a128e559a30fb830e8a77a5022ee6902806925c216658652b452a44"
+dependencies = [
+ "debug_unsafe",
+ "rustversion",
 ]
 
 [[package]]
@@ -3519,7 +3529,7 @@ version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15e02a18e79de779a78b0a6ec84a3deed1ff0607dd970a11369f993263f99f1a"
 dependencies = [
- "atoi_simd",
+ "atoi_simd 0.16.1",
  "byteorder",
  "codepage",
  "encoding_rs",
@@ -3528,6 +3538,23 @@ dependencies = [
  "quick-xml 0.37.5",
  "serde",
  "zip 4.6.1",
+]
+
+[[package]]
+name = "calamine"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9ca341b94bc4b29e08970b1a03914fad2dfe177e2ecb67fcd6de9046004aafb"
+dependencies = [
+ "atoi_simd 0.18.1",
+ "byteorder",
+ "codepage",
+ "encoding_rs",
+ "fast-float2",
+ "log",
+ "quick-xml 0.42.0",
+ "serde",
+ "zip 9.1.2",
 ]
 
 [[package]]
@@ -3556,7 +3583,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/candle.git?rev=efbb9a72e92789eafed0806c3e16f14640c504f6#efbb9a72e92789eafed0806c3e16f14640c504f6"
+source = "git+https://github.com/spiceai/candle.git?rev=5a67f5ecd62321b019c0daffd6613cfb9f71505e#5a67f5ecd62321b019c0daffd6613cfb9f71505e"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -3581,7 +3608,7 @@ dependencies = [
  "tokenizers 0.22.2",
  "yoke 0.8.2",
  "zerocopy",
- "zip 8.6.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
@@ -3606,7 +3633,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/candle.git?rev=efbb9a72e92789eafed0806c3e16f14640c504f6#efbb9a72e92789eafed0806c3e16f14640c504f6"
+source = "git+https://github.com/spiceai/candle.git?rev=5a67f5ecd62321b019c0daffd6613cfb9f71505e#5a67f5ecd62321b019c0daffd6613cfb9f71505e"
 dependencies = [
  "cudaforge",
 ]
@@ -3626,7 +3653,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/candle.git?rev=efbb9a72e92789eafed0806c3e16f14640c504f6#efbb9a72e92789eafed0806c3e16f14640c504f6"
+source = "git+https://github.com/spiceai/candle.git?rev=5a67f5ecd62321b019c0daffd6613cfb9f71505e#5a67f5ecd62321b019c0daffd6613cfb9f71505e"
 dependencies = [
  "block2 0.6.2",
  "half",
@@ -3641,7 +3668,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/candle.git?rev=efbb9a72e92789eafed0806c3e16f14640c504f6#efbb9a72e92789eafed0806c3e16f14640c504f6"
+source = "git+https://github.com/spiceai/candle.git?rev=5a67f5ecd62321b019c0daffd6613cfb9f71505e#5a67f5ecd62321b019c0daffd6613cfb9f71505e"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -3669,7 +3696,7 @@ dependencies = [
 [[package]]
 name = "candle-transformers"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/candle.git?rev=efbb9a72e92789eafed0806c3e16f14640c504f6#efbb9a72e92789eafed0806c3e16f14640c504f6"
+source = "git+https://github.com/spiceai/candle.git?rev=5a67f5ecd62321b019c0daffd6613cfb9f71505e#5a67f5ecd62321b019c0daffd6613cfb9f71505e"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -3687,7 +3714,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/candle.git?rev=efbb9a72e92789eafed0806c3e16f14640c504f6#efbb9a72e92789eafed0806c3e16f14640c504f6"
+source = "git+https://github.com/spiceai/candle.git?rev=5a67f5ecd62321b019c0daffd6613cfb9f71505e#5a67f5ecd62321b019c0daffd6613cfb9f71505e"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -4374,8 +4401,8 @@ dependencies = [
  "flate2",
  "liblzma",
  "memchr",
- "zstd",
- "zstd-safe",
+ "zstd 0.13.3",
+ "zstd-safe 7.2.4",
 ]
 
 [[package]]
@@ -4796,7 +4823,7 @@ dependencies = [
  "tracing",
  "url",
  "util",
- "zip 8.6.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
@@ -5285,15 +5312,18 @@ checksum = "d9c50fcfdf972929aff202c16b80086aa3cfc6a3a820af714096c58c7c1d0582"
 
 [[package]]
 name = "constant_time_eq"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
-
-[[package]]
-name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb6feb175df65d0a3ccd3e73484e940d0ac664e8034f0519fd49a93db3071d9"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "convert_case"
@@ -6464,8 +6494,8 @@ dependencies = [
  "util",
  "uuid 1.23.2",
  "wiremock",
- "zip 8.6.0",
- "zstd",
+ "zip 9.1.2",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -6534,7 +6564,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid 1.23.2",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -6654,7 +6684,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -7800,7 +7830,7 @@ version = "2.3.3"
 dependencies = [
  "async-trait",
  "bytes",
- "calamine",
+ "calamine 0.37.0",
  "docx-rs",
  "flate2",
  "liteparse",
@@ -7811,13 +7841,13 @@ dependencies = [
  "tar",
  "tokio",
  "ureq 2.12.1",
- "zip 7.2.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
 name = "docx-rs"
 version = "0.4.17"
-source = "git+https://github.com/spiceai/docx-rs?rev=2a85dce57d0128e2cd7c369545516c347cb8c529#2a85dce57d0128e2cd7c369545516c347cb8c529"
+source = "git+https://github.com/spiceai/docx-rs?rev=81faaf2187185b097710b9ee589bf039efdd74de#81faaf2187185b097710b9ee589bf039efdd74de"
 dependencies = [
  "base64 0.13.1",
  "image 0.24.9",
@@ -7825,7 +7855,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "xml-rs",
- "zip 8.6.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
@@ -7880,7 +7910,7 @@ version = "1.4.4"
 source = "git+https://github.com/spiceai/duckdb-rs.git?rev=320c6d1b974352aebc814f26b1dcddcc61f1629a#320c6d1b974352aebc814f26b1dcddcc61f1629a"
 dependencies = [
  "arrow",
- "calamine",
+ "calamine 0.28.0",
  "cast",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
@@ -10470,7 +10500,7 @@ dependencies = [
  "url",
  "uuid 1.23.2",
  "zeroize",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -12131,18 +12161,9 @@ dependencies = [
 
 [[package]]
 name = "lzma-rust2"
-version = "0.15.8"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e20f57f9918e5bd7bc58c22cdd70a6afc7375d4dd9683af5f2b34bd3d2bba619"
-dependencies = [
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "lzma-rust2"
-version = "0.16.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce716bf1a316f47a280fc76295f6495b5bea4752bca01c3b3885e101b1c23c02"
+checksum = "f1c46f3fcd2e888afdb01a07efc071cb21300e07c68d32c3e8b01b5c8cb1fcaa"
 dependencies = [
  "sha2 0.11.0",
 ]
@@ -12577,7 +12598,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12604,7 +12625,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "apodize",
@@ -12615,7 +12636,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-code-exec"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -12634,7 +12655,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "ahash 0.8.12",
  "akin",
@@ -12737,7 +12758,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-flash-attn"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12748,7 +12769,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -12759,7 +12780,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12780,7 +12801,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-metal-compile"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "candle-metal-kernels",
  "objc2-metal 0.3.2",
@@ -12789,7 +12810,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12807,7 +12828,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -12842,7 +12863,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-sandbox"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "itoa",
@@ -12859,7 +12880,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "candle-core",
  "image 0.25.10",
@@ -13125,7 +13146,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "uuid 1.23.2",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -14666,7 +14687,7 @@ dependencies = [
  "spicepod",
  "tracing",
  "yaml",
- "zip 7.2.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
@@ -14750,7 +14771,7 @@ dependencies = [
  "thrift",
  "tokio",
  "twox-hash",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -15480,9 +15501,9 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "ppmd-rust"
-version = "1.4.0"
+version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efca4c95a19a79d1c98f791f10aebd5c1363b473244630bb7dbde1dc98455a24"
+checksum = "cd4acc8d264ea385db64ccfdcdfd5909ee9eda0975666723d59f3bfec80b3611"
 
 [[package]]
 name = "ppv-lite86"
@@ -16020,6 +16041,16 @@ checksum = "2474bd2e5029e7ccb6abb2ba48cf2383a333851dedf495901544281590c7da7f"
 dependencies = [
  "memchr",
  "serde",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "encoding_rs",
+ "memchr",
 ]
 
 [[package]]
@@ -19959,7 +19990,7 @@ dependencies = [
  "wiremock",
  "yaml",
  "zeroize",
- "zip 7.2.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
@@ -21035,7 +21066,7 @@ dependencies = [
  "tantivy-bitpacker",
  "tantivy-common",
  "tantivy-fst",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -22679,9 +22710,9 @@ dependencies = [
 
 [[package]]
 name = "typed-path"
-version = "0.12.3"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
 
 [[package]]
 name = "typeface"
@@ -23894,7 +23925,7 @@ dependencies = [
  "vortex-error",
  "vortex-mask",
  "vortex-session",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -25605,57 +25636,31 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "7.2.0"
+version = "9.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
-dependencies = [
- "aes 0.8.4",
- "bzip2",
- "constant_time_eq 0.3.1",
- "crc32fast",
- "deflate64",
- "flate2",
- "generic-array",
- "getrandom 0.3.4",
- "hmac 0.12.1",
- "indexmap 2.14.0",
- "lzma-rust2 0.15.8",
- "memchr",
- "pbkdf2 0.12.2",
- "ppmd-rust",
- "sha1 0.10.6",
- "time",
- "typed-path",
- "zeroize",
- "zopfli",
- "zstd",
-]
-
-[[package]]
-name = "zip"
-version = "8.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+checksum = "ec2e3161de27091f18a831d9494e9c53378a34833af5c1dda35ad85849da18d6"
 dependencies = [
  "aes 0.9.1",
  "bzip2",
- "constant_time_eq 0.4.2",
+ "constant_time_eq 0.6.1",
  "crc32fast",
  "deflate64",
  "flate2",
  "getrandom 0.4.2",
  "hmac 0.13.0",
  "indexmap 2.14.0",
- "lzma-rust2 0.16.4",
+ "lzma-rust2",
  "memchr",
+ "nix 0.31.3",
  "pbkdf2 0.13.0",
  "ppmd-rust",
  "sha1 0.11.0",
  "time",
  "typed-path",
+ "windows-sys 0.61.2",
  "zeroize",
  "zopfli",
- "zstd",
+ "zstd 0.14.3",
 ]
 
 [[package]]
@@ -25688,7 +25693,16 @@ version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
 dependencies = [
- "zstd-safe",
+ "zstd-safe 7.2.4",
+]
+
+[[package]]
+name = "zstd"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
+dependencies = [
+ "zstd-safe 8.2.0",
 ]
 
 [[package]]
@@ -25701,10 +25715,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "zstd-sys"
-version = "2.0.16+zstd.1.5.7"
+name = "zstd-safe"
+version = "8.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.2+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
 dependencies = [
  "cc",
  "pkg-config",
