@@ -137,9 +137,9 @@ fn resolve_gguf(
     if quantizations.is_empty() || weights(&names).is_some() {
         return Ok(Vec::new());
     }
-    let chosen = choose_quantization(snapshot, &quantizations, budget, name, repo)?;
+    let chosen = choose_quantization(snapshot, &listing, &quantizations, budget, name, repo)?;
     let mut gguf = chosen.files.clone();
-    gguf.extend(gguf_files::draft_head(&listing, &chosen.name));
+    gguf.extend(gguf_files::draft_head(&listing, chosen));
     Ok(gguf)
 }
 
@@ -147,6 +147,7 @@ fn resolve_gguf(
 /// fit `memory` with room for the context.
 fn choose_quantization<'q>(
     snapshot: &Snapshot,
+    listing: &[ListedFile],
     quantizations: &'q [Quantization],
     budget: Budget,
     name: &str,
@@ -191,12 +192,16 @@ fn choose_quantization<'q>(
                     format!("; {} ({}) does not", q.name, gigabytes(q.bytes))
                 });
             tracing::info!(
-                "Model '{name}' loads {} ({}) from Hugging Face repo '{repo}', the largest of its {} complete GGUF quantizations whose weights fit the {} of memory free for it with room for the context{larger}. Pin it with `files: [{{path: {}}}]`.",
+                "Model '{name}' loads {} ({}) from Hugging Face repo '{repo}', the largest of its {} complete GGUF quantizations whose weights fit the {} of memory free for it with room for the context{larger}. Pin it with `files: [{}]`.",
                 describe(Some(&chosen.name), chosen.files.len()),
                 gigabytes(chosen.bytes),
                 quantizations.len(),
                 gibibytes(memory),
-                chosen.name
+                gguf_files::pin(listing, chosen)
+                    .iter()
+                    .map(|entry| format!("{{path: {entry}}}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             Ok(chosen)
         }

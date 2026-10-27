@@ -262,10 +262,11 @@ pub fn quantizations(listing: &[ListedFile]) -> Vec<Quantization> {
 }
 
 /// The repository's MTP draft head for `quantization`: a `Q8_0` head if it offers one,
-/// otherwise the head with the quantization's own tag. `shared` variants, which expect the
-/// target's own embeddings, are passed over.
+/// otherwise the head with the tag its weight files carry, which its name may not (a folder or
+/// a path names it then). `shared` variants, which expect the target's own embeddings, are
+/// passed over.
 #[must_use]
-pub fn draft_head(listing: &[ListedFile], quantization: &str) -> Option<String> {
+pub fn draft_head(listing: &[ListedFile], quantization: &Quantization) -> Option<String> {
     let heads: Vec<&str> = listing
         .iter()
         .map(|f| f.path.as_str())
@@ -279,9 +280,23 @@ pub fn draft_head(listing: &[ListedFile], quantization: &str) -> Option<String> 
             .map(|p| (*p).to_string())
     };
     with_tag("Q8_0").or_else(|| {
-        let own = quantization.trim_start_matches("UD-");
-        with_tag(quantization).or_else(|| with_tag(own))
+        let own = tag(quantization.files.first()?)?;
+        with_tag(&own).or_else(|| with_tag(own.trim_start_matches("UD-")))
     })
+}
+
+/// The `files` entries that load what choosing `quantization` with no `files` loads: its
+/// weights and its draft head. Its name brings both, unless the name is a `.gguf` path, which
+/// is honoured as exactly that file and brings no head; the head is then named too.
+#[must_use]
+pub fn pin(listing: &[ListedFile], quantization: &Quantization) -> Vec<String> {
+    let mut entries = vec![quantization.name.clone()];
+    if is_gguf(&quantization.name)
+        && let Some(head) = draft_head(listing, quantization)
+    {
+        entries.push(head);
+    }
+    entries
 }
 
 /// Resolves a model's `files` against the repository listing. An exact `.gguf` path is
@@ -365,18 +380,18 @@ pub fn resolve(
                 }
             };
             weights.extend(q.files.iter().cloned());
-            named_quantization = Some(q.name.clone());
+            named_quantization = Some(q);
         }
     }
     weights.dedup();
     if weights.is_empty() && draft.is_none() {
         return Ok(None);
     }
-    if let Some(name) = &named_quantization {
+    if let Some(q) = named_quantization {
         if draft.is_none() {
-            draft = draft_head(listing, name);
+            draft = draft_head(listing, q);
         }
-        quantization = Some(name.clone());
+        quantization = Some(q.name.clone());
     } else if let Some(q) = quantizations.iter().find(|q| q.files == weights) {
         quantization = Some(q.name.clone());
     }
@@ -838,6 +853,81 @@ mod tests {
                 assert_eq!(resolved.quantization.as_deref(), Some(q.name.as_str()));
             }
         }
+    }
+
+    /// A quantization a folder names, beside a head with its tag and none for `Q8_0`: Copilot's
+    /// case on #15590.
+    fn folder_and_own_head() -> Vec<ListedFile> {
+        listing(&[
+            ("gguf/Model-Q4_K_M.gguf", 4 * GB),
+            ("MTP/mtp-Model-Q4_K_M.gguf", GB / 10),
+        ])
+    }
+
+    #[test]
+    fn a_quantization_named_by_its_folder_drafts_with_the_head_of_its_tag() {
+        let files = folder_and_own_head();
+        let qs = quantizations(&files);
+        assert_eq!(names(&qs), ["gguf"]);
+        let resolved = resolve(&files, &["gguf"])
+            .expect("resolves")
+            .expect("names files");
+        assert_eq!(resolved.draft.as_deref(), Some("MTP/mtp-Model-Q4_K_M.gguf"));
+        assert_eq!(
+            draft_head(&files, &qs[0]).as_deref(),
+            Some("MTP/mtp-Model-Q4_K_M.gguf")
+        );
+        // a `Q8_0` head is still preferred
+        let mut with_q8 = files;
+        with_q8.extend(listing(&[("MTP/mtp-Model-Q8_0.gguf", GB / 5)]));
+        assert_eq!(
+            resolve(&with_q8, &["gguf"])
+                .expect("resolves")
+                .expect("names files")
+                .draft
+                .as_deref(),
+            Some("MTP/mtp-Model-Q8_0.gguf")
+        );
+    }
+
+    /// The `files` a load log advertises load exactly what choosing that quantization with no
+    /// `files` loads, its draft head included, whatever its name is.
+    #[test]
+    fn every_pin_loads_what_choosing_its_quantization_loads() {
+        let mut path_named = fallback_meets_folder();
+        path_named.extend(listing(&[("MTP/mtp-Model-Q8_0.gguf", GB / 5)]));
+        let fixtures = [
+            ("qwen38", qwen38()),
+            ("glm", glm()),
+            ("folder_and_own_head", folder_and_own_head()),
+            ("fallback_meets_folder_with_a_head", path_named),
+        ];
+        let mut pinned_a_head = false;
+        for (fixture, files) in fixtures {
+            for q in &quantizations(&files) {
+                let head = draft_head(&files, q);
+                pinned_a_head |= head.is_some();
+                let pin = pin(&files, q);
+                let entries: Vec<&str> = pin.iter().map(String::as_str).collect();
+                let resolved = resolve(&files, &entries)
+                    .unwrap_or_else(|e| panic!("{fixture}: {pin:?} does not resolve: {e}"))
+                    .unwrap_or_else(|| panic!("{fixture}: {pin:?} names no weights"));
+                assert_eq!(resolved.weights, q.files, "{fixture}: {pin:?}");
+                assert_eq!(resolved.draft, head, "{fixture}: {pin:?}");
+            }
+        }
+        assert!(pinned_a_head, "a fixture's quantization drafts with a head");
+        // the quantization named by its path is pinned with its head beside it
+        let mut files = fallback_meets_folder();
+        files.extend(listing(&[("MTP/mtp-Model-Q8_0.gguf", GB / 5)]));
+        let by_path = quantizations(&files)
+            .into_iter()
+            .find(|q| q.name == "Model-Q4_K_M.gguf")
+            .expect("a quantization named by its path");
+        assert_eq!(
+            pin(&files, &by_path),
+            ["Model-Q4_K_M.gguf", "MTP/mtp-Model-Q8_0.gguf"]
+        );
     }
 
     #[test]
