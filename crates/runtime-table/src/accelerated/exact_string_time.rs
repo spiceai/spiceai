@@ -169,8 +169,9 @@ fn collect_atoms(expr: &Expr, schema: &SchemaRef, atoms: &mut Vec<Atom>) {
     };
     // The largest subexpression over that one column is pinned whole: one scan,
     // and the comparison is evaluated together with the text bound and
-    // nanosecond tie-break the converter writes around it.
-    if expr.column_refs().len() == 1 {
+    // nanosecond tie-break the converter writes around it. A volatile one
+    // (`random()`) is not: equal strings need not get equal results.
+    if expr.column_refs().len() == 1 && !expr.is_volatile() {
         if !atoms.iter().any(|atom| &atom.expr == expr) {
             atoms.push(Atom {
                 expr: expr.clone(),
@@ -190,7 +191,7 @@ fn collect_atoms(expr: &Expr, schema: &SchemaRef, atoms: &mut Vec<Atom>) {
         return;
     }
     tracing::warn!(
-        "[retention] '{expr}' parses '{}' as a timestamp but references other columns too; it is left as written",
+        "[retention] '{expr}' parses '{}' as a timestamp but references other columns or is volatile; it is left as written",
         column.name
     );
 }
@@ -302,7 +303,7 @@ mod tests {
     use arrow::array::{RecordBatch, StringArray};
     use arrow::datatypes::{Field, Schema, TimeUnit};
     use datafusion::datasource::MemTable;
-    use datafusion::functions::expr_fn::nullif;
+    use datafusion::functions::expr_fn::{nullif, random};
     use datafusion::prelude::{SessionContext, cast, col, lit, try_cast};
 
     const CUTOFF: i64 = 1_620_025_200_000_000_000; // 2021-05-03T07:00:00Z
@@ -456,6 +457,23 @@ mod tests {
             selected(&table, &predicates).await,
             selected(&table, std::slice::from_ref(&expr)).await
         );
+    }
+
+    /// A volatile conjunct is kept as written next to the pinned comparison:
+    /// pinning `c AND random() < 0.01` whole would delete every row sharing a
+    /// sampled row's timestamp.
+    #[tokio::test]
+    async fn keeps_a_volatile_conjunct_outside_the_pinned_comparison() {
+        let table = table(&[Some("2021-05-01"), Some("2021-05-01")]);
+        let expr = before_cutoff().and(random().lt(lit(0.01)));
+        let ctx = SessionContext::new();
+        let predicates = pin_string_time_comparisons(&table, &ctx.state(), expr)
+            .await
+            .expect("pin");
+        assert_eq!(predicates.len(), 1);
+        let rendered = predicates[0].to_string();
+        assert!(rendered.contains("random()"), "{rendered}");
+        assert!(!rendered.contains("CAST(ts"), "{rendered}");
     }
 
     /// A selection past the per-delete limit is split, and the chunks together
