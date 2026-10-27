@@ -1,0 +1,176 @@
+{
+  "config-errors-known": [
+    {
+      "run": "config-errors-known",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"bad_engine\",\"message-contains\":\"Unknown acceleration engine 'nosuchengine'\",\"status\":\"Error\"}",
+      "kind": "other",
+      "signature": "spiced has no dataset 'bad_engine'",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "config-errors-known",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"bad_interval\",\"message-contains\":\"refresh_check_interval\",\"status\":\"Error\"}",
+      "kind": "other",
+      "signature": "spiced has no dataset 'bad_interval'",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "config-errors-known",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"bad_cron\",\"message-contains\":\"not a cron\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected status Error, saw status=Ready ready=false message=",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "config-errors-known",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"bad_param\",\"message-contains\":\"pg_nosuchparam\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected status Error, saw status=Ready ready=false message=",
+      "group": "api-and-errors"
+    }
+  ],
+  "connector-errors-gaps": [
+    {
+      "run": "connector-errors-gaps",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"ch_bad_table\",\"message-contains\":\"no_such_table\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected status Error, saw status=Ready ready=false message=",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "connector-errors-gaps",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"kf_bad_topic\",\"message-contains\":\"no_such_topic\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected a message containing 'no_such_topic', saw status=Error ready=false message=Failed to load the dataset kf_bad_topic (kafka). Unable to receive message from Kafka: Message consumption error: BrokerTransportFailure (Local: Broker transpor…",
+      "also": [
+        "expected a message containing 'no_such_topic', saw status=Error ready=false message=Failed to load the dataset kf_bad_topic (kafka). Unable to receive message from Kafka: Message consumption error: UnknownTopicOrPartition (Broker: Unknown topic…"
+      ],
+      "varies": true,
+      "group": "api-and-errors"
+    },
+    {
+      "run": "connector-errors-gaps",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"s3_bad_secret\",\"message-contains\":\"Authentication failed\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected a message containing 'Authentication failed', saw status=Error ready=false message=Cannot connect to the dataset s3_bad_secret (s3). Object Store error: Generic S3 error: Error performing list request: Error performing GET http://127.0.0.1:<port>…",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "connector-errors-gaps",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"mg_bad_host\",\"message-contains\":\"Ensure that the host and port are correctly configured\",\"status\":\"Error\"}",
+      "kind": "error",
+      "signature": "expected a message containing 'Ensure that the host and port are correctly configured', saw status=Error ready=false message=Failed to initialize data connector: Cannot connect to the dataset mg_bad_host (mongodb). Failed to connect to MongoDB: Kind: Server selection timeout: No avail…",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "connector-errors-gaps",
+      "who": "default",
+      "key": "query: SELECT * FROM ch_bad_table_acc",
+      "kind": "error",
+      "signature": "rejected, but the error lacks `no_such_table`: Query execution failed. Acceleration not ready; loading initial data for ch_bad_table_acc: Acceleration not ready; loading initial data for ch_bad_table_acc",
+      "group": "api-and-errors"
+    }
+  ],
+  "http-float-specials": [
+    {
+      "run": "http-float-specials",
+      "who": "default",
+      "key": "query: SELECT id, f FROM p",
+      "kind": "wrong-answer",
+      "signature": "the HTTP JSON answer differs from Flight's: DataMismatch { column: \"f\", row_number: 1, expected: \"None\", actual: \"\\\"NaN\\\"\" }",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "http-float-specials",
+      "who": "default",
+      "key": "query: SELECT max(f), min(f) FROM p",
+      "kind": "wrong-answer",
+      "signature": "the HTTP JSON answer differs from Flight's: DataMismatch { column: \"max(p.f)\", row_number: 1, expected: \"None\", actual: \"\\\"NaN\\\"\" }",
+      "group": "api-and-errors"
+    }
+  ],
+  "refresh-api-changes": [
+    {
+      "run": "refresh-api-changes",
+      "who": "default",
+      "key": "http: {\"method\":\"POST\",\"path\":\"/v1/datasets/c/acceleration/refresh\"}",
+      "kind": "status",
+      "signature": "status 500, expected 400; body does not match /changes/: {\"message\":\"Failed to refresh the dataset c. Manual refresh is not supported for `append` mode. Only `full` refresh mode supports manual refreshes.\"}; body matches /`append` mode/ at '`append` mode'",
+      "group": "api-and-errors"
+    }
+  ],
+  "refresh-api-invalid-sql": [
+    {
+      "run": "refresh-api-invalid-sql",
+      "who": "append",
+      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"SELECT * FROM other\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"POST\",\"path\":\"/v1/datasets/t/acceleration/refresh\"}",
+      "kind": "status",
+      "signature": "status 201, expected 400",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "refresh-api-invalid-sql",
+      "who": "append",
+      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"SELECT * FROM t; DROP TABLE t\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"POST\",\"path\":\"/v1/datasets/t/acceleration/refresh\"}",
+      "kind": "status",
+      "signature": "status 201, expected 400",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "refresh-api-invalid-sql",
+      "who": "append",
+      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"DELETE FROM t\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"POST\",\"path\":\"/v1/datasets/t/acceleration/refresh\"}",
+      "kind": "status",
+      "signature": "status 201, expected 400",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "refresh-api-invalid-sql",
+      "who": "append",
+      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"DELETE FROM t\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"PATCH\",\"path\":\"/v1/datasets/t/acceleration\"}",
+      "kind": "status",
+      "signature": "status 500, expected 400",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "refresh-api-invalid-sql",
+      "who": "full",
+      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"SELECT * FROM other\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"POST\",\"path\":\"/v1/datasets/t/acceleration/refresh\"}",
+      "kind": "status",
+      "signature": "status 201, expected 400",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "refresh-api-invalid-sql",
+      "who": "full",
+      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"SELECT * FROM t; DROP TABLE t\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"POST\",\"path\":\"/v1/datasets/t/acceleration/refresh\"}",
+      "kind": "status",
+      "signature": "status 201, expected 400",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "refresh-api-invalid-sql",
+      "who": "full",
+      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"DELETE FROM t\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"POST\",\"path\":\"/v1/datasets/t/acceleration/refresh\"}",
+      "kind": "status",
+      "signature": "status 201, expected 400",
+      "group": "api-and-errors"
+    },
+    {
+      "run": "refresh-api-invalid-sql",
+      "who": "full",
+      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"DELETE FROM t\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"PATCH\",\"path\":\"/v1/datasets/t/acceleration\"}",
+      "kind": "status",
+      "signature": "status 500, expected 400",
+      "group": "api-and-errors"
+    }
+  ]
+}

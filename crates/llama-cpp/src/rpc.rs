@@ -27,6 +27,18 @@ use snafu::{ResultExt, ensure};
 
 use crate::{Backend, Result, RpcConnectSnafu, RpcEndpointSnafu, RpcServeSnafu, sys};
 
+/// Whether llama.cpp splits a model of `architecture`, the `general.architecture` its GGUF
+/// header names, across devices tensor by tensor, as a model placed on several [`Device`]s is.
+/// An architecture llama.cpp does not know, or cannot split, loads only on one node.
+#[must_use]
+pub fn splits_by_tensor(architecture: &str) -> bool {
+    let Ok(architecture) = CString::new(architecture) else {
+        return false;
+    };
+    // SAFETY: a NUL-terminated string for the call, which only reads it.
+    unsafe { sys::spice_arch_splits_by_tensor(architecture.as_ptr()) }
+}
+
 /// A device that a model can place tensors on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Device(pub(crate) sys::ggml_backend_dev_t);

@@ -20,8 +20,9 @@ limitations under the License.
 //! An engine crate registers itself with [`register_local_chat_engine!`], and a binary
 //! that links the crate gets the engine; `llms` itself never depends on one. A model is
 //! loaded by the first registered engine that serves its weight files, and by mistral.rs when
-//! none does. A model distributed over several nodes goes to that engine only when it serves
-//! distributed models ([`LocalChatEngine::distributed`]), and to mistral.rs's ring otherwise.
+//! none does. A model distributed over several nodes goes to that engine only when it splits
+//! models of the architecture the weights name ([`LocalChatEngine::splits`]), and to
+//! mistral.rs's ring otherwise.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,10 +43,41 @@ pub struct LocalChatEngine {
     /// names only, so a remote model can be matched before its files are downloaded.
     pub serves: fn(&[PathBuf]) -> bool,
     /// Whether the engine also serves a model split across several nodes, with the topology in
-    /// [`LocalModelOptions::distributed`].
-    pub distributed: bool,
+    /// [`LocalModelOptions::distributed`], given the architecture its first shard's header names
+    /// (`general.architecture`); `None` when it serves no model split across nodes. A model the
+    /// engine does not split goes to mistral.rs's ring.
+    pub distributed: Option<fn(&str) -> bool>,
     /// Loads the model from local weight files.
     pub load: LoadLocalModel,
+}
+
+impl LocalChatEngine {
+    /// Whether the engine serves a model split across nodes whose first shard's header names
+    /// `architecture`. Every node decides from that header, so all of them decide alike. A node
+    /// that cannot read it, one that does not hold the weights, can only hold a share for the
+    /// node that serves the model: mistral.rs's ring reads the weights on every node.
+    #[must_use]
+    pub fn splits(&self, architecture: Option<&str>) -> bool {
+        match (self.distributed, architecture) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(splits), Some(architecture)) => splits(architecture),
+        }
+    }
+
+    /// Whether the engine serves the model of local GGUF `weights` split across nodes:
+    /// [`Self::splits`] with the architecture their first shard's header names, when this node
+    /// holds it.
+    pub async fn splits_weights(&self, weights: &[PathBuf]) -> bool {
+        if self.distributed.is_none() {
+            return false;
+        }
+        self.splits(
+            super::gguf_header::local_architecture(weights)
+                .await
+                .as_deref(),
+        )
+    }
 }
 
 #[linkme::distributed_slice]

@@ -22,12 +22,13 @@ use crate::{
     model::provider_models::get_available_models_hint, status,
 };
 use app::App;
+use llms::chat::DistributedBackendSetting;
 use llms::evaluate::Evaluate;
 use model_capabilities::{Capability, DecisionsBackend, ModelCapabilities};
 use opentelemetry::KeyValue;
 use runtime_metrics as metrics;
 use runtime_secrets::get_params_with_secrets;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 use telemetry::timing::TimeMeasurement;
@@ -142,7 +143,7 @@ impl Runtime {
 
         // A node other than the first of a distributed model never reads the weights: the first
         // reads them and sends each node its share, so the files need exist only there.
-        if matches!(source, Some(ModelSource::File)) && !is_distributed_worker(&p) {
+        if matches!(source, Some(ModelSource::File)) && !is_distributed_worker(&params) {
             // Verify all referenced local files exist before attempting to load the model and determine its type.
             // Otherwise, we will fail to determine the model type and the error will be confusing.
             if let Err(err) = verify_local_files_exist(m) {
@@ -426,14 +427,16 @@ fn model_error<'a>(
 }
 
 /// Whether this node holds a share of a distributed model for another node, which serves it.
-fn is_distributed_worker(params: &HashMap<String, String>) -> bool {
-    params
-        .get("distributed_backend")
-        .is_some_and(|backend| backend.trim() == "ring")
-        && params
-            .get("node_rank")
-            .and_then(|rank| rank.trim().parse::<usize>().ok())
-            .is_some_and(|rank| rank > 0)
+/// It reads the params with their secrets and environment variables resolved, and parses them
+/// as the model's loader does, so both agree on which node this is.
+fn is_distributed_worker(params: &HashMap<String, SecretString>) -> bool {
+    params.get("distributed_backend").is_some_and(|backend| {
+        backend.expose_secret().parse::<DistributedBackendSetting>()
+            == Ok(DistributedBackendSetting::Ring)
+    }) && params
+        .get("node_rank")
+        .and_then(|rank| rank.expose_secret().trim().parse::<usize>().ok())
+        .is_some_and(|rank| rank > 0)
 }
 
 fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {

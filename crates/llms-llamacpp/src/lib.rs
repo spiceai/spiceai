@@ -92,7 +92,7 @@ llms::register_local_chat_engine!(
     LocalChatEngine {
         name: "llama.cpp",
         serves: serves_weights,
-        distributed: true,
+        distributed: Some(llama_cpp::rpc::splits_by_tensor),
         load: load_weights,
     }
 );
@@ -112,6 +112,16 @@ fn load_weights<'a>(
     options: LocalModelOptions<'a>,
 ) -> futures::future::BoxFuture<'a, Result<std::sync::Arc<dyn Chat>>> {
     Box::pin(async move {
+        if let Some(cfg) = options.distributed {
+            distributed::ensure_insecure_allowed(cfg, options.reasoning.model_name)?;
+            // A rank other than 0 lends its GPU and never reads the weights: the head sends each
+            // rank its share.
+            if cfg.node_rank > 0 {
+                return distributed::lend_gpu(cfg, options.reasoning.model_name)
+                    .await
+                    .map(|share| std::sync::Arc::new(share) as std::sync::Arc<dyn Chat>);
+            }
+        }
         LlamaCpp::from(weights, options)
             .await
             .map(|model| std::sync::Arc::new(model) as std::sync::Arc<dyn Chat>)
@@ -316,16 +326,10 @@ impl LlamaCpp {
     /// When a weight file is missing, llama.cpp cannot load the model or its MTP head, the
     /// model has no chat template or writes Harmony replies, or `reasoning_effort` is one
     /// its chat template refuses.
-    pub async fn from(weights: &[PathBuf], options: LocalModelOptions<'_>) -> Result<Self> {
-        // A rank other than 0 of a distributed model lends its GPU and never reads the weights:
-        // the head sends each rank its share.
-        if let Some(cfg) = options.distributed
-            && cfg.node_rank > 0
-        {
-            return distributed::lend_gpu(cfg, options.reasoning.model_name)
-                .await
-                .map(|never| match never {});
-        }
+    ///
+    /// A distributed model loads here only on rank 0, the head, which serves it; another rank
+    /// holds a share ([`distributed::lend_gpu`]).
+    async fn from(weights: &[PathBuf], options: LocalModelOptions<'_>) -> Result<Self> {
         for weight in weights {
             if !weight.exists() {
                 return Err(ChatError::LocalModelNotFound {
@@ -358,8 +362,8 @@ impl LlamaCpp {
             Some(file) => template_in_file(file).await?,
             None => None,
         };
-        // A distributed model: a rank other than 0 lends its GPU and serves nothing itself;
-        // the head reaches every rank's GPU and splits the model across them.
+        // A distributed model: the head reaches every rank's GPU and splits the model across
+        // them.
         let devices = match options.distributed {
             None => Vec::new(),
             Some(cfg) => distributed::reach_ranks(cfg, options.reasoning.model_name).await?,
@@ -845,6 +849,16 @@ fn serve(
             (model, false)
         }
     };
+    // This engine decodes one token after another with a decoder alone. An encoder-decoder
+    // model's decoder aborts the process when no encoder pass ran, and a diffusion model
+    // decodes nothing, so both are refused while they load.
+    if model.has_encoder() || model.is_diffusion() {
+        let _ = ready.send(Err(ChatError::UnsupportedArchitecture {
+            architecture: model.architecture().unwrap_or_default(),
+            file: file_name(path),
+        }));
+        return;
+    }
     let draft_model = match draft.map(|d| {
         // A DFlash or DSpark drafter says so in its header; any other draft file is an MTP head.
         let kind = DraftKind::dflash_of(d).unwrap_or(DraftKind::Mtp);

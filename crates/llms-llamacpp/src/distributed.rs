@@ -24,9 +24,15 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use async_openai::error::{ApiError, OpenAIError};
+use async_openai::types::chat::{
+    ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+};
+use async_trait::async_trait;
 use llama_cpp::Backend;
 use llama_cpp::rpc::{self, Device};
-use llms::chat::{DistributedConfig, Error as ChatError, Result};
+use llms::chat::nsql::SqlGeneration;
+use llms::chat::{Chat, DistributedConfig, Error as ChatError, Result};
 
 /// Rank `r` serves its GPU on this port plus `r`; llama.cpp's pairwise connections between the
 /// ranks use the ports 1000 above.
@@ -129,23 +135,97 @@ fn serve_gpus(name: &str, endpoint: &str) -> Result<()> {
     }
 }
 
-/// A rank other than 0 lends its GPU to the head and holds its share of the model there; it
-/// serves no requests itself. The load does not complete: the GPU is served for the life of
-/// the process, and the call returns only when that cannot start.
-pub(crate) async fn lend_gpu(
-    cfg: &DistributedConfig,
-    name: &str,
-) -> Result<std::convert::Infallible> {
+/// Refuses to split the model `name` across nodes unless spiced runs with
+/// `--allow-insecure-connections`: llama.cpp's RPC connections between the nodes are neither
+/// authenticated nor encrypted, so a node's GPU server would serve any host that reaches it.
+pub(crate) fn ensure_insecure_allowed(cfg: &DistributedConfig, name: &str) -> Result<()> {
+    if cfg.allow_insecure_connections {
+        Ok(())
+    } else {
+        Err(ChatError::InsecureConnectionsNotAllowed {
+            model: name.to_string(),
+        })
+    }
+}
+
+/// A rank other than 0 lends its GPU to the head and holds its share of the model there. Its
+/// load completes once it serves the GPU, which it does for the life of the process, so the
+/// models listed after it load too; it serves no requests itself and refuses them, naming
+/// the head.
+pub(crate) async fn lend_gpu(cfg: &DistributedConfig, name: &str) -> Result<Share> {
+    ensure_insecure_allowed(cfg, name)?;
     let rank = cfg.node_rank;
-    let endpoint = format!("{}:{}", ipv4(&cfg.nodes[rank])?, port(rank)?);
-    serve_gpus(name, &endpoint)?;
+    let (node, model) = (cfg.nodes[rank].clone(), name.to_string());
+    // Resolving a node named by host name can block on DNS.
+    let endpoint = tokio::task::spawn_blocking(move || {
+        let endpoint = format!("{}:{}", ipv4(&node)?, port(rank)?);
+        serve_gpus(&model, &endpoint)?;
+        Ok::<_, ChatError>(endpoint)
+    })
+    .await
+    .map_err(|e| {
+        failed(format!(
+            "Model '{name}' could not serve this node's GPU: {e}"
+        ))
+    })??;
+    let head = host(&cfg.nodes[0]);
     tracing::info!(
-        "Model '{name}': this node is rank {rank} of {} and holds its share of the model for the head at '{}', which serves the model's requests; this node serves its GPU at {endpoint}.",
+        "Model '{name}': this node is rank {rank} of {} and holds its share of the model for the head at '{head}', which serves the model's requests; this node serves its GPU at {endpoint}.",
         cfg.world_size(),
-        host(&cfg.nodes[0])
     );
-    // The share stays loaded while the process runs.
-    Ok(std::future::pending::<std::convert::Infallible>().await)
+    Ok(Share {
+        refusal: served_by_head(name, head),
+    })
+}
+
+/// What a request to a rank other than 0 is answered with.
+fn served_by_head(name: &str, head: &str) -> String {
+    format!(
+        "Model '{name}' is served by the first machine in 'nodes' ({head}); this machine holds part of it."
+    )
+}
+
+/// A model on a rank other than 0: this node's GPU holds a share of it for the head, which
+/// serves every request.
+pub(crate) struct Share {
+    refusal: String,
+}
+
+impl Share {
+    fn refuse(&self) -> OpenAIError {
+        OpenAIError::ApiError(ApiError {
+            message: self.refusal.clone(),
+            r#type: Some("invalid_request_error".to_string()),
+            param: None,
+            code: None,
+        })
+    }
+}
+
+#[async_trait]
+impl Chat for Share {
+    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+        None
+    }
+
+    /// Healthy while this node serves its GPU, which it does for the life of the process.
+    async fn health(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn chat_stream(
+        &self,
+        _req: CreateChatCompletionRequest,
+    ) -> std::result::Result<ChatCompletionResponseStream, OpenAIError> {
+        Err(self.refuse())
+    }
+
+    async fn chat_request(
+        &self,
+        _req: CreateChatCompletionRequest,
+    ) -> std::result::Result<CreateChatCompletionResponse, OpenAIError> {
+        Err(self.refuse())
+    }
 }
 
 /// The address the head serves and reaches its own GPU at: the one this node sends from to
@@ -175,6 +255,7 @@ fn source_toward(peer: &str) -> Option<String> {
 /// The head serves its own GPU at the address it reaches rank 1 from, waits for every other rank
 /// to serve theirs, and returns all of them in rank order, for the model to be split across.
 pub(crate) async fn reach_ranks(cfg: &DistributedConfig, name: &str) -> Result<Vec<Device>> {
+    ensure_insecure_allowed(cfg, name)?;
     let world = cfg.world_size();
     let head_gpu = format!("{}:{}", head_gpu_address(cfg), port(0)?);
     serve_gpus(name, &head_gpu)?;
@@ -265,7 +346,15 @@ fn configure_comm(cfg: &DistributedConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::host;
+    use super::{host, served_by_head};
+
+    #[test]
+    fn a_request_to_another_rank_names_the_node_that_serves_the_model() {
+        assert_eq!(
+            served_by_head("deepseek-v4.1-flash", "10.42.9.100"),
+            "Model 'deepseek-v4.1-flash' is served by the first machine in 'nodes' (10.42.9.100); this machine holds part of it."
+        );
+    }
 
     #[test]
     fn a_node_entry_may_carry_a_port() {

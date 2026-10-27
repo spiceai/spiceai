@@ -40,6 +40,8 @@ use async_openai::types::chat::{
 #[cfg(feature = "local_llm")]
 pub mod engine;
 #[cfg(feature = "local_llm")]
+mod gguf_header;
+#[cfg(feature = "local_llm")]
 pub mod hf_files;
 #[cfg(feature = "local_llm")]
 pub mod mistral;
@@ -384,34 +386,41 @@ pub async fn create_hf_model(
             })
         })
         .collect::<Result<Vec<&str>>>()?;
-    // A rank other than 0 of a model an engine serves across nodes never reads the weights (the
-    // head sends each rank its share), so it doesn't download them.
+    let download_error = |error: huggingface_hub::DownloadError| Error::FailedToDownloadModel {
+        configuration: error.is_configuration_error(),
+        source: Box::new(error),
+    };
+    // A rank other than 0 of a model an engine splits across nodes never reads the weights (the
+    // head sends each rank its share), so it doesn't download them. It reads the first shard's
+    // header from the Hub instead, to decide as the head does.
     if let Some(cfg) = distributed.as_ref()
         && cfg.node_rank > 0
         && let Some(engine) = engine::engine_for(gguf_files)
-        && engine.distributed
+        && engine.distributed.is_some()
     {
-        ensure_distributed_build()?;
-        let options = LocalModelOptions {
-            reasoning,
-            distributed: Some(cfg),
-            ..LocalModelOptions::default()
-        };
-        return (engine.load)(gguf_files, options).await;
+        let architecture = hf_files::model_architecture(model_id, &gguf, hub, reasoning.model_name)
+            .await
+            .map_err(download_error)?;
+        if engine.splits(architecture.as_deref()) {
+            ensure_distributed_build()?;
+            let options = LocalModelOptions {
+                reasoning,
+                distributed: Some(cfg),
+                ..LocalModelOptions::default()
+            };
+            return (engine.load)(gguf_files, options).await;
+        }
     }
     let dir = hf_files::download_model(model_id, &gguf, hub, reasoning.model_name)
         .await
-        .map_err(|error| Error::FailedToDownloadModel {
-            configuration: error.is_configuration_error(),
-            source: Box::new(error),
-        })?;
+        .map_err(download_error)?;
+    let weights: Vec<PathBuf> = gguf_files.iter().map(|file| dir.join(file)).collect();
     if let Some(engine) = engine::engine_for(gguf_files)
-        && (distributed.is_none() || engine.distributed)
+        && (distributed.is_none() || engine.splits_weights(&weights).await)
     {
         if distributed.is_some() {
             ensure_distributed_build()?;
         }
-        let weights: Vec<PathBuf> = gguf_files.iter().map(|file| dir.join(file)).collect();
         let template_file = hf_files::chat_template_file(&dir).await;
         let options = LocalModelOptions {
             chat_template_literal,
@@ -492,10 +501,10 @@ pub async fn create_local_model(
     options: LocalModelOptions<'_>,
 ) -> Result<Arc<dyn Chat>> {
     // A model goes to a registered engine that serves its weights; a distributed one only when
-    // that engine serves distributed models, and to mistral.rs's ring otherwise.
+    // that engine splits models of its architecture, and to mistral.rs's ring otherwise.
     let weights = model_weights.iter().map(PathBuf::from).collect::<Vec<_>>();
     if let Some(engine) = engine::engine_for(&weights)
-        && (distributed.is_none() || engine.distributed)
+        && (distributed.is_none() || engine.splits_weights(&weights).await)
     {
         if distributed.is_some() {
             ensure_distributed_build()?;

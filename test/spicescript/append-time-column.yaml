@@ -1,0 +1,90 @@
+name: append-time-column
+description: >
+  Append refresh on a time column adds exactly the source rows newer than the
+  stored maximum minus the overlap window: new rows and late rows inside the
+  window arrive once, late rows older than the window never do, re-reading the
+  window adds nothing, and a row changed in place inside the window replaces
+  the stored one when the dataset has a primary key with upsert.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  engine: [cayenne, duckdb]
+
+variants:
+  no-key: {}
+  key-upsert:
+    datasets: { events: { acceleration: { primary_key: id, on_conflict: { id: upsert } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: append-time-column
+  datasets:
+    - from: postgres:public.events
+      name: events
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      acceleration:
+        enabled: true
+        engine: '${matrix.engine}'
+        mode: file
+        refresh_mode: append
+        refresh_append_overlap: 1h
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  # Timestamps far in the future, so wall-clock time never decides anything.
+  - source-exec:
+      src: |
+        CREATE TABLE events (id bigint NOT NULL, ts timestamptz NOT NULL, v integer, phase text NOT NULL);
+        INSERT INTO events
+          SELECT i, TIMESTAMPTZ '2100-01-01 00:00:00+00' + i * INTERVAL '1 minute', i % 100, 'initial'
+          FROM generate_series(1, 1000) AS i;
+  - start: {}
+  - query: SELECT * FROM events
+
+  # Newer rows.
+  - source-exec:
+      src: |
+        INSERT INTO events
+          SELECT i, TIMESTAMPTZ '2100-01-01 00:00:00+00' + i * INTERVAL '1 minute', i % 100, 'newer'
+          FROM generate_series(1001, 1100) AS i;
+  - refresh: events
+  - query: SELECT * FROM events
+
+  # Late rows: 30 minutes behind the stored maximum (inside the 1h window), and
+  # 5 hours behind it (outside), which append refresh does not read.
+  - source-exec:
+      src: |
+        INSERT INTO events
+          SELECT 2000 + i, TIMESTAMPTZ '2100-01-01 00:00:00+00' + INTERVAL '1100 minutes' - INTERVAL '30 minutes', i, 'late-inside'
+          FROM generate_series(1, 10) AS i;
+        INSERT INTO events
+          SELECT 3000 + i, TIMESTAMPTZ '2100-01-01 00:00:00+00' + INTERVAL '1100 minutes' - INTERVAL '5 hours', i, 'late-outside'
+          FROM generate_series(1, 10) AS i;
+  - refresh: events
+  - query: SELECT * FROM events
+    oracle-sql: SELECT * FROM events WHERE phase <> 'late-outside'
+
+  # Re-reading the window with no change adds nothing.
+  - refresh: events
+  - query: SELECT count(*), count(DISTINCT id), sum(v) FROM events
+    oracle-sql: SELECT count(*), count(DISTINCT id), sum(v) FROM events WHERE phase <> 'late-outside'
+
+  # A row changed in place inside the window: with a key and upsert it
+  # replaces the stored row; without one, append keeps both versions.
+  - source-exec: { src: "UPDATE events SET v = 999 WHERE id = 1095" }
+  - refresh: events
+  - query: SELECT * FROM events
+    oracle-sql: SELECT * FROM events WHERE phase <> 'late-outside'
+    only: key-upsert
+  - query: SELECT v FROM events WHERE id = 1095 ORDER BY v
+    expect: { rows: [["95"], ["999"]] }
+    only: no-key
