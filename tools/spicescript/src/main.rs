@@ -291,7 +291,12 @@ async fn run(cli: Cli) -> Result<bool> {
         // script's own outcome still counts, and the other scripts still run.
         if let Some(root) = &options.log_capture
             && !report.failures.is_empty()
-            && let Err(e) = capture_script(&runner::capture_dir(root, script), path, &out)
+            && let Err(e) = capture_script(
+                &runner::capture_dir(root, script),
+                path,
+                &out,
+                &report.failures,
+            )
         {
             println!("warning: {e:#}");
         }
@@ -404,12 +409,25 @@ async fn run(cli: Cli) -> Result<bool> {
 }
 
 /// `--log-capture`'s files for a whole script, beside its combinations'
-/// logs: the script as run, and what the run printed for it.
-fn capture_script(dir: &std::path::Path, path: &std::path::Path, out: &str) -> Result<()> {
+/// logs: the script as run, and what the run printed for it, with each
+/// failure in full.
+fn capture_script(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    out: &str,
+    failures: &[runner::Failure],
+) -> Result<()> {
+    use std::fmt::Write as _;
     std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     std::fs::copy(path, dir.join("script.yaml"))
         .with_context(|| format!("Failed to copy {} into {}", path.display(), dir.display()))?;
-    std::fs::write(dir.join("output.txt"), out)
+    // The progress lines name each failure; what went wrong is printed with
+    // the run's summary, so it is added here as the summary prints it.
+    let mut text = out.to_string();
+    for failure in failures {
+        let _ = write!(text, "\nFAILED {failure}\n");
+    }
+    std::fs::write(dir.join("output.txt"), text)
         .with_context(|| format!("Failed to write {}", dir.join("output.txt").display()))
 }
 
