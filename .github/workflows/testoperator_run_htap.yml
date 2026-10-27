@@ -1,5 +1,5 @@
 name: htap benchmark tests
-run-name: CH-BenCHmark - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s${{ github.event.inputs.source_version != '' && format(' - source {0}', github.event.inputs.source_version) || '' }}${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}
+run-name: CH-BenCHmark - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s${{ github.event.inputs.source_version != '' && format(' - source {0}', github.event.inputs.source_version) || '' }}${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}${{ github.event.inputs.spiced_ref != '' && format(' - spiced {0}', github.event.inputs.spiced_ref) || '' }}
 
 on:
   workflow_dispatch:
@@ -8,6 +8,12 @@ on:
         description: 'spiced build commit'
         required: false
         type: string
+      # Runs another release's spiced with this ref's testoperator and spec files.
+      spiced_ref:
+        description: 'Branch or tag whose spiced to run, e.g. v2.1.0 or release/2.4; empty = trunk. A release tag uses that release''s published binary. Ignored when spiced_commit is set'
+        required: false
+        type: string
+        default: ''
       spicepod_path:
         description: 'The spicepod file to test with (relative to test/spicepods/chbench/)'
         required: true
@@ -177,14 +183,37 @@ jobs:
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      - name: Resolve the spiced source
+        id: spiced_source
+        env:
+          SPICED_COMMIT_INPUT: ${{ github.event.inputs.spiced_commit }}
+          SPICED_REF: ${{ github.event.inputs.spiced_ref }}
+        run: |
+          if [ -z "${SPICED_COMMIT_INPUT}" ] && [[ "${SPICED_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "release=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "release=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Setup spiced
+        if: steps.spiced_source.outputs.release != 'true'
         uses: ./.github/actions/setup-spiced
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
+          ref: ${{ github.event.inputs.spiced_ref || 'refs/heads/trunk' }}
+
+      - name: Install the released spiced
+        if: steps.spiced_source.outputs.release == 'true'
+        id: release-spiced
+        uses: ./.github/actions/setup-released-spiced
+        with:
+          release: ${{ github.event.inputs.spiced_ref }}
+          spicepod_file: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}"
 
       # Write the commit + high-level config to the job summary up front, so the
       # run is identifiable and reproducible even if it crashes mid-run. Results
@@ -217,7 +246,7 @@ jobs:
             echo ""
             echo "| Parameter | Value |"
             echo "| --- | --- |"
-            echo "| spiced commit | \`${{ steps.setup-spiced.outputs.SPICED_COMMIT }}\` |"
+            echo "| spiced commit | \`${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}\` |"
             echo "| testoperator commit | \`${{ github.sha }}\` |"
             echo "| spicepod | \`${{ github.event.inputs.spicepod_path }}\` |"
             echo "| source database | ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE }} |"
@@ -419,7 +448,7 @@ jobs:
         env:
           LAYOUT: ${{ github.event.inputs.layout }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
           CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
           # Dedicated in-cluster MySQL pod on xlarge; per-run docker container (loopback) elsewhere. Used only when the spicepod is a MySQL source.
