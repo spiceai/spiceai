@@ -2380,6 +2380,41 @@ http.server.ThreadingHTTPServer((host, int(port)), Handler).serve_forever()
         assert!(!lab.agent_started("only"));
     }
 
+    /// Ctrl-C ends a session that is waiting for another to finish starting the
+    /// runtime at once, not when the other session lets go.
+    #[test]
+    fn interrupting_a_wait_for_another_sessions_start_ends_at_once() {
+        // Longer than the test runs: the first session is still starting the runtime.
+        let lab = Lab::new(Duration::from_secs(600));
+        let endpoint = format!("http://{}", free_address());
+
+        let _starting = lab.session("first", &endpoint);
+        wait_for("the runtime to be launched", || lab.runtime_pid().is_some());
+        let mut waiting = lab.session("second", &endpoint);
+        wait_for("the second session to wait for the first", || {
+            lab.output("second")
+                .contains("Waiting for another `spice` session to finish starting")
+        });
+
+        let interrupted = std::time::Instant::now();
+        waiting.interrupt();
+        let deadline = interrupted + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = waiting.0.try_wait().expect("poll the session") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the interrupted session still runs {:?} after Ctrl-C: {}",
+                interrupted.elapsed(),
+                lab.output("second")
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(130), "{}", lab.output("second"));
+        assert!(!lab.agent_started("second"));
+    }
+
     /// A stub Claude Code's recorded arguments, one per line: the path of the
     /// `--settings` file spice routes it with, which comes first, and the rest.
     fn after_routing_settings(recorded: &str) -> (&str, &str) {

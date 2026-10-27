@@ -644,32 +644,34 @@ async fn lock_exclusive_reporting_wait(file: &File, path: &Path, endpoint: &str)
 }
 
 async fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
-    let handle = file.try_clone().context(CodingAgentRuntimeLockSnafu {
-        path: path.to_path_buf(),
-    })?;
-    blocking_lock(move || handle.lock(), path).await
+    poll_lock(|| file.try_lock(), path).await
 }
 
 async fn lock_shared(file: &File, path: &Path) -> Result<()> {
-    let handle = file.try_clone().context(CodingAgentRuntimeLockSnafu {
-        path: path.to_path_buf(),
-    })?;
-    blocking_lock(move || handle.lock_shared(), path).await
+    poll_lock(|| file.try_lock_shared(), path).await
 }
 
-/// Wait for a lock off the async runtime: another session may hold it for as
-/// long as a runtime takes to start.
-async fn blocking_lock<F>(lock: F, path: &Path) -> Result<()>
-where
-    F: FnOnce() -> std::io::Result<()> + Send + 'static,
-{
-    match tokio::task::spawn_blocking(lock).await {
-        Ok(result) => result.context(CodingAgentRuntimeLockSnafu {
-            path: path.to_path_buf(),
-        }),
-        Err(join) => Err(std::io::Error::other(join)).context(CodingAgentRuntimeLockSnafu {
-            path: path.to_path_buf(),
-        }),
+/// How often a session waiting for another's lock tries it again.
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Wait for a lock another session may hold for as long as a runtime takes to
+/// start, by trying it again between async sleeps: a thread blocked on it
+/// could not be cancelled, and would keep Ctrl-C from ending the session
+/// until the other session let go.
+async fn poll_lock(
+    try_lock: impl Fn() -> std::result::Result<(), std::fs::TryLockError>,
+    path: &Path,
+) -> Result<()> {
+    loop {
+        match try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => tokio::time::sleep(LOCK_POLL_INTERVAL).await,
+            Err(std::fs::TryLockError::Error(source)) => {
+                return Err(source).context(CodingAgentRuntimeLockSnafu {
+                    path: path.to_path_buf(),
+                });
+            }
+        }
     }
 }
 
