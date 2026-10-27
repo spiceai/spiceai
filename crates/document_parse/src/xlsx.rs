@@ -22,6 +22,7 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 
 use crate::{
     Document, DocumentParser, DocumentParserFactory, DocumentType, InternalParsingSnafu, Result,
+    archive::open_consistent_archive,
 };
 
 pub struct XlsxParserFactory {}
@@ -52,6 +53,8 @@ impl XlsxParser {
 #[async_trait::async_trait]
 impl DocumentParser for XlsxParser {
     async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
+        // calamine opens the zip with its own reader; check the archive first.
+        open_consistent_archive(raw, DocumentType::Xlsx)?;
         let cursor = Cursor::new(raw.clone());
         let mut wb: Xlsx<_> =
             open_workbook_from_rs(cursor)
