@@ -15,8 +15,9 @@ limitations under the License.
 */
 
 //! A model split tensor-parallel across two ranks on this machine: this test binary runs
-//! again as rank 1, which lends this machine's GPU over loopback, and this process is rank 0,
-//! which serves the model. Its greedy replies must equal the single-node model's: the ranks
+//! again as rank 0, which serves the model, and again as rank 1, which lends this machine's GPU
+//! over loopback. Every rank runs in a process of its own, as the GPU server a process starts
+//! lives as long as the process. Its greedy replies must equal the single-node model's: the ranks
 //! sum their partials exactly, so the split changes only the order of float additions, which
 //! one-answer prompts don't feel.
 
@@ -39,6 +40,9 @@ const RANK_ONE: &str = "SPICE_LLAMACPP_TEST_RANK_ONE";
 
 /// Set in the environment of the process `rank_two_of_three` runs in.
 const RANK_TWO: &str = "SPICE_LLAMACPP_TEST_RANK_TWO";
+
+/// Set in the environment of the process `head_of_two_ranks` runs in.
+const HEAD_OF_TWO: &str = "SPICE_LLAMACPP_TEST_HEAD_OF_TWO";
 
 /// Set in the environment of the process `head_with_a_silent_rank` runs in.
 const SILENT_RANK: &str = "SPICE_LLAMACPP_TEST_SILENT_RANK";
@@ -68,9 +72,9 @@ fn options(distributed: Option<&DistributedConfig>) -> LocalModelOptions<'_> {
     }
 }
 
-/// Rank 1, run only by `a_model_split_across_two_ranks_answers_as_on_one` in a process of
-/// its own: rank 1's load lends this machine's GPU, which stays served after the load, so this
-/// pends until that test kills it. Without `RANK_ONE` it does nothing.
+/// Rank 1, run only by `head_of_two_ranks` in a process of its own: rank 1's load lends this
+/// machine's GPU, which stays served after the load, so this pends until the head kills it.
+/// Without `RANK_ONE` it does nothing.
 #[tokio::test]
 async fn rank_one() {
     if std::env::var_os(RANK_ONE).is_none() {
@@ -355,8 +359,13 @@ async fn replies(model: &dyn Chat) -> Vec<String> {
     out
 }
 
+/// The head of `a_model_split_across_two_ranks_answers_as_on_one`, run only by it in a process
+/// of its own. Without `HEAD_OF_TWO` it does nothing.
 #[tokio::test]
-async fn a_model_split_across_two_ranks_answers_as_on_one() {
+async fn head_of_two_ranks() {
+    if std::env::var_os(HEAD_OF_TWO).is_none() {
+        return;
+    }
     let gguf = local_gguf().await;
     let weights = [gguf];
     let engine = llms::chat::engine::engine_for(&weights).expect("a .gguf goes to llama.cpp");
@@ -408,6 +417,28 @@ async fn a_model_split_across_two_ranks_answers_as_on_one() {
         got.iter().any(|reply| reply.contains("Paris")),
         "the replies answer the prompts: {got:?}"
     );
+}
+
+/// Serializes the tests whose head runs in a process of its own: a head serves its own GPU at
+/// port 12345 and reaches rank 1 at 12346, which only one head at a time can use.
+static HEADS: Mutex<()> = Mutex::new(());
+
+/// Runs the test `name` in a process of its own with `env` set, holding [`HEADS`].
+fn run_head(name: &str, env: &str) -> std::process::ExitStatus {
+    let _head = HEADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Command::new(std::env::current_exe().expect("the test binary's path"))
+        .args(["--exact", name, "--nocapture"])
+        .env(env, "1")
+        .status()
+        .expect("the head runs")
+}
+
+#[tokio::test]
+async fn a_model_split_across_two_ranks_answers_as_on_one() {
+    let status = run_head("distributed::head_of_two_ranks", HEAD_OF_TWO);
+    assert!(status.success(), "the head's checks failed: {status}");
 }
 
 /// The head of two ranks whose rank 1 port accepts connections and never answers, run only by
@@ -463,14 +494,6 @@ async fn head_with_a_silent_rank() {
 /// the head's wait loop, which goes on noting what it waits for and fails at its deadline.
 #[tokio::test]
 async fn a_rank_that_never_answers_does_not_stall_the_head() {
-    let status = Command::new(std::env::current_exe().expect("the test binary's path"))
-        .args([
-            "--exact",
-            "distributed::head_with_a_silent_rank",
-            "--nocapture",
-        ])
-        .env(SILENT_RANK, "1")
-        .status()
-        .expect("the head runs");
+    let status = run_head("distributed::head_with_a_silent_rank", SILENT_RANK);
     assert!(status.success(), "the head's checks failed: {status}");
 }
