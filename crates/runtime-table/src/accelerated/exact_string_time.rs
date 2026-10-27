@@ -132,7 +132,7 @@ pub(crate) async fn pin_string_time_comparisons(
         for (index, chunk) in only.values.chunks(MAX_PINNED_VALUES_PER_DELETE).enumerate() {
             // A NULL row is the chunks' common business; it rides on the first.
             let replacement = membership(&only.atom.column, chunk, index == 0 && only.selects_null);
-            predicates.push(replace(expr.clone(), &[(&only.atom.expr, replacement)])?);
+            predicates.push(replace(expr.clone(), &[(&only.atom.expr, replacement)]));
         }
         return Ok(predicates);
     }
@@ -146,7 +146,7 @@ pub(crate) async fn pin_string_time_comparisons(
             )
         })
         .collect();
-    Ok(vec![replace(expr, &replacements)?])
+    Ok(vec![replace(expr, &replacements)])
 }
 
 /// A boolean subexpression to pin: the largest one below the `AND`/`OR` that
@@ -274,22 +274,26 @@ fn membership(column: &Column, values: &[ScalarValue], selects_null: bool) -> Ex
     }
 }
 
-/// Replaces each target with its replacement in one top-down pass, so a target
-/// nested in another (`c` inside `NOT c`) is never rewritten before the outer
-/// one is matched.
-fn replace(expr: Expr, replacements: &[(&Expr, Expr)]) -> Result<Expr> {
-    Ok(expr
-        .transform_down(
-            |node| match replacements.iter().find(|(target, _)| **target == node) {
-                Some((_, replacement)) => Ok(Transformed::new(
-                    replacement.clone(),
-                    true,
-                    TreeNodeRecursion::Jump,
-                )),
-                None => Ok(Transformed::no(node)),
-            },
-        )?
-        .data)
+/// Replaces each target with its replacement, looking through `AND`/`OR`
+/// only, exactly as [`collect_atoms`] did: a target also inside a subexpression
+/// that was left as written (`NULLIF(c, flag)`) is left there too, where FALSE
+/// and NULL part ways.
+fn replace(expr: Expr, replacements: &[(&Expr, Expr)]) -> Expr {
+    if let Some((_, replacement)) = replacements.iter().find(|(target, _)| **target == expr) {
+        return replacement.clone();
+    }
+    match expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: op @ (Operator::And | Operator::Or),
+            right,
+        }) => Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(replace(*left, replacements)),
+            op,
+            Box::new(replace(*right, replacements)),
+        )),
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -416,6 +420,42 @@ mod tests {
                 "{expr} -> {predicates:?}"
             );
         }
+    }
+
+    /// A comparison repeated inside a subexpression over another column is left
+    /// there: with no string selected it pins to FALSE, which `NULLIF` would turn
+    /// from NULL into a value and select a row the predicate keeps.
+    #[tokio::test]
+    async fn leaves_a_repeat_inside_a_multi_column_subexpression_alone() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Utf8, true),
+            Field::new("flag", DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(arrow::array::BooleanArray::from(vec![Some(true)])),
+            ],
+        )
+        .expect("batch");
+        let table: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("table"));
+        let expr = before_cutoff().or(nullif(before_cutoff(), col("flag")).is_not_null());
+        let ctx = SessionContext::new();
+        let predicates = pin_string_time_comparisons(&table, &ctx.state(), expr.clone())
+            .await
+            .expect("pin");
+        assert_eq!(predicates.len(), 1);
+        assert!(
+            predicates[0].to_string().contains("NULLIF(CAST(ts"),
+            "{}",
+            predicates[0]
+        );
+        assert_eq!(
+            selected(&table, &predicates).await,
+            selected(&table, std::slice::from_ref(&expr)).await
+        );
     }
 
     /// A selection past the per-delete limit is split, and the chunks together
