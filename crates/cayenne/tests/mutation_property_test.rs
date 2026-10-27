@@ -1355,6 +1355,34 @@ fn sequential_cold() -> Workload {
         cold: true,
     }
 }
+// Sequential cold upsert replay: upserts that keep re-inserting keys already in
+// the datalake (often several generations deep), deletes of datalake-resident
+// keys, and promotions and restarts in between, model-checked after every op.
+// Each promotion leaves every earlier datalake file in place, so superseded
+// copies accumulate across generations and only the tombstones hide them.
+fn sequential_cold_upsert_replay() -> Workload {
+    Workload {
+        mode: Mode::Key,
+        durability: Durability::File,
+        concurrency: Concurrency::Sequential,
+        weights: OpWeights {
+            upsert: 55,
+            delete: 10,
+            delete_all: 0,
+            delete_predicate: 5,
+            overwrite: 0,
+            compact: 5,
+            restart: 5,
+            move_to_cold_tier: 20,
+        },
+        population: 24,
+        batch_size: 3,
+        ops: scaled_ops(80),
+        seeds: scaled_seeds(12),
+        pk_keyset_cache_mb: None,
+        cold: true,
+    }
+}
 // Concurrent cold: foreground mixed delete/upsert + promotions + restarts with
 // a background maintenance loop.
 fn concurrent_cold() -> Workload {
@@ -1638,6 +1666,11 @@ async fn prop_sequential_cold_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential_cold()).await
 }
 test_with_backends!(prop_sequential_cold_impl);
+
+async fn prop_sequential_cold_upsert_replay_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential_cold_upsert_replay()).await
+}
+test_with_backends!(prop_sequential_cold_upsert_replay_impl);
 
 // Foreground promotions + restarts with a background compactor/bake loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
