@@ -51,7 +51,7 @@ token_provider = { path = "../../token_provider" }
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
-zip = "8.3.0"
+zip = "9.1"
 
 [dev-dependencies]
 runtime = { path = "../../runtime" }
