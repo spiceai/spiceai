@@ -2443,6 +2443,41 @@ where
     }
 }
 
+/// A result stream dropped before it ended was abandoned: the client went away
+/// (an HTTP or Flight disconnect drops the response body) or stopped reading.
+/// Neither end of the stream ran, so without this the tracker was dropped
+/// unfinished and the query's `runtime.task_history` row closed with no error,
+/// which reads as a success.
+impl<S> Drop for QueryTrackerStream<S> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let Some(tracker) = self.tracker.take() else {
+            return;
+        };
+        let _span = self.inner_span.enter();
+        let message = ABANDONED_QUERY_MESSAGE.to_string();
+        if self.capture_task_history {
+            tracing::error!(target: "task_history", parent: &self.inner_span, "{message}");
+        }
+        tracker
+            .schema(Arc::clone(&self.schema))
+            .rows_produced(self.num_records)
+            .finish_with_error(
+                &self.request_context,
+                message,
+                ErrorCode::QueryExecutionError,
+            );
+    }
+}
+
+/// The error a query is recorded with when its result stream is dropped
+/// before it ends.
+const ABANDONED_QUERY_MESSAGE: &str =
+    "Query was cancelled: the result stream was dropped before it was fully read \
+     (the client disconnected or stopped reading)";
+
 /// The task-history preview of a result batch: its first rows, as JSON.
 fn output_preview(batch: &RecordBatch) -> Cow<'static, str> {
     Cow::Owned(write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default())
@@ -5801,6 +5836,116 @@ mod tests {
         );
         assert!(guard_dropped.load(Ordering::SeqCst));
         assert!(stream.next().await.is_none());
+    }
+
+    /// What the tracker logged while `consume` read a tracked two-batch stream
+    /// and then dropped it.
+    async fn tracker_log_after<F, Fut>(consume: F) -> String
+    where
+        F: FnOnce(SendableRecordBatchStream) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        struct WriteTo(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for WriteTo {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("probe buffer").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = Arc::clone(&buffer);
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || WriteTo(Arc::clone(&writer)))
+                .with_filter(tracing_subscriber::filter::Targets::new().with_target(
+                    "runtime::datafusion::query::tracker",
+                    tracing::Level::TRACE,
+                )),
+        );
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let batch = |v: i64| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![v])) as ArrayRef],
+            )
+            .expect("batch")
+        };
+        let tracker = QueryTracker {
+            task_history_enabled: false,
+            log_errors: spicepod::component::runtime::QueryErrorLogging::Execution,
+            captured_output_enabled: false,
+            schema: None,
+            query_duration_secs: None,
+            query_execution_duration_secs: None,
+            rows_produced: 0,
+            results_cache_hit: None,
+            is_accelerated: None,
+            error_message: None,
+            error_code: None,
+            query_duration_timer: tokio::time::Instant::now(),
+            query_execution_duration_timer: tokio::time::Instant::now(),
+            datasets: Arc::new(HashSet::new()),
+        };
+        let stream = attach_query_tracker_to_stream(
+            tracing::Span::current(),
+            Arc::new(RequestContextBuilder::new(Protocol::Internal).build()),
+            Some(tracker),
+            stream_from_batches(&schema, vec![batch(1), batch(2)]),
+        );
+        consume(stream).await;
+
+        let captured = buffer.lock().expect("probe buffer").clone();
+        String::from_utf8_lossy(&captured).into_owned()
+    }
+
+    /// A client that disconnects drops the result stream mid-read. The query
+    /// did not succeed, so it has to be recorded as cancelled, not left to
+    /// close its task-history row with no error.
+    #[tokio::test]
+    async fn a_result_stream_dropped_before_its_end_is_recorded_as_cancelled() {
+        let logged = tracker_log_after(|mut stream| async move {
+            let first = stream.next().await.expect("first batch").expect("ok");
+            assert_eq!(first.num_rows(), 1);
+            drop(stream);
+        })
+        .await;
+        assert!(
+            logged.contains(ABANDONED_QUERY_MESSAGE.split(" (").next().expect("prefix"))
+                && logged.contains("QueryExecutionError"),
+            "an abandoned stream must finish its tracker with a cancellation: {logged:?}"
+        );
+    }
+
+    /// A stream read to its end succeeded, and dropping it afterwards must not
+    /// turn that into a failure.
+    #[tokio::test]
+    async fn a_result_stream_read_to_its_end_is_not_recorded_as_cancelled() {
+        let logged = tracker_log_after(|mut stream| async move {
+            while let Some(batch) = stream.next().await {
+                batch.expect("ok");
+            }
+            drop(stream);
+        })
+        .await;
+        assert!(
+            !logged.contains("cancelled"),
+            "a drained stream must not be recorded as cancelled: {logged:?}"
+        );
     }
 
     #[tokio::test]
