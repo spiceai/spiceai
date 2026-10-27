@@ -22,16 +22,13 @@ use aws_credential_types::provider::error::CredentialsError;
 use aws_sdk_glue::{Client, error::DisplayErrorContext, types::Table};
 use aws_sdk_s3::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
+use aws_sdk_credential_bridge::S3CredentialProvider;
 use iceberg::{
     CatalogBuilder, NamespaceIdent, TableIdent,
-    io::{
-        S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
-        S3_SESSION_TOKEN,
-    },
+    io::{S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION},
 };
 use iceberg_catalog_glue::{
-    AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
-    GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
+    AWS_REGION_NAME, GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
 };
 use iceberg_datafusion::IcebergTableProvider;
 use iceberg_storage_opendal::OpenDalStorageFactory;
@@ -463,7 +460,9 @@ async fn create_iceberg_provider(
         }
     })?;
 
-    let credentials = config
+    // Fails dataset load early with a clear error when no credentials resolve. The catalog and
+    // FileIO resolve their own credentials from `config` on each request, so they refresh.
+    config
         .credentials_provider()
         .ok_or_else(|| {
             let e = Error::MissingCredentials;
@@ -495,35 +494,22 @@ async fn create_iceberg_provider(
         }
     })?;
 
+    let s3_credential_loader = S3CredentialProvider::from_config(config)
+        .map_err(|e| super::DataConnectorError::InvalidConfiguration {
+            dataconnector: PREFIX.to_string(),
+            connector_component: dataset.into(),
+            message: e.to_string(),
+            source: Box::new(e),
+        })?
+        .into_custom_loader();
+
     let mut props = HashMap::from([
-        (
-            AWS_ACCESS_KEY_ID.to_string(),
-            credentials.access_key_id().to_string(),
-        ),
-        (
-            AWS_SECRET_ACCESS_KEY.to_string(),
-            credentials.secret_access_key().to_string(),
-        ),
         (AWS_REGION_NAME.to_string(), region.to_string()),
-        (
-            S3_ACCESS_KEY_ID.to_string(),
-            credentials.access_key_id().to_string(),
-        ),
-        (
-            S3_SECRET_ACCESS_KEY.to_string(),
-            credentials.secret_access_key().to_string(),
-        ),
         (S3_REGION.to_string(), region.to_string()),
     ]);
 
-    if let Some(session_token) = credentials.session_token() {
-        props.insert(AWS_SESSION_TOKEN.to_string(), session_token.to_string());
-        props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
-    }
-
-    // Disable OpenDAL's automatic credential loading from environment variables and config files.
-    // As we provide explicit credentials, we don't want OpenDAL to pick up AWS_SESSION_TOKEN
-    // or other credentials from the environment that may not be valid for this specific connection.
+    // OpenDAL must take credentials only from `s3_credential_loader`, never from the environment
+    // or config files, which may not belong to this connection.
     props.insert("s3.disable-config-load".to_string(), "true".to_string());
 
     props.extend(s3_addressing_props(params, &metadata_location));
@@ -539,11 +525,12 @@ async fn create_iceberg_provider(
 
     let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
         Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
+            customized_credential_load: Some(s3_credential_loader),
         });
 
     let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
         GlueCatalogBuilder::default()
+            .with_sdk_config(config.clone())
             .with_storage_factory(storage_factory)
             .load("glue", props)
             .await
