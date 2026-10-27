@@ -4026,6 +4026,18 @@ const PROTECTED_TIER_GROWTH: u64 = 8;
 /// same-tier runs have accumulated.
 const PROTECTED_MERGE_MAX_WIDTH: usize = 32;
 
+/// Fewest same-size datalake generations a cold compaction merges at once (see
+/// [`CayenneTableProvider::compact_cold_tier`]). With [`COLD_TIER_GROWTH`] it
+/// bounds the generations a table holds to about `(COLD_MERGE_MIN_RUNS - 1)`
+/// per size tier.
+const COLD_MERGE_MIN_RUNS: usize = 4;
+
+/// Most datalake generations one cold compaction merges.
+const COLD_MERGE_MAX_WIDTH: usize = 16;
+
+/// Geometric growth factor between datalake generation size tiers; tier 0 holds
+/// generations no larger than one cold target file.
+const COLD_TIER_GROWTH: u64 = 4;
 
 /// Bytes of merge input one protected-snapshot pass may select, per byte of the
 /// memory pool it accounts against.
@@ -27756,6 +27768,250 @@ impl CayenneTableProvider {
         Ok(true)
     }
 
+    /// Merge a size tier of datalake (cold) generations into one, so the number
+    /// of generations, the number of cold files, and the tombstones kept to hide
+    /// their superseded rows all stay bounded.
+    ///
+    /// A generation is the set of cold files sharing one `max_sequence` — one
+    /// promotion's output, or one earlier merge's. Generations are size-tiered
+    /// exactly as protected snapshots are ([`select_protected_snapshot_merge_tier`]):
+    /// the lowest tier holding at least [`COLD_MERGE_MIN_RUNS`] generations is
+    /// merged, oldest first, up to [`COLD_MERGE_MAX_WIDTH`]. Each input file is
+    /// read with its own cutoff — only tombstones newer than its `max_sequence`
+    /// apply ([`ColdDeletionFilterExec`]) — so the merged rows are exactly the
+    /// inputs' live rows, written by [`Self::write_stream_to_cold`] (per-file PK
+    /// blooms and statistics) with `max_sequence` = the newest input's. That is
+    /// sound because every tombstone a reader applies to the output with that
+    /// cutoff is newer than every input, and every tombstone it no longer
+    /// applies (at or below it) was either applied by this read or older than
+    /// the input it would have hidden a row of.
+    ///
+    /// Publication is conditional: [`MetadataCatalog::swap_cold_tier_files`]
+    /// replaces the inputs with the output only if every input is still in the
+    /// manifest, and the in-memory manifest is swapped under the same
+    /// `listing_fence` write. Warm data and delete files are untouched by the
+    /// swap. Afterwards the tombstones that can no longer hide any cold row are
+    /// cleared, durably and in memory, at or below the newest cold file's
+    /// sequence.
+    ///
+    /// Locks: `compaction_lock` for the whole pass, which serializes it with
+    /// promotion and warm-tier compaction (both rewrite what the retention
+    /// decision reads); no `write_lock` while reading, encoding, and uploading;
+    /// `listing_fence` for writing around the swap; `write_lock` only around the
+    /// tombstone clear, so a DELETE executing under it never judges a cold row
+    /// against a half-pruned index.
+    ///
+    /// Returns `Ok(true)` when a merge was published, `Ok(false)` when the tier
+    /// is disabled, nothing qualifies, or the swap found an input gone (an
+    /// overwrite replaced the table meanwhile; the written files are left to
+    /// the cold GC).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest cannot be read, or the merge's read,
+    /// write, or catalog swap fails. The manifest is unchanged on every error
+    /// before the swap commits.
+    #[doc(hidden)]
+    pub async fn compact_cold_tier(&self) -> Result<bool> {
+        let vc = &self.table_metadata.vortex_config;
+        if !vc.cold_tier_enabled() || self.pk_deletion_strategy.is_position_based() {
+            return Ok(false);
+        }
+        // `cold_tier_enabled()` guarantees a non-empty location.
+        let cold_location = vc.cold_tier_location.clone().unwrap_or_default();
+        let table_id = self.table_metadata.table_id.clone();
+
+        let _compaction_guard = self.compaction_lock.write().await;
+        if !self.maintenance_still_admitted() {
+            return Ok(false);
+        }
+
+        // Group the manifest into generations, oldest first.
+        let manifest = self.catalog.list_cold_tier_files(&table_id).await?;
+        let mut generations: BTreeMap<i64, (u64, Vec<crate::metadata::ColdTierFile>)> =
+            BTreeMap::new();
+        for file in manifest {
+            let generation = generations.entry(file.max_sequence).or_default();
+            generation.0 = generation
+                .0
+                .saturating_add(u64::try_from(file.file_size_bytes.max(0)).unwrap_or(0));
+            generation.1.push(file);
+        }
+        let runs: Vec<(String, i64, u64)> = generations
+            .iter()
+            .map(|(max_sequence, (bytes, _))| (max_sequence.to_string(), *max_sequence, *bytes))
+            .collect();
+        let base_bytes = u64::try_from(vc.cold_target_file_size_mb)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(1024 * 1024);
+        let ProtectedMergeSelection::Merge(selected) = select_protected_snapshot_merge_tier(
+            &runs,
+            COLD_MERGE_MIN_RUNS,
+            COLD_MERGE_MAX_WIDTH,
+            base_bytes,
+            COLD_TIER_GROWTH,
+            None,
+            None,
+        ) else {
+            return Ok(false);
+        };
+        let selected_sequences: HashSet<i64> = selected.iter().map(|(_, seq)| *seq).collect();
+        let Some(output_max_sequence) = selected_sequences.iter().copied().max() else {
+            return Ok(false);
+        };
+        let generation_count = generations.len();
+        let inputs: Vec<crate::metadata::ColdTierFile> = generations
+            .into_iter()
+            .filter(|(max_sequence, _)| selected_sequences.contains(max_sequence))
+            .flat_map(|(_, (_, files))| files)
+            .collect();
+
+        // Taken after the manifest: every tombstone that can hide an input row
+        // was published before the promotion that wrote the newest cold file, so
+        // it is here; any published later is newer than every cold file and
+        // keeps applying to the output after the swap.
+        let deletions = self.pk_deletion_snapshot();
+
+        let pass_start = Instant::now();
+        let ctx = self.create_compaction_session_context();
+        let schema = self.table_schema();
+        let Some(branch) = self
+            .build_cold_tier_scan_plan(ColdTierScan {
+                state: &ctx.state(),
+                projection: None,
+                filters: &[],
+                limit: None,
+                scan_config: &ctx.copied_config(),
+                read_schema_override: None,
+                file_statistics_schema: Arc::clone(&schema),
+                cold_files: &inputs,
+                selective: false,
+                per_file_thresholds: cold_files_need_deletion_filter(&deletions, &inputs),
+            })
+            .await?
+        else {
+            return Ok(false);
+        };
+        let plan = self.apply_cold_deletion_filter(branch, &self.pk_column_indices, &deletions)?;
+        let clustering = self.resolve_cold_clustering_indices();
+        let clustering_is_empty = clustering.is_empty();
+        let task_ctx = ctx.task_ctx();
+        let stream = self.cluster_runs_stream(plan, &clustering, &task_ctx)?;
+        let (written, total_rows) = self
+            .write_stream_to_cold(
+                &cold_location,
+                self.cold_object_store_config.as_ref(),
+                stream,
+                output_max_sequence,
+                if clustering_is_empty {
+                    EncodeFanOut::Sized
+                } else {
+                    EncodeFanOut::Serial
+                },
+            )
+            .await?;
+
+        let removed: Vec<String> = inputs.iter().map(|f| f.file_url.clone()).collect();
+        let swapped = {
+            let _fence = self.listing_fence.write().await;
+            let swapped = self
+                .catalog
+                .swap_cold_tier_files(&table_id, &removed, &written)
+                .await?;
+            if swapped {
+                // Re-read under the fence, so the published manifest is the
+                // catalog's (a schema change may have cleared statistics blobs
+                // since the capture), and scans resolve it with no metastore read.
+                let files = Arc::new(self.catalog.list_cold_tier_files(&table_id).await?);
+                self.store_cold_manifest(&self.get_current_snapshot_id(), &schema, &files);
+                self.notify_scan_input_change();
+            }
+            swapped
+        };
+        if !swapped {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Datalake compaction found an input already replaced; discarding its output"
+            );
+            return Ok(false);
+        }
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            merged_generations = selected_sequences.len(),
+            generations_before = generation_count,
+            input_files = inputs.len(),
+            written_files = written.len(),
+            total_rows,
+            duration_ms = u64::try_from(pass_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "Merged datalake generations"
+        );
+
+        self.clear_tombstones_no_cold_row_needs().await;
+        Ok(true)
+    }
+
+    /// Clear the tombstones that can no longer hide any row of the current
+    /// datalake manifest, durably and in memory, after a cold compaction raised
+    /// the oldest generation's sequence.
+    ///
+    /// The cutoff is the retention decision's ([`Self::cold_tombstone_retention`])
+    /// capped at the newest cold file's sequence: a tombstone at or below it was
+    /// published before the promotion that wrote that file, so the warm tier no
+    /// longer holds a row it hides either, while a tombstone above it may be a
+    /// write that raced this pass. Best effort — a failure keeps tombstones,
+    /// which costs memory, never a row.
+    async fn clear_tombstones_no_cold_row_needs(&self) {
+        let table_id = &self.table_metadata.table_id;
+        let manifest = match self.catalog.list_cold_tier_files(table_id).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Could not re-read the datalake manifest; keeping every tombstone this pass"
+                );
+                return;
+            }
+        };
+        let Some(newest_cold_sequence) = manifest.iter().map(|f| f.max_sequence).max() else {
+            return;
+        };
+        let retention = match self.cold_tombstone_retention(&manifest).await {
+            Ok(retention) => retention,
+            Err(error) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Could not decide which tombstones the datalake still needs; keeping every tombstone this pass"
+                );
+                return;
+            }
+        };
+        let cutoff = retention
+            .retain_above
+            .map_or(newest_cold_sequence, |cutoff| cutoff.min(newest_cold_sequence));
+
+        let _write_guard = self.write_lock_arc().lock_owned().await;
+        if let Err(error) = self
+            .catalog
+            .clear_key_tombstones_at_or_below(table_id, cutoff)
+            .await
+        {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                "Could not clear the tombstones the datalake no longer needs; keeping them in memory too"
+            );
+            return;
+        }
+        self.prune_deletion_index_at_or_below(cutoff);
+    }
+
     /// Fast, write-lock-free consolidation of a size-tiered subset of the
     /// immutable protected snapshots into a single new protected snapshot.
     ///
@@ -44776,6 +45032,18 @@ impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
                     "Tiering tick failed to move data to the datalake (warm tier left intact; next cycle retries): {e}"
                 );
             }
+        }
+
+        // Merge datalake generations after the move (which may have added one)
+        // and before GC, which then reclaims the merged inputs once their grace
+        // passes.
+        if let Err(e) = self.compact_cold_tier().await {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Failed to merge datalake files of table '{}', so its datalake keeps more files and deletion records until the next cycle retries. Cause: {e}",
+                self.table_metadata.table_name
+            );
         }
 
         // Physical cold GC fires about every `cold_tier_gc_interval_ms`

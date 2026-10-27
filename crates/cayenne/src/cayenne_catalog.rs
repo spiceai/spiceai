@@ -1128,6 +1128,71 @@ impl CayenneCatalog {
         Ok(true)
     }
 
+    /// In-transaction body of [`MetadataCatalog::swap_cold_tier_files`]:
+    /// `Ok(false)` with no mutation when a removed file is no longer registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failing statement's error (which rolls back the whole
+    /// transaction at the caller).
+    async fn swap_cold_tier_files_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        removed_file_urls: &[String],
+        added: &[ColdTierFile],
+    ) -> CatalogResult<bool> {
+        if removed_file_urls.is_empty() {
+            return Ok(false);
+        }
+        // CAS guard: every removed file must still be registered. URLs are user
+        // paths, so they are bound as parameters, never interpolated.
+        for url in removed_file_urls {
+            let values = txn
+                .query_row_values(QueryRowParams {
+                    sql: "SELECT COUNT(*) FROM cayenne_cold_tier_file \
+                          WHERE table_id = ?1 AND file_url = ?2",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Text(url.clone()),
+                    ],
+                })
+                .await?;
+            if i64::from_value(metastore_value_at(&values, 0)?)? != 1 {
+                return Ok(false);
+            }
+        }
+        for url in removed_file_urls {
+            txn.execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_cold_tier_file WHERE table_id = ?1 AND file_url = ?2",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(url.clone()),
+                ],
+            })
+            .await?;
+        }
+        for f in added {
+            txn.execute(ExecuteParams {
+                sql: COLD_TIER_FILE_UPSERT_SQL,
+                params: vec![
+                    MetastoreValue::Text(f.table_id.clone()),
+                    MetastoreValue::Text(f.file_url.clone()),
+                    MetastoreValue::Integer(f.row_count),
+                    MetastoreValue::Integer(f.file_size_bytes),
+                    MetastoreValue::Integer(f.min_sequence),
+                    MetastoreValue::Integer(f.max_sequence),
+                    MetastoreValue::Blob(f.statistics_blob.clone()),
+                    f.pk_bloom
+                        .clone()
+                        .map_or(MetastoreValue::Null, MetastoreValue::Blob),
+                ],
+            })
+            .await?;
+        }
+        Ok(true)
+    }
+
     /// Apply an overwrite commit's catalog mutations inside the caller's
     /// `MetastoreTransaction`, without opening a new transaction.
     ///
@@ -4478,6 +4543,109 @@ impl MetadataCatalog for CayenneCatalog {
         })
     }
 
+    async fn swap_cold_tier_files(
+        &self,
+        table_id: &str,
+        removed_file_urls: &[String],
+        added: &[ColdTierFile],
+    ) -> CatalogResult<bool> {
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        if max_attempts == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "swap_cold_tier_files requires at least one attempt".to_string(),
+            });
+        }
+
+        for attempt in 1..=max_attempts {
+            let mut tx =
+                self.begin_transaction()
+                    .await
+                    .map_err(|e| CatalogError::InvalidOperation {
+                        message: "Failed to begin the datalake file swap transaction.".to_string(),
+                        source: Box::new(e),
+                    })?;
+
+            match self
+                .swap_cold_tier_files_in_txn(&mut *tx, table_id, removed_file_urls, added)
+                .await
+            {
+                // A removed file is already gone; the transaction made no changes.
+                Ok(false) => return Ok(false),
+                Ok(true) => match tx.commit().await {
+                    Ok(()) => return Ok(true),
+                    Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                        let delay = retry_backoff_delay(attempt);
+                        tracing::debug!(
+                            attempt,
+                            max_attempts,
+                            ?delay,
+                            "Retrying the datalake file swap after commit conflict"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => {
+                        return Err(CatalogError::InvalidOperation {
+                            message: "Failed to commit the datalake file swap.".to_string(),
+                            source: Box::new(e),
+                        });
+                    }
+                },
+                Err(e) if is_retryable_write_conflict(&e) => {
+                    if !end_conflicted_attempt(tx, attempt, max_attempts, "swap datalake files")
+                        .await
+                    {
+                        return Err(e);
+                    }
+                }
+                // Drop `tx` → automatic rollback; leaves the catalog unchanged.
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "swap_cold_tier_files exhausted {max_attempts} attempts without success or a terminal error"
+            ),
+        })
+    }
+
+    async fn clear_key_tombstones_at_or_below(
+        &self,
+        table_id: &str,
+        cutoff: i64,
+    ) -> CatalogResult<()> {
+        let mut tx = self
+            .begin_transaction()
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to begin the tombstone clear transaction.".to_string(),
+                source: Box::new(e),
+            })?;
+        tx.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_delete_file \
+                  WHERE table_id = ?1 AND source_data_file_path IS NULL AND sequence_number <= ?2",
+            params: vec![
+                MetastoreValue::Text(table_id.to_string()),
+                MetastoreValue::Integer(cutoff),
+            ],
+        })
+        .await?;
+        tx.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?1 AND sequence_number <= ?2",
+            params: vec![
+                blob_keyed_table_id_value(table_id),
+                MetastoreValue::Integer(cutoff),
+            ],
+        })
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to commit the tombstone clear.".to_string(),
+                source: Box::new(e),
+            })
+    }
+
     async fn upsert_pk_index(
         &self,
         table_id: &str,
@@ -7046,6 +7214,106 @@ mod tests {
                 .expect("list insert records")
                 .is_empty(),
             "no cutoff clears every insert record"
+        );
+
+        drop(catalog);
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// A datalake merge's swap replaces its inputs with its output only while
+    /// every input is still registered; once one is gone it changes nothing.
+    #[tokio::test]
+    async fn swap_cold_tier_files_is_conditional_on_every_input() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!("sqlite://./.test_cold_swap_{}.db", uuid::Uuid::now_v7());
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
+        catalog.init().await.expect("Failed to initialize catalog");
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "cold_swap_tbl".to_string(),
+                schema,
+                primary_key: vec!["id".to_string()],
+                on_conflict: None,
+                base_path: base_path.clone(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+        let cold = |url: &str, max_sequence: i64| ColdTierFile {
+            table_id: table_id.clone(),
+            file_url: url.to_string(),
+            row_count: 10,
+            file_size_bytes: 100,
+            min_sequence: 0,
+            max_sequence,
+            statistics_blob: Vec::new(),
+            pk_bloom: None,
+        };
+        let urls = |catalog: Arc<CayenneCatalog>, table_id: String| async move {
+            let mut urls: Vec<String> = catalog
+                .list_cold_tier_files(&table_id)
+                .await
+                .expect("list cold files")
+                .into_iter()
+                .map(|f| f.file_url)
+                .collect();
+            urls.sort();
+            urls
+        };
+        catalog
+            .commit_overwrite_to_cold(
+                &table_id,
+                &uuid::Uuid::now_v7().to_string(),
+                &[
+                    cold("s3://b/a.vortex", 1),
+                    cold("s3://b/b.vortex", 2),
+                    cold("s3://b/c.vortex", 3),
+                ],
+                None,
+            )
+            .await
+            .expect("seed the manifest");
+
+        assert!(
+            catalog
+                .swap_cold_tier_files(
+                    &table_id,
+                    &["s3://b/a.vortex".to_string(), "s3://b/b.vortex".to_string()],
+                    &[cold("s3://b/m.vortex", 2)],
+                )
+                .await
+                .expect("swap"),
+            "every input is registered, so the swap applies"
+        );
+        assert_eq!(
+            urls(Arc::clone(&catalog), table_id.clone()).await,
+            vec!["s3://b/c.vortex".to_string(), "s3://b/m.vortex".to_string()]
+        );
+
+        assert!(
+            !catalog
+                .swap_cold_tier_files(
+                    &table_id,
+                    &["s3://b/a.vortex".to_string(), "s3://b/c.vortex".to_string()],
+                    &[cold("s3://b/n.vortex", 3)],
+                )
+                .await
+                .expect("swap"),
+            "an input is already gone, so the swap declines"
+        );
+        assert_eq!(
+            urls(Arc::clone(&catalog), table_id.clone()).await,
+            vec!["s3://b/c.vortex".to_string(), "s3://b/m.vortex".to_string()],
+            "a declined swap changes nothing"
         );
 
         drop(catalog);

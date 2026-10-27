@@ -895,8 +895,10 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 materialize_warm_files_for_cold_promotion(&table, w.durability).await?;
                 // `Ok(false)` (warm tier below threshold) is fine.
                 let _ = table.promote_warm_to_cold().await?;
-                // GC serialized after promote, same task — the production
-                // promotion-tick order (out-of-band GC is unsupported).
+                // Then the datalake merge and GC, serialized in the same task —
+                // the production promotion-tick order (out-of-band GC is
+                // unsupported). `Ok(false)` (no tier qualifies) is fine.
+                let _ = table.compact_cold_tier().await?;
                 table.run_cold_tier_gc_tick().await;
             }
         }
@@ -1069,6 +1071,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 let t = handle.read().await;
                 materialize_warm_files_for_cold_promotion(&t, w.durability).await?;
                 let _ = t.promote_warm_to_cold().await?;
+                let _ = t.compact_cold_tier().await?;
                 t.run_cold_tier_gc_tick().await;
             }
             Op::Compact => continue,

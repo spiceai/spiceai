@@ -888,6 +888,32 @@ pub trait MetadataCatalog: Send + Sync {
         retain_tombstones_above: Option<i64>,
     ) -> CatalogResult<()>;
 
+    /// Atomically replace datalake (cold) files: remove the manifest rows of
+    /// `removed_file_urls` and register `added`, in one transaction.
+    ///
+    /// Conditional, like [`Self::swap_protected_snapshots`]: returns `Ok(false)`
+    /// and changes nothing when any of `removed_file_urls` is no longer in the
+    /// manifest (an overwrite or another swap consumed it), so a merge built from
+    /// a stale manifest can never re-register rows twice or drop rows another
+    /// commit placed. Never touches warm data, delete files, or insert records.
+    async fn swap_cold_tier_files(
+        &self,
+        table_id: &str,
+        removed_file_urls: &[String],
+        added: &[ColdTierFile],
+    ) -> CatalogResult<bool>;
+
+    /// Clear every key-based delete file and insert record at or below
+    /// `cutoff`, in one transaction. Position-based delete files are untouched.
+    ///
+    /// The caller must have established that no tombstone at or below `cutoff`
+    /// can hide a live row anywhere in the table.
+    async fn clear_key_tombstones_at_or_below(
+        &self,
+        table_id: &str,
+        cutoff: i64,
+    ) -> CatalogResult<()>;
+
     /// Upsert the persisted primary-key existence index (a bloom checkpoint),
     /// tagged with the snapshot id it covers. Stored in the metastore so it is
     /// captured by metastore snapshots — letting both a restart and a new node

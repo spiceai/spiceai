@@ -373,3 +373,146 @@ async fn test_promotion_never_rewrites_existing_datalake_files_impl(
 
     Ok(())
 }
+
+/// Distinct `max_sequence` values in the manifest: one per promotion, or per
+/// datalake merge.
+fn generation_count(files: &[ColdTierFile]) -> usize {
+    files
+        .iter()
+        .map(|f| f.max_sequence)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+test_with_backends!(test_cold_compaction_merges_generations_impl);
+
+/// A datalake merge folds several promotion generations — each still holding
+/// rows later upserts and deletes superseded — into one, keeps every query
+/// answer exact, physically drops the superseded rows, and clears the
+/// tombstones that hid them; a reopen answers the same.
+async fn test_cold_compaction_merges_generations_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            catalog,
+            table_options(&fixture, &cold_dir),
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    ctx.register_table(TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    let mut oracle: BTreeMap<i64, i64> = BTreeMap::new();
+    let lookups = [7, 8, 100, 101, 150, 205, 241];
+
+    // Generation 1: ids 0..200.
+    let initial: Vec<(i64, i64)> = (0..200).map(|id| (id, id * 2)).collect();
+    upsert(&table, &mut oracle, &initial).await?;
+    flush_warm(&table).await;
+    assert!(table.promote_warm_to_cold().await?, "promotion 1 fires");
+
+    // Generations 2..=5: replay upserts of ids 0..50 (each superseding the
+    // previous generation's copy), delete one datalake-resident key, and add
+    // ten new keys per round.
+    for round in 1..=4_i64 {
+        let rows: Vec<(i64, i64)> = (0..50)
+            .map(|id| (id, id * 10 + round))
+            .chain((200 + round * 10..210 + round * 10).map(|id| (id, id * 2)))
+            .collect();
+        upsert(&table, &mut oracle, &rows).await?;
+        let deleted = delete_where(&table, col("id").eq(lit(99 + round))).await?;
+        eprintln!(
+            "[cold_compaction] DELETE id = {} reported {deleted} rows affected",
+            99 + round
+        );
+        oracle.remove(&(99 + round));
+        flush_warm(&table).await;
+        assert!(
+            table.promote_warm_to_cold().await?,
+            "promotion {} fires",
+            round + 1
+        );
+    }
+    let before = manifest(&fixture.catalog, &table).await?;
+    assert_eq!(
+        generation_count(&before),
+        5,
+        "five promotions leave five datalake generations"
+    );
+    let tombstones_before = fixture
+        .catalog
+        .get_table_delete_files(table.table_id())
+        .await?
+        .len();
+    assert!(
+        tombstones_before > 0,
+        "the replayed upserts and deletes must leave tombstones hiding datalake rows"
+    );
+    assert_matches_oracle(&ctx, &oracle, &lookups, "before the datalake merge").await?;
+
+    assert!(
+        table.compact_cold_tier().await?,
+        "five small generations qualify for a merge"
+    );
+    let after = manifest(&fixture.catalog, &table).await?;
+    assert_eq!(
+        generation_count(&after),
+        1,
+        "every generation is merged into one"
+    );
+    assert!(
+        after.len() < before.len(),
+        "the merge reduces the datalake file count ({} -> {})",
+        before.len(),
+        after.len()
+    );
+    assert_eq!(
+        after.iter().map(|f| f.row_count).sum::<i64>(),
+        i64::try_from(oracle.len())?,
+        "the merged generation holds exactly the live rows: every superseded copy is gone"
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .get_table_delete_files(table.table_id())
+            .await?
+            .len(),
+        0,
+        "no tombstone can hide a row of the merged generation, so all are cleared"
+    );
+    assert_matches_oracle(&ctx, &oracle, &lookups, "after the datalake merge").await?;
+
+    // Writes after the merge still supersede datalake rows correctly.
+    upsert(&table, &mut oracle, &[(7, 777), (150, 1500)]).await?;
+    delete_where(&table, col("id").eq(lit(205_i64))).await?;
+    oracle.remove(&205);
+    assert_matches_oracle(&ctx, &oracle, &lookups, "after writes following the merge").await?;
+
+    table.drain_in_flight_maintenance().await?;
+    drop(ctx);
+    drop(table);
+    let catalog_2 = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    catalog_2.init().await?;
+    let ctx_2 = SessionContext::new();
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog_2) as Arc<dyn MetadataCatalog>,
+            ctx_2.runtime_env(),
+        )
+        .open(TABLE)
+        .await?,
+    );
+    ctx_2.register_table(TABLE, Arc::clone(&reopened) as Arc<dyn TableProvider>)?;
+    assert_eq!(
+        generation_count(&manifest(&catalog_2, &reopened).await?),
+        1,
+        "the reopened table sees the merged manifest"
+    );
+    assert_matches_oracle(&ctx_2, &oracle, &lookups, "after reopen").await?;
+    Ok(())
+}
