@@ -358,10 +358,13 @@ async fn query_stream_to_http_response(
         None => None,
     };
 
-    let headers = response_headers(format, cache_status).await;
     let account = EgressAccount::register(&memory_pool, "http_egress");
-    let body = Body::from_stream(record_batch_body(kind, first, data_stream, account));
-    streamed_response(headers, body)
+    let body = match record_batch_body(kind, first, data_stream, account) {
+        Ok(body) => body,
+        Err(e) => return encoding_error_response(&e),
+    };
+    let headers = response_headers(format, cache_status).await;
+    streamed_response(headers, Body::from_stream(body))
 }
 
 /// Run a `BEGIN … COMMIT` body through the shared transaction orchestrator
@@ -542,10 +545,24 @@ async fn query_raw_stream_to_http_response(
         None => None,
     };
 
-    let headers = response_headers(format, cache_status).await;
     let account = EgressAccount::register(&memory_pool, "http_egress");
-    let body = Body::from_stream(record_batch_body(kind, first, data_stream, account));
-    streamed_response(headers, body)
+    let body = match record_batch_body(kind, first, data_stream, account) {
+        Ok(body) => body,
+        Err(e) => return encoding_error_response(&e),
+    };
+    let headers = response_headers(format, cache_status).await;
+    streamed_response(headers, Body::from_stream(body))
+}
+
+/// The response for a result the format cannot encode (CSV rejects nested
+/// columns), as the buffered path reports it.
+fn encoding_error_response(error: &std::io::Error) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        HeaderMap::new(),
+        error.to_string(),
+    )
+        .into_response()
 }
 
 /// A `200 OK` whose body streams, marked so its `Server-Timing` total is sent
@@ -718,22 +735,34 @@ impl BodyEncoder {
 /// Streams the query result in `kind`'s framing, one input batch at a time,
 /// charging each serialized chunk against the query memory pool via `account`.
 /// The bytes emitted are identical to the buffered `to_http_response` output.
+///
+/// The first batch is encoded before this returns, so a result the format
+/// cannot encode still fails with an error status instead of a `200` whose
+/// body breaks off.
 fn record_batch_body<S, B>(
     kind: StreamedBody,
     first: Option<B>,
-    rest: S,
+    mut rest: S,
     account: Arc<EgressAccount>,
-) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send
+) -> std::io::Result<impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>
 where
     S: Stream<Item = Result<B, datafusion::error::DataFusionError>> + Send + Unpin + 'static,
     B: SqlJsonBatch,
 {
-    let first_schema = first.as_ref().map(|batch| batch.as_record_batch().schema());
-    let mut batches =
-        futures::stream::iter(first.map(Ok::<_, datafusion::error::DataFusionError>)).chain(rest);
-    try_stream! {
-        let mut encoder = BodyEncoder::new(kind, first_schema.as_deref())?;
-        while let Some(item) = batches.next().await {
+    let first = first.as_ref().map(SqlJsonBatch::as_record_batch);
+    let mut encoder = BodyEncoder::new(kind, first.map(|batch| batch.schema_ref().as_ref()))?;
+    let head = match first {
+        Some(batch) => encoder.encode(batch)?,
+        None => Vec::new(),
+    };
+    Ok(try_stream! {
+        if !head.is_empty() {
+            let size = head.len();
+            account.reserve(size).await;
+            yield Bytes::from(head);
+            account.release(size);
+        }
+        while let Some(item) = rest.next().await {
             let batch = item.map_err(|e| std::io::Error::other(e.to_string()))?;
             let chunk = encoder.encode(batch.as_record_batch())?;
             if !chunk.is_empty() {
@@ -750,7 +779,7 @@ where
             yield Bytes::from(tail);
             account.release(size);
         }
-    }
+    })
 }
 
 // Runs query and returns the results as a vector of `RecordBatch`.
@@ -1496,6 +1525,48 @@ mod tests {
         }
     }
 
+    /// CSV cannot encode nested columns. A streamed CSV response must still
+    /// fail with the buffered path's status and message, not a `200` whose
+    /// body breaks off after the headers.
+    #[tokio::test]
+    async fn csv_of_a_nested_column_is_an_error_status_not_a_broken_body() {
+        use arrow::array::ListArray;
+        use arrow::datatypes::Int32Type;
+        use datafusion::execution::memory_pool::UnboundedMemoryPool;
+
+        let list = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![Some(vec![
+            Some(1),
+            Some(2),
+        ])]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            list.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(list) as ArrayRef])
+            .expect("list batch");
+
+        let (status, _, expected) = to_http_response(
+            vec![batch.clone()],
+            CacheStatus::CacheMiss,
+            ResponseMimeType::Csv,
+            ResponseMetadata::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let response = query_stream_to_http_response(
+            stream_of(schema, vec![batch]),
+            CacheStatus::CacheMiss,
+            ResponseMimeType::Csv,
+            pool,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response_text(response).await, expected);
+    }
+
     /// The first rows of a `vnd.spiceai.sql.v1+json` or CSV response must reach
     /// the client while the query is still producing: a body that waits for the
     /// last batch holds the whole result in memory.
@@ -1592,12 +1663,10 @@ mod tests {
                 futures::stream::iter(batches.map(Ok::<_, DataFusionError>)),
             ));
 
-            let mut body = std::pin::pin!(record_batch_body(
-                StreamedBody::JsonArray,
-                first,
-                rest,
-                account,
-            ));
+            let mut body = std::pin::pin!(
+                record_batch_body(StreamedBody::JsonArray, first, rest, account)
+                    .expect("an Int64/Utf8 batch encodes")
+            );
             let mut streamed = Vec::new();
             while let Some(chunk) = body.next().await {
                 streamed.extend_from_slice(&chunk.expect("chunk"));
