@@ -42,3 +42,5 @@ steps:
   - query: SELECT count(*) AS n FROM (SELECT 42 AS k FROM e GROUP BY ROLLUP(v) LIMIT 1) q
   - query: SELECT outer_t.id AS id, (SELECT (SELECT outer_t.id AS k) FROM (SELECT max(e.id) AS m FROM e WHERE e.id >= 0) a) AS k FROM e AS outer_t ORDER BY id
   - query: SELECT outer_t.id AS id, (SELECT (SELECT outer_t.id AS k) FROM (SELECT max(e.id) AS m FROM e WHERE e.id < 0) a) AS k FROM e AS outer_t ORDER BY id
+  - query: SELECT outer_t.id AS id, (SELECT (SELECT outer_t.id) FROM (SELECT max(e.id) AS id FROM e WHERE e.id >= 0) a) AS k FROM e AS outer_t ORDER BY id
+  - query: SELECT outer_t.id AS id, (SELECT (SELECT outer_t.id) FROM (SELECT max(e.id) AS id FROM e WHERE e.id < 0) a) AS k FROM e AS outer_t ORDER BY id
