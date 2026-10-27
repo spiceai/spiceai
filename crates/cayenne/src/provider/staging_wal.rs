@@ -278,13 +278,6 @@ impl CayenneStagedAppend {
         // bucket (acquiring the visibility lock + listing fence) is the one that
         // grows: publishes serialize across the table, so a high lock-wait vs a
         // high move/commit distinguishes lock-bound from work-bound finalization.
-        // Register before the WAL is discoverable, as `prepare` does: recovery
-        // treats a committed WAL that is not in the in-flight set as a crash
-        // leftover, and compaction must not move the snapshot this WAL targets
-        // while the publish is pending. On an error the guard unregisters and
-        // leaves the staging flags set, so the next write audits what is left.
-        let inflight_guard =
-            InflightStagingAppendGuard::register(&self.table, &self.staging_snapshot_id);
         let wal_start = Instant::now();
         self.write_wal().await?;
         record_cayenne_write_phase(self.table.table_name(), "publish_wal_write", wal_start);
@@ -303,17 +296,6 @@ impl CayenneStagedAppend {
         self.table
             .publish_current_snapshot_files_changed_under_held_fence();
         self.table.mark_maintained_aggregates_stale();
-        inflight_guard.disarm();
-        self.table
-            .unregister_inflight_staging_append(&self.staging_snapshot_id);
-        if !self.table.has_inflight_staging_appends() {
-            self.table
-                .staging_wal_present()
-                .store(false, Ordering::Release);
-            self.table
-                .staging_may_have_files()
-                .store(false, Ordering::Release);
-        }
         record_cayenne_write_phase(self.table.table_name(), "publish_commit", commit_start);
         Ok(())
     }

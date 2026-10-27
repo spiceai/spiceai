@@ -1432,16 +1432,14 @@ async fn test_cancelled_plain_append_does_not_wedge_after_compaction_impl(
     );
     drop(fence);
 
-    // Whatever the cancelled append left behind settles before compaction:
-    // either its publish completes or nothing of it remains.
+    // The cancelled append had already staged its rows and written its WAL, so
+    // it commits: its publish finishes even though its caller is gone.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    let cancelled_rows = loop {
-        let rows = row_count(&ctx, name).await;
-        if rows == usize::try_from(5 * ROWS)? || std::time::Instant::now() >= deadline {
-            break rows;
-        }
+    let mut cancelled_rows = row_count(&ctx, name).await;
+    while cancelled_rows != usize::try_from(5 * ROWS)? && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+        cancelled_rows = row_count(&ctx, name).await;
+    }
 
     // Move the current snapshot.
     assert!(
@@ -1453,19 +1451,21 @@ async fn test_cancelled_plain_append_does_not_wedge_after_compaction_impl(
     let next_start = 20_001;
     append_batch(&table, large_batch(next_start, ROWS)).await?;
 
+    assert_eq!(
+        cancelled_rows,
+        usize::try_from(5 * ROWS)?,
+        "the cancelled append's publish must complete"
+    );
     let mut expected: Vec<i64> = (1..=4 * ROWS).collect();
-    if cancelled_rows == usize::try_from(5 * ROWS)? {
-        expected.extend(cancelled_start..cancelled_start + ROWS);
-    } else {
-        assert_eq!(
-            cancelled_rows,
-            usize::try_from(4 * ROWS)?,
-            "a cancelled append must be all or nothing"
-        );
-    }
+    expected.extend(cancelled_start..cancelled_start + ROWS);
     expected.extend(next_start..next_start + ROWS);
     let ids: Vec<i64> = query_all(&ctx, name).await.into_iter().map(|(id, _)| id).collect();
     assert_eq!(ids, expected, "rows after a cancelled append and compaction");
+    assert_eq!(
+        count_star(&ctx, name).await,
+        expected.len(),
+        "COUNT(*) must match the rows a scan returns"
+    );
     assert!(
         staging_wal_paths(&table).is_empty(),
         "no staging WAL may remain"
@@ -1485,8 +1485,30 @@ async fn test_cancelled_plain_append_does_not_wedge_after_compaction_impl(
         .map(|(id, _)| id)
         .collect();
     assert_eq!(ids, expected, "rows after reopening");
+    assert_eq!(
+        count_star(&reopened_ctx, name).await,
+        expected.len(),
+        "COUNT(*) after reopening"
+    );
 
     Ok(())
+}
+
+async fn count_star(ctx: &SessionContext, table_name: &str) -> usize {
+    let batches = ctx
+        .sql(&format!("SELECT COUNT(*) FROM {table_name}"))
+        .await
+        .expect("count query")
+        .collect()
+        .await
+        .expect("collect count");
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT(*) is Int64")
+        .value(0);
+    usize::try_from(count).expect("non-negative count")
 }
 
 async fn append_batch(
