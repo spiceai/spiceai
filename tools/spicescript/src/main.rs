@@ -287,10 +287,13 @@ async fn run(cli: Cli) -> Result<bool> {
     {
         print!("{out}");
         let report = report?;
+        // A log that cannot be saved is a warning, as in the runner: the
+        // script's own outcome still counts, and the other scripts still run.
         if let Some(root) = &options.log_capture
             && !report.failures.is_empty()
+            && let Err(e) = capture_script(&runner::capture_dir(root, script), path, &out)
         {
-            capture_script(&runner::capture_dir(root, script), path, &out)?;
+            println!("warning: {e:#}");
         }
         // The time it held slots, not the time it waited for them.
         let took = if report.ran.is_zero() {
