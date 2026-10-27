@@ -261,12 +261,12 @@ bigdecimal = "0.4.7"
 blake3 = "1.5"
 byte-unit = "5.1.4"
 bytes = "1.10.0"
-candle = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-core" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-kernels" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-metal-kernels" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-nn" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-transformers" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
+candle = { git = "https://github.com/spiceai/candle.git", rev = "829b57522e601ea169b04e2d4a375c3abe3ed58c", package = "candle-core" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant; spiceai/candle#19: zip 9.1)
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "829b57522e601ea169b04e2d4a375c3abe3ed58c" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant; spiceai/candle#19: zip 9.1)
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "829b57522e601ea169b04e2d4a375c3abe3ed58c", package = "candle-kernels" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant; spiceai/candle#19: zip 9.1)
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "829b57522e601ea169b04e2d4a375c3abe3ed58c", package = "candle-metal-kernels" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant; spiceai/candle#19: zip 9.1)
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "829b57522e601ea169b04e2d4a375c3abe3ed58c", package = "candle-nn" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant; spiceai/candle#19: zip 9.1)
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "829b57522e601ea169b04e2d4a375c3abe3ed58c", package = "candle-transformers" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant; spiceai/candle#19: zip 9.1)
 charset = "0.1.5"
 # AEAD for the at-rest delivered-secrets cache. Already in the tree via `hpke`,
 # which uses the same primitive for the sealed-secret wire format.
@@ -643,11 +643,11 @@ backoff = { path = "crates/backoff" }
 
 # Redirect candle-core / kernels / nn / transformers to the spiceai fork;
 # this matches the git rev pinned in [workspace.dependencies] above.
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "829b57522e601ea169b04e2d4a375c3abe3ed58c" } # spiceai
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "829b57522e601ea169b04e2d4a375c3abe3ed58c" } # spiceai
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "829b57522e601ea169b04e2d4a375c3abe3ed58c" } # spiceai
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "829b57522e601ea169b04e2d4a375c3abe3ed58c" } # spiceai
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "829b57522e601ea169b04e2d4a375c3abe3ed58c" } # spiceai
 # candle-index-select-cu is crates.io-sourced by text-embeddings-inference;
 # point it at the spiceai fork, which builds against candle 0.11.
 candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select-cu.git", rev = "75fc0b689b33a327907d36dd479f7d242640ca71" } # spiceai (candle 0.11)

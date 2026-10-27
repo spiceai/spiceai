@@ -12,7 +12,7 @@ version.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 calamine = "0.37"
-docx-rs = { git = "https://github.com/spiceai/docx-rs", rev = "2a85dce57d0128e2cd7c369545516c347cb8c529" }
+docx-rs = { git = "https://github.com/spiceai/docx-rs", rev = "81faaf2187185b097710b9ee589bf039efdd74de" }
 flate2 = "1"
 liteparse = { version = "2.3", default-features = false }
 # Preload PDFium through liteparse's own runtime loader (shared `dynamic` OnceLock).
