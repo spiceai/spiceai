@@ -6835,15 +6835,24 @@ impl CayenneTableProvider {
     /// once the commit succeeds: no row names them afterwards, and nothing else
     /// would. Such a rewrite excludes writers, so the rows read before the commit
     /// are the rows it clears.
+    ///
+    /// `cold_cap` is [`Self::cold_tombstone_prune_cap`], read once by the caller
+    /// so its in-memory clear ([`Self::clear_deletion_caches_for_rewrite`]) uses
+    /// the same bound. A warm rewrite never touches datalake files, so every
+    /// scope clears only tombstones at or below it: the ones above may still
+    /// hide superseded datalake rows.
     pub(crate) async fn commit_snapshot_rewrite(
         &self,
         replaced_snapshot_id: &str,
         new_snapshot_id: &str,
         scope: &RewriteScope,
+        cold_cap: Option<i64>,
     ) -> CatalogResult<()> {
+        let clear_through = Self::rewrite_tombstone_clear_bound(scope, cold_cap);
         let cleared_delete_files = match scope {
             RewriteScope::All | RewriteScope::AllTombstonesFoldedSnapshots { .. } => {
-                self.catalog
+                let mut files = self
+                    .catalog
                     .get_table_delete_files(&self.table_metadata.table_id)
                     .await
                     .unwrap_or_else(|error| {
@@ -6856,12 +6865,22 @@ impl CayenneTableProvider {
                             "Could not list the deletion vectors a snapshot rewrite clears; their files stay on disk"
                         );
                         Vec::new()
-                    })
+                    });
+                // The rows a capped commit keeps still name their files.
+                files.retain(|file| {
+                    clear_through.is_none_or(|bound| file.sequence_number <= bound)
+                });
+                files
             }
             RewriteScope::Fenced { .. } => Vec::new(),
         };
         let committed = self
-            .commit_snapshot_rewrite_catalog(replaced_snapshot_id, new_snapshot_id, scope)
+            .commit_snapshot_rewrite_catalog(
+                replaced_snapshot_id,
+                new_snapshot_id,
+                scope,
+                clear_through,
+            )
             .await;
         if committed.is_ok() {
             super::delete::remove_dropped_deletion_vector_files(
@@ -6872,22 +6891,51 @@ impl CayenneTableProvider {
         committed
     }
 
+    /// The highest sequence of a tombstone a rewrite commit of `scope` clears,
+    /// or `None` for every one: the scope's own bound, capped at `cold_cap`.
+    fn rewrite_tombstone_clear_bound(scope: &RewriteScope, cold_cap: Option<i64>) -> Option<i64> {
+        match scope {
+            RewriteScope::All | RewriteScope::AllTombstonesFoldedSnapshots { .. } => cold_cap,
+            RewriteScope::Fenced { cutoff, .. } => {
+                Some(cold_cap.map_or(*cutoff, |cap| (*cutoff).min(cap)))
+            }
+        }
+    }
+
     async fn commit_snapshot_rewrite_catalog(
         &self,
         replaced_snapshot_id: &str,
         new_snapshot_id: &str,
         scope: &RewriteScope,
+        clear_through: Option<i64>,
     ) -> CatalogResult<()> {
         match scope {
-            RewriteScope::All => {
-                self.catalog
-                    .commit_compaction(
-                        &self.table_metadata.table_id,
-                        replaced_snapshot_id,
-                        new_snapshot_id,
-                    )
-                    .await
-            }
+            RewriteScope::All => match clear_through {
+                None => {
+                    self.catalog
+                        .commit_compaction(
+                            &self.table_metadata.table_id,
+                            replaced_snapshot_id,
+                            new_snapshot_id,
+                        )
+                        .await
+                }
+                // Datalake files exist: keep the tombstones that may hide their
+                // rows. A wholesale rewrite folds every protected snapshot.
+                Some(bound) => {
+                    let folded_ids: Vec<String> =
+                        self.protected_snapshot_ids().into_iter().collect();
+                    self.catalog
+                        .commit_compaction_fenced(
+                            &self.table_metadata.table_id,
+                            replaced_snapshot_id,
+                            new_snapshot_id,
+                            bound,
+                            &folded_ids,
+                        )
+                        .await
+                }
+            },
             RewriteScope::AllTombstonesFoldedSnapshots { folded } => {
                 let folded_ids: Vec<String> = folded.iter().cloned().collect();
                 self.catalog
@@ -6900,8 +6948,9 @@ impl CayenneTableProvider {
                         // rewrite that rewrote their file away — an unbounded
                         // cutoff clears every one, exactly as
                         // `commit_compaction` does. Only the protected-snapshot
-                        // clear is narrowed to `folded`.
-                        i64::MAX,
+                        // clear is narrowed to `folded`, and the tombstone clear
+                        // to the datalake cap when the table has datalake files.
+                        clear_through.unwrap_or(i64::MAX),
                         &folded_ids,
                     )
                     .await
@@ -6912,16 +6961,12 @@ impl CayenneTableProvider {
                 // that follows the commit: a tombstone that may still mask a
                 // superseded cold row must survive a restart too, and the reload
                 // sees only what this commit leaves.
-                let cutoff = self
-                    .cold_tombstone_prune_cap()
-                    .await
-                    .map_or(*cutoff, |cap| (*cutoff).min(cap));
                 self.catalog
                     .commit_compaction_fenced(
                         &self.table_metadata.table_id,
                         replaced_snapshot_id,
                         new_snapshot_id,
-                        cutoff,
+                        clear_through.unwrap_or(*cutoff),
                         &folded_ids,
                     )
                     .await
@@ -15574,6 +15619,8 @@ impl CayenneTableProvider {
             cold_files,
             cold_statistics_schema,
             _scan_guard,
+            deleted_pk_i64,
+            deleted_row_keys,
         ) = {
             let _fence = self.listing_fence.read().await;
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
@@ -15620,6 +15667,25 @@ impl CayenneTableProvider {
             } else {
                 None
             };
+            // The deletion index joins the same instant: a datalake merge swaps the
+            // manifest under the WRITE fence and only afterwards clears the
+            // tombstones its inputs needed, so an index loaded after this block
+            // could pair the pre-merge manifest with a pruned index and let a
+            // deleted key back into the keyset.
+            let deleted_pk_i64: Option<Arc<DeletionIndex>> = match &self.pk_deletion_strategy {
+                PkDeletionStrategyWithCache::Int64Pk {
+                    deletion_snapshot, ..
+                } => Some(Arc::clone(&deletion_snapshot.load_full().tombstones)),
+                _ => None,
+            };
+            let deleted_row_keys: Option<Arc<KeyDeletionIndex>> = match &self
+                .pk_deletion_strategy
+            {
+                PkDeletionStrategyWithCache::RowConverterBased {
+                    deletion_snapshot, ..
+                } => Some(Arc::clone(&deletion_snapshot.load_full().tombstones)),
+                _ => None,
+            };
             // Pin every snapshot dir this rebuild reads (the current snapshot plus
             // every protected snapshot) against the retired-dir sweep for the whole
             // read. Unlike a query scan, this write-path read opens Vortex files with
@@ -15646,6 +15712,8 @@ impl CayenneTableProvider {
                 cold_files,
                 self.table_schema(),
                 scan_guard,
+                deleted_pk_i64,
+                deleted_row_keys,
             )
         };
         #[cfg(test)]
@@ -15666,24 +15734,9 @@ impl CayenneTableProvider {
             )
             .await?;
 
-        // Load the deletion caches based on pk_deletion_strategy.
+        // The deletion caches were captured with the snapshot list above.
         // Note: PositionBased strategy is never used here since it implies no primary key,
         // and this function is only called for tables with primary keys.
-        // ArcSwap loads are wait-free; the resulting `Arc<...Index>` is an immutable
-        // snapshot of the deletion state at this instant.
-        let deleted_pk_i64: Option<Arc<DeletionIndex>> = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                deletion_snapshot, ..
-            } => Some(Arc::clone(&deletion_snapshot.load_full().tombstones)),
-            _ => None,
-        };
-
-        let deleted_row_keys: Option<Arc<KeyDeletionIndex>> = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::RowConverterBased {
-                deletion_snapshot, ..
-            } => Some(Arc::clone(&deletion_snapshot.load_full().tombstones)),
-            _ => None,
-        };
 
         // Byte budget only for upsert tables — a bloom is a sound existence
         // answer there; `do-nothing` needs an exact answer (a false positive
@@ -21379,9 +21432,15 @@ impl CayenneTableProvider {
         // and the flip would then put the sorted old rows back over it.
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
+        let cold_cap = self.cold_tombstone_prune_cap().await;
         let listing_guard = self.listing_fence.write().await;
         if let Err(e) = self
-            .commit_snapshot_rewrite(&replaced_snapshot_id, &new_snapshot_id, &RewriteScope::All)
+            .commit_snapshot_rewrite(
+                &replaced_snapshot_id,
+                &new_snapshot_id,
+                &RewriteScope::All,
+                cold_cap,
+            )
             .await
         {
             drop(listing_guard);
@@ -21410,7 +21469,7 @@ impl CayenneTableProvider {
         // silently vanish/resurrect rows. Mirrors `publish_overwrite_snapshot` and the
         // compaction publish in `rewrite_current_snapshot_for_compaction`.
         self.update_current_snapshot_id(&new_snapshot_id);
-        self.clear_all_deletion_caches();
+        self.clear_deletion_caches_for_rewrite(None, cold_cap);
         self.listing_table.store(new_listing_table);
         drop(listing_guard);
 
@@ -26262,8 +26321,9 @@ impl CayenneTableProvider {
                 );
                 return Ok(false);
             }
+            let cold_cap = self.cold_tombstone_prune_cap().await;
             if let Err(e) = self
-                .commit_snapshot_rewrite(&snapshot_id_before, &new_snapshot_id, &scope)
+                .commit_snapshot_rewrite(&snapshot_id_before, &new_snapshot_id, &scope, cold_cap)
                 .await
             {
                 drop(listing_guard);
@@ -26329,17 +26389,13 @@ impl CayenneTableProvider {
             // difference, which overstates the yield.
             let held_before_clear = self.pk_deletion_snapshot().delete_len();
             match &scope {
-                // This rewrite always captures a folded set, so `All` is
-                // unreachable here; treat it as the conservative wholesale clear
-                // rather than silently skipping a clear it did materialize.
-                RewriteScope::All => self.clear_all_deletion_caches(),
-                // Position-delete tables held `write_lock` across the whole
-                // rewrite, so no tombstone interleaved and clearing them all is
-                // exactly correct — but a mem-tier checkpoint can still have
-                // published a protected snapshot the scan never folded, so that
-                // half is narrowed to `folded`.
+                // `All` is unreachable here (this rewrite always captures a
+                // folded set) and the position-delete scope clears every
+                // tombstone below the datalake cap: both through the shared
+                // in-memory clear, which keeps the tombstones above the cap.
+                RewriteScope::All => self.clear_deletion_caches_for_rewrite(None, cold_cap),
                 RewriteScope::AllTombstonesFoldedSnapshots { folded } => {
-                    self.clear_deletion_caches_retaining_unfolded_snapshots(folded);
+                    self.clear_deletion_caches_for_rewrite(Some(folded), cold_cap);
                 }
                 // Key-delete tables ran the encode concurrently with writers.
                 // Drop only what the rewrite materialized (`seq <= cutoff` +
@@ -26350,7 +26406,6 @@ impl CayenneTableProvider {
                 // touches cold objects, so tombstones masking cold-resident keys
                 // must survive while the files they mask remain.
                 RewriteScope::Fenced { cutoff, folded } => {
-                    let cold_cap = self.cold_tombstone_prune_cap().await;
                     let prune_cutoff = cold_cap.map_or(*cutoff, |cap| (*cutoff).min(cap));
                     self.prune_deletion_caches_after_full_rewrite(prune_cutoff, folded);
                     // The rewritten files are gone, and the rows any position delete
@@ -27797,9 +27852,11 @@ impl CayenneTableProvider {
     /// Locks: `compaction_lock` for the whole pass, which serializes it with
     /// promotion and warm-tier compaction (both rewrite what the retention
     /// decision reads); no `write_lock` while reading, encoding, and uploading;
-    /// `listing_fence` for writing around the swap; `write_lock` only around the
-    /// tombstone clear, so a DELETE executing under it never judges a cold row
-    /// against a half-pruned index.
+    /// `write_lock` then `listing_fence` for writing around the swap, and
+    /// `write_lock` again around the tombstone clear, so a DELETE — which
+    /// captures its datalake sources and scans them inside one `write_lock`
+    /// hold — sees either the inputs with every tombstone they need or the
+    /// output, and no file it reads leaves the manifest while it runs.
     ///
     /// Returns `Ok(true)` when a merge was published, `Ok(false)` when the tier
     /// is disabled, nothing qualifies, or the swap found an input gone (an
@@ -27913,6 +27970,11 @@ impl CayenneTableProvider {
 
         let removed: Vec<String> = inputs.iter().map(|f| f.file_url.clone()).collect();
         let swapped = {
+            // A DELETE captures its datalake sources and scans them inside one
+            // `write_lock` hold. Swapping inside the same lock keeps every file a
+            // running DELETE reads in the manifest until it finishes, so the cold
+            // GC can never remove one from under it.
+            let _write_guard = self.write_lock_arc().lock_owned().await;
             let _fence = self.listing_fence.write().await;
             let swapped = self
                 .catalog
@@ -31087,6 +31149,27 @@ impl CayenneTableProvider {
             folded_protected = folded.len(),
             "Cleared deletion caches after position-delete full rewrite, retaining unfolded protected snapshots"
         );
+    }
+
+    /// In-memory clear for a rewrite whose scope clears every tombstone, matching
+    /// its catalog commit ([`Self::commit_snapshot_rewrite`]): `folded` is the
+    /// protected set an `AllTombstonesFoldedSnapshots` rewrite folded (`None` for
+    /// `All`, which folds them all), and with datalake files present (`cold_cap`
+    /// set) the tombstones above the cap stay, since the rewrite never touched
+    /// the datalake rows they may hide.
+    pub(crate) fn clear_deletion_caches_for_rewrite(
+        &self,
+        folded: Option<&std::collections::HashSet<String>>,
+        cold_cap: Option<i64>,
+    ) {
+        let retained = cold_cap.map(|cap| self.deletion_index_retained_above(cap));
+        match folded {
+            Some(folded) => self.clear_deletion_caches_retaining_unfolded_snapshots(folded),
+            None => self.clear_all_deletion_caches(),
+        }
+        if let Some(retained) = retained {
+            self.install_retained_tombstones(retained);
+        }
     }
 
     /// The ids of every protected snapshot currently registered on this table.
@@ -44095,22 +44178,24 @@ impl CayenneTableProvider {
         })
     }
 
-    /// Build a `ListingTable` per distinct live cold-file directory (storage-
-    /// cascade bottom tier), so a key-based DELETE scan finds cold-resident keys
-    /// and records their tombstones, each paired with the
-    /// [`ColdTierFile::max_sequence`](crate::metadata::ColdTierFile::max_sequence)
+    /// Build a `ListingTable` per distinct live cold-file directory of
+    /// `cold_files` (storage-cascade bottom tier), so a key-based DELETE scan
+    /// finds cold-resident keys and records their tombstones, each paired with
+    /// the [`ColdTierFile::max_sequence`](crate::metadata::ColdTierFile::max_sequence)
     /// its files were written at: only tombstones newer than that hide a row of
     /// them (see [`ColdTierBranch`]). Empty when the cold tier is disabled/empty.
     ///
-    /// Dirs are derived from the `cayenne_cold_tier_file` manifest URLs (the
-    /// authoritative live set), NOT a directory scan — so a superseded physical
-    /// cold generation left behind by replace-all promotion is never scanned. A
-    /// promotion writes every file of a directory at one sequence, so a
+    /// `cold_files` is the manifest the caller captured under `listing_fence`
+    /// together with the deletion index the sources are judged by. Dirs are
+    /// derived from its URLs (the authoritative live set), NOT a directory scan
+    /// — so a superseded physical cold generation is never scanned. A promotion
+    /// or datalake merge writes every file of a directory at one sequence, so a
     /// directory is one source; should its live files disagree, each file is
     /// listed as a source of its own rather than judged by another file's
     /// sequence.
-    async fn build_cold_tier_listing_tables(
+    fn build_cold_tier_listing_tables(
         &self,
+        cold_files: &[crate::metadata::ColdTierFile],
     ) -> datafusion_common::Result<Vec<(i64, Arc<ListingTable>)>> {
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
             return Ok(Vec::new());
@@ -44120,18 +44205,8 @@ impl CayenneTableProvider {
         if let Some(ref cold_config) = self.cold_object_store_config {
             Self::register_object_store_if_needed(self.context.runtime_env(), cold_config);
         }
-        let cold_files = self
-            .catalog
-            .list_cold_tier_files(&self.table_metadata.table_id)
-            .await
-            .map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to list cold-tier files for delete on table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?;
         let mut dirs: Vec<(String, Vec<&crate::metadata::ColdTierFile>)> = Vec::new();
-        for f in &cold_files {
+        for f in cold_files {
             if f.file_size_bytes <= 0 {
                 continue;
             }
@@ -44197,11 +44272,18 @@ impl CayenneTableProvider {
             listing_fence: Arc::clone(&self.listing_fence),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
         };
-        let (protected_tables, tombstones_at_capture) = {
+        // The datalake manifest joins the same capture: a datalake merge swaps the
+        // manifest under `listing_fence` and only later clears the tombstones its
+        // inputs needed, so a source list resolved apart from the index it is judged
+        // by could pair a merged-away file with a pruned index.
+        let (protected_tables, tombstones_at_capture, cold_files) = {
             let _guards = capture_locks.read().await;
+            let cold_files =
+                self.cold_manifest_under_held_fence(&self.get_current_snapshot_id()).await?;
             (
                 self.build_protected_snapshot_listing_tables()?,
                 self.pk_deletion_snapshot(),
+                cold_files,
             )
         };
         let mut snapshot_tables: Vec<DeleteScanSource> = protected_tables
@@ -44239,15 +44321,16 @@ impl CayenneTableProvider {
         // matched the predicate. Each source carries its files' sequence as the
         // cutoff, as the scan does: a tombstone no newer than a cold file was applied
         // when the file was written, and the key's live copy may be in that file.
+        // Judged against the index captured with the manifest as well as the live
+        // one, like the protected snapshots (see `DeleteScanSource::tombstones_at_capture`).
         snapshot_tables.extend(
-            self.build_cold_tier_listing_tables()
-                .await?
+            self.build_cold_tier_listing_tables(&cold_files)?
                 .into_iter()
                 .map(|(max_sequence, table)| DeleteScanSource {
                     min_delete_seq: Some(max_sequence),
                     insert_records: InsertRecordHandling::Ignore,
                     table,
-                    tombstones_at_capture: None,
+                    tombstones_at_capture: Some(tombstones_at_capture.clone()),
                 }),
         );
 
@@ -48261,6 +48344,7 @@ mod tests {
                 &RewriteScope::AllTombstonesFoldedSnapshots {
                     folded: folded.clone(),
                 },
+                None,
             )
             .await
             .expect("fenced compaction commit succeeds");
@@ -48788,6 +48872,7 @@ mod tests {
                 &provider.get_current_snapshot_id(),
                 &new_snapshot_id,
                 &RewriteScope::All,
+                None,
             )
             .await
             .expect("wholesale compaction commit succeeds");
@@ -83705,6 +83790,140 @@ mod tests {
                 "a deletion file beside the table root is in no snapshot directory under it"
             );
         }
+    }
+
+    /// A keyset rebuild that captured the datalake manifest before a datalake
+    /// merge and reads the deletion index after the merge's tombstone clear
+    /// would judge the merged-away files by a pruned index, and a deleted key
+    /// would come back into the exact keyset (a later insert of it on this
+    /// do-nothing table is then dropped). The rebuild must judge the files it
+    /// captured by the tombstones captured with them.
+    #[tokio::test]
+    async fn keyset_rebuild_judges_the_datalake_by_the_tombstones_captured_with_it() {
+        use datafusion::prelude::{col, lit};
+
+        async fn load_and_promote(
+            provider: &CayenneTableProvider,
+            schema: &SchemaRef,
+            ids: std::ops::Range<i64>,
+        ) {
+            let ids: Vec<i64> = ids.collect();
+            let values: Vec<i64> = ids.iter().map(|id| id * 2).collect();
+            insert_batch(provider, id_value_batch(Arc::clone(schema), &ids, &values)).await;
+            assert!(
+                provider
+                    .promote_warm_to_cold()
+                    .await
+                    .expect("promotion runs"),
+                "promotion fires with any warm file"
+            );
+        }
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = temp_dir.path().join("metadata");
+        let data_dir = temp_dir.path().join("data");
+        let cold_dir = temp_dir.path().join("cold");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        std::fs::create_dir_all(&cold_dir).expect("cold dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!(
+                "sqlite://{}/cayenne.db",
+                metadata_dir
+                    .to_str()
+                    .expect("metadata path should be UTF-8")
+            ))
+            .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let provider = Arc::new(
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+                .create(CreateTableOptions {
+                    table_name: "keyset_merge_race".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: data_dir.to_string_lossy().into_owned(),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        inline_max_rows: 0,
+                        cold_tier_location: Some(format!(
+                            "file://{}",
+                            cold_dir.to_string_lossy()
+                        )),
+                        cold_tier_warm_max_files: 1,
+                        cold_tier_gc_interval_ms: 300_000,
+                        cold_tier_background_interval_ms: 3_600_000,
+                        deletion_mode: crate::metadata::DeletionMode::Key,
+                        ..VortexConfig::default()
+                    },
+                })
+                .await
+                .expect("datalake table created"),
+        );
+
+        // Generation 1 holds id 5; its delete is newer than generation 1, older
+        // than every later generation, so the merge below clears it.
+        load_and_promote(&provider, &schema, 0..10).await;
+        let plan = provider
+            .delete_from(&ctx.state(), vec![col("id").eq(lit(5_i64))])
+            .await
+            .expect("delete planned");
+        datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("delete runs");
+        load_and_promote(&provider, &schema, 10..13).await;
+        load_and_promote(&provider, &schema, 13..16).await;
+        load_and_promote(&provider, &schema, 16..19).await;
+
+        // Merge the four generations between the rebuild's capture and the rest
+        // of the rebuild.
+        let merged = Arc::new(AtomicBool::new(false));
+        {
+            let merging = Arc::clone(&provider);
+            let merged = Arc::clone(&merged);
+            *provider.test_post_keyset_capture_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let did_merge = merging
+                        .compact_cold_tier()
+                        .await
+                        .expect("datalake merge runs");
+                    merged.store(did_merge, Ordering::SeqCst);
+                })
+            }));
+        }
+        let pk_indices = provider.pk_column_indices.clone();
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary-key converter");
+        let rebuilt = provider
+            .load_existing_pk_index(&pk_indices, &converter, true, None, 1)
+            .await
+            .expect("keyset rebuild");
+        assert!(
+            merged.load(Ordering::SeqCst),
+            "precondition: the merge ran inside the rebuild"
+        );
+        assert!(
+            catalog
+                .get_table_delete_files(&provider.table_metadata.table_id)
+                .await
+                .expect("list delete files")
+                .is_empty(),
+            "precondition: the merge cleared the tombstone of id 5"
+        );
+        let ShardedPkIndex::Exact(keysets) = rebuilt else {
+            panic!("a do-nothing table rebuilds an exact keyset");
+        };
+        assert_eq!(
+            keysets.iter().map(CachedPkKeyset::len).sum::<usize>(),
+            18,
+            "ids 0..19 without the deleted id 5"
+        );
     }
 
     mod layered_upsert_state;

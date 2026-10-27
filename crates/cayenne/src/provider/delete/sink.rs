@@ -340,7 +340,7 @@ pub(crate) struct DeleteScanSource {
     pub(crate) insert_records: InsertRecordHandling,
     pub(crate) table: Arc<ListingTable>,
     /// The deletion index as it stood when `table` was captured, taken under the same
-    /// `listing_fence` read. `None` for a source captured without one (the cold tier).
+    /// `listing_fence` read. `None` for a source captured without one.
     ///
     /// A row's liveness is only meaningful against the index its source was captured
     /// with. A seq-prefix bake or a current-snapshot compaction folds the rows a
@@ -445,22 +445,38 @@ impl StagedPkDelete {
         Ok(())
     }
 
-    /// Number of keys this delete newly tombstones — keys not already deleted
-    /// when the delete began. Re-deletions of already-tombstoned keys are not
-    /// counted, preserving the pre-refactor "rows affected" semantics.
+    /// Number of keys this delete newly tombstones — keys that were live when
+    /// the delete began. A key is live unless its newest delete is newer than
+    /// its newest re-insert: an upserted key carries a tombstone that its
+    /// re-insert outranks, and is live. Re-deletions of keys already deleted
+    /// are not counted.
     fn new_count(&self) -> usize {
         match self {
             Self::Int64 {
                 initial, new_pks, ..
             } => new_pks
                 .iter()
-                .filter(|pk| initial.tombstones.get(**pk).is_none())
+                .filter(|pk| {
+                    is_pk_visible_i64(
+                        **pk,
+                        &initial.tombstones,
+                        InsertRecordHandling::Apply,
+                        None,
+                    )
+                })
                 .count(),
             Self::RowKeys {
                 initial, new_keys, ..
             } => new_keys
                 .iter()
-                .filter(|key| initial.tombstones.get(key.as_ref()).is_none())
+                .filter(|key| {
+                    is_pk_visible_row_key(
+                        key.as_ref(),
+                        &initial.tombstones,
+                        InsertRecordHandling::Apply,
+                        None,
+                    )
+                })
                 .count(),
         }
     }
