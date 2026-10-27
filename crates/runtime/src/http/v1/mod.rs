@@ -1534,10 +1534,8 @@ mod tests {
         use arrow::datatypes::Int32Type;
         use datafusion::execution::memory_pool::UnboundedMemoryPool;
 
-        let list = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![Some(vec![
-            Some(1),
-            Some(2),
-        ])]);
+        let list =
+            ListArray::from_iter_primitive::<Int32Type, _, _>(vec![Some(vec![Some(1), Some(2)])]);
         let schema = Arc::new(Schema::new(vec![Field::new(
             "a",
             list.data_type().clone(),
