@@ -20,6 +20,7 @@ else
   OWN_WORKDIR=1
 fi
 cd "$WORKDIR"
+WORKDIR=$(pwd -P) # absolute, so a relative override still resolves in the generated paths
 echo "spiced: $("$SPICED" --version 2>&1 | head -1)"
 echo "workdir: $WORKDIR"
 
