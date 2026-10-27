@@ -63,24 +63,28 @@ fn convert_timestamp_expr(
             op,
             lit((timestamp_in_nanos / scale) as u64),
         ),
-        TimestampFormat::Iso8601 => {
-            // ISO8601 strings are lexicographically orderable — string comparison
-            // produces correct results without a CAST, which avoids issues with engines
-            // (e.g. Vortex/Cayenne) that lack a utf8→timestamp cast kernel.
-            let iso_string = nanos_to_iso8601_string(timestamp_in_nanos);
-            binary_expr(ident(time_column), op, lit(iso_string))
+        // ISO 8601 strings are compared as instants, not as text. Text order only
+        // matches time order when every value shares one spelling: a space separator
+        // sorts before `T`, and an offset (`-07:00`) or `Z` suffix is ignored, so a
+        // text comparison against the cutoff keeps expired rows, drops live ones, and
+        // disagrees with the column type (`LargeUtf8` vs a `Utf8` literal) on engines
+        // that evaluate the predicate without coercion. Casting parses each spelling
+        // to the UTC instant it names (a value without an offset is read as UTC).
+        // Vortex declines a cast it can't evaluate, so on Cayenne the comparison runs
+        // in the `FilterExec` above the scan instead.
+        TimestampFormat::Iso8601 | TimestampFormat::Date | TimestampFormat::Timestamp => {
+            binary_expr(
+                cast(
+                    ident(time_column),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                ),
+                op,
+                Expr::Literal(
+                    ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), None),
+                    None,
+                ),
+            )
         }
-        TimestampFormat::Date | TimestampFormat::Timestamp => binary_expr(
-            cast(
-                ident(time_column),
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-            ),
-            op,
-            Expr::Literal(
-                ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), None),
-                None,
-            ),
-        ),
         TimestampFormat::Timestamptz(tz) => {
             // The cast carries the accelerator schema's timezone spelling, and the
             // DuckDB unparser renders `CAST(col AS Timestamp(ns, tz))` as
@@ -186,9 +190,10 @@ pub struct TimestampFilterConvert {
     time_partition_format: Option<TimestampFormat>,
 
     /// Whether `time_column`'s Arrow type is day-granular ([`is_day_granular`]).
-    /// Only consulted by [`TimestampFilterConvert::convert_high_water_mark`].
+    /// Consulted by the high-water-mark builders only.
     time_is_day_granular: bool,
-    /// Whether `time_partition_column`'s Arrow type is day-granular.
+    /// Whether `time_partition_column`'s Arrow type is day-granular. Also bounds the
+    /// partition side of [`TimestampFilterConvert::convert_window_start`].
     time_partition_is_day_granular: bool,
 }
 
@@ -250,6 +255,29 @@ impl TimestampFilterConvert {
             op,
         };
         self.convert_with_bounds(bound, bound)
+    }
+
+    /// Build the `refresh_data_window` filter: rows newer than `start_in_nanos`.
+    ///
+    /// The time column compares `> start` exactly. A day-granular *partition* column
+    /// instead compares `>=` against midnight of `start`'s day: each of its values
+    /// casts to midnight, so `CAST(day AS Timestamp) > start` is false for the
+    /// partition holding the window's oldest rows whenever `start` falls after
+    /// midnight — a `24h` window would then load only rows since midnight UTC
+    /// today. The time column still trims the window precisely.
+    #[must_use]
+    pub fn convert_window_start(&self, start_in_nanos: u128) -> Expr {
+        self.convert_with_bounds(
+            Bound {
+                timestamp_in_nanos: start_in_nanos,
+                op: Operator::Gt,
+            },
+            mark_bound(
+                start_in_nanos,
+                self.time_partition_is_day_granular,
+                Operator::Gt,
+            ),
+        )
     }
 
     /// Build a filter expression selecting rows *after* an append high-water mark
@@ -520,7 +548,7 @@ mod tests {
             &DataType::Utf8,
             None,
             1_620_000_000_000_000_000,
-            r#"timestamp > Utf8("2021-05-03T00:00:00.000000000")"#,
+            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
         );
     }
 
@@ -679,10 +707,7 @@ mod tests {
         assert_eq!(high_water_mark_expr(&time32), TS_STRICT);
         assert_eq!(high_water_mark_expr(&time64), TS_STRICT);
         assert_eq!(high_water_mark_expr(&timestamp), TS_STRICT);
-        assert_eq!(
-            high_water_mark_expr(&DataType::Utf8),
-            r#"ts > Utf8("2021-05-03T00:00:00.000000000")"#,
-        );
+        assert_eq!(high_water_mark_expr(&DataType::Utf8), TS_STRICT);
     }
 
     #[test]
@@ -819,6 +844,133 @@ mod tests {
         assert_eq!(
             converter.convert(TS_NANOS, Operator::Gt).to_string(),
             "CAST(ts AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None) AND CAST(day AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
+        );
+    }
+
+    /// Keeps the rows of a one-column string batch that `filter` selects.
+    fn surviving_iso_rows(
+        data_type: &DataType,
+        values: &[Option<&str>],
+        filter: &Expr,
+    ) -> Vec<Option<String>> {
+        use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch};
+        use datafusion::arrow::compute::{cast, filter_record_batch};
+        use datafusion::common::DFSchema;
+        use datafusion::logical_expr::execution_props::ExecutionProps;
+        use datafusion::physical_expr::create_physical_expr;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", data_type.clone(), true)]));
+        let utf8: ArrayRef = Arc::new(datafusion::arrow::array::StringArray::from(values.to_vec()));
+        let column = cast(&utf8, data_type).expect("string array casts to the column type");
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![column]).expect("batch should build");
+        let df_schema = DFSchema::try_from(Arc::clone(&schema)).expect("schema converts");
+        let physical = create_physical_expr(filter, &df_schema, &ExecutionProps::new())
+            .expect("filter should plan without a type error");
+        let mask = physical
+            .evaluate(&batch)
+            .and_then(|v| v.into_array(batch.num_rows()))
+            .expect("filter should evaluate");
+        let mask = mask
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("filter yields booleans");
+        let kept = filter_record_batch(&batch, mask).expect("filter applies");
+        let kept = cast(kept.column(0), &DataType::Utf8).expect("back to utf8");
+        let kept = kept
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .expect("utf8");
+        (0..kept.len())
+            .map(|i| (!kept.is_null(i)).then(|| kept.value(i).to_string()))
+            .collect()
+    }
+
+    /// The cutoff the ISO tests compare against: 2021-05-03T00:00:00Z.
+    fn iso_converter() -> TimestampFilterConvert {
+        let format = data_type_to_timestamp_format(&DataType::Utf8, None).expect("resolves");
+        TimestampFilterConvert::new("ts".to_string(), format, None, None)
+    }
+
+    #[test]
+    fn iso_strings_compare_as_instants_not_text() {
+        // Every value below is *after* the cutoff (2021-05-03T00:00:00Z) except the
+        // first two. As text, the space-separated value sorts before the `T` cutoff and
+        // the `-07:00` value (= 2021-05-03T06:00Z) sorts before it too; the `+09:00`
+        // value (= 2021-05-02T23:00Z, expired) sorts after it.
+        let values = [
+            Some("2021-05-02T23:59:59"),
+            Some("2021-05-03T08:00:00+09:00"),
+            Some("2021-05-03 00:00:01"),
+            Some("2021-05-02T23:00:00-07:00"),
+            Some("2021-05-03T00:00:01Z"),
+            Some("2021-05-03T00:00:00.5"),
+        ];
+        let keep = iso_converter().convert(TS_NANOS, Operator::Gt);
+        for data_type in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            assert_eq!(
+                surviving_iso_rows(&data_type, &values, &keep),
+                vec![
+                    Some("2021-05-03 00:00:01".to_string()),
+                    Some("2021-05-02T23:00:00-07:00".to_string()),
+                    Some("2021-05-03T00:00:01Z".to_string()),
+                    Some("2021-05-03T00:00:00.5".to_string()),
+                ],
+                "{data_type}: rows after the cutoff, whatever their spelling",
+            );
+        }
+    }
+
+    #[test]
+    fn iso_delete_predicate_selects_exactly_the_expired_rows() {
+        // The retention DELETE (`<`) is the complement of the keep side for non-NULL
+        // values, and never matches a NULL timestamp.
+        let values = [
+            Some("2021-05-02 23:59:59"),
+            Some("2021-05-03T08:00:00+09:00"),
+            Some("2021-05-03T00:00:00Z"),
+            Some("2021-05-03T01:00:00+00:00"),
+            None,
+        ];
+        let delete = iso_converter().convert(TS_NANOS, Operator::Lt);
+        assert_eq!(
+            surviving_iso_rows(&DataType::LargeUtf8, &values, &delete),
+            vec![
+                Some("2021-05-02 23:59:59".to_string()),
+                Some("2021-05-03T08:00:00+09:00".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn window_start_floors_a_day_partition_and_keeps_the_time_column_exact() {
+        // refresh_data_window: 24h before 2021-05-03T12:00Z is 2021-05-02T12:00Z. The
+        // `day` partition holding the window's oldest rows is 2021-05-02, which casts to
+        // midnight — `> 12:00` would exclude it and leave only today's partition.
+        let window_start = TS_MIDDAY_NANOS - 86_400_000_000_000;
+        assert_eq!(
+            sub_day_time_with_day_partition()
+                .convert_window_start(window_start)
+                .to_string(),
+            "CAST(ts AS Timestamp(ns)) > TimestampNanosecond(1619956800000000000, None) AND CAST(day AS Timestamp(ns)) >= TimestampNanosecond(1619913600000000000, None)",
+        );
+    }
+
+    #[test]
+    fn window_start_leaves_a_sub_day_partition_strict() {
+        let format =
+            data_type_to_timestamp_format(&DataType::Timestamp(TimeUnit::Nanosecond, None), None)
+                .expect("resolves");
+        let converter = TimestampFilterConvert::new(
+            "ts".to_string(),
+            format.clone(),
+            Some("hour".to_string()),
+            Some(format),
+        )
+        .with_day_granular_columns(false, false);
+        assert_eq!(
+            converter.convert_window_start(TS_MIDDAY_NANOS).to_string(),
+            converter.convert(TS_MIDDAY_NANOS, Operator::Gt).to_string(),
         );
     }
 
