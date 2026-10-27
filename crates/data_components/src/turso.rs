@@ -85,7 +85,12 @@ limitations under the License.
 //! The read path automatically detects the storage format (TEXT vs INTEGER) and converts
 //! to the Arrow schema's expected timestamp type and unit.
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    ops::ControlFlow,
+    sync::Arc,
+};
 
 use arrow::{
     array::{
@@ -1348,7 +1353,12 @@ impl TableProvider for TursoTableProvider {
         filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DeletionExec::new(Arc::new(
-            TursoDeletionSink::new(Arc::clone(&self.pool), self.table_name.clone(), &filters),
+            TursoDeletionSink::new(
+                Arc::clone(&self.pool),
+                self.table_name.clone(),
+                &self.schema,
+                &filters,
+            ),
         ))))
     }
 }
@@ -1758,18 +1768,142 @@ pub struct TursoDeletionSink {
     pool: Arc<TursoConnectionPool>,
     table_name: String,
     filters: Vec<Expr>,
+    /// Columns of `table_name` whose Arrow type is a string; see
+    /// [`compare_text_timestamps_as_instants`].
+    string_columns: HashSet<String>,
 }
 
 impl TursoDeletionSink {
     /// Creates a new deletion sink
     #[must_use]
-    pub fn new(pool: Arc<TursoConnectionPool>, table_name: String, filters: &[Expr]) -> Self {
+    pub fn new(
+        pool: Arc<TursoConnectionPool>,
+        table_name: String,
+        schema: &arrow::datatypes::Schema,
+        filters: &[Expr],
+    ) -> Self {
         Self {
             pool,
             table_name,
             filters: filters.to_vec(),
+            string_columns: schema
+                .fields()
+                .iter()
+                .filter(|field| field.data_type().is_string())
+                .map(|field| field.name().clone())
+                .collect(),
         }
     }
+}
+
+/// Compares an ISO 8601 text column with a timestamp as instants, not as text.
+///
+/// A retention filter on a string time column casts it to a timestamp
+/// (`util::timestamp_filter`), which the `SQLite` dialect renders as
+/// `CAST(col AS TEXT) < CAST('2026-01-02 03:04:05' AS TEXT)`: a text comparison
+/// against a space-separated literal, so a `T`, `Z` or UTC-offset spelling in the
+/// column orders by spelling instead of by time. This rewrites each such comparison to
+/// `datetime(col, 'subsec') < datetime('…', 'subsec')`, which parses both sides to
+/// the UTC instant they name (a value with no offset is read as UTC).
+///
+/// Only a cast of a column in `string_columns` is rewritten: a timestamp column may be
+/// stored as integer milliseconds, which `datetime` would read as a Julian day.
+fn compare_text_timestamps_as_instants(
+    unparser: &Unparser,
+    ast: &mut sqlast::Expr,
+    string_columns: &HashSet<String>,
+) -> DataFusionResult<()> {
+    fn text_cast(expr: &sqlast::Expr) -> Option<&sqlast::Expr> {
+        match expr {
+            sqlast::Expr::Cast {
+                expr,
+                data_type: sqlast::DataType::Text,
+                ..
+            } => Some(expr),
+            _ => None,
+        }
+    }
+    fn string_column<'a>(
+        expr: &'a sqlast::Expr,
+        string_columns: &HashSet<String>,
+    ) -> Option<&'a str> {
+        let name = match text_cast(expr)? {
+            sqlast::Expr::Identifier(ident) => &ident.value,
+            sqlast::Expr::CompoundIdentifier(parts) => &parts.last()?.value,
+            _ => return None,
+        };
+        string_columns.contains(name).then_some(name.as_str())
+    }
+    fn string_literal(expr: &sqlast::Expr) -> Option<&str> {
+        match text_cast(expr)? {
+            sqlast::Expr::Value(sqlast::ValueWithSpan {
+                value: sqlast::Value::SingleQuotedString(literal),
+                ..
+            }) => Some(literal),
+            _ => None,
+        }
+    }
+    let instant = |value: Expr| {
+        unparser.scalar_function_to_sql(
+            "datetime",
+            &[value, datafusion::logical_expr::lit("subsec")],
+        )
+    };
+
+    let mut error = None;
+    let _ = sqlast::visit_expressions_mut(ast, |expr| {
+        let sqlast::Expr::BinaryOp { left, op, right } = expr else {
+            return ControlFlow::Continue(());
+        };
+        if !matches!(
+            op,
+            sqlast::BinaryOperator::Lt
+                | sqlast::BinaryOperator::LtEq
+                | sqlast::BinaryOperator::Gt
+                | sqlast::BinaryOperator::GtEq
+                | sqlast::BinaryOperator::Eq
+                | sqlast::BinaryOperator::NotEq
+        ) {
+            return ControlFlow::Continue(());
+        }
+        let operands = match (
+            string_column(left, string_columns),
+            string_literal(right),
+            string_literal(left),
+            string_column(right, string_columns),
+        ) {
+            (Some(column), Some(literal), _, _) => {
+                Some((column.to_string(), literal.to_string(), false))
+            }
+            (_, _, Some(literal), Some(column)) => {
+                Some((column.to_string(), literal.to_string(), true))
+            }
+            _ => None,
+        };
+        let Some((column, literal, literal_first)) = operands else {
+            return ControlFlow::Continue(());
+        };
+        match (
+            instant(datafusion::logical_expr::ident(column)),
+            instant(datafusion::logical_expr::lit(literal)),
+        ) {
+            (Ok(column), Ok(literal)) => {
+                let (new_left, new_right) = if literal_first {
+                    (literal, column)
+                } else {
+                    (column, literal)
+                };
+                **left = new_left;
+                **right = new_right;
+                ControlFlow::Continue(())
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                error = Some(e);
+                ControlFlow::Break(())
+            }
+        }
+    });
+    error.map_or(Ok(()), Err)
 }
 
 #[async_trait]
@@ -1787,7 +1921,11 @@ impl DeletionSink for TursoDeletionSink {
             let filter_sqls: Vec<String> = self
                 .filters
                 .iter()
-                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("({ast})")))
+                .map(|f| {
+                    let mut ast = unparser.expr_to_sql(f)?;
+                    compare_text_timestamps_as_instants(&unparser, &mut ast, &self.string_columns)?;
+                    Ok(format!("({ast})"))
+                })
                 .collect::<datafusion::error::Result<Vec<_>>>()?;
             format!(" WHERE {}", filter_sqls.join(" AND "))
         };
@@ -3367,6 +3505,75 @@ mod tests {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// Retention on an ISO 8601 text column deletes by instant, whatever the spelling.
+    #[tokio::test]
+    async fn retention_delete_compares_iso_text_as_instants() {
+        let pool = Arc::new(
+            TursoConnectionPool::new(":memory:")
+                .await
+                .expect("in-memory Turso pool should be created"),
+        );
+        let conn = pool
+            .connect()
+            .await
+            .expect("Turso connection should be created");
+        // The cutoff is 2021-05-03T00:00:00Z. Expired: ids 1, 2 and 4.
+        for sql in [
+            "CREATE TABLE events (id INTEGER, ts TEXT)",
+            "INSERT INTO events VALUES \
+             (1, '2021-05-02T23:59:59Z'), \
+             (2, '2021-05-03T08:00:00+09:00'), \
+             (3, '2021-05-02T23:00:00-07:00'), \
+             (4, '2021-05-02 12:00:00'), \
+             (5, '2021-05-03 00:00:01'), \
+             (6, '2021-05-03T00:00:01Z'), \
+             (7, NULL)",
+        ] {
+            conn.execute(sql, ())
+                .await
+                .expect("fixture statement should execute");
+        }
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]);
+        let format = util::timestamp_filter::data_type_to_timestamp_format(&DataType::Utf8, None)
+            .expect("an ISO 8601 format resolves");
+        let filter = util::timestamp_filter::TimestampFilterConvert::new(
+            "ts".to_string(),
+            format,
+            None,
+            None,
+        )
+        .convert(
+            1_620_000_000_000_000_000,
+            datafusion::logical_expr::Operator::Lt,
+        );
+
+        let deleted =
+            TursoDeletionSink::new(Arc::clone(&pool), "events".to_string(), &schema, &[filter])
+                .delete_from(Arc::new(TaskContext::default()))
+                .await
+                .expect("the retention delete should run");
+
+        let mut rows = conn
+            .query("SELECT id FROM events ORDER BY id", ())
+            .await
+            .expect("the survivors should be readable");
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await.expect("rows should stream") {
+            match row.get_value(0).expect("id should be present") {
+                TursoValue::Integer(id) => ids.push(id),
+                other => panic!("expected integer id, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            (deleted, ids),
+            (3, vec![3, 5, 6, 7]),
+            "rows before the cutoff are deleted whatever their spelling; NULL stays"
+        );
     }
 
     #[tokio::test]
