@@ -29,13 +29,13 @@ METRICS_ADDR="${METRICS_ADDR:-127.0.0.1:19090}"
 Seed `spicepod.yaml` plus `data/events.csv` and `data/events.jsonl` with the helper (it writes the baseline files and the pod):
 
 ```bash
-.cursor/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh seed --work "$WORK_DIR"
+.agents/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh seed --work "$WORK_DIR"
 ```
 
 Start only this instance, with logs and a pidfile under `$WORK_DIR`:
 
 ```bash
-.cursor/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh launch \
+.agents/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh launch \
   --spiced target/debug/spiced \
   --work "$WORK_DIR" \
   --http "$HTTP_ADDR" \
@@ -67,7 +67,7 @@ Teardown is `cleanup` below. Do not `pkill -f spiced`.
 Read-only check that this instance is the one the run started and is worth driving:
 
 ```bash
-.cursor/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh doctor \
+.agents/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh doctor \
   --work "$WORK_DIR" \
   --http "$HTTP_ADDR" \
   --spiced target/debug/spiced
@@ -95,7 +95,7 @@ On-demand refresh: capture a completion marker (`last_refresh`, `error_message`,
 The mapped journeys are in `features/`. Drive them with:
 
 ```bash
-.cursor/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh drive \
+.agents/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh drive \
   --work "$WORK_DIR" \
   --http "$HTTP_ADDR" \
   --evidence "$EVIDENCE_DIR" \
@@ -132,7 +132,7 @@ Standards:
 Trunk vs branch in one shot (builds are the caller's job):
 
 ```bash
-.cursor/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh compare \
+.agents/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh compare \
   --trunk-spiced /path/to/spiced-trunk \
   --branch-spiced /path/to/spiced-branch \
   --evidence /opt/cursor/artifacts/verify-file-connector
@@ -143,7 +143,7 @@ Each side runs in a subshell. An `EXIT` trap installed before launch always runs
 ## Cleanup
 
 ```bash
-.cursor/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh cleanup --work "$WORK_DIR"
+.agents/skills/verify-spiced-file-connector/helpers/verify-file-connector.sh cleanup --work "$WORK_DIR"
 ```
 
 Sends `TERM` (then `KILL` if needed) only to the pid in `$WORK_DIR/spiced.pid` when `$WORK_DIR/spiced.identity` still names that same process (pid, executable, `/proc/<pid>/stat` starttime). An unreaped zombie (state `Z`) is stopped: `kill -0` still succeeds, but `/proc/<pid>/exe` is gone, so cleanup treats `Z` as gone instead of an ownership change. An unreadable process state is not treated as terminated. Refuses to signal when ownership cannot be established. Removes the work dir's runtime scratch (pidfile, identity, `.spice/`). Leaves `$EVIDENCE_DIR` untouched.
