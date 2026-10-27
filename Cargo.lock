@@ -3583,7 +3583,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/candle.git?rev=efbb9a72e92789eafed0806c3e16f14640c504f6#efbb9a72e92789eafed0806c3e16f14640c504f6"
+source = "git+https://github.com/spiceai/candle.git?rev=5a67f5ecd62321b019c0daffd6613cfb9f71505e#5a67f5ecd62321b019c0daffd6613cfb9f71505e"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -3608,7 +3608,7 @@ dependencies = [
  "tokenizers 0.22.2",
  "yoke 0.8.2",
  "zerocopy",
- "zip 8.6.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
@@ -3633,7 +3633,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/candle.git?rev=efbb9a72e92789eafed0806c3e16f14640c504f6#efbb9a72e92789eafed0806c3e16f14640c504f6"
+source = "git+https://github.com/spiceai/candle.git?rev=5a67f5ecd62321b019c0daffd6613cfb9f71505e#5a67f5ecd62321b019c0daffd6613cfb9f71505e"
 dependencies = [
  "cudaforge",
 ]
@@ -3653,7 +3653,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/candle.git?rev=efbb9a72e92789eafed0806c3e16f14640c504f6#efbb9a72e92789eafed0806c3e16f14640c504f6"
+source = "git+https://github.com/spiceai/candle.git?rev=5a67f5ecd62321b019c0daffd6613cfb9f71505e#5a67f5ecd62321b019c0daffd6613cfb9f71505e"
 dependencies = [
  "block2 0.6.2",
  "half",
@@ -3668,7 +3668,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/candle.git?rev=efbb9a72e92789eafed0806c3e16f14640c504f6#efbb9a72e92789eafed0806c3e16f14640c504f6"
+source = "git+https://github.com/spiceai/candle.git?rev=5a67f5ecd62321b019c0daffd6613cfb9f71505e#5a67f5ecd62321b019c0daffd6613cfb9f71505e"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -3696,7 +3696,7 @@ dependencies = [
 [[package]]
 name = "candle-transformers"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/candle.git?rev=efbb9a72e92789eafed0806c3e16f14640c504f6#efbb9a72e92789eafed0806c3e16f14640c504f6"
+source = "git+https://github.com/spiceai/candle.git?rev=5a67f5ecd62321b019c0daffd6613cfb9f71505e#5a67f5ecd62321b019c0daffd6613cfb9f71505e"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -3714,7 +3714,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/candle.git?rev=efbb9a72e92789eafed0806c3e16f14640c504f6#efbb9a72e92789eafed0806c3e16f14640c504f6"
+source = "git+https://github.com/spiceai/candle.git?rev=5a67f5ecd62321b019c0daffd6613cfb9f71505e#5a67f5ecd62321b019c0daffd6613cfb9f71505e"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -7847,7 +7847,7 @@ dependencies = [
 [[package]]
 name = "docx-rs"
 version = "0.4.17"
-source = "git+https://github.com/spiceai/docx-rs?rev=2a85dce57d0128e2cd7c369545516c347cb8c529#2a85dce57d0128e2cd7c369545516c347cb8c529"
+source = "git+https://github.com/spiceai/docx-rs?rev=81faaf2187185b097710b9ee589bf039efdd74de#81faaf2187185b097710b9ee589bf039efdd74de"
 dependencies = [
  "base64 0.13.1",
  "image 0.24.9",
@@ -7855,7 +7855,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "xml-rs",
- "zip 8.6.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
@@ -12598,7 +12598,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12625,7 +12625,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "apodize",
@@ -12636,7 +12636,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-code-exec"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -12655,7 +12655,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "ahash 0.8.12",
  "akin",
@@ -12758,7 +12758,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-flash-attn"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12769,7 +12769,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -12780,7 +12780,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12801,7 +12801,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-metal-compile"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "candle-metal-kernels",
  "objc2-metal 0.3.2",
@@ -12810,7 +12810,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12828,7 +12828,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -12863,7 +12863,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-sandbox"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "anyhow",
  "itoa",
@@ -12880,7 +12880,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2d15d171236803481d582a9fbf8a80869bf74d8c#2d15d171236803481d582a9fbf8a80869bf74d8c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=60d8e5b5ea5efdfa89c0d709428044b553d1b5b0#60d8e5b5ea5efdfa89c0d709428044b553d1b5b0"
 dependencies = [
  "candle-core",
  "image 0.25.10",
@@ -22710,12 +22710,6 @@ dependencies = [
 
 [[package]]
 name = "typed-path"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
-
-[[package]]
-name = "typed-path"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
@@ -25642,20 +25636,6 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
-dependencies = [
- "crc32fast",
- "flate2",
- "indexmap 2.14.0",
- "memchr",
- "typed-path 0.12.3",
- "zopfli",
-]
-
-[[package]]
-name = "zip"
 version = "9.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec2e3161de27091f18a831d9494e9c53378a34833af5c1dda35ad85849da18d6"
@@ -25676,7 +25656,7 @@ dependencies = [
  "ppmd-rust",
  "sha1 0.11.0",
  "time",
- "typed-path 0.13.0",
+ "typed-path",
  "windows-sys 0.61.2",
  "zeroize",
  "zopfli",
