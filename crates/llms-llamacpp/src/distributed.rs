@@ -155,8 +155,19 @@ pub(crate) fn ensure_insecure_allowed(cfg: &DistributedConfig, name: &str) -> Re
 pub(crate) async fn lend_gpu(cfg: &DistributedConfig, name: &str) -> Result<Share> {
     ensure_insecure_allowed(cfg, name)?;
     let rank = cfg.node_rank;
-    let endpoint = format!("{}:{}", ipv4(&cfg.nodes[rank])?, port(rank)?);
-    serve_gpus(name, &endpoint)?;
+    let (node, model) = (cfg.nodes[rank].clone(), name.to_string());
+    // Resolving a node named by host name can block on DNS.
+    let endpoint = tokio::task::spawn_blocking(move || {
+        let endpoint = format!("{}:{}", ipv4(&node)?, port(rank)?);
+        serve_gpus(&model, &endpoint)?;
+        Ok::<_, ChatError>(endpoint)
+    })
+    .await
+    .map_err(|e| {
+        failed(format!(
+            "Model '{name}' could not serve this node's GPU: {e}"
+        ))
+    })??;
     let head = host(&cfg.nodes[0]);
     tracing::info!(
         "Model '{name}': this node is rank {rank} of {} and holds its share of the model for the head at '{head}', which serves the model's requests; this node serves its GPU at {endpoint}.",
