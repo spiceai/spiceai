@@ -21,18 +21,18 @@ use std::ptr::NonNull;
 
 use snafu::ensure;
 
-use crate::{BatchFullSnafu, Error, Result, Token, sys};
+use crate::{
+    BatchFullSnafu, Error, PartialSequenceCopySnafu, Result, Token, UnknownSequenceSnafu, sys,
+};
 
 /// How a context is created.
-#[expect(
-    clippy::struct_field_names,
-    reason = "the names are llama.cpp's own context parameters"
-)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ContextParams {
     n_ctx: Option<NonZeroU32>,
     n_batch: Option<u32>,
     n_rs_seq: u32,
+    n_seq_max: Option<u32>,
+    kv_unified: Option<bool>,
 }
 
 impl ContextParams {
@@ -58,6 +58,21 @@ impl ContextParams {
         self
     }
 
+    /// How many sequences the context holds at once; llama.cpp's own default (one) when unset.
+    #[must_use]
+    pub fn with_n_seq_max(mut self, n_seq_max: u32) -> Self {
+        self.n_seq_max = Some(n_seq_max);
+        self
+    }
+
+    /// Whether the sequences share one KV cache, so a sequence's share is not fixed in advance;
+    /// llama.cpp's own default when unset.
+    #[must_use]
+    pub fn with_kv_unified(mut self, kv_unified: bool) -> Self {
+        self.kv_unified = Some(kv_unified);
+        self
+    }
+
     /// The C parameters; `mtp_of` makes an MTP draft context that reads that target's
     /// hidden states.
     pub(crate) fn raw(&self, mtp_of: Option<&Context<'_>>) -> sys::llama_context_params {
@@ -70,6 +85,12 @@ impl ContextParams {
             raw.n_batch = n_batch;
         }
         raw.n_rs_seq = self.n_rs_seq;
+        if let Some(n_seq_max) = self.n_seq_max {
+            raw.n_seq_max = n_seq_max;
+        }
+        if let Some(kv_unified) = self.kv_unified {
+            raw.kv_unified = kv_unified;
+        }
         if let Some(target) = mtp_of {
             raw.ctx_type = sys::llama_context_type_LLAMA_CONTEXT_TYPE_MTP;
             raw.ctx_other = target.as_ptr();
@@ -108,15 +129,31 @@ impl Context<'_> {
         unsafe { sys::llama_n_ctx(self.raw.as_ptr()) }
     }
 
+    /// How many sequences the context holds at once.
+    #[must_use]
+    pub fn n_seq_max(&self) -> u32 {
+        // SAFETY: the context is live.
+        unsafe { sys::llama_n_seq_max(self.raw.as_ptr()) }
+    }
+
+    /// The most tokens one sequence can hold: the context length, or its share of it when the
+    /// sequences do not share one KV cache.
+    #[must_use]
+    pub fn n_ctx_seq(&self) -> u32 {
+        // SAFETY: the context is live.
+        unsafe { sys::llama_n_ctx_seq(self.raw.as_ptr()) }
+    }
+
     /// Decodes `batch`, computing the logits of the tokens it marks for output.
+    ///
+    /// A batch the cache has no room for returns [`Error::NoRoom`] before anything is computed,
+    /// so a caller that frees room can retry the same batch.
     pub fn decode(&mut self, batch: &Batch) -> Result<()> {
         // SAFETY: the batch's arrays hold `n_tokens` entries; llama.cpp copies what it keeps.
         let status = unsafe { sys::llama_decode(self.raw.as_ptr(), batch.raw) };
         match status {
             0 => Ok(()),
-            1 => Err(Error::Decode {
-                reason: "the context has no room left for the batch".to_string(),
-            }),
+            1 => Err(Error::NoRoom),
             2 => Err(Error::Decode {
                 reason: "decoding was aborted".to_string(),
             }),
@@ -138,8 +175,64 @@ impl Context<'_> {
     /// Removes sequence 0's entries from position `from` on. Returns false when the context
     /// cannot roll back that far, as when a recurrent layer keeps too few state snapshots.
     pub fn truncate(&mut self, from: i32) -> bool {
-        // SAFETY: as above; -1 means "to the end".
+        // SAFETY: the context is live, a context always has memory, and holds sequence 0.
         unsafe { sys::llama_memory_seq_rm(sys::llama_get_memory(self.raw.as_ptr()), 0, from, -1) }
+    }
+
+    /// Removes sequence `seq`'s entries in positions `[p0, p1)`; a negative `p1` means "to the
+    /// end", and `seq` -1 means every sequence. Returns false when the context cannot remove
+    /// that range, as when a recurrent layer keeps too few state snapshots to roll back.
+    pub fn seq_rm(&mut self, seq: i32, p0: i32, p1: i32) -> Result<bool> {
+        if seq != -1 {
+            self.check_seq(seq)?;
+        }
+        // SAFETY: the context is live, a context always has memory, and holds `seq`.
+        Ok(unsafe {
+            sys::llama_memory_seq_rm(sys::llama_get_memory(self.raw.as_ptr()), seq, p0, p1)
+        })
+    }
+
+    /// Makes sequence `dst` hold sequence `src`'s entries in positions `[p0, p1)`; a negative
+    /// `p1` means "to the end". When the sequences share one KV cache they share the entries;
+    /// in separate caches the entries are copied, which llama.cpp does only for a whole
+    /// sequence, so a partial copy there returns [`Error::PartialSequenceCopy`].
+    pub fn seq_cp(&mut self, src: i32, dst: i32, p0: i32, p1: i32) -> Result<()> {
+        self.check_seq(src)?;
+        self.check_seq(dst)?;
+        ensure!(
+            src == dst || !self.separate_caches() || (p0 <= 0 && p1 < 0),
+            PartialSequenceCopySnafu { src, dst }
+        );
+        // SAFETY: the context is live, holds both sequences, and the copy is one llama.cpp
+        // supports between their caches.
+        unsafe {
+            sys::llama_memory_seq_cp(sys::llama_get_memory(self.raw.as_ptr()), src, dst, p0, p1);
+        }
+        Ok(())
+    }
+
+    /// The largest position sequence `seq` holds, or -1 when it holds none.
+    pub fn seq_pos_max(&self, seq: i32) -> Result<i32> {
+        self.check_seq(seq)?;
+        // SAFETY: as above; reading the positions does not change the memory.
+        Ok(unsafe { sys::llama_memory_seq_pos_max(sys::llama_get_memory(self.raw.as_ptr()), seq) })
+    }
+
+    /// llama.cpp ends the process on a sequence its cache does not hold, so every sequence is
+    /// checked before it is passed on.
+    fn check_seq(&self, seq: i32) -> Result<()> {
+        let n_seq_max = self.n_seq_max();
+        ensure!(
+            u32::try_from(seq).is_ok_and(|seq| seq < n_seq_max),
+            UnknownSequenceSnafu { seq, n_seq_max }
+        );
+        Ok(())
+    }
+
+    /// Whether each sequence has a KV cache of its own: llama.cpp then splits the context
+    /// length between them, and with one shared cache gives each sequence all of it.
+    fn separate_caches(&self) -> bool {
+        self.n_ctx_seq() < self.n_ctx()
     }
 }
 
@@ -151,7 +244,7 @@ impl Drop for Context<'_> {
     }
 }
 
-/// Tokens to decode in one call, all in sequence 0.
+/// Tokens to decode in one call, each in one sequence.
 #[derive(Debug)]
 pub struct Batch {
     raw: sys::llama_batch,
@@ -175,8 +268,9 @@ impl Batch {
         }
     }
 
-    /// Appends `token` at `pos` in sequence 0; `output` computes its logits.
-    pub fn add(&mut self, token: Token, pos: i32, output: bool) -> Result<()> {
+    /// Appends `token` at `pos` in sequence `seq` (below the context's `n_seq_max`); `output`
+    /// computes its logits.
+    pub fn add(&mut self, token: Token, pos: i32, seq: i32, output: bool) -> Result<()> {
         let index = usize::try_from(self.raw.n_tokens).unwrap_or(usize::MAX);
         ensure!(
             index < self.capacity,
@@ -190,7 +284,7 @@ impl Batch {
             *self.raw.token.add(index) = token.0;
             *self.raw.pos.add(index) = pos;
             *self.raw.n_seq_id.add(index) = 1;
-            **self.raw.seq_id.add(index) = 0;
+            **self.raw.seq_id.add(index) = seq;
             *self.raw.logits.add(index) = i8::from(output);
         }
         self.raw.n_tokens += 1;

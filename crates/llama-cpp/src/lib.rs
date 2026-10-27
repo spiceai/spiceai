@@ -36,7 +36,7 @@ use snafu::Snafu;
 
 pub use context::{Batch, Context, ContextParams};
 pub use model::{Model, ModelParams, Vocab};
-pub use mtp::{Mtp, MtpParams};
+pub use mtp::{DraftRequest, Mtp, MtpParams};
 pub use sampler::Sampler;
 
 /// The llama.cpp release this crate is built from, such as `b11803`.
@@ -75,8 +75,23 @@ pub enum Error {
     #[snafu(display("llama.cpp could not decode the batch: {reason}"))]
     Decode { reason: String },
 
+    /// The KV cache has no room for the batch; nothing was computed, so the caller can free room
+    /// and decode the same batch again.
+    #[snafu(display(
+        "llama.cpp could not decode the batch: the context has no room left for the batch"
+    ))]
+    NoRoom,
+
     #[snafu(display("The batch is full: it holds {capacity} tokens"))]
     BatchFull { capacity: usize },
+
+    #[snafu(display("Sequence {seq} is not one of the context's {n_seq_max} sequences"))]
+    UnknownSequence { seq: i32, n_seq_max: u32 },
+
+    #[snafu(display(
+        "Sequence {src} cannot be copied to sequence {dst} in part: each has a KV cache of its own, and llama.cpp copies between caches only whole sequences"
+    ))]
+    PartialSequenceCopy { src: i32, dst: i32 },
 
     #[snafu(display("The text is too long for llama.cpp to tokenize: {bytes} bytes"))]
     TextTooLong { bytes: usize },

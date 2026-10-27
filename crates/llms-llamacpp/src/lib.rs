@@ -1135,7 +1135,7 @@ fn read_prompt<'m>(
         batch.clear();
         for (j, &token) in chunk.iter().enumerate() {
             let last = i + 1 == chunks && j + 1 == chunk.len();
-            batch.add(token, pos, last).map_err(|e| e.to_string())?;
+            batch.add(token, pos, 0, last).map_err(|e| e.to_string())?;
             pos += 1;
         }
         target
@@ -1535,7 +1535,7 @@ fn generate(
             break FinishReason::Length;
         }
         batch.clear();
-        batch.add(token, pos, true).map_err(|e| e.to_string())?;
+        batch.add(token, pos, 0, true).map_err(|e| e.to_string())?;
         pos += 1;
         context.decode(&batch).map_err(|e| e.to_string())?;
     };
@@ -1557,7 +1557,7 @@ fn generate_mtp(
     // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
     // hidden state at each prompt position before `begin`.
     let (tokens, mut batch) = read_prompt(model, spec, &prompt, &out.stopping)?;
-    spec.begin(&tokens).map_err(|e| e.to_string())?;
+    spec.begin(0, &tokens).map_err(|e| e.to_string())?;
     let n_ctx = usize::try_from(spec.target().n_ctx()).unwrap_or(usize::MAX);
     let mut history = tokens.clone();
     let mut n_past = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
@@ -1571,7 +1571,7 @@ fn generate_mtp(
             break FinishReason::Length;
         }
         let mut draft = spec
-            .draft(n_past, id, &history)
+            .draft(0, n_past, id, &history)
             .map_err(|e| e.to_string())?;
         // `accept` is owed exactly when the head drafted something.
         let drafted = !draft.is_empty();
@@ -1581,10 +1581,10 @@ fn generate_mtp(
         truncate_cache(spec.draft_mut(), n_past)?;
 
         batch.clear();
-        batch.add(id, n_past, true).map_err(|e| e.to_string())?;
+        batch.add(id, n_past, 0, true).map_err(|e| e.to_string())?;
         for (i, &token) in draft.iter().enumerate() {
             let at = n_past + 1 + i32::try_from(i).map_err(|e| e.to_string())?;
-            batch.add(token, at, true).map_err(|e| e.to_string())?;
+            batch.add(token, at, 0, true).map_err(|e| e.to_string())?;
         }
         spec.target_mut()
             .decode(&batch)
@@ -1608,7 +1608,7 @@ fn generate_mtp(
         };
         n_past += 1 + i32::try_from(accepted).map_err(|e| e.to_string())?;
         if drafted {
-            spec.accept(u16::try_from(accepted).unwrap_or(u16::MAX))
+            spec.accept(0, u16::try_from(accepted).unwrap_or(u16::MAX))
                 .map_err(|e| e.to_string())?;
         }
         // The rejected drafts leave both caches.
