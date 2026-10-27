@@ -56,14 +56,13 @@ fn strip_index_wrapper_layers(tbl: &Arc<dyn TableProvider>) -> Arc<dyn TableProv
 /// delete's filter with `DataFusion`: a Cayenne table, or a partitioned table whose
 /// partitions are Cayenne tables.
 fn deletes_evaluate_with_datafusion(provider: &Arc<dyn TableProvider>) -> bool {
-    let any = provider.as_any();
-    any.is::<cayenne::CayenneTableProvider>()
-        || any
+    let provider: &dyn std::any::Any = provider.as_ref();
+    provider.is::<cayenne::CayenneTableProvider>()
+        || provider
             .downcast_ref::<runtime_table_partition::provider::PartitionTableProvider>()
             .is_some_and(|partitioned| {
-                (**partitioned.creator())
-                    .as_any()
-                    .is::<cayenne::CayennePartitionCreator>()
+                let creator: &dyn std::any::Any = partitioned.creator().as_ref();
+                creator.is::<cayenne::CayennePartitionCreator>()
             })
 }
 
@@ -706,7 +705,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         let format = data_type_to_timestamp_format(&DataType::Utf8, None).expect("ISO8601");
         let converter = TimestampFilterConvert::new("ts".to_string(), format, None, None);
-        let cutoff = refresh::get_timestamp(SystemTime::now() - Duration::from_secs(86_400));
+        let cutoff = refresh::get_timestamp(SystemTime::now() - Duration::from_hours(24));
         let deleted = apply_retention_filters_once(
             &TableReference::bare("string_time_retention"),
             &accelerator,
