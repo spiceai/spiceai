@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `b962eb6a985fefaba7d75b85234dd6d65ed32048` | `lukim/unparse-empty-projection-over-unnest` (TEMPORARY: spiceai/datafusion#274) |
+| [datafusion](#datafusion) | `2fc7d6fc313ab3542163b10506cb934d9f2eab76` | `lukim/unparse-empty-projection-over-unnest` (TEMPORARY: spiceai/datafusion#274) |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `fe98a21f50e017faa7d9dbd436fec3671ce5631a` | `lukim/sqlite-keep-unnest-local` (TEMPORARY: spiceai/datafusion-table-providers#105) |
