@@ -19,8 +19,9 @@ limitations under the License.
 //! it reaches every node's GPU, its own included, and splits each weight across them. The
 //! nodes add up their partial results over direct connections between every pair of them.
 
-use std::net::{IpAddr, TcpStream, ToSocketAddrs};
-use std::sync::OnceLock;
+use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,9 @@ const RPC_THREADS: usize = 4;
 
 /// How long one probe of a rank's port waits for the connection.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long this node's GPU server has to start accepting connections.
+const SERVE_START: Duration = Duration::from_secs(30);
 
 /// Whether something accepts connections at `endpoint`. llama.cpp's RPC client aborts the
 /// process when it cannot connect, so a rank is reached only once this says it listens.
@@ -98,41 +102,88 @@ fn ipv4(node: &str) -> Result<String> {
         })
 }
 
-/// This node's GPUs, served once per process: a model that loads again reuses the server.
-static SERVING: OnceLock<std::result::Result<String, String>> = OnceLock::new();
+/// This node's GPU server: the endpoint it serves at, and whether its thread still runs.
+struct Serving {
+    endpoint: String,
+    running: Arc<AtomicBool>,
+}
 
-/// Serves this node's GPUs at `endpoint` on a thread of its own, once per process.
-fn serve_gpus(name: &str, endpoint: &str) -> Result<()> {
-    let served = SERVING.get_or_init(|| {
-        let backend = Backend::get();
-        let gpus = Device::local_gpus(backend);
-        if gpus.is_empty() {
-            return Err(
-                "this node has no GPU llama.cpp can use, so it cannot hold a share of a distributed model"
-                    .to_string(),
-            );
-        }
-        let at = endpoint.to_string();
-        thread::Builder::new()
-            .name("llama-cpp-rpc".to_string())
-            .spawn(move || {
-                // Runs for the life of the process; it returns only when it cannot serve.
-                if let Err(e) = rpc::serve(Backend::get(), &at, &gpus, None, RPC_THREADS) {
-                    tracing::error!("{e}");
-                }
-            })
-            .map_err(|e| format!("could not start the thread that serves this node's GPU: {e}"))?;
-        Ok(endpoint.to_string())
-    });
-    match served {
-        Ok(at) if *at == endpoint => Ok(()),
-        Ok(at) => Err(failed(format!(
-            "Model '{name}' would serve this node's GPU at {endpoint}, but this spiced already serves it at {at} for another model. Restart spiced to change the node's address or rank."
-        ))),
-        Err(reason) => Err(failed(format!(
-            "Model '{name}' could not serve this node's GPU: {reason}"
-        ))),
+/// The server of this node's GPUs, one per process: a model that loads again reuses it.
+static SERVING: Mutex<Option<Serving>> = Mutex::new(None);
+
+/// Serves this node's GPUs at `endpoint` on a thread of its own, once per process, and returns
+/// whether that server still runs. The GPU counts as served only once the server accepts
+/// connections; a server that could not start, or has stopped, is not reused, so a later load
+/// starts it again. Blocks until the server accepts connections or fails.
+fn serve_gpus(name: &str, endpoint: &str) -> Result<Arc<AtomicBool>> {
+    let mut serving = SERVING.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(served) = serving.as_ref()
+        && served.running.load(Ordering::Acquire)
+    {
+        return if served.endpoint == endpoint {
+            Ok(Arc::clone(&served.running))
+        } else {
+            Err(failed(format!(
+                "Model '{name}' would serve this node's GPU at {endpoint}, but this spiced already serves it at {} for another model. Restart spiced to change the node's address or rank.",
+                served.endpoint
+            )))
+        };
     }
+    let cannot = |reason: String| {
+        failed(format!(
+            "Model '{name}' could not serve this node's GPU at {endpoint}: {reason}"
+        ))
+    };
+    let gpus = Device::local_gpus(Backend::get());
+    if gpus.is_empty() {
+        return Err(cannot(
+            "this node has no GPU llama.cpp can use, so it cannot hold a share of a distributed model"
+                .to_string(),
+        ));
+    }
+    // llama.cpp's server fails to bind only inside its own thread; another process on the port
+    // is found here, before the load reports the GPU served.
+    drop(TcpListener::bind(endpoint).map_err(|e| {
+        cannot(format!(
+            "{e}. Stop what listens on that port, or give this node another address in `nodes`"
+        ))
+    })?);
+    let running = Arc::new(AtomicBool::new(true));
+    let flag = Arc::clone(&running);
+    let at = endpoint.to_string();
+    thread::Builder::new()
+        .name("llama-cpp-rpc".to_string())
+        .spawn(move || {
+            // Runs for the life of the process; it returns only when it cannot serve.
+            if let Err(e) = rpc::serve(Backend::get(), &at, &gpus, None, RPC_THREADS) {
+                tracing::error!("{e}");
+            }
+            flag.store(false, Ordering::Release);
+        })
+        .map_err(|e| cannot(format!("could not start the thread that serves it: {e}")))?;
+    let started = Instant::now();
+    loop {
+        if !running.load(Ordering::Acquire) {
+            return Err(cannot(
+                "llama.cpp's RPC server stopped; see the lines it logged before this".to_string(),
+            ));
+        }
+        if listening(endpoint) {
+            break;
+        }
+        if started.elapsed() > SERVE_START {
+            return Err(cannot(format!(
+                "llama.cpp's RPC server did not accept connections within {}s",
+                SERVE_START.as_secs()
+            )));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    *serving = Some(Serving {
+        endpoint: endpoint.to_string(),
+        running: Arc::clone(&running),
+    });
+    Ok(running)
 }
 
 /// Refuses to split the model `name` across nodes unless spiced runs with
@@ -157,10 +208,10 @@ pub(crate) async fn lend_gpu(cfg: &DistributedConfig, name: &str) -> Result<Shar
     let rank = cfg.node_rank;
     let (node, model) = (cfg.nodes[rank].clone(), name.to_string());
     // Resolving a node named by host name can block on DNS.
-    let endpoint = tokio::task::spawn_blocking(move || {
+    let (endpoint, running) = tokio::task::spawn_blocking(move || {
         let endpoint = format!("{}:{}", ipv4(&node)?, port(rank)?);
-        serve_gpus(&model, &endpoint)?;
-        Ok::<_, ChatError>(endpoint)
+        let running = serve_gpus(&model, &endpoint)?;
+        Ok::<_, ChatError>((endpoint, running))
     })
     .await
     .map_err(|e| {
@@ -175,6 +226,10 @@ pub(crate) async fn lend_gpu(cfg: &DistributedConfig, name: &str) -> Result<Shar
     );
     Ok(Share {
         refusal: served_by_head(name, head),
+        stopped: format!(
+            "Model '{name}' no longer holds its share on this node: the server of this node's GPU at {endpoint} stopped. Restart spiced on this node."
+        ),
+        running,
     })
 }
 
@@ -189,6 +244,10 @@ fn served_by_head(name: &str, head: &str) -> String {
 /// serves every request.
 pub(crate) struct Share {
     refusal: String,
+    /// The health check's error once the GPU server has stopped.
+    stopped: String,
+    /// Whether this node's GPU server still runs.
+    running: Arc<AtomicBool>,
 }
 
 impl Share {
@@ -208,9 +267,15 @@ impl Chat for Share {
         None
     }
 
-    /// Healthy while this node serves its GPU, which it does for the life of the process.
+    /// Healthy while this node's GPU server runs.
     async fn health(&self) -> Result<()> {
-        Ok(())
+        if self.running.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(ChatError::HealthCheckError {
+                source: self.stopped.clone().into(),
+            })
+        }
     }
 
     async fn chat_stream(
@@ -257,8 +322,21 @@ fn source_toward(peer: &str) -> Option<String> {
 pub(crate) async fn reach_ranks(cfg: &DistributedConfig, name: &str) -> Result<Vec<Device>> {
     ensure_insecure_allowed(cfg, name)?;
     let world = cfg.world_size();
-    let head_gpu = format!("{}:{}", head_gpu_address(cfg), port(0)?);
-    serve_gpus(name, &head_gpu)?;
+    let head_gpu = {
+        let (cfg, model) = (cfg.clone(), name.to_string());
+        // Finding the head's address and starting its GPU server both block.
+        tokio::task::spawn_blocking(move || {
+            let head_gpu = format!("{}:{}", head_gpu_address(&cfg), port(0)?);
+            serve_gpus(&model, &head_gpu)?;
+            Ok::<_, ChatError>(head_gpu)
+        })
+        .await
+        .map_err(|e| {
+            failed(format!(
+                "Model '{name}' could not serve this node's GPU: {e}"
+            ))
+        })??
+    };
     configure_comm(cfg);
 
     let mut endpoints = Vec::with_capacity(world);
@@ -270,19 +348,30 @@ pub(crate) async fn reach_ranks(cfg: &DistributedConfig, name: &str) -> Result<V
     let started = Instant::now();
     let mut noted = Instant::now();
     let mut devices: Vec<Option<Vec<Device>>> = vec![None; world];
+    // Each rank's connection attempt runs on a blocking thread, and the loop never waits on one:
+    // llama.cpp's handshake has no deadline, so a port that accepts and never answers would
+    // otherwise hold the loop past `RANK_WAIT`. A rank gets a new attempt only once its last one
+    // has ended.
+    let mut attempts: Vec<Option<tokio::task::JoinHandle<Option<Vec<Device>>>>> =
+        (0..world).map(|_| None).collect();
     loop {
         for (rank, endpoint) in endpoints.iter().enumerate() {
-            if devices[rank].is_none() {
-                let at = endpoint.clone();
-                let reached = tokio::task::spawn_blocking(move || {
-                    listening(&at)
-                        .then(|| rpc::connect(Backend::get(), &at).ok())
-                        .flatten()
-                })
-                .await
-                .ok()
-                .flatten();
-                devices[rank] = reached;
+            if devices[rank].is_some() {
+                continue;
+            }
+            match attempts[rank].take() {
+                Some(attempt) if attempt.is_finished() => {
+                    devices[rank] = attempt.await.ok().flatten();
+                }
+                Some(attempt) => attempts[rank] = Some(attempt),
+                None => {
+                    let at = endpoint.clone();
+                    attempts[rank] = Some(tokio::task::spawn_blocking(move || {
+                        listening(&at)
+                            .then(|| rpc::connect(Backend::get(), &at).ok())
+                            .flatten()
+                    }));
+                }
             }
         }
         let missing: Vec<usize> = (0..world).filter(|&rank| devices[rank].is_none()).collect();
