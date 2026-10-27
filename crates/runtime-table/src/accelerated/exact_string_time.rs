@@ -125,8 +125,11 @@ pub(crate) async fn pin_string_time_comparisons(
         });
     }
 
+    // A volatile remainder (`OR random() < 0.01`) would get one more chance per
+    // chunk, so such a predicate is issued once, however long its list.
     if let [only] = pinned.as_slice()
         && only.values.len() > MAX_PINNED_VALUES_PER_DELETE
+        && !expr.is_volatile()
     {
         let mut predicates = Vec::new();
         for (index, chunk) in only.values.chunks(MAX_PINNED_VALUES_PER_DELETE).enumerate() {
@@ -495,6 +498,23 @@ mod tests {
             selected(&table, &predicates).await.len(),
             MAX_PINNED_VALUES_PER_DELETE + 5
         );
+    }
+
+    /// A volatile remainder is evaluated once: a long selection is not split
+    /// when chunks would each re-roll `random()`.
+    #[tokio::test]
+    async fn issues_a_volatile_predicate_as_one_delete() {
+        let owned: Vec<String> = (0..MAX_PINNED_VALUES_PER_DELETE + 5)
+            .map(|i| format!("2021-05-01T00:00:{:02}.{:09}Z", i % 60, i))
+            .collect();
+        let rows: Vec<Option<&str>> = owned.iter().map(|s| Some(s.as_str())).collect();
+        let table = table(&rows);
+        let ctx = SessionContext::new();
+        let expr = before_cutoff().or(random().lt(lit(0.01)));
+        let predicates = pin_string_time_comparisons(&table, &ctx.state(), expr)
+            .await
+            .expect("pin");
+        assert_eq!(predicates.len(), 1);
     }
 
     /// Nothing to pin: the predicate comes back as it was.
