@@ -5,11 +5,20 @@ expression: "normalize_chat_completion_response(response, true)"
 {
   "choices": [
     {
-      "finish_reason": "stop",
+      "finish_reason": "tool_calls",
       "index": 0,
       "message": {
-        "content": "content_val",
-        "role": "assistant"
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"query\":\"{\\\"table\\\":\\\"spice.public.taxi_trips\\\"}\"}",
+              "name": "describe"
+            },
+            "id": "call-0edea482-f8d1-4a66-a24b-e8d8b49f0685",
+            "type": "function"
+          }
+        ]
       }
     }
   ],
@@ -21,7 +30,6 @@ expression: "normalize_chat_completion_response(response, true)"
   "usage": {
     "completion_tokens": "completion_tokens_val",
     "prompt_tokens": "prompt_tokens_val",
-    "prompt_tokens_details": "prompt_tokens_details_val",
     "total_tokens": "total_tokens_val"
   }
 }
