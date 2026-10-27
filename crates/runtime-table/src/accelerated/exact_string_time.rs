@@ -452,7 +452,7 @@ mod tests {
             .expect("pin");
         assert_eq!(predicates.len(), 1);
         assert!(
-            predicates[0].to_string().contains("NULLIF(CAST(ts"),
+            predicates[0].to_string().contains("nullif(CAST(ts"),
             "{}",
             predicates[0]
         );
