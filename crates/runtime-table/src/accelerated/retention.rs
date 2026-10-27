@@ -17,7 +17,8 @@ limitations under the License.
 use std::{sync::Arc, time::SystemTime};
 
 use crate::accelerated::{
-    DataRetentionFilter, Retention, refresh, refresh_task::collect_all_indexes,
+    DataRetentionFilter, Retention, exact_string_time::pin_string_time_comparisons, refresh,
+    refresh_task::collect_all_indexes,
 };
 use crate::federated::FederatedTable;
 use crate::filter_converter::{TimestampFilterConvert, create_timestamp_filter_convert};
@@ -120,29 +121,46 @@ pub(crate) async fn apply_retention_filters_once(
         }
     }
 
+    // The accelerator renders the delete's filter into its own SQL, which parses a
+    // string time column differently than `DataFusion`; pin each such comparison to
+    // the strings `DataFusion` selects first (see `exact_string_time`).
+    let predicates = match pin_string_time_comparisons(accelerator, &ctx.state(), expr).await {
+        Ok(predicates) => predicates,
+        Err(e) => {
+            tracing::error!("[retention] Error running retention check: {e}");
+            return Err(e);
+        }
+    };
+
     let raw_accelerator = strip_index_wrapper_layers(accelerator);
-    let plan = match raw_accelerator.delete_from(&ctx.state(), vec![expr]).await {
-        Ok(plan) => plan,
-        Err(e) => {
-            tracing::error!("[retention] Error running retention check: {e}");
-            return Err(e);
-        }
-    };
+    let mut num_records = 0;
+    for predicate in predicates {
+        let plan = match raw_accelerator
+            .delete_from(&ctx.state(), vec![predicate])
+            .await
+        {
+            Ok(plan) => plan,
+            Err(e) => {
+                tracing::error!("[retention] Error running retention check: {e}");
+                return Err(e);
+            }
+        };
 
-    let deleted = match collect(plan, ctx.task_ctx()).await {
-        Ok(deleted) => deleted,
-        Err(e) => {
-            tracing::error!("[retention] Error running retention check: {e}");
-            return Err(e);
-        }
-    };
+        let deleted = match collect(plan, ctx.task_ctx()).await {
+            Ok(deleted) => deleted,
+            Err(e) => {
+                tracing::error!("[retention] Error running retention check: {e}");
+                return Err(e);
+            }
+        };
 
-    let num_records = deleted.first().map_or(0, |f| {
-        f.column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .map_or(0, |v| v.values().first().copied().unwrap_or(0))
-    });
+        num_records += deleted.first().map_or(0, |f| {
+            f.column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .map_or(0, |v| v.values().first().copied().unwrap_or(0))
+        });
+    }
 
     for (target, keys) in warm_deletes {
         if let Err(e) = target.delete_by_keys(keys).await {

@@ -31,8 +31,9 @@ use crate::timezone;
 /// are constructed.
 #[derive(Debug, Clone)]
 pub enum TimestampFormat {
-    /// ISO 8601 string column (`Utf8`, `LargeUtf8`, `Utf8View`).
-    Iso8601,
+    /// ISO 8601 string column of the given string type (`Utf8`, `LargeUtf8`,
+    /// `Utf8View`). The type is the one text literals compared with the column take.
+    Iso8601(DataType),
     /// Integer column representing a unix epoch value, divided by `scale`
     /// to convert from nanoseconds.
     ///
@@ -65,25 +66,21 @@ fn convert_timestamp_expr(
         ),
         // ISO 8601 strings are compared as instants, not as text. Text order only
         // matches time order when every value shares one spelling: a space separator
-        // sorts before `T`, and an offset (`-07:00`) or `Z` suffix is ignored, so a
-        // text comparison against the cutoff keeps expired rows, drops live ones, and
-        // disagrees with the column type (`LargeUtf8` vs a `Utf8` literal) on engines
-        // that evaluate the predicate without coercion. Casting parses each spelling
-        // to the UTC instant it names (a value without an offset is read as UTC).
-        // Vortex declines a cast it can't evaluate, so on Cayenne the comparison runs
-        // in the `FilterExec` above the scan instead.
-        TimestampFormat::Iso8601 | TimestampFormat::Date | TimestampFormat::Timestamp => {
-            binary_expr(
-                cast(
-                    ident(time_column),
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-                ),
-                op,
-                Expr::Literal(
-                    ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), None),
-                    None,
-                ),
-            )
+        // sorts before `T`, and an offset (`-07:00`) or `Z` suffix is ignored. Casting
+        // parses each spelling to the UTC instant it names (a value without an offset
+        // is read as UTC). Engines do not all parse a string the way `DataFusion`
+        // does, so the pushdown gates keep that cast local; the text bound ANDed in
+        // front of it is a superset of the rows it selects, written so every engine
+        // compares it the same way, and is what a scan can push down.
+        TimestampFormat::Iso8601(string_type) => {
+            let exact = instant_comparison(time_column, timestamp_in_nanos, op);
+            match iso8601_text_superset(time_column, string_type, timestamp_in_nanos, op) {
+                Some(superset) => and(superset, exact),
+                None => exact,
+            }
+        }
+        TimestampFormat::Date | TimestampFormat::Timestamp => {
+            instant_comparison(time_column, timestamp_in_nanos, op)
         }
         TimestampFormat::Timestamptz(tz) => {
             // The cast carries the accelerator schema's timezone spelling, and the
@@ -118,6 +115,64 @@ fn convert_timestamp_expr(
             )
         }
     }
+}
+
+/// `CAST(col AS Timestamp(ns)) op <timestamp_in_nanos>`.
+#[expect(clippy::cast_possible_truncation)]
+fn instant_comparison(time_column: &str, timestamp_in_nanos: u128, op: Operator) -> Expr {
+    binary_expr(
+        cast(
+            ident(time_column),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        ),
+        op,
+        Expr::Literal(
+            ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), None),
+            None,
+        ),
+    )
+}
+
+/// A text comparison that every ISO 8601 value satisfying
+/// `CAST(col AS Timestamp) op <timestamp_in_nanos>` also satisfies.
+///
+/// Every spelling starts with its local `YYYY-MM-DD`, and a UTC offset is less
+/// than a day, so a value's local date is within one day of its UTC date. A value
+/// after the bound therefore starts with a date no earlier than the day before
+/// the bound's, and one before it with a date earlier than two days after. A
+/// string compares against a bare `YYYY-MM-DD` by that prefix alone, so the
+/// comparison is plain text in any engine. The literal takes the column's string
+/// type, so an engine that compares without coercion sees matching types. `None`
+/// for an operator with no such bound, or a bound outside the dates `chrono` can
+/// spell.
+#[expect(clippy::cast_possible_truncation)]
+fn iso8601_text_superset(
+    time_column: &str,
+    string_type: &DataType,
+    timestamp_in_nanos: u128,
+    op: Operator,
+) -> Option<Expr> {
+    let day = chrono::DateTime::from_timestamp_nanos(timestamp_in_nanos as i64).date_naive();
+    let (text_op, date) = match op {
+        Operator::Gt | Operator::GtEq => {
+            (Operator::GtEq, day.checked_sub_days(chrono::Days::new(1))?)
+        }
+        Operator::Lt | Operator::LtEq => {
+            (Operator::Lt, day.checked_add_days(chrono::Days::new(2))?)
+        }
+        _ => return None,
+    };
+    let date = date.format("%Y-%m-%d").to_string();
+    let literal = match string_type {
+        DataType::LargeUtf8 => ScalarValue::LargeUtf8(Some(date)),
+        DataType::Utf8View => ScalarValue::Utf8View(Some(date)),
+        _ => ScalarValue::Utf8(Some(date)),
+    };
+    Some(binary_expr(
+        ident(time_column),
+        text_op,
+        Expr::Literal(literal, None),
+    ))
 }
 
 /// Whether an Arrow `DataType` can only represent whole days.
@@ -164,7 +219,9 @@ pub fn data_type_to_timestamp_format(
             Some(TimestampFormat::Timestamp)
         }
         DataType::Timestamp(_, tz) => Some(TimestampFormat::Timestamptz(tz.to_owned())),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Some(TimestampFormat::Iso8601),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            Some(TimestampFormat::Iso8601(data_type.clone()))
+        }
         DataType::Date32 => Some(TimestampFormat::Date),
         _ => {
             tracing::warn!("Data type is not supported yet: {data_type}");
@@ -548,7 +605,7 @@ mod tests {
             &DataType::Utf8,
             None,
             1_620_000_000_000_000_000,
-            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
+            "timestamp >= Utf8(\"2021-05-02\") AND CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
         );
     }
 
@@ -707,7 +764,10 @@ mod tests {
         assert_eq!(high_water_mark_expr(&time32), TS_STRICT);
         assert_eq!(high_water_mark_expr(&time64), TS_STRICT);
         assert_eq!(high_water_mark_expr(&timestamp), TS_STRICT);
-        assert_eq!(high_water_mark_expr(&DataType::Utf8), TS_STRICT);
+        assert_eq!(
+            high_water_mark_expr(&DataType::Utf8),
+            format!("ts >= Utf8(\"2021-05-02\") AND {TS_STRICT}")
+        );
     }
 
     #[test]
@@ -893,8 +953,8 @@ mod tests {
     }
 
     /// The cutoff the ISO tests compare against: 2021-05-03T00:00:00Z.
-    fn iso_converter() -> TimestampFilterConvert {
-        let format = data_type_to_timestamp_format(&DataType::Utf8, None).expect("resolves");
+    fn iso_converter(data_type: &DataType) -> TimestampFilterConvert {
+        let format = data_type_to_timestamp_format(data_type, None).expect("resolves");
         TimestampFilterConvert::new("ts".to_string(), format, None, None)
     }
 
@@ -912,8 +972,8 @@ mod tests {
             Some("2021-05-03T00:00:01Z"),
             Some("2021-05-03T00:00:00.5"),
         ];
-        let keep = iso_converter().convert(TS_NANOS, Operator::Gt);
         for data_type in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            let keep = iso_converter(&data_type).convert(TS_NANOS, Operator::Gt);
             assert_eq!(
                 surviving_iso_rows(&data_type, &values, &keep),
                 vec![
@@ -924,6 +984,32 @@ mod tests {
                 ],
                 "{data_type}: rows after the cutoff, whatever their spelling",
             );
+        }
+    }
+
+    /// The text bound in front of the instant comparison never drops a row the
+    /// comparison selects, whatever the offset: a value's local date is within a
+    /// day of its UTC date. The bound's literal takes the column's string type.
+    #[test]
+    fn iso_text_bound_is_a_superset_of_the_instant_comparison() {
+        let values = [
+            Some("2021-05-01T23:00:00-23:59"),           // 2021-05-02T22:59Z
+            Some("2021-05-02T23:59:59.999999999-23:00"), // 2021-05-03T22:59Z
+            Some("2021-05-04T00:30:00+23:00"),           // 2021-05-03T01:30Z
+            Some("2021-05-04T23:59:59+23:59"),           // 2021-05-04T00:00:59Z
+            Some("2021-05-03T00:00:00.000000001Z"),
+            Some("2021-05-03"),
+        ];
+        for data_type in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            for op in [Operator::Gt, Operator::GtEq, Operator::Lt, Operator::LtEq] {
+                let bounded = iso_converter(&data_type).convert(TS_NANOS, op);
+                let exact = instant_comparison("ts", TS_NANOS, op);
+                assert_eq!(
+                    surviving_iso_rows(&data_type, &values, &bounded),
+                    surviving_iso_rows(&data_type, &values, &exact),
+                    "{data_type} {op}: {bounded}"
+                );
+            }
         }
     }
 
@@ -938,7 +1024,7 @@ mod tests {
             Some("2021-05-03T01:00:00+00:00"),
             None,
         ];
-        let delete = iso_converter().convert(TS_NANOS, Operator::Lt);
+        let delete = iso_converter(&DataType::LargeUtf8).convert(TS_NANOS, Operator::Lt);
         assert_eq!(
             surviving_iso_rows(&DataType::LargeUtf8, &values, &delete),
             vec![

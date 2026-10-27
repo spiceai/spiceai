@@ -1972,7 +1972,7 @@ fn plan_casts_string_column_to_timestamp(plan: &LogicalPlan) -> bool {
             )
         };
         node.apply_expressions(|expr| {
-            found = casts_string_column_to_timestamp(expr, &is_string_column);
+            found = casts_string_column_to_timestamp(expr, is_string_column);
             if found {
                 Ok(TreeNodeRecursion::Stop)
             } else {

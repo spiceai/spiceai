@@ -6,7 +6,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SPICED=${SPICED:-spiced}
 PY=${PY:-python3}                      # needs pyarrow
 HP=${HP:-18190}; FP=${FP:-50161}
-ENGINES=${ENGINES:-"arrow duckdb cayenne"}
+ENGINES=${ENGINES:-"arrow duckdb sqlite cayenne"}
+# A non-UTC zone: SQLite reads an offset-free string in the host zone unless kept local.
+SPICED_TZ=${SPICED_TZ:-Asia/Tokyo}
 W=$(mktemp -d /tmp/verify-retention-XXXX)
 FAIL=0
 pass() { echo "PASS $*"; }
@@ -23,13 +25,13 @@ trap cleanup EXIT
 pod() { mkdir -p "$W/$1"; sed "s#__DATA__#$DATA#g" > "$W/$1/spicepod.yaml"; } # $1 = name; spicepod on stdin
 run_pod() { # $1 = name; not in a pipeline, so PID stays in this shell
   stop; local dir=$W/$1
-  ( cd "$dir" && exec "$SPICED" --http 127.0.0.1:$HP --flight 127.0.0.1:$FP --metrics 127.0.0.1:$((HP+1000)) > spiced.log 2>&1 ) &
+  ( cd "$dir" && TZ=$SPICED_TZ exec "$SPICED" --http 127.0.0.1:$HP --flight 127.0.0.1:$FP --metrics 127.0.0.1:$((HP+1000)) > spiced.log 2>&1 ) &
   PID=$!
   for _ in $(seq 1 60); do curl -sf 127.0.0.1:$HP/v1/ready >/dev/null && return 0; sleep 1; done
   echo "(spiced not ready after 60s: $dir/spiced.log)"; tail -5 "$dir/spiced.log"
 }
 mode() { [ "$1" = arrow ] && echo memory || echo file; }
-echo "spiced: $($SPICED --version 2>&1 | head -1)  workdir: $W"
+echo "spiced: $($SPICED --version 2>&1 | head -1)  TZ=$SPICED_TZ  workdir: $W"
 
 # 1+2: ISO 8601 string time columns (Z, offsets, space separator) with retention.
 { printf 'version: v1\nkind: Spicepod\nname: verify\ndatasets:\n'

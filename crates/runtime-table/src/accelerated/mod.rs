@@ -83,6 +83,7 @@ pub mod refresh_completion;
 pub mod refresh_task;
 pub mod refresh_task_runner;
 pub mod retention;
+pub(crate) mod exact_string_time;
 pub(crate) mod sink;
 pub mod snapshots;
 pub(crate) mod source_stall;

@@ -300,6 +300,7 @@ pub fn duckdb_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> 
     duckdb::literal_is_renderable(expr)
         && duckdb::cast_is_renderable(expr, scope)
         && integer_cast_is_renderable(expr, scope)
+        && string_timestamp_cast_is_renderable(expr, scope)
         && !divides_a_decimal(expr, scope)
 }
 
@@ -335,7 +336,7 @@ pub(crate) fn divides_a_decimal(expr: &Expr, scope: Option<&DFSchema>) -> bool {
 /// the one shape it does not (see [`integer_cast_is_renderable`]).
 #[must_use]
 pub fn postgres_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
-    integer_cast_is_renderable(expr, scope)
+    integer_cast_is_renderable(expr, scope) && string_timestamp_cast_is_renderable(expr, scope)
 }
 
 /// Whether `MySQL` evaluates this non-function expression node the way
@@ -343,7 +344,49 @@ pub fn postgres_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -
 /// the one shape it does not (see [`integer_cast_is_renderable`]).
 #[must_use]
 pub fn mysql_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
-    integer_cast_is_renderable(expr, scope)
+    integer_cast_is_renderable(expr, scope) && string_timestamp_cast_is_renderable(expr, scope)
+}
+
+/// Whether an engine parses the string this cast reads into the instant
+/// `DataFusion` reads out of it.
+///
+/// `DataFusion` reads an ISO 8601 string's UTC offset (`-07:00`, `Z`) and its
+/// nanoseconds, and reads a string without an offset as UTC. The engines this
+/// crate unparses a `CAST(s AS Timestamp)` for do not: `DuckDB` is handed
+/// `TO_TIMESTAMP(EPOCH(CAST(s AS TIMESTAMP)))`, which drops the offset and
+/// truncates to microseconds, `PostgreSQL`'s and `MySQL`'s `TIMESTAMP` ignore
+/// the offset (`MySQL` rejects some spellings outright), and `SQLite` reads a
+/// string without an offset in the host's time zone. A filter over the cast
+/// would then select different rows than the same filter evaluated locally —
+/// for a retention or refresh-window filter, live rows deleted or expired rows
+/// kept — so it stays local. A string *literal* is folded by `DataFusion` before
+/// any pushdown and carries no column's spelling, so it is not refused; an
+/// operand whose type cannot be read is, matching [`integer_cast_is_renderable`].
+#[must_use]
+pub(crate) fn string_timestamp_cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let (Expr::Cast(Cast {
+        expr: operand,
+        field,
+    })
+    | Expr::TryCast(TryCast {
+        expr: operand,
+        field,
+    })) = expr
+    else {
+        return true;
+    };
+    if !matches!(field.data_type(), DataType::Timestamp(_, _)) {
+        return true;
+    }
+    if let Expr::Literal(..) = operand.as_ref() {
+        return true;
+    }
+    let empty = DFSchema::empty();
+    operand_type(operand, scope.unwrap_or(&empty)).is_some_and(|data_type| {
+        !(data_type.is_string()
+            || data_type.is_null()
+            || matches!(&data_type, DataType::Dictionary(_, value) if value.is_string()))
+    })
 }
 
 /// Whether an engine that rounds a fractional value on its way into an integer
@@ -511,7 +554,7 @@ mod tests {
         bigquery, bigquery_native_function_names, duckdb, duckdb_builtin_scalar_overrides,
         duckdb_can_evaluate_expression, duckdb_can_translate, duckdb_native_function_names,
         integer_cast_is_renderable, mysql_can_evaluate_expression, new_duckdb_dialect,
-        postgres_can_evaluate_expression,
+        postgres_can_evaluate_expression, string_timestamp_cast_is_renderable,
     };
     use crate::function_support::bigquery_can_evaluate_expression;
     use arrow_schema::{DataType, Field, Schema};
@@ -858,6 +901,59 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// A cast from a string column into a timestamp stays local on every engine
+    /// that parses the string differently: `DuckDB` drops the UTC offset and the
+    /// nanoseconds, `PostgreSQL` and `MySQL` drop the offset. A timestamp literal
+    /// spelled as a cast of a string literal, a cast from a non-string column,
+    /// and a cast of a string into anything else still federate; an operand
+    /// whose type cannot be read is refused.
+    #[test]
+    fn a_string_to_timestamp_cast_stays_local_where_the_engine_parses_it_differently() {
+        use arrow_schema::TimeUnit;
+        let scope = scope_of(&[
+            ("s", DataType::Utf8),
+            ("l", DataType::LargeUtf8),
+            ("v", DataType::Utf8View),
+            ("t", DataType::Timestamp(TimeUnit::Microsecond, None)),
+            ("d", DataType::Date32),
+        ]);
+        let nanos = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let utc = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+        let engines: [(&str, CanEvaluateExpression); 4] = [
+            ("DuckDB", duckdb_can_evaluate_expression),
+            ("PostgreSQL", postgres_can_evaluate_expression),
+            ("MySQL", mysql_can_evaluate_expression),
+            ("gate", string_timestamp_cast_is_renderable),
+        ];
+        for (engine, can_evaluate) in engines {
+            for expr in [
+                cast(col("s"), nanos.clone()),
+                try_cast(col("l"), nanos.clone()),
+                cast(col("v"), utc.clone()),
+                cast(col("t.s"), nanos.clone()),
+                cast(upper(col("s")), nanos.clone()),
+            ] {
+                assert!(
+                    !can_evaluate(&expr, Some(&scope)),
+                    "{engine} parses {expr} differently, so it must stay local"
+                );
+            }
+            assert!(!can_evaluate(&cast(col("s"), nanos.clone()), None));
+            for expr in [
+                cast(lit("2021-05-02T00:00:00Z"), nanos.clone()),
+                cast(col("t"), nanos.clone()),
+                cast(col("d"), utc.clone()),
+                cast(col("s"), DataType::Date32),
+                col("s").gt_eq(lit("2021-05-01")),
+            ] {
+                assert!(
+                    can_evaluate(&expr, Some(&scope)),
+                    "{engine} must still be handed {expr}"
+                );
             }
         }
     }

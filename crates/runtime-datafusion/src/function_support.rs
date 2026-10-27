@@ -285,7 +285,12 @@ pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> 
         "sqlite" => Some(Arc::new(sqlite_driver_can_evaluate_expression)),
         // Documented to round a fractional value cast into an integer, like the
         // engines above; the gate costs them only the cast's pushdown.
-        "snowflake" | "athena" => Some(Arc::new(crate::dialect::integer_cast_is_renderable)),
+        // Both also read a string's timestamp differently than `DataFusion` (an
+        // offset-free `TIMESTAMP_NTZ` / `timestamp` drops a string's offset).
+        "snowflake" | "athena" => Some(Arc::new(|expr: &Expr, scope: Option<&DFSchema>| {
+            crate::dialect::integer_cast_is_renderable(expr, scope)
+                && crate::dialect::string_timestamp_cast_is_renderable(expr, scope)
+        })),
         _ => None,
     }
 }
