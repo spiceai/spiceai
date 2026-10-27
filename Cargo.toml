@@ -301,7 +301,7 @@ datafusion-proto-common = "55.2.0"
 datafusion-pruning = "55.2.0"
 datafusion-spark = "55.2.0"
 datafusion-substrait = "55.2.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "11df78671cfe2e378a0acde63a53bc288a5fec58" } # branch: lukim/sqlite-timestamp-delete-text (spiceai/datafusion-table-providers#104, into spiceai-55)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "091209d701ac6c341c201dfca04c99fa2d99f2ba" } # branch: lukim/sqlite-timestamp-delete-text (spiceai/datafusion-table-providers#104, into spiceai-55)
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",
