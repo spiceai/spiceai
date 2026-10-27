@@ -24,6 +24,7 @@
   "debezium-direct": 10,
   "debezium-direct-chaos": 35,
   "debezium-kafka": 62,
+  "distinct-on-scopes": 5,
   "duckdb-nested-union-all": 4,
   "ducklake-coverage": 25,
   "ducklake-refresh": 28,
