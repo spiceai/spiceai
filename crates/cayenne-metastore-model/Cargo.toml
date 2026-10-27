@@ -1,0 +1,11 @@
+[package]
+name = "cayenne-metastore-model"
+version.workspace = true
+edition = "2024"
+publish = false
+
+[dependencies]
+stateright = { workspace = true }
+
+[lints]
+workspace = true
