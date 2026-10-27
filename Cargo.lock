@@ -6483,6 +6483,7 @@ dependencies = [
  "native-tls",
  "num_cpus",
  "object_store 0.13.2",
+ "object_store_spawn",
  "opendal",
  "oracle",
  "parking_lot",
@@ -6561,6 +6562,7 @@ dependencies = [
  "datafusion",
  "datafusion-datasource",
  "datafusion-physical-expr",
+ "flate2",
  "futures",
  "object_store 0.13.2",
  "orc-rust",
@@ -7434,7 +7436,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=f103fe809cc186168833632b9a0ee07ff40a9283#f103fe809cc186168833632b9a0ee07ff40a9283"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=4a2920746865562e604150fbee49eea6241c0b85#4a2920746865562e604150fbee49eea6241c0b85"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -8017,7 +8019,7 @@ checksum = "ab23e69df104e2fd85ee63a533a22d2132ef5975dc6b36f9f3e5a7305e4a8ed7"
 [[package]]
 name = "duckdb"
 version = "1.4.4"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=504debbf8269a76aef74daa2247b6296c2fe2290#504debbf8269a76aef74daa2247b6296c2fe2290"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9#40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9"
 dependencies = [
  "arrow",
  "calamine",
@@ -11672,7 +11674,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libduckdb-sys"
 version = "1.4.4"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=504debbf8269a76aef74daa2247b6296c2fe2290#504debbf8269a76aef74daa2247b6296c2fe2290"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9#40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9"
 dependencies = [
  "cc",
  "flate2",
@@ -12322,14 +12324,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "lzokay-native"
-version = "0.1.0"
+name = "lzo"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "792ba667add2798c6c3e988e630f4eb921b5cbc735044825b7111ef1582c8730"
-dependencies = [
- "byteorder",
- "thiserror 1.0.69",
-]
+checksum = "1574f8e322bb9d442095896ff66d126e521f5a85ef7d7343a269bb7d6eeb3f0b"
 
 [[package]]
 name = "mac"
@@ -14786,8 +14784,7 @@ dependencies = [
 [[package]]
 name = "orc-rust"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e54c163f843c4f0fcfca65b9b73ca6f93c37c8e86736d5a1e578c6e843eed0a0"
+source = "git+https://github.com/spiceai/orc-rust.git?rev=5b35c6d10a8cbd9750d501216ff04e72e23829b6#5b35c6d10a8cbd9750d501216ff04e72e23829b6"
 dependencies = [
  "arrow",
  "async-trait",
@@ -14801,7 +14798,7 @@ dependencies = [
  "futures-util",
  "log",
  "lz4_flex 0.11.6",
- "lzokay-native",
+ "lzo",
  "num",
  "prost 0.13.5",
  "snafu",
@@ -17772,6 +17769,7 @@ dependencies = [
  "object_store 0.13.2",
  "object_store_occ",
  "opendal",
+ "opendal-http-transport-reqwest",
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
  "opentelemetry-prometheus",
@@ -18547,7 +18545,6 @@ dependencies = [
  "headers",
  "http 1.4.1",
  "opentelemetry 0.32.0",
- "percent-encoding",
  "regex",
  "runtime-auth",
  "sha2 0.10.9",
@@ -20547,7 +20544,7 @@ dependencies = [
 [[package]]
 name = "spiceai"
 version = "4.0.0"
-source = "git+https://github.com/spiceai/spice-rs.git?rev=4429f3956972c4c329ee406ac60b15ad6ae4a777#4429f3956972c4c329ee406ac60b15ad6ae4a777"
+source = "git+https://github.com/spiceai/spice-rs.git?rev=f53c2c1c96791bea14c37cee93cae38626d9cfbc#f53c2c1c96791bea14c37cee93cae38626d9cfbc"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -20571,6 +20568,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "webpki-roots 1.0.10",
  "winver",
 ]
 

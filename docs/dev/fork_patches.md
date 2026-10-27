@@ -118,15 +118,16 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `2e8b24f72e4dffb694fa2dbe3e1f9bd56ea528e7` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `f103fe809cc186168833632b9a0ee07ff40a9283` | `spiceai-55` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `4a2920746865562e604150fbee49eea6241c0b85` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
+| [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `a6b07b8b9625e552c502c3a7229fd4bb7725bd2e` | `spiceai-0.11.0-df-55` |
 | [llama.cpp](#llamacpp) | `1082d1983689a13315cdf2a80d9bd0bbdd572da2` | `spiceai-b11803` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `aa8e8d43949970b91fb42a2243b4f60f810d9bbd` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
+| [orc-rust](#orc-rust) | `5b35c6d10a8cbd9750d501216ff04e72e23829b6` | `spiceai-0.9` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
 | [sea-query](#sea-query) | `ae75baef819513fb8d19af014972dcfa324e201a` | `spiceai` |
@@ -525,6 +526,7 @@ which #49 was squash-merged from), the only other source change is an equivalent
 | Bundled DuckDB version pinned to the release (fork PR #38) | Extension downloads resolve against a mismatched DuckDB version and fail | silent | covered by the two extension guards above |
 | Thrift `TEnumIterator::operator==` backport for macOS 27 / libc++ (fork PR #47; upstream [duckdb/duckdb@fccde6aa](https://github.com/duckdb/duckdb/commit/fccde6aa1932f48dfa6282a916ea2477b57aa44d)) | Bundled DuckDB with Parquet fails to compile against the macOS 27 SDK: newer libc++ constructs Thrift enum maps with `iterator == end`, and the vendored Thrift header only defined `operator!=` | build (macOS 27) | `scripts/check_fork_patches.py::duckdb_thrift_iterator_equality` — reads `operator==(const TEnumIterator` out of the pinned revision's `duckdb.tar.gz`. The fork's own `crates/libduckdb-sys/tests/test_bundled_thrift.py` covers the same property inside the fork and does not survive a re-cut of this pin |
 | Arrow bumped to 59 (fork PR #49, squash-merged into `spiceai-1.4.4`), with the fork's `test_fixed_array_roundtrip` rebuilt from a whole number of lists — arrow 58 silently dropped a trailing value that arrow 59 rejects | Upstream duckdb-rs is on arrow 58 on every line. Without the bump the workspace resolves two arrow majors, and every Arrow value that crosses into or out of DuckDB — the accelerator's appender and its query results, `register_arrow_scan_view` — is a type from the other copy, so the crates that call it stop compiling. The test fix is fork-internal and changes no behaviour here | build | compile-guarded by `crates/accelerators/accelerator-duckdb` and `crates/data_components/src/ducklake/writer.rs`, which pass arrow types across that boundary |
+| Brotli decoder rejects an invalid block switch with `BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH` instead of decoding on with stale block-type state (fork PR #53, from spiceai/duckdb#20; upstream [duckdb/duckdb#27791](https://github.com/duckdb/duckdb/pull/27791), a port of [google/brotli@0ed4268a](https://github.com/google/brotli/commit/0ed4268a4401abcb4472096340477cf4af7d1a2b)) | A malformed Brotli-compressed page in a Parquet file that DuckDB reads can write out of bounds in the decoder (CVE-2026-111497) | silent (memory corruption) | `scripts/check_fork_patches.py::duckdb_brotli_block_switch` — reads the `BLOCK_SWITCH, -17` error code and the decoder path that returns it out of the pinned revision's `duckdb.tar.gz` |
 | `ToSql for DateTime<Tz>` writes the UTC instant instead of the local wall-clock fields with a `+00:00` suffix (fork PR #50, backport of upstream duckdb-rs `2bf67df`) | A non-UTC `chrono::DateTime` bound as a parameter is stored shifted by its UTC offset | none in this workspace | Not reachable here: the impl is behind duckdb-rs's `chrono` feature, which no crate in this workspace enables (`cargo metadata` resolves `duckdb` without it), so nothing binds a `chrono::DateTime` through `ToSql`. A change that enables `chrono` turns this into a silent wrong-data row and needs a guard with it |
 
 ## iceberg-rust
@@ -650,6 +652,16 @@ Upstream [MinishLab/model2vec-rs](https://github.com/MinishLab/model2vec-rs).
 | IDs-only fast WordPiece tokenizer for the potion models | Static embedding throughput drops sharply | silent (perf) | **GAP** |
 | `config.json` made optional, and the embedding tensor read from `embedding.weight` or `0` as well as `embeddings`, for sentence-transformers compatibility (fork commit `f1190f1f`) | Loading a sentence-transformers static model fails. Two independent halves of the same use case: such an export ships no `config.json` **and** names its tensor `embedding.weight`, so losing either one leaves the model failing to load | silent (load failure) | `crates/llms/src/model2vec.rs::a_local_model_loads_without_a_config_json` and `…::a_local_model_loads_with_the_sentence_transformers_tensor_names`, against a model directory the test writes — a tokenizer and a hand-built `safetensors` tensor, no `config.json`, and the tensor name as a parameter so each test is the other's control |
 | HF cache directory read from the environment (fork commit `1259c0d3`) | Nothing in Spice: Spice downloads a `model2vec` model into the Hugging Face cache itself and hands `model2vec-rs` the local snapshot, so the fork's own Hub download never runs. The patch can be dropped at the next re-cut | none | Not needed. `crates/llms/tests/model2vec_hf_cache.rs::a_cached_model_is_read_from_the_directory_hf_hub_cache_names` guards Spice's own use of the cache `HF_HUB_CACHE` names instead. It sets process-wide environment variables, so it calls `require_process_per_test` first; it is a module of `llms`'s `integration` binary, selected in the Makefile's `NEXTEST_FILTER` alongside the other credential-free `llms` modules |
+
+## orc-rust
+
+Upstream [datafusion-contrib/orc-rust](https://github.com/datafusion-contrib/orc-rust),
+branch `spiceai-0.9` cut from upstream `v0.9.0`.
+
+| Patch | What breaks if it is lost | Loss | Guard |
+|---|---|---|---|
+| Metadata streams (file footer, file metadata, stripe footers, row indexes, bloom filters) fail once decoded output exceeds both 64 MiB and 100 times the encoded size; column data streams stay unbounded | A small ORC file with a highly compressible footer makes the runtime allocate until it runs out of memory | silent (memory) | `crates/dataformat-orc/src/file_format.rs::infer_schema_rejects_high_ratio_compressed_footer` |
+| Each codec stops decoding at the remaining allowance, with LZO decoded through `lzo` into a bounded buffer instead of `lzokay-native` | One compressed chunk is decoded in full before the bound rejects it, so a single chunk can still allocate up to its own expansion | silent (memory) | **GAP** — the bound above still rejects the stream after the chunk decodes, so only a memory measurement can tell the two apart |
 
 ## text-splitter
 
@@ -791,7 +803,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**40 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**41 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -853,22 +865,25 @@ They are not equal in consequence; this is the order to close them in.
    error, an HTTP 500, or a hang), never with wrong text. A guard needs a GGUF of
    each architecture small enough for CI; today's evidence is those models served
    on the 3-node DGX Spark cluster.
+9. `orc-rust` in-codec decode allowance — losing it lets one compressed metadata
+   chunk decode in full before the stream is rejected. A guard needs a memory
+   measurement around one ORC open; the rejection itself is guarded.
 
 **Blocked, not merely undone.** These have been looked at and cannot be closed by
 writing a test; each says what would unblock it:
 
-9. `snowflake-rs` (five rows) — no host override, private response types. Needs a
+10. `snowflake-rs` (five rows) — no host override, private response types. Needs a
    live account, or an upstream change letting the base URL be set.
-10. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
+11. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
    race, so any test of it is a timing test. Upstream has since removed the code
    path and the lock (vortex-data/vortex#8919); if a run confirms that, drop the row
    rather than guard it.
-11. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
+12. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
 
 **Reported late rather than wrongly.** The right answer, after an avoidable wait:
 
-12. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
+13. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
    `endpoint` is retried through the whole backoff budget before reporting, so a
    configuration error looks like a slow provider. What changes is *when* the
    error arrives, and asserting that is a timing test.
@@ -876,7 +891,7 @@ writing a test; each says what would unblock it:
 **Diagnostics only.** The query is unaffected; what is lost is the ability to see
 how it ran:
 
-13. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
+14. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
    upstream's; `EXPLAIN FORMAT TREE` is not carried) — plain `EXPLAIN` is guarded
    through the cluster harness, and `ANALYZE` is not issued through it by anything. Closing this needs the
    harness to submit the statement rather than build its text as a label.
@@ -887,7 +902,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-14. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+15. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `mistral.rs` `deepseek41` and `glm5-next` decode kernels (spiceai/mistral.rs#49), which
     no suite here trends yet — their evidence is the DGX Spark decode A/B in that PR;
@@ -900,7 +915,7 @@ without becoming a flaky timing test:
 **Unoptimised builds only.** No query answers anything differently; what is lost
 is stack headroom in a debug build (release builds were not measured):
 
-15. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
+16. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
     it keeps the unparser's opt-level-0 frame from growing with #233 and #234, which
     without it push the fork's `roundtrip_statement` past the 2 MiB default test
     thread (it needs 2,112 KiB without the refactor, 1,984 KiB with it). This repo's

@@ -337,7 +337,7 @@ async fn postgres_keeps_calls_with_unrendered_clauses_local() -> Result<(), anyh
             }
 
             rt.shutdown().await;
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await

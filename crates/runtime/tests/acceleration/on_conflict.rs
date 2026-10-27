@@ -305,7 +305,7 @@ WHERE event_name = 'File Download'
             assert_batches_eq!(upsert_expected_result, &sqlite_file_upsert_data);
             assert_batches_eq!(drop_expected_result, &sqlite_file_drop_data);
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             std::fs::remove_file(&duckdb_file_path).expect("File should be removed");
             std::fs::remove_file(&sqlite_upsert_file_path).expect("File should be removed");
             std::fs::remove_file(&sqlite_drop_file_path).expect("File should be removed");

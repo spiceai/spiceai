@@ -15,14 +15,18 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 pub mod guardrail;
+mod reasoning;
 pub(super) mod util;
 
 use crate::bedrock::BedrockClient;
+use crate::bedrock::api_error;
 use crate::bedrock::chat::guardrail::GuardRail;
+use crate::bedrock::chat::reasoning::{ReasoningControl, ReasoningRequest};
 use crate::bedrock::chat::util::{
-    chat_choice_stream, convert_usage, extract_from_content_block, into_fallible_stream,
-    to_api_error, tool_config, try_convert_finish_reason, try_convert_role, value_to_document,
+    ResponseParts, chat_choice_stream, convert_usage, into_fallible_stream, to_api_error,
+    tool_config, try_convert_finish_reason, try_convert_role, value_to_document,
 };
+use crate::bedrock::model_id::ModelId;
 use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
 use crate::streaming_utils::{create_stream_response, generate_stream_id};
@@ -75,7 +79,7 @@ use tokio::sync::RwLock;
 /// [`BedrockConverse`] provides an `OpenAI` compatible interface (i.e. `impl Chat` ), for models on AWS bedrock that are compatible with the [Converse API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html).
 pub struct BedrockConverse {
     client: Arc<BedrockClient>,
-    model_id: String,
+    model_id: ModelId,
     guardrail: Option<GuardRail>,
 }
 
@@ -84,7 +88,7 @@ impl BedrockConverse {
     pub fn new(client: Arc<BedrockClient>, model_id: String) -> Self {
         Self {
             client,
-            model_id,
+            model_id: ModelId::from(model_id),
             guardrail: None,
         }
     }
@@ -99,7 +103,7 @@ impl BedrockConverse {
     /// Instead of performing these changes in the underlying conversion (i.e. within Converse
     /// APIs), we do it here for consistency with other model providers.
     fn alter_request(&self, mut req: CreateChatCompletionRequest) -> CreateChatCompletionRequest {
-        req.model.clone_from(&self.model_id);
+        self.model_id.as_str().clone_into(&mut req.model);
         // Bedrock should set Option::None parameters to a schema with no inputs, but doesn't.
         // Must be done explicitly.
         if let Some(ref mut tools) = req.tools {
@@ -408,14 +412,35 @@ impl BedrockConverse {
         }
     }
 
-    #[expect(clippy::cast_possible_wrap, deprecated)]
-    fn inference_cfg(req: &CreateChatCompletionRequest) -> InferenceConfiguration {
+    #[expect(deprecated)]
+    fn max_tokens(req: &CreateChatCompletionRequest) -> Option<u32> {
+        req.max_completion_tokens.or(req.max_tokens)
+    }
+
+    /// The reasoning settings for `req`'s `reasoning_effort`, in the shape this model takes.
+    fn reasoning_request(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> Result<Option<ReasoningRequest>, OpenAIError> {
+        ReasoningControl::for_model(&self.model_id).request(
+            &self.model_id,
+            req.reasoning_effort.as_ref(),
+            Self::max_tokens(req),
+        )
+    }
+
+    /// `reasoning` replaces the request's `max_tokens` when its thinking budget needs room.
+    #[expect(clippy::cast_possible_wrap)]
+    fn inference_cfg(
+        req: &CreateChatCompletionRequest,
+        reasoning: Option<&ReasoningRequest>,
+    ) -> InferenceConfiguration {
+        let max_tokens = match reasoning {
+            Some(r) => r.max_tokens,
+            None => Self::max_tokens(req),
+        };
         InferenceConfiguration::builder()
-            .set_max_tokens(
-                req.max_completion_tokens
-                    .or(req.max_tokens)
-                    .map(|u| u as i32),
-            )
+            .set_max_tokens(max_tokens.map(|u| u as i32))
             .set_stop_sequences(req.stop.as_ref().map(|stop| match stop {
                 StopConfiguration::String(s) => vec![s.clone()],
                 StopConfiguration::StringArray(arr) => arr.clone(),
@@ -430,7 +455,8 @@ impl BedrockConverse {
         client: &Arc<BedrockClient>,
         req: CreateChatCompletionRequest,
     ) -> Result<ConverseStreamFluentBuilder, OpenAIError> {
-        let inf_cfg = Self::inference_cfg(&req);
+        let reasoning = self.reasoning_request(&req)?;
+        let inf_cfg = Self::inference_cfg(&req, reasoning.as_ref());
         let CreateChatCompletionRequest {
             messages,
             metadata,
@@ -471,13 +497,16 @@ impl BedrockConverse {
         let mut bldr = client
             .client
             .converse_stream()
-            .model_id(self.model_id.clone())
+            .model_id(self.model_id.as_str())
             .set_messages(Some(messages))
             .inference_config(inf_cfg)
             .set_system(Some(system))
             .set_guardrail_config(guardrails)
             .set_output_config(Self::output_config(response_format)?)
-            .set_tool_config(tool_config(tools, tool_choice));
+            .set_tool_config(tool_config(tools, tool_choice))
+            .set_additional_model_request_fields(
+                reasoning.map(|r| r.additional_model_request_fields),
+            );
 
         if let Some(metadata) = metadata {
             // Metadata is a newtype around serde_json::Value - convert and extract object
@@ -496,7 +525,8 @@ impl BedrockConverse {
         client: &Arc<BedrockClient>,
         req: CreateChatCompletionRequest,
     ) -> Result<ConverseFluentBuilder, OpenAIError> {
-        let inf_cfg = Self::inference_cfg(&req);
+        let reasoning = self.reasoning_request(&req)?;
+        let inf_cfg = Self::inference_cfg(&req, reasoning.as_ref());
         let CreateChatCompletionRequest {
             messages,
             metadata,
@@ -537,13 +567,16 @@ impl BedrockConverse {
         let mut bldr = client
             .client
             .converse()
-            .model_id(self.model_id.clone())
+            .model_id(self.model_id.as_str())
             .set_messages(Some(messages))
             .inference_config(inf_cfg)
             .set_system(Some(system))
             .set_guardrail_config(guardrails)
             .set_output_config(Self::output_config(response_format)?)
-            .set_tool_config(tool_config(tools, tool_choice));
+            .set_tool_config(tool_config(tools, tool_choice))
+            .set_additional_model_request_fields(
+                reasoning.map(|r| r.additional_model_request_fields),
+            );
 
         if let Some(metadata) = metadata {
             // Metadata is a newtype around serde_json::Value - convert and extract object
@@ -567,28 +600,28 @@ impl BedrockConverse {
         let Some(choices) = output
             .output
             .map(|o| {
-                let Message { role, content, .. } =
-                    o.as_message().map_err(|e| to_api_error(format!("{e:?}")))?;
+                let Message {
+                    role,
+                    content: blocks,
+                    ..
+                } = o.as_message().map_err(|e| to_api_error(format!("{e:?}")))?;
 
-                let (texts, tool_calls): (Vec<_>, Vec<_>) = content
-                    .iter()
-                    .map(extract_from_content_block)
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .unzip();
+                let ResponseParts {
+                    content,
+                    reasoning,
+                    tool_calls,
+                } = ResponseParts::try_from_blocks(blocks)?;
 
-                // Convert tool_calls from Vec<ChatCompletionMessageToolCall> to Vec<ChatCompletionMessageToolCalls>
                 let tool_calls_enum: Vec<ChatCompletionMessageToolCalls> = tool_calls
                     .into_iter()
-                    .flatten()
                     .map(ChatCompletionMessageToolCalls::Function)
                     .collect();
 
                 Ok::<_, OpenAIError>(ChatChoice {
                     index: 0,
                     message: ChatCompletionResponseMessage {
-                        reasoning_content: None,
-                        content: Some(texts.into_iter().flatten().join("\n")),
+                        reasoning_content: (!reasoning.is_empty()).then(|| reasoning.join("\n")),
+                        content: Some(content.join("\n")),
                         // Converse has no refusal: a guardrail or content filter that stops the
                         // reply is reported through `finish_reason`.
                         refusal: None,
@@ -615,13 +648,13 @@ impl BedrockConverse {
 
         Ok(CreateChatCompletionResponse {
             usage,
-            id: generate_stream_id(&self.model_id),
+            id: generate_stream_id(self.model_id.as_str()),
             choices: vec![choices],
             created: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
                 .as_secs() as u32,
-            model: self.model_id.clone(),
+            model: self.model_id.to_string(),
             service_tier: None,
             system_fingerprint: None,
             object: "chat.completion".to_string(),
@@ -632,16 +665,6 @@ impl BedrockConverse {
         model: &str,
         input_stream: EventReceiver<ConverseStreamOutputPacket, ConverseStreamOutputError>,
     ) -> ChatCompletionResponseStream {
-        // Individual packets in the stream may need information from previous packets to be converted correctly to a  [`CreateChatCompletionStreamResponse`]. This struct track all the necessary information.
-        #[derive(Default)]
-        struct StreamState {
-            id: String,
-            model: String,
-            role: Option<Role>,
-            content_block_index_to_tool_details: HashMap<i32, ToolUseBlockStart>,
-            content_block_index_to_delta_idx: HashMap<i32, u32>,
-        }
-
         let state = Arc::new(RwLock::new(StreamState {
             id: generate_stream_id(model),
             model: model.to_string(),
@@ -658,19 +681,19 @@ impl BedrockConverse {
                     Err(SdkError::ServiceError(e)) => {
                         match e.into_err() {
                             ConverseStreamOutputError::InternalServerException(e) => {
-                                Some(Err(to_api_error(format!("Bedrock internal server error: {e}"))))
+                                Some(Err(api_error::with_code(format!("Bedrock internal server error: {e}"), Some("InternalServerException"))))
                             }
                             ConverseStreamOutputError::ThrottlingException(e) => {
-                                Some(Err(to_api_error(format!("Bedrock rate limit exceeded: {e}"))))
+                                Some(Err(api_error::with_code(format!("Bedrock rate limit exceeded: {e}"), Some("ThrottlingException"))))
                             }
                             ConverseStreamOutputError::ValidationException(e) => {
-                                Some(Err(to_api_error(format!("Bedrock validation error: {e}"))))
+                                Some(Err(api_error::with_code(format!("Bedrock validation error: {e}"), Some("ValidationException"))))
                             }
                             ConverseStreamOutputError::ModelStreamErrorException(e) => {
-                                Some(Err(to_api_error(format!("Bedrock model stream error: {e}"))))
+                                Some(Err(api_error::with_code(format!("Bedrock model stream error: {e}"), Some("ModelStreamErrorException"))))
                             }
                             ee => {
-                                Some(Err(to_api_error(format!("Bedrock error: {ee}"))))
+                                Some(Err(api_error::with_code(format!("Bedrock error: {ee}"), aws_sdk_bedrockruntime::error::ProvideErrorMetadata::code(&ee))))
                             }
                         }
                     }
@@ -689,141 +712,141 @@ impl BedrockConverse {
                         Some(Err(to_api_error(msg)))
                     }
                     Ok(None) => None, // Natural end-of-stream.
-                    Ok(Some(pkt)) => {
-                        let value: Option<Result<CreateChatCompletionStreamResponse, OpenAIError>> =
-                            match pkt {
-                                ConverseStreamOutputPacket::MessageStart(MessageStartEvent {
-                                    role,
-                                    ..
-                                }) => match try_convert_role(&role) {
-                                    Ok(r) => {
-                                        state_.role = Some(r);
-                                        None
-                                    }
-                                    Err(e) => Some(Err(e)),
-                                },
-                                ConverseStreamOutputPacket::ContentBlockStart(
-                                    ContentBlockStartEvent {
-                                        start: Some(ContentBlockStartInner::ToolUse(tool_use)),
-                                        content_block_index,
-                                        ..
-                                    },
-                                ) => {
-                                    state_
-                                        .content_block_index_to_delta_idx
-                                        .insert(content_block_index, 0);
-                                    state_
-                                        .content_block_index_to_tool_details
-                                        .insert(content_block_index, tool_use);
-                                    None
-                                }
-                                ConverseStreamOutputPacket::ContentBlockDelta(
-                                    ContentBlockDeltaEvent {
-                                        delta: Some(ContentBlockDeltaType::Text(text)),
-                                        ..
-                                    },
-                                ) => Some(create_stream_response(
-                                    state_.id.as_str(),
-                                    &state_.model,
-                                    vec![chat_choice_stream(
-                                        Some(text),
-                                        None,
-                                        state_.role,
-                                        None,
-                                        None,
-                                    )],
-                                    None,
-                                )),
-                                ConverseStreamOutputPacket::ContentBlockDelta(
-                                    ContentBlockDeltaEvent {
-                                        delta:
-                                            Some(ContentBlockDeltaType::ToolUse(ToolUseBlockDelta {
-                                                input,
-                                                ..
-                                            })),
-                                        content_block_index,
-                                        ..
-                                    },
-                                ) => {
-                                    let tool_delta_idx = *state_
-                                        .content_block_index_to_delta_idx
-                                        .get(&content_block_index)
-                                        .unwrap_or(&0);
-
-                                    if let Some(ToolUseBlockStart {
-                                        tool_use_id, name, ..
-                                    }) = state_
-                                        .content_block_index_to_tool_details
-                                        .get(&content_block_index)
-                                    {
-                                        let z = create_stream_response(
-                                            state_.id.as_str(),
-                                            &state_.model,
-                                            vec![chat_choice_stream(
-                                                None,
-                                                Some(vec![ChatCompletionMessageToolCallChunk {
-                                                    index: tool_delta_idx,
-                                                    id: Some(tool_use_id.clone()),
-                                                    r#type: Some(FunctionType::Function),
-                                                    function: Some(FunctionCallStream {
-                                                        name: Some(name.clone()),
-                                                        arguments: Some(input),
-                                                    }),
-                                                }]),
-                                                state_.role,
-                                                None,
-                                                None,
-                                            )],
-                                            None,
-                                        );
-                                        state_
-                                            .content_block_index_to_delta_idx
-                                            .insert(content_block_index, tool_delta_idx + 1);
-                                        Some(z)
-                                    } else {
-                                        Some(Err(to_api_error("Invalid stream from Bedrock Converse API. Tool use delta received before starting packet".to_string())))
-                                    }
-                                }
-                                ConverseStreamOutputPacket::MessageStop(MessageStopEvent {
-                                    stop_reason,
-                                    ..
-                                }) => match try_convert_finish_reason(&stop_reason) {
-                                    Ok(finish_reason) => Some(create_stream_response(
-                                        state_.id.as_str(),
-                                        &state_.model,
-                                        vec![chat_choice_stream(
-                                            None,
-                                            None,
-                                            state_.role,
-                                            None,
-                                            Some(finish_reason),
-                                        )],
-                                        None,
-                                    )),
-                                    Err(e) => Some(Err(e)),
-                                },
-                                ConverseStreamOutputPacket::Metadata(
-                                    ConverseStreamMetadataEvent {
-                                        usage: Some(usage), ..
-                                    },
-                                ) => Some(create_stream_response(
-                                    state_.id.as_str(),
-                                    &state_.model,
-                                    vec![],
-                                    Some(convert_usage(&usage)),
-                                )),
-                                ConverseStreamOutputPacket::ContentBlockStop(_) => None,
-                                unknown => Some(Err(to_api_error(format!(
-                                    "Unknown event from Bedrock stream: {unknown:?}"
-                                )))),
-                            };
-                        // Need to drop [`RwLockWriteGuard`] before returning `state.
-                        value
-                    }
+                    Ok(Some(pkt)) => state_.convert_packet(pkt),
                 };
                zz
             }
         }))
+    }
+}
+
+/// Individual packets in the stream may need information from previous packets to be converted correctly to a [`CreateChatCompletionStreamResponse`]. This struct tracks all the necessary information.
+#[derive(Default)]
+struct StreamState {
+    id: String,
+    model: String,
+    role: Option<Role>,
+    content_block_index_to_tool_details: HashMap<i32, ToolUseBlockStart>,
+    content_block_index_to_delta_idx: HashMap<i32, u32>,
+}
+
+impl StreamState {
+    /// Converts one Converse stream packet into an `OpenAI` chunk, or `None` when the packet yields no chunk.
+    fn convert_packet(
+        &mut self,
+        pkt: ConverseStreamOutputPacket,
+    ) -> Option<Result<CreateChatCompletionStreamResponse, OpenAIError>> {
+        match pkt {
+            ConverseStreamOutputPacket::MessageStart(MessageStartEvent { role, .. }) => {
+                match try_convert_role(&role) {
+                    Ok(r) => {
+                        self.role = Some(r);
+                        None
+                    }
+                    Err(e) => Some(Err(e)),
+                }
+            }
+            ConverseStreamOutputPacket::ContentBlockStart(ContentBlockStartEvent {
+                start: Some(ContentBlockStartInner::ToolUse(tool_use)),
+                content_block_index,
+                ..
+            }) => {
+                self.content_block_index_to_delta_idx
+                    .insert(content_block_index, 0);
+                self.content_block_index_to_tool_details
+                    .insert(content_block_index, tool_use);
+                None
+            }
+            ConverseStreamOutputPacket::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: Some(ContentBlockDeltaType::Text(text)),
+                ..
+            }) => Some(create_stream_response(
+                self.id.as_str(),
+                &self.model,
+                vec![chat_choice_stream(Some(text), None, self.role, None, None)],
+                None,
+            )),
+            ConverseStreamOutputPacket::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: Some(ContentBlockDeltaType::ToolUse(ToolUseBlockDelta { input, .. })),
+                content_block_index,
+                ..
+            }) => {
+                let tool_delta_idx = *self
+                    .content_block_index_to_delta_idx
+                    .get(&content_block_index)
+                    .unwrap_or(&0);
+
+                if let Some(ToolUseBlockStart {
+                    tool_use_id, name, ..
+                }) = self
+                    .content_block_index_to_tool_details
+                    .get(&content_block_index)
+                {
+                    let z = create_stream_response(
+                        self.id.as_str(),
+                        &self.model,
+                        vec![chat_choice_stream(
+                            None,
+                            Some(vec![ChatCompletionMessageToolCallChunk {
+                                index: tool_delta_idx,
+                                id: Some(tool_use_id.clone()),
+                                r#type: Some(FunctionType::Function),
+                                function: Some(FunctionCallStream {
+                                    name: Some(name.clone()),
+                                    arguments: Some(input),
+                                }),
+                            }]),
+                            self.role,
+                            None,
+                            None,
+                        )],
+                        None,
+                    );
+                    self.content_block_index_to_delta_idx
+                        .insert(content_block_index, tool_delta_idx + 1);
+                    Some(z)
+                } else {
+                    Some(Err(to_api_error("Invalid stream from Bedrock Converse API. Tool use delta received before starting packet".to_string())))
+                }
+            }
+            ConverseStreamOutputPacket::MessageStop(MessageStopEvent { stop_reason, .. }) => {
+                match try_convert_finish_reason(&stop_reason) {
+                    Ok(finish_reason) => Some(create_stream_response(
+                        self.id.as_str(),
+                        &self.model,
+                        vec![chat_choice_stream(
+                            None,
+                            None,
+                            self.role,
+                            None,
+                            Some(finish_reason),
+                        )],
+                        None,
+                    )),
+                    Err(e) => Some(Err(e)),
+                }
+            }
+            ConverseStreamOutputPacket::Metadata(ConverseStreamMetadataEvent {
+                usage: Some(usage),
+                ..
+            }) => Some(create_stream_response(
+                self.id.as_str(),
+                &self.model,
+                vec![],
+                Some(convert_usage(&usage)),
+            )),
+            // An `OpenAI` stream delta has no reasoning field, so reasoning text, signatures and
+            // redacted reasoning yield no chunk. The Anthropic provider drops thinking deltas the
+            // same way.
+            ConverseStreamOutputPacket::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: Some(ContentBlockDeltaType::ReasoningContent(_)),
+                ..
+            })
+            | ConverseStreamOutputPacket::ContentBlockStop(_) => None,
+            unknown => Some(Err(to_api_error(format!(
+                "Unknown event from Bedrock stream: {unknown:?}"
+            )))),
+        }
     }
 }
 
@@ -838,7 +861,7 @@ impl Chat for BedrockConverse {
             .client
             .do_converse_stream(input)
             .await
-            .map_err(|e| to_api_error(e.to_string()))?;
+            .map_err(|e| api_error::from_client_error(e.as_ref()))?;
         Ok(Self::process_stream(self.model_id.as_str(), output.stream))
     }
 
@@ -851,7 +874,7 @@ impl Chat for BedrockConverse {
             .client
             .do_converse(input)
             .await
-            .map_err(|e| to_api_error(e.to_string()))?;
+            .map_err(|e| api_error::from_client_error(e.as_ref()))?;
         self.convert_converse_output(output)
     }
 
@@ -864,6 +887,8 @@ impl Chat for BedrockConverse {
 mod tests {
     use super::*;
     use async_openai::types::chat::ChatCompletionRequestUserMessageArgs;
+    use aws_config::{BehaviorVersion, Region, SdkConfig};
+    use aws_sdk_bedrockruntime::types::{ReasoningContentBlock, ReasoningTextBlock};
 
     #[test]
     fn prompt_cache_point_is_added_to_last_message() {
@@ -890,6 +915,109 @@ mod tests {
         ));
     }
 
+    fn converse_reply(blocks: Vec<ContentBlock>) -> ConverseOutput {
+        let message = Message::builder()
+            .role(ConversationRole::Assistant)
+            .set_content(Some(blocks))
+            .build()
+            .expect("message should build");
+        ConverseOutput::builder()
+            .output(aws_sdk_bedrockruntime::types::ConverseOutput::Message(
+                message,
+            ))
+            .stop_reason(aws_sdk_bedrockruntime::types::StopReason::EndTurn)
+            .build()
+            .expect("converse output should build")
+    }
+
+    fn reasoning_block(text: &str) -> ContentBlock {
+        ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(
+            ReasoningTextBlock::builder()
+                .text(text)
+                .build()
+                .expect("reasoning text should build"),
+        ))
+    }
+
+    /// A converse model with a client that is never sent a request.
+    fn converse(model_id: &str) -> BedrockConverse {
+        let config = SdkConfig::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::from_static("us-east-1"))
+            .build();
+        BedrockConverse::new(Arc::new(BedrockClient::from(&config)), model_id.to_string())
+    }
+
+    fn converted_message(blocks: Vec<ContentBlock>) -> ChatCompletionResponseMessage {
+        converse("test-model")
+            .convert_converse_output(converse_reply(blocks))
+            .expect("converse output should convert")
+            .choices
+            .into_iter()
+            .next()
+            .expect("one choice")
+            .message
+    }
+
+    // Regression test for #15406: reasoning text must not go into `content`.
+    #[test]
+    fn reasoning_text_goes_to_reasoning_content_not_content() {
+        let message = converted_message(vec![
+            ContentBlock::Text("\n\n4".to_string()),
+            reasoning_block("Okay, the user asks for 2+2."),
+        ]);
+
+        assert_eq!(message.content.as_deref(), Some("\n\n4"));
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some("Okay, the user asks for 2+2.")
+        );
+    }
+
+    // Regression test for #15406: a reasoning draft of a JSON answer must not reach the answer
+    // text, or `ai_*` decisions see two JSON objects.
+    #[test]
+    fn json_answer_is_the_only_content_when_reasoning_holds_a_draft() {
+        let answer = r#"{"answers":{"q000":1.0}}"#;
+        let message = converted_message(vec![
+            ContentBlock::Text(answer.to_string()),
+            reasoning_block(r#"A first draft is {"answers":{"q000":0.5}}. Let me check."#),
+        ]);
+
+        let content = message.content.expect("content should be set");
+        assert_eq!(content, answer);
+        serde_json::from_str::<Value>(&content).expect("content should be exactly one JSON value");
+        assert!(
+            message
+                .reasoning_content
+                .is_some_and(|reasoning| reasoning.contains("first draft"))
+        );
+    }
+
+    #[test]
+    fn redacted_reasoning_is_dropped_without_error() {
+        let message = converted_message(vec![
+            ContentBlock::ReasoningContent(ReasoningContentBlock::RedactedContent(
+                aws_smithy_types::Blob::new(b"encrypted".to_vec()),
+            )),
+            ContentBlock::Text("answer".to_string()),
+        ]);
+
+        assert_eq!(message.content.as_deref(), Some("answer"));
+        assert_eq!(message.reasoning_content, None);
+    }
+
+    #[test]
+    fn reply_without_reasoning_has_no_reasoning_content() {
+        let message = converted_message(vec![
+            ContentBlock::Text("first".to_string()),
+            ContentBlock::Text("second".to_string()),
+        ]);
+
+        assert_eq!(message.content.as_deref(), Some("first\nsecond"));
+        assert_eq!(message.reasoning_content, None);
+    }
+
     #[test]
     fn prompt_cache_point_is_added_to_system_when_messages_are_empty() {
         let mut system = vec![];
@@ -903,5 +1031,107 @@ mod tests {
             Some(SystemContentBlock::CachePoint(cache_point))
                 if cache_point.r#type == CachePointType::Default
         ));
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use async_openai::types::chat::{ChatChoiceStream, FinishReason};
+    use aws_sdk_bedrockruntime::types::{
+        ContentBlockStopEvent, ReasoningContentBlockDelta, StopReason,
+    };
+    use aws_smithy_types::Blob;
+
+    fn delta_packet(index: i32, delta: ContentBlockDeltaType) -> ConverseStreamOutputPacket {
+        ConverseStreamOutputPacket::ContentBlockDelta(
+            ContentBlockDeltaEvent::builder()
+                .content_block_index(index)
+                .delta(delta)
+                .build()
+                .expect("delta event should build"),
+        )
+    }
+
+    fn reasoning_packet(
+        index: i32,
+        delta: ReasoningContentBlockDelta,
+    ) -> ConverseStreamOutputPacket {
+        delta_packet(index, ContentBlockDeltaType::ReasoningContent(delta))
+    }
+
+    fn stop_block_packet(index: i32) -> ConverseStreamOutputPacket {
+        ConverseStreamOutputPacket::ContentBlockStop(
+            ContentBlockStopEvent::builder()
+                .content_block_index(index)
+                .build()
+                .expect("block stop event should build"),
+        )
+    }
+
+    #[test]
+    fn reasoning_deltas_yield_no_chunk() {
+        let mut state = StreamState::default();
+        for delta in [
+            ReasoningContentBlockDelta::Text("The user asks for a sum.".to_string()),
+            ReasoningContentBlockDelta::Signature("c2lnbmF0dXJl".to_string()),
+            ReasoningContentBlockDelta::RedactedContent(Blob::new(b"opaque".to_vec())),
+        ] {
+            let packet = reasoning_packet(0, delta);
+            let debug = format!("{packet:?}");
+            let out = state.convert_packet(packet);
+            assert!(out.is_none(), "{debug} must yield no chunk: {out:?}");
+        }
+    }
+
+    /// Regression test for #15410: a reasoning delta stopped the stream with an error.
+    #[test]
+    fn reasoning_stream_yields_only_answer_text_and_finish_reason() {
+        let packets = vec![
+            ConverseStreamOutputPacket::MessageStart(
+                MessageStartEvent::builder()
+                    .role(ConversationRole::Assistant)
+                    .build()
+                    .expect("message start event should build"),
+            ),
+            reasoning_packet(0, ReasoningContentBlockDelta::Text("2+2 is 4.".to_string())),
+            reasoning_packet(
+                0,
+                ReasoningContentBlockDelta::Signature("c2lnbmF0dXJl".to_string()),
+            ),
+            stop_block_packet(0),
+            delta_packet(1, ContentBlockDeltaType::Text("4".to_string())),
+            stop_block_packet(1),
+            ConverseStreamOutputPacket::MessageStop(
+                MessageStopEvent::builder()
+                    .stop_reason(StopReason::EndTurn)
+                    .build()
+                    .expect("message stop event should build"),
+            ),
+        ];
+
+        let mut state = StreamState::default();
+        let chunks: Vec<CreateChatCompletionStreamResponse> = packets
+            .into_iter()
+            .filter_map(|packet| state.convert_packet(packet))
+            .collect::<Result<_, _>>()
+            .expect("a reasoning stream should convert without errors");
+
+        let choices: Vec<&ChatChoiceStream> =
+            chunks.iter().flat_map(|chunk| &chunk.choices).collect();
+        let content: String = choices
+            .iter()
+            .filter_map(|choice| choice.delta.content.as_deref())
+            .collect();
+        assert_eq!(content, "4");
+        assert!(
+            choices
+                .iter()
+                .all(|choice| choice.delta.role == Some(Role::Assistant))
+        );
+        assert_eq!(
+            choices.last().and_then(|choice| choice.finish_reason),
+            Some(FinishReason::Stop)
+        );
     }
 }

@@ -130,7 +130,7 @@ async fn test_postgres_avg_rounds_to_declared_scale_instead_of_erroring()
                 "AVG(qty) rounded to the declared scale should match Postgres's own ROUND()"
             );
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
 
             Ok(())
         })
