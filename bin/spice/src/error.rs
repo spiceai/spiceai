@@ -302,6 +302,94 @@ pub enum Error {
     /// Atomic Cloud Connect project creation/attachment failed.
     #[snafu(display("{message}"))]
     CloudConnectProject { message: String },
+
+    #[snafu(display(
+        "Failed to start {agent}: it is not installed (no `{binary}` on PATH). Install it with `{install}`, then rerun `spice {command}`. See: {docs}"
+    ))]
+    CodingAgentNotInstalled {
+        agent: &'static str,
+        binary: String,
+        install: &'static str,
+        command: &'static str,
+        docs: &'static str,
+    },
+
+    #[snafu(display("Failed to start {agent} with the Spice runtime: {explanation}"))]
+    CodingAgentUnsupportedBuild {
+        agent: &'static str,
+        explanation: &'static str,
+    },
+
+    #[snafu(display(
+        "`spice {command}` runs a coding agent against a Spice runtime on this machine, and --cloud is not supported. Remove --cloud to use the runtime at --http-endpoint, or the one started for the Spicepod in this directory."
+    ))]
+    CodingAgentCloudUnsupported { command: &'static str },
+
+    #[snafu(display("Failed to start {agent} ('{}'): {source}", program.display()))]
+    CodingAgentLaunch {
+        agent: String,
+        program: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to prepare {agent}: `{command}` exited with {status}: {detail}."))]
+    CodingAgentPrepare {
+        agent: String,
+        command: String,
+        status: String,
+        detail: String,
+    },
+
+    #[snafu(display("Failed to write '{}' for the coding agent: {source}", path.display()))]
+    CodingAgentFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
+        "Failed to start the Spice runtime at {endpoint}, so the coding agent was not started: {detail}\nThe full log is at '{}'. See: https://spiceai.org/docs/cli",
+        log.display()
+    ))]
+    CodingAgentRuntimeStart {
+        endpoint: String,
+        log: PathBuf,
+        detail: String,
+    },
+
+    #[snafu(display(
+        "Failed to coordinate the Spice runtime with other `spice` sessions through '{}': {source}",
+        path.display()
+    ))]
+    CodingAgentRuntimeLock {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to record the Spice runtime in '{}': {source}", path.display()))]
+    CodingAgentRuntimeState {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
+        "Failed to start the coding agent: the Spice runtime has no model '{model}'. Available models: {available}. Pass one of them with --model, or add the model to spicepod.yaml. See: https://spiceai.org/docs/components/models"
+    ))]
+    CodingAgentModelNotFound { model: String, available: String },
+
+    #[snafu(display(
+        "Failed to load model '{model}', so the coding agent has no model to use. Cause: {message}. Check the model's configuration in spicepod.yaml and the runtime log. See: https://spiceai.org/docs/components/models"
+    ))]
+    CodingAgentModelFailed { model: String, message: String },
+
+    #[snafu(display(
+        "The Spice runtime serves no models, so the coding agent has nothing to use. Add one to spicepod.yaml, for example `spice model add llm --from openai:gpt-4o-mini`, and rerun. See: https://spiceai.org/docs/components/models"
+    ))]
+    CodingAgentNoModels,
+
+    #[snafu(display(
+        "Failed to start the coding agent: the Spice runtime did not finish loading {models} within {minutes} minutes. Check the runtime log, then rerun."
+    ))]
+    CodingAgentModelTimeout { models: String, minutes: u64 },
 }
 
 impl Error {
@@ -390,7 +478,9 @@ impl Error {
             // behavior on the generic failure code because that variant is
             // also used for operational validation failures throughout the
             // existing command surface.
-            Self::InvalidUsage { .. } | Self::ServiceNotInstalled { .. } => Self::USAGE_EXIT_CODE,
+            Self::InvalidUsage { .. }
+            | Self::ServiceNotInstalled { .. }
+            | Self::CodingAgentCloudUnsupported { .. } => Self::USAGE_EXIT_CODE,
             Self::Interrupted => Self::INTERRUPTED_EXIT_CODE,
             _ => Self::FAILURE_EXIT_CODE,
         }

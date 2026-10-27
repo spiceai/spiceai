@@ -1,0 +1,624 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! The runtime a coding agent talks to, and who stops it.
+//!
+//! A coding agent needs a runtime for as long as it runs, and a user may run
+//! several agents at once against the same endpoint. So a runtime that some
+//! `spice <agent>` session started belongs to all of the sessions using it,
+//! and the last of them to exit stops it. A runtime nobody here started — one
+//! the user runs with `spice run` — is only ever used, never stopped.
+//!
+//! The bookkeeping is two advisory file locks per endpoint under
+//! `~/.spice/run/`:
+//!
+//! - `<endpoint>.sessions.lock`: every session holds it shared while its agent
+//!   runs, so a session that can take it exclusively knows it is the last one.
+//! - `<endpoint>.start.lock`: held exclusively while a session decides whether
+//!   to start a runtime and while an exiting session decides whether it is the
+//!   last one, so a session joining and a session leaving cannot both conclude
+//!   they are alone.
+//!
+//! The operating system releases both when a process dies, however it dies,
+//! so a crashed session never blocks the next one. `<endpoint>.json` records
+//! the runtime a session started (its PID and executable), which is what
+//! separates a runtime to stop from one to leave alone; `<endpoint>.log` is
+//! that runtime's output, since the agent owns the terminal.
+
+use std::fs::File;
+use std::io::{Read as _, Seek as _, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use snafu::ResultExt;
+
+use crate::context::RuntimeContext;
+use crate::error::{
+    CodingAgentRuntimeLockSnafu, CodingAgentRuntimeStartSnafu, CodingAgentRuntimeStateSnafu, Result,
+};
+
+/// How long a started runtime has to start answering `/health`. It normally
+/// does within a second; the bound only exists so a runtime that never binds
+/// its port is reported rather than waited on forever.
+const HEALTH_BUDGET: Duration = Duration::from_secs(120);
+
+/// How long a runtime is given to shut down cleanly before it is killed.
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
+
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How much of the runtime's log an error quotes.
+const LOG_TAIL_BYTES: u64 = 4096;
+
+/// A runtime some session started, as recorded for the sessions that follow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StartedRuntime {
+    pub pid: u32,
+    pub executable: PathBuf,
+}
+
+/// The files that coordinate the sessions using one endpoint.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionFiles {
+    pub sessions_lock: PathBuf,
+    pub start_lock: PathBuf,
+    pub state: PathBuf,
+    pub log: PathBuf,
+}
+
+impl SessionFiles {
+    /// The files for `endpoint`, under `run_dir`.
+    #[must_use]
+    pub fn for_endpoint(run_dir: &Path, endpoint: &str) -> Self {
+        let key = endpoint_key(endpoint);
+        Self {
+            sessions_lock: run_dir.join(format!("{key}.sessions.lock")),
+            start_lock: run_dir.join(format!("{key}.start.lock")),
+            state: run_dir.join(format!("{key}.json")),
+            log: run_dir.join(format!("{key}.log")),
+        }
+    }
+}
+
+/// A file name for an endpoint: its host and port, with anything a file name
+/// should not carry replaced.
+fn endpoint_key(endpoint: &str) -> String {
+    let address = endpoint
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    address
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Where the runtime an agent uses came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// This session started it.
+    Started,
+    /// It was already serving: started by another `spice <agent>` session, or
+    /// by the user.
+    AlreadyRunning,
+}
+
+/// This session's claim on the runtime at one endpoint. Releasing it stops the
+/// runtime when this is the last session using a runtime a session started.
+#[derive(Debug)]
+pub(crate) struct RuntimeLease {
+    files: SessionFiles,
+    sessions: File,
+    origin: Origin,
+}
+
+impl RuntimeLease {
+    /// Join the sessions using the runtime at the context's endpoint, starting
+    /// the runtime for the Spicepod in the current directory if none is serving.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the coordination files cannot be used, or when a
+    /// runtime has to be started and fails to start serving.
+    pub async fn acquire(ctx: &RuntimeContext) -> Result<Self> {
+        let run_dir = ctx.spice_runtime_dir().join("run");
+        std::fs::create_dir_all(&run_dir).context(CodingAgentRuntimeLockSnafu {
+            path: run_dir.clone(),
+        })?;
+        let files = SessionFiles::for_endpoint(&run_dir, ctx.http_endpoint());
+
+        let start = open_lock(&files.start_lock)?;
+        lock_exclusive_reporting_wait(&start, &files.start_lock, ctx.http_endpoint()).await?;
+
+        let sessions = open_lock(&files.sessions_lock)?;
+        lock_shared(&sessions, &files.sessions_lock).await?;
+
+        let origin = match prepare_runtime(ctx, &files).await {
+            Ok(origin) => origin,
+            Err(error) => {
+                // Unlocks happen on drop; nothing was started that outlives us.
+                return Err(error);
+            }
+        };
+        drop(start);
+
+        Ok(Self {
+            files,
+            sessions,
+            origin,
+        })
+    }
+
+    #[must_use]
+    pub fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    /// Leave the sessions using this runtime, stopping it when this was the
+    /// last one and a session started it.
+    ///
+    /// Returns whether the runtime was stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the coordination files cannot be used.
+    pub async fn release(self) -> Result<bool> {
+        let Self {
+            files,
+            sessions,
+            origin: _,
+        } = self;
+        // Taking the start lock first serializes this check against a session
+        // that is joining, which holds it until its shared lease is taken.
+        let start = open_lock(&files.start_lock)?;
+        lock_exclusive(&start, &files.start_lock).await?;
+        drop(sessions);
+
+        let sessions = open_lock(&files.sessions_lock)?;
+        let last = match sessions.try_lock() {
+            Ok(()) => true,
+            Err(std::fs::TryLockError::WouldBlock) => false,
+            Err(std::fs::TryLockError::Error(source)) => {
+                return Err(source).context(CodingAgentRuntimeLockSnafu {
+                    path: files.sessions_lock.clone(),
+                });
+            }
+        };
+        if !last {
+            return Ok(false);
+        }
+
+        let Some(started) = read_state(&files.state)? else {
+            return Ok(false);
+        };
+        let stopped = if process::is_runtime(&started) {
+            process::stop(started.pid, SHUTDOWN_BUDGET).await;
+            true
+        } else {
+            false
+        };
+        remove_state(&files.state)?;
+        drop(sessions);
+        drop(start);
+        Ok(stopped)
+    }
+}
+
+/// Use the runtime already serving at the context's endpoint, or start one.
+async fn prepare_runtime(ctx: &RuntimeContext, files: &SessionFiles) -> Result<Origin> {
+    let recorded = read_state(&files.state)?;
+    if is_healthy(ctx).await {
+        if let Some(started) = &recorded
+            && !process::is_runtime(started)
+        {
+            // The session that recorded it crashed, and what answers now is a
+            // runtime nobody here started.
+            remove_state(&files.state)?;
+        }
+        return Ok(Origin::AlreadyRunning);
+    }
+
+    if let Some(started) = recorded {
+        // Recorded by a session that no longer exists — no session holds a
+        // lease, or this one could not have joined alone to find it unhealthy —
+        // so a live process is a runtime nobody is waiting on any more.
+        if process::is_runtime(&started) {
+            process::stop(started.pid, SHUTDOWN_BUDGET).await;
+        }
+        remove_state(&files.state)?;
+    }
+
+    start_runtime(ctx, files).await?;
+    Ok(Origin::Started)
+}
+
+async fn start_runtime(ctx: &RuntimeContext, files: &SessionFiles) -> Result<()> {
+    ctx.ensure_local_runtime_supported()?;
+    let resolved = crate::runtime_launcher::resolve_or_install(ctx).await?;
+    let mut command = ctx.get_run_cmd(&resolved, &[], None)?;
+
+    let log = File::create(&files.log).context(CodingAgentRuntimeLockSnafu {
+        path: files.log.clone(),
+    })?;
+    let log_err = log.try_clone().context(CodingAgentRuntimeLockSnafu {
+        path: files.log.clone(),
+    })?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    // Its own process group, so the Ctrl-C an agent's user presses reaches the
+    // agent rather than taking the runtime down under it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+
+    tracing::info!(
+        "Starting the Spice runtime at {} for the Spicepod in '{}' (log: {})",
+        ctx.http_endpoint(),
+        ctx.app_dir().display(),
+        files.log.display()
+    );
+    let mut child = command.spawn().map_err(|source| {
+        CodingAgentRuntimeStartSnafu {
+            endpoint: ctx.http_endpoint().to_string(),
+            log: files.log.clone(),
+            detail: format!("the runtime could not be launched: {source}"),
+        }
+        .build()
+    })?;
+    let started = StartedRuntime {
+        pid: child.id(),
+        executable: resolved.path().to_path_buf(),
+    };
+    write_state(&files.state, &started)?;
+
+    let deadline = Instant::now() + HEALTH_BUDGET;
+    loop {
+        if is_healthy(ctx).await {
+            // The child is deliberately not waited on: it outlives this
+            // session whenever another one is still using it.
+            drop(child);
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            remove_state(&files.state)?;
+            return Err(CodingAgentRuntimeStartSnafu {
+                endpoint: ctx.http_endpoint().to_string(),
+                log: files.log.clone(),
+                detail: format!(
+                    "the runtime exited ({status}) before it started serving. Its last output:\n{}",
+                    log_tail(&files.log)
+                ),
+            }
+            .build());
+        }
+        if Instant::now() >= deadline {
+            process::stop(started.pid, SHUTDOWN_BUDGET).await;
+            remove_state(&files.state)?;
+            return Err(CodingAgentRuntimeStartSnafu {
+                endpoint: ctx.http_endpoint().to_string(),
+                log: files.log.clone(),
+                detail: format!(
+                    "the runtime did not answer `/health` within {}s, so it was stopped. Its last output:\n{}",
+                    HEALTH_BUDGET.as_secs(),
+                    log_tail(&files.log)
+                ),
+            }
+            .build());
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Whether a runtime answers `/health` at the context's endpoint.
+async fn is_healthy(ctx: &RuntimeContext) -> bool {
+    let url = format!("{}/health", ctx.http_endpoint());
+    let request = ctx.http_client().get(&url).timeout(Duration::from_secs(2));
+    matches!(request.send().await, Ok(response) if response.status().is_success())
+}
+
+/// The end of the runtime's log, for an error that has to explain a failed start.
+fn log_tail(path: &Path) -> String {
+    let Ok(mut file) = File::open(path) else {
+        return String::from("(the log could not be read)");
+    };
+    let len = file.metadata().map_or(0, |m| m.len());
+    let _ = file.seek(SeekFrom::Start(len.saturating_sub(LOG_TAIL_BYTES)));
+    let mut bytes = Vec::new();
+    let _ = file.read_to_end(&mut bytes);
+    let text = String::from_utf8_lossy(&bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        String::from("(the runtime wrote nothing)")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn open_lock(path: &Path) -> Result<File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .context(CodingAgentRuntimeLockSnafu {
+            path: path.to_path_buf(),
+        })
+}
+
+/// Take `file` exclusively, saying so when another session is holding it.
+async fn lock_exclusive_reporting_wait(file: &File, path: &Path, endpoint: &str) -> Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            tracing::info!(
+                "Waiting for another `spice` session to finish starting or stopping the Spice runtime at {endpoint}..."
+            );
+            lock_exclusive(file, path).await
+        }
+        Err(std::fs::TryLockError::Error(source)) => {
+            Err(source).context(CodingAgentRuntimeLockSnafu {
+                path: path.to_path_buf(),
+            })
+        }
+    }
+}
+
+async fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
+    let handle = file.try_clone().context(CodingAgentRuntimeLockSnafu {
+        path: path.to_path_buf(),
+    })?;
+    blocking_lock(move || handle.lock(), path).await
+}
+
+async fn lock_shared(file: &File, path: &Path) -> Result<()> {
+    let handle = file.try_clone().context(CodingAgentRuntimeLockSnafu {
+        path: path.to_path_buf(),
+    })?;
+    blocking_lock(move || handle.lock_shared(), path).await
+}
+
+/// Wait for a lock off the async runtime: another session may hold it for as
+/// long as a runtime takes to start.
+async fn blocking_lock<F>(lock: F, path: &Path) -> Result<()>
+where
+    F: FnOnce() -> std::io::Result<()> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(lock).await {
+        Ok(result) => result.context(CodingAgentRuntimeLockSnafu {
+            path: path.to_path_buf(),
+        }),
+        Err(join) => Err(std::io::Error::other(join)).context(CodingAgentRuntimeLockSnafu {
+            path: path.to_path_buf(),
+        }),
+    }
+}
+
+fn read_state(path: &Path) -> Result<Option<StartedRuntime>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(source).context(CodingAgentRuntimeStateSnafu {
+            path: path.to_path_buf(),
+        }),
+    }
+}
+
+fn write_state(path: &Path, started: &StartedRuntime) -> Result<()> {
+    let bytes = serde_json::to_vec(started)
+        .map_err(std::io::Error::other)
+        .context(CodingAgentRuntimeStateSnafu {
+            path: path.to_path_buf(),
+        })?;
+    std::fs::write(path, bytes).context(CodingAgentRuntimeStateSnafu {
+        path: path.to_path_buf(),
+    })
+}
+
+fn remove_state(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(source).context(CodingAgentRuntimeStateSnafu {
+            path: path.to_path_buf(),
+        }),
+    }
+}
+
+/// Identifying and stopping a recorded runtime process.
+mod process {
+    use std::time::{Duration, Instant};
+
+    use super::{POLL_INTERVAL, StartedRuntime};
+
+    /// Whether `started` still names a running runtime: the PID is alive and
+    /// its executable is the one recorded, so a PID the system has since
+    /// reused for something else is never signalled.
+    #[cfg(unix)]
+    pub(super) fn is_runtime(started: &StartedRuntime) -> bool {
+        if !is_alive(started.pid) {
+            return false;
+        }
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &started.pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        let command = String::from_utf8_lossy(&output.stdout);
+        command_names_executable(command.trim(), &started.executable)
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn is_runtime(_started: &StartedRuntime) -> bool {
+        false
+    }
+
+    /// Whether `ps -o comm=` output names `executable`. macOS reports the full
+    /// path; Linux reports the file name, truncated to 15 bytes.
+    pub(super) fn command_names_executable(command: &str, executable: &std::path::Path) -> bool {
+        let reported = command.rsplit('/').next().unwrap_or_default();
+        let Some(name) = executable.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        !reported.is_empty()
+            && (reported == name || (reported.len() >= 15 && name.starts_with(reported)))
+    }
+
+    /// Whether `pid` is still running.
+    ///
+    /// A process that has exited but not been reaped is not running, yet still
+    /// answers a signal check. When this process is its parent — the session
+    /// that started the runtime — it is reaped here; otherwise `ps` reports it
+    /// in state `Z` until its own parent reaps it.
+    #[cfg(unix)]
+    fn is_alive(pid: u32) -> bool {
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+
+        let Ok(raw) = i32::try_from(pid) else {
+            return false;
+        };
+        let target = nix::unistd::Pid::from_raw(raw);
+        match waitpid(target, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => return true,
+            // It exited, and is reaped now.
+            Ok(_) => return false,
+            // Not a child of this process.
+            Err(_) => {}
+        }
+        if nix::sys::signal::kill(target, None).is_err() {
+            return false;
+        }
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return true;
+        };
+        !String::from_utf8_lossy(&output.stdout)
+            .trim_start()
+            .starts_with('Z')
+    }
+
+    /// Ask the runtime to shut down, and kill it if it has not within `budget`.
+    #[cfg(unix)]
+    pub(super) async fn stop(pid: u32, budget: Duration) {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        let Ok(raw) = i32::try_from(pid) else {
+            return;
+        };
+        let target = Pid::from_raw(raw);
+        if kill(target, Signal::SIGTERM).is_err() {
+            return;
+        }
+        let deadline = Instant::now() + budget;
+        while is_alive(pid) {
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    "The Spice runtime (PID {pid}) did not shut down within {}s, so it was killed.",
+                    budget.as_secs()
+                );
+                let _ = kill(target, Signal::SIGKILL);
+                return;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(super) async fn stop(_pid: u32, _budget: Duration) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_endpoint_gets_its_own_files() {
+        let files =
+            SessionFiles::for_endpoint(Path::new("/home/u/.spice/run"), "http://127.0.0.1:8090");
+        assert_eq!(
+            files.sessions_lock,
+            PathBuf::from("/home/u/.spice/run/127.0.0.1_8090.sessions.lock")
+        );
+        assert_eq!(
+            files.start_lock,
+            PathBuf::from("/home/u/.spice/run/127.0.0.1_8090.start.lock")
+        );
+        assert_eq!(
+            files.state,
+            PathBuf::from("/home/u/.spice/run/127.0.0.1_8090.json")
+        );
+        assert_eq!(
+            files.log,
+            PathBuf::from("/home/u/.spice/run/127.0.0.1_8090.log")
+        );
+        assert_eq!(endpoint_key("http://[::1]:9000/"), "___1__9000");
+    }
+
+    #[test]
+    fn a_reused_pid_is_not_taken_for_the_runtime() {
+        let spiced = Path::new("/home/u/.spice/bin/spiced");
+        // macOS reports the whole path, Linux the (possibly truncated) name.
+        assert!(process::command_names_executable(
+            "/home/u/.spice/bin/spiced",
+            spiced
+        ));
+        assert!(process::command_names_executable("spiced", spiced));
+        assert!(process::command_names_executable(
+            "spiced-a5720dc8",
+            Path::new("/opt/spiced-a5720dc85d")
+        ));
+        // A short name is a different program, not a truncation.
+        assert!(!process::command_names_executable("spice", spiced));
+        assert!(!process::command_names_executable(
+            "/usr/bin/python3",
+            spiced
+        ));
+        assert!(!process::command_names_executable("", spiced));
+    }
+
+    #[test]
+    fn recorded_runtimes_round_trip_and_garbage_reads_as_none() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("state.json");
+        assert_eq!(read_state(&path).expect("absent state"), None);
+        let started = StartedRuntime {
+            pid: 42,
+            executable: PathBuf::from("/bin/spiced"),
+        };
+        write_state(&path, &started).expect("write state");
+        assert_eq!(read_state(&path).expect("read state"), Some(started));
+        std::fs::write(&path, b"not json").expect("overwrite state");
+        assert_eq!(read_state(&path).expect("unreadable state"), None);
+        remove_state(&path).expect("remove state");
+        remove_state(&path).expect("removing absent state is not an error");
+    }
+}
