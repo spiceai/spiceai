@@ -1852,6 +1852,40 @@ mod store_reads {
         );
     }
 
+    /// A read without a precondition does not depend on the file's description.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_reads_the_file_when_its_description_fails() {
+        let mock = Mock::start().await;
+        let bytes = Bytes::from_static(b"id,name\n1,one\n");
+        mock.commit("r/no-info", C1, vec![("a.csv", text("id,name\n1,one\n"))]);
+        let (store, _) = registered(&mock, "r/no-info");
+        let location = path("r/no-info", "a.csv");
+        mock.0
+            .lock()
+            .faults
+            .api_truncated
+            .insert("paths-info", u32::MAX);
+
+        let read = store.get(&location).await.expect("an ordinary read");
+        assert_eq!(read.meta.e_tag, None);
+        assert_eq!(read.bytes().await.expect("bytes"), bytes);
+
+        let error = store
+            .get_opts(
+                &location,
+                object_store::GetOptions {
+                    if_match: Some("any".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a precondition needs the description");
+        assert!(
+            !matches!(error, object_store::Error::Precondition { .. }),
+            "{error}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_download_cut_off_part_way_resumes_where_it_stopped() {
         let mock = Mock::start().await;

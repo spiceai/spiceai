@@ -291,14 +291,21 @@ impl ObjectStore for HuggingFaceStore {
             .map_err(|e| store_error(location, e))?;
         // `list` advertises `TreeEntry::content_id` (the git oid, or the LFS
         // SHA-256). The download `ETag` is Hub `x-linked-etag`, a different
-        // identifier, so every read reports the listed one: a precondition on
-        // the `ETag` of any earlier `list`, `head`, or `get` then matches.
-        let entry = file_entry(hub, &repo, commit, path, location).await?;
+        // identifier, so a read reports the listed one: a precondition on the
+        // `ETag` of any earlier `list`, `head`, or `get` then matches. A read
+        // without a precondition still returns its bytes when the description
+        // cannot be fetched, with no `ETag` rather than one that would not match.
+        let e_tag = if options.if_match.is_some() || options.if_none_match.is_some() {
+            Some(file_entry(hub, &repo, commit, path, location).await?)
+        } else {
+            file_entry(hub, &repo, commit, path, location).await.ok()
+        }
+        .map(|entry| entry.content_id().to_string());
         let meta = ObjectMeta {
             location: location.clone(),
             last_modified,
             size: read.size,
-            e_tag: Some(entry.content_id().to_string()),
+            e_tag,
             version: Some(commit.to_string()),
         };
         options.check_preconditions(&meta)?;
