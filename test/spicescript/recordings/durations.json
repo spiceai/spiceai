@@ -134,6 +134,7 @@
   "tpch-oracles": 26,
   "unparse-aggregate-scopes": 4,
   "unparse-nullable-having": 12,
+  "unparse-projected-exists": 3,
   "unparse-pruned-aggregate": 15,
   "unparse-set-operations": 5,
   "unsigned-negation": 5,

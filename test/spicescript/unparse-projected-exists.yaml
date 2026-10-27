@@ -1,0 +1,41 @@
+name: unparse-projected-exists
+description: Projected EXISTS inputs retain computed names and scalar correlations; repeated probes see one volatile build result.
+sources:
+  src: { kind: postgres }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: unparse-projected-exists
+  datasets:
+    - { from: 'postgres:public.p', name: p, params: '${sources.src.params}' }
+    - { from: 'postgres:public.b', name: b, params: '${sources.src.params}' }
+    - { from: 'postgres:public.vp', name: vp, params: '${sources.src.params}' }
+    - { from: 'postgres:public.vb', name: vb, params: '${sources.src.params}' }
+defaults:
+  expect: { oracle: src }
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE p (id int NOT NULL, c int NOT NULL);
+        INSERT INTO p VALUES (1,3),(2,3),(3,4),(4,9),(5,1),(6,2);
+        CREATE TABLE b (x int NOT NULL, y int NOT NULL);
+        INSERT INTO b VALUES (1,2),(2,2);
+        CREATE TABLE vp (id int NOT NULL, c double precision NOT NULL);
+        INSERT INTO vp SELECT i, 0.5 FROM generate_series(1,512) i;
+        CREATE TABLE vb (x int NOT NULL); INSERT INTO vb VALUES (1);
+  - start: {}
+  - query: SELECT id, c IN (SELECT x + y FROM b) AS matched FROM p ORDER BY id
+  - query: SELECT id FROM p WHERE c IN (SELECT x + y FROM b) ORDER BY id
+  - query: SELECT id FROM p WHERE c NOT IN (SELECT x + y FROM b) ORDER BY id
+  - query: SELECT id, c IN (SELECT x + y FROM b WHERE x > 1 ORDER BY x LIMIT 1) AS matched FROM p ORDER BY id
+  - query: SELECT id, c IN (SELECT (SELECT b.x AS v) AS c FROM b) AS matched FROM p ORDER BY id
+  - query: SELECT id, c IN (SELECT (SELECT b.x) AS c FROM b) AS matched FROM p ORDER BY id
+  - query: SELECT id FROM p WHERE EXISTS (SELECT 1 FROM (SELECT (SELECT b.x AS v) AS c FROM b) s WHERE p.c = s.c) ORDER BY id
+  - query: SELECT count(DISTINCT matched) AS n FROM (SELECT vp.id, vp.c < ANY (SELECT random() FROM vb) AS matched FROM vp) q
+    oracle-sql: SELECT 1::bigint AS n
+  - query: SELECT count(*) IN (0,512) AS consistent FROM vp WHERE (vp.c < ANY (SELECT random() FROM vb)) OR vp.c < 0
+    oracle-sql: SELECT true AS consistent
+  - query: SELECT count(*) IN (0,512) AS consistent FROM vp WHERE NOT (vp.c < ANY (SELECT random() FROM vb)) OR vp.c < 0
+    oracle-sql: SELECT true AS consistent
+  - query: SELECT id, c IN (SELECT x + CAST(NULL AS int) FROM b) AS matched FROM p ORDER BY id
+  - query: SELECT id, c IN (SELECT x + y FROM b WHERE x < 0) AS matched FROM p ORDER BY id
