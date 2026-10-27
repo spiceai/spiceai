@@ -336,7 +336,7 @@ impl Highlighter for EditorHelper {
     }
 }
 
-#[expect(clippy::missing_errors_doc, clippy::too_many_lines)]
+#[expect(clippy::missing_errors_doc)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Note: custom_headers are currently not applied to the gRPC Flight connection.
     // Adding gRPC metadata headers requires interceptor changes.

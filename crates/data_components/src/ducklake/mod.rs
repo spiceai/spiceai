@@ -20,6 +20,8 @@ limitations under the License.
 //! This module provides a catalog provider that connects to a `DuckLake` catalog using `DuckDB`
 //! with the `ducklake` extension.
 
+use crate::duckdb::install_and_load_extension;
+
 pub mod provider;
 pub mod writer;
 
@@ -52,8 +54,7 @@ pub fn configure_duckdb_httpfs(
     conn: &duckdb::Connection,
     s3: &DuckLakeS3Params,
 ) -> Result<(), duckdb::Error> {
-    conn.execute("INSTALL httpfs", [])?;
-    conn.execute("LOAD httpfs", [])?;
+    install_and_load_extension(conn, "httpfs")?;
 
     if let Some(secret_sql) = build_ducklake_s3_secret_sql(s3) {
         conn.execute(&secret_sql, [])?;

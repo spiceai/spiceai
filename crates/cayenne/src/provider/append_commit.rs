@@ -41,6 +41,13 @@ pub(super) struct PreparedResolvedAppend {
     pub table: CayenneTableProvider,
     pub context: Arc<CayenneContext>,
     pub _write_guard: OwnedMutexGuard<()>,
+    /// When autocommit `UPDATE` already held `write_lock`, `_write_guard` is a
+    /// dummy (the mutex is not reentrant). This clone of the real owned hold
+    /// keeps exclusive access until `commit`'s spawned task finishes, so
+    /// cancelling the UPDATE stream cannot drop the lock mid-publish.
+    /// Task-local [`super::write_lock_held`] does not propagate into
+    /// `tokio::spawn`.
+    pub _held_write_lock: Option<Arc<OwnedMutexGuard<()>>>,
     /// Holds the mem-tier checkpoint off until publication has acted on what
     /// validation decided about where each replaced row lives
     /// ([`CayenneTableProvider::lock_mem_tier_checkpoint_for_durable_write`]).

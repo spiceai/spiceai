@@ -543,6 +543,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn infer_schema_rejects_high_ratio_compressed_footer() {
+        use std::io::Write;
+
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder
+            .write_all(&vec![0; 64 * 1024 * 1024 + 1])
+            .expect("deflate footer");
+        let deflated = encoder.finish().expect("finish deflate");
+
+        // One ZLIB chunk: a 3-byte little-endian header of `length << 1`, low bit clear.
+        let header = u32::try_from(deflated.len() << 1).expect("chunk header");
+        let mut bytes = header.to_le_bytes()[..3].to_vec();
+        bytes.extend_from_slice(&deflated);
+
+        // PostScript: footerLength, compression = ZLIB, metadataLength = 0.
+        let mut postscript = vec![0x08];
+        let mut footer_length = bytes.len();
+        while footer_length >= 0x80 {
+            postscript.push(0x80 | u8::try_from(footer_length & 0x7f).expect("varint"));
+            footer_length >>= 7;
+        }
+        postscript.push(u8::try_from(footer_length).expect("varint"));
+        postscript.extend_from_slice(&[0x10, 0x01, 0x28, 0x00]);
+        bytes.extend_from_slice(&postscript);
+        bytes.push(u8::try_from(postscript.len()).expect("postscript length"));
+
+        let memory = Arc::new(InMemory::new());
+        let meta = put_orc(memory.as_ref(), "data/footer.orc", bytes).await;
+        let store: Arc<dyn ObjectStore> = memory;
+        let ctx = SessionContext::new();
+        let err = OrcFormat::new()
+            .infer_schema(&ctx.state(), &store, &[meta])
+            .await
+            .expect_err("a footer that inflates past the metadata bound must fail");
+
+        assert!(
+            err.to_string().contains("decompression limit"),
+            "expected the footer to be rejected by the decompression bound, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn infer_stats_reports_exact_row_count() {
         let memory = Arc::new(InMemory::new());
         let batch = sample_batch();

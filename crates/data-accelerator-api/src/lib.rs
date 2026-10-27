@@ -50,7 +50,9 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_checkpoint_api::CheckpointError;
 use runtime_parameters::ParameterSpec;
 use runtime_parameters::{Diagnostics, Parameters};
-use runtime_secrets::{ExposeSecret, Secrets, get_params_with_secrets};
+use runtime_secrets::{
+    ExposeSecret, Secrets, get_params_with_secrets, secret_sources_from_templates,
+};
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use snafu::prelude::*;
 use std::path::PathBuf;
@@ -58,6 +60,7 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 pub mod keep_first;
+pub mod pk_write_guard;
 pub mod snapshots;
 pub mod storage;
 pub mod swappable;
@@ -958,7 +961,9 @@ pub trait DataAccelerator: Send + Sync {
     /// Perform the engine's maintenance after a snapshot was restored and
     /// `provider` serves it: after the initial provider is installed, and after
     /// each reload's replacement is swapped in — never before a swap, since the
-    /// replaced provider keeps serving if the swap is refused. The default does
+    /// replaced provider keeps serving if the swap is refused. An engine may record
+    /// `provider` here as the one a later restore into the same location must stop
+    /// first (see `SnapshotEngine::prepare_directory_restore`). The default does
     /// nothing.
     async fn maintain_after_snapshot_restore(
         &self,
@@ -1210,14 +1215,16 @@ pub async fn acceleration_parameters(
     // writer queued between them.
     let params_with_secrets =
         get_params_with_secrets(Arc::clone(&secrets), &acceleration.params).await;
+    let secret_sources = secret_sources_from_templates(&acceleration.params);
 
-    Parameters::try_new_with_diagnostics(
+    Parameters::try_new_with_secret_sources(
         &format!("accelerator {}", accelerator.name()),
         params_with_secrets.into_iter().collect::<Vec<_>>(),
         accelerator.prefix(),
         secrets,
         accelerator.parameters(),
         diagnostics,
+        Some(secret_sources),
     )
     .await
 }

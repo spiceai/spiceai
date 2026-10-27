@@ -1,0 +1,55 @@
+name: refresh-api-sql
+description: >
+  The refresh API on Cayenne, full and append: a POST with its own
+  `refresh_sql` refreshes with it once and the next plain refresh uses the
+  configured SQL again; a PATCH of `refresh_sql` is kept for later
+  refreshes.
+sources:
+  src: { kind: postgres }
+variants:
+  full: {}
+  append: { datasets: { t: { acceleration: { refresh_mode: append } } } }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: refresh-api-sql
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: timestamptz
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+defaults:
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, ts timestamptz NOT NULL);
+        INSERT INTO t SELECT i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 minute' FROM generate_series(1, 100) i;
+  - start: {}
+  - query: SELECT id FROM t
+  # A one-off refresh with its own SQL.
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, headers: { content-type: application/json }, body: '{"refresh_sql": "SELECT * FROM t WHERE id <= 10"}' }
+    expect: { status: 201 }
+  - query: SELECT id FROM t
+    oracle-sql: SELECT id FROM t WHERE id <= 10
+    eventually: 30s
+    only: full
+  # A plain refresh afterwards uses the configured SQL again.
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh }
+    expect: { status: 201 }
+    only: full
+  - query: SELECT id FROM t
+    eventually: 30s
+  # PATCH keeps the SQL for later refreshes.
+  - http: { method: PATCH, path: /v1/datasets/t/acceleration, headers: { content-type: application/json }, body: '{"refresh_sql": "SELECT * FROM t WHERE id <= 20"}' }
+    expect: { status: 200 }
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh }
+    expect: { status: 201 }
+  - query: SELECT id FROM t
+    oracle-sql: SELECT id FROM t WHERE id <= 20
+    eventually: 30s
+    only: full

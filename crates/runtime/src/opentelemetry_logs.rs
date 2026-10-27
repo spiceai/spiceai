@@ -30,6 +30,8 @@ limitations under the License.
 //! ([`apply_dataset_defaults`]): writable, Cayenne file acceleration appending, and the
 //! `timestamp` column as its time column.
 
+use std::borrow::Cow;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -76,6 +78,10 @@ pub fn is_otlp_logs_store_param(value: &str) -> bool {
 /// Rows per logs store batch. Bounds the memory one batch takes, since resource and scope
 /// columns repeat on every row.
 pub const MAX_LOGS_BATCH_ROWS: usize = 8192;
+
+/// Expanded string bytes per logs store batch. This keeps every `Utf8` column well below
+/// its 32-bit Arrow offset limit when resource and scope values repeat across many rows.
+const MAX_LOGS_BATCH_STRING_BYTES: usize = 256 * 1024 * 1024;
 
 /// Largest OTLP logs message the gRPC receiver accepts, the same bound as an OTLP/HTTP body.
 /// The gRPC default of 4 MiB rejects a Collector batch of 8,192 records of about 500 bytes.
@@ -222,6 +228,56 @@ struct ScopeColumns<'a> {
     schema_url: Option<&'a str>,
 }
 
+/// Values that need conversion or validation before a record can be appended.
+struct PreparedRecord<'a> {
+    timestamp: i64,
+    observed_timestamp: Option<i64>,
+    body: Option<Cow<'a, str>>,
+    attributes: String,
+    string_bytes: usize,
+}
+
+impl<'a> PreparedRecord<'a> {
+    fn new(
+        resource: &ResourceColumns<'_>,
+        scope: &ScopeColumns<'_>,
+        record: &'a LogRecord,
+        received_unix_nano: u64,
+    ) -> Option<Self> {
+        let timestamp = i64::try_from(record_time(record, received_unix_nano)).ok()?;
+        let observed_timestamp = match record.observed_time_unix_nano {
+            0 => None,
+            observed => Some(i64::try_from(observed).ok()?),
+        };
+        let body = prepared_body(record.body.as_ref());
+        let attributes = attributes_to_json(&record.attributes).to_string();
+        let string_bytes = [
+            non_empty(&record.severity_text).map_or(0, str::len),
+            body.as_deref().map_or(0, str::len),
+            attributes.len(),
+            encoded_id_len(&record.trace_id),
+            encoded_id_len(&record.span_id),
+            non_empty(&record.event_name).map_or(0, str::len),
+            resource.service_name.as_deref().map_or(0, str::len),
+            resource.attributes.len(),
+            resource.schema_url.map_or(0, str::len),
+            scope.name.map_or(0, str::len),
+            scope.version.map_or(0, str::len),
+            scope.attributes.len(),
+            scope.schema_url.map_or(0, str::len),
+        ]
+        .into_iter()
+        .fold(0_usize, usize::saturating_add);
+        Some(Self {
+            timestamp,
+            observed_timestamp,
+            body,
+            attributes,
+            string_bytes,
+        })
+    }
+}
+
 /// Builders for every column of [`LOGS_STORE_SCHEMA`].
 struct LogsBuilders {
     timestamp: TimestampNanosecondBuilder,
@@ -275,36 +331,22 @@ impl LogsBuilders {
         self.timestamp.len()
     }
 
-    /// Appends `record`, or returns `false` without appending it when one of its times is
-    /// past the last instant a nanosecond timestamp holds (2262-04-11), which no real event
-    /// has: storing it would wrap to a time it never had.
     fn append(
         &mut self,
         resource: &ResourceColumns<'_>,
         scope: &ScopeColumns<'_>,
         record: &LogRecord,
-        received_unix_nano: u64,
-    ) -> bool {
-        let Ok(timestamp) = i64::try_from(record_time(record, received_unix_nano)) else {
-            return false;
-        };
-        // OTLP uses 0 for "not set".
-        let observed = match record.observed_time_unix_nano {
-            0 => None,
-            observed => match i64::try_from(observed) {
-                Ok(observed) => Some(observed),
-                Err(_) => return false,
-            },
-        };
-        self.timestamp.append_value(timestamp);
-        self.observed_timestamp.append_option(observed);
+        prepared: &PreparedRecord<'_>,
+    ) {
+        self.timestamp.append_value(prepared.timestamp);
+        self.observed_timestamp
+            .append_option(prepared.observed_timestamp);
         self.severity_number
             .append_option((record.severity_number != 0).then_some(record.severity_number));
         self.severity_text
             .append_option(non_empty(&record.severity_text));
-        append_body(&mut self.body, record.body.as_ref());
-        self.attributes
-            .append_value(attributes_to_json(&record.attributes).to_string());
+        self.body.append_option(prepared.body.as_deref());
+        self.attributes.append_value(&prepared.attributes);
         append_id(&mut self.trace_id, &record.trace_id, &mut self.id_scratch);
         append_id(&mut self.span_id, &record.span_id, &mut self.id_scratch);
         self.flags.append_value(record.flags);
@@ -317,7 +359,6 @@ impl LogsBuilders {
         self.scope_version.append_option(scope.version);
         self.scope_attributes.append_value(&scope.attributes);
         self.scope_schema_url.append_option(scope.schema_url);
-        true
     }
 
     /// The rows appended since the last call, as a batch. The builders are left empty.
@@ -360,11 +401,11 @@ fn record_time(record: &LogRecord, received_unix_nano: u64) -> u64 {
 /// A string body as is; any other body as JSON in the attributes encoding. A string-table
 /// reference is a profiling-signal encoding that has no meaning in a log, so it is stored as
 /// absent, like a body that is not set.
-fn append_body(builder: &mut StringBuilder, body: Option<&AnyValue>) {
+fn prepared_body(body: Option<&AnyValue>) -> Option<Cow<'_, str>> {
     match body.and_then(|b| b.value.as_ref()) {
-        None | Some(any_value::Value::StringValueStrindex(_)) => builder.append_null(),
-        Some(any_value::Value::StringValue(s)) => builder.append_value(s),
-        Some(_) => builder.append_value(any_value_to_json(body).to_string()),
+        None | Some(any_value::Value::StringValueStrindex(_)) => None,
+        Some(any_value::Value::StringValue(s)) => Some(Cow::Borrowed(s)),
+        Some(_) => Some(Cow::Owned(any_value_to_json(body).to_string())),
     }
 }
 
@@ -384,6 +425,14 @@ fn append_id(builder: &mut StringBuilder, id: &[u8], scratch: &mut String) {
         scratch.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
     }
     builder.append_value(scratch.as_str());
+}
+
+fn encoded_id_len(id: &[u8]) -> usize {
+    if id.iter().all(|byte| *byte == 0) {
+        0
+    } else {
+        id.len().saturating_mul(2)
+    }
 }
 
 /// Number of log records in an export.
@@ -415,10 +464,26 @@ pub fn export_to_batches(
     received_unix_nano: u64,
     max_rows: usize,
 ) -> Result<LogsBatches, ArrowError> {
+    export_to_batches_with_limits(
+        request,
+        received_unix_nano,
+        max_rows,
+        MAX_LOGS_BATCH_STRING_BYTES,
+    )
+}
+
+fn export_to_batches_with_limits(
+    request: &ExportLogsServiceRequest,
+    received_unix_nano: u64,
+    max_rows: usize,
+    max_string_bytes: usize,
+) -> Result<LogsBatches, ArrowError> {
     let max_rows = max_rows.max(1);
+    let max_string_bytes = max_string_bytes.max(1);
     let total = log_record_count(request);
     let mut batches = Vec::with_capacity(total.div_ceil(max_rows));
     let mut rejected = 0;
+    let mut batch_string_bytes = 0_usize;
     let mut builders = LogsBuilders::with_capacity(total.min(max_rows));
     for resource_logs in &request.resource_logs {
         let resource = ResourceColumns::new(
@@ -438,12 +503,29 @@ pub fn export_to_batches(
                 schema_url: non_empty(&scope_logs.schema_url),
             };
             for record in &scope_logs.log_records {
-                if !builders.append(&resource, &scope, record, received_unix_nano) {
+                let Some(prepared) =
+                    PreparedRecord::new(&resource, &scope, record, received_unix_nano)
+                else {
                     rejected += 1;
                     continue;
+                };
+                if prepared.string_bytes > max_string_bytes {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "The OpenTelemetry logs export contains one record that expands to {} string bytes, above the per-batch limit of {max_string_bytes} bytes; reduce the record's body or attributes",
+                        prepared.string_bytes
+                    )));
                 }
+                if builders.len() > 0
+                    && batch_string_bytes.saturating_add(prepared.string_bytes) > max_string_bytes
+                {
+                    batches.push(builders.finish()?);
+                    batch_string_bytes = 0;
+                }
+                builders.append(&resource, &scope, record, &prepared);
+                batch_string_bytes = batch_string_bytes.saturating_add(prepared.string_bytes);
                 if builders.len() == max_rows {
                     batches.push(builders.finish()?);
+                    batch_string_bytes = 0;
                 }
             }
         }
@@ -468,18 +550,33 @@ fn now_unix_nanos() -> u64 {
 /// it serves, including `/health`.
 async fn build_batches(request: ExportLogsServiceRequest) -> Result<LogsBatches, Status> {
     let received_unix_nano = now_unix_nanos();
+    run_batch_builder(move || export_to_batches(&request, received_unix_nano, MAX_LOGS_BATCH_ROWS))
+        .await
+}
+
+const BATCH_BUILD_FAILED_MESSAGE: &str =
+    "Failed to convert the OTLP logs export: the batch builder failed";
+
+async fn run_batch_builder(
+    builder: impl FnOnce() -> Result<LogsBatches, ArrowError> + Send + 'static,
+) -> Result<LogsBatches, Status> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     rayon::spawn(move || {
+        let result = match catch_unwind(AssertUnwindSafe(builder)) {
+            Ok(Ok(batches)) => Ok(batches),
+            Ok(Err(ArrowError::InvalidArgumentError(message))) => {
+                Err(Status::invalid_argument(message))
+            }
+            Ok(Err(error)) => Err(Status::internal(format!(
+                "Failed to convert the OTLP logs export: {error}"
+            ))),
+            Err(_) => Err(Status::internal(BATCH_BUILD_FAILED_MESSAGE)),
+        };
         // The receiver is gone only when the export was cancelled; nothing waits for the result.
-        let _ = tx.send(export_to_batches(
-            &request,
-            received_unix_nano,
-            MAX_LOGS_BATCH_ROWS,
-        ));
+        let _ = tx.send(result);
     });
     rx.await
-        .map_err(|_| Status::internal("Failed to convert the OTLP logs export: the task stopped"))?
-        .map_err(|e| Status::internal(format!("Failed to convert the OTLP logs export: {e}")))
+        .map_err(|_| Status::internal(BATCH_BUILD_FAILED_MESSAGE))?
 }
 
 /// The OpenTelemetry logs ingest service (the `LogsService::export` handler).
@@ -1020,6 +1117,42 @@ mod tests {
                 Some("b".into())
             ]
         );
+    }
+
+    #[test]
+    fn expanded_strings_split_batches_at_the_byte_limit() {
+        let request = request_with(vec![], None, vec![LogRecord::default(); 5]);
+        // Each empty record adds "{}" to its record, resource and scope attribute columns.
+        let batches = export_to_batches_with_limits(&request, RECEIVED, usize::MAX, 12)
+            .expect("batches")
+            .batches;
+        let sizes: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(sizes, vec![2, 2, 1]);
+    }
+
+    #[test]
+    fn a_record_larger_than_the_byte_limit_is_invalid() {
+        let request = request_with(vec![], None, vec![LogRecord::default()]);
+        let Err(error) = export_to_batches_with_limits(&request, RECEIVED, usize::MAX, 5) else {
+            panic!("three empty attribute objects use six string bytes");
+        };
+        let ArrowError::InvalidArgumentError(message) = error else {
+            panic!("an oversized record must be an invalid argument");
+        };
+        assert_eq!(
+            message,
+            "The OpenTelemetry logs export contains one record that expands to 6 string bytes, above the per-batch limit of 5 bytes; reduce the record's body or attributes"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_builder_panics_become_request_errors() {
+        let result = run_batch_builder(|| panic!("injected batch-builder failure")).await;
+        let Err(status) = result else {
+            panic!("a batch-builder panic must fail the request");
+        };
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(status.message(), BATCH_BUILD_FAILED_MESSAGE);
     }
 
     #[test]

@@ -25,7 +25,7 @@ limitations under the License.
 //! every top-level JSON or Jinja file comes along, so a config the engine reads by name is
 //! there whichever it is.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use huggingface_hub::{DownloadError, Requester, Snapshot};
@@ -36,8 +36,9 @@ use crate::hf::HubParams;
 use crate::hf::SAFETENSORS_INDEX as SAFETENSOR_INDEX;
 const DOCS_URL: &str = "https://spiceai.org/docs/components/models/huggingface";
 
-/// Downloads the files mistral.rs loads the model `model_id` (`org/name[:revision]`) from, for
-/// the model named `name`, and returns the directory they are in.
+/// Downloads the files the model `model_id` (`org/name[:revision]`) loads from, for the model
+/// named `name`, and returns the directory they are in: the GGUF files `gguf` names, or the
+/// files mistral.rs loads when it names none.
 ///
 /// # Errors
 ///
@@ -45,7 +46,7 @@ const DOCS_URL: &str = "https://spiceai.org/docs/components/models/huggingface";
 /// needs, or a download fails.
 pub async fn download_model(
     model_id: &str,
-    gguf: Option<&str>,
+    gguf: &[&str],
     hub: HubParams<'_>,
     name: &str,
 ) -> Result<PathBuf, DownloadError> {
@@ -77,19 +78,17 @@ static SAFETENSORS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 static PICKLES: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"pytorch_model-\d{5}-of-\d{5}.((pth)|(pt)|(bin))\b").ok());
 
-/// Downloads what mistral.rs loads a model from: the weights named by `gguf`, or the repo's
-/// safetensors (or sharded pickle) weights, and the top-level configs. Returns the snapshot
-/// directory.
+/// Downloads what a model loads from: the GGUF files `gguf` names (every shard, and any MTP
+/// draft head), or, when it names none, the repo's safetensors (or sharded pickle) weights;
+/// and the top-level configs. Returns the snapshot directory.
 ///
 /// # Errors
 ///
 /// Returns an error if the repository lacks a file the engine needs, or a download fails.
-pub async fn download(snapshot: &Snapshot, gguf: Option<&str>) -> Result<PathBuf, DownloadError> {
+pub async fn download(snapshot: &Snapshot, gguf: &[&str]) -> Result<PathBuf, DownloadError> {
     let names: Vec<&str> = snapshot.files().map(|file| file.path.as_str()).collect();
     let mut paths = configs(&names);
-    if let Some(gguf) = gguf {
-        paths.push(gguf.to_string());
-    } else {
+    if gguf.is_empty() {
         for alternatives in [
             ["tokenizer.json", "tekken.json"],
             ["config.json", "params.json"],
@@ -112,6 +111,8 @@ pub async fn download(snapshot: &Snapshot, gguf: Option<&str>) -> Result<PathBuf
             }
         };
         paths.extend(weights);
+    } else {
+        paths.extend(gguf.iter().map(ToString::to_string));
     }
     paths.sort();
     paths.dedup();
@@ -133,6 +134,20 @@ fn configs(names: &[&str]) -> Vec<String> {
         })
         .map(ToString::to_string)
         .collect()
+}
+
+/// The file mistral.rs reads a downloaded repository's chat template from: its
+/// `chat_template.jinja`, else its `tokenizer_config.json`. Every top-level JSON and Jinja file
+/// of the repository is downloaded with the model, so a file missing from `dir` is missing from
+/// the repository.
+pub async fn chat_template_file(dir: &Path) -> Option<PathBuf> {
+    for name in ["chat_template.jinja", "tokenizer_config.json"] {
+        let path = dir.join(name);
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Where the weights mistral.rs loads are named.
@@ -189,6 +204,20 @@ mod tests {
 
     fn owned(names: &[&str]) -> Vec<String> {
         names.iter().map(ToString::to_string).collect()
+    }
+
+    /// As mistral.rs does, a repository's `chat_template.jinja` is read before its
+    /// `tokenizer_config.json`, and a repository with neither has no template file.
+    #[tokio::test]
+    async fn the_chat_template_file_is_the_jinja_file_before_tokenizer_config() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        assert_eq!(chat_template_file(dir.path()).await, None);
+        let config = dir.path().join("tokenizer_config.json");
+        std::fs::write(&config, "{}").expect("tokenizer_config.json writes");
+        assert_eq!(chat_template_file(dir.path()).await, Some(config));
+        let jinja = dir.path().join("chat_template.jinja");
+        std::fs::write(&jinja, "").expect("chat_template.jinja writes");
+        assert_eq!(chat_template_file(dir.path()).await, Some(jinja));
     }
 
     #[test]

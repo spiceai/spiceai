@@ -1,5 +1,5 @@
 name: benchmark e2e tests
-run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}${{ contains(github.event.inputs.spicepod_path, 'postgres') && format(' - PostgreSQL {0}', github.event.inputs.postgres_version || '16') || '' }}${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}
+run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}${{ contains(github.event.inputs.spicepod_path, 'postgres') && format(' - PostgreSQL {0}', github.event.inputs.postgres_version || '16') || '' }}${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}${{ github.event.inputs.spiced_ref != '' && format(' - spiced {0}', github.event.inputs.spiced_ref) || '' }}
 
 on:
   workflow_dispatch:
@@ -8,6 +8,15 @@ on:
         description: 'spiced build commit'
         required: false
         type: string
+      # Benchmarks another release's spiced with this ref's testoperator and spec files. A release
+      # tag installs the spiced_linux_x86_64.tar.gz that release published; a branch or other ref
+      # uses the newest commit within ten of it that has a MinIO build. No result or explain-plan
+      # snapshot is compared or written back, since those record this ref's answers and plans.
+      spiced_ref:
+        description: 'Branch or tag whose spiced to benchmark, e.g. v2.1.0 or release/2.4; empty = trunk. A release tag uses that release''s published binary. Ignored when spiced_commit is set'
+        required: false
+        type: string
+        default: ''
       spicepod_path:
         description: 'The spicepod file to test with'
         required: true
@@ -171,9 +180,13 @@ jobs:
 
       - name: Determine snapshot update mode
         id: determine_update_snapshots
+        env:
+          SPICED_REF: ${{ github.event.inputs.spiced_ref }}
         run: |
           update_mode="${{ github.event.inputs.update_snapshots }}"
-          if [ "${update_mode}" = "default" ] || [ -z "${update_mode}" ]; then
+          if [ -n "${SPICED_REF}" ]; then
+            update_mode="no"
+          elif [ "${update_mode}" = "default" ] || [ -z "${update_mode}" ]; then
             branch_name="${{ github.ref_name }}"
             if [[ "${branch_name}" == "release/"* ]]; then
               update_mode="no"
@@ -237,15 +250,41 @@ jobs:
         run: |
           spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
+      # A release tag benchmarks the binary that release published, so releases older than the
+      # MinIO builds (kept only for recent commits) can be measured.
+      - name: Resolve the spiced source
+        id: spiced_source
+        env:
+          SPICED_COMMIT_INPUT: ${{ github.event.inputs.spiced_commit }}
+          SPICED_REF: ${{ github.event.inputs.spiced_ref }}
+        run: |
+          if [ -z "${SPICED_COMMIT_INPUT}" ] && [[ "${SPICED_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "release=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "release=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Setup spiced
+        if: steps.spiced_source.outputs.release != 'true'
         uses: ./.github/actions/setup-spiced
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
+          ref: ${{ github.event.inputs.spiced_ref || 'refs/heads/trunk' }}
           with_odbc: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
 
+      - name: Install the released spiced
+        if: steps.spiced_source.outputs.release == 'true'
+        id: release-spiced
+        uses: ./.github/actions/setup-released-spiced
+        with:
+          release: ${{ github.event.inputs.spiced_ref }}
+          spicepod_file: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          with_odbc: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}"
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
@@ -410,7 +449,7 @@ jobs:
 
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
@@ -573,6 +612,16 @@ jobs:
           echo "cluster ${DATABRICKS_CLUSTER_ID} did not reach RUNNING"
           exit 1
 
+      # The image restores its database once, after a fixed sleep, and never retries;
+      # see .github/scripts/mssql_tpch_restore.sh.
+      - name: Wait for the SQL Server TPC-H database
+        if: ${{ contains(github.event.inputs.spicepod_path, 'mssql') }}
+        # The script gives up after ten minutes; this also bounds a hung docker call.
+        timeout-minutes: 15
+        env:
+          MSSQL_SA_PASSWORD: S3cretP@ssw0rd
+        run: bash .github/scripts/mssql_tpch_restore.sh "${{ job.services.mssql_tpch.id }}" tpch_sf1
+
       # `--disable-caching` sends `Cache-Control: no-cache` on the benchmark's Flight
       # connection. It is load-bearing: `runtime.caching.sql_results` is enabled by
       # default with a one-second `item_ttl`, and the harness runs one warmup query
@@ -596,6 +645,7 @@ jobs:
             --disable-caching=${{ github.event.inputs.disable_caching }} \
             --validate=${{ github.event.inputs.validate_results }} \
             ${LAYOUT:+--layout "$LAYOUT"} \
+            --snapshots=${{ github.event.inputs.spiced_ref == '' }} \
             --metrics \
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
@@ -654,7 +704,7 @@ jobs:
           ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
           ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}
           SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
           SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
           SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
@@ -750,7 +800,6 @@ jobs:
             PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
             if [[ -n "${PR_URL}" ]]; then
               echo "PR already exists -> ${PR_URL}"
-              exit 0
             else
               BODY=$(cat <<EOF
           Automated benchmark snapshot update from workflow run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
@@ -760,8 +809,9 @@ jobs:
           **Profile:** \`${{ github.event.inputs.profile_option || 'release' }}\`
           EOF
           )
-              # Target the branch the run was dispatched on
-              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base "${{ github.ref_name }}" --head ${BRANCH_NAME} --label kind/bug
+              # Target the branch the run was dispatched on. enforce-pull-with-spice, a required
+              # check, fails a PR without both a kind/ and an area/ label.
+              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base "${{ github.ref_name }}" --head ${BRANCH_NAME} --label kind/bug --label area/tests
               # Auto-merge only into trunk: on an unprotected feature branch
               # --auto merges immediately, before the branch owner can review
               # the snapshots.
@@ -769,6 +819,8 @@ jobs:
                 gh pr merge --squash --auto ${BRANCH_NAME}
               fi
             fi
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
+            bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

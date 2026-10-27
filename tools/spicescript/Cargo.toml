@@ -28,12 +28,14 @@ indexmap = { workspace = true, features = ["serde"] }
 nix = { workspace = true, features = ["signal"] }
 parking_lot.workspace = true
 parquet = { workspace = true, features = ["arrow"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 regex.workspace = true
 secrecy.workspace = true
 reqwest.workspace = true
 result-compare = { path = "../../crates/result-compare" }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+sqlparser.workspace = true
 sqllogictest = "0.29.1"
 tokio = { workspace = true, features = ["full"] }
 tonic.workspace = true

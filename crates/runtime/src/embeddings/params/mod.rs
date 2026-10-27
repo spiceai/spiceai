@@ -58,7 +58,7 @@ impl FromStr for Pooling {
             "cls" => Ok(Pooling::Cls),
             "mean" => Ok(Pooling::Mean),
             "splade" => Ok(Pooling::Splade),
-            other => Err(format!("must be one of: cls, mean, splade. Found {other}")),
+            _ => Err("must be one of: cls, mean, splade".to_string()),
         }
     }
 }
@@ -110,7 +110,7 @@ impl FromStr for Truncation {
             "NONE" => Ok(Truncation::None),
             "END" => Ok(Truncation::End),
             "START" => Ok(Truncation::Start),
-            other => Err(format!("must be one of: NONE, END, START. Found {other}")),
+            _ => Err("must be one of: NONE, END, START".to_string()),
         }
     }
 }

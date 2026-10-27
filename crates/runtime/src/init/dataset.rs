@@ -52,7 +52,8 @@ use crate::{
         builder::DatasetBuilder,
     },
     component::{
-        AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
+        AcceleratedComponent, component_accelerations, deprecated_acceleration_engines_warning,
+        deprecated_ready_state_warning, disabled_acceleration_warning,
     },
     dataaccelerator::{AccelerationSource, validate_snapshot_paths},
     dataconnector::{
@@ -298,6 +299,14 @@ impl Runtime {
                     &app.runtime,
                 )
             {
+                tracing::warn!("{warning}");
+            }
+            // Once for the whole Spicepod, not per component. A hot reload warns about
+            // the components it adds or changes (`Runtime::apply_app_diff`).
+            if let Some(warning) = deprecated_acceleration_engines_warning(component_accelerations(
+                &app.datasets,
+                &app.views,
+            )) {
                 tracing::warn!("{warning}");
             }
             if let Some(section) = app.snapshots.as_deref() {
@@ -1319,10 +1328,15 @@ impl Runtime {
             &checkpoint_schema,
             resolved_refresh_mode,
         );
-        let federated_table = FederatedTable::new_deferred(
-            Arc::new(ds.spec.clone()),
+        let refresh_source =
+            ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds));
+        // Snapshot refreshes report snapshot-store failures. The original source
+        // remains available for federation without changing the reader's status.
+        let refresh_source = if resolved_refresh_mode == RefreshMode::Snapshot {
+            refresh_source
+        } else {
             crate::dataconnector::refresh_source::ReportingRefreshSource::new_arc(
-                ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds)),
+                refresh_source,
                 Arc::clone(&ds),
                 Arc::clone(&self.status),
                 match reason {
@@ -1332,11 +1346,17 @@ impl Runtime {
                     } => Some(*configuration_error),
                     SourceUnavailable::NotContacted => None,
                 },
-            ),
+            )
+        };
+        let federated_table = FederatedTable::new_deferred(
+            Arc::new(ds.spec.clone()),
+            refresh_source,
             checkpoint_schema,
             self.status.shutdown_token(),
         );
-        reason.log_serving_from_acceleration(&ds.name);
+        if resolved_refresh_mode != RefreshMode::Snapshot {
+            reason.log_serving_from_acceleration(&ds.name);
+        }
         (ds, federated_table)
     }
 
@@ -1931,16 +1951,20 @@ impl Runtime {
     }
 
     #[cfg(test)]
-    async fn update_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
+    async fn update_dataset(self: Arc<Self>, ds: Arc<Dataset>) -> Option<AcceleratorBootstrap> {
         self.update_dataset_with_bootstrap(ds, BootstrapStatus::None.into())
-            .await;
+            .await
     }
 
+    /// Returns the bootstrap to load the dataset with, retrying, when the full
+    /// reload unregistered the dataset and then failed to load its new
+    /// configuration. An acceleration that cannot be initialized is not retried,
+    /// as for an added dataset.
     async fn update_dataset_with_bootstrap(
         self: Arc<Self>,
         ds: Arc<Dataset>,
         bootstrap: AcceleratorBootstrap,
-    ) {
+    ) -> Option<AcceleratorBootstrap> {
         // Defense in depth. Today the only caller is `apply_dataset_diff`, which
         // preflights through `initialize_datasets_accelerators` and skips a
         // refused dataset before it gets here. But both branches below mutate
@@ -1951,7 +1975,7 @@ impl Runtime {
         // and the running dataset is left as it was.
         if preflight_dataset(&ds, &self.status, &self.spaced_tracer).is_err() {
             // `preflight_dataset` reported it.
-            return;
+            return None;
         }
 
         self.status
@@ -1995,7 +2019,7 @@ impl Runtime {
                             self.invalidate_cached_results_for(&ds.name).await;
                             self.status
                                 .update_dataset(&ds.name, status::ComponentStatus::Ready);
-                            return;
+                            return None;
                         }
                         // The reason is the only thing that distinguishes a swap
                         // that could not be built from one whose acceleration
@@ -2018,14 +2042,14 @@ impl Runtime {
                         )
                         .await
                     {
-                        return;
+                        return None;
                     }
                     let Some(Ok(bootstrap)) = self
                         .initialize_datasets_accelerators(std::slice::from_ref(&ds))
                         .await
                         .remove(&ds.name)
                     else {
-                        return;
+                        return None;
                     };
                     bootstrap
                 } else {
@@ -2040,14 +2064,14 @@ impl Runtime {
                     )
                     .await
                 {
-                    return;
+                    return None;
                 }
 
                 let initialized = DatasetInitialization::plan_eager(
                     Arc::clone(&ds),
                     Arc::clone(&self),
                     Arc::clone(&connector),
-                    bootstrap,
+                    bootstrap.clone(),
                     None,
                     None,
                 )
@@ -2062,17 +2086,22 @@ impl Runtime {
                 // accepts as fresh.
                 self.invalidate_cached_results_for(&ds.name).await;
 
+                // The serving table is gone, so the new configuration loads
+                // like an added dataset's, retrying until its source answers.
                 if let Err(e) = initialized {
                     self.status.update_dataset(
                         &ds.name,
                         status::ComponentStatus::error_with_message(e.to_string()),
                     );
+                    return Some(bootstrap);
                 }
+                None
             }
             Err(e) => {
                 // `load_dataset_connector` set the error status for this failure.
                 // Only the hot-reload context it cannot know is added here (#12365).
                 tracing::error!("Unable to update dataset {}: {e}", ds.name);
+                None
             }
         }
     }
@@ -2676,11 +2705,13 @@ impl Runtime {
         Ok(())
     }
 
+    /// Returns the datasets this diff loads, reloads or removes: the views that read
+    /// them hold the tables they planned against, or failed to find one.
     pub(crate) async fn apply_dataset_diff(
         self: Arc<Self>,
         current_app: &Arc<App>,
         new_app: &Arc<App>,
-    ) {
+    ) -> HashSet<ResolvedTableReference> {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
 
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
@@ -2719,7 +2750,14 @@ impl Runtime {
             .datasets
             .iter()
             .filter(|ds| !new_app.datasets.iter().any(|d| d.name == ds.name))
-            .filter_map(|ds| Dataset::parse_table_reference(&ds.name).ok());
+            .filter_map(|ds| Dataset::parse_table_reference(&ds.name).ok())
+            .collect::<Vec<_>>();
+        let reloaded: HashSet<ResolvedTableReference> = datasets_to_apply
+            .iter()
+            .map(|ds| ds.name.clone())
+            .chain(removed_datasets.iter().cloned())
+            .map(resolve_table_reference)
+            .collect();
         let mut still_loading = HashSet::new();
         for name in datasets_to_apply
             .iter()
@@ -2853,9 +2891,23 @@ impl Runtime {
                 }
 
                 if !bootstrap_status.is_pending() {
-                    Arc::clone(&self)
+                    if let Some(bootstrap_status) = Arc::clone(&self)
                         .update_dataset_with_bootstrap(Arc::clone(ds), bootstrap_status)
-                        .await;
+                        .await
+                    {
+                        let runtime = Arc::clone(&self);
+                        let ds_clone = Arc::clone(ds);
+                        let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
+                        let load = self.dataset_loads.begin(&ds.name);
+                        added_futures.insert(
+                            resolve_table_reference(ds.name.clone()),
+                            Box::pin(async move {
+                                runtime
+                                    .load_dataset(ds_clone, bootstrap_status, load_semaphore, load)
+                                    .await;
+                            }),
+                        );
+                    }
                     continue;
                 }
                 // Keep the serving table until the replacement snapshot has been
@@ -3000,6 +3052,8 @@ impl Runtime {
                     .await;
             }
         }
+
+        reloaded
     }
 
     /// The load of a queued `localpod` dataset, followed by the loads of the `localpod` datasets
@@ -7034,6 +7088,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
     }
 }
 
-#[cfg(all(test, feature = "snapshots", feature = "duckdb"))]
+#[cfg(test)]
+#[cfg(all(feature = "snapshots", feature = "duckdb"))]
 #[path = "dataset_snapshot_bootstrap_tests.rs"]
 mod snapshot_bootstrap_tests;

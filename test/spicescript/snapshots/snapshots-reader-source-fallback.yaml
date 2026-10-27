@@ -1,0 +1,107 @@
+name: snapshots-reader-source-fallback
+description: >
+  Explicit snapshot readers retain their configured source fallback: before
+  publication on_registration serves source rows, and on_zero_results:
+  use_source can return source-only rows after a snapshot is loaded. Snapshot
+  refreshes still replace the accelerated rows, across readiness modes and
+  supported reload-capable engines. Fallback scans may wait for their source;
+  snapshot refreshes must not.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  engine: [cayenne, duckdb, sqlite, turso]
+  ready_state: [on_registration, on_load, on_schema_resolved]
+
+variants:
+  writer:
+    datasets:
+      t:
+        ready_state: on_load
+        acceleration: { refresh_mode: full, snapshots: create_only }
+  reader:
+    datasets:
+      t:
+        ready_state: '${matrix.ready_state}'
+        acceleration:
+          refresh_mode: snapshot
+          snapshots: bootstrap_only
+          refresh_check_interval: 1s
+          on_zero_results: use_source
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshots-reader-source-fallback
+  snapshots:
+    enabled: true
+    location: file://${instance.dir}/../shared-snapshots/
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file }
+
+defaults:
+  run-variants: side-by-side
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text);
+        INSERT INTO t VALUES (1, 'snapshot-one'), (2, NULL);
+    only: writer
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text);
+        INSERT INTO t VALUES (999, 'source-only');
+    only: reader
+
+  # This readiness mode explicitly permits source reads before any snapshot.
+  - start: { ready: false }
+    only: reader
+    when: { ready_state: on_registration }
+  - query: SELECT * FROM t WHERE id = 999
+    expect: { rows: [['999', source-only]] }
+    eventually: 30s
+    only: reader
+    when: { ready_state: on_registration }
+
+  - start: {}
+    only: writer
+  - assert-log: { contains: 'Snapshot created dataset=t' }
+    eventually: 30s
+    only: writer
+  - start: { ready: false }
+    only: reader
+    when: { ready_state: [on_load, on_schema_resolved] }
+  - query: SELECT * FROM t WHERE id IN (1, 2)
+    expect: { rows: [['1', snapshot-one], ['2', null]] }
+    eventually: 60s
+    only: reader
+
+  # An empty acceleration answer goes to the original source. A schema-only
+  # snapshot provider cannot stand in for that source.
+  - query: SELECT * FROM t WHERE id = 999
+    expect: { rows: [['999', source-only]] }
+    only: reader
+  - query: SELECT * FROM t WHERE id = 1000
+    expect: { rows: [] }
+    expect-empty: true
+    only: reader
+  - source-exec: { src: "UPDATE t SET v = 'snapshot-two' WHERE id = 1; DELETE FROM t WHERE id = 2" }
+    only: writer
+  - refresh: t
+    only: writer
+  - query: SELECT * FROM t WHERE id IN (1, 2)
+    expect: { rows: [['1', snapshot-two]] }
+    eventually: 60s
+    only: reader
+  - query: SELECT * FROM t WHERE id = 999
+    expect: { rows: [['999', source-only]] }
+    only: reader
+  - assert-status: { dataset: t, status: Ready, ready: true }
+    eventually: 10s
+    only: reader

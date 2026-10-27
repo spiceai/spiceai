@@ -49,6 +49,13 @@ use std::{
 };
 use tokio::sync::{Notify, Semaphore};
 
+/// A hang guard, not a latency bound. Registering each test's Cayenne table takes
+/// ~0.65s on its own and over 10s while a full-workspace test run starts many test
+/// processes at once: the first Cayenne table in a process probes the EC2 instance
+/// metadata service, and the AWS SDK client for that probe loads the platform's
+/// root certificates.
+const HANG_GUARD: Duration = Duration::from_secs(60);
+
 #[derive(Debug)]
 struct MetadataGate {
     provider: Arc<dyn TableProvider>,
@@ -161,7 +168,7 @@ enum Outcome {
 }
 
 async fn installation(outcome: Outcome) {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(HANG_GUARD, async {
         let runtime = Arc::new(Runtime::builder().build().await);
         let df = runtime.datafusion();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -304,7 +311,7 @@ async fn change_sink_installation_publishes_a_live_owner() {
 async fn change_sink_initialization_refusal_keeps_installed_generation_live() {
     use crate::component::dataset::acceleration::Mode;
 
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(HANG_GUARD, async {
         let runtime = Arc::new(Runtime::builder().build().await);
         let df = runtime.datafusion();
         let app = Arc::new(app::AppBuilder::new("initialization-test").build());
@@ -468,7 +475,7 @@ async fn rejected_build_releases_the_generation() {
     use crate::component::dataset::acceleration::{Engine, Mode};
     use spicepod::partitioning::PartitionedBy;
 
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(HANG_GUARD, async {
         let runtime = Arc::new(Runtime::builder().build().await);
         let df = runtime.datafusion();
         let app = Arc::new(app::AppBuilder::new("rejected-build-test").build());
@@ -570,7 +577,7 @@ async fn rejected_build_releases_the_generation() {
 /// later attempt loads the dataset without a restart.
 #[tokio::test]
 async fn transient_build_failure_loads_on_retry() {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(HANG_GUARD, async {
         let runtime = Arc::new(Runtime::builder().build().await);
         let df = runtime.datafusion();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -652,7 +659,7 @@ async fn transient_build_failure_loads_on_retry() {
 /// a caching child fails to initialize because its parent refuses new children.
 #[tokio::test]
 async fn build_failure_after_ingestion_starts_keeps_the_generation_fenced() {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(HANG_GUARD, async {
         let runtime = Arc::new(Runtime::builder().build().await);
         let df = runtime.datafusion();
         let app = Arc::new(app::AppBuilder::new("fenced-build-test").build());
