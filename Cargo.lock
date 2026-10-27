@@ -584,7 +584,7 @@ dependencies = [
  "strum_macros 0.27.2",
  "thiserror 2.0.18",
  "uuid 1.23.2",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -855,7 +855,7 @@ dependencies = [
  "arrow-select",
  "flatbuffers",
  "lz4_flex 0.14.0",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -1531,6 +1531,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a49e05797ca52e312a0c658938b7d00693ef037799ef7187678f212d7684cf"
 dependencies = [
  "debug_unsafe",
+]
+
+[[package]]
+name = "atoi_simd"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3cdb3708a128e559a30fb830e8a77a5022ee6902806925c216658652b452a44"
+dependencies = [
+ "debug_unsafe",
+ "rustversion",
 ]
 
 [[package]]
@@ -3520,7 +3530,7 @@ version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15e02a18e79de779a78b0a6ec84a3deed1ff0607dd970a11369f993263f99f1a"
 dependencies = [
- "atoi_simd",
+ "atoi_simd 0.16.1",
  "byteorder",
  "codepage",
  "encoding_rs",
@@ -3529,6 +3539,23 @@ dependencies = [
  "quick-xml 0.37.5",
  "serde",
  "zip 4.6.1",
+]
+
+[[package]]
+name = "calamine"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9ca341b94bc4b29e08970b1a03914fad2dfe177e2ecb67fcd6de9046004aafb"
+dependencies = [
+ "atoi_simd 0.18.1",
+ "byteorder",
+ "codepage",
+ "encoding_rs",
+ "fast-float2",
+ "log",
+ "quick-xml 0.42.0",
+ "serde",
+ "zip 9.1.2",
 ]
 
 [[package]]
@@ -4383,8 +4410,8 @@ dependencies = [
  "flate2",
  "liblzma",
  "memchr",
- "zstd",
- "zstd-safe",
+ "zstd 0.13.3",
+ "zstd-safe 7.2.4",
 ]
 
 [[package]]
@@ -4808,7 +4835,7 @@ dependencies = [
  "url",
  "util",
  "wiremock",
- "zip 8.6.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
@@ -5335,15 +5362,18 @@ checksum = "d9c50fcfdf972929aff202c16b80086aa3cfc6a3a820af714096c58c7c1d0582"
 
 [[package]]
 name = "constant_time_eq"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
-
-[[package]]
-name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb6feb175df65d0a3ccd3e73484e940d0ac664e8034f0519fd49a93db3071d9"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "convert_case"
@@ -6525,8 +6555,8 @@ dependencies = [
  "util",
  "uuid 1.23.2",
  "wiremock",
- "zip 8.6.0",
- "zstd",
+ "zip 9.1.2",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -6614,7 +6644,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid 1.23.2",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -6738,7 +6768,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -7936,7 +7966,7 @@ version = "2.4.0"
 dependencies = [
  "async-trait",
  "bytes",
- "calamine",
+ "calamine 0.37.0",
  "docx-rs",
  "flate2",
  "liteparse",
@@ -7947,7 +7977,7 @@ dependencies = [
  "tar",
  "tokio",
  "ureq 2.12.1",
- "zip 7.2.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
@@ -8016,7 +8046,7 @@ version = "1.4.4"
 source = "git+https://github.com/spiceai/duckdb-rs.git?rev=40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9#40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9"
 dependencies = [
  "arrow",
- "calamine",
+ "calamine 0.28.0",
  "cast",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
@@ -10608,7 +10638,7 @@ dependencies = [
  "url",
  "uuid 1.23.2",
  "zeroize",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -12265,18 +12295,9 @@ dependencies = [
 
 [[package]]
 name = "lzma-rust2"
-version = "0.15.8"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e20f57f9918e5bd7bc58c22cdd70a6afc7375d4dd9683af5f2b34bd3d2bba619"
-dependencies = [
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "lzma-rust2"
-version = "0.16.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce716bf1a316f47a280fc76295f6495b5bea4752bca01c3b3885e101b1c23c02"
+checksum = "f1c46f3fcd2e888afdb01a07efc071cb21300e07c68d32c3e8b01b5c8cb1fcaa"
 dependencies = [
  "sha2 0.11.0",
 ]
@@ -13260,7 +13281,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "uuid 1.23.2",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -14691,7 +14712,7 @@ dependencies = [
  "snafu",
  "snap",
  "tokio",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -14843,7 +14864,7 @@ dependencies = [
  "spicepod",
  "tracing",
  "yaml",
- "zip 7.2.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
@@ -14925,7 +14946,7 @@ dependencies = [
  "snap",
  "tokio",
  "twox-hash",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -15702,9 +15723,9 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "ppmd-rust"
-version = "1.4.0"
+version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efca4c95a19a79d1c98f791f10aebd5c1363b473244630bb7dbde1dc98455a24"
+checksum = "cd4acc8d264ea385db64ccfdcdfd5909ee9eda0975666723d59f3bfec80b3611"
 
 [[package]]
 name = "ppv-lite86"
@@ -16270,6 +16291,7 @@ version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
+ "encoding_rs",
  "memchr",
  "serde",
 ]
@@ -20262,7 +20284,7 @@ dependencies = [
  "wiremock",
  "yaml",
  "zeroize",
- "zip 7.2.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
@@ -21405,7 +21427,7 @@ dependencies = [
  "tantivy-bitpacker",
  "tantivy-common",
  "tantivy-fst",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -23052,6 +23074,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
 
 [[package]]
+name = "typed-path"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
+
+[[package]]
 name = "typeface"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -24425,7 +24453,7 @@ dependencies = [
  "vortex-error",
  "vortex-mask",
  "vortex-session",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -26135,57 +26163,45 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "7.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
-dependencies = [
- "aes 0.8.4",
- "bzip2",
- "constant_time_eq 0.3.1",
- "crc32fast",
- "deflate64",
- "flate2",
- "generic-array",
- "getrandom 0.3.4",
- "hmac 0.12.1",
- "indexmap 2.14.0",
- "lzma-rust2 0.15.8",
- "memchr",
- "pbkdf2 0.12.2",
- "ppmd-rust",
- "sha1 0.10.6",
- "time",
- "typed-path",
- "zeroize",
- "zopfli",
- "zstd",
-]
-
-[[package]]
-name = "zip"
 version = "8.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
 dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap 2.14.0",
+ "memchr",
+ "typed-path 0.12.3",
+ "zopfli",
+]
+
+[[package]]
+name = "zip"
+version = "9.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec2e3161de27091f18a831d9494e9c53378a34833af5c1dda35ad85849da18d6"
+dependencies = [
  "aes 0.9.1",
  "bzip2",
- "constant_time_eq 0.4.2",
+ "constant_time_eq 0.6.1",
  "crc32fast",
  "deflate64",
  "flate2",
  "getrandom 0.4.2",
  "hmac 0.13.0",
  "indexmap 2.14.0",
- "lzma-rust2 0.16.4",
+ "lzma-rust2",
  "memchr",
+ "nix 0.31.3",
  "pbkdf2 0.13.0",
  "ppmd-rust",
  "sha1 0.11.0",
  "time",
- "typed-path",
+ "typed-path 0.13.0",
+ "windows-sys 0.61.2",
  "zeroize",
  "zopfli",
- "zstd",
+ "zstd 0.14.3",
 ]
 
 [[package]]
@@ -26218,7 +26234,16 @@ version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
 dependencies = [
- "zstd-safe",
+ "zstd-safe 7.2.4",
+]
+
+[[package]]
+name = "zstd"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
+dependencies = [
+ "zstd-safe 8.2.0",
 ]
 
 [[package]]
@@ -26231,10 +26256,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "zstd-sys"
-version = "2.0.16+zstd.1.5.7"
+name = "zstd-safe"
+version = "8.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.2+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
 dependencies = [
  "cc",
  "pkg-config",
