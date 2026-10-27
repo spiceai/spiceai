@@ -470,7 +470,13 @@ async fn hub_handler(State(mock): State<Mock>, request: Request<Body>) -> Respon
             let entries: Vec<_> = wanted
                 .iter()
                 .filter_map(|path| files.get(path).map(|file| (path, file)))
-                .map(|(path, file)| serde_json::json!({"type": "file", "oid": blob_id(&file.bytes)[..40].to_string(), "size": file.bytes.len(), "path": path}))
+                .map(|(path, file)| {
+                    let mut entry = serde_json::json!({"type": "file", "oid": blob_id(&file.bytes)[..40].to_string(), "size": file.bytes.len(), "path": path});
+                    if file.lfs {
+                        entry["lfs"] = serde_json::json!({"oid": blob_id(&file.bytes), "size": file.bytes.len(), "pointerSize": 133});
+                    }
+                    entry
+                })
                 .collect();
             response(
                 StatusCode::OK,
@@ -1850,6 +1856,31 @@ mod store_reads {
             matches!(error, object_store::Error::NotModified { .. }),
             "{error}"
         );
+    }
+
+    /// An LFS file lists its SHA-256, and a read reports the same `ETag`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_of_an_lfs_file_reports_its_listed_e_tag() {
+        let mock = Mock::start().await;
+        let file = File {
+            bytes: Bytes::from_static(b"id,name\n1,one\n"),
+            lfs: true,
+        };
+        mock.commit("r/lfs-etag", C1, vec![("data/a.csv", file)]);
+        let (store, _) = registered(&mock, "r/lfs-etag");
+        let listed = futures::TryStreamExt::try_collect::<Vec<_>>(
+            store.list(Some(&path("r/lfs-etag", "data"))),
+        )
+        .await
+        .expect("the listing");
+        let listed_etag = listed[0].e_tag.clone().expect("a listing e_tag");
+        assert_eq!(listed_etag.len(), 64, "the LFS SHA-256: {listed_etag}");
+
+        let read = store
+            .get(&path("r/lfs-etag", "data/a.csv"))
+            .await
+            .expect("an ordinary read");
+        assert_eq!(read.meta.e_tag, Some(listed_etag));
     }
 
     /// A read without a precondition does not depend on the file's description.
