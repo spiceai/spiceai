@@ -127,7 +127,7 @@ twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 uuid.workspace = true
-zip = "8.3.0"
+zip = "9.1"
 tokio-stream.workspace = true
 
 # Align on 0.21 (already pulled in via iceberg) so the binary carries one
