@@ -72,7 +72,7 @@
   "mysql-cdc-shared-binlog": 41,
   "mysql-cdc-upgrade": 12,
   "mysql-literals": 12,
-  "mysql-string-length": 9,
+  "mysql-string-length": 8,
   "mysql-types-acceleration": 10,
   "newest-by-time": 12,
   "on-zero-results": 20,
@@ -126,5 +126,5 @@
   "unparse-pruned-aggregate": 11,
   "unparse-set-operations": 6,
   "views": 11,
-  "unparse-aggregate-scopes": 3
+  "unparse-aggregate-scopes": 4
 }
