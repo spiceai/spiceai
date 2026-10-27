@@ -26,6 +26,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+mod archive;
 mod docx;
 mod pdf;
 pub use docx::DocxParser;
