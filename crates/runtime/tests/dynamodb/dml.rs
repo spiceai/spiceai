@@ -267,10 +267,7 @@ async fn dynamodb_dml_insert() -> anyhow::Result<()> {
             assert!(result.contains("Item 2"), "Should contain inserted Item 2");
             assert!(result.contains("seed"), "Should still contain seed row");
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -331,10 +328,7 @@ async fn dynamodb_dml_delete() -> anyhow::Result<()> {
             assert!(result.contains("Item 3"), "Item 3 should remain");
             assert!(result.contains("Item 4"), "Item 4 should remain");
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -409,10 +403,7 @@ async fn dynamodb_dml_insert_then_delete() -> anyhow::Result<()> {
             assert!(result.contains("Charlie"), "Charlie should remain");
             assert!(result.contains("Seed"), "Seed should remain");
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -479,10 +470,7 @@ async fn dynamodb_dml_insert_multiple_types() -> anyhow::Result<()> {
             assert!(result.contains("Test Row"), "Should contain name");
             assert!(result.contains("seed"), "Should still contain seed row");
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })
@@ -578,10 +566,7 @@ async fn dynamodb_dml_delete_composite_key_tuple_in() -> anyhow::Result<()> {
             );
             assert!(result.contains("beta-two"), "beta-two should remain");
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            running_container.cleanup().await;
 
             Ok(())
         })

@@ -1,0 +1,169 @@
+name: snapshots-policies
+description: >
+  When Cayenne snapshots are written and read. On a time interval with
+  `snapshots_creation_policy: always`, one per interval whether or not the
+  data changed; with `on_change`, only after something wrote the table. After each refresh
+  with `always`, one per refresh even when it changed nothing. A
+  `create_only` dataset writes snapshots but does not start from one; a
+  `bootstrap_only` dataset starts from them but never writes one.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshots-policies
+  snapshots:
+    enabled: true
+    location: file://${instance.dir}/snapshots/
+  datasets:
+    - from: postgres:public.a
+      name: every
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_check_interval: 1h
+        snapshots: enabled
+        snapshots_trigger: time_interval
+        snapshots_trigger_threshold: 2s
+        snapshots_creation_policy: always
+        params: { cayenne_file_path: '${instance.dir}/every-1', cayenne_metadata_dir: '${instance.dir}/meta-1' }
+    - from: postgres:public.b
+      name: changed
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_check_interval: 1h
+        snapshots: enabled
+        snapshots_trigger: time_interval
+        snapshots_trigger_threshold: 2s
+        snapshots_creation_policy: on_change
+        params: { cayenne_file_path: '${instance.dir}/changed-1', cayenne_metadata_dir: '${instance.dir}/meta-1' }
+    - from: postgres:public.c
+      name: per_refresh
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_check_interval: 1h
+        snapshots: enabled
+        snapshots_creation_policy: always
+        params: { cayenne_file_path: '${instance.dir}/per_refresh-1', cayenne_metadata_dir: '${instance.dir}/meta-1' }
+    - from: postgres:public.d
+      name: writer
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_check_interval: 1h
+        snapshots: create_only
+        params: { cayenne_file_path: '${instance.dir}/writer-1', cayenne_metadata_dir: '${instance.dir}/meta-1' }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE a (id int PRIMARY KEY, v text);
+        CREATE TABLE b (id int PRIMARY KEY, v text);
+        CREATE TABLE c (id int PRIMARY KEY, v text);
+        CREATE TABLE d (id int PRIMARY KEY, v text);
+        INSERT INTO a SELECT i, 'v' || i FROM generate_series(1, 100) i;
+        INSERT INTO b SELECT i, 'v' || i FROM generate_series(1, 100) i;
+        INSERT INTO c SELECT i, 'v' || i FROM generate_series(1, 100) i;
+        INSERT INTO d SELECT i, 'v' || i FROM generate_series(1, 100) i;
+  - start: {}
+  - query: SELECT id, v FROM every
+    oracle-sql: SELECT id, v FROM a
+  - query: SELECT id, v FROM changed
+    oracle-sql: SELECT id, v FROM b
+  - query: SELECT id, v FROM per_refresh
+    oracle-sql: SELECT id, v FROM c
+  - query: SELECT id, v FROM writer
+    oracle-sql: SELECT id, v FROM d
+  - assert-log:
+      count:
+        'Snapshot created dataset=per_refresh\b': 1
+        'Snapshot created dataset=writer\b': 1
+    eventually: 30s
+
+  # On an interval: `always` writes again and again, `on_change` once.
+  - sleep: 7s
+  - assert-log:
+      count:
+        'Snapshot created dataset=every\b': '>=3'
+        'Snapshot created dataset=changed\b': 1
+
+  # After each refresh: `always` writes even when nothing changed.
+  - refresh: per_refresh
+  - refresh: per_refresh
+  - assert-log:
+      count: { 'Snapshot created dataset=per_refresh\b': 3 }
+    eventually: 30s
+
+  # `on_change` on an interval: none while nothing writes the table; a full
+  # refresh rewrites it, so it counts as a change even when the rows are the
+  # same, and so does one that changes them.
+  - refresh: changed
+  - assert-log:
+      count: { 'Snapshot created dataset=changed\b': 2 }
+    eventually: 30s
+  - source-exec: { src: "UPDATE b SET v = 'changed' WHERE id <= 10" }
+  - refresh: changed
+  - query: SELECT id, v FROM changed
+    oracle-sql: SELECT id, v FROM b
+  - assert-log:
+      count: { 'Snapshot created dataset=changed\b': 3 }
+    eventually: 30s
+  - assert-log:
+      count: { 'Snapshot created dataset=changed\b': 3 }
+    consistently: 5s
+
+  # Empty local storage with the source down: `create_only` does not start
+  # from the snapshot it wrote, `bootstrap_only` does.
+  - query: SELECT id, v FROM writer
+    oracle-sql: SELECT id, v FROM d
+    id: written
+  - stop: {}
+  - stop-source: src
+  - start:
+      ready: false
+      patch:
+        datasets:
+          every: { acceleration: { params: { cayenne_file_path: '${instance.dir}/every-2', cayenne_metadata_dir: '${instance.dir}/meta-2' } } }
+          changed: { acceleration: { params: { cayenne_file_path: '${instance.dir}/changed-2', cayenne_metadata_dir: '${instance.dir}/meta-2' } } }
+          per_refresh: { acceleration: { params: { cayenne_file_path: '${instance.dir}/per_refresh-2', cayenne_metadata_dir: '${instance.dir}/meta-2' } } }
+          writer: { acceleration: { params: { cayenne_file_path: '${instance.dir}/writer-2', cayenne_metadata_dir: '${instance.dir}/meta-2' } } }
+  - sleep: 10s
+  - query: SELECT count(*) AS n FROM writer
+    expect-error: true
+  - stop: {}
+  - start:
+      ready: false
+      patch:
+        datasets:
+          every: { acceleration: { params: { cayenne_file_path: '${instance.dir}/every-3', cayenne_metadata_dir: '${instance.dir}/meta-3' } } }
+          changed: { acceleration: { params: { cayenne_file_path: '${instance.dir}/changed-3', cayenne_metadata_dir: '${instance.dir}/meta-3' } } }
+          per_refresh: { acceleration: { params: { cayenne_file_path: '${instance.dir}/per_refresh-3', cayenne_metadata_dir: '${instance.dir}/meta-3' } } }
+          writer: { acceleration: { snapshots: bootstrap_only, params: { cayenne_file_path: '${instance.dir}/writer-3', cayenne_metadata_dir: '${instance.dir}/meta-3' } } }
+  - query: SELECT id, v FROM writer
+    expect: { same-as: written }
+    eventually: 60s
+  - start-source: src
+  - source-exec: { src: "INSERT INTO d VALUES (1000, 'after')" }
+  - refresh: writer
+  - query: SELECT id, v FROM writer
+    oracle-sql: SELECT id, v FROM d
+    eventually: 60s
+  # (The log runs on across restarts: the one snapshot is the first start's.)
+  - assert-log:
+      count: { 'Snapshot created dataset=writer\b': 1 }
+    consistently: 3s

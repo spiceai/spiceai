@@ -107,7 +107,8 @@ async fn create_table(
     Ok((table, ctx, table_id))
 }
 
-/// Every write goes to a Vortex file, and compaction runs only when driven.
+/// Every write goes to a Vortex file, and no interval scheduler compacts. A write
+/// still schedules a post-write compaction once the table has enough new files.
 fn files_only_config() -> VortexConfig {
     VortexConfig {
         inline_max_rows: 0,
@@ -424,6 +425,10 @@ async fn no_pk_full_rewrite_removes_the_vector_files_it_clears(
         },
     )
     .await?;
+    // Once two files exist, a post-write compaction comes due, and on a slow host
+    // it commits before the setup below is done. Hold it off until the explicit
+    // rewrite.
+    let held = table.hold_compaction().await;
     for start in [1_i64, 6, 11] {
         let rows: Vec<Row> = (start..start + 5)
             .map(|id| row(id, Some("g"), Some(id)))
@@ -442,6 +447,7 @@ async fn no_pk_full_rewrite_removes_the_vector_files_it_clears(
         "one vector per data file before the rewrite"
     );
 
+    drop(held);
     assert!(
         table.maybe_compact_small_files().await?,
         "the rewrite committed"

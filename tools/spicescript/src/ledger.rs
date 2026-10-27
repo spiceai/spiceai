@@ -237,11 +237,14 @@ impl Ledger {
             }
         }
         let none_failed = failures.is_empty();
-        if none_failed && !entries.is_empty() && entries.iter().all(|e| e.may_pass) {
+        // Entries for runs and variants `--matrix` or `--variant` left out
+        // were not checked, so their passing says nothing.
+        let ran = |e: &Entry| !script.left_out.covers(&e.run, &e.who);
+        let checked = entries.iter().filter(|e| ran(e)).count();
+        if none_failed && checked > 0 && entries.iter().filter(|e| ran(e)).all(|e| e.may_pass) {
             verdict.notes.push(format!(
-                "{}: none of its {} expected failures failed this run; if this repeats, its bug may be fixed",
+                "{}: none of its {checked} expected failures failed this run; if this repeats, its bug may be fixed",
                 script.name,
-                entries.len()
             ));
         }
         // A run, or one instance of it, that failed outside its steps: starting
@@ -252,7 +255,7 @@ impl Ledger {
             .map(|f| (f.run.as_str(), f.who.as_str()))
             .collect();
         for (entry, matched) in entries.iter().zip(matched) {
-            if !matched && !entry.may_pass {
+            if !matched && !entry.may_pass && ran(entry) {
                 let stopped = stopped
                     .iter()
                     .any(|&(run, who)| run == entry.run && (who.is_empty() || who == entry.who));
@@ -273,8 +276,9 @@ impl Ledger {
     }
 
     /// Replaces a script's entries with its current failures, keeping the
-    /// group and `may-pass` of an entry that is still there, and a `may-pass`
-    /// entry that passed this time.
+    /// group and `may-pass` of an entry that is still there, a `may-pass`
+    /// entry that passed this time, and the entries of runs and variants
+    /// `--matrix` or `--variant` left out.
     pub fn record(&mut self, script: &Script, failures: &[Failure]) {
         let old = self.entries(script).to_vec();
         let group_of_dir = known_failing_group(&script.dir);
@@ -322,10 +326,10 @@ impl Ledger {
                 }
             })
             .collect();
-        entries.extend(
-            old.into_iter()
-                .filter(|e| e.may_pass && !failures.iter().any(|f| failure_id(f) == e.id())),
-        );
+        entries.extend(old.into_iter().filter(|e| {
+            (e.may_pass || script.left_out.covers(&e.run, &e.who))
+                && !failures.iter().any(|f| failure_id(f) == e.id())
+        }));
         let file = self.files.entry(script.dir.clone()).or_default();
         if entries.is_empty() {
             file.remove(&script.file_stem);
@@ -789,6 +793,28 @@ mod tests {
             1,
             "another failure is still a change"
         );
+    }
+
+    #[test]
+    fn entries_of_what_a_selection_left_out_are_neither_gone_nor_dropped() {
+        let mut script = script_in("x");
+        script.left_out.variants.insert("other".into());
+        let mut skipped = entry("other", false);
+        skipped.key = "assert-status: b".into();
+        let mut ledger = ledger(&script, vec![entry("a", false), skipped.clone()]);
+        // The selected variant's expected failure fails; the other's never ran.
+        let verdict = ledger.judge(&script, &[failure("a")]);
+        assert_eq!(verdict.expected, 1);
+        assert!(verdict.gone.is_empty(), "{:?}", verdict.gone);
+        // Recording keeps the entry the run could not have seen.
+        ledger.record(&script, &[failure("a")]);
+        assert_eq!(
+            ledger.entries(&script),
+            [entry("a", false), skipped.clone()]
+        );
+        // Without the selection, the same run reports it gone.
+        let verdict = ledger.judge(&script_in("x"), &[failure("a")]);
+        assert_eq!(verdict.gone, [skipped]);
     }
 
     #[test]

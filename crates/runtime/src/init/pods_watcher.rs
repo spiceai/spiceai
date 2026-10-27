@@ -353,11 +353,11 @@ impl Runtime {
             Arc::clone(&self)
                 .apply_catalog_diff(current_app, &new_app)
                 .await;
-            Arc::clone(&self)
+            let reloaded_datasets = Arc::clone(&self)
                 .apply_dataset_diff(current_app, &new_app)
                 .await;
             Arc::clone(&self)
-                .apply_view_diff(current_app, &new_app)
+                .apply_view_diff(current_app, &new_app, &reloaded_datasets)
                 .await;
             self.apply_model_diff(current_app, &new_app).await;
             crate::datafusion::udf::apply_function_diff(&self, current_app, &new_app).await;

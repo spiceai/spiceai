@@ -115,18 +115,19 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `2e8b24f72e4dffb694fa2dbe3e1f9bd56ea528e7` | `spiceai-55` |
+| [datafusion](#datafusion) | `3a75c403e4db3bc2f76f0d8c2cfce610f52f3675` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `f103fe809cc186168833632b9a0ee07ff40a9283` | `spiceai-55` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `4a2920746865562e604150fbee49eea6241c0b85` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
+| [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
-| [iceberg-rust](#iceberg-rust) | `a6b07b8b9625e552c502c3a7229fd4bb7725bd2e` | `spiceai-0.11.0-df-55` |
+| [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
 | [llama.cpp](#llamacpp) | `1082d1983689a13315cdf2a80d9bd0bbdd572da2` | `spiceai-b11803` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `aa8e8d43949970b91fb42a2243b4f60f810d9bbd` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
+| [orc-rust](#orc-rust) | `5b35c6d10a8cbd9750d501216ff04e72e23829b6` | `spiceai-0.9` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
 | [sea-query](#sea-query) | `ae75baef819513fb8d19af014972dcfa324e201a` | `spiceai` |
@@ -217,7 +218,8 @@ fetch through a single-input repartition, #266, which charges each slice of a ba
 sort shares with its producer for the slice's own rows, #261, which keeps a union input's own
 `ORDER BY` and `LIMIT` inside that input, #262, which keeps a cast that drops decimal digits out
 of `unwrap_cast`, the unparser fixes #246, #247 and #264, and #268, which narrows #266's copy to
-batches whose rows are slices of larger buffers; the pin is #268's merge commit. None changes a
+batches whose rows are slices of larger buffers, and #273, upstream apache/datafusion#23232
+cherry-picked from `main`; the pin is #273's merge commit. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
@@ -290,6 +292,7 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Placeholder type inference (`Expr::infer_placeholder_types`, incl. `CASE`, `LIMIT`/`OFFSET` `Int64`, name/metadata preservation) (fork PRs #87, #88, #89, #167, and commit `d37a426e`) | A parameterised query fails to plan, or infers the wrong type for `$1` | silent (query failure) | `crates/runtime/src/datafusion/query.rs::every_shape_the_fork_patches_cover_infers_its_parameter_type`, `…::a_limit_and_an_offset_placeholder_are_both_int64`, `…::a_comparison_of_two_placeholders_still_plans`, `…::a_placeholder_inferred_from_a_column_keeps_the_columns_metadata` |
 | Placeholder type inference stays linear in the depth of an expression: an expression without a placeholder is returned before the walk, and an operand's field is looked up only beside an untyped placeholder (spiceai/datafusion#259) | Planning a wide disjunction, such as a batched primary-key lookup, becomes quadratic in its width again, with or without a placeholder. A lookup of 100 four-column keys spent ~147 ms in logical planning without the patch and ~2 ms with it | silent (perf) | `crates/runtime/src/datafusion/query.rs::a_wide_disjunction_plans_in_time_linear_in_its_width` (400 branches must plan in under 8× the time of 100) |
 | `unwrap_cast` keeps a cast that drops decimal digits — a decimal with fractional digits cast to an integer, or a decimal cast to a smaller scale — on the column instead of moving it onto the literal, in the logical and physical simplifiers (`is_decimal_scale_narrowing_cast`; spiceai/datafusion#262; upstream tracks the class as apache/datafusion#23095) | `CAST(price AS BIGINT) = 173665` over a `DECIMAL(15, 2)` column is rewritten to `price = 173665.00`, which holds for one value where every price in [173665, 173666) should match, and a range on the same cast returns a row outside it; on TPC-H SF1, `orders WHERE CAST(o_totalprice AS BIGINT) = 173665` returned 0 rows instead of 4 ([#14969](https://github.com/spiceai/spiceai/issues/14969)) | silent (wrong data) | **GAP** — the guard, `crates/runtime-datafusion/src/fork_backport_guards.rs::a_filter_on_a_decimal_cast_that_drops_digits_keeps_the_cast`, lands with [#15207](https://github.com/spiceai/spiceai/pull/15207); see [Open gaps](#open-gaps) |
+| Type coercion turns an implicit cast of a scalar function's literal argument into a literal of the coerced type, so `return_field_from_args` sees the literal (`coerce_scalar_function_arguments_for_signature` in `analyzer/type_coercion.rs`, `scalar_arguments_for_fields` in `expr_schema.rs`; spiceai/datafusion#273, upstream apache/datafusion#23232) | `round(decimal, 2)` plans `decimal(p+1, s)` after analysis, where the literal hides behind `CAST(Int64(2) AS Int32)`, and `decimal(p, 2)` after the simplifier folds the cast; the optimizer's schema check ignores decimal precision and scale, so nothing fails. Flight SQL `GetFlightInfo` announces the analyzed schema and the stream sends the other, so ADBC clients fail every `round` over a decimal with "endpoint 0 returned inconsistent schema" ([#15652](https://github.com/spiceai/spiceai/issues/15652)) | silent (query failure) | `crates/runtime/src/datafusion/query.rs::get_schema_matches_streamed_schema_for_decimal_round` (announced against streamed type for a literal, a column and `avg`); in the fork, `expr_schema::tests::scalar_arguments_*` and `test_return_field_args_scalar_argument_types_match_arg_fields` |
 | BigQuery dialect: temporal typing and naming — a tz-naive timestamp cast is `DATETIME` not `TIMESTAMP`, a timestamp literal's cast target follows the offset it renders with, sub-second digits are truncated to six, a comparison BigQuery has no supertype for is brought to one, `date - date` is `DATE_DIFF`, `CAST(date AS INT64)` is `UNIX_DATE`, `btrim`/`now`/`to_unixtime`/`unix_seconds`/`to_timestamp` are renamed or type-directed, `median`/`approx_percentile_cont` are rendered by ordering the group, a constant `GROUP BY` key is cast to its own type, and `array_element` subscripts with `SAFE_ORDINAL` (fork PR #212) | BigQuery puts no timezone qualifier on a timestamp type, so a tz-naive value typed `TIMESTAMP` becomes an instant with no supertype against a `DATETIME` column and the statement is refused; the name and cast rows are refused outright too. Two are quieter: `array_element` is 1-based where a bare BigQuery subscript is 0-based, so the neighbouring element is read with no error, and dropping a constant grouping key turns a grouped aggregate into a global one, returning one row of zeros where the grouped form returns none | silent (query failure; wrong data for the subscript and the dropped grouping key) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the four `#212` arms: `DATE_DIFF`, `UNIX_DATE`, `DATETIME`, cast `GROUP BY`) and `::array_element_federates_only_for_a_non_negative_integer_index`; in the fork, the per-rendering tests in `plan_to_sql.rs` and, restored by fork PR #214 after #212 deleted them, `rewrite.rs`'s own; real-engine guard: `test/scripts/bigquery-pushdown.sh` |
 | Spark concat coerces an untyped NULL argument to a string type (fork PR #217). Upstream adopted the behaviour in DataFusion 55 (`ConcatFunc` coercion, apache/datafusion#22244), so the merge took upstream's `coerce_types`; the fork keeps its tests | A string array concatenated with an untyped NULL reaches an unsupported kernel branch | silent (panic) | `crates/runtime/src/datafusion/builder.rs::tests::the_built_session_concatenates_an_untyped_null` |
 | Substrait VarChar literals decode as UTF-8 strings (fork PR #215) | Plans containing VarChar literals fail to decode | silent (query failure) | `crates/runtime/src/flight/flightsql/statement_substrait_plan.rs::tests::decode_plan_executes_a_varchar_literal`; `tools/substrait-compliance/src/mode_a.rs::varchar_literal_lowers_to_utf8` (Isthmus TPC-H plans emit `VarChar` literals such as `EUROPE`, length 25; the Mode A harness `spice-substrait-compliance` exercises them on q02/q03/q05/q11/q12/q16/q17/q19–q22) |
@@ -525,6 +528,7 @@ which #49 was squash-merged from), the only other source change is an equivalent
 | Bundled DuckDB version pinned to the release (fork PR #38) | Extension downloads resolve against a mismatched DuckDB version and fail | silent | covered by the two extension guards above |
 | Thrift `TEnumIterator::operator==` backport for macOS 27 / libc++ (fork PR #47; upstream [duckdb/duckdb@fccde6aa](https://github.com/duckdb/duckdb/commit/fccde6aa1932f48dfa6282a916ea2477b57aa44d)) | Bundled DuckDB with Parquet fails to compile against the macOS 27 SDK: newer libc++ constructs Thrift enum maps with `iterator == end`, and the vendored Thrift header only defined `operator!=` | build (macOS 27) | `scripts/check_fork_patches.py::duckdb_thrift_iterator_equality` — reads `operator==(const TEnumIterator` out of the pinned revision's `duckdb.tar.gz`. The fork's own `crates/libduckdb-sys/tests/test_bundled_thrift.py` covers the same property inside the fork and does not survive a re-cut of this pin |
 | Arrow bumped to 59 (fork PR #49, squash-merged into `spiceai-1.4.4`), with the fork's `test_fixed_array_roundtrip` rebuilt from a whole number of lists — arrow 58 silently dropped a trailing value that arrow 59 rejects | Upstream duckdb-rs is on arrow 58 on every line. Without the bump the workspace resolves two arrow majors, and every Arrow value that crosses into or out of DuckDB — the accelerator's appender and its query results, `register_arrow_scan_view` — is a type from the other copy, so the crates that call it stop compiling. The test fix is fork-internal and changes no behaviour here | build | compile-guarded by `crates/accelerators/accelerator-duckdb` and `crates/data_components/src/ducklake/writer.rs`, which pass arrow types across that boundary |
+| Brotli decoder rejects an invalid block switch with `BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH` instead of decoding on with stale block-type state (fork PR #53, from spiceai/duckdb#20; upstream [duckdb/duckdb#27791](https://github.com/duckdb/duckdb/pull/27791), a port of [google/brotli@0ed4268a](https://github.com/google/brotli/commit/0ed4268a4401abcb4472096340477cf4af7d1a2b)) | A malformed Brotli-compressed page in a Parquet file that DuckDB reads can write out of bounds in the decoder (CVE-2026-111497) | silent (memory corruption) | `scripts/check_fork_patches.py::duckdb_brotli_block_switch` — reads the `BLOCK_SWITCH, -17` error code and the decoder path that returns it out of the pinned revision's `duckdb.tar.gz` |
 | `ToSql for DateTime<Tz>` writes the UTC instant instead of the local wall-clock fields with a `+00:00` suffix (fork PR #50, backport of upstream duckdb-rs `2bf67df`) | A non-UTC `chrono::DateTime` bound as a parameter is stored shifted by its UTC offset | none in this workspace | Not reachable here: the impl is behind duckdb-rs's `chrono` feature, which no crate in this workspace enables (`cargo metadata` resolves `duckdb` without it), so nothing binds a `chrono::DateTime` through `ToSql`. A change that enables `chrono` turns this into a silent wrong-data row and needs a guard with it |
 
 ## iceberg-rust
@@ -543,6 +547,7 @@ upstream's new REST auth API.
 | Pinned snapshot reads in `IcebergTableProvider` (fork PR #45) | A scan reads the current snapshot instead of the pinned one — time-travel and repeatable reads silently return live data | silent (wrong data) | `crates/data_components/src/iceberg/provider.rs::a_scan_pinned_to_a_snapshot_reads_that_snapshot_not_the_current_one` |
 | `IcebergTableScan` decodes at the session `batch_size` (fork PR #58) | Every Iceberg scan decodes 1024-row batches, the Parquet reader's default, instead of the session's 8192, and every operator downstream pays its per-batch cost 8x as often | silent (perf) | `crates/data_components/src/iceberg/provider.rs::a_scan_uses_the_session_batch_size` |
 | An unpinned scan projects the table's current schema, not the schema its current snapshot was written with (cherry-pick of apache/iceberg-rust#2904, fork PR #59) | A table whose last commit is schema-only (`ADD`/`RENAME COLUMN` with no write since) fails every query, including `SELECT *`, with `Column … not found in table`, and an accelerated copy never loads; a dropped column stays visible | silent (query failure) | `crates/runtime/tests/iceberg/schema_only_commit/mod.rs` (the `iceberg::schema_only_commit` integration tests): rename, add and drop as the last commit, read catalog-less, pinned by `iceberg_metadata_path`, through the catalog connector, and arrow-accelerated, with an unchanged table as the control |
+| `GlueCatalogBuilder::with_sdk_config` (fork PR #60) | The Glue connector's Iceberg catalog signs with static credentials, so a dataset on temporary AWS credentials (web identity, assumed role, SSO) fails every refresh with `ExpiredTokenException` once they expire | build | compile-guarded by `crates/runtime/src/dataconnector/glue.rs`, which calls it; the per-request credential resolution is guarded by the fork's `catalog::tests::sdk_config_credentials_are_resolved_per_request` |
 | Parallel file scanning with eager task bucketing (fork PR #43) | Iceberg scans lose file-level parallelism | silent (perf) | **GAP** |
 | `IcebergTableProvider::try_new` made public | No construction path from Spice | build | compile-guarded by `crates/data_components/src/iceberg/provider.rs`, which calls it |
 | `IcebergTableProvider::catalog` and `::table_ident` exposed (fork PR #49, on `spiceai-0.11.0-df-55`) | The Iceberg REST `loadTable` cannot load the table a provider reads, so no table can be served to an Iceberg client as itself | build | compile-guarded by `crates/runtime/src/http/v1/iceberg/passthrough.rs`, which calls both; what is served is guarded by `…::tests::an_iceberg_table_read_unchanged_is_served_as_itself` |
@@ -650,6 +655,16 @@ Upstream [MinishLab/model2vec-rs](https://github.com/MinishLab/model2vec-rs).
 | IDs-only fast WordPiece tokenizer for the potion models | Static embedding throughput drops sharply | silent (perf) | **GAP** |
 | `config.json` made optional, and the embedding tensor read from `embedding.weight` or `0` as well as `embeddings`, for sentence-transformers compatibility (fork commit `f1190f1f`) | Loading a sentence-transformers static model fails. Two independent halves of the same use case: such an export ships no `config.json` **and** names its tensor `embedding.weight`, so losing either one leaves the model failing to load | silent (load failure) | `crates/llms/src/model2vec.rs::a_local_model_loads_without_a_config_json` and `…::a_local_model_loads_with_the_sentence_transformers_tensor_names`, against a model directory the test writes — a tokenizer and a hand-built `safetensors` tensor, no `config.json`, and the tensor name as a parameter so each test is the other's control |
 | HF cache directory read from the environment (fork commit `1259c0d3`) | Nothing in Spice: Spice downloads a `model2vec` model into the Hugging Face cache itself and hands `model2vec-rs` the local snapshot, so the fork's own Hub download never runs. The patch can be dropped at the next re-cut | none | Not needed. `crates/llms/tests/model2vec_hf_cache.rs::a_cached_model_is_read_from_the_directory_hf_hub_cache_names` guards Spice's own use of the cache `HF_HUB_CACHE` names instead. It sets process-wide environment variables, so it calls `require_process_per_test` first; it is a module of `llms`'s `integration` binary, selected in the Makefile's `NEXTEST_FILTER` alongside the other credential-free `llms` modules |
+
+## orc-rust
+
+Upstream [datafusion-contrib/orc-rust](https://github.com/datafusion-contrib/orc-rust),
+branch `spiceai-0.9` cut from upstream `v0.9.0`.
+
+| Patch | What breaks if it is lost | Loss | Guard |
+|---|---|---|---|
+| Metadata streams (file footer, file metadata, stripe footers, row indexes, bloom filters) fail once decoded output exceeds both 64 MiB and 100 times the encoded size; column data streams stay unbounded | A small ORC file with a highly compressible footer makes the runtime allocate until it runs out of memory | silent (memory) | `crates/dataformat-orc/src/file_format.rs::infer_schema_rejects_high_ratio_compressed_footer` |
+| Each codec stops decoding at the remaining allowance, with LZO decoded through `lzo` into a bounded buffer instead of `lzokay-native` | One compressed chunk is decoded in full before the bound rejects it, so a single chunk can still allocate up to its own expansion | silent (memory) | **GAP** — the bound above still rejects the stream after the chunk decodes, so only a memory measurement can tell the two apart |
 
 ## text-splitter
 
@@ -791,7 +806,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**40 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**41 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -809,7 +824,7 @@ They are not equal in consequence; this is the order to close them in.
    a minimal repro built here.
 2. `text-embeddings-inference` pooling and model-loading fixes — embeddings
    differ from the reference implementation.
-3. `datafusion` fixes the pin to spiceai/datafusion#268 carries ahead of their
+3. `datafusion` fixes the pin to spiceai/datafusion#273 carries ahead of their
    guards, four rows. #262 (a decimal cast that drops digits) has its guard in
    [#15207](https://github.com/spiceai/spiceai/pull/15207), which replaces its
    **GAP** marker when it lands. The unparser fixes #246, #247 and #264
@@ -853,22 +868,25 @@ They are not equal in consequence; this is the order to close them in.
    error, an HTTP 500, or a hang), never with wrong text. A guard needs a GGUF of
    each architecture small enough for CI; today's evidence is those models served
    on the 3-node DGX Spark cluster.
+9. `orc-rust` in-codec decode allowance — losing it lets one compressed metadata
+   chunk decode in full before the stream is rejected. A guard needs a memory
+   measurement around one ORC open; the rejection itself is guarded.
 
 **Blocked, not merely undone.** These have been looked at and cannot be closed by
 writing a test; each says what would unblock it:
 
-9. `snowflake-rs` (five rows) — no host override, private response types. Needs a
+10. `snowflake-rs` (five rows) — no host override, private response types. Needs a
    live account, or an upstream change letting the base URL be set.
-10. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
+11. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
    race, so any test of it is a timing test. Upstream has since removed the code
    path and the lock (vortex-data/vortex#8919); if a run confirms that, drop the row
    rather than guard it.
-11. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
+12. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
 
 **Reported late rather than wrongly.** The right answer, after an avoidable wait:
 
-12. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
+13. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
    `endpoint` is retried through the whole backoff budget before reporting, so a
    configuration error looks like a slow provider. What changes is *when* the
    error arrives, and asserting that is a timing test.
@@ -876,7 +894,7 @@ writing a test; each says what would unblock it:
 **Diagnostics only.** The query is unaffected; what is lost is the ability to see
 how it ran:
 
-13. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
+14. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
    upstream's; `EXPLAIN FORMAT TREE` is not carried) — plain `EXPLAIN` is guarded
    through the cluster harness, and `ANALYZE` is not issued through it by anything. Closing this needs the
    harness to submit the statement rather than build its text as a label.
@@ -887,7 +905,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-14. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+15. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `mistral.rs` `deepseek41` and `glm5-next` decode kernels (spiceai/mistral.rs#49), which
     no suite here trends yet — their evidence is the DGX Spark decode A/B in that PR;
@@ -900,7 +918,7 @@ without becoming a flaky timing test:
 **Unoptimised builds only.** No query answers anything differently; what is lost
 is stack headroom in a debug build (release builds were not measured):
 
-15. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
+16. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
     it keeps the unparser's opt-level-0 frame from growing with #233 and #234, which
     without it push the fork's `roundtrip_statement` past the 2 MiB default test
     thread (it needs 2,112 KiB without the refactor, 1,984 KiB with it). This repo's

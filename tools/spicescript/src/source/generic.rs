@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 //! A source that is any Docker image (`kind: docker`), for systems with no
-//! source of their own here, such as MongoDB, `DynamoDB` under `LocalStack`, or
-//! Kafka. `source-exec` runs a shell command inside the container and
+//! source adapter of their own here. `source-exec` runs a shell command inside
+//! the container and
 //! `source-query` returns the lines a command prints, one row each. The
 //! script isolates instances itself, by naming its databases, tables or
 //! topics after `${sources.<name>.namespace}`.
@@ -126,14 +126,7 @@ impl Source for Generic {
 
     async fn query(&self, _namespace: &str, command: &str) -> Result<TextResult> {
         let out = self.shell(command).await?;
-        Ok(TextResult {
-            columns: vec!["line".into()],
-            rows: out
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| vec![Some(l.trim_end().to_string())])
-                .collect(),
-        })
+        Ok(output_lines(&out))
     }
 
     fn dialect(&self) -> Dialect {
@@ -148,5 +141,32 @@ impl Source for Generic {
         _rows: &mut (dyn Iterator<Item = Vec<Option<String>>> + Send),
     ) -> Result<u64> {
         bail!("a docker source is loaded with source-exec commands")
+    }
+}
+
+/// A command's output as a one-column answer, `line`: one row per line, kept
+/// as printed, so blank lines and trailing spaces are part of the answer. A
+/// command whose output needs cleaning does it itself.
+fn output_lines(out: &str) -> TextResult {
+    TextResult {
+        columns: vec!["line".into()],
+        rows: out.lines().map(|l| vec![Some(l.to_string())]).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::output_lines;
+
+    #[test]
+    fn keeps_blank_lines_and_trailing_spaces() {
+        let rows: Vec<Option<String>> = output_lines("alpha  \n\n \nbeta\n")
+            .rows
+            .into_iter()
+            .flatten()
+            .collect();
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(rows, vec![s("alpha  "), s(""), s(" "), s("beta")]);
+        assert!(output_lines("").rows.is_empty());
     }
 }

@@ -1,0 +1,97 @@
+name: cron-and-reload
+description: >
+  refresh_cron refreshes a Cayenne acceleration on its schedule: a full
+  refresh, an append and an accelerated view each follow the source with no
+  manual refresh. With the spicepod watched, edits take effect without a
+  restart: a slower cron made faster, a dataset added and one removed, and a
+  view's SQL changed.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cron-and-reload
+  datasets:
+    - from: postgres:public.t
+      name: full_cron
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_cron: '*/2 * * * * *' }
+    - from: postgres:public.events
+      name: append_cron
+      params: ${sources.src.params}
+      time_column: at
+      time_format: timestamptz
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: append, refresh_cron: '*/2 * * * * *' }
+    - from: postgres:public.t
+      name: slow_cron
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_cron: '0 0 * * * *' }
+    - from: postgres:public.t
+      name: removed_later
+      params: ${sources.src.params}
+  views:
+    - name: v
+      sql: SELECT id, v FROM full_cron WHERE id <= 10
+      acceleration: { enabled: true, engine: cayenne, refresh_cron: '*/2 * * * * *' }
+
+defaults:
+  expect: { oracle: src }
+  spiced-args: [--pods-watcher-enabled]
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text);
+        INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 100) i;
+        CREATE TABLE events (id int PRIMARY KEY, at timestamptz NOT NULL);
+        INSERT INTO events SELECT i, TIMESTAMPTZ '2025-01-01 00:00:00+00' + i * INTERVAL '1 minute' FROM generate_series(1, 100) i;
+  - start: {}
+  - query: SELECT id, v FROM full_cron
+    oracle-sql: SELECT id, v FROM t
+
+  # Each schedule picks up source changes on its own.
+  - source-exec:
+      src: |
+        UPDATE t SET v = 'changed' WHERE id <= 5;
+        DELETE FROM t WHERE id > 90;
+        INSERT INTO events SELECT i, TIMESTAMPTZ '2025-06-01 00:00:00+00' + i * INTERVAL '1 minute' FROM generate_series(101, 120) i;
+  - query: SELECT id, v FROM full_cron
+    oracle-sql: SELECT id, v FROM t
+    eventually: 30s
+  - query: SELECT id, at FROM append_cron
+    oracle-sql: SELECT id, at FROM events
+    eventually: 30s
+  - query: SELECT id, v FROM v
+    oracle-sql: SELECT id, v FROM t WHERE id <= 10
+    eventually: 30s
+  # The hourly schedule has not run.
+  - query: SELECT count(*) AS n FROM slow_cron
+    expect: { rows: [['100']] }
+    consistently: 5s
+
+  # Edits to the watched spicepod.
+  - edit-spicepod:
+      datasets:
+        slow_cron: { acceleration: { refresh_cron: '*/2 * * * * *' } }
+  - query: SELECT id, v FROM slow_cron
+    oracle-sql: SELECT id, v FROM t
+    eventually: 60s
+  - edit-spicepod:
+      spicepod:
+        datasets:
+          - { from: 'postgres:public.t', name: full_cron, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_cron: '*/2 * * * * *' } }
+          - { from: 'postgres:public.events', name: added_later, params: '${sources.src.params}' }
+        views:
+          - name: v
+            sql: SELECT id, v FROM full_cron WHERE id > 80
+  - query: SELECT id, at FROM added_later
+    oracle-sql: SELECT id, at FROM events
+    eventually: 60s
+  - query: SELECT count(*) FROM removed_later
+    expect-error: removed_later
+    eventually: 60s
+  - query: SELECT id, v FROM v
+    oracle-sql: SELECT id, v FROM t WHERE id > 80
+    eventually: 60s

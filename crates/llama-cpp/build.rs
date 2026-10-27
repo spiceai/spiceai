@@ -223,6 +223,9 @@ fn bindings(root: &Path) {
         // into Rust, which only an unwinding ABI allows. Rust then aborts where it would
         // catch it, as llama.cpp's own unhandled exception would.
         .override_abi(bindgen::Abi::CUnwind, "(llama|spice)_.*")
+        // `FILE` only crosses the API as a pointer. glibc declares fields of its `_IO_FILE`
+        // as bitfields, and bindgen's accessors for those fail the lint gate.
+        .opaque_type("_IO_FILE")
         .layout_tests(false)
         .generate()
         .expect("bindgen generates the llama.cpp bindings")

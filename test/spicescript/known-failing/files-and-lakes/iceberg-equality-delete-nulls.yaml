@@ -1,0 +1,41 @@
+# Known failing (#15549; oracle): DuckDB's Iceberg reader drops a row whose
+# equality-delete key columns are NULL, so it disagrees with Spice — which is
+# right per the Iceberg spec — after Spice deletes a row that shares the NULL
+# row's non-NULL keys. Move this script up a level once DuckDB is fixed.
+name: iceberg-equality-delete-nulls
+description: >
+  After Spice deletes ('x', false, …) with an equality delete, a row ('x', NULL,
+  …) survives for every reader of the table.
+
+sources:
+  ice: { kind: iceberg }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: iceberg-equality-delete-nulls
+  datasets:
+    - from: 'iceberg:${sources.ice.catalog}/v1/namespaces/${sources.ice.namespace}/tables/t'
+      name: t
+      access: read_write
+      params: ${sources.ice.params}
+
+defaults:
+  expect: { oracle: ice }
+
+steps:
+  - source-exec:
+      ice: "CREATE TABLE t (batch VARCHAR, b BOOLEAN, i INTEGER, l BIGINT, f REAL, d DOUBLE, dec DECIMAL(10, 4), dt DATE, ts TIMESTAMP, bin BLOB)"
+  - start: {}
+  - spice-exec: >-
+      INSERT INTO t (batch, b, i, l, f, d, dec, dt, ts, bin) VALUES
+      ('x', TRUE, 1, 10000000001, 1.5, 2.25, 12345.6789, DATE '2024-01-01', TIMESTAMP '2024-01-01 02:03:04', X'00FFAB'),
+      ('x', FALSE, 2, 20000000002, -0.5, -1.125, -0.0001, DATE '1999-12-31', TIMESTAMP '1999-12-31 23:59:59', X''),
+      ('x', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+  - spice-exec: DELETE FROM t WHERE batch = 'x' AND b = false
+  # Spice's answer, which the Iceberg spec gives.
+  - query: SELECT batch, b, i FROM t
+    expect: { rows: [["x", "true", "1"], ["x", null, null]] }
+  # DuckDB reading the same snapshot.
+  - query: SELECT batch, b, i FROM t
+    eventually: 10s

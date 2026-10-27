@@ -26,6 +26,7 @@ pub mod context;
 pub mod control_stream_client;
 pub mod correlated;
 pub mod executor_liveness;
+pub mod executor_processes;
 pub mod executor_registry;
 pub mod executor_selection;
 pub mod flight_config;

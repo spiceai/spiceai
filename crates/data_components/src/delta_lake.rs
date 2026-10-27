@@ -353,28 +353,27 @@ impl DeltaTable {
         self
     }
 
-    /// Gets the latest snapshot by paginating object storage. It uses version hints from the currently
-    /// bound snapshot to prune the log scan.
-    ///
-    /// At the start of a scan, you can get the latest snapshot then reuse it via `DeltaTable::bound_snapshot`
-    /// without polling object storage.
-    fn get_and_update_snapshot(&self) -> Result<SnapshotRef> {
-        let mut current_snapshot = self
+    fn current_snapshot(&self) -> Result<SnapshotRef> {
+        self.snapshot
+            .read()
+            .map(|snapshot| Arc::clone(&*snapshot))
+            .map_err(|e| Error::SnapshotLockError {
+                source: format!("Unable to read snapshot {e}").into(),
+            })
+    }
+
+    /// Stores `latest` unless a concurrent scan already stored a newer version.
+    fn store_snapshot(&self, latest: &SnapshotRef) -> Result<()> {
+        let mut current = self
             .snapshot
             .write()
             .map_err(|e| Error::SnapshotLockError {
                 source: format!("Unable to update snapshot {e}").into(),
             })?;
-
-        let new_snapshot = Snapshot::builder_from(Arc::clone(&*current_snapshot))
-            .build(self.engine.as_ref())
-            .context(DeltaTableSnafu)?;
-
-        if new_snapshot != *current_snapshot {
-            *current_snapshot = new_snapshot;
+        if latest.version() > current.version() {
+            *current = Arc::clone(latest);
         }
-
-        Ok(Arc::clone(&*current_snapshot))
+        Ok(())
     }
 
     /// Builds the logical (user-facing) Arrow schema from the snapshot's delta schema.
@@ -1028,7 +1027,7 @@ impl TableProvider for DeltaTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
-        let Ok(snapshot) = self.get_and_update_snapshot() else {
+        let Ok(current_snapshot) = self.current_snapshot() else {
             return exec_err!("Unable to get latest Delta table snapshot");
         };
 
@@ -1047,14 +1046,21 @@ impl TableProvider for DeltaTable {
         // Clone the filters since we need to move them into the spawn_blocking closure
         let filters_clone = filters.to_vec();
 
-        // The following Delta Lake scan is blocking - run it in a separate blocking task to prevent the Tokio runtime from starving
-        let (scan_context, parquet_file_reader_factory, df_schema) =
+        // Refreshing the snapshot and planning the scan read the Delta log and block, so run them
+        // on the blocking pool to keep the Tokio worker free.
+        let (snapshot, scan_context, parquet_file_reader_factory, df_schema) =
             tokio::task::spawn_blocking(move || {
+                // Uses the version of the current snapshot to read only newer log entries.
+                let Ok(snapshot) = Snapshot::builder_from(current_snapshot).build(engine.as_ref())
+                else {
+                    return exec_err!("Unable to get latest Delta table snapshot");
+                };
+
                 // We'll convert all filters for delta_kernel predicates since
                 // partition pruning is already handled separately later in the code
 
                 let mut scan_builder =
-                    ScanBuilder::new(snapshot).with_schema(projected_delta_schema);
+                    ScanBuilder::new(Arc::clone(&snapshot)).with_schema(projected_delta_schema);
 
                 // Convert and apply predicate if possible
                 if let Some(predicate) = filters_to_delta_kernel_predicate(&filters_clone) {
@@ -1083,6 +1089,7 @@ impl TableProvider for DeltaTable {
                 }
 
                 Ok::<_, datafusion::error::DataFusionError>((
+                    snapshot,
                     scan_context,
                     parquet_file_reader_factory,
                     df_schema,
@@ -1092,6 +1099,10 @@ impl TableProvider for DeltaTable {
             .map_err(|e| {
                 datafusion::error::DataFusionError::Execution(format!("Delta Scan panicked: {e}"))
             })??;
+
+        if self.store_snapshot(&snapshot).is_err() {
+            return exec_err!("Unable to get latest Delta table snapshot");
+        }
 
         if let Some(err) = scan_context.errs.into_iter().next() {
             return Err(err);
