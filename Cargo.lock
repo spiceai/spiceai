@@ -6562,6 +6562,7 @@ dependencies = [
  "datafusion",
  "datafusion-datasource",
  "datafusion-physical-expr",
+ "flate2",
  "futures",
  "object_store 0.13.2",
  "orc-rust",
@@ -10543,7 +10544,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -10602,7 +10603,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10617,7 +10618,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -10640,7 +10641,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10656,7 +10657,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10666,7 +10667,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10685,7 +10686,7 @@ dependencies = [
 [[package]]
 name = "iceberg_test_utils"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1f0744b900e69e1b3fafa721aa4283bd4b048a61#1f0744b900e69e1b3fafa721aa4283bd4b048a61"
 dependencies = [
  "iceberg",
  "tracing-subscriber",
@@ -12323,14 +12324,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "lzokay-native"
-version = "0.1.0"
+name = "lzo"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "792ba667add2798c6c3e988e630f4eb921b5cbc735044825b7111ef1582c8730"
-dependencies = [
- "byteorder",
- "thiserror 1.0.69",
-]
+checksum = "1574f8e322bb9d442095896ff66d126e521f5a85ef7d7343a269bb7d6eeb3f0b"
 
 [[package]]
 name = "mac"
@@ -14787,8 +14784,7 @@ dependencies = [
 [[package]]
 name = "orc-rust"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e54c163f843c4f0fcfca65b9b73ca6f93c37c8e86736d5a1e578c6e843eed0a0"
+source = "git+https://github.com/spiceai/orc-rust.git?rev=5b35c6d10a8cbd9750d501216ff04e72e23829b6#5b35c6d10a8cbd9750d501216ff04e72e23829b6"
 dependencies = [
  "arrow",
  "async-trait",
@@ -14802,7 +14798,7 @@ dependencies = [
  "futures-util",
  "log",
  "lz4_flex 0.11.6",
- "lzokay-native",
+ "lzo",
  "num",
  "prost 0.13.5",
  "snafu",
@@ -17773,6 +17769,7 @@ dependencies = [
  "object_store 0.13.2",
  "object_store_occ",
  "opendal",
+ "opendal-http-transport-reqwest",
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
  "opentelemetry-prometheus",
@@ -20547,7 +20544,7 @@ dependencies = [
 [[package]]
 name = "spiceai"
 version = "4.0.0"
-source = "git+https://github.com/spiceai/spice-rs.git?rev=4429f3956972c4c329ee406ac60b15ad6ae4a777#4429f3956972c4c329ee406ac60b15ad6ae4a777"
+source = "git+https://github.com/spiceai/spice-rs.git?rev=f53c2c1c96791bea14c37cee93cae38626d9cfbc#f53c2c1c96791bea14c37cee93cae38626d9cfbc"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -20571,6 +20568,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "webpki-roots 1.0.10",
  "winver",
 ]
 

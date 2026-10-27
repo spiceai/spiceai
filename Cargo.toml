@@ -363,7 +363,7 @@ odbc-api = { version = "29" } # arrow-odbc 25.3 requires odbc-api >=27, <30
 opendal = { version = "0.58", default-features = false, features = ["services-s3", "services-fs", "services-gcs", "services-memory"] }
 # orc-rust 0.9.0 is the first release on Arrow ^59.0, matching the workspace Arrow 59 pin.
 # Do not use datafusion-orc; the FileFormat lives in crates/dataformat-orc.
-orc-rust = { version = "0.9.0", default-features = false, features = ["async"] }
+orc-rust = { git = "https://github.com/spiceai/orc-rust.git", rev = "5b35c6d10a8cbd9750d501216ff04e72e23829b6", default-features = false, features = ["async"] } # orc-rust 0.9.0 + bounded metadata decompression
 opentelemetry = { version = "0.32", default-features = false, features = [
     "logs",
     "metrics",
@@ -528,7 +528,7 @@ vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "e556674
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
 
 x509-certificate = "0.25.0"
-spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "4429f3956972c4c329ee406ac60b15ad6ae4a777" } # branch: trunk (arrow 59.3)
+spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "f53c2c1c96791bea14c37cee93cae38626d9cfbc" } # branch: trunk (arrow 59.3)
 
 [profile.release-lto]
 inherits = "release"
@@ -659,12 +659,12 @@ duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "40a0ad2a7de6
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a6b07b8b9625e552c502c3a7229fd4bb7725bd2e" } # branch: spiceai-0.11.0-df-55
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a6b07b8b9625e552c502c3a7229fd4bb7725bd2e" } # branch: spiceai-0.11.0-df-55
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a6b07b8b9625e552c502c3a7229fd4bb7725bd2e" } # branch: spiceai-0.11.0-df-55
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a6b07b8b9625e552c502c3a7229fd4bb7725bd2e" } # branch: spiceai-0.11.0-df-55
-iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a6b07b8b9625e552c502c3a7229fd4bb7725bd2e" } # branch: spiceai-0.11.0-df-55
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a6b07b8b9625e552c502c3a7229fd4bb7725bd2e" } # branch: spiceai-0.11.0-df-55
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f0744b900e69e1b3fafa721aa4283bd4b048a61" } # branch: spiceai-0.11.0-df-55
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f0744b900e69e1b3fafa721aa4283bd4b048a61" } # branch: spiceai-0.11.0-df-55
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f0744b900e69e1b3fafa721aa4283bd4b048a61" } # branch: spiceai-0.11.0-df-55
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f0744b900e69e1b3fafa721aa4283bd4b048a61" } # branch: spiceai-0.11.0-df-55
+iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f0744b900e69e1b3fafa721aa4283bd4b048a61" } # branch: spiceai-0.11.0-df-55
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f0744b900e69e1b3fafa721aa4283bd4b048a61" } # branch: spiceai-0.11.0-df-55
 
 # candle-* crates are already redirected to the spiceai/candle fork via the
 # [patch.crates-io] block higher up in this file. Keeping those here would be
