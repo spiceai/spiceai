@@ -99,6 +99,52 @@ async fn assert_count_agrees(
     Ok(())
 }
 
+/// Assert a real scan and `COUNT(*)` both return `expected` rows while the
+/// maintained count is NOT claimed exact, neither as served nor as persisted.
+///
+/// After a promotion that kept tombstones, datalake files still hold rows those
+/// tombstones hide, so the manifest's row total over-counts and no exact live
+/// count is known. Serving one could fold a wrong number into `COUNT(*)`; the
+/// persisted flag is what a reopen serves.
+async fn assert_count_held_inexact(
+    table: &CayenneTableProvider,
+    catalog: &CayenneCatalog,
+    ctx: &SessionContext,
+    expected: usize,
+    phase: &str,
+) -> TestResult<()> {
+    let expected = i64::try_from(expected)?;
+    assert_eq!(scan_row_count(ctx).await?, expected, "scanned rows ({phase})");
+    let counted = ctx
+        .sql(&format!("SELECT COUNT(*) FROM {TABLE}"))
+        .await?
+        .collect()
+        .await?
+        .first()
+        .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+        .and_then(|a| a.values().first())
+        .copied();
+    assert_eq!(counted, Some(expected), "COUNT(*) ({phase})");
+
+    let maintained = table
+        .statistics()
+        .unwrap_or_else(|| panic!("maintained statistics must be populated ({phase})"))
+        .num_rows;
+    assert!(
+        !maintained.is_exact().unwrap_or(false),
+        "the maintained count must not be served Exact while tombstones hide datalake \
+         rows ({phase}), got {maintained:?}"
+    );
+    if let Some(persisted) = catalog.get_table_statistics(table.table_id()).await? {
+        assert!(
+            !persisted.num_rows_exact,
+            "the persisted exactness flag must stay tainted ({phase}), got num_rows={}",
+            persisted.num_rows
+        );
+    }
+    Ok(())
+}
+
 async fn delete_id(table: &CayenneTableProvider, id: i64) -> TestResult<()> {
     let ctx = SessionContext::new();
     let plan = table
@@ -216,14 +262,15 @@ async fn test_cold_tier_statistics_survive_promotion_impl(
 
 test_with_backends!(test_cold_tier_statistics_follow_a_folded_delete_impl);
 
-/// Deleting a datalake-resident row must decrement the maintained count once the
-/// promotion that folds the tombstone has run.
+/// Deleting a datalake-resident row must never leave a stale count served as
+/// `Exact` across the next promotion.
 ///
-/// Regression test for #12846: promotion applied every tombstone physically and
-/// cleared the deletion index — dropping the `has_pending_deletions()` mask that
-/// was the only thing keeping the stale count off the `Exact` path — without
-/// re-baselining the count, so the table reported `Exact(110)` while the cold
-/// manifest correctly held 109 rows.
+/// Regression test for #12846: a promotion that clears the deletion index drops
+/// the `has_pending_deletions()` mask that was the only thing keeping the stale
+/// count off the `Exact` path, so without re-baselining the table reported
+/// `Exact(110)` for 109 live rows. A promotion carries the datalake file holding
+/// the deleted row forward and keeps the tombstone that hides it, so the
+/// manifest still counts that row and the maintained count must stay inexact.
 async fn test_cold_tier_statistics_follow_a_folded_delete_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
@@ -243,13 +290,12 @@ async fn test_cold_tier_statistics_follow_a_folded_delete_impl(
         "the delete hides the datalake-resident row immediately"
     );
 
-    // A promotion needs warm data to graduate, so the next batch is what carries
-    // the tombstone into the datalake: 99 live + 10 new = 109.
+    // A promotion needs warm data to graduate: 99 live + 10 new = 109.
     insert_range(&table, 100..110).await?;
     settle(&table).await?;
     assert!(
         table.promote_warm_to_cold().await?,
-        "the promotion folding the tombstone should fire"
+        "the promotion after the delete should fire"
     );
     table.flush_pending_maintenance().await?;
 
@@ -261,10 +307,17 @@ async fn test_cold_tier_statistics_follow_a_folded_delete_impl(
         .map(|f| f.row_count)
         .sum();
     assert_eq!(
-        cold_rows, 109,
-        "the cold manifest drops the physically-removed row"
+        cold_rows, 110,
+        "the carried datalake file still holds the deleted row, hidden by its tombstone"
     );
-    assert_count_agrees(&table, &ctx, 109, "after the tombstone was folded").await?;
+    assert_count_held_inexact(
+        &table,
+        &fixture.catalog,
+        &ctx,
+        109,
+        "after a promotion that kept the tombstone",
+    )
+    .await?;
 
     Ok(())
 }
@@ -335,13 +388,14 @@ async fn test_a_delete_taints_the_maintained_count_exactness_impl(
 
 test_with_backends!(test_a_promotion_after_a_reopen_rebaselines_the_count_impl);
 
-/// A promotion whose statistics cache is cold must still re-baseline the count.
+/// A promotion whose statistics cache is cold must still leave a truthful count.
 ///
 /// `commit_overwrite_to_cold` deletes the table's `cayenne_table_statistics` row,
 /// so a re-baseline that reads the record *after* the commit finds nothing and
 /// silently no-ops — while the in-memory cache goes on serving the count loaded at
 /// open. That is the #12846 failure again, reached through a reopen rather than a
-/// single session: the promotion must capture its baseline before committing.
+/// single session: the promotion must capture its baseline before committing, and
+/// with the tombstone kept it must write that baseline back held inexact.
 async fn test_a_promotion_after_a_reopen_rebaselines_the_count_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
@@ -355,8 +409,8 @@ async fn test_a_promotion_after_a_reopen_rebaselines_the_count_impl(
         table.flush_pending_maintenance().await?;
         assert_count_agrees(&table, &ctx, 100, "before the reopen").await?;
 
-        // The tombstone this session leaves is what the next session's promotion
-        // folds — and what its count must stop including.
+        // The tombstone this session leaves hides a datalake row the next
+        // session's promotion carries forward.
         delete_id(&table, 42).await?;
         insert_range(&table, 100..110).await?;
         settle(&table).await?;
@@ -382,25 +436,31 @@ async fn test_a_promotion_after_a_reopen_rebaselines_the_count_impl(
 
     assert!(
         reopened.promote_warm_to_cold().await?,
-        "the promotion folding the tombstone should fire after the reopen"
+        "the promotion after the reopen should fire"
     );
     reopened.flush_pending_maintenance().await?;
-    assert_count_agrees(&reopened, &ctx, 109, "after a promotion post-reopen").await?;
+    assert_count_held_inexact(
+        &reopened,
+        &catalog,
+        &ctx,
+        109,
+        "after a promotion post-reopen",
+    )
+    .await?;
 
     Ok(())
 }
 
 test_with_backends!(test_a_promotion_does_not_fold_a_stale_extremum_impl);
 
-/// A metadata-folded `MAX` must reflect deletes a promotion just folded.
+/// `MAX` must reflect deletes of datalake rows across a promotion.
 ///
-/// Re-baselining the count restores `num_rows_exact`, which re-opens the
-/// metadata-only `MIN`/`MAX`/`SUM` fold ([`cayenne::stats_aggregate`]) — while the
-/// table-level column aggregate carried across the promotion is a superset whose
-/// min/max only ever widened, so it still names the deleted extremum. This pins
-/// that the fold answers from the live files' footer statistics rather than that
-/// superset: the plan folds to a constant (`ProjectionExec: expr=[108 as m]`) and
-/// the constant is right.
+/// The table-level column aggregate carried across the promotion is a superset
+/// whose min/max only ever widened, so it still names the deleted extremum, and
+/// the carried datalake file still physically holds that row. With the
+/// tombstone kept the count stays inexact, which keeps the metadata-only
+/// `MIN`/`MAX`/`SUM` fold ([`cayenne::stats_aggregate`]) closed, so the answer
+/// comes from a scan that applies the tombstone.
 async fn test_a_promotion_does_not_fold_a_stale_extremum_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
@@ -420,12 +480,19 @@ async fn test_a_promotion_does_not_fold_a_stale_extremum_impl(
     settle(&table).await?;
     assert!(
         table.promote_warm_to_cold().await?,
-        "the promotion folding the tombstones should fire"
+        "the promotion after the deletes should fire"
     );
     table.flush_pending_maintenance().await?;
 
     // 100 - 1 + 10 - 1 = 108 live rows, with 99 and 109 both gone.
-    assert_count_agrees(&table, &ctx, 108, "after the tombstones were folded").await?;
+    assert_count_held_inexact(
+        &table,
+        &fixture.catalog,
+        &ctx,
+        108,
+        "after a promotion that kept the tombstones",
+    )
+    .await?;
 
     let batches = ctx
         .sql(&format!("SELECT MAX(id) AS m FROM {TABLE}"))

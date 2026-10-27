@@ -869,15 +869,23 @@ pub trait MetadataCatalog: Send + Sync {
     /// records, inline data, snapshot sequences, per-file/table stats, pk index)
     /// + repoint `current_snapshot_id` to `new_snapshot_id` (a fresh empty warm
     /// snapshot). All-or-nothing, so a crash mid-promotion never leaves rows in
-    /// BOTH tiers (double-count) or NEITHER (loss). The deletion state is cleared
-    /// because the cold files were written with all deletes already applied
-    /// (single-version) — exactly the semantics of `commit_overwrite`, whose new
-    /// content here lives on the cold object store instead of a warm snapshot.
+    /// BOTH tiers (double-count) or NEITHER (loss). `cold_files` is the whole
+    /// new manifest: the files this promotion wrote plus every existing cold
+    /// file it carries forward.
+    ///
+    /// `retain_tombstones_above` decides what happens to the deletion state.
+    /// `None` clears all of it, which is correct when no tombstone can hide a
+    /// row of any cold file in `cold_files`. `Some(cutoff)` keeps every
+    /// key-based delete file and every insert record whose sequence is above
+    /// `cutoff` — tombstones that still hide superseded rows of carried-forward
+    /// cold files — and clears the rest, including every position-based delete
+    /// file (those name warm files the overwrite clear retires).
     async fn commit_overwrite_to_cold(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         cold_files: &[ColdTierFile],
+        retain_tombstones_above: Option<i64>,
     ) -> CatalogResult<()>;
 
     /// Upsert the persisted primary-key existence index (a bloom checkpoint),

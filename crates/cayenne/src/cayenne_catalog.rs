@@ -1165,11 +1165,13 @@ impl CayenneCatalog {
     /// generation's manifest rows — then (b) inserts this graduation's new
     /// cold-file rows.
     ///
-    /// Replace-all (a): v1 promotion re-materializes the WHOLE visible table
-    /// (warm + any prior cold, via the cross-tier scan) into this new cold
-    /// generation, so the prior cold rows are duplicated in `cold_files`; clearing
-    /// them first makes a repeated promotion non-double-counting. The superseded
-    /// physical cold objects are unreferenced afterward and reclaimed by GC.
+    /// Replace-all (a): `cold_files` is the whole new manifest — the files this
+    /// promotion wrote from the warm tier plus every cold file it carries
+    /// forward — so the prior manifest rows are cleared first and re-registered
+    /// from `cold_files`, which keeps a repeated promotion from double-counting.
+    ///
+    /// `retain_tombstones_above` narrows the overwrite clear's deletion-state
+    /// half: see [`MetadataCatalog::commit_overwrite_to_cold`].
     ///
     /// # Errors
     ///
@@ -1181,6 +1183,7 @@ impl CayenneCatalog {
         table_id: &str,
         new_snapshot_id: &str,
         cold_files: &[ColdTierFile],
+        retain_tombstones_above: Option<i64>,
     ) -> CatalogResult<()> {
         // The proven overwrite clear FIRST (it also clears the cold manifest —
         // replace-all), then register this graduation's cold files, so cold
@@ -1188,8 +1191,15 @@ impl CayenneCatalog {
         // cold store. No inline payload: a graduation's content is the cold files
         // registered below, and the overwrite clear correctly drops the warm
         // tier's inline corpus along with everything else keyed on the old snapshot.
-        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None, &[])
-            .await?;
+        self.commit_overwrite_clearing_in_txn(
+            txn,
+            table_id,
+            new_snapshot_id,
+            None,
+            &[],
+            retain_tombstones_above,
+        )
+        .await?;
         // One statement per file rather than `execute_many`: each row carries
         // a statistics blob and a primary-key bloom of up to
         // `COLD_PK_BLOOM_PER_FILE_MAX_BYTES`, so binding them all at once would
@@ -1232,6 +1242,30 @@ impl CayenneCatalog {
         inlined: Option<&InlinedData>,
         delete_files: &[crate::metadata::DeleteFile],
     ) -> CatalogResult<()> {
+        self.commit_overwrite_clearing_in_txn(
+            txn,
+            table_id,
+            new_snapshot_id,
+            inlined,
+            delete_files,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::commit_overwrite_in_txn`], with the deletion-state clear narrowed
+    /// by `retain_tombstones_above` (see
+    /// [`MetadataCatalog::commit_overwrite_to_cold`]). `None` is the overwrite's
+    /// wholesale clear.
+    async fn commit_overwrite_clearing_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        new_snapshot_id: &str,
+        inlined: Option<&InlinedData>,
+        delete_files: &[crate::metadata::DeleteFile],
+        retain_tombstones_above: Option<i64>,
+    ) -> CatalogResult<()> {
         for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
             if uuid::Uuid::parse_str(value).is_err() {
                 return Err(CatalogError::InvalidOperationNoSource {
@@ -1252,9 +1286,26 @@ impl CayenneCatalog {
         // (a full refresh after a promotion would return 2x rows). The
         // cold-graduation commit reuses this clear and re-registers its new
         // cold files AFTER it (see `commit_overwrite_to_cold_in_txn`).
+        //
+        // A promotion that carries cold files forward keeps the tombstones that
+        // still hide superseded rows of those files: every key-based delete file
+        // and insert record above the cutoff survives. Position-based delete
+        // files name warm files this clear retires, so they go regardless.
+        // `cutoff` is an i64, interpolated as a bare integer literal.
+        let tombstone_clear = match retain_tombstones_above {
+            None => format!(
+                "DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
+                 DELETE FROM cayenne_insert_record WHERE table_id = {insert_record_table_id_literal}; "
+            ),
+            Some(cutoff) => format!(
+                "DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal} \
+                   AND (source_data_file_path IS NOT NULL OR sequence_number <= {cutoff}); \
+                 DELETE FROM cayenne_insert_record WHERE table_id = {insert_record_table_id_literal} \
+                   AND sequence_number <= {cutoff}; "
+            ),
+        };
         let batch_sql = format!(
-            "DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
-             DELETE FROM cayenne_insert_record WHERE table_id = {insert_record_table_id_literal}; \
+            "{tombstone_clear}\
              DELETE FROM cayenne_snapshot_sequence WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_inlined_data WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_inlined_delete WHERE table_id = {table_id_literal}; \
@@ -4351,6 +4402,7 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         new_snapshot_id: &str,
         cold_files: &[ColdTierFile],
+        retain_tombstones_above: Option<i64>,
     ) -> CatalogResult<()> {
         // Atomic warm→cold graduation with the same retry-on-conflict shape as
         // commit_compaction/commit_overwrite; the per-attempt work lives in
@@ -4373,7 +4425,13 @@ impl MetadataCatalog for CayenneCatalog {
                     })?;
 
             match self
-                .commit_overwrite_to_cold_in_txn(&mut *tx, table_id, new_snapshot_id, cold_files)
+                .commit_overwrite_to_cold_in_txn(
+                    &mut *tx,
+                    table_id,
+                    new_snapshot_id,
+                    cold_files,
+                    retain_tombstones_above,
+                )
                 .await
             {
                 Ok(()) => match tx.commit().await {
@@ -6815,6 +6873,7 @@ mod tests {
                 &table_id,
                 &new_snapshot_id,
                 &[with_bloom.clone(), without_bloom.clone()],
+                None,
             )
             .await
             .expect("commit cold files");
@@ -6844,6 +6903,152 @@ mod tests {
         drop(catalog);
 
         // Cleanup test database
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// A datalake promotion that carries cold files forward keeps exactly the
+    /// key-based delete files and insert records above its cutoff — the
+    /// tombstones that may still hide superseded rows of those files — and
+    /// clears every position-based delete file and everything at or below the
+    /// cutoff, in the transaction that registers the new manifest. With no
+    /// cutoff it clears them all.
+    #[tokio::test]
+    async fn commit_overwrite_to_cold_keeps_tombstones_above_the_cutoff() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!("sqlite://./.test_cold_retain_{}.db", uuid::Uuid::now_v7());
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let options = CreateTableOptions {
+            table_name: "cold_retain_tbl".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: base_path.clone(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog.create_table(options).await.expect("create table");
+
+        for (path, sequence_number, source_data_file_path) in [
+            ("/tmp/cold_retain_k5.arrow", 5, None),
+            ("/tmp/cold_retain_k10.arrow", 10, None),
+            ("/tmp/cold_retain_k11.arrow", 11, None),
+            (
+                "/tmp/cold_retain_p20.arrow",
+                20,
+                Some("/tmp/cold_retain_warm.vortex".to_string()),
+            ),
+        ] {
+            catalog
+                .add_delete_file(DeleteFile {
+                    delete_file_id: String::new(),
+                    table_id: table_id.clone(),
+                    source_data_file_path,
+                    path: path.to_string(),
+                    path_is_relative: false,
+                    format: "arrow_ipc".to_string(),
+                    delete_count: 1,
+                    file_size_bytes: 64,
+                    deletion_type: DeletionType::default(),
+                    sequence_number,
+                    reinsert_sequence: None,
+                })
+                .await
+                .expect("add delete file");
+        }
+        catalog
+            .add_insert_records_batch(&table_id, vec![vec![1_u8; 8]], 10)
+            .await
+            .expect("insert record at the cutoff");
+        catalog
+            .add_insert_records_batch(&table_id, vec![vec![2_u8; 8]], 12)
+            .await
+            .expect("insert record above the cutoff");
+
+        let cold = ColdTierFile {
+            table_id: table_id.clone(),
+            file_url: "s3://bucket/t/data/p1/a.vortex".to_string(),
+            row_count: 100,
+            file_size_bytes: 4096,
+            min_sequence: 0,
+            max_sequence: 8,
+            statistics_blob: Vec::new(),
+            pk_bloom: None,
+        };
+        catalog
+            .commit_overwrite_to_cold(
+                &table_id,
+                &uuid::Uuid::now_v7().to_string(),
+                std::slice::from_ref(&cold),
+                Some(10),
+            )
+            .await
+            .expect("commit keeping tombstones above 10");
+
+        let kept: Vec<(String, i64)> = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("list delete files")
+            .into_iter()
+            .map(|f| (f.path, f.sequence_number))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![("/tmp/cold_retain_k11.arrow".to_string(), 11)],
+            "only the key-based delete file above the cutoff survives"
+        );
+        let records = catalog
+            .get_insert_records(&table_id)
+            .await
+            .expect("list insert records");
+        assert_eq!(records.len(), 1, "only the insert record above the cutoff");
+        assert_eq!(records.get(&[2_u8; 8][..]), Some(&12));
+        assert_eq!(
+            catalog
+                .list_cold_tier_files(&table_id)
+                .await
+                .expect("list cold files")
+                .len(),
+            1,
+            "the manifest is registered in the same commit"
+        );
+
+        catalog
+            .commit_overwrite_to_cold(
+                &table_id,
+                &uuid::Uuid::now_v7().to_string(),
+                std::slice::from_ref(&cold),
+                None,
+            )
+            .await
+            .expect("commit clearing every tombstone");
+        assert!(
+            catalog
+                .get_table_delete_files(&table_id)
+                .await
+                .expect("list delete files")
+                .is_empty(),
+            "no cutoff clears every delete file"
+        );
+        assert!(
+            catalog
+                .get_insert_records(&table_id)
+                .await
+                .expect("list insert records")
+                .is_empty(),
+            "no cutoff clears every insert record"
+        );
+
+        drop(catalog);
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
@@ -6908,6 +7113,7 @@ mod tests {
                 &table_id,
                 &uuid::Uuid::now_v7().to_string(),
                 std::slice::from_ref(&cold),
+                None,
             )
             .await
             .expect("seed a cold file whose statistics blob is the scale-2 bound");
@@ -9733,7 +9939,7 @@ mod tests {
 
         let before = catalog.metastore_query_count();
         let result = catalog
-            .commit_overwrite_to_cold(&table_id, &uuid::Uuid::now_v7().to_string(), &[])
+            .commit_overwrite_to_cold(&table_id, &uuid::Uuid::now_v7().to_string(), &[], None)
             .await;
         violations.extend(statement_conflict_violation(
             "commit_overwrite_to_cold",
