@@ -977,9 +977,9 @@ impl Runtime {
             }
         }
 
-        // Removing a view may cause cached LogicalPlans that reference it
-        // to be obsolete, so we invalidate them.
-        self.df.clear_cached_plans().await;
+        // Cached plans and results that read through the view are obsolete. A result
+        // records the tables the view reads, not the view, so no table stamp reaches it.
+        self.df.clear_cached_plans_and_results().await;
 
         tracing::info!("Unloaded view {}", name);
     }
