@@ -4067,6 +4067,50 @@ mod tests {
         assert_eq!(field.data_type(), &DataType::Decimal128(22, 2));
     }
 
+    #[tokio::test]
+    async fn get_schema_matches_streamed_schema_for_decimal_round() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        for sql in [
+            "SELECT round(CAST(2.345 AS DECIMAL(10,3)), 2) AS x",
+            "SELECT round(x, 2) AS x FROM (VALUES (CAST(1.255 AS DECIMAL(10,3)))) t(x)",
+            "SELECT round(avg(x), 2) AS x FROM (VALUES (CAST(1.25 AS DECIMAL(10,2))), (2.50)) t(x)",
+        ] {
+            let (schema, _) = QueryBuilder::new(sql, Arc::clone(&df))
+                .build()
+                .get_schema()
+                .await
+                .expect("schema should be available");
+
+            let mut query = QueryBuilder::new(sql, Arc::clone(&df))
+                .build()
+                .run()
+                .await
+                .expect("query should run");
+            let mut batches = Vec::new();
+            while let Some(batch) = query.data.next().await {
+                batches.push(batch.expect("batch"));
+            }
+
+            let advertised = schema.field(0).data_type();
+            assert_eq!(
+                advertised,
+                query.data.schema().field(0).data_type(),
+                "{sql}"
+            );
+            for batch in &batches {
+                assert_eq!(advertised, batch.schema().field(0).data_type(), "{sql}");
+            }
+        }
+    }
+
     /// A leaked `x-session-id` must not let `GetFlightInfo` resolve
     /// against another principal's session (and then cache that plan
     /// under the caller's namespace).
