@@ -1894,7 +1894,16 @@ impl<'a> AppendMutationWriter<'a> {
             rows,
         );
         let publish_start = Instant::now();
-        staged_append.finalize_staged_write().await?;
+        // Once the staging WAL is written the append is committed (recovery rolls
+        // it forward), so the publish runs to completion in its own task: a caller
+        // that drops this future (an exporter timing out) must not leave the WAL
+        // behind for recovery to refuse once compaction moves the snapshot.
+        tokio::spawn(async move { staged_append.finalize_staged_write().await })
+            .await
+            .map_err(|source| Error::TaskPanicked {
+                table: self.table.table_name().to_string(),
+                source,
+            })??;
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
         // Fold the metastore publish-wall latency into the adaptive tuner's
         // publish-bound signal (the single-writer finalization on the CDC-apply path).
