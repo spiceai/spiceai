@@ -31,11 +31,23 @@ steps:
   - query: SELECT id, c IN (SELECT (SELECT b.x AS v) AS c FROM b) AS matched FROM p ORDER BY id
   - query: SELECT id, c IN (SELECT (SELECT b.x) AS c FROM b) AS matched FROM p ORDER BY id
   - query: SELECT id FROM p WHERE EXISTS (SELECT 1 FROM (SELECT (SELECT b.x AS v) AS c FROM b) s WHERE p.c = s.c) ORDER BY id
-  - query: SELECT count(DISTINCT matched) AS n FROM (SELECT vp.id, vp.c < ANY (SELECT random() FROM vb) AS matched FROM vp) q
-    oracle-sql: SELECT 1::bigint AS n
+  - query: SELECT count(*) = 512 AND count(matched) = 512 AND count(DISTINCT matched) = 1 AS consistent FROM (SELECT vp.id, vp.c < ANY (SELECT random() FROM vb) AS matched FROM vp) q
+    oracle-sql: SELECT true AS consistent
   - query: SELECT count(*) IN (0,512) AS consistent FROM vp WHERE (vp.c < ANY (SELECT random() FROM vb)) OR vp.c < 0
     oracle-sql: SELECT true AS consistent
   - query: SELECT count(*) IN (0,512) AS consistent FROM vp WHERE NOT (vp.c < ANY (SELECT random() FROM vb)) OR vp.c < 0
     oracle-sql: SELECT true AS consistent
   - query: SELECT id, c IN (SELECT x + CAST(NULL AS int) FROM b) AS matched FROM p ORDER BY id
   - query: SELECT id, c IN (SELECT x + y FROM b WHERE x < 0) AS matched FROM p ORDER BY id
+  # Volatile subqueries use invariants, so independent RNG streams are not compared.
+  - query: SELECT count(*) = 512 AND count(matched) = 512 AND count(DISTINCT matched) = 1 AS consistent FROM (SELECT vp.id, vp.c < ALL (SELECT random() FROM vb) AS matched FROM vp) q
+    oracle-sql: SELECT true AS consistent
+  - query: SELECT count(*) IN (0,512) AS consistent FROM vp WHERE (vp.c < ALL (SELECT random() FROM vb)) OR vp.c < 0
+    oracle-sql: SELECT true AS consistent
+  - query: SELECT count(*) IN (0,512) AS consistent FROM vp WHERE NOT (vp.c < ALL (SELECT random() FROM vb)) OR vp.c < 0
+    oracle-sql: SELECT true AS consistent
+  # Put ANY/ALL in the probe projection, then consume it in another subquery predicate.
+  - query: SELECT count(*) = 512 AND count(matched) = 512 AND count(DISTINCT matched) = 1 AS consistent FROM (SELECT id, v IN (SELECT x = 1 FROM vb) AS matched FROM (SELECT id, c < ANY (SELECT random() FROM vb) AS v FROM vp) q) r
+    oracle-sql: SELECT true AS consistent
+  - query: SELECT count(*) = 512 AND count(matched) = 512 AND count(DISTINCT matched) = 1 AS consistent FROM (SELECT id, v NOT IN (SELECT x = 1 FROM vb) AS matched FROM (SELECT id, c < ALL (SELECT random() FROM vb) AS v FROM vp) q) r
+    oracle-sql: SELECT true AS consistent
