@@ -124,7 +124,7 @@ pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
 pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
     "spice.optimizer.duckdb_aggregate_pushdown";
 
-use data_accelerator_api::{keep_first, upsert_dedup};
+use data_accelerator_api::{keep_first, pk_write_guard, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -1733,13 +1733,25 @@ pub(crate) async fn create_table_provider(
         None => Arc::new(duckdb_writer.clone()),
     };
 
-    // Wrap with upsert deduplication if needed
+    let write_provider: Arc<dyn TableProvider> = duckdb_writer;
+    let write_provider = guard_unique_index_overwrites(write_provider, cmd);
+    // Reject a NULL primary key and an in-batch duplicate before DuckDB, and
+    // map `__data_<dataset>_<n>` in remaining constraint errors back to the
+    // user dataset. Configured `upsert_dedup` sits above this so it can
+    // collapse a repeated key before uniqueness is judged. `keep_first` sits
+    // above both so `on_conflict: drop` still keeps the first copy.
+    let write_provider = pk_write_guard::wrap_with_pk_write_guard_if_needed(
+        write_provider,
+        cmd.schema.as_arrow(),
+        &cmd.constraints,
+        keep_first::NanKey::Value,
+        Some(cmd.name.table().to_string()),
+    );
     let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
-        duckdb_writer,
+        write_provider,
         &cmd.options,
         cmd.constraints.clone(),
     );
-    let write_provider = guard_unique_index_overwrites(write_provider, cmd);
     // DuckDB writes a whole stream as one `INSERT … ON CONFLICT DO NOTHING`,
     // which refuses a key repeated within one batch and resolves one repeated
     // across batches in parallel-insert order, so `drop` keeps the first copy
@@ -2430,9 +2442,12 @@ mod tests {
         )
         .expect("the poly read/write layer");
         let writer = poly.writer();
-        let writer = writer
-            .downcast_ref::<datafusion_table_providers::duckdb::write::DuckDBTableWriter>()
-            .expect("DuckDBTableWriter");
+        // `RewriteInternalTableNames` sits on the write stack and stops a
+        // `LayerWalk::Write`, so peel with `Read` to reach the engine writer.
+        let writer = spice_table::find_concrete::<
+            datafusion_table_providers::duckdb::write::DuckDBTableWriter,
+        >(writer.as_ref(), spice_table::LayerWalk::Read)
+        .expect("DuckDBTableWriter");
         Ok(writer.write_settings().clone())
     }
 
@@ -2926,6 +2941,155 @@ mod tests {
                 (8, "c".to_string())
             ]
         );
+    }
+
+    fn nullable_id_v_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Utf8, false),
+        ]))
+    }
+
+    async fn upsert_id_v_table(name: &str, schema: Arc<Schema>) -> Arc<dyn TableProvider> {
+        upsert_id_v_table_with_options(
+            name,
+            schema,
+            [("on_conflict".to_string(), "upsert:id".to_string())],
+        )
+        .await
+    }
+
+    async fn upsert_id_v_table_with_options(
+        name: &str,
+        schema: Arc<Schema>,
+        options: impl IntoIterator<Item = (String, String)>,
+    ) -> Arc<dyn TableProvider> {
+        let external_table = CreateExternalTable {
+            schema: ToDFSchema::to_dfschema_ref(schema)
+                .expect("to convert Arrow schema to DataFusion schema"),
+            name: TableReference::bare(name),
+            locations: vec![],
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: options.into_iter().collect(),
+            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let duckdb_accelerator = DuckDBAccelerator::new();
+        super::create_table_provider(&duckdb_accelerator.duckdb_factory, &external_table, None)
+            .await
+            .expect("table should be created")
+    }
+
+    /// Regression: a `DuckDB` constraint or NULL-primary-key error must name the
+    /// user dataset, not the internal `__data_<dataset>_<n>` table.
+    #[tokio::test]
+    async fn constraint_errors_name_the_user_dataset_not_the_internal_table() {
+        let table = upsert_id_v_table("o_duckdb", nullable_id_v_schema()).await;
+        let ctx = SessionContext::new();
+        let batch = RecordBatch::try_new(
+            nullable_id_v_schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec!["nullpk"])),
+            ],
+        )
+        .expect("nullable batch");
+        let exec = Arc::new(MockExec::new(vec![Ok(batch)], nullable_id_v_schema()));
+        let plan = table
+            .insert_into(&ctx.state(), exec, InsertOp::Append)
+            .await
+            .expect("insertion should be planned");
+        let error = collect(plan, ctx.task_ctx())
+            .await
+            .expect_err("a NULL primary key must fail");
+        let message = error.to_string();
+        assert!(
+            !message.contains("__data_"),
+            "DuckDB constraint errors must not leak the internal table name, got: {message}"
+        );
+        assert!(
+            message.contains("o_duckdb")
+                || message.contains("Primary key")
+                || message.contains("NULL"),
+            "the error must name the dataset or the NULL primary key, got: {message}"
+        );
+    }
+
+    /// A unique-index append that `DuckDB` itself refuses must name the user
+    /// dataset, not `__data_<dataset>_<n>`.
+    #[tokio::test]
+    async fn unique_index_errors_name_the_user_dataset_not_the_internal_table() {
+        let mut options = HashMap::new();
+        options.insert("indexes".to_string(), "v:unique".to_string());
+        let external_table = CreateExternalTable {
+            schema: ToDFSchema::to_dfschema_ref(id_v_schema())
+                .expect("to convert Arrow schema to DataFusion schema"),
+            name: TableReference::bare("o_duckdb"),
+            locations: vec![],
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let duckdb_accelerator = DuckDBAccelerator::new();
+        let table =
+            super::create_table_provider(&duckdb_accelerator.duckdb_factory, &external_table, None)
+                .await
+                .expect("table should be created");
+        write_batches(&table, vec![id_v_batch(&[(1, "a")])], InsertOp::Overwrite)
+            .await
+            .expect("seed row");
+        let error = write_batches(&table, vec![id_v_batch(&[(2, "a")])], InsertOp::Append)
+            .await
+            .expect_err("a unique-index conflict must fail");
+        let message = error.to_string();
+        assert!(
+            !message.contains("__data_"),
+            "DuckDB constraint errors must not leak the internal table name, got: {message}"
+        );
+        assert!(
+            message.contains("o_duckdb")
+                || message.to_lowercase().contains("unique")
+                || message.to_lowercase().contains("constraint"),
+            "the error must name the dataset or the unique constraint, got: {message}"
+        );
+    }
+
+    /// Configured last-write-wins must collapse a repeated key before the
+    /// uniqueness guard sees the batch.
+    #[tokio::test]
+    async fn last_write_wins_collapses_an_in_batch_duplicate_before_the_guard() {
+        let table = upsert_id_v_table_with_options(
+            "lww_before_guard",
+            id_v_schema(),
+            [
+                ("on_conflict".to_string(), "upsert:id".to_string()),
+                ("upsert_last_write_wins".to_string(), "true".to_string()),
+            ],
+        )
+        .await;
+        write_batches(
+            &table,
+            vec![id_v_batch(&[(1, "a"), (1, "b")])],
+            InsertOp::Append,
+        )
+        .await
+        .expect("last-write-wins must collapse the repeat before uniqueness is judged");
+        assert_eq!(id_v_rows(&table).await, vec![(1, "b".to_string())]);
     }
 
     #[tokio::test]
