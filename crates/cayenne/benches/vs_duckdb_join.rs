@@ -17,9 +17,8 @@
 //!   exercises join-side pushdown (the optimizer should restrict the build
 //!   side to one region before probing).
 //!
-//! Lanes (compile-time gated):
-//! - `cayenne`       — Cayenne with the SQLite metastore (default)
-//! - `cayenne_turso` — Cayenne with the Turso metastore (--features turso)
+//! Lanes:
+//! - `cayenne`       — Cayenne with the SQLite metastore
 //! - `duckdb`        — DuckDB file-mode
 
 #![allow(clippy::expect_used)]
