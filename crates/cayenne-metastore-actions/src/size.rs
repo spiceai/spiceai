@@ -109,7 +109,7 @@ pub fn design_record(table_id: &str, before: Option<&TableState>, after: Option<
     if !removed.is_empty() || regrouped > 0 {
         // A removal names the file; a regroup names the file and its group.
         let mut names = removed;
-        names.extend(std::iter::repeat_n(String::from("x".repeat(48)), regrouped));
+        names.extend(std::iter::repeat_n("x".repeat(48), regrouped));
         actions.push(Action::new(Kind::RemoveFiles(RemoveBySnapshot {
             table_id: t(),
             select: Select::Listed as i32,

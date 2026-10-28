@@ -260,6 +260,7 @@ async fn run(
             if let Err(e) = &result {
                 t.disabled = true;
                 failure(&failures, "commit", e);
+                report.differences.push(format!("{id}: shadow commit: {e}"));
             }
             let latency = t
                 .store
@@ -332,11 +333,15 @@ async fn commit(
     let mut size = 0;
     for p in payloads {
         let record = Record::decode(p.bytes.clone())?;
-        let keep = !(!*dropped
-            && drop_kind.is_some_and(|kind| record.actions.iter().any(|a| a.name() == kind)));
+        let keep = *dropped
+            || !drop_kind.is_some_and(|kind| record.actions.iter().any(|a| a.name() == kind));
         if !keep {
             *dropped = true;
-            chunks.last_mut().ok_or("no chunk")?.push(Entry { bytes: p.bytes, keep, payload: None });
+            chunks.last_mut().ok_or("no chunk")?.push(Entry {
+                bytes: p.bytes,
+                keep,
+                payload: None,
+            });
             continue;
         }
         let payload = encode_payload(&mut t.writer, config, &p.bytes, &mut t.spilled_bytes).await?;
@@ -347,10 +352,11 @@ async fn commit(
             size = 0;
         }
         size += len;
-        chunks
-            .last_mut()
-            .ok_or("no chunk")?
-            .push(Entry { bytes: p.bytes, keep, payload: Some(payload) });
+        chunks.last_mut().ok_or("no chunk")?.push(Entry {
+            bytes: p.bytes,
+            keep,
+            payload: Some(payload),
+        });
     }
     for chunk in chunks {
         commit_chunk(t, id, chunk, receipts, report).await?;
@@ -410,7 +416,6 @@ async fn commit_chunk(
     if t.writer.state().head.floor > previous_floor {
         report.published_checkpoints += 1;
     }
-    let records_count = records.len();
     for bytes in records {
         t.state.apply(&Record::decode(bytes)?)?;
     }
@@ -428,6 +433,13 @@ async fn commit_chunk(
         return Err("shadow contains unconverted actions".into());
     }
     let head = &t.writer.state().head;
+    // A checkpoint lands on a batch end, and a batch end is cut from the
+    // window, so only states at listed batch ends and at commits still in the
+    // window can ever be needed.
+    let window_start = (head.commit + 1).saturating_sub(head.window.len() as u64);
+    t.ends.retain(|end, _| {
+        *end > t.staged && (*end + 1 >= window_start || head.batches.contains(end))
+    });
     if head.batches.len() >= CHECKPOINT_BATCHES
         && let Some(&at) = head.batches.last()
         && at > t.staged

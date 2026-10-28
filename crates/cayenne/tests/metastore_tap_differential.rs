@@ -574,13 +574,17 @@ async fn metastore_shadow_detects_dropped_payload() -> TestResult<()> {
         Some((Arc::new(object_store::memory::InMemory::new()), true)),
     )
     .await?;
-    // Dropping every `AddDeleteFiles` from the shadow must leave the shadow
-    // without deletion vectors SQL holds, whatever else it disables.
+    // Dropping the first record with `AddDeleteFiles` drops its deletion
+    // vectors and the group it registers. Depending on how the queued records
+    // fall into group commits, the shadow sees that either at a checkpoint or
+    // SQL comparison (missing `delete_files`), or when a later `RemoveGroups`
+    // replaces the unregistered group and its guard refuses.
     assert!(
-        report
-            .differences
-            .iter()
-            .any(|difference| difference.contains("delete_files")),
+        report.differences.iter().any(|difference| {
+            difference.contains("delete_files")
+                || difference.contains("RemoveGroups on table")
+                    && difference.contains("every replaced protected snapshot is still registered")
+        }),
         "negative control: {report:#?}"
     );
     Ok(())
