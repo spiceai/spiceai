@@ -652,30 +652,29 @@ async fn run_combination(
         state: BTreeMap::new(),
         kinds: BTreeMap::new(),
     };
-    let matrix_ctx = json!({ "matrix": combo });
-    for (name, spec) in &script.sources {
-        let kind = template::substitute_text(&spec.kind, &matrix_ctx)?;
-        let version = spec
-            .version
-            .as_deref()
-            .map(|v| template::substitute_text(v, &matrix_ctx))
-            .transpose()?;
-        let src = source::start(
-            name,
-            run_id,
-            &kind,
-            version.as_deref(),
-            &options.work_dir.join(run_id).join("sources"),
-            spec,
-        )
-        .await
-        .with_context(|| format!("Failed to start source '{name}' ({kind})"))?;
-        sources.by_name.insert(name.clone(), Arc::from(src));
-        sources.state.insert(name.clone(), SourceState::Running);
-        sources.kinds.insert(name.clone(), kind);
-    }
-
     let result = async {
+        let matrix_ctx = json!({ "matrix": combo });
+        for (name, spec) in &script.sources {
+            let kind = template::substitute_text(&spec.kind, &matrix_ctx)?;
+            let version = spec
+                .version
+                .as_deref()
+                .map(|v| template::substitute_text(v, &matrix_ctx))
+                .transpose()?;
+            let src = source::start(
+                name,
+                run_id,
+                &kind,
+                version.as_deref(),
+                &options.work_dir.join(run_id).join("sources"),
+                spec,
+            )
+            .await
+            .with_context(|| format!("Failed to start source '{name}' ({kind})"))?;
+            sources.by_name.insert(name.clone(), Arc::from(src));
+            sources.state.insert(name.clone(), SourceState::Running);
+            sources.kinds.insert(name.clone(), kind);
+        }
         let mut instances = create_instances(script, options, combo, run_id, &sources).await?;
         match schedule {
             Schedule::Lockstep => {
