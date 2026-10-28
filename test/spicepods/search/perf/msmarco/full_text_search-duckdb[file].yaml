@@ -1,0 +1,100 @@
+version: v1
+kind: Spicepod
+name: full_text_search-duckdb[file]
+
+metadata:
+  benchmark_dataset: msmarco_dev_retrieval
+
+# Latency benchmark for full-text search. Each query must reach the search index on every pass, so
+# both results caches are off. Run with `--warmup-passes` and `--passes`, for example:
+#   testoperator run search -p <this file> --warmup-passes 1 --passes 2 --concurrency 8
+runtime:
+  caching:
+    search_results:
+      enabled: false
+    sql_results:
+      enabled: false
+
+datasets:
+
+  # MTEB MSMARCO Retrieval, read straight from Hugging Face: https://huggingface.co/datasets/mteb/msmarco
+
+  # The corpus has 7 parquet shards. Each shard is its own dataset, and the
+  # `corpus` view below joins them. Acceleration and search live on the view, so one refresh
+  # of the view reads every shard and builds the search indexes.
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/0.parquet
+    name: corpus_0
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/1.parquet
+    name: corpus_1
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/2.parquet
+    name: corpus_2
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/3.parquet
+    name: corpus_3
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/4.parquet
+    name: corpus_4
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/5.parquet
+    name: corpus_5
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/corpus/corpus/6.parquet
+    name: corpus_6
+    params:
+      file_format: parquet
+
+  # All 509,962 MS MARCO queries. `test_queries` keeps only the dev queries that have judgments.
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/queries/queries/0.parquet
+    name: all_queries
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+
+  # The MS MARCO dev qrels (6,980 queries), which MTEB evaluates.
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/default/dev/0.parquet
+    name: relevance_data
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+
+views:
+  - name: test_queries
+    sql: |
+      SELECT _id, text FROM all_queries
+      WHERE _id IN (SELECT DISTINCT "query-id" FROM relevance_data)
+
+  - name: corpus
+    sql: |
+      SELECT * FROM corpus_0
+      UNION ALL SELECT * FROM corpus_1
+      UNION ALL SELECT * FROM corpus_2
+      UNION ALL SELECT * FROM corpus_3
+      UNION ALL SELECT * FROM corpus_4
+      UNION ALL SELECT * FROM corpus_5
+      UNION ALL SELECT * FROM corpus_6
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+    columns:
+      - name: text
+        full_text_search:
+          enabled: true
+          row_id:
+            - _id

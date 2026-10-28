@@ -30,6 +30,26 @@ on:
         required: false
         default: ''
         type: string
+      concurrency:
+        description: 'Number of clients that send search requests at the same time'
+        required: false
+        default: 10
+        type: number
+      limit:
+        description: 'Maximum number of results of each search request'
+        required: false
+        default: 10
+        type: number
+      warmup_passes:
+        description: 'Passes over all test queries before measurement starts'
+        required: false
+        default: 0
+        type: number
+      passes:
+        description: 'Measured passes over all test queries. More than 1 pass in total needs a spicepod with the results caches off.'
+        required: false
+        default: 1
+        type: number
 
 jobs:
   run-bench:
@@ -128,7 +148,10 @@ jobs:
           fi
           testoperator run search \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
-            --concurrency 10 \
+            --concurrency ${{ github.event.inputs.concurrency }} \
+            --limit ${{ github.event.inputs.limit }} \
+            --warmup-passes ${{ github.event.inputs.warmup_passes }} \
+            --passes ${{ github.event.inputs.passes }} \
             "${sql_pipeline_args[@]}" \
             --metrics \
             -p "${{ github.event.inputs.spicepod_path }}"

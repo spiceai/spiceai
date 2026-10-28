@@ -76,6 +76,14 @@ jobs:
             "$SPICEPOD_VALIDATOR" "$file"
           done
 
+      - name: Validate spicepods - Search - Latency benchmarks
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/search/perf/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
       - name: Validate spicepods - Search - FinanceBench
         run: |
           shopt -s globstar nullglob

@@ -40,6 +40,7 @@ testoperator run search --spicepod-path test/spicepods/search/mteb/fiqa/full_tex
 | `mteb/<dataset>/` | MTEB retrieval datasets on Hugging Face (`mteb/*`) | `_id` |
 | `conteb/<dataset>/` | ConTEB datasets on Hugging Face (`illuin-conteb/*`) | `chunk_id` |
 | `financebench/` | FinanceBench PDFs staged to the benchmark bucket (see [its README](./financebench/README.md)) | `_id` |
+| `perf/<dataset>/` | Latency benchmarks (see [Latency benchmarks](#latency-benchmarks)) | `_id` |
 
 ### Dataset label
 
@@ -104,14 +105,67 @@ stable nDCG@10. Use them to find large changes only.
 
 ## Required tables
 
-Every search spicepod must define three tables with a fixed schema. Each table may be a dataset or
-a view.
+Every search spicepod must define `corpus` and `test_queries`. It can also define
+`relevance_data`. Without `relevance_data`, the run measures latency only and does not report
+retrieval quality. Each table may be a dataset or a view.
 
 | Name | Kind | Required columns | Notes |
 |---|---|---|---|
 | `corpus` | dataset or view | the column(s) set up for `embeddings:` and/or `full_text_search:` | Must declare a one-column `row_id:` (a source-system primary key is not discovered automatically). The test reads the corpus id of each search result from this column, and matches it to `"corpus-id"`. |
-| `test_queries` | dataset or view | `_id` (query id), `text` (query text) | Read as `SELECT _id as id, text FROM test_queries`. |
-| `relevance_data` | dataset or view | `"query-id"`, `"corpus-id"`, `score` | Read as `SELECT "query-id", "corpus-id", CAST(score AS BIGINT) AS score FROM relevance_data`. `score` must be a whole-number grade (0, 1, 2, ...); NDCG uses it as a weight. |
+| `test_queries` | dataset or view | `_id` (query id), `text` (query text) | Read as `SELECT * FROM test_queries`. An optional `query_type` column groups the queries for per-type latency percentiles. |
+| `relevance_data` (optional) | dataset or view | `"query-id"`, `"corpus-id"`, `score` | Read as `SELECT "query-id", "corpus-id", CAST(score AS BIGINT) AS score FROM relevance_data`. `score` must be a whole-number grade (0, 1, 2, ...); NDCG uses it as a weight. |
 
 Id columns may be `Utf8`, `LargeUtf8`, or an integer type. Use `views:` to map real column names
 onto these names. See [`custom/example.yaml`](./custom/example.yaml) for a template.
+
+## Latency benchmarks
+
+`testoperator run search` measures the latency of each search request. These flags make the
+measurement a benchmark:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--warmup-passes <n>` | `0` | Send all test queries `n` times before measurement starts. |
+| `--passes <n>` | `1` | Send all test queries `n` times and measure each request. Retrieval quality uses the first measured pass. |
+| `--limit <n>` | `10` | The maximum number of results of each request. |
+| `--concurrency <n>` | `1` | The number of clients. Each client sends one request, waits for the response, and then sends the next request. |
+
+The run prints the P50, P95, P99, and P99.9 latency and the sample count, for all queries and for
+each `query_type`. It does not report a percentile that has fewer than 10 samples beyond it. For
+example, P99.9 needs at least 10,000 samples. The run records the same values as the
+`search_latency_ms` (with `percentile` and `query_type` attributes) and `search_latency_samples`
+metrics.
+
+When the run sends each query more than one time (`--warmup-passes` + `--passes` > 1), the
+spicepod must turn off both results caches. Otherwise the run fails, because a repeated query
+would come from the cache:
+
+```yaml
+runtime:
+  caching:
+    search_results:
+      enabled: false
+    sql_results:
+      enabled: false
+```
+
+Compare two runs only when they use the same runner type, spicepod, `--concurrency`, `--limit`,
+and pass counts.
+
+| Directory | Data | Queries | `relevance_data` |
+|---|---|---|---|
+| `perf/msmarco/` | MS MARCO passages (8.8M) from `mteb/msmarco` | The 6,980 dev queries that have judgments | MS MARCO dev qrels |
+| `perf/search_benchmark_game/` | English Wikipedia (about 5M articles) from [`spiceai/search-benchmark-game`](https://huggingface.co/datasets/spiceai/search-benchmark-game) | 962 keyword queries from [search-benchmark-game](https://github.com/quickwit-oss/search-benchmark-game), with `query_type` (`union`, `intersection`, `phrase`, ...) | None (latency only) |
+
+For example, to get P99.9 for each query type of search-benchmark-game (about 300 queries for
+each type, so 34 or more passes):
+
+```console
+testoperator run search \
+  -p "test/spicepods/search/perf/search_benchmark_game/full_text_search-cayenne[file].yaml" \
+  --warmup-passes 2 --passes 35 --concurrency 1
+```
+
+The search-benchmark-game queries use the Tantivy query syntax: `+term` is a required term, and
+`"a b"` is a phrase. Spice indexes text with an English stemmer, and the benchmark does not.
+Thus, Spice results are not the same as the published search-benchmark-game results.
