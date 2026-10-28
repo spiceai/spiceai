@@ -21,7 +21,9 @@ use std::sync::Arc;
 
 use datafusion::error::Result as DFResult;
 
-use super::sql_depth_guard::{MAX_SQL_EXPR_DEPTH, MAX_UNPROTECTED_EXPR_DEPTH};
+use super::sql_depth_guard::{
+    MAX_QUERY_NESTING_DEPTH, MAX_SQL_EXPR_DEPTH, MAX_UNPROTECTED_EXPR_DEPTH,
+};
 
 /// `n` terms of `+1` after `head`: an expression tree `n` deep.
 fn plus_chain(head: &str, n: usize) -> String {
@@ -96,4 +98,30 @@ async fn chains_at_the_caps_plan_on_the_worker_stack() {
             .await
             .unwrap_or_else(|e| panic!("{sql:.60}… must plan: {e}"));
     }
+}
+
+/// `n` CTEs, each reading the one before it, then a query over the last:
+/// queries nested `n + 1` deep.
+fn cte_chain(n: usize) -> String {
+    let mut ctes = vec!["c0 AS (SELECT 1 AS x)".to_string()];
+    ctes.extend((1..n).map(|i| format!("c{i} AS (SELECT x FROM c{})", i - 1)));
+    format!("WITH {} SELECT x FROM c{}", ctes.join(", "), n - 1)
+}
+
+/// A CTE chain at the query nesting cap plans on the worker stack, and one
+/// level more is a planning error.
+#[tokio::test]
+async fn cte_chains_are_bounded_on_the_worker_stack() {
+    plan_on_default_worker_stack(cte_chain(MAX_QUERY_NESTING_DEPTH - 1))
+        .await
+        .unwrap_or_else(|e| panic!("a CTE chain at the cap must plan: {e}"));
+    let err = plan_on_default_worker_stack(cte_chain(MAX_QUERY_NESTING_DEPTH))
+        .await
+        .expect_err("a CTE chain over the cap is rejected");
+    assert!(
+        err.strip_backtrace().contains(&format!(
+            "queries are nested more than {MAX_QUERY_NESTING_DEPTH} levels deep"
+        )),
+        "unexpected error: {err}"
+    );
 }
