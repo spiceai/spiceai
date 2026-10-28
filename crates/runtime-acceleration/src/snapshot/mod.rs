@@ -901,6 +901,75 @@ impl SnapshotUploadError {
     }
 }
 
+/// A snapshot's object key below the snapshot location, in the form the object store
+/// stores it: each segment percent-encoded by [`PathPart`] (`ord#ers` is stored as
+/// `ord%23ers`).
+///
+/// Snapshot URIs in `metadata.json` carry this form after the location URI, so it is
+/// joined back onto the location as it is. Building an [`ObjectPath`] from it with
+/// `ObjectPath::from` encodes every `%` a second time and names an object that does not
+/// exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelativeKey {
+    /// Stored segments; each one is a valid [`PathPart`] as it is.
+    segments: Vec<String>,
+}
+
+impl RelativeKey {
+    /// The key of `location` below `base`, or `None` when `location` is not below it or is
+    /// `base` itself.
+    fn below(location: &ObjectPath, base: &ObjectPath) -> Option<Self> {
+        let segments: Vec<String> = location
+            .prefix_match(base)?
+            .map(|part| part.as_ref().to_string())
+            .collect();
+        (!segments.is_empty()).then_some(Self { segments })
+    }
+
+    /// Reads the key from the part of a snapshot URI after its location. Every URI this
+    /// runtime records holds stored segments. A segment in another form, such as a raw
+    /// `#` in a URI written by hand, is encoded the way the object store stores it.
+    fn from_uri_suffix(suffix: &str) -> Self {
+        Self {
+            segments: suffix
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(stored_segment)
+                .collect(),
+        }
+    }
+
+    /// The stored key, segments joined by `/`.
+    fn to_key(&self) -> String {
+        self.segments.join("/")
+    }
+
+    /// The object path of this key below `base`.
+    fn under(&self, base: &ObjectPath) -> ObjectPath {
+        self.segments.iter().fold(base.clone(), |path, segment| {
+            // Each segment is a valid `PathPart` by construction; `parse` keeps it as
+            // stored where `PathPart::from` would encode it again.
+            match PathPart::parse(segment) {
+                Ok(part) => path.join(part),
+                Err(_) => path.join(PathPart::from(segment.as_str())),
+            }
+        })
+    }
+}
+
+/// `segment` as the object store stores it. A segment already in that form is kept, and
+/// any other is percent-encoded by [`PathPart`].
+fn stored_segment(segment: &str) -> String {
+    let already_stored = PathPart::parse(segment).is_ok()
+        && ObjectPath::from_url_path(segment)
+            .is_ok_and(|decoded| PathPart::from(decoded.to_string()).as_ref() == segment);
+    if already_stored {
+        segment.to_string()
+    } else {
+        PathPart::from(segment).as_ref().to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SnapshotPathLayout<'a> {
     dataset_name: &'a str,
@@ -1265,22 +1334,16 @@ impl SnapshotManager {
         )
     }
 
+    /// The URI recorded in `metadata.json` for the snapshot at `location`: the snapshot
+    /// location URI followed by the stored key below it. See [`RelativeKey`].
     fn snapshot_uri_for_location(&self, location: &ObjectPath) -> String {
         let base = self.snapshot_location_uri.trim_end_matches('/').to_string();
-        let relative = location
-            .prefix_match(&self.snapshots_location)
-            .map(|parts| {
-                parts
-                    .map(|p| p.as_ref().to_string())
-                    .collect::<Vec<_>>()
-                    .join("/")
-            })
-            .filter(|rel| !rel.is_empty());
+        let relative = RelativeKey::below(location, &self.snapshots_location);
 
         match (base.is_empty(), relative) {
-            (true, Some(rel)) => rel,
+            (true, Some(rel)) => rel.to_key(),
             (true, None) => location.to_string(),
-            (false, Some(rel)) => format!("{base}/{rel}"),
+            (false, Some(rel)) => format!("{base}/{}", rel.to_key()),
             (false, None) => base,
         }
     }
@@ -1387,7 +1450,8 @@ impl SnapshotManager {
 
         // Check if actual snapshot files exist in object store
         let layout = SnapshotPathLayout::new(&self.dataset_name, &self.engine);
-        let dataset_partition = layout.dataset_partition_raw();
+        // Listed keys hold the partition as stored, percent-encoded by `PathPart`.
+        let dataset_partition = PathPart::from(layout.dataset_partition_raw());
 
         let mut list_stream = self.object_store.list(Some(&self.snapshots_location));
         while let Some(result) = list_stream.next().await {
@@ -1396,8 +1460,7 @@ impl SnapshotManager {
                 // Using contains() would incorrectly match prefix names (e.g., dataset=foo matches dataset=foobar).
                 if meta
                     .location
-                    .as_ref()
-                    .split('/')
+                    .parts()
                     .any(|segment| segment == dataset_partition)
                 {
                     return true;
@@ -3021,27 +3084,15 @@ impl SnapshotManager {
             if !relative.is_empty() && !relative.starts_with('/') {
                 continue;
             }
-            let relative = relative.trim_start_matches('/');
-            let combined = if relative.is_empty() {
-                self.snapshots_location.to_string()
-            } else {
-                format!("{}/{}", self.snapshots_location, relative)
-            };
-            return Ok(ObjectPath::from(combined));
+            return Ok(RelativeKey::from_uri_suffix(relative).under(&self.snapshots_location));
         }
 
         match Url::parse(uri) {
             Ok(parsed_uri) => {
-                let mut combined = self.snapshots_location.to_string();
-                if let Some(host) = parsed_uri.host_str() {
-                    combined = format!("{combined}/{host}");
-                }
-                let path = parsed_uri.path().trim_start_matches('/').trim();
-                if path.is_empty() {
-                    Ok(ObjectPath::from(combined))
-                } else {
-                    Ok(ObjectPath::from(format!("{combined}/{path}")))
-                }
+                let host = parsed_uri.host_str().unwrap_or_default();
+                let path = parsed_uri.path().trim();
+                Ok(RelativeKey::from_uri_suffix(&format!("{host}/{path}"))
+                    .under(&self.snapshots_location))
             }
             Err(parse_err) => {
                 if uri.contains("://") {
@@ -3050,7 +3101,7 @@ impl SnapshotManager {
                         source: parse_err,
                     })
                 } else {
-                    Ok(ObjectPath::from(uri))
+                    Ok(RelativeKey::from_uri_suffix(uri).under(&ObjectPath::ROOT))
                 }
             }
         }
@@ -11355,6 +11406,201 @@ mod tests {
                     ),
                     "files gone: {gone:?}: {:?}",
                     poll.outcome
+                );
+            }
+        }
+    }
+
+    // ========== Snapshot keys of names the object store percent-encodes ==========
+
+    /// Names with characters that `object_store::path` percent-encodes in a key.
+    const ENCODED_NAMES: [&str; 6] = ["ord#ers", "ord~ers", "ord[1]", "100%", "a|b", "q?x"];
+
+    /// The entries `metadata.json` at `metadata_path` holds for `dataset`.
+    async fn entries_of(
+        store: &dyn ObjectStore,
+        metadata_path: &Path,
+        dataset: &str,
+    ) -> Vec<SnapshotEntry> {
+        let bytes = store
+            .get(metadata_path)
+            .await
+            .expect("metadata stored")
+            .bytes()
+            .await
+            .expect("read metadata");
+        let metadata: SnapshotMetadata = serde_json::from_slice(&bytes).expect("parse metadata");
+        metadata
+            .datasets
+            .get(dataset)
+            .map(|dataset| dataset.snapshots.clone())
+            .unwrap_or_default()
+    }
+
+    /// The URI a publish records resolves to the object the publish wrote, for dataset
+    /// names and location prefixes the object store percent-encodes. Each `%` used to be
+    /// encoded again on lookup (`ord%23ers` became `ord%2523ers`).
+    #[test]
+    fn a_recorded_snapshot_uri_resolves_to_the_key_written() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let locations = [
+            (SNAPSHOT_BASE_PATH, SNAPSHOT_URI_PREFIX.to_string()),
+            // `ObjectPath::from` stores the `~` of a location prefix as `%7E`.
+            (
+                "te~am/snapshots",
+                "s3://bucket/te~am/snapshots/".to_string(),
+            ),
+        ];
+        for (prefix, location_uri) in locations {
+            for name in ENCODED_NAMES {
+                let mut manager = build_manager_over(
+                    Arc::clone(&store) as Arc<dyn ObjectStore>,
+                    PathBuf::from("/tmp/unused"),
+                    &schema,
+                );
+                manager.dataset_name = name.to_string();
+                manager.snapshots_location = Path::from(prefix);
+                manager.snapshot_location_uri.clone_from(&location_uri);
+
+                let written = SnapshotPathLayout::new(name, &manager.engine)
+                    .build_location(&manager.snapshots_location, Utc::now());
+                let uri = manager.snapshot_uri_for_location(&written);
+                for recorded_location in [None, Some(location_uri.as_str())] {
+                    let resolved = manager
+                        .snapshot_uri_to_object_path(&uri, recorded_location)
+                        .expect("resolve the recorded uri");
+                    assert_eq!(
+                        resolved, written,
+                        "name={name} location={location_uri} uri={uri}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A URI written by hand with the raw name resolves to the key the store holds.
+    #[test]
+    fn a_hand_written_uri_with_raw_characters_resolves_to_the_stored_key() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            PathBuf::from("/tmp/unused"),
+            &schema,
+        );
+        let resolved = manager
+            .snapshot_uri_to_object_path(
+                &format!("{SNAPSHOT_URI_PREFIX}/month=2026-10/day=2026-10-27/dataset=ord#ers/ord#ers_1.cayenne"),
+                None,
+            )
+            .expect("resolve");
+        assert_eq!(
+            resolved.to_string(),
+            "snapshots/month=2026-10/day=2026-10-27/dataset=ord%23ers/ord%23ers_1.cayenne"
+        );
+
+        for (segment, stored) in [
+            ("ord%23ers", "ord%23ers"),
+            ("ord#ers", "ord%23ers"),
+            ("100%25", "100%25"),
+            ("100%", "100%25"),
+            ("ord~ers", "ord%7Eers"),
+            ("ord%5B1%5D", "ord%5B1%5D"),
+            ("a b", "a b"),
+            ("..", "%2E%2E"),
+        ] {
+            assert_eq!(stored_segment(segment), stored, "segment={segment}");
+        }
+    }
+
+    /// A dataset whose name the object store encodes bootstraps from its published
+    /// snapshot, and `has_existing_snapshots` finds the snapshot's file.
+    #[tokio::test]
+    async fn a_dataset_whose_name_is_encoded_bootstraps_from_its_snapshot() {
+        let schema = sample_schema();
+        for name in ENCODED_NAMES {
+            let store = Arc::new(InMemory::new());
+            let dir = TempDir::new().expect("tempdir");
+            let local_path = dir.path().join("accelerated.db");
+            let mut writer = build_manager_over(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                local_path.clone(),
+                &schema,
+            );
+            writer.dataset_name = name.to_string();
+            publish_contents(&writer, &local_path, "rows", &schema).await;
+            assert!(
+                writer.has_existing_snapshots().await,
+                "name={name}: the published file is found"
+            );
+
+            let reader_dir = TempDir::new().expect("tempdir");
+            let restored_path = reader_dir.path().join("restored.db");
+            let mut reader = build_manager_for_engine(
+                Arc::clone(&store),
+                restored_path.clone(),
+                BootstrapOnFailureBehavior::Warn,
+                &schema,
+                &AccelerationEngine::Cayenne,
+                false,
+            );
+            reader.dataset_name = name.to_string();
+            let info = reader
+                .download_latest_snapshot()
+                .await
+                .expect("the snapshot downloads")
+                .expect("a snapshot is published");
+            assert_eq!(info.snapshot_id, 0, "name={name}");
+            assert_eq!(
+                std::fs::read(&restored_path).expect("restored file"),
+                b"rows",
+                "name={name}"
+            );
+        }
+    }
+
+    /// Retention keeps the entries and files of a dataset whose name the object store
+    /// encodes. The sweep used to resolve each entry to a key that does not exist, so
+    /// once an entry was a day old it was dropped as gone and its file deleted as an
+    /// orphan.
+    #[tokio::test]
+    async fn retention_keeps_the_snapshots_of_a_dataset_whose_name_is_encoded() {
+        let schema = sample_schema();
+        for name in ENCODED_NAMES {
+            let store = Arc::new(InMemory::new());
+            let dir = TempDir::new().expect("tempdir");
+            let local_path = dir.path().join("accelerated.db");
+            let mut writer = build_manager_over(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                local_path.clone(),
+                &schema,
+            );
+            writer.dataset_name = name.to_string();
+            let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+            for publish_number in 0..3 {
+                publish_contents(
+                    &writer,
+                    &local_path,
+                    &format!("publish {publish_number}"),
+                    &schema,
+                )
+                .await;
+            }
+
+            *writer.next_sweep.lock() = None;
+            writer.cleanup_clock = CleanupClock::ahead_by(2 * DAY);
+            publish_contents(&writer, &local_path, "publish 3", &schema).await;
+
+            let entries = entries_of(store.as_ref(), &metadata_path, name).await;
+            assert_eq!(entry_ids(&entries), vec![0, 1, 2, 3], "name={name}");
+            for entry in &entries {
+                let path = writer
+                    .snapshot_uri_to_object_path(&entry.snapshot, None)
+                    .expect("snapshot path");
+                assert!(
+                    object_exists(store.as_ref(), &path).await,
+                    "name={name}: {path} stays"
                 );
             }
         }
