@@ -2068,7 +2068,9 @@ mod coding_agents {
     /// A stub `spiced`: writes its PID, waits `delay`, then serves `/health`
     /// and `/v1/models` on the `--http` address it is given. It exits on
     /// SIGTERM, and once the test's directory is gone, so a failing test
-    /// cannot leave it running.
+    /// cannot leave it running. It binds without `HTTPServer`'s lookup of the
+    /// host's name, which waits on DNS: on a host whose resolver did not answer
+    /// it, the stub never listened within the test's budget.
     fn stub_runtime(path: &Path, pid_file: &Path, delay: Duration) {
         let python = python3();
         let test_dir = pid_file.parent().expect("the PID file's directory");
@@ -2076,7 +2078,7 @@ mod coding_agents {
             path,
             &format!(
                 r#"#!{python}
-import http.server, os, signal, sys, threading, time
+import http.server, os, signal, socketserver, sys, threading, time
 args = sys.argv[1:]
 host, port = args[args.index("--http") + 1].rsplit(":", 1)
 signal.signal(signal.SIGTERM, lambda *args: os._exit(0))
@@ -2097,7 +2099,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
     def log_message(self, *args):
         pass
-http.server.ThreadingHTTPServer((host, int(port)), Handler).serve_forever()
+class Server(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = host, int(port)
+Server((host, int(port)), Handler).serve_forever()
 "#,
                 python = python.display(),
                 test_dir = test_dir.display().to_string(),
