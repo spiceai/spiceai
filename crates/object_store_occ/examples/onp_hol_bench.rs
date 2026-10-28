@@ -60,7 +60,9 @@ fn store(spec: &str, run: &str) -> Arc<dyn ObjectStore> {
             .expect("s3");
         return Arc::new(PrefixStore::new(s3, format!("hol/{run}")));
     }
-    let dir = spec.strip_prefix("local-durable:").expect("local-durable:<dir>");
+    let dir = spec
+        .strip_prefix("local-durable:")
+        .expect("local-durable:<dir>");
     let dir = std::path::PathBuf::from(dir).join(run);
     std::fs::create_dir_all(&dir).expect("dir");
     Arc::new(LocalConditionalPut::new_durable(&dir).expect("local"))
@@ -105,9 +107,14 @@ async fn main() {
                 let mut n = 0_u64;
                 while !stop.load(Ordering::Relaxed) {
                     let path = Path::from(format!("data/{u}/{n:020}"));
-                    conditional_put(store.as_ref(), &path, blob.clone().into(), &Expected::Absent)
-                        .await
-                        .expect("upload");
+                    conditional_put(
+                        store.as_ref(),
+                        &path,
+                        blob.clone().into(),
+                        &Expected::Absent,
+                    )
+                    .await
+                    .expect("upload");
                     store.delete(&path).await.expect("delete");
                     uploaded.fetch_add(1, Ordering::Relaxed);
                     n += 1;
@@ -117,9 +124,14 @@ async fn main() {
         // Let the uploaders reach steady state first.
         tokio::time::sleep(Duration::from_millis(if uploaders == 0 { 0 } else { 2000 })).await;
         let head = Path::from("head");
-        let created = conditional_put(store.as_ref(), &head, Bytes::from(vec![0_u8; 4096]).into(), &Expected::Absent)
-            .await
-            .expect("head");
+        let created = conditional_put(
+            store.as_ref(),
+            &head,
+            Bytes::from(vec![0_u8; 4096]).into(),
+            &Expected::Absent,
+        )
+        .await
+        .expect("head");
         let mut version = UpdateVersion {
             e_tag: created.e_tag,
             version: created.version,

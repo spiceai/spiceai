@@ -37,8 +37,8 @@ pub mod headlog;
 pub mod lease;
 pub mod local_conditional_put;
 mod retry;
-mod state;
 pub mod sim;
+mod state;
 pub mod store;
 pub mod wal;
 

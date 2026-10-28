@@ -51,8 +51,7 @@ use object_store::{GetOptions, ObjectStore, ObjectStoreExt, UpdateVersion};
 use object_store_occ::sim::latency::Delay;
 use object_store_occ::sim::{LatencyProfile, LatencyStore};
 use object_store_occ::{
-    ConditionalWriteError, Expected, LocalConditionalPut, conditional_put,
-    probe_conditional_writes,
+    ConditionalWriteError, Expected, LocalConditionalPut, conditional_put, probe_conditional_writes,
 };
 
 const KIB: usize = 1024;
@@ -99,7 +98,9 @@ fn build_store(spec: &str, run: &str) -> (String, Arc<dyn ObjectStore>) {
                 .with_allow_http(true)
                 .with_bucket_name(bucket)
                 .with_region("us-east-1")
-                .with_access_key_id(std::env::var("ONP_S3_KEY").unwrap_or_else(|_| "onpadmin".into()))
+                .with_access_key_id(
+                    std::env::var("ONP_S3_KEY").unwrap_or_else(|_| "onpadmin".into()),
+                )
                 .with_secret_access_key(
                     std::env::var("ONP_S3_SECRET").unwrap_or_else(|_| "onpadmin123".into()),
                 )
@@ -127,7 +128,10 @@ fn build_store(spec: &str, run: &str) -> (String, Arc<dyn ObjectStore>) {
                 Duration::from_millis(p99),
             ));
             let store = LatencyStore::new(Arc::new(InMemory::new()), profile, 20_261_027);
-            (format!("latency-{median}ms-p99-{p99}ms (simulated latency)"), Arc::new(store))
+            (
+                format!("latency-{median}ms-p99-{p99}ms (simulated latency)"),
+                Arc::new(store),
+            )
         }
         other => panic!("unknown store {other}"),
     }
@@ -162,10 +166,27 @@ async fn condition_checks(store: &Arc<dyn ObjectStore>) -> Vec<Check> {
 
     // A second create of one name is refused.
     let path = Path::from("checks/create-once");
-    let first = conditional_put(store.as_ref(), &path, payload(64, 1).into(), &Expected::Absent).await;
-    let second =
-        conditional_put(store.as_ref(), &path, payload(64, 2).into(), &Expected::Absent).await;
-    let kept = store.get(&path).await.expect("get").bytes().await.expect("bytes");
+    let first = conditional_put(
+        store.as_ref(),
+        &path,
+        payload(64, 1).into(),
+        &Expected::Absent,
+    )
+    .await;
+    let second = conditional_put(
+        store.as_ref(),
+        &path,
+        payload(64, 2).into(),
+        &Expected::Absent,
+    )
+    .await;
+    let kept = store
+        .get(&path)
+        .await
+        .expect("get")
+        .bytes()
+        .await
+        .expect("bytes");
     checks.push(Check {
         name: "second create refused, first bytes kept",
         expected: "accepted, refused (Conflict), first bytes".into(),
@@ -173,7 +194,11 @@ async fn condition_checks(store: &Arc<dyn ObjectStore>) -> Vec<Check> {
             "{}, {}, {}",
             describe(&first),
             describe(&second),
-            if kept == payload(64, 1) { "first bytes" } else { "OTHER bytes" }
+            if kept == payload(64, 1) {
+                "first bytes"
+            } else {
+                "OTHER bytes"
+            }
         ),
         pass: first.is_ok()
             && matches!(second, Err(ConditionalWriteError::Conflict { .. }))
@@ -182,9 +207,14 @@ async fn condition_checks(store: &Arc<dyn ObjectStore>) -> Vec<Check> {
 
     // A CAS on a stale version (a lost update) is refused.
     let head = Path::from("checks/head");
-    let v1 = conditional_put(store.as_ref(), &head, payload(64, 10).into(), &Expected::Absent)
-        .await
-        .expect("create head");
+    let v1 = conditional_put(
+        store.as_ref(),
+        &head,
+        payload(64, 10).into(),
+        &Expected::Absent,
+    )
+    .await
+    .expect("create head");
     let v2 = conditional_put(
         store.as_ref(),
         &head,
@@ -200,14 +230,24 @@ async fn condition_checks(store: &Arc<dyn ObjectStore>) -> Vec<Check> {
         &Expected::Version(version_of(&v1)),
     )
     .await;
-    let current = store.get(&head).await.expect("get").bytes().await.expect("bytes");
+    let current = store
+        .get(&head)
+        .await
+        .expect("get")
+        .bytes()
+        .await
+        .expect("bytes");
     checks.push(Check {
         name: "stale CAS (lost update) refused, winner kept",
         expected: "refused (Conflict), v2 bytes".into(),
         seen: format!(
             "{}, {}",
             describe(&stale),
-            if current == payload(64, 11) { "v2 bytes" } else { "OTHER bytes" }
+            if current == payload(64, 11) {
+                "v2 bytes"
+            } else {
+                "OTHER bytes"
+            }
         ),
         pass: matches!(stale, Err(ConditionalWriteError::Conflict { .. }))
             && current == payload(64, 11),
@@ -254,9 +294,14 @@ async fn condition_checks(store: &Arc<dyn ObjectStore>) -> Vec<Check> {
     // design rules this out by never repeating head bytes; this records
     // whether the store would otherwise let a delayed CAS apply (ABA).
     let aba = Path::from("checks/aba");
-    let a1 = conditional_put(store.as_ref(), &aba, Bytes::from_static(b"same").into(), &Expected::Absent)
-        .await
-        .expect("aba create");
+    let a1 = conditional_put(
+        store.as_ref(),
+        &aba,
+        Bytes::from_static(b"same").into(),
+        &Expected::Absent,
+    )
+    .await
+    .expect("aba create");
     let a2 = conditional_put(
         store.as_ref(),
         &aba,
@@ -295,9 +340,14 @@ async fn condition_checks(store: &Arc<dyn ObjectStore>) -> Vec<Check> {
     // round.
     let race = Path::from("checks/race");
     let mut version = version_of(
-        &conditional_put(store.as_ref(), &race, payload(64, 100).into(), &Expected::Absent)
-            .await
-            .expect("race create"),
+        &conditional_put(
+            store.as_ref(),
+            &race,
+            payload(64, 100).into(),
+            &Expected::Absent,
+        )
+        .await
+        .expect("race create"),
     );
     let rounds = 200_u64;
     let writers = 8_u64;
@@ -392,13 +442,23 @@ struct Fixture {
 
 async fn setup(store: &Arc<dyn ObjectStore>) -> Fixture {
     let head = Path::from("bench/head");
-    let created = conditional_put(store.as_ref(), &head, payload(4 * KIB, 0).into(), &Expected::Absent)
-        .await
-        .expect("bench head");
+    let created = conditional_put(
+        store.as_ref(),
+        &head,
+        payload(4 * KIB, 0).into(),
+        &Expected::Absent,
+    )
+    .await
+    .expect("bench head");
     let poll_target = Path::from("bench/poll");
-    let p1 = conditional_put(store.as_ref(), &poll_target, payload(4 * KIB, 1).into(), &Expected::Absent)
-        .await
-        .expect("poll v1");
+    let p1 = conditional_put(
+        store.as_ref(),
+        &poll_target,
+        payload(4 * KIB, 1).into(),
+        &Expected::Absent,
+    )
+    .await
+    .expect("poll v1");
     let p2 = conditional_put(
         store.as_ref(),
         &poll_target,
@@ -495,7 +555,13 @@ async fn run_one(store: &Arc<dyn ObjectStore>, fixture: &mut Fixture, bench: Ben
             };
             let path = fixture.sized[&size].clone();
             let start = Instant::now();
-            let body = store.get(&path).await.expect("get").bytes().await.expect("bytes");
+            let body = store
+                .get(&path)
+                .await
+                .expect("get")
+                .bytes()
+                .await
+                .expect("bytes");
             let elapsed = start.elapsed();
             assert_eq!(body.len(), size);
             elapsed
