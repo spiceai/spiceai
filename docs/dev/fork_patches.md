@@ -118,7 +118,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `7f887215833c82112d94188adb8855cda8a4e47e` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `300acfcfb51abfa9c477f57bff3e0529ec4f5f1a` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `3cd2af82c74e5ab322e8a8282c52ce441cf82697` | `ben/result-column-identity-and-union-scope` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `bd6e935eeb6abd9a84099d3ec4f6f1615b93d2db` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
