@@ -12076,6 +12076,7 @@ dependencies = [
  "llms",
  "mistralrs-core",
  "rand 0.10.1",
+ "runtime-request-context",
  "serde_json",
  "tempfile",
  "tokio",

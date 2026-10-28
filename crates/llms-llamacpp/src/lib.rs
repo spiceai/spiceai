@@ -84,6 +84,7 @@ use llms::chat::{
     nsql::SqlGeneration,
 };
 use llms::streaming_utils::generate_stream_id;
+use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
 mod distributed;
 
@@ -251,6 +252,9 @@ struct Sampling {
 
 struct Job {
     prompt: String,
+    /// The caller's cache namespace: a request reuses only what its own caller's requests left
+    /// in the KV cache.
+    namespace: CacheNamespace,
     limit: Option<usize>,
     sampling: Sampling,
     stop: Vec<String>,
@@ -504,6 +508,7 @@ impl LlamaCpp {
     fn submit(
         &self,
         req: &CreateChatCompletionRequest,
+        namespace: &CacheNamespace,
     ) -> std::result::Result<Vec<mpsc::Receiver<Event>>, OpenAIError> {
         let choices = choice_count(req)?;
         let reasoning = reasoning_controls(
@@ -564,6 +569,7 @@ impl LlamaCpp {
             let job = Job {
                 reasoning: reasoning_parser(template, &prompt),
                 prompt: prompt.clone(),
+                namespace: namespace.clone(),
                 limit: completion_limit(req),
                 // Each choice samples with its own seed, so choices differ above temperature 0.
                 sampling: Sampling {
@@ -608,7 +614,7 @@ impl Chat for LlamaCpp {
         &self,
         req: CreateChatCompletionRequest,
     ) -> std::result::Result<ChatCompletionResponseStream, OpenAIError> {
-        let choices = self.submit(&req)?.into();
+        let choices = self.submit(&req, &caller().await)?.into();
         let id = self.id();
         let model = req.model;
         let created = now();
@@ -716,7 +722,8 @@ impl Chat for LlamaCpp {
     ) -> std::result::Result<CreateChatCompletionResponse, OpenAIError> {
         let mut choices = Vec::new();
         let (mut prompt_tokens, mut completion_tokens) = (0, 0_u32);
-        for (index, mut rx) in (0..).zip(self.submit(&req)?) {
+        let namespace = caller().await;
+        for (index, mut rx) in (0..).zip(self.submit(&req, &namespace)?) {
             let (mut reasoning, mut content, mut tool_calls) =
                 (String::new(), String::new(), Vec::new());
             let outcome = loop {
@@ -1256,6 +1263,8 @@ struct PromptCache {
     /// The tokens in the KV cache, in order: the last prompt, then the reply tokens decoded
     /// after it. Empty while a request runs, so one that fails leaves nothing to reuse.
     tokens: Vec<Token>,
+    /// The cache namespace of the caller whose request left `tokens` and the checkpoints.
+    namespace: Option<CacheNamespace>,
     /// For a cache that cannot be cut back to any position, as a recurrent state or a
     /// compressed cache cannot.
     checkpoints: Option<Checkpoints>,
@@ -1270,6 +1279,7 @@ impl PromptCache {
         Self {
             model: name.to_string(),
             tokens: Vec::new(),
+            namespace: None,
             checkpoints: (truncation != Truncation::Anywhere).then(Checkpoints::default),
             reused: Arc::default(),
             cost: CheckpointCost::default(),
@@ -1281,8 +1291,24 @@ impl PromptCache {
     /// request samples from. A cache that cannot be cut back to any position is used as it
     /// stands only when the prompt extends it; otherwise it restores its latest checkpoint within
     /// that prefix, and failing that, the cache is emptied.
-    fn reuse<'m>(&mut self, target: &mut impl Target<'m>, tokens: &[Token]) -> usize {
-        let cached = std::mem::take(&mut self.tokens);
+    ///
+    /// Only a request from the caller in `namespace` whose request filled the cache reuses it:
+    /// how long a request takes must not say what another caller asked. Another caller's
+    /// request starts from an empty cache, its checkpoints dropped.
+    fn reuse<'m>(
+        &mut self,
+        target: &mut impl Target<'m>,
+        tokens: &[Token],
+        namespace: &CacheNamespace,
+    ) -> usize {
+        let mut cached = std::mem::take(&mut self.tokens);
+        if self.namespace.as_ref() != Some(namespace) {
+            cached.clear();
+            if let Some(checkpoints) = &mut self.checkpoints {
+                checkpoints.clear();
+            }
+            self.namespace = Some(namespace.clone());
+        }
         let common = cached
             .iter()
             .zip(tokens)
@@ -1455,7 +1481,7 @@ fn read_prompt<'m>(
     model: &Model,
     target: &mut impl Target<'m>,
     cache: &mut PromptCache,
-    prompt: &str,
+    (prompt, namespace): (&str, &CacheNamespace),
     stopping: &AtomicBool,
 ) -> std::result::Result<(Vec<Token>, Batch), String> {
     let tokens = model
@@ -1472,7 +1498,7 @@ fn read_prompt<'m>(
             tokens.len()
         ));
     }
-    let start = cache.reuse(target, &tokens);
+    let start = cache.reuse(target, &tokens, namespace);
     let mut batch = Batch::new(PROMPT_BATCH);
     // The prompt is read in two spans split at the checkpoint, so the state saved there
     // follows exactly the tokens before it; without one, the first span is empty.
@@ -1898,11 +1924,13 @@ fn generate(
     job: Job,
     eog: &[Token],
 ) -> std::result::Result<Outcome, String> {
+    let namespace = job.namespace.clone();
     let (prompt, sampling, mut out) = Output::new(job);
     let vocab = model.vocab();
     let mut picker = Picker::new(vocab, &sampling, eog, context.n_ctx())?;
     // `tokens` grows by every reply token decoded, so it is always what the cache holds.
-    let (mut tokens, mut batch) = read_prompt(model, context, cache, &prompt, &out.stopping)?;
+    let (mut tokens, mut batch) =
+        read_prompt(model, context, cache, (&prompt, &namespace), &out.stopping)?;
     let prompt_tokens = tokens.len();
     let n_ctx = usize::try_from(context.n_ctx()).unwrap_or(usize::MAX);
     let finish = loop {
@@ -1938,13 +1966,15 @@ fn generate_mtp(
     job: Job,
     eog: &[Token],
 ) -> std::result::Result<Outcome, String> {
+    let namespace = job.namespace.clone();
     let (prompt, sampling, mut out) = Output::new(job);
     let vocab = model.vocab();
     let mut picker = Picker::new(vocab, &sampling, eog, spec.target().n_ctx())?;
     // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
     // hidden state at each prompt position before `begin`; its cache keeps the positions the
     // target's reuses.
-    let (mut history, mut batch) = read_prompt(model, spec, cache, &prompt, &out.stopping)?;
+    let (mut history, mut batch) =
+        read_prompt(model, spec, cache, (&prompt, &namespace), &out.stopping)?;
     spec.begin(&history).map_err(|e| e.to_string())?;
     let n_ctx = usize::try_from(spec.target().n_ctx()).unwrap_or(usize::MAX);
     let prompt_tokens = history.len();
@@ -2472,6 +2502,12 @@ fn now() -> u32 {
         .unwrap_or_default()
 }
 
+/// The cache namespace of the caller this request runs for: its authenticated principal's, or
+/// the shared one of an unauthenticated or internal request, as the runtime scopes each request.
+async fn caller() -> CacheNamespace {
+    RequestContext::current(AsyncMarker::new().await).cache_namespace()
+}
+
 fn api_error(message: &str) -> OpenAIError {
     OpenAIError::ApiError(ApiError {
         message: message.to_string(),
@@ -2540,6 +2576,7 @@ mod tests {
             .expect("a matcher for one tool");
         let job = Job {
             prompt: String::new(),
+            namespace: CacheNamespace::Public,
             limit: None,
             sampling: Sampling::default(),
             stop: Vec::new(),
@@ -2863,6 +2900,7 @@ mod tests {
         let (events, rx) = mpsc::channel(STREAM_BUFFER);
         let job = Job {
             prompt: String::new(),
+            namespace: CacheNamespace::Public,
             limit: None,
             sampling: Sampling::default(),
             stop: Vec::new(),
@@ -3067,6 +3105,7 @@ mod tests {
         let (events, rx) = mpsc::channel(STREAM_BUFFER);
         let job = Job {
             prompt: String::new(),
+            namespace: CacheNamespace::Public,
             limit: None,
             sampling: Sampling::default(),
             stop: vec!["STOP".to_string()],

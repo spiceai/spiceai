@@ -307,6 +307,58 @@ async fn a_sliding_window_cache_is_cut_back_more_than_a_window() {
     );
 }
 
+/// A request made as `caller`, an authenticated principal's cache namespace, as the runtime
+/// scopes every request it serves.
+async fn as_caller<F: std::future::Future>(caller: &str, f: F) -> F::Output {
+    use runtime_request_context::{CacheNamespace, Protocol, RequestContext};
+    std::sync::Arc::new(
+        RequestContext::builder(Protocol::Http)
+            .with_cache_namespace(CacheNamespace::Principal(std::sync::Arc::from(caller)))
+            .build(),
+    )
+    .scope(f)
+    .await
+}
+
+/// A cached prompt is reused only by the caller who sent it: one caller's conversation reuses
+/// its own turns, and another caller sending the same messages reads none of them from the
+/// cache, so the time a request takes says nothing about what another caller asked. Each
+/// reply is the one an empty cache gives.
+#[tokio::test]
+async fn a_caller_reuses_only_its_own_prompts() {
+    let gguf = crate::qwen3_gguf().await;
+    let name = "qwen3-0.6b-per-caller";
+    let model = load(&gguf, name).await;
+    let first = vec![json!({ "role": "user", "content": USER_TURNS[0] })];
+    let (reply, _) = as_caller("alice", ask(&model, name, &first)).await;
+    let mut second = first.clone();
+    second.push(json!({ "role": "assistant", "content": reply }));
+    second.push(json!({ "role": "user", "content": USER_TURNS[1] }));
+
+    let (alice, alice_tokens) = as_caller("alice", ask(&model, name, &second)).await;
+    let alice_reused = model.reused_prompt_tokens();
+    let (bob, bob_tokens) = as_caller("bob", ask(&model, name, &second)).await;
+    let bob_reused = model.reused_prompt_tokens();
+    let (again, _) = as_caller("bob", ask(&model, name, &second)).await;
+    let bob_again = model.reused_prompt_tokens();
+    eprintln!(
+        "alice reused {alice_reused} of {alice_tokens}, bob {bob_reused} of {bob_tokens}, then {bob_again}"
+    );
+
+    assert!(
+        alice_reused > 0 && alice_reused < alice_tokens,
+        "alice's next turn reuses her first: {alice_reused} of {alice_tokens}"
+    );
+    assert_eq!(bob_reused, 0, "bob reads nothing alice's requests left");
+    assert_eq!(bob_again, bob_tokens - 1, "bob reuses his own prompt");
+    drop(model);
+    let fresh = load(&gguf, name).await;
+    let (cold, _) = ask(&fresh, name, &second).await;
+    assert_eq!(alice, cold, "alice's reply against an empty cache's");
+    assert_eq!(bob, cold, "bob's reply against an empty cache's");
+    assert_eq!(again, cold, "bob's repeated reply against an empty cache's");
+}
+
 /// `n` choices run one after another on the same prompt, so every choice after the first
 /// reuses the whole prompt but its last token, and greedy, all choices are the same reply.
 #[tokio::test]
