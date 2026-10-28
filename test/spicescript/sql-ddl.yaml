@@ -143,6 +143,12 @@ steps:
       headers: { content-type: application/json }
       body: '{"tool_id": "sql", "arguments": {"query": "CREATE TABLE p17 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-tool-invoke'')"}}'
     expect: { body-contains: p17 }
+  - http:
+      method: POST
+      path: /v1/tools/tool_invoke
+      headers: { content-type: application/json }
+      body: '{"tool_id": "sql", "arguments": {"sql": "CRATE TABLE p18 WITH (pg_pass = ''leak-tool-invoke-bad-arguments'')"}}'
+    expect: { body-contains: 'missing field' }
   - spice-exec: "CREATE TABLE p_last WITH (from = 'postgres:public.t', pg_host = '127.0.0.1', pg_port = 1, pg_db = 'd', pg_pass = 'leak-last')"
     expect-error: true
   # Task history, as a read-only key reads it, once the last statement is in it.

@@ -534,7 +534,7 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
     /// arguments that are not this tool's JSON only as a placeholder.
     fn recorded_arguments<'a>(&self, arg: &'a str) -> (Cow<'a, str>, Vec<String>) {
         let Ok(params) = serde_json::from_str::<ToolInvokeParams>(arg) else {
-            return (Cow::Borrowed(UNREADABLE_STATEMENT), Vec::new());
+            return (Cow::Owned(UNREADABLE_STATEMENT.to_string()), Vec::new());
         };
         let selected = self.find_tool(&params.tool_id);
         let (Some(tool), Ok(arguments)) = (selected, invoked_arguments(params.arguments)) else {
@@ -544,19 +544,17 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
             );
         };
         let (recorded, removed) = tool.recorded_arguments(&arguments);
-        match recorded {
-            Cow::Borrowed(_) => (Cow::Borrowed(arg), removed),
-            Cow::Owned(recorded) => {
-                let arguments =
-                    serde_json::from_str::<Value>(&recorded).unwrap_or(Value::String(recorded));
-                (
-                    Cow::Owned(
-                        json!({ "tool_id": params.tool_id, "arguments": arguments }).to_string(),
-                    ),
-                    removed,
-                )
-            }
+        // Unchanged only when the text is the arguments themselves: a tool can
+        // borrow a placeholder of its own in their place.
+        if recorded == arguments.as_str() {
+            return (Cow::Borrowed(arg), removed);
         }
+        let recorded = recorded.into_owned();
+        let arguments = serde_json::from_str::<Value>(&recorded).unwrap_or(Value::String(recorded));
+        (
+            Cow::Owned(json!({ "tool_id": params.tool_id, "arguments": arguments }).to_string()),
+            removed,
+        )
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -1740,13 +1738,46 @@ mod tests {
         }
     }
 
+    /// A tool that records any arguments as a placeholder of its own, which it
+    /// borrows.
+    struct PlaceholderTool;
+
+    #[async_trait]
+    impl SpiceModelTool for PlaceholderTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("placeholder")
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!({"rows": 0}))
+        }
+
+        fn recorded_arguments<'a>(&self, _arg: &'a str) -> (Cow<'a, str>, Vec<String>) {
+            (Cow::Borrowed(UNREADABLE_STATEMENT), Vec::new())
+        }
+    }
+
     /// `tool_invoke` records the arguments it passes on as the tool it selects
     /// records them, so an agent's definition keeps its credentials out of task
     /// history on this path too.
     #[test]
     fn invoke_records_arguments_as_the_selected_tool_does() {
         let advertised_tools = tool_registry_tools(
-            vec![Arc::new(RedactingTool) as Arc<dyn SpiceModelTool>],
+            vec![
+                Arc::new(RedactingTool) as Arc<dyn SpiceModelTool>,
+                Arc::new(PlaceholderTool) as Arc<dyn SpiceModelTool>,
+            ],
             mock_embed(),
         );
         let invoke_tool = advertised_tools
@@ -1773,6 +1804,15 @@ mod tests {
                 r#"{"tool_id":"sql","arguments":"{\"query\":\"CREATE TABLE t WITH (pg_pass = 'hunter2')\"}"}"#
             ),
             json!({"tool_id": "sql", "arguments": {"query": "CREATE TABLE t WITH (pg_pass = '<redacted>')"}})
+        );
+
+        // A tool that records its arguments as a placeholder it borrows: the
+        // placeholder, not the arguments.
+        assert_eq!(
+            recorded_json(
+                r#"{"tool_id":"placeholder","arguments":{"sql":"CRATE TABLE t WITH (pg_pass = 'hunter2')"}}"#
+            ),
+            json!({"tool_id": "placeholder", "arguments": UNREADABLE_STATEMENT})
         );
 
         // A call that selects no tool runs nothing, and keeps none of its

@@ -144,7 +144,8 @@ impl SpiceModelTool for SqlTool {
 /// nothing, and are recorded only as [`UNREADABLE_STATEMENT`].
 fn recorded_input(arg: &str) -> (Cow<'_, str>, Vec<String>) {
     let Ok(SqlToolParams { query }) = serde_json::from_str::<SqlToolParams>(arg) else {
-        return (Cow::Borrowed(UNREADABLE_STATEMENT), Vec::new());
+        // Owned, as any changed text is: a caller tells a changed text by it.
+        return (Cow::Owned(UNREADABLE_STATEMENT.to_string()), Vec::new());
     };
     let dialect = PostgreSqlDialect {};
     let recorded = if DFParser::parse_sql_with_dialect(&query, &dialect).is_ok() {
@@ -212,11 +213,12 @@ mod tests {
             r#"{"query": "CRATE TABLE t WITH (pg_pass = 'hunter2')""#,
             "not json",
         ] {
-            assert_eq!(
-                recorded_input(arg),
-                (Cow::Borrowed(UNREADABLE_STATEMENT), Vec::new()),
-                "{arg}"
+            let (recorded, removed) = recorded_input(arg);
+            assert!(
+                matches!(&recorded, Cow::Owned(text) if text == UNREADABLE_STATEMENT),
+                "{arg}: {recorded:?}"
             );
+            assert!(removed.is_empty(), "{arg}: {removed:?}");
         }
     }
 }
