@@ -7,6 +7,8 @@
 set -euo pipefail
 
 SPICED=${SPICED:-$(command -v spiced || echo target/debug/spiced)}
+# spiced runs from the work directory, so pin a relative path to the caller's.
+if [[ $SPICED == */* && $SPICED != /* ]]; then SPICED="$PWD/$SPICED"; fi
 HTTP=${HTTP:-127.0.0.1:18590}
 FLIGHT=${FLIGHT:-127.0.0.1:18591}
 METRICS=${METRICS:-127.0.0.1:18592}
@@ -15,8 +17,8 @@ PID=
 
 cleanup() {
   if [[ ${KEEP:-0} != 1 ]]; then
-    [[ -n $PID ]] && kill "$PID" 2>/dev/null || true
-    [[ -z ${WORKDIR:-} ]] && rm -rf "$W"
+    if [[ -n $PID ]]; then kill "$PID" 2>/dev/null || true; fi
+    if [[ -z ${WORKDIR:-} ]]; then rm -rf "$W"; fi
   fi
 }
 trap cleanup EXIT
