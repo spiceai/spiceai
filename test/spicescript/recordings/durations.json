@@ -20,6 +20,7 @@
   "conflict-batches": 17,
   "connector-errors": 44,
   "cron-and-reload": 15,
+  "csv-header-binding": 32,
   "debezium-direct": 10,
   "debezium-kafka": 62,
   "debezium-offset-recovery": 34,
