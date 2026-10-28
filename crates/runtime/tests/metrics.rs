@@ -1857,11 +1857,12 @@ async fn server_timing_reports_the_recorded_duration_samples() -> Result<(), any
     let (http_port, channel) = start_servers(FLIGHT).await?;
     let sql = "SELECT 1 AS n";
 
-    // A buffered format: the head carries the response-head sample.
+    // `text/plain` stays buffered (it sizes its columns from every row), so the
+    // head carries the response-head sample.
     let response = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{http_port}/v1/sql"))
         .header("user-agent", BUFFERED)
-        .header("accept", "text/csv")
+        .header("accept", "text/plain")
         .body(sql)
         .send()
         .await?;
