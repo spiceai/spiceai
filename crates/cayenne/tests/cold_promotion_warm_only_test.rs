@@ -797,6 +797,71 @@ async fn test_do_nothing_ignores_a_key_already_in_the_datalake_impl(
     Ok(())
 }
 
+/// Run a `DELETE` with no `WHERE` and return the rows-affected count.
+async fn delete_all(table: &CayenneTableProvider) -> TestResult<u64> {
+    let ctx = SessionContext::new();
+    let plan = table.delete_from(&ctx.state(), vec![]).await?;
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    batches
+        .first()
+        .and_then(|b| b.column(0).as_any().downcast_ref::<UInt64Array>())
+        .and_then(|a| a.values().first())
+        .copied()
+        .ok_or_else(|| "DELETE returned no rows-affected count".into())
+}
+
+test_with_backends!(test_delete_all_counts_live_rows_impl);
+
+/// A `DELETE` with no `WHERE` reports the rows that were visible: a key deleted
+/// earlier, whose row is still in a file, is not counted again, and neither is
+/// a superseded datalake copy of a key that is live elsewhere.
+async fn test_delete_all_counts_live_rows_impl(fixture: common::TestFixture) -> TestResult<()> {
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options(&fixture, &cold_dir), ctx.runtime_env())
+            .await?,
+    );
+    ctx.register_table(TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    let mut oracle: BTreeMap<i64, i64> = BTreeMap::new();
+
+    // Warm files only: one key deleted, its row still in a file.
+    let initial: Vec<(i64, i64)> = (0..10).map(|id| (id, id * 2)).collect();
+    upsert(&table, &mut oracle, &initial).await?;
+    flush_warm(&table).await;
+    assert_eq!(delete_where(&table, col("id").eq(lit(1_i64))).await?, 1);
+    oracle.remove(&1);
+    assert_eq!(delete_all(&table).await?, 9, "warm: DELETE without WHERE counts the 9 live rows");
+    oracle.clear();
+    assert_eq!(count_star(&ctx).await?, 0);
+
+    // Datalake generations holding superseded copies and a deleted key.
+    let rows: Vec<(i64, i64)> = (100..200).map(|id| (id, id * 2)).collect();
+    upsert(&table, &mut oracle, &rows).await?;
+    flush_warm(&table).await;
+    assert!(table.promote_warm_to_cold().await?, "promotion 1 fires");
+    let rows: Vec<(i64, i64)> = (100..110).map(|id| (id, id + 1000)).collect();
+    upsert(&table, &mut oracle, &rows).await?;
+    assert_eq!(delete_where(&table, col("id").eq(lit(150_i64))).await?, 1);
+    oracle.remove(&150);
+    flush_warm(&table).await;
+    assert!(table.promote_warm_to_cold().await?, "promotion 2 fires");
+    let rows: Vec<(i64, i64)> = (120..125).map(|id| (id, id + 2000)).collect();
+    upsert(&table, &mut oracle, &rows).await?;
+    assert_matches_oracle(&ctx, &oracle, &[100, 120, 150], "before the delete-all").await?;
+    assert_eq!(
+        delete_all(&table).await?,
+        u64::try_from(oracle.len())?,
+        "datalake: DELETE without WHERE counts each live key once"
+    );
+    oracle.clear();
+    assert_matches_oracle(&ctx, &oracle, &[100, 120, 150], "after the delete-all").await?;
+    Ok(())
+}
+
 const COMPOSITE_TABLE: &str = "composite_t";
 
 fn composite_schema() -> Arc<Schema> {
