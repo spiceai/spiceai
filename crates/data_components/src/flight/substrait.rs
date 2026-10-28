@@ -50,8 +50,8 @@ use datafusion_substrait::{
     logical_plan::producer::{SubstraitProducer, from_table_scan},
     substrait::{
         proto::{
-            Expression, FunctionArgument, Plan, PlanRel, Rel, RelRoot, expression::RexType,
-            function_argument::ArgType, plan_rel, read_rel::ReadType, rel::RelType,
+            Expression, Plan, PlanRel, Rel, RelRoot, expression::RexType, plan_rel,
+            read_rel::ReadType, rel::RelType,
         },
         version::version_with_producer,
     },
@@ -164,17 +164,11 @@ impl SubstraitProducer for SpiceProducer {
             self, function, schema,
         )?;
         if let Some(RexType::ScalarFunction(scalar)) = &mut encoded.rex_type {
-            // Rebuild arguments in original order. Canonical Substrait rewrites
-            // (for example log's argument swap) do not apply to exact functions.
-            scalar.arguments = function
-                .args
-                .iter()
-                .map(|arg| {
-                    Ok(FunctionArgument {
-                        arg_type: Some(ArgType::Value(self.handle_expr(arg, schema)?)),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+            // DataFusion's producer swaps log(base, value) for Substrait's
+            // logb(value, base). Exact function binding uses DataFusion order.
+            if function.func.name() == "log" && scalar.arguments.len() == 2 {
+                scalar.arguments.swap(0, 1);
+            }
             // Canonical aliases (isnan -> is_nan) may bind a different UDF.
             scalar.function_reference = self
                 .extensions

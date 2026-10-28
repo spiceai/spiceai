@@ -118,6 +118,30 @@ def main():
     cases = [
         ("rows", "SELECT id, value, label FROM orders ORDER BY id", INPUT),
         (
+            "int64-upper-boundary",
+            "SELECT value + CAST(9223372036854775790 AS BIGINT) AS v FROM orders ORDER BY id",
+            [
+                {
+                    "v": None
+                    if row["value"] is None
+                    else row["value"] + 9223372036854775790
+                }
+                for row in INPUT
+            ],
+        ),
+        (
+            "int64-lower-boundary",
+            "SELECT value + CAST(-9223372036854775790 AS BIGINT) AS v FROM orders ORDER BY id",
+            [
+                {
+                    "v": None
+                    if row["value"] is None
+                    else row["value"] - 9223372036854775790
+                }
+                for row in INPUT
+            ],
+        ),
+        (
             "decimal",
             "SELECT CAST(value AS DECIMAL(20, 3)) AS v FROM orders ORDER BY id",
             [

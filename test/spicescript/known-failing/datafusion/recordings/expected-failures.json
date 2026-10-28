@@ -116,5 +116,23 @@
       "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"64\\\"\", actual: \"\\\"61\\\"\" }",
       "group": "datafusion"
     }
+  ],
+  "int64-overflow": [
+    {
+      "run": "int64-overflow",
+      "who": "default",
+      "key": "http: {\"path\":\"/v1/sql\",\"body\":\"SELECT v + CAST(9223372036854775807 AS BIGINT) AS v FROM (VALUES (CAST(11 AS BIGINT))) AS t(v)\"}",
+      "kind": "status",
+      "signature": "status 200, expected 400",
+      "group": "datafusion"
+    },
+    {
+      "run": "int64-overflow",
+      "who": "default",
+      "key": "http: {\"path\":\"/v1/sql\",\"body\":\"SELECT v + CAST(-9223372036854775808 AS BIGINT) AS v FROM (VALUES (CAST(-7 AS BIGINT))) AS t(v)\"}",
+      "kind": "status",
+      "signature": "status 200, expected 400",
+      "group": "datafusion"
+    }
   ]
 }
