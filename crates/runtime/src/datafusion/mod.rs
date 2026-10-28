@@ -7082,7 +7082,7 @@ impl DataFusion {
         parameters: Option<&ParamValues>,
     ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
         let dialect = session.config().options().sql_parser.dialect;
-        let mut statement = session.sql_to_statement(sql, &dialect)?;
+        let mut statement = sql_depth_guard::sql_to_statement(session, sql, &dialect)?;
         sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
         let placeholders = bind_table_function_args(&mut statement, parameters)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
@@ -7106,8 +7106,7 @@ impl DataFusion {
         // The plain parser suffices: only `CREATE TABLE ... CLUSTER BY` needs
         // `planner::parse_sql_statement`, and it has no table functions.
         let dialect = state.config().options().sql_parser.dialect;
-        state
-            .sql_to_statement(sql, &dialect)
+        sql_depth_guard::sql_to_statement(&state, sql, &dialect)
             .and_then(|mut statement| bind_table_function_args(&mut statement, None))
             .is_ok_and(|placeholders| placeholders == TableFunctionPlaceholders::Present)
     }

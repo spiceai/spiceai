@@ -129,6 +129,11 @@ pub fn transaction_statements(sql: &str) -> Option<Vec<String>> {
 /// [`transaction_statements`] without the leading-word check: parses `sql` in
 /// full to find out.
 fn parse_transaction_statements(sql: &str) -> Option<Vec<String>> {
+    crate::datafusion::sql_depth_guard::ensure_data_types_within_depth_limit(
+        sql,
+        &PostgreSqlDialect {},
+    )
+    .ok()?;
     let statements: Vec<DFStatement> = DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {})
         .ok()?
         .into_iter()
