@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{
     collections::{BTreeMap, HashMap},
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::{
@@ -28,7 +28,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use arrow::{
-    array::Float64Builder,
+    array::{Float64Builder, UInt64Builder},
     datatypes::{DataType, Field},
 };
 use tokio::task::JoinHandle;
@@ -36,11 +36,13 @@ use tokio::task::JoinHandle;
 use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 
 mod evaluate;
+mod latency;
 mod worker;
 pub use evaluate::RetrievalMetrics;
+pub use latency::{LatencyPercentile, LatencySummary, MIN_SAMPLES_BEYOND_PERCENTILE};
 pub use worker::{
-    CorpusId, SearchApiResponse, SearchConfig, SearchMethod, SearchRequest, SearchResponse,
-    SearchResult, SqlPipeline, SqlSearchHit, SqlSearchResponse,
+    CorpusId, SearchApiResponse, SearchConfig, SearchMethod, SearchPasses, SearchRequest,
+    SearchResponse, SearchResult, SqlPipeline, SqlSearchHit, SqlSearchResponse,
 };
 use worker::{VectorSearchWorker, VectorSearchWorkerResult};
 
@@ -50,6 +52,7 @@ pub use evaluate::{QueryId, QueryRetrievalMetrics, RetrievalEvaluation};
 pub struct NotStarted {
     parallel_count: usize,
     config: SearchConfig,
+    passes: SearchPasses,
 }
 
 impl NotStarted {
@@ -69,6 +72,12 @@ impl NotStarted {
         self.config = config;
         self
     }
+
+    #[must_use]
+    pub fn with_passes(mut self, passes: SearchPasses) -> Self {
+        self.passes = passes;
+        self
+    }
 }
 
 type VectorSearchWorkers = Vec<JoinHandle<Result<VectorSearchWorkerResult>>>;
@@ -79,6 +88,8 @@ pub struct Running {
 
 pub struct Completed {
     end_time: SystemTime,
+    /// From the first worker's first measured pass to the last worker's end. Warmup is excluded.
+    measured_duration: Duration,
     search_results: BTreeMap<String, worker::SearchResult>,
 }
 
@@ -102,6 +113,7 @@ impl SpiceTest<NotStarted> {
 
         // Split the requests among workers based on the parallel_count
         let method = self.state.config.method().clone();
+        let passes = self.state.passes;
         let requests = self.state.config.into_requests();
         let chunk_size = if self.state.parallel_count > 0 {
             requests.len().div_ceil(self.state.parallel_count)
@@ -116,7 +128,8 @@ impl SpiceTest<NotStarted> {
                 let worker_config = SearchConfig::new()
                     .with_method(method.clone())
                     .add_requests(chunk.iter().cloned());
-                VectorSearchWorker::new(worker_id, http_client.clone(), worker_config).start()
+                VectorSearchWorker::new(worker_id, http_client.clone(), worker_config, passes)
+                    .start()
             })
             .collect();
 
@@ -139,15 +152,27 @@ impl SpiceTest<NotStarted> {
 impl SpiceTest<Running> {
     pub async fn wait(self) -> Result<SpiceTest<Completed>> {
         let mut search_results = BTreeMap::new();
+        let mut measured_window: Option<(Instant, Instant)> = None;
 
         for worker in self.state.vector_workers {
             let worker_result = worker
                 .await
                 .context("Error waiting for vector search worker")??;
 
+            measured_window = Some(match measured_window {
+                None => (worker_result.measured_started_at, worker_result.finished_at),
+                Some((start, end)) => (
+                    start.min(worker_result.measured_started_at),
+                    end.max(worker_result.finished_at),
+                ),
+            });
+
             // Combine all worker results
             search_results.extend(worker_result.search_results);
         }
+        let measured_duration = measured_window.map_or(Duration::ZERO, |(start, end)| {
+            end.saturating_duration_since(start)
+        });
 
         Ok(SpiceTest {
             name: self.name,
@@ -160,6 +185,7 @@ impl SpiceTest<Running> {
             validate_row_count: self.validate_row_count,
             state: Completed {
                 end_time: SystemTime::now(),
+                measured_duration,
                 search_results,
             },
         })
@@ -172,25 +198,34 @@ impl SpiceTest<Completed> {
         &self.state.search_results
     }
 
-    pub fn get_p95_response_time_metric(&self) -> Result<f64> {
-        let durations = self
-            .state
+    /// The latency of every measured request, across all queries and passes.
+    #[must_use]
+    pub fn latency_samples(&self) -> Vec<Duration> {
+        self.state
             .search_results
             .values()
-            .map(|result| result.duration) // Convert to milliseconds
-            .collect::<Vec<_>>();
+            .flat_map(|result| result.durations.iter().copied())
+            .collect()
+    }
+
+    pub fn get_p95_response_time_metric(&self) -> Result<f64> {
+        let durations = self.latency_samples();
 
         #[expect(clippy::cast_precision_loss)]
         let p95 = durations.percentile(95.0)?.as_millis() as f64;
         Ok(p95)
     }
 
+    /// Measured requests per second. Warmup passes are not counted.
     pub fn get_rps_metric(&self) -> Result<f64> {
-        let total_duration = self.state.end_time.duration_since(self.start_time)?;
-
         #[expect(clippy::cast_precision_loss)]
-        let total_requests = self.state.search_results.len() as f64;
-        let seconds = total_duration.as_secs_f64();
+        let total_requests = self
+            .state
+            .search_results
+            .values()
+            .map(|result| result.durations.len())
+            .sum::<usize>() as f64;
+        let seconds = self.state.measured_duration.as_secs_f64();
         if seconds <= 0.0 {
             return Ok(total_requests);
         }
@@ -262,7 +297,7 @@ impl MetricCollector<SearchScoreMetric, SearchRunMetric> for SpiceTest<Completed
             .map(|(id, result)| {
                 QueryMetric::new_from_durations(
                     id.as_str().into(),
-                    &vec![result.duration],
+                    &result.durations,
                     QueryStatus::Passed,
                     system_time_to_unix_epoch_ms(self.start_time)?,
                     system_time_to_unix_epoch_ms(self.state.end_time)?,
@@ -301,75 +336,98 @@ impl SearchScoreMetric {
     }
 }
 
+/// The run-level row of a search test. The percentiles are `None` when the run has too few samples
+/// (see [`LatencySummary::percentile_ms`]), and the retrieval metrics are `None` when the run has no
+/// relevance judgments (a latency-only run).
 pub struct SearchRunMetric {
     pub rps: f64,
     pub p95_latency_ms: f64,
-    /// NDCG@10 (kept as `score` for telemetry backward-compatibility).
-    pub score: f64,
-    pub recall: f64,
-    pub mrr: f64,
-    pub precision: f64,
+    pub latency_samples: u64,
+    pub p50_latency_ms: Option<f64>,
+    pub p99_latency_ms: Option<f64>,
+    pub p999_latency_ms: Option<f64>,
+    pub retrieval: Option<RetrievalMetrics>,
 }
+
+const FLOAT64_RUN_FIELDS: [&str; 2] = ["rps", "p95_latency_ms"];
+const NULLABLE_FLOAT64_RUN_FIELDS: [&str; 7] = [
+    "p50_latency_ms",
+    "p99_latency_ms",
+    "p999_latency_ms",
+    // NDCG@10 (kept as `score` for telemetry backward-compatibility).
+    "score",
+    "recall",
+    "mrr",
+    "precision",
+];
+
 impl ExtendedMetrics for SearchRunMetric {
     fn fields() -> Vec<Field> {
-        vec![
-            Field::new("rps", DataType::Float64, false),
-            Field::new("p95_latency_ms", DataType::Float64, false),
-            Field::new("score", DataType::Float64, false),
-            Field::new("recall", DataType::Float64, false),
-            Field::new("mrr", DataType::Float64, false),
-            Field::new("precision", DataType::Float64, false),
-        ]
+        FLOAT64_RUN_FIELDS
+            .iter()
+            .map(|name| Field::new(*name, DataType::Float64, false))
+            .chain(std::iter::once(Field::new(
+                "latency_samples",
+                DataType::UInt64,
+                false,
+            )))
+            .chain(
+                NULLABLE_FLOAT64_RUN_FIELDS
+                    .iter()
+                    .map(|name| Field::new(*name, DataType::Float64, true)),
+            )
+            .collect()
     }
 
     fn builders() -> BTreeMap<String, Builder> {
-        let mut builders = BTreeMap::new();
-        builders.insert("rps".to_string(), Builder::Float64(Float64Builder::new()));
+        let mut builders: BTreeMap<String, Builder> = FLOAT64_RUN_FIELDS
+            .iter()
+            .chain(NULLABLE_FLOAT64_RUN_FIELDS.iter())
+            .map(|name| ((*name).to_string(), Builder::Float64(Float64Builder::new())))
+            .collect();
         builders.insert(
-            "p95_latency_ms".to_string(),
-            Builder::Float64(Float64Builder::new()),
-        );
-        builders.insert("score".to_string(), Builder::Float64(Float64Builder::new()));
-        builders.insert(
-            "recall".to_string(),
-            Builder::Float64(Float64Builder::new()),
-        );
-        builders.insert("mrr".to_string(), Builder::Float64(Float64Builder::new()));
-        builders.insert(
-            "precision".to_string(),
-            Builder::Float64(Float64Builder::new()),
+            "latency_samples".to_string(),
+            Builder::UInt64(UInt64Builder::new()),
         );
         builders
     }
 
     fn build(&self) -> Result<Vec<BuilderTarget>> {
+        let retrieval = self.retrieval.as_ref();
         Ok(vec![
             BuilderTarget::Float64(("rps".to_string(), self.rps)),
             BuilderTarget::Float64(("p95_latency_ms".to_string(), self.p95_latency_ms)),
-            BuilderTarget::Float64(("score".to_string(), self.score)),
-            BuilderTarget::Float64(("recall".to_string(), self.recall)),
-            BuilderTarget::Float64(("mrr".to_string(), self.mrr)),
-            BuilderTarget::Float64(("precision".to_string(), self.precision)),
+            BuilderTarget::UInt64(("latency_samples".to_string(), self.latency_samples)),
+            BuilderTarget::NullableFloat64(("p50_latency_ms".to_string(), self.p50_latency_ms)),
+            BuilderTarget::NullableFloat64(("p99_latency_ms".to_string(), self.p99_latency_ms)),
+            BuilderTarget::NullableFloat64(("p999_latency_ms".to_string(), self.p999_latency_ms)),
+            BuilderTarget::NullableFloat64(("score".to_string(), retrieval.map(|r| r.ndcg))),
+            BuilderTarget::NullableFloat64(("recall".to_string(), retrieval.map(|r| r.recall))),
+            BuilderTarget::NullableFloat64(("mrr".to_string(), retrieval.map(|r| r.mrr))),
+            BuilderTarget::NullableFloat64((
+                "precision".to_string(),
+                retrieval.map(|r| r.precision),
+            )),
         ])
     }
 }
+
 impl SearchRunMetric {
     #[must_use]
     pub fn new(
         rps: f64,
         p95_latency_ms: f64,
-        score: f64,
-        recall: f64,
-        mrr: f64,
-        precision: f64,
+        latency: &LatencySummary,
+        retrieval: Option<RetrievalMetrics>,
     ) -> Self {
         Self {
             rps,
             p95_latency_ms,
-            score,
-            recall,
-            mrr,
-            precision,
+            latency_samples: u64::try_from(latency.samples()).unwrap_or(u64::MAX),
+            p50_latency_ms: latency.percentile_ms(LatencyPercentile::P50),
+            p99_latency_ms: latency.percentile_ms(LatencyPercentile::P99),
+            p999_latency_ms: latency.percentile_ms(LatencyPercentile::P999),
+            retrieval,
         }
     }
 }

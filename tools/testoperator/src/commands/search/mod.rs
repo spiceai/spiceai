@@ -15,9 +15,10 @@ limitations under the License.
 */
 
 mod harness;
+mod latency;
 mod per_query;
 mod spicepod;
-use self::spicepod::BenchmarkDataset;
+use self::{latency::LatencyReport, spicepod::BenchmarkDataset};
 use super::{duration_millis_between, get_app_and_start_request};
 use crate::{
     args::{SearchTestArgs, SqlPipelineArg},
@@ -33,7 +34,10 @@ use test_framework::{
     spiced::SpicedInstance,
     spicetest::{
         SpiceTest,
-        search::{NotStarted, RetrievalMetrics, SearchMethod, SearchRunMetric, SqlPipeline},
+        search::{
+            NotStarted, RetrievalEvaluation, RetrievalMetrics, SearchMethod, SearchRunMetric,
+            SqlPipeline,
+        },
     },
     telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
@@ -47,6 +51,9 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     let search_method = load_search_method(args.sql_pipeline.as_ref())?;
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
     spicepod::validate_required_tables(&app)?;
+    let passes = args.search_passes();
+    spicepod::validate_results_caches_disabled(&app, passes.total())?;
+    let has_relevance_data = spicepod::has_relevance_data(&app);
 
     let started_at = Instant::now();
 
@@ -77,6 +84,10 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         KeyValue::new("config_name", app.name.clone()),
         KeyValue::new("benchmark_dataset", benchmark_dataset.as_str().to_string()),
         KeyValue::new("search_method", search_method.name()),
+        KeyValue::new("search_limit", i64::try_from(args.limit.get())?),
+        KeyValue::new("concurrency", i64::try_from(args.common.concurrency)?),
+        KeyValue::new("warmup_passes", i64::try_from(passes.warmup)?),
+        KeyValue::new("passes", i64::try_from(passes.measured.get())?),
     ];
     if let Some(sql_pipeline) = &args.sql_pipeline {
         search_attributes.push(KeyValue::new("sql_pipeline", sql_pipeline.name()));
@@ -99,12 +110,16 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     println!("Running search ({})", search_method.name());
 
-    let config = harness::init_search_config(&spiced_instance, Some(10))
-        .await?
-        .with_method(search_method);
+    let test_queries = harness::load_test_queries(&spiced_instance, args.limit).await?;
+    let config = test_queries.config.with_method(search_method);
 
-    // retrieve query relevance data
-    let qrels = harness::get_query_relevance_data(&spiced_instance).await?;
+    // Without relevance judgments, the run measures latency only.
+    let qrels = if has_relevance_data {
+        Some(harness::get_query_relevance_data(&spiced_instance).await?)
+    } else {
+        println!("The spicepod has no `relevance_data` table: measuring latency only.");
+        None
+    };
 
     let search_started_at = Instant::now();
 
@@ -112,7 +127,8 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         app.name.clone(),
         NotStarted::new()
             .with_config(config)
-            .with_parallel_count(args.common.concurrency),
+            .with_parallel_count(args.common.concurrency)
+            .with_passes(passes),
     )
     .with_spiced_instance(spiced_instance)
     .start()?;
@@ -132,26 +148,41 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     let p95 = test.get_p95_response_time_metric()?;
     let rps = test.get_rps_metric()?;
-    let evaluation =
-        test.evaluate_search_results(&qrels, harness::transform_search_results_for_eval)?;
-    let retrieval_metrics_at_all_k = evaluation.mean_at_all_k();
+    let latency = LatencyReport::new(test.get_search_results(), &test_queries.query_types);
+    latency.print();
 
-    // Report the metric-vs-k curve, then pick the primary cutoff (k=10, matching MTEB; falling back
-    // to the largest available k when fewer results were returned) for the fixed-schema run row.
-    print_retrieval_metrics_table(&retrieval_metrics_at_all_k);
-    let (primary_k, retrieval_metrics) = per_query::primary_k(&evaluation)
-        .and_then(|k| evaluation.mean_at_k(k).map(|metrics| (k, metrics)))
-        .ok_or_else(|| anyhow::anyhow!("No retrieval metrics were computed for any rank cutoff"))?;
+    let quality = match &qrels {
+        Some(qrels) => {
+            let evaluation =
+                test.evaluate_search_results(qrels, harness::transform_search_results_for_eval)?;
+            let at_all_k = evaluation.mean_at_all_k();
+
+            // Report the metric-vs-k curve, then pick the primary cutoff (k=10, matching MTEB;
+            // falling back to the largest available k when fewer results were returned) for the
+            // fixed-schema run row.
+            print_retrieval_metrics_table(&at_all_k);
+            let (primary_k, at_primary_k) = per_query::primary_k(&evaluation)
+                .and_then(|k| evaluation.mean_at_k(k).map(|metrics| (k, metrics)))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("No retrieval metrics were computed for any rank cutoff")
+                })?;
+            Some(Quality {
+                evaluation,
+                at_all_k,
+                primary_k,
+                at_primary_k,
+            })
+        }
+        None => None,
+    };
 
     let metrics: QueryMetrics<_, _> =
         test.collect(TestType::Search)?
             .with_run_metric(SearchRunMetric::new(
                 rps,
                 p95,
-                retrieval_metrics.ndcg,
-                retrieval_metrics.recall,
-                retrieval_metrics.mrr,
-                retrieval_metrics.precision,
+                &latency.overall,
+                quality.as_ref().map(|quality| quality.at_primary_k),
             ));
 
     let mut spiced_instance = test.end()?;
@@ -177,16 +208,19 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     crate::metrics::SEARCH_RPS.record(rps, &[]);
     crate::metrics::SEARCH_P95_RESPONSE_TIME.record(p95, &[]);
-    // Emit each retrieval metric as a `k`-dimensioned series so the full metric-vs-k curve is
-    // recorded, not just the primary cutoff.
-    for (&k, metrics_at_k) in &retrieval_metrics_at_all_k {
-        let k_attr = [KeyValue::new("k", i64::try_from(k)?)];
-        crate::metrics::SCORE.record(metrics_at_k.ndcg, &k_attr);
-        crate::metrics::SEARCH_RECALL.record(metrics_at_k.recall, &k_attr);
-        crate::metrics::SEARCH_MRR.record(metrics_at_k.mrr, &k_attr);
-        crate::metrics::SEARCH_PRECISION.record(metrics_at_k.precision, &k_attr);
+    latency.record_metrics()?;
+    if let Some(quality) = &quality {
+        // Emit each retrieval metric as a `k`-dimensioned series so the full metric-vs-k curve is
+        // recorded, not just the primary cutoff.
+        for (&k, metrics_at_k) in &quality.at_all_k {
+            let k_attr = [KeyValue::new("k", i64::try_from(k)?)];
+            crate::metrics::SCORE.record(metrics_at_k.ndcg, &k_attr);
+            crate::metrics::SEARCH_RECALL.record(metrics_at_k.recall, &k_attr);
+            crate::metrics::SEARCH_MRR.record(metrics_at_k.mrr, &k_attr);
+            crate::metrics::SEARCH_PRECISION.record(metrics_at_k.precision, &k_attr);
+        }
+        per_query::record_metrics(&quality.evaluation, quality.primary_k)?;
     }
-    per_query::record_metrics(&evaluation, primary_k)?;
     if let Some((max_memory, median_memory)) = memory_usage {
         crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
         crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
@@ -205,6 +239,14 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     println!("Benchmark completed successfully!");
 
     Ok(())
+}
+
+/// The retrieval quality of a run that has relevance judgments.
+struct Quality {
+    evaluation: RetrievalEvaluation,
+    at_all_k: BTreeMap<usize, RetrievalMetrics>,
+    primary_k: usize,
+    at_primary_k: RetrievalMetrics,
 }
 
 /// Gets the `--sql-pipeline` SQL, if set, before spiced starts so that an empty pipeline fails

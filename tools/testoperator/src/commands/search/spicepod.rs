@@ -27,8 +27,11 @@ use test_framework::{
     spicepod::{acceleration::Acceleration, semantic::Column, spec::SpicepodDefinition},
 };
 
-/// Tables the harness queries. Each may be a dataset or a view.
-const REQUIRED_TABLES: [&str; 3] = ["corpus", "test_queries", "relevance_data"];
+/// Tables the harness always queries. Each may be a dataset or a view.
+const REQUIRED_TABLES: [&str; 2] = ["corpus", "test_queries"];
+
+/// The optional table of relevance judgments. Without it, a run measures latency only.
+const RELEVANCE_TABLE: &str = "relevance_data";
 
 /// Fails fast with an actionable message when the spicepod is missing one of the fixed tables the
 /// harness queries. Without this check the run would fail later with a raw `table not found` from
@@ -42,11 +45,57 @@ pub(crate) fn validate_required_tables(app: &App) -> anyhow::Result<()> {
     if !missing.is_empty() {
         return Err(anyhow::anyhow!(
             "Failed to run search test ({}): spicepod is missing required table(s): {}. \
-            A search spicepod must define `corpus`, `test_queries`, and `relevance_data` \
-            (each may be a dataset or a view). \
+            A search spicepod must define `corpus` and `test_queries`, and can define \
+            `relevance_data` (each may be a dataset or a view). \
             See: https://github.com/spiceai/spiceai/issues/12935",
             app.name,
             missing.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
+/// Whether the spicepod defines `relevance_data`, so that the run can score retrieval quality.
+pub(crate) fn has_relevance_data(app: &App) -> bool {
+    has_table(app, RELEVANCE_TABLE)
+}
+
+/// Fails when a run sends each query more than once (`total_passes > 1`) and a results cache is on.
+/// A repeated query would then be answered from the cache, and its latency would not measure
+/// search. Both caches must be off: `/v1/search` uses the search results cache, and a SQL pipeline
+/// uses the SQL results cache.
+pub(crate) fn validate_results_caches_disabled(
+    app: &App,
+    total_passes: usize,
+) -> anyhow::Result<()> {
+    if total_passes <= 1 {
+        return Ok(());
+    }
+
+    let caching = &app.runtime.caching;
+    // An omitted cache config is enabled at runtime.
+    let enabled: Vec<&str> = [
+        (
+            "search_results",
+            caching.search_results.as_ref().is_none_or(|c| c.enabled),
+        ),
+        (
+            "sql_results",
+            caching.sql_results.as_ref().is_none_or(|c| c.enabled),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, enabled)| enabled.then_some(name))
+    .collect();
+
+    if !enabled.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Failed to run search test ({}): the run sends each query {total_passes} times, but \
+            these results caches are enabled: {}. Set `runtime.caching.<cache>.enabled: false` \
+            in the spicepod, or run one pass.",
+            app.name,
+            enabled.join(", ")
         ));
     }
 
@@ -170,7 +219,10 @@ pub(crate) fn corpus_attributes(app: &App) -> Vec<KeyValue> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchmarkDataset, corpus_attributes, validate_required_tables};
+    use super::{
+        BenchmarkDataset, corpus_attributes, has_relevance_data, validate_required_tables,
+        validate_results_caches_disabled,
+    };
     use std::collections::HashMap;
     use test_framework::{
         app::{App, AppBuilder},
@@ -295,10 +347,18 @@ columns:
             .with_dataset(dataset(
                 "from: https://example.com/c.parquet\nname: corpus\n",
             ))
+            .build();
+        let err = validate_required_tables(&app).expect_err("test_queries is missing");
+        assert!(err.to_string().contains("test_queries"), "{err}");
+
+        let app = AppBuilder::new("t")
+            .with_dataset(dataset(
+                "from: https://example.com/c.parquet\nname: corpus\n",
+            ))
             .with_view(View::new("test_queries".to_string()).with_sql("SELECT 1"))
             .build();
-        let err = validate_required_tables(&app).expect_err("relevance_data is missing");
-        assert!(err.to_string().contains("relevance_data"), "{err}");
+        validate_required_tables(&app).expect("relevance_data is optional");
+        assert!(!has_relevance_data(&app));
 
         let app = AppBuilder::new("t")
             .with_dataset(dataset(
@@ -308,5 +368,45 @@ columns:
             .with_view(View::new("relevance_data".to_string()).with_sql("SELECT 1"))
             .build();
         validate_required_tables(&app).expect("all tables present");
+        assert!(has_relevance_data(&app));
+    }
+
+    fn app_with_caching(caching_yaml: &str) -> App {
+        let mut app = AppBuilder::new("t").build();
+        app.runtime.caching = yaml::from_str(caching_yaml).expect("valid caching yaml");
+        app
+    }
+
+    #[test]
+    fn one_pass_allows_results_caches() {
+        validate_results_caches_disabled(&AppBuilder::new("t").build(), 1)
+            .expect("one pass never repeats a query");
+    }
+
+    #[test]
+    fn repeated_passes_need_both_results_caches_off() {
+        // Omitted caches are enabled at runtime.
+        let err = validate_results_caches_disabled(&app_with_caching("{}"), 2)
+            .expect_err("default caches are on");
+        let message = err.to_string();
+        assert!(message.contains("search_results"), "{message}");
+        assert!(message.contains("sql_results"), "{message}");
+
+        let err = validate_results_caches_disabled(
+            &app_with_caching("search_results:\n  enabled: false\n"),
+            2,
+        )
+        .expect_err("sql_results is still on");
+        let message = err.to_string();
+        assert!(!message.contains("search_results"), "{message}");
+        assert!(message.contains("sql_results"), "{message}");
+
+        validate_results_caches_disabled(
+            &app_with_caching(
+                "search_results:\n  enabled: false\nsql_results:\n  enabled: false\n",
+            ),
+            2,
+        )
+        .expect("both caches are off");
     }
 }

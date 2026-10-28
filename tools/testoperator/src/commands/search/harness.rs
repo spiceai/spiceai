@@ -16,11 +16,14 @@ limitations under the License.
 
 //! Dataset-agnostic search harness: the SQL and result-mapping logic of a
 //! `testoperator run search` run. Every spicepod exposes the same fixed schema — a `corpus` table,
-//! a `test_queries` table with `_id`/`text`, and a `relevance_data` table with `query-id`,
-//! `corpus-id`, and `score` (each may be a dataset or a view) — so these steps work for any
-//! dataset the spicepod loads.
+//! a `test_queries` table with `_id`/`text` (and an optional `query_type`), and an optional
+//! `relevance_data` table with `query-id`, `corpus-id`, and `score` (each may be a dataset or a
+//! view) — so these steps work for any dataset the spicepod loads.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    num::NonZeroUsize,
+};
 
 use test_framework::{
     anyhow,
@@ -66,44 +69,53 @@ fn read_text_column(batch: &RecordBatch, name: &str) -> anyhow::Result<Vec<Strin
         .collect())
 }
 
-/// Builds the search config by reading the queries from `test_queries`, which every search spicepod
-/// exposes with `_id`/`text` columns.
-pub(crate) async fn init_search_config(
-    spiced_instance: &SpicedInstance,
-    search_limit: Option<usize>,
-) -> anyhow::Result<SearchConfig> {
-    let mut spice_client = spiced_instance.spice_client(None, false).await?;
+/// The optional `test_queries` column that groups queries for per-type latency, for example
+/// `union`, `intersection`, or `phrase`.
+const QUERY_TYPE_COLUMN: &str = "query_type";
 
-    let records = execute_sql(
-        &mut spice_client,
-        "SELECT _id as id, text FROM test_queries",
-    )
-    .await?;
-
-    let queries = to_search_requests(&records, search_limit)?;
-
-    Ok(SearchConfig::new().add_requests(queries))
+/// The queries of a run.
+pub(crate) struct TestQueries {
+    pub(crate) config: SearchConfig,
+    /// Query id → query type. Empty when `test_queries` has no `query_type` column.
+    pub(crate) query_types: HashMap<String, String>,
 }
 
-fn to_search_requests(
-    records: &[RecordBatch],
-    search_limit: Option<usize>,
-) -> anyhow::Result<Vec<SearchRequest>> {
-    let mut queries = Vec::new();
-    for batch in records {
-        let ids = read_text_column(batch, "id")?;
-        let texts = read_text_column(batch, "text")?;
+/// Reads the queries from `test_queries`, which every search spicepod exposes with `_id`/`text`
+/// columns and an optional `query_type` column.
+pub(crate) async fn load_test_queries(
+    spiced_instance: &SpicedInstance,
+    limit: NonZeroUsize,
+) -> anyhow::Result<TestQueries> {
+    let mut spice_client = spiced_instance.spice_client(None, false).await?;
 
-        for (id, text) in ids.into_iter().zip(texts) {
-            let mut search_request = SearchRequest::new(id, text);
-            if let Some(limit) = search_limit {
-                search_request = search_request.with_limit(limit);
+    let records = execute_sql(&mut spice_client, "SELECT * FROM test_queries").await?;
+
+    to_test_queries(&records, limit)
+}
+
+fn to_test_queries(records: &[RecordBatch], limit: NonZeroUsize) -> anyhow::Result<TestQueries> {
+    let mut requests = Vec::new();
+    let mut query_types = HashMap::new();
+    for batch in records {
+        let ids = read_text_column(batch, "_id")?;
+        let texts = read_text_column(batch, "text")?;
+        let types = match batch.column_by_name(QUERY_TYPE_COLUMN) {
+            Some(_) => Some(read_text_column(batch, QUERY_TYPE_COLUMN)?),
+            None => None,
+        };
+
+        for (i, (id, text)) in ids.into_iter().zip(texts).enumerate() {
+            if let Some(types) = &types {
+                query_types.insert(id.clone(), types[i].clone());
             }
-            queries.push(search_request);
+            requests.push(SearchRequest::new(id, text).with_limit(limit.get()));
         }
     }
 
-    Ok(queries)
+    Ok(TestQueries {
+        config: SearchConfig::new().add_requests(requests),
+        query_types,
+    })
 }
 
 /// Loads the relevance judgments (qrels) from `relevance_data`, keyed query id → corpus id → grade.
@@ -234,14 +246,44 @@ async fn execute_sql(
 mod tests {
     use super::{
         primary_key_value_to_string, rank_scores, read_text_column, sole_primary_key_value,
+        to_test_queries,
     };
     use std::collections::HashMap;
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
     use test_framework::arrow::array::{Int64Array, LargeStringArray, RecordBatch, StringArray};
     use test_framework::spicetest::search::SqlSearchHit;
 
     fn sql_hits(json: &str) -> Vec<SqlSearchHit> {
         serde_json::from_str(json).expect("failed to parse SQL rows")
+    }
+
+    #[test]
+    fn test_queries_read_optional_query_type_and_limit() {
+        let limit = NonZeroUsize::new(100).expect("non-zero");
+        let ids = Arc::new(StringArray::from(vec!["q1", "q2"]));
+        let texts = Arc::new(StringArray::from(vec!["+a +b", "\"a b\""]));
+        let types = Arc::new(StringArray::from(vec!["intersection", "phrase"]));
+
+        let batch = RecordBatch::try_from_iter(vec![
+            ("_id", Arc::clone(&ids) as _),
+            ("text", Arc::clone(&texts) as _),
+            ("query_type", types as _),
+        ])
+        .expect("failed to build batch");
+        let queries = to_test_queries(&[batch], limit).expect("valid queries");
+        let requests = queries.config.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].text, "\"a b\"");
+        assert!(requests.iter().all(|r| r.limit == Some(100)));
+        assert_eq!(queries.query_types["q1"], "intersection");
+        assert_eq!(queries.query_types["q2"], "phrase");
+
+        let batch = RecordBatch::try_from_iter(vec![("_id", ids as _), ("text", texts as _)])
+            .expect("failed to build batch");
+        let queries = to_test_queries(&[batch], limit).expect("valid queries");
+        assert_eq!(queries.config.requests().len(), 2);
+        assert!(queries.query_types.is_empty());
     }
 
     #[test]
