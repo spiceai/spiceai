@@ -1,6 +1,6 @@
-# Cluster sidecar mode Enhancement draft
+# Cluster sidecar mode Enhancement
 
-Status: surface approved by the requester on 2026-10-27; implementation in progress.
+Status: surface approved by the requester on 2026-10-27; implementation and qualification in progress.
 Enhancement: [#15707](https://github.com/spiceai/spiceai/issues/15707).
 Source baseline: `34825bb456d62d616f693187b0baf0fa1e8cfb14`, inspected 2026-10-27.
 The specification below is the approved implementation contract.
@@ -37,9 +37,9 @@ small queries and keep planning close to the application. An application should
 need one endpoint and should not select a wire protocol or implement cache,
 acceleration, and cluster routing itself.
 
-This is a product proposal, not a reproduced bug or a measured performance result.
-The implementation map below is based on code inspection. Implementation and
-performance acceptance require the engine runs in the QA plan.
+The surface is approved. The [qualification record](../../test/sidecar/README.md)
+separates observed engine behavior, planned checks and measured results.
+Performance acceptance requires the engine runs in the QA plan.
 
 ## By When
 
@@ -48,7 +48,7 @@ performance acceptance require the engine runs in the QA plan.
 
 ## Done-Done
 
-- [ ] Principles Driven
+- [x] Principles Driven
 - [x] The Algorithm
 - [x] PM/Design Review
 - [x] DX/UX Review
@@ -402,8 +402,9 @@ cache-disabled runs, sustained execution, and `/health` under load.
 Ship only with equal results, bounded memory and admission, and no per-workload
 performance regression beyond the measured noise floor. Report improvements
 only where those runs show them; Substrait alone is not a latency measurement.
-The current documentation-only draft cannot reach a shipped binary, so it has
-no runtime performance numbers.
+The qualification record contains commands, source identities and retained
+artifacts. Final-candidate qualification and merge sign-off remain in progress;
+protocol selection alone does not establish a performance improvement.
 
 ## Release Notes
 

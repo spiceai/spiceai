@@ -23,6 +23,12 @@ SHA-256, which each driver also records. All commands below run from the
 repository root. The standalone benchmark is the primary performance topology;
 distributed execution is a separate functional check.
 
+For upgrade and rollback qualification, add
+`--legacy-spiced /path/to/older/spiced --legacy-source-commit OLDER_COMMIT` to the
+main driver. It requires SQL federation to return exact rows against that
+upstream and Substrait federation to return the actionable upgrade/rollback
+diagnostic. Use an upstream built before the Spice Substrait extensions.
+
 ```bash
 python3 test/scripts/sidecar_semantics.py \
   --spiced /path/to/spiced --source-commit COMMIT --out /tmp/sidecar-semantics

@@ -147,7 +147,6 @@ def main():
                 actual, _ = sidecar.query(sql)
             except urllib.error.HTTPError as error:
                 actual = {"status": error.code, "error": error.read().decode()}
-            explained, _ = sidecar.query("EXPLAIN " + sql)
             result = {
                 "name": name,
                 "sql": sql,
@@ -156,9 +155,17 @@ def main():
                 "passed": actual == wanted,
             }
             results.append(result)
+            (args.out / "results.json").write_text(json.dumps(results, indent=2))
+            try:
+                explained, _ = sidecar.query("EXPLAIN " + sql)
+            except urllib.error.HTTPError as error:
+                explained = {"status": error.code, "error": error.read().decode()}
+                result["explain_error"] = explained
+                result["passed"] = False
             (args.out / f"{name}-explain.json").write_text(
                 json.dumps(explained, indent=2)
             )
+            (args.out / "results.json").write_text(json.dumps(results, indent=2))
             print(json.dumps(result), flush=True)
         (args.out / "results.json").write_text(json.dumps(results, indent=2))
         assert all(result["passed"] for result in results), (
