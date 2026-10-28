@@ -2151,7 +2151,9 @@ where
                     ),
                     "pin-expiry" => matches!(
                         p.name,
-                        "lapsed query errors" | "paused partial scan resumes"
+                        "lapsed query errors"
+                            | "paused partial scan resumes"
+                            | "renewed pin protects its snapshot past the first deadline"
                     ),
                     "pin-expiry-no-lapse-recheck" => p.name == "expired read without head recheck",
                     "transaction-begin-pin"
