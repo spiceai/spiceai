@@ -223,6 +223,11 @@ pub struct RuntimeContext {
     /// silence deadline
     inference_http_client: reqwest::Client,
 
+    /// HTTP client for Spicepod registry downloads (`spice add`, `spice connect`). It keeps
+    /// the platform roots: `--tls-root-certificate-file` names the runtime's CA, and trusting
+    /// only that CA would reject the public registry.
+    registry_http_client: reqwest::Client,
+
     /// The deadline `inference_http_client` carries. Held so a caller that has to measure
     /// progress itself — a streamed response, where the transport's own silence deadline is
     /// reset by keep-alives — bounds it by the same value rather than a second constant.
@@ -263,6 +268,7 @@ impl RuntimeContext {
             cloud_region: None,
             user_agent: Self::default_user_agent(),
             extra_headers: HashMap::new(),
+            registry_http_client: http_client.clone(),
             http_client,
             inference_http_client,
             inference_deadline: INFERENCE_DEADLINE,
@@ -295,6 +301,8 @@ impl RuntimeContext {
             extra_headers: HashMap::new(),
             http_client: build_http_client(TEST_USER_AGENT.to_string(), control_plane)
                 .expect("the test control-plane client should build"),
+            registry_http_client: build_http_client(TEST_USER_AGENT.to_string(), control_plane)
+                .expect("the test registry client should build"),
             inference_http_client: build_http_client(TEST_USER_AGENT.to_string(), inference)
                 .expect("the test inference client should build"),
             inference_deadline: inference,
@@ -360,7 +368,8 @@ impl RuntimeContext {
         ctx.api_key = normalize_credential(api_key);
 
         // The flag is global, so every HTTP call the CLI makes to the runtime has to trust
-        // it, not only the Flight client `spice sql` builds.
+        // it, not only the Flight client `spice sql` builds. The registry client is left on
+        // the platform roots: the flag names the runtime's CA, not the registry's.
         if let Some(path) = &tls_root_certificate_file {
             let roots = load_root_certificates(path)?;
             ctx.http_client = build_http_client_trusting(
@@ -515,6 +524,14 @@ impl RuntimeContext {
     #[must_use]
     pub fn http_client(&self) -> &reqwest::Client {
         &self.http_client
+    }
+
+    /// HTTP client for Spicepod registry downloads. Same user agent, deadline and redirect
+    /// policy as [`RuntimeContext::http_client`], but trusting the platform roots even when
+    /// `--tls-root-certificate-file` is given, since that file names the runtime's CA.
+    #[must_use]
+    pub fn registry_http_client(&self) -> &reqwest::Client {
+        &self.registry_http_client
     }
 
     /// Get the HTTP client for requests whose duration is set by model inference.
@@ -1587,6 +1604,7 @@ mod tests {
             extra_headers: HashMap::new(),
             http_client: reqwest::Client::new(),
             inference_http_client: reqwest::Client::new(),
+            registry_http_client: reqwest::Client::new(),
             inference_deadline: INFERENCE_DEADLINE,
             tls_root_certificate_file: None,
         }
@@ -1637,6 +1655,7 @@ mod tests {
             extra_headers: HashMap::new(),
             http_client: reqwest::Client::new(),
             inference_http_client: reqwest::Client::new(),
+            registry_http_client: reqwest::Client::new(),
             inference_deadline: INFERENCE_DEADLINE,
             tls_root_certificate_file: None,
         };

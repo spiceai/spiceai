@@ -5,7 +5,7 @@ description: Live-check that the spice CLI's HTTP commands (status, datasets, re
 
 # Verify the spice CLI against a TLS runtime
 
-Unit tests (`cargo test -p spice status_ refresh_reports test_with_args_`) cover this with an
+Unit tests (`cargo test -p spice status_ refresh_reports test_with_args_ registry_client_`) cover this with an
 in-process HTTPS server. This skill is the end-to-end check against a real `spiced`.
 
 ## 1. PKI in a scratch dir (never in the repo)
@@ -51,6 +51,8 @@ Start it on unused ports: `spiced --http 127.0.0.1:28090 --flight 127.0.0.1:2505
 | `--tls-root-certificate-file missing.pem` | `Could not load the TLS root certificate file 'missing.pem': ...` before any request |
 | `spice datasets ... ca.pem --api-key ro-key` | dataset table (empty is fine), exit 0 |
 | `spice refresh any_name ... wrongca.pem --api-key rw-key` | the TLS error, not `Is it running?` (fails at the handshake, so no dataset is needed) |
+| `spice status --http-endpoint https://localhost:28090 ...` with a server cert whose SAN is only `IP:127.0.0.1` (reissue it for this row) | `... certificate is not valid for this host. Connect with a host name the runtime's certificate covers ...`: no CA-flag advice |
+| `spice add spiceai/quickstart --tls-root-certificate-file ca.pem` in an empty dir (needs internet) | the pod downloads: the runtime CA does not replace the registry client's platform roots |
 | `spice status --http-endpoint https://127.0.0.1:1 --tls-root-certificate-file ca.pem` | still `The Spice runtime is unavailable ... Is it running?` (nothing listening) |
 
 Kill `spiced` and remove `$D` afterwards.
