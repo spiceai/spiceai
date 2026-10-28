@@ -779,27 +779,36 @@ pub fn capture_dir(root: &Path, script: &Script) -> PathBuf {
 
 /// A matrix combination's directory within its script's: the script's own
 /// for a script without a matrix, else one named by the combination's values.
-/// Values that differ only in case or punctuation (`a-b` and `a_b`) name the
-/// same directory, so each such combination also gets its position in the
-/// matrix after a `-`, which no named directory contains.
 fn combination_capture_dir(script_dir: &Path, script: &Script, run_label: &str) -> PathBuf {
     let dir_name = |label: &str| {
         label
             .strip_prefix(script.name.as_str())
             .map(|combo| sanitize(combo).trim_matches('_').to_string())
-            .filter(|name| !name.is_empty())
-    };
-    let Some(name) = dir_name(run_label) else {
-        return script_dir.to_path_buf();
+            .unwrap_or_default()
     };
     let labels = script.run_labels();
-    let sharing = labels
-        .iter()
-        .filter(|label| dir_name(label).as_ref() == Some(&name))
-        .count();
-    match labels.iter().position(|label| label == run_label) {
-        Some(index) if sharing > 1 => script_dir.join(format!("{name}-{}", index + 1)),
-        _ => script_dir.join(name),
+    let names: Vec<String> = labels.iter().map(|label| dir_name(label)).collect();
+    let name = match labels.iter().position(|label| label == run_label) {
+        Some(index) => distinct_name(&names, index),
+        None => dir_name(run_label),
+    };
+    if name.is_empty() {
+        script_dir.to_path_buf()
+    } else {
+        script_dir.join(name)
+    }
+}
+
+/// `names[index]`, a [`sanitize`]d name, followed by its position after a
+/// `-` when another of `names` is the same. Names that differ only in case or
+/// punctuation (`a-b` and `a_b`) sanitize the same, and the `-` is never part
+/// of a sanitized name, so the result names only this one.
+fn distinct_name(names: &[String], index: usize) -> String {
+    let name = &names[index];
+    if names.iter().filter(|other| *other == name).count() > 1 {
+        format!("{name}-{}", index + 1)
+    } else {
+        name.clone()
     }
 }
 
@@ -818,16 +827,26 @@ async fn capture_combination(sources: &Sources, run_id: &str, work: &Path, dir: 
     }
     // Containers are named `spicescript-<run id>-<source>[-<part>]`.
     let prefix = format!("spicescript-{run_id}-");
-    for src in sources.by_name.values() {
-        for container in src.containers() {
-            let name = container
-                .name
-                .strip_prefix(&prefix)
-                .unwrap_or(&container.name);
-            let path = dir.join(format!("{}.log", sanitize(name)));
-            if let Err(e) = container.save_logs(&path).await {
-                say!("warning: {e:#}");
-            }
+    let containers: Vec<_> = sources
+        .by_name
+        .values()
+        .flat_map(|src| src.containers())
+        .collect();
+    let names: Vec<String> = containers
+        .iter()
+        .map(|container| {
+            sanitize(
+                container
+                    .name
+                    .strip_prefix(&prefix)
+                    .unwrap_or(&container.name),
+            )
+        })
+        .collect();
+    for (index, container) in containers.iter().enumerate() {
+        let path = dir.join(format!("{}.log", distinct_name(&names, index)));
+        if let Err(e) = container.save_logs(&path).await {
+            say!("warning: {e:#}");
         }
     }
     let (work, to) = (work.to_path_buf(), dir.to_path_buf());
