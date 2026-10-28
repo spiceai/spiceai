@@ -1,0 +1,83 @@
+version: v1
+kind: Spicepod
+name: full_text_search-duckdb[file]
+
+metadata:
+  benchmark_dataset: search_benchmark_game
+
+# Latency benchmark for full-text search. Each query must reach the search index on every pass, so
+# both results caches are off. There is no `relevance_data`, so the run measures latency only.
+#   testoperator run search -p <this file> --warmup-passes 2 --passes 35 --concurrency 1
+runtime:
+  caching:
+    search_results:
+      enabled: false
+    sql_results:
+      enabled: false
+
+datasets:
+
+  # quickwit-oss/search-benchmark-game as Parquet: https://huggingface.co/datasets/spiceai/search-benchmark-game
+  # 5,032,104 English Wikipedia articles, lowercased, with non-letters replaced by spaces.
+
+  # The corpus has 6 parquet shards. Each shard is its own dataset, and the
+  # `corpus` view below joins them. Acceleration and search live on the view, so one refresh
+  # of the view reads every shard and builds the search indexes.
+  - from: https://huggingface.co/datasets/spiceai/search-benchmark-game/resolve/main/corpus/corpus-00000.parquet
+    name: corpus_0
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/datasets/spiceai/search-benchmark-game/resolve/main/corpus/corpus-00001.parquet
+    name: corpus_1
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/datasets/spiceai/search-benchmark-game/resolve/main/corpus/corpus-00002.parquet
+    name: corpus_2
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/datasets/spiceai/search-benchmark-game/resolve/main/corpus/corpus-00003.parquet
+    name: corpus_3
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/datasets/spiceai/search-benchmark-game/resolve/main/corpus/corpus-00004.parquet
+    name: corpus_4
+    params:
+      file_format: parquet
+
+  - from: https://huggingface.co/datasets/spiceai/search-benchmark-game/resolve/main/corpus/corpus-00005.parquet
+    name: corpus_5
+    params:
+      file_format: parquet
+
+  # 962 queries in the Tantivy query syntax, with a `query_type` column (union, intersection,
+  # phrase, intersection_union, negated, term, two-phase-critic).
+  - from: https://huggingface.co/datasets/spiceai/search-benchmark-game/resolve/main/queries/queries.parquet
+    name: test_queries
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+
+views:
+  - name: corpus
+    sql: |
+      SELECT * FROM corpus_0
+      UNION ALL SELECT * FROM corpus_1
+      UNION ALL SELECT * FROM corpus_2
+      UNION ALL SELECT * FROM corpus_3
+      UNION ALL SELECT * FROM corpus_4
+      UNION ALL SELECT * FROM corpus_5
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+    columns:
+      - name: text
+        full_text_search:
+          enabled: true
+          row_id:
+            - _id
