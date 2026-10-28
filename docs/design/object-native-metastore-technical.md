@@ -455,8 +455,8 @@ the one after record `a`. A batch is named by its first record's commit number.
   never splits a batch, so a batch is either wholly retained or wholly
   reclaimable, and readers never clip one. This is a simplification, not a
   safety rule: a clipped alternative, in which a batch above the floor stays
-  listed and readers skip its records at or below the floor, was also
-  model-checked safe, and is not proposed because it complicates the decoder.
+  listed and readers skip its records at or below the floor, is not proposed
+  because it complicates the decoder.
 - **The batch index is bounded by the checkpoint cadence.** A checkpoint moves
   the floor and trims the index. The writer checkpoints before the index
   would push the head past its budget.
@@ -757,8 +757,8 @@ never splits a batch:
 
 A checkpoint's name determines its contents: two checkpoints at the same
 commit are identical, because `apply` is deterministic and a commit number
-names one state (model: `naming`; naming states by `seq` instead fails, in
-`naming-by-seq`).
+names one state (model: `naming` holds; without the commit number,
+`naming-no-commit-number` fails).
 
 **A checkpoint is a compaction of the log.** Its pages behave like the levels
 of an LSM tree, and rewriting only changed pages works when changes are
@@ -784,8 +784,8 @@ all commit numbers.
 - *Why states need their own number.* A compaction draws no `seq`, and a
   schema change touches no rows, yet each changes the state. Named by `seq`,
   the states before and after either would share one name, and so would their
-  checkpoints. The model finds both (`naming-by-seq`), and a dense commit number
-  removes them (`naming`).
+  checkpoints. A dense commit number gives each state its own name
+  (`naming`).
 - *Iceberg keeps the same split:* each commit gets a snapshot sequence number,
   while a rewrite's output files carry an explicit, older data sequence number
   "for data that logically belongs to an older sequence number"
@@ -826,8 +826,8 @@ deletion index and the PK keyset, and stores it as each file's
 - **Why per table, not per dataset.** A dataset-wide rule would compare
   numbers from different allocators. When one partition's allocator is behind
   another's, a correctly allocated record that touches both is refused, and
-  retrying the same bytes cannot help (model: `table-seq-dataset-wide` fails,
-  `table-seq` holds, including a key that moves between partitions in one
+  retrying the same bytes cannot help (model: without the per-table scope,
+  `table-seq-no-table-scope` fails; `table-seq` holds, including a key that moves between partitions in one
   record). So a record that meets each touched table's rule is never refused
   because another table's high-water mark is higher. A per-table rule also survives either future for partitions:
   flattening them into one table makes it per dataset, and a log per subtable
@@ -1004,16 +1004,15 @@ Tables that go away have one line.
   above the cap waits for the `Resolve`, which the transaction deadline bounds.
   A `Resolve{abort}` leaves no trace in coverage or cutoffs.
   - *Model-checked:* `dataset-prepare-cutoff-cap` holds. Without a cap
-    (`dataset-prepare-file-footprint`, `dataset-prepare-no-cutoff-cap`):
+    (`dataset-prepare-no-cutoff-cap`):
     prepare a delete of key 0, compact the warm files and promote the cold
     ones, `Resolve{commit}`, then a covered clear removes the delete and key 0
     is visible again.
-  - *Alternatives that also hold:* rejecting maintenance whose inputs hold a
-    key an unresolved `Prepare` reserves (`dataset-prepare-input-reservation`),
-    which blocks compacting those files until the `Resolve`; and stamping the
-    `Prepare`'s actions with fresh `seq`s at `Resolve`
-    (`dataset-prepare-resolve-seq`), which moves buffered writes below them
-    through the lost-race shift. The cap is chosen because it blocks no rewrite
+  - *Alternatives considered:* rejecting maintenance whose inputs hold a
+    key an unresolved `Prepare` reserves, which blocks compacting those files
+    until the `Resolve`; and stamping the `Prepare`'s actions with fresh
+    `seq`s at `Resolve`, which moves buffered writes below them through the
+    lost-race shift. The cap is chosen because it blocks no rewrite
     and re-stamps nothing.
 - **Clearing follows coverage, not a single compaction.** A compaction that
   rewrites every file a delete could still hide rows in clears it in its own
@@ -1023,15 +1022,14 @@ Tables that go away have one line.
   clears only after a full rewrite of the hot files, capped at the cold
   manifest's newest `seq` (`provider/table.rs`, `RewriteScope::Fenced`).
   - *Model-checked:* `delete-coverage` holds with compaction of any subset of
-    files and a cold file only promotion rewrites. Clearing by the cutoff
-    alone (`delete-coverage-cutoff-only`) or leaving cold files out of the
-    coverage check (`delete-coverage-no-cold`) resurrects a deleted row.
+    files and a cold file only promotion rewrites. Leaving cold files out of
+    the coverage check (`delete-coverage-no-cold`) makes a deleted row
+    visible again.
   - *Alternative: Iceberg's form.* An Iceberg rewrite by default gives its
     outputs the sequence number of the snapshot it started from
     (`use-starting-sequence-number`), so deletes before it no longer apply to
     the outputs, and a delete that applies to no live file is dangling
-    (`remove-dangling-deletes`). The model found it equivalent for one-row
-    files (`delete-coverage-iceberg`). It is not proposed because it changes
+    (`remove-dangling-deletes`). It is not proposed because it changes
     the `seq` stamped on compaction outputs, which Cayenne's visibility code
     reads; `applied_through` adds a field instead.
 - **Derived or rebuilt:**
@@ -1095,9 +1093,9 @@ Retired. Its one remaining writer, the flush path at
 - *Why not a separate object tagged with `as_of`:* GC removes records below the
   floor regardless of an index's `as_of`, so an older index could no longer be
   brought up to date, and an index that misses keys can admit duplicate live
-  rows. The model shows the loss (`pk-index-stale-reference`), and that a
-  checkpoint collection (`pk-index-checkpoint`), or dropping the stale
-  reference and rebuilding (`pk-index-drop`), avoids it.
+  rows. The model checks recovery from the checkpoint collection
+  (`pk-index-checkpoint` holds; without refreshing the collection,
+  `pk-index-checkpoint-no-refresh` loses keys).
 
 ### `cayenne_inlined_data` and `cayenne_inlined_delete`
 
@@ -1418,8 +1416,8 @@ still reads, never above the node's current commit.
 - **One mark per dataset, not one per query or a range.** A pin anchored at
   the oldest query alone does not protect a newer query's files: a file added
   after the oldest query's commit and removed before the floor advanced is in
-  neither (`pins-oldest-query-only` fails; `pins-low-water` holds). A pin
-  listing each query's commit would protect only those states, at the cost of
+  neither. The low-water mark covers every state from the oldest active
+  query's commit on (`pins-low-water` holds). A pin listing each query's commit would protect only those states, at the cost of
   a write whenever a query starts at a new commit.
 - **The cost.** A long query keeps everything removed since it started, like
   PostgreSQL's xmin horizon.
@@ -1815,15 +1813,14 @@ stale `UPDATE` in the first statement commits.
 
 *Considered and rejected: one read-dependent write at a time.* Excluding
 other read-dependent writes on the same tables, with blind writes checked only
-by key footprints, is not enough (`read-rule1-minimal-blind` fails). `UPDATE t
+by key footprints, is not enough. `UPDATE t
 SET b = b + 1 WHERE a = 1` plans at commit 0 and selects only `s`. A blind
 upsert then commits `r(1, 0)`, which now matches the predicate. The keys are
 disjoint, so the `UPDATE` commits its stale plan, giving `r(1, 0), s(1, 1)`
 where running it after the upsert gives `r(1, 1), s(1, 1)`. Making it safe
 needs validation against blind winners anyway: either predicate validation as
 above, or re-planning whenever any winner wrote a table the statement reads,
-which never commits under ingestion. Mixing the two rules on one dataset is also
-unsafe (`read-mixed-rules`).
+which never commits under ingestion.
 
 **Leases coordinate work; guards guarantee correctness.** CDC writers hold
 one lease per source partition. Maintenance nodes lease a deterministic unit: a
