@@ -11,11 +11,15 @@ description: >
 sources:
   src: { kind: postgres }
 
+matrix:
+  runtime_mode: [server, sidecar]
+
 spicepod:
   version: v1
   kind: Spicepod
   name: results-cache
   runtime:
+    mode: '${matrix.runtime_mode}'
     caching:
       sql_results:
         enabled: true

@@ -713,6 +713,17 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     }
 
     let runtime_config = app.as_ref().map(|app| &app.runtime);
+    if runtime_config.is_some_and(|runtime| {
+        runtime.mode == app::spicepod::component::runtime::RuntimeMode::Sidecar
+    }) && (args.runtime.cluster.role.is_some()
+        || args.runtime.cluster.scheduler_address.is_some())
+    {
+        return Err(Error::InvalidClusterConfig {
+            source: std::io::Error::other(
+                "runtime.mode: sidecar cannot run as a cluster scheduler or executor. Remove --role and --scheduler-address, or set runtime.mode: server.",
+            ),
+        });
+    }
     let app_name = app.as_ref().map(|app| app.name.clone());
     let spicepod_tls_config = runtime_config.and_then(|rt| rt.tls.clone());
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());

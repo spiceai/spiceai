@@ -159,7 +159,7 @@ impl KeyUse {
                 | CacheControl::MaxStale(CacheKeyType::Default, _)
                 | CacheControl::MinFresh(CacheKeyType::Default, _)
                 | CacheControl::OnlyIfCached(CacheKeyType::Default),
-                CacheKey::LogicalPlan(_),
+                CacheKey::LogicalPlan(_) | CacheKey::SerializedPlan(_, _),
             )
             | (
                 CacheControl::Cache(CacheKeyType::Raw)
@@ -474,6 +474,7 @@ impl Query {
         tracker: Option<QueryTracker>,
         pre_parsed_plan: Option<Box<LogicalPlan>>,
         already_looked_up: Option<RawCacheKey>,
+        serialized_plan_cache_key: Option<&str>,
     ) -> super::Result<PlanOrCached> {
         let cache_control = request_context.cache_control();
         let cache_namespace = request_context.cache_namespace();
@@ -550,7 +551,9 @@ impl Query {
             df,
             &request_context,
             tracker,
-            &CacheKey::LogicalPlan(&plan),
+            &serialized_plan_cache_key.map_or(CacheKey::LogicalPlan(&plan), |digest| {
+                CacheKey::SerializedPlan(digest, &plan)
+            }),
             sql,
             already_looked_up,
             // A `LogicalPlan` key carries the parameter values already bound
@@ -774,7 +777,7 @@ impl Query {
 
         // Extract plan from cache key if available to avoid re-parsing
         let plan = match key {
-            CacheKey::LogicalPlan(p) => Some(*p),
+            CacheKey::LogicalPlan(p) | CacheKey::SerializedPlan(_, p) => Some(*p),
             _ => None,
         };
         let cache_status = entry.cache_status;
@@ -867,11 +870,12 @@ impl Query {
                     };
                     cached_plan.insert(plan)
                 };
-                CacheKey::LogicalPlan(plan).as_raw_key_in_namespace(
-                    cache_provider.hasher(),
-                    ns_tag,
-                    ns_id,
-                )
+                self.serialized_plan_cache_key
+                    .as_deref()
+                    .map_or(CacheKey::LogicalPlan(plan), |digest| {
+                        CacheKey::SerializedPlan(digest, plan)
+                    })
+                    .as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
             }
         };
 

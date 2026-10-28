@@ -376,9 +376,17 @@ impl RuntimeBuilder {
         document_parse::register_all().await;
 
         let query = spicepod_rt.query.clone().unwrap_or_default();
+        if spicepod_rt.mode == spicepod::component::runtime::RuntimeMode::Sidecar {
+            tracing::info!(
+                "Runtime mode: sidecar. Remote Spice reads use Substrait plans created locally."
+            );
+        }
 
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
-        let target_partitions = query.target_partitions;
+        let target_partitions = query.target_partitions.or_else(|| {
+            (spicepod_rt.mode == spicepod::component::runtime::RuntimeMode::Sidecar)
+                .then(|| cpu_budget::cpu_budget().sidecar_target_partitions())
+        });
         let max_concurrent_queries = query.max_concurrent_queries;
 
         // The effective timeout is resolved per request by
@@ -874,6 +882,7 @@ impl RuntimeBuilder {
         };
 
         let mut rt = Runtime {
+            mode: spicepod_rt.mode,
             app: shared_app,
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
             initial_load: Arc::new(crate::InitialLoad::default()),

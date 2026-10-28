@@ -461,6 +461,15 @@ impl DataConnectorFactory for SpiceAIFactory {
                 Arc::new(SpiceCloudPlatformDialect {}),
             );
             let spiceai = SpiceAI { flight_factory };
+            let spiceai = if context.app().runtime.mode
+                == spicepod::component::runtime::RuntimeMode::Sidecar
+            {
+                SpiceAI {
+                    flight_factory: spiceai.flight_factory.with_substrait(),
+                }
+            } else {
+                spiceai
+            };
             Ok(Arc::new(spiceai) as Arc<dyn DataConnector>)
         })
     }

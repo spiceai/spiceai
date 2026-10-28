@@ -1293,6 +1293,17 @@ impl CpuBudget {
         self.cores
     }
 
+    /// Local fan-out for an application sidecar. Independent queries share
+    /// the CPU entitlement instead of each reserving every core.
+    #[must_use]
+    #[expect(
+        clippy::unused_self,
+        reason = "deployment defaults belong beside the CPU budget defaults"
+    )]
+    pub const fn sidecar_target_partitions(&self) -> usize {
+        1
+    }
+
     /// Ceiling on the splits ONE Vortex file scan decodes concurrently when the
     /// count is derived rather than configured (`scan_concurrency: auto`).
     ///

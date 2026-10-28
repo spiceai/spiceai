@@ -275,6 +275,7 @@ pub(super) enum QueryRuntimeBinding {
 }
 
 pub struct Query {
+    serialized_plan_cache_key: Option<Arc<str>>,
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
     tracker: Option<QueryTracker>,
@@ -689,6 +690,15 @@ impl Query {
     /// Panics when running under test if no cache key is computed for the query.
     pub async fn run(mut self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
+        if self.serialized_plan_cache_key.is_some()
+            && request_context.cache_control().cache_key_type()
+                != Some(runtime_request_context::CacheKeyType::Default)
+        {
+            // Serialized plans carry no SQL or client-supplied key. Preserve
+            // no-cache and bypass incompatible cache modes rather than using
+            // their synthetic task-history description as SQL text.
+            self.results_cache_mode = ResultsCacheMode::Bypass;
+        }
         let guards = self.lifetime_guards(&request_context);
 
         // Looked up on the runtime the request arrived on: a hit needs no
@@ -979,6 +989,7 @@ impl Query {
                                 tracker,
                                 pre_parsed_plan,
                                 None,
+                                self.serialized_plan_cache_key.as_deref(),
                             )
                             .await?
                         }
@@ -1413,6 +1424,13 @@ impl Query {
                 };
 
                 let mut session = ctx.get_session_state(&request_context);
+                if let Some(timeout) = request_context.query_timeout()
+                    && let Some(deadline) = started_at.checked_add(timeout)
+                {
+                    session.config_mut().set_extension(Arc::new(
+                        runtime_request_context::QueryDeadline(deadline),
+                    ));
+                }
 
                 let results_cache_mode = ctx.results_cache_mode;
                 let tracker = ctx.tracker;
@@ -1511,6 +1529,7 @@ impl Query {
                                     tracker,
                                     pre_parsed_plan,
                                     already_looked_up,
+                                    ctx.serialized_plan_cache_key.as_deref(),
                                 )
                                 .await?
                             }
@@ -2029,6 +2048,7 @@ impl Query {
 
     pub fn from_logical_plan(df: &Arc<DataFusion>, plan: LogicalPlan) -> Self {
         Self {
+            serialized_plan_cache_key: None,
             df: Arc::clone(df),
             sql: QueryMethod::Plan(Box::new(plan)),
             tracker: None,

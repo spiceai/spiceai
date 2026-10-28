@@ -102,7 +102,13 @@ impl RuntimeConnectorContext {
 #[async_trait]
 impl ConnectorContext for RuntimeConnectorContext {
     fn app(&self) -> Arc<App> {
-        Arc::clone(&self.app)
+        if self.app.runtime.mode == self.runtime.mode {
+            Arc::clone(&self.app)
+        } else {
+            let mut app = (*self.app).clone();
+            app.runtime.mode = self.runtime.mode;
+            Arc::new(app)
+        }
     }
 
     fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry> {

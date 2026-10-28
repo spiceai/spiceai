@@ -30,12 +30,14 @@ use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::sql::{CommandStatementSubstraitPlan, ProstMessageExt, SubstraitPlan};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt;
 use futures::{TryStreamExt, ready, stream};
+use prost::Message;
 use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -189,6 +191,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("{source}"))]
+    SubstraitUnsupported { source: TonicStatusError },
+
     #[snafu(display("Failed to publish data to flight endpoint. {source}"))]
     UnableToPublish { source: TonicStatusError },
 
@@ -283,6 +288,96 @@ pub struct FlightClient {
 }
 
 impl FlightClient {
+    /// Opaque federation identity covering the endpoint, credentials, and all
+    /// configured metadata. Different authorization scopes cannot share a plan.
+    #[must_use]
+    pub fn federation_context(&self) -> String {
+        use sha2::{Digest, Sha256};
+        static SALT: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(rand::random);
+        let mut digest = Sha256::new();
+        digest.update(*SALT);
+        let mut field = |bytes: &[u8]| {
+            digest.update(bytes.len().to_le_bytes());
+            digest.update(bytes);
+        };
+        field(self.url.as_bytes());
+        match &self.credentials {
+            Credentials::Anonymous => field(b"anonymous"),
+            Credentials::UsernamePassword { username, password } => {
+                field(b"basic");
+                field(username.as_bytes());
+                field(password.expose_secret().as_bytes());
+            }
+            Credentials::Bearer { token, prefix } => {
+                field(if *prefix { b"bearer" } else { b"token" });
+                field(token.expose_secret().as_bytes());
+            }
+        }
+        if let Some(metadata) = &self.metadata {
+            let mut fields: Vec<_> = metadata
+                .iter()
+                .map(|entry| match entry {
+                    tonic::metadata::KeyAndValueRef::Ascii(key, value) => {
+                        (key.as_str(), value.as_encoded_bytes())
+                    }
+                    tonic::metadata::KeyAndValueRef::Binary(key, value) => {
+                        (key.as_str(), value.as_encoded_bytes())
+                    }
+                })
+                .collect();
+            fields.sort_unstable();
+            for (key, value) in fields {
+                field(key.as_bytes());
+                field(value);
+            }
+        }
+        format!("spice-substrait:{:x}", digest.finalize())
+    }
+
+    /// Executes a serialized Substrait plan over Flight SQL without converting
+    /// it to SQL. Spice accepts the typed command directly as a `DoGet` ticket,
+    /// so a sidecar that already knows the schema needs no `GetFlightInfo` call.
+    ///
+    /// # Errors
+    /// Returns an error on authentication, unsupported plans, invalid tickets,
+    /// or transport failure. Stream errors remain visible to the caller.
+    pub async fn query_substrait(
+        &self,
+        plan: Bytes,
+        timeout: Option<Duration>,
+    ) -> Result<FlightRecordBatchStream> {
+        let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
+        let token = self.authenticate_basic_token().await?;
+        let command = CommandStatementSubstraitPlan {
+            plan: Some(SubstraitPlan {
+                plan,
+                version: String::new(),
+            }),
+            transaction_id: None,
+        };
+        let mut request = arrow_flight::Ticket {
+            ticket: command.as_any().encode_to_vec().into(),
+        }
+        .into_request();
+        self.apply_request_metadata(&mut request, token.as_ref())?;
+        if let Some(deadline) = deadline {
+            request.set_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+        }
+        let (metadata, stream, _) = self
+            .client
+            .clone()
+            .do_get(request)
+            .await
+            .map_err(map_substrait_error)?
+            .into_parts();
+        Ok(FlightRecordBatchStream::new_from_flight_data(
+            stream
+                .map_ok(conforming_map_entries)
+                .map_err(|status| FlightError::Tonic(Box::new(status))),
+        )
+        .with_headers(metadata))
+    }
+
     /// Creates a new instance of `FlightClient`.
     ///
     /// # Arguments
@@ -339,6 +434,17 @@ impl FlightClient {
     pub fn with_metadata(mut self, metadata: tonic::metadata::MetadataMap) -> Self {
         self.metadata = Some(metadata);
         self
+    }
+
+    /// Adds request-scoped trace metadata without replacing connector metadata.
+    ///
+    /// # Errors
+    /// Returns an error when the supplied value is not valid gRPC metadata.
+    pub fn with_trace_header(mut self, key: &'static str, value: &str) -> Result<Self> {
+        self.metadata
+            .get_or_insert_default()
+            .insert(key, value.parse().context(InvalidMetadataSnafu)?);
+        Ok(self)
     }
 
     /// Overrides default maximum message size for encoding and decoding.
@@ -656,6 +762,16 @@ impl FlightClient {
 
     pub fn client(&self) -> &FlightServiceClient<Channel> {
         &self.client
+    }
+}
+
+fn map_substrait_error(error: tonic::Status) -> Error {
+    if error.code() == tonic::Code::Unimplemented {
+        Error::SubstraitUnsupported {
+            source: error.into(),
+        }
+    } else {
+        map_tonic_error_to_message(error)
     }
 }
 

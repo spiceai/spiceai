@@ -142,7 +142,7 @@ pub(crate) async fn get_flight_info(
             .map_err(|e| Status::permission_denied(format!("Write access denied. {e}")))?;
     }
 
-    let query = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion)).build();
+    let query = QueryBuilder::from_substrait_plan(plan, cache_key, Arc::clone(&datafusion)).build();
     let (dataset_schema, _) = query
         .get_schema()
         .await
@@ -181,7 +181,7 @@ pub(crate) async fn do_get(
             .map_err(|e| Status::permission_denied(format!("Write access denied. {e}")))?;
     }
 
-    let query_result = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion))
+    let query_result = QueryBuilder::from_substrait_plan(plan, cache_key, Arc::clone(&datafusion))
         .build()
         .run()
         .await

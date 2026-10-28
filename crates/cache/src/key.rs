@@ -65,6 +65,9 @@ impl SearchKey {
 #[derive(Clone, Copy)]
 pub enum CacheKey<'a> {
     LogicalPlan(&'a LogicalPlan),
+    /// Digest of a serialized plan, with its decoded plan retained for normal
+    /// cache eligibility, table invalidation, and background revalidation.
+    SerializedPlan(&'a str, &'a LogicalPlan),
     Query(&'a str, Option<&'a ParamValues>),
     Search(&'a SearchKey),
     /// A caller-supplied key (`Spice-Cache-Key` / `client_supplied`). This is an
@@ -100,6 +103,10 @@ impl CacheKey<'_> {
     fn hash_payload<T: Hasher>(&self, hasher: &mut T) {
         match self {
             Self::LogicalPlan(logical_plan) => logical_plan.hash(hasher),
+            Self::SerializedPlan(digest, _) => {
+                b"spice:serialized-plan:v1".hash(hasher);
+                digest.hash(hasher);
+            }
             Self::Search(search_key) => search_key.hash(hasher),
             Self::EmbeddingRequest(embedding_request) => embedding_request.hash(hasher),
             Self::EmbeddingInput(model_name, embedding_input) => {

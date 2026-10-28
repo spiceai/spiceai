@@ -53,6 +53,7 @@ pub struct QueryBuilder {
     results_cache_mode: ResultsCacheMode,
     runtime_binding: QueryRuntimeBinding,
     emit_tracker: bool,
+    serialized_plan_cache_key: Option<Arc<str>>,
 }
 
 impl QueryBuilder {
@@ -68,6 +69,7 @@ impl QueryBuilder {
             results_cache_mode: ResultsCacheMode::default(),
             runtime_binding: QueryRuntimeBinding::QueryRuntime,
             emit_tracker: true,
+            serialized_plan_cache_key: None,
         }
     }
 
@@ -88,6 +90,7 @@ impl QueryBuilder {
             results_cache_mode: ResultsCacheMode::default(),
             runtime_binding: QueryRuntimeBinding::QueryRuntime,
             emit_tracker: true,
+            serialized_plan_cache_key: None,
         }
     }
 
@@ -111,7 +114,19 @@ impl QueryBuilder {
             results_cache_mode: ResultsCacheMode::default(),
             runtime_binding: QueryRuntimeBinding::QueryRuntime,
             emit_tracker: true,
+            serialized_plan_cache_key: None,
         }
+    }
+
+    /// A wire plan is keyed by its serialized digest only in plan cache mode.
+    pub(crate) fn from_substrait_plan(
+        plan: LogicalPlan,
+        digest: String,
+        df: Arc<DataFusion>,
+    ) -> Self {
+        let mut builder = Self::from_plan(plan, digest.clone(), df);
+        builder.serialized_plan_cache_key = Some(digest.into());
+        builder
     }
 
     #[must_use]
@@ -238,6 +253,7 @@ impl QueryBuilder {
             read_only: self.read_only,
             results_cache_mode: self.results_cache_mode,
             runtime_binding: self.runtime_binding,
+            serialized_plan_cache_key: self.serialized_plan_cache_key,
         }
     }
 }
