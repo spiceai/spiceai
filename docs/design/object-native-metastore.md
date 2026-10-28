@@ -704,8 +704,9 @@ moves a file, and GC only deletes files no protected state references.
 data share one location. The format lets the catalog reference data in other
 locations, each with its own permissions, storage class or region (see
 [multiple data locations](object-native-metastore-technical.md#future-multiple-data-locations));
-today's per-dataset overrides, such as S3 Express, would become one. The open
-questions are the surface for configuring them and when it ships. Every data
+today's per-dataset overrides, such as S3 Express, would become one. The
+surface for configuring them, and when it ships, belong to a separate
+Enhancement on object-native data; this one covers the metadata. Every data
 location must be an object store that every instance needing its files can
 read.
 
