@@ -513,6 +513,10 @@
       "description": "Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory` deprecation",
       "type": "object",
       "properties": {
+        "mode": {
+          "$ref": "#/$defs/RuntimeMode",
+          "default": "server"
+        },
         "results_cache": {
           "anyOf": [
             {
@@ -728,6 +732,14 @@
         }
       },
       "additionalProperties": false
+    },
+    "RuntimeMode": {
+      "description": "Selects the deployment profile without changing cluster membership.",
+      "type": "string",
+      "enum": [
+        "server",
+        "sidecar"
+      ]
     },
     "ResultsCache": {
       "type": "object",

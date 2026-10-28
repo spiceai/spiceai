@@ -37,7 +37,10 @@ def command(plan):
     # it independently avoids sharing the Spice command construction code.
     substrait = field(1, plan)
     message = field(1, substrait)
-    return field(1, b"type.googleapis.com/arrow.flight.protocol.sql.CommandStatementSubstraitPlan") + field(2, message)
+    return field(
+        1,
+        b"type.googleapis.com/arrow.flight.protocol.sql.CommandStatementSubstraitPlan",
+    ) + field(2, message)
 
 
 class Headers(flight.ClientMiddleware):
@@ -58,7 +61,11 @@ class Capture(flight.ClientMiddlewareFactory):
 
 def execute(client, capture, plan, options):
     capture.headers = []
-    actual = client.do_get(flight.Ticket(command(plan)), options=options).read_all().to_pylist()
+    actual = (
+        client.do_get(flight.Ticket(command(plan)), options=options)
+        .read_all()
+        .to_pylist()
+    )
     status = None
     for headers in capture.headers:
         values = headers.get("results-cache-status")
@@ -73,49 +80,104 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spiced", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--source-commit", help="Commit that produced the prebuilt spiced binary; defaults to HEAD")
+    parser.add_argument(
+        "--source-commit",
+        help="Commit that produced the prebuilt spiced binary; defaults to HEAD",
+    )
     args = parser.parse_args()
     args.out = args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=False)
     args.spiced = args.spiced.resolve()
     ctx = SessionContext()
-    plan = bytes(Producer.to_substrait_plan(ctx.sql("SELECT 11 AS value").optimized_logical_plan(), ctx).encode())
+    plan = bytes(
+        Producer.to_substrait_plan(
+            ctx.sql("SELECT 11 AS value").optimized_logical_plan(), ctx
+        ).encode()
+    )
     # A protobuf unknown field changes wire bytes but not decoded operations.
     # It distinguishes byte identity from logical-plan identity without changing
     # the expected answer. Prost must ignore this field during plan decoding.
     equivalent = plan + varint(1000 << 3) + varint(1)
     (args.out / "plan.bin").write_bytes(plan)
     (args.out / "equivalent-plan.bin").write_bytes(equivalent)
-    (args.out / "provenance.json").write_text(json.dumps({
-        "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "commit": args.source_commit or subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "harness_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "common_harness_sha256": hashlib.sha256(Path(__file__).with_name("sidecar.py").read_bytes()).hexdigest(),
-        "binary_sha256": hashlib.sha256(args.spiced.read_bytes()).hexdigest(),
-        "plan_sha256": hashlib.sha256(plan).hexdigest(),
-        "equivalent_plan_sha256": hashlib.sha256(equivalent).hexdigest(),
-    }, indent=2))
+    (args.out / "provenance.json").write_text(
+        json.dumps(
+            {
+                "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "commit": args.source_commit
+                or subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], text=True
+                ).strip(),
+                "harness_commit": subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], text=True
+                ).strip(),
+                "harness_sha256": hashlib.sha256(
+                    Path(__file__).read_bytes()
+                ).hexdigest(),
+                "common_harness_sha256": hashlib.sha256(
+                    Path(__file__).with_name("sidecar.py").read_bytes()
+                ).hexdigest(),
+                "binary_sha256": hashlib.sha256(args.spiced.read_bytes()).hexdigest(),
+                "plan_sha256": hashlib.sha256(plan).hexdigest(),
+                "equivalent_plan_sha256": hashlib.sha256(equivalent).hexdigest(),
+            },
+            indent=2,
+        )
+    )
     observations = []
     mismatches = []
     for key_type in ["plan", "sql"]:
         pod = base_pod("substrait-cache", [], cache=True)
         pod["runtime"]["caching"]["sql_results"]["cache_key_type"] = key_type
-        pod["runtime"]["auth"] = {"api-key": {"enabled": True, "keys": ["alice-cache-key", "bob-cache-key:ro"]}}
-        instance = Instance(args.spiced, args.out / key_type, pod, api_key="alice-cache-key")
+        pod["runtime"]["auth"] = {
+            "api-key": {
+                "enabled": True,
+                "keys": ["alice-cache-key", "bob-cache-key:ro"],
+            }
+        }
+        instance = Instance(
+            args.spiced, args.out / key_type, pod, api_key="alice-cache-key"
+        )
         try:
             instance.start()
             capture = Capture()
-            client = flight.FlightClient(f"grpc://127.0.0.1:{instance.flight}", middleware=[capture])
-            alice = flight.FlightCallOptions(headers=[client.authenticate_basic_token("", "alice-cache-key")])
-            bob = flight.FlightCallOptions(headers=[client.authenticate_basic_token("", "bob-cache-key")])
-            expected_statuses = ["MISS", "HIT", "MISS", "HIT", "MISS", "HIT"] if key_type == "plan" else [None] * 6
-            requests = [(plan, alice), (plan, alice), (equivalent, alice), (equivalent, alice), (plan, bob), (plan, bob)]
-            for number, ((wire, options), expected_status) in enumerate(zip(requests, expected_statuses)):
+            client = flight.FlightClient(
+                f"grpc://127.0.0.1:{instance.flight}", middleware=[capture]
+            )
+            alice = flight.FlightCallOptions(
+                headers=[client.authenticate_basic_token("", "alice-cache-key")]
+            )
+            bob = flight.FlightCallOptions(
+                headers=[client.authenticate_basic_token("", "bob-cache-key")]
+            )
+            expected_statuses = (
+                ["MISS", "HIT", "MISS", "HIT", "MISS", "HIT"]
+                if key_type == "plan"
+                else [None] * 6
+            )
+            requests = [
+                (plan, alice),
+                (plan, alice),
+                (equivalent, alice),
+                (equivalent, alice),
+                (plan, bob),
+                (plan, bob),
+            ]
+            for number, ((wire, options), expected_status) in enumerate(
+                zip(requests, expected_statuses)
+            ):
                 rows, status = execute(client, capture, wire, options)
-                observation = {"mode": key_type, "request": number, "status": status, "expected_status": expected_status, "rows": rows}
+                observation = {
+                    "mode": key_type,
+                    "request": number,
+                    "status": status,
+                    "expected_status": expected_status,
+                    "rows": rows,
+                }
                 observations.append(observation)
-                (args.out / "observations.json").write_text(json.dumps(observations, indent=2))
+                (args.out / "observations.json").write_text(
+                    json.dumps(observations, indent=2)
+                )
                 print(json.dumps(observation), flush=True)
                 assert rows == [{"value": 11}], observation
                 if status != expected_status:

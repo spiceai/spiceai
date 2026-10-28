@@ -52,7 +52,7 @@ def fields(data):
         tag, offset = integer(offset)
         if tag & 7 == 2:
             length, offset = integer(offset)
-            result[tag >> 3] = data[offset:offset + length]
+            result[tag >> 3] = data[offset : offset + length]
             offset += length
         elif tag & 7 == 0:
             _, offset = integer(offset)
@@ -63,29 +63,87 @@ def fields(data):
 
 def pki(directory):
     def run(*arguments):
-        subprocess.run(["openssl", *arguments], cwd=directory, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["openssl", *arguments],
+            cwd=directory,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
-    run("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.crt",
-        "-days", "1", "-subj", "/CN=Sidecar Test CA")
-    (directory / "server.ext").write_text("subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n")
+    run(
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        "ca.key",
+        "-out",
+        "ca.crt",
+        "-days",
+        "1",
+        "-subj",
+        "/CN=Sidecar Test CA",
+    )
+    (directory / "server.ext").write_text(
+        "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n"
+    )
     (directory / "client.ext").write_text("extendedKeyUsage=clientAuth\n")
     for name in ["server", "alice", "bob"]:
-        run("req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", f"{name}.key",
-            "-out", f"{name}.csr", "-subj", f"/CN={name}")
-        run("x509", "-req", "-in", f"{name}.csr", "-CA", "ca.crt", "-CAkey", "ca.key",
-            "-CAcreateserial", "-out", f"{name}.crt", "-days", "1", "-extfile",
-            "server.ext" if name == "server" else "client.ext")
+        run(
+            "req",
+            "-new",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            f"{name}.key",
+            "-out",
+            f"{name}.csr",
+            "-subj",
+            f"/CN={name}",
+        )
+        run(
+            "x509",
+            "-req",
+            "-in",
+            f"{name}.csr",
+            "-CA",
+            "ca.crt",
+            "-CAkey",
+            "ca.key",
+            "-CAcreateserial",
+            "-out",
+            f"{name}.crt",
+            "-days",
+            "1",
+            "-extfile",
+            "server.ext" if name == "server" else "client.ext",
+        )
 
 
 class IdentityFlight(flight.FlightServerBase):
     def __init__(self, directory):
-        super().__init__("grpc+tls://localhost:0", tls_certificates=[(
-            (directory / "server.crt").read_bytes(), (directory / "server.key").read_bytes())],
-            verify_client=True, root_certificates=(directory / "ca.crt").read_bytes())
+        super().__init__(
+            "grpc+tls://localhost:0",
+            tls_certificates=[
+                (
+                    (directory / "server.crt").read_bytes(),
+                    (directory / "server.key").read_bytes(),
+                )
+            ],
+            verify_client=True,
+            root_certificates=(directory / "ca.crt").read_bytes(),
+        )
         self.observations = []
         self.schemas = {
-            name: pa.schema([pa.field(f"id_{name}", pa.int64(), nullable=True), pa.field(f"key_{name}", pa.int64(), nullable=True)])
+            name: pa.schema(
+                [
+                    pa.field(f"id_{name}", pa.int64(), nullable=True),
+                    pa.field(f"key_{name}", pa.int64(), nullable=True),
+                ]
+            )
             for name in ["alice", "bob"]
         }
 
@@ -98,13 +156,25 @@ class IdentityFlight(flight.FlightServerBase):
         assert identity in ["alice", "bob"], identity
         ctx = SessionContext()
         for name, schema in self.schemas.items():
-            source = pa.Table.from_arrays([pa.array([1 if identity == "alice" else 2], type=pa.int64()), pa.array([1], type=pa.int64())], schema=schema)
+            source = pa.Table.from_arrays(
+                [
+                    pa.array([1 if identity == "alice" else 2], type=pa.int64()),
+                    pa.array([1], type=pa.int64()),
+                ],
+                schema=schema,
+            )
             ctx.register_record_batches(f"remote_{name}", [source.to_batches()])
         plan = fields(fields(fields(ticket.ticket)[2])[1])[1]
         logical = Consumer.from_substrait_plan(ctx, Serde.deserialize_bytes(plan))
         frame = ctx.create_dataframe_from_logical_plan(logical)
         table = frame.to_arrow_table()
-        self.observations.append({"identity": identity, "plan_sha256": hashlib.sha256(plan).hexdigest(), "rows": table.to_pylist()})
+        self.observations.append(
+            {
+                "identity": identity,
+                "plan_sha256": hashlib.sha256(plan).hexdigest(),
+                "rows": table.to_pylist(),
+            }
+        )
         return flight.RecordBatchStream(table)
 
 
@@ -112,30 +182,59 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spiced", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--source-commit", help="Commit that produced the prebuilt spiced binary; defaults to HEAD")
+    parser.add_argument(
+        "--source-commit",
+        help="Commit that produced the prebuilt spiced binary; defaults to HEAD",
+    )
     args = parser.parse_args()
     args.out = args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=False)
     args.spiced = args.spiced.resolve()
-    (args.out / "provenance.json").write_text(json.dumps({
-        "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "commit": args.source_commit or subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "harness_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "common_harness_sha256": hashlib.sha256(Path(__file__).with_name("sidecar.py").read_bytes()).hexdigest(),
-        "binary_sha256": hashlib.sha256(args.spiced.read_bytes()).hexdigest(),
-    }, indent=2))
+    (args.out / "provenance.json").write_text(
+        json.dumps(
+            {
+                "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "commit": args.source_commit
+                or subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], text=True
+                ).strip(),
+                "harness_commit": subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], text=True
+                ).strip(),
+                "harness_sha256": hashlib.sha256(
+                    Path(__file__).read_bytes()
+                ).hexdigest(),
+                "common_harness_sha256": hashlib.sha256(
+                    Path(__file__).with_name("sidecar.py").read_bytes()
+                ).hexdigest(),
+                "binary_sha256": hashlib.sha256(args.spiced.read_bytes()).hexdigest(),
+            },
+            indent=2,
+        )
+    )
     pki(args.out)
     upstream = IdentityFlight(args.out)
     datasets = []
     for identity in ["alice", "bob"]:
-        datasets.append({"from": f"spice.ai:remote_{identity}", "name": identity, "params": {
-            "spiceai_endpoint": f"https://localhost:{upstream.port}",
-            "spiceai_tls_ca_certificate_file": str(args.out / "ca.crt"),
-            "spiceai_tls_client_certificate_file": str(args.out / f"{identity}.crt"),
-            "spiceai_tls_client_key_file": str(args.out / f"{identity}.key"),
-        }})
-    sidecar = Instance(args.spiced, args.out / "sidecar", base_pod("identity-scope", datasets, "sidecar"))
+        datasets.append(
+            {
+                "from": f"spice.ai:remote_{identity}",
+                "name": identity,
+                "params": {
+                    "spiceai_endpoint": f"https://localhost:{upstream.port}",
+                    "spiceai_tls_ca_certificate_file": str(args.out / "ca.crt"),
+                    "spiceai_tls_client_certificate_file": str(
+                        args.out / f"{identity}.crt"
+                    ),
+                    "spiceai_tls_client_key_file": str(args.out / f"{identity}.key"),
+                },
+            }
+        )
+    sidecar = Instance(
+        args.spiced,
+        args.out / "sidecar",
+        base_pod("identity-scope", datasets, "sidecar"),
+    )
     try:
         sidecar.start()
         sql = "SELECT a.id_alice AS aid, b.id_bob AS bid FROM alice a JOIN bob b ON a.key_alice = b.key_bob"
@@ -146,9 +245,14 @@ def main():
         print(json.dumps(observation), flush=True)
         (args.out / "result.json").write_text(json.dumps(observation, indent=2))
         assert actual == observation["expected"], observation
-        assert {item["identity"] for item in upstream.observations} == {"alice", "bob"}, upstream.observations
+        assert {item["identity"] for item in upstream.observations} == {
+            "alice",
+            "bob",
+        }, upstream.observations
     finally:
-        (args.out / "upstream-observations.json").write_text(json.dumps(upstream.observations, indent=2))
+        (args.out / "upstream-observations.json").write_text(
+            json.dumps(upstream.observations, indent=2)
+        )
         sidecar.stop()
         upstream.shutdown()
 
