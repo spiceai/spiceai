@@ -97,6 +97,7 @@ struct TapInner {
     last_commit: BTreeMap<String, Instant>,
     pending_verify: BTreeSet<String>,
     out: Option<std::io::BufWriter<std::fs::File>>,
+    seeded: bool,
 }
 
 /// The tap one catalog writes through.
@@ -106,6 +107,7 @@ pub struct MetastoreTap {
     verify_each_commit: bool,
     started: Instant,
     break_apply: Option<&'static str>,
+    panic_on_divergence: bool,
 }
 
 impl std::fmt::Debug for MetastoreTap {
@@ -136,11 +138,35 @@ impl MetastoreTap {
                 last_commit: BTreeMap::new(),
                 pending_verify: BTreeSet::new(),
                 out,
+                seeded: false,
             }),
             verify_each_commit,
             started: Instant::now(),
             break_apply: None,
+            panic_on_divergence: false,
         })
+    }
+
+    /// Panic on the first difference or apply error, so an existing test
+    /// suite run with the tap attached fails at the commit that diverged.
+    #[must_use]
+    pub fn panicking_on_divergence(mut self) -> Self {
+        self.panic_on_divergence = true;
+        self
+    }
+
+    /// Whether the tap still needs its baseline from SQL.
+    pub(crate) fn needs_seed(&self) -> bool {
+        !self.inner.lock().seeded
+    }
+
+    /// Starts the tap from the state SQL already holds (a reopened metastore).
+    pub(crate) fn seed(&self, tables: Vec<(String, TableState)>) {
+        let mut inner = self.inner.lock();
+        inner.seeded = true;
+        for (table_id, table) in tables {
+            inner.state.tables.insert(table_id, table);
+        }
     }
 
     /// Negative control: drop every action named `action` before applying,
@@ -182,6 +208,11 @@ impl MetastoreTap {
     pub(crate) fn record_verification(&self, table: &str, differences: Vec<String>) {
         let mut inner = self.inner.lock();
         inner.report.verified_tables += 1;
+        assert!(
+            !self.panic_on_divergence || differences.is_empty(),
+            "metastore tap: table {table} differs from SQL: {differences:#?}\nentered from:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
         for difference in differences {
             inner
                 .report
@@ -234,6 +265,10 @@ impl MetastoreTap {
             .map(|t| (t.clone(), inner.state.tables.get(t).cloned()))
             .collect();
         if let Err(err) = inner.state.apply(&record) {
+            assert!(
+                !self.panic_on_divergence,
+                "metastore tap: commit {commit} ({ops:?}) failed to apply: {err}"
+            );
             inner
                 .report
                 .apply_errors

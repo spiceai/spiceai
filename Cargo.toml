@@ -175,7 +175,7 @@ version = "2.5.0-unstable"
 # both so the otherwise-unknown cfg names don't trip the `unexpected_cfgs` lint on
 # builds without the flag. Declared workspace-wide (via each crate's
 # `lints.workspace = true`) rather than per-crate.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)', 'cfg(cayenne_loom)', 'cfg(cayenne_metastore_tap)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)', 'cfg(cayenne_loom)', 'cfg(cayenne_metastore_tap)', 'cfg(cayenne_metastore_tap_verify)'] }
 
 [workspace.lints.clippy]
 # Deny the pedantic group with a lower priority so the specific opt-outs below win.

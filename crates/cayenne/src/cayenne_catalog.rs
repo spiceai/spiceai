@@ -297,10 +297,22 @@ impl CayenneCatalog {
             MetastoreImpl::sqlite(SqliteMetastore::new(&connection_string))
         };
 
+        // Prototype verification, compiled in only with
+        // `--cfg cayenne_metastore_tap_verify`: every catalog checks its
+        // metastore-tap state against SQL after every commit and panics on the
+        // first difference, so existing test suites run as the differential.
+        #[cfg(cayenne_metastore_tap_verify)]
+        let tap = Some(Arc::new(
+            crate::metastore_tap::MetastoreTap::new(None, true)
+                .map_err(|source| CatalogError::Io { source })?
+                .panicking_on_divergence(),
+        ));
+        #[cfg(not(cayenne_metastore_tap_verify))]
+        let tap = None;
         Ok(Self {
             connection_string,
             metastore,
-            tap: None,
+            tap,
         })
     }
 
@@ -476,6 +488,27 @@ impl CayenneCatalog {
         let Some(tap) = &self.tap else {
             return;
         };
+        if tap.needs_seed() {
+            let mut tables = Vec::new();
+            if let Ok(ids) = self
+                .metastore
+                .query_helper(
+                    QueryParams {
+                        sql: "SELECT table_id FROM cayenne_table",
+                        params: vec![],
+                    },
+                    |row| row.get_string(0),
+                )
+                .await
+            {
+                for table_id in ids {
+                    if let Ok(Some(table)) = self.tap_read_table_state(&table_id).await {
+                        tables.push((table_id, table));
+                    }
+                }
+            }
+            tap.seed(tables);
+        }
         for table_id in tap.take_pending_verify() {
             self.tap_verify_table(tap, &table_id).await;
         }
