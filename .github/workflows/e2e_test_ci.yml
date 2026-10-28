@@ -2909,6 +2909,11 @@ jobs:
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      - name: Check documented SQL cases
+        run: |
+          python3 -m unittest discover -s test/spicescript/corpus -p test_sql_surface.py
+          python3 test/spicescript/corpus/sql_surface.py --check
+
       - name: Build spicescript
         uses: ./.github/actions/build-tool
         with:
@@ -2990,6 +2995,14 @@ jobs:
           unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
 
+      - name: Check harness rejects incorrect answers
+        if: ${{ matrix.partition == '1/4' }}
+        run: |
+          python3 test/spicescript/check_harness.py \
+            --runner "${{ steps.spicescript.outputs.path }}" \
+            --spiced "$(command -v spiced)" \
+            --work-dir "$RUNNER_TEMP/spicescript/harness-checks"
+
       - name: Run scenario scripts
         run: |
           "${{ steps.spicescript.outputs.path }}" --jobs 4 \
@@ -3008,6 +3021,8 @@ jobs:
             ${{ runner.temp }}/spicescript/**/spiced.log
             ${{ runner.temp }}/spicescript/**/spicepod.yaml
             ${{ runner.temp }}/spicescript/**/slt-*.txt
+            ${{ runner.temp }}/spicescript/**/random-queries-seed*.txt
+            ${{ runner.temp }}/spicescript/harness-checks/*.log
           retention-days: 7
 
   # Stable, matrix-proof summary check. It succeeds only if every E2E job above
