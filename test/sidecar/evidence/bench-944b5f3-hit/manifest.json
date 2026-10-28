@@ -1,0 +1,102 @@
+[
+  {
+    "path": "bench-cacheTrue-c32-0-server/testoperator.log.gz",
+    "uncompressed_sha256": "65c7509ed4587b1c8823c22767e2a1816c68c46cf32aab3d79c2567221022542",
+    "uncompressed_bytes": 507819
+  },
+  {
+    "path": "bench-cacheTrue-c32-0-server/resources.jsonl.gz",
+    "uncompressed_sha256": "ff17f88598158205b9ff142a78be5020b1a25baeb7300b8c9040a5f8cf370d5d",
+    "uncompressed_bytes": 45955
+  },
+  {
+    "path": "bench-cacheTrue-c32-0-server/upstream-metrics-after-warmup.txt.gz",
+    "uncompressed_sha256": "9b36905464e9f0879f4638bfd19b521ed99411a30ecf71a1ada91501250765af",
+    "uncompressed_bytes": 124539
+  },
+  {
+    "path": "bench-cacheTrue-c32-0-server/upstream-metrics-after.txt.gz",
+    "uncompressed_sha256": "e36e8264dcb36fce34b465161a46f7f4332681acdf6aec284b748a1e1a45bfd7",
+    "uncompressed_bytes": 124540
+  },
+  {
+    "path": "bench-cacheTrue-c32-0-server/metrics.txt.gz",
+    "uncompressed_sha256": "646c4d0e69135fb8d25bd02340d6da22b945199bf148a961046847d8d82fad8d",
+    "uncompressed_bytes": 197325
+  },
+  {
+    "path": "bench-cacheTrue-c32-1-sidecar/testoperator.log.gz",
+    "uncompressed_sha256": "fd8cd3c8e1907fa684d398ce9f0ead05186fdce5dec28d742f86eb4b61a2aa12",
+    "uncompressed_bytes": 527705
+  },
+  {
+    "path": "bench-cacheTrue-c32-1-sidecar/resources.jsonl.gz",
+    "uncompressed_sha256": "04ce39f8857f722a41289d1eee1b44b9449732f0db18ca454f92f46614b17b5b",
+    "uncompressed_bytes": 45928
+  },
+  {
+    "path": "bench-cacheTrue-c32-1-sidecar/upstream-metrics-after-warmup.txt.gz",
+    "uncompressed_sha256": "d8c471ef70aa8f25e1d1c19a0a5c52106d94dc8ec0452224d8b160ee78e382da",
+    "uncompressed_bytes": 117018
+  },
+  {
+    "path": "bench-cacheTrue-c32-1-sidecar/upstream-metrics-after.txt.gz",
+    "uncompressed_sha256": "d2ac0a15f0e428363efe35bd8baf94fb889d57f083e5450d988fc2204436d7be",
+    "uncompressed_bytes": 129396
+  },
+  {
+    "path": "bench-cacheTrue-c32-1-sidecar/metrics.txt.gz",
+    "uncompressed_sha256": "117b65a55062b8c6de23c6b456e4bda996eff1ccec2096a2bf6dfa3add6c08bc",
+    "uncompressed_bytes": 197330
+  },
+  {
+    "path": "bench-cacheTrue-c32-2-sidecar/testoperator.log.gz",
+    "uncompressed_sha256": "052a17dcbfb11e4f29859e92b88fd1ce47116fc063f1695b490ff9cb7d8bb07a",
+    "uncompressed_bytes": 528561
+  },
+  {
+    "path": "bench-cacheTrue-c32-2-sidecar/resources.jsonl.gz",
+    "uncompressed_sha256": "28ec84934c1a629dffcb667ef7a2aaba4453bafd8e6d2452c4888223ddb84a8b",
+    "uncompressed_bytes": 45817
+  },
+  {
+    "path": "bench-cacheTrue-c32-2-sidecar/upstream-metrics-after-warmup.txt.gz",
+    "uncompressed_sha256": "74071850f123e0e41124a5503918638815e058705cf937225997851429cf1a5d",
+    "uncompressed_bytes": 117180
+  },
+  {
+    "path": "bench-cacheTrue-c32-2-sidecar/upstream-metrics-after.txt.gz",
+    "uncompressed_sha256": "dd66652af128310ecc6279c77b2d73f956aa2a044c140b125ab352fe3dc6a845",
+    "uncompressed_bytes": 129608
+  },
+  {
+    "path": "bench-cacheTrue-c32-2-sidecar/metrics.txt.gz",
+    "uncompressed_sha256": "580773b25ca1a8e81512a823a11d4bbe1c06400aec08dfdcb30cb7faa321ccb4",
+    "uncompressed_bytes": 197416
+  },
+  {
+    "path": "bench-cacheTrue-c32-3-server/testoperator.log.gz",
+    "uncompressed_sha256": "35b1ba81ad1bf926a2745fd9a0d457a0066a2a173e59bce3eb16ba17c34a8522",
+    "uncompressed_bytes": 506525
+  },
+  {
+    "path": "bench-cacheTrue-c32-3-server/resources.jsonl.gz",
+    "uncompressed_sha256": "8bd6d7e28850d2b03dfc05edc7d2583b3e15557da07371351184cb5b88caf262",
+    "uncompressed_bytes": 45809
+  },
+  {
+    "path": "bench-cacheTrue-c32-3-server/upstream-metrics-after-warmup.txt.gz",
+    "uncompressed_sha256": "c659a4b6dab3c5273e4eee84714abdbb49954ddc52b1e0accda43ace345b7273",
+    "uncompressed_bytes": 124684
+  },
+  {
+    "path": "bench-cacheTrue-c32-3-server/upstream-metrics-after.txt.gz",
+    "uncompressed_sha256": "826d4b511b4a1d6dd211eb2125cae0cc14c0c77ac830a0a0d8caaec37f876bbf",
+    "uncompressed_bytes": 124685
+  },
+  {
+    "path": "bench-cacheTrue-c32-3-server/metrics.txt.gz",
+    "uncompressed_sha256": "b4c14b5fa27f686c54347a87c4fdcdaac4711227ab8ef01416aab4c9b3db0bdf",
+    "uncompressed_bytes": 197298
+  }
+]

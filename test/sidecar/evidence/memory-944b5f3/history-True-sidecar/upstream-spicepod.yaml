@@ -1,0 +1,36 @@
+{
+  "version": "v1",
+  "kind": "Spicepod",
+  "name": "upstream",
+  "runtime": {
+    "query": {
+      "target_partitions": 1,
+      "max_concurrent_queries": 16,
+      "memory_limit": "512MiB"
+    },
+    "caching": {
+      "sql_results": {
+        "enabled": false,
+        "item_ttl": "1h",
+        "max_size": "32MiB"
+      }
+    },
+    "task_history": {
+      "enabled": true
+    }
+  },
+  "datasets": [
+    {
+      "from": "file:/tmp/spice-sidecar-artifacts/memory-944b5f3/orders.csv",
+      "name": "remote_orders",
+      "params": {
+        "file_format": "csv"
+      },
+      "acceleration": {
+        "enabled": true,
+        "engine": "cayenne",
+        "mode": "memory"
+      }
+    }
+  ]
+}

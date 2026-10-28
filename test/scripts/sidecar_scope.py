@@ -164,13 +164,20 @@ class IdentityFlight(flight.FlightServerBase):
                 schema=schema,
             )
             ctx.register_record_batches(f"remote_{name}", [source.to_batches()])
-        plan = fields(fields(fields(ticket.ticket)[2])[1])[1]
+        command = fields(ticket.ticket)
+        trace_id = None
+        if command[1] == b"type.googleapis.com/spiceai.flight.TracedTicket":
+            trace_id = command[2][:32].decode("ascii")
+            assert len(trace_id) == 32 and int(trace_id, 16) != 0, trace_id
+            command = fields(command[2][32:])
+        plan = fields(fields(command[2])[1])[1]
         logical = Consumer.from_substrait_plan(ctx, Serde.deserialize_bytes(plan))
         frame = ctx.create_dataframe_from_logical_plan(logical)
         table = frame.to_arrow_table()
         self.observations.append(
             {
                 "identity": identity,
+                "trace_id": trace_id,
                 "plan_sha256": hashlib.sha256(plan).hexdigest(),
                 "rows": table.to_pylist(),
             }

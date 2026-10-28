@@ -489,13 +489,15 @@ impl ExecutionPlan for SubstraitExec {
         let deadline = context
             .session_config()
             .get_extension::<runtime_request_context::QueryDeadline>();
+        let mut propagated_trace_id = None;
         if let Some(request) = runtime_request_context::resolve_request_context(&context, false) {
+            propagated_trace_id = request.settled_trace_id().cloned();
             if let Some(parent) = request.trace_parent() {
                 client = client
                     .with_trace_header("traceparent", &parent.to_string())
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
             }
-            if let Some(trace_id) = request.settled_trace_id() {
+            if let Some(trace_id) = request.client_trace_id() {
                 client = client
                     .with_trace_header("spice-trace-id", trace_id)
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
@@ -508,7 +510,7 @@ impl ExecutionPlan for SubstraitExec {
         let datasets = self.datasets.clone();
         let stream = try_stream! {
             let timeout = deadline.as_ref().map(|deadline| deadline.0.saturating_duration_since(std::time::Instant::now()));
-            let mut stream = client.query_substrait(plan, timeout).await
+            let mut stream = client.query_substrait_with_trace_id(plan, timeout, propagated_trace_id.as_deref()).await
                 .map_err(|error| match error {
                     flight_client::Error::SubstraitUnsupported { source } => {
                         DataFusionError::Execution(format!(

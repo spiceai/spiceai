@@ -50,6 +50,7 @@ use tonic::transport::{Channel, Endpoint};
 pub mod arrow_flight_factory;
 pub mod cookie;
 pub mod tls;
+pub mod traced_ticket;
 
 pub const MAX_ENCODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 pub const MAX_DECODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
@@ -357,6 +358,25 @@ impl FlightClient {
         plan: Bytes,
         timeout: Option<Duration>,
     ) -> Result<FlightRecordBatchStream> {
+        self.query_substrait_with_trace_id(plan, timeout, None)
+            .await
+    }
+
+    /// Executes a plan carrying a runtime-generated trace id in its opaque ticket.
+    ///
+    /// The id joins the upstream trace without declaring a client override.
+    /// Explicit trace headers retain their normal precedence. `trace_id`, when
+    /// supplied, must be normalized to 32 hexadecimal characters, not all zero.
+    ///
+    /// # Errors
+    /// Returns the same authentication, plan and transport errors as
+    /// [`Self::query_substrait`].
+    pub async fn query_substrait_with_trace_id(
+        &self,
+        plan: Bytes,
+        timeout: Option<Duration>,
+        trace_id: Option<&str>,
+    ) -> Result<FlightRecordBatchStream> {
         let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
         let token = self.authenticate_basic_token().await?;
         let command = CommandStatementSubstraitPlan {
@@ -366,10 +386,14 @@ impl FlightClient {
             }),
             transaction_id: None,
         };
-        let mut request = arrow_flight::Ticket {
+        let ticket = arrow_flight::Ticket {
             ticket: command.as_any().encode_to_vec().into(),
-        }
-        .into_request();
+        };
+        let ticket = match trace_id {
+            Some(id) => traced_ticket::wrap(&ticket, id),
+            None => ticket,
+        };
+        let mut request = ticket.into_request();
         self.apply_request_metadata(&mut request, token.as_ref())?;
         if let Some(deadline) = deadline {
             request.set_timeout(deadline.saturating_duration_since(std::time::Instant::now()));

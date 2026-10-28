@@ -43,6 +43,9 @@ uv run --python 3.12 --with pyarrow==26.0.0 python test/scripts/sidecar_types.py
 python3 test/scripts/sidecar_schema.py \
   --spiced /path/to/spiced --source-commit COMMIT --out /tmp/sidecar-schema
 
+python3 test/scripts/sidecar_trace.py \
+  --spiced /path/to/spiced --source-commit COMMIT --out /tmp/sidecar-trace
+
 uv run --python 3.12 --with datafusion==55.0.0 --with pyarrow==26.0.0 \
   python test/scripts/substrait_cache.py \
   --spiced /path/to/spiced --source-commit COMMIT --out /tmp/sidecar-cache
@@ -296,7 +299,54 @@ remote network RTT.
 The Substrait arms also had higher upstream peak RSS, especially at concurrency
 two. Sidecar RSS stayed similar between protocols. These are whole-arm process
 peaks, not live query-pool reservations: the upstream query-pool gauge was zero
-at the final scrape. The cause of the RSS difference remains under investigation;
-it is not classified as a leak or dismissed as allocator behavior without a
-discriminating run. Cache-hit qualification and full workspace sign-off are
-still pending.
+at the final scrape. Follow-up identified trace reconciliation, as described
+below. These numbers precede that correction. Full workspace sign-off is still
+pending.
+
+The separate cache-hit command used the same binary and testoperator, with
+`--rows 100000 --concurrency 32 --duration 30 --cache-states hit` and output
+`/tmp/spice-sidecar-artifacts/bench-944b5f3-hit`. It exited 0; the
+[report and complete raw evidence](evidence/bench-944b5f3-hit) contain four of
+four arms with every measured query status `passed` and zero observer errors:
+
+| Protocol | Repetition | Queries/s | Per-query P99 ms |
+| --- | --- | ---: | --- |
+| SQL | 0 | 13083.6 | 3 for all five queries |
+| Substrait | 1 | 13643.3 | 3 for all five queries |
+| Substrait | 2 | 13691.4 | 3 for all five queries |
+| SQL | 3 | 13059.3 | 3 for all five queries |
+
+Upstream query RPC deltas were zero in every hit arm after warmup. Whole-arm
+sidecar peak RSS was 699.5–729.1 MiB, with task history enabled; upstream peak
+RSS was 138.7–140.1 MiB. HTTP health P99 was 3.30–3.42 ms during these arms.
+The higher cache-hit throughput does not measure delegation: both modes served
+their local cache without an uplink query.
+
+## Trace reconciliation follow-up
+
+The matched-count [memory probe](evidence/memory-944b5f3) used 20,000 requests,
+two clients and a 30-second idle period per protocol/history combination. It
+retains its exact source, command, every returned row, RSS trace, metrics, and
+macOS `vmmap`/`heap` captures. With history enabled, upstream peak RSS was
+156.3 MiB for SQL and 845.6 MiB for Substrait. With history disabled it was
+137.3 MiB and 133.8 MiB respectively. The enabled Substrait run recorded 2,446
+internal reads of `runtime.task_history` during load; SQL recorded none.
+
+The sidecar sent its runtime-generated ID as a `spice-trace-id` client pin.
+`TaskSpan::write` reconciles such overrides by scanning and rewriting rows under
+the original trace ID. Generated IDs instead belong in the existing opaque
+Flight ticket envelope, which joins the trace before execution. The correction
+shares that encoder with the Flight client, preserves explicit trace-header
+precedence and matching W3C parents, and skips identity rewrites when the SDK
+span already has the requested ID.
+
+The maintained `sidecar_trace.py` scenario reads generated HTTP response IDs,
+queries the upstream history and compares internal query counters. These dynamic
+cross-runtime values require the native driver; spicescript HTTP assertions do
+not bind response values for later SQL. On binary `944b5f3`, the same scenario
+recorded `10, 1, 1, 1` reconciliation reads for generated IDs, explicit pins,
+W3C parents and conflicting headers respectively, while every ID and parent
+remained correlated. All four cases failed the zero-reconciliation guard;
+the [actual failure and observations](evidence/trace-before-944b5f3) are retained.
+The corrected binary, repeated memory probe and new uplink measurements remain
+to be run.
