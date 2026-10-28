@@ -1,4 +1,4 @@
-name: debezium-direct-chaos
+name: debezium-offset-recovery
 description: >
   Debezium Server posting PostgreSQL changes straight to Spice (`from: cdc:`)
   loses and duplicates nothing through faults: spiced killed while changes
@@ -22,7 +22,7 @@ sources:
 spicepod:
   version: v1
   kind: Spicepod
-  name: debezium-direct-chaos
+  name: debezium-offset-recovery
   datasets:
     - from: cdc:acct
       name: acct

@@ -1182,6 +1182,12 @@ fn table_from(kind: &str, entry: &Map<String, Value>) -> (String, String, bool) 
     let field = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or_default();
     match kind {
         "postgres" => ("postgres:public.".into(), String::new(), false),
+        "kafka" | "dynamodb" => (
+            format!("{kind}:{}_", field("namespace")),
+            String::new(),
+            false,
+        ),
+        "mongodb" => ("mongodb:".into(), String::new(), false),
         "mysql" | "clickhouse" => (format!("{kind}:"), String::new(), false),
         "ducklake" => ("ducklake:main.".into(), String::new(), false),
         "iceberg" => (
@@ -1436,6 +1442,9 @@ mod table_from_tests {
             (format!("{prefix}t{suffix}"), files)
         };
         assert_eq!(named("postgres"), ("postgres:public.t".into(), false));
+        assert_eq!(named("kafka"), ("kafka:i0_x_t".into(), false));
+        assert_eq!(named("mongodb"), ("mongodb:t".into(), false));
+        assert_eq!(named("dynamodb"), ("dynamodb:i0_x_t".into(), false));
         assert_eq!(named("mysql"), ("mysql:t".into(), false));
         assert_eq!(named("clickhouse"), ("clickhouse:t".into(), false));
         assert_eq!(named("ducklake"), ("ducklake:main.t".into(), false));
