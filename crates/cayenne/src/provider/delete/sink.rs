@@ -105,10 +105,6 @@ const PK_DELETE_FLUSH_BATCH_SIZE: usize = 50_000;
 enum StagedPkDelete {
     Int64 {
         delete_files: Vec<DeleteFile>,
-        /// Tombstone snapshot captured when the delete began. Used only to count
-        /// how many keys are newly deleted (not already tombstoned) — it is never
-        /// re-published, so a concurrent update is never observed here.
-        initial: Arc<Int64PkDeletionSnapshot>,
         /// This delete's primary keys, de-duplicated across chunks. Published by
         /// merging (compare-and-swap) onto the live snapshot at commit.
         new_pks: HashSet<i64>,
@@ -117,7 +113,6 @@ enum StagedPkDelete {
     },
     RowKeys {
         delete_files: Vec<DeleteFile>,
-        initial: Arc<RowConverterDeletionSnapshot>,
         new_keys: HashSet<Box<[u8]>>,
         delete_sequence: Option<i64>,
     },
@@ -357,19 +352,13 @@ pub(crate) struct DeleteScanSource {
 impl StagedPkDelete {
     fn new(strategy: &PkDeletionStrategyWithCache, table_name: &str) -> super::super::Result<Self> {
         match strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                deletion_snapshot, ..
-            } => Ok(Self::Int64 {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => Ok(Self::Int64 {
                 delete_files: Vec::new(),
-                initial: deletion_snapshot.load_full(),
                 new_pks: HashSet::new(),
                 delete_sequence: None,
             }),
-            PkDeletionStrategyWithCache::RowConverterBased {
-                deletion_snapshot, ..
-            } => Ok(Self::RowKeys {
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => Ok(Self::RowKeys {
                 delete_files: Vec::new(),
-                initial: deletion_snapshot.load_full(),
                 new_keys: HashSet::new(),
                 delete_sequence: None,
             }),
@@ -445,39 +434,18 @@ impl StagedPkDelete {
         Ok(())
     }
 
-    /// Number of keys this delete newly tombstones — keys that were live when
-    /// the delete began. A key is live unless its newest delete is newer than
-    /// its newest re-insert: an upserted key carries a tombstone that its
-    /// re-insert outranks, and is live. Re-deletions of keys already deleted
-    /// are not counted.
+    /// Number of keys this delete newly tombstones: the distinct keys of the
+    /// rows it matched. Every key was already judged live in the source it was
+    /// read from, against that source's own cutoff (see
+    /// [`CayenneDeletionSink::is_live_int64_pk`]), so a key deleted before this
+    /// delete began, or a superseded version, never reaches this set. Judging
+    /// the keys again against the whole-table index cannot be right for every
+    /// source: a datalake file's rows are live by its sequence cutoff, and a
+    /// composite-key upsert's tombstone carries no re-insert record.
     fn new_count(&self) -> usize {
         match self {
-            Self::Int64 {
-                initial, new_pks, ..
-            } => new_pks
-                .iter()
-                .filter(|pk| {
-                    is_pk_visible_i64(
-                        **pk,
-                        &initial.tombstones,
-                        InsertRecordHandling::Apply,
-                        None,
-                    )
-                })
-                .count(),
-            Self::RowKeys {
-                initial, new_keys, ..
-            } => new_keys
-                .iter()
-                .filter(|key| {
-                    is_pk_visible_row_key(
-                        key.as_ref(),
-                        &initial.tombstones,
-                        InsertRecordHandling::Apply,
-                        None,
-                    )
-                })
-                .count(),
+            Self::Int64 { new_pks, .. } => new_pks.len(),
+            Self::RowKeys { new_keys, .. } => new_keys.len(),
         }
     }
 }
