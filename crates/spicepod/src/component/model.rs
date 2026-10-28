@@ -334,12 +334,11 @@ impl Model {
     pub fn gguf_selectors(&self) -> Vec<String> {
         self.files
             .iter()
-            .cloned()
             .filter(|f| {
                 matches!(f.file_type(), Some(ModelFileType::Weights) | None)
                     && !is_other_weights_format(&f.path)
             })
-            .map(|f| f.path)
+            .map(|f| f.path.clone())
             .collect()
     }
 
