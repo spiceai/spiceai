@@ -95,7 +95,7 @@ steps:
         DEBEZIUM_FORMAT_KEY_SCHEMAS_ENABLE=false
         QUARKUS_HTTP_PORT=${instance.port}
         QUARKUS_LOG_FILE_ENABLE=false
-        nohup /debezium/run.sh >> /tmp/${sources.src.namespace}/debezium.log 2>&1 < /dev/null &
+        nohup /debezium/run.sh > /proc/1/fd/1 2>&1 < /dev/null &
         echo $! > /tmp/${sources.src.namespace}/pid
     when: { src: postgres }
   - query: &rows SELECT _id, n, v, s FROM t
@@ -128,7 +128,15 @@ steps:
         - "DELETE FROM t WHERE n >= 380"
     when: *changes
   - start: {}
-  - source-exec: { dbz: &kill-debezium 'kill -9 $(cat /tmp/${sources.src.namespace}/pid)' }
+  # Debezium Server exits on its own when its database goes away for long
+  # enough, so the process may already be gone; either way it must be gone
+  # before the next one starts on its HTTP port and replication slot.
+  - source-exec:
+      dbz: &kill-debezium >-
+        pid=$(cat /tmp/${sources.src.namespace}/pid);
+        kill -9 "$pid" 2>/dev/null;
+        for _ in $(seq 100); do kill -0 "$pid" 2>/dev/null || exit 0; sleep 0.1; done;
+        echo "Debezium (pid $pid) still running 10s after kill -9" >&2; exit 1
     when: { src: postgres }
   - source-exec: { dbz: *debezium }
     when: { src: postgres }
