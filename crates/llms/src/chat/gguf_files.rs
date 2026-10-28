@@ -355,9 +355,14 @@ pub fn resolve(
             }
         } else {
             let name = entry.trim_end_matches('/');
-            let named = quantizations
-                .iter()
-                .find(|q| q.name.eq_ignore_ascii_case(name));
+            // `name/` is a folder, never a quantization's name.
+            let named = (!entry.ends_with('/'))
+                .then(|| {
+                    quantizations
+                        .iter()
+                        .find(|q| q.name.eq_ignore_ascii_case(name))
+                })
+                .flatten();
             let in_folder: Vec<&Quantization> = quantizations
                 .iter()
                 .filter(|q| q.files.iter().all(|f| folder(f).eq_ignore_ascii_case(name)))
@@ -927,6 +932,31 @@ mod tests {
         assert_eq!(
             pin(&files, &by_path),
             ["Model-Q4_K_M.gguf", "MTP/mtp-Model-Q8_0.gguf"]
+        );
+    }
+
+    /// A folder named like a quantization, holding two others: Copilot's case on #15590.
+    #[test]
+    fn a_trailing_slash_names_only_a_folder() {
+        let files = listing(&[
+            ("Model-Q4_K_M.gguf", 4 * GB),
+            ("Q4_K_M/A-Q8_0.gguf", 8 * GB),
+            ("Q4_K_M/B-Q5_K_M.gguf", 5 * GB),
+        ]);
+        assert_eq!(
+            resolve(&files, &["Q4_K_M/"]),
+            Err(ResolveError::AmbiguousQuantization {
+                name: "Q4_K_M".to_string(),
+                quantizations: vec!["Q8_0".to_string(), "Q5_K_M".to_string()],
+            })
+        );
+        // without the slash the name is the quantization's
+        assert_eq!(
+            resolve(&files, &["Q4_K_M"])
+                .expect("resolves")
+                .expect("names files")
+                .weights,
+            ["Model-Q4_K_M.gguf"]
         );
     }
 

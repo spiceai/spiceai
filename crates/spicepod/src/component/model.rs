@@ -328,10 +328,13 @@ impl Model {
     /// The `files` entries a GGUF repository resolves: `.gguf` files, and names of a
     /// quantization or its folder (`Q4_K_M`, `UD-Q2_K_XL/`, `model.v1`), typed `weights` or
     /// untyped. Weights of another format and the model's other files are not among them.
+    /// Read from `files` as written: they name files of the repository, not of this machine, so
+    /// a local directory of the same name expands nothing.
     #[must_use]
     pub fn gguf_selectors(&self) -> Vec<String> {
-        self.get_all_files()
-            .into_iter()
+        self.files
+            .iter()
+            .cloned()
             .filter(|f| {
                 matches!(f.file_type(), Some(ModelFileType::Weights) | None)
                     && !is_other_weights_format(&f.path)
@@ -611,6 +614,19 @@ mod tests {
                 "Model-Q4_0.gguf"
             ]
         );
+    }
+
+    /// `src` is a directory of this crate, where its tests run: a selector of the same name names
+    /// the repository's quantization or folder, not the local directory's files.
+    #[test]
+    fn a_selector_is_not_expanded_against_a_local_directory() {
+        assert!(
+            Path::new("src").is_dir(),
+            "the tests run in the crate's directory"
+        );
+        let mut model = Model::new("huggingface:huggingface.co/unsloth/Qwen3-0.6B-GGUF", "qwen");
+        model.files = vec![file("src", Some(ModelFileType::Weights))];
+        assert_eq!(model.gguf_selectors(), ["src"]);
     }
 
     #[test]
