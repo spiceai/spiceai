@@ -1,0 +1,7 @@
+{
+  "source_commit": "f4f0d5dc7885fc4bc5d20dcc130ab3456a881682",
+  "rust_tree_identical_at_end_commit": "34cda8c889",
+  "date": "2026-10-28",
+  "command": "env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ CARGO_TARGET_DIR=/Users/Code/dev/spiceai/target cargo nextest run --cargo-profile release -p spiced -p runtime -p flight_client --no-default-features --features release --test integration --test cookie_middleware -E 'test(/^flight::(sidecar|statement_substrait_plan|trace_id)::/) | test(/^http::trace_id::/) | binary(cookie_middleware)' --no-capture",
+  "result": "15 tests run: 15 passed, 547 skipped; execution 3.098s, build 16m43s"
+}
