@@ -283,6 +283,31 @@ async fn only_an_architecture_llama_cpp_splits_is_split_by_it() {
     );
 }
 
+/// A rank other than 0 of a model given as a directory only the head holds names no GGUF file,
+/// so no engine serves it by its file names; it holds a share over the engine that splits
+/// models across nodes, as it cannot join the ring without the weights. A node that holds the
+/// weights is matched by their files as before.
+#[tokio::test]
+async fn a_rank_without_the_model_directory_holds_a_share_over_llama_cpp() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let absent = [dir.path().join("qwen3-model-directory")];
+    assert!(
+        llms::chat::engine::engine_for(&absent).is_none(),
+        "a directory path names no GGUF file"
+    );
+    let engine = llms::chat::engine::engine_without_weights(&absent)
+        .await
+        .expect("an engine splits models across nodes");
+    assert_eq!(engine.name, "llama.cpp");
+    let present = [header_only(dir.path(), "model.bin", "qwen3")];
+    assert!(
+        llms::chat::engine::engine_without_weights(&present)
+            .await
+            .is_none(),
+        "a node that holds the weights is matched by their files"
+    );
+}
+
 /// A rank other than 0 of a Hugging Face model reads the first shard's architecture from the
 /// Hub with a range read, so it decides as the head does without downloading the weights.
 #[tokio::test]

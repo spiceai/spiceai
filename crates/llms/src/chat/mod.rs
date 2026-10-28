@@ -503,7 +503,14 @@ pub async fn create_local_model(
     // A model goes to a registered engine that serves its weights; a distributed one only when
     // that engine splits models of its architecture, and to mistral.rs's ring otherwise.
     let weights = model_weights.iter().map(PathBuf::from).collect::<Vec<_>>();
-    if let Some(engine) = engine::engine_for(&weights)
+    let engine = match engine::engine_for(&weights) {
+        Some(engine) => Some(engine),
+        None if distributed.as_ref().is_some_and(|cfg| cfg.node_rank > 0) => {
+            engine::engine_without_weights(&weights).await
+        }
+        None => None,
+    };
+    if let Some(engine) = engine
         && (distributed.is_none() || engine.splits_weights(&weights).await)
     {
         if distributed.is_some() {
