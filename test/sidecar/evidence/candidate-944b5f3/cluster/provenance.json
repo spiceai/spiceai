@@ -1,0 +1,37 @@
+{
+  "date": "2026-10-28T07:52:54Z",
+  "commit": "944b5f351ef64c8713bfefd9d9cb8ce4cc134606",
+  "harness_commit": "84adbc129690e655781149c1caac33b4cffd626f",
+  "harness_sha256": "7519c39de38c39cad3eb124e20f108e6ccdb85a95183783a3df787bfdf92c922",
+  "common_harness_sha256": "7519c39de38c39cad3eb124e20f108e6ccdb85a95183783a3df787bfdf92c922",
+  "binary_sha256": "823f19ba1718df146e8ec7e67627c0c48a65cca0c3e4b6fc6cb68d9ae71cbed9",
+  "legacy_binary_sha256": null,
+  "testoperator_sha256": null,
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "machine": "arm64",
+  "host_logical_cpus": 14,
+  "cpu_model": "Apple M4 Pro",
+  "host_memory_bytes": 68719476736,
+  "load_average_at_start": [
+    1.76416015625,
+    1.9658203125,
+    3.59130859375
+  ],
+  "cpu_entitlement_per_instance": 2,
+  "topology": "scheduler+2executors",
+  "upstream_storage": "csv-federation",
+  "arguments": {
+    "spiced": "/private/tmp/spice-sidecar-artifacts/candidate-944b5f3/spiced",
+    "out": "/private/tmp/spice-sidecar-artifacts/cluster-944b5f3-3",
+    "source_commit": "944b5f351ef64c8713bfefd9d9cb8ce4cc134606",
+    "testoperator": "None",
+    "legacy_spiced": "None",
+    "legacy_source_commit": "None",
+    "modes": "['server', 'sidecar']",
+    "rows": "1000",
+    "duration": "30",
+    "concurrency": "[2, 8, 32, 128]",
+    "cache_states": "['miss']",
+    "executors": "2"
+  }
+}

@@ -1,0 +1,42 @@
+local: rows exact typed rows
+local: int64-upper-boundary exact typed rows
+local: int64-lower-boundary exact typed rows
+local: decimal exact typed rows
+local: list exact typed rows
+local: struct exact typed rows
+local: map exact typed rows
+local: timestamp exact typed rows
+local: binary exact typed rows
+local: view exact typed rows
+local: empty-decimal exact typed rows
+local: 320 typed comparisons with 32 client threads; 0 mismatches
+local: cast-error returned an error
+local: divide-error returned an error
+server: rows exact typed rows
+server: int64-upper-boundary exact typed rows
+server: int64-lower-boundary exact typed rows
+server: decimal exact typed rows
+server: list exact typed rows
+server: struct expected SQL federation limitation
+server: map expected SQL federation limitation
+server: timestamp exact typed rows
+server: binary expected SQL federation limitation
+server: view exact typed rows
+server: empty-decimal exact typed rows
+server: 320 typed comparisons with 32 client threads; 0 mismatches
+server: cast-error returned an error
+server: divide-error returned an error
+sidecar: rows exact typed rows
+sidecar: int64-upper-boundary exact typed rows
+sidecar: int64-lower-boundary exact typed rows
+sidecar: decimal exact typed rows
+sidecar: list exact typed rows
+sidecar: struct exact typed rows
+sidecar: map exact typed rows
+sidecar: timestamp exact typed rows
+sidecar: binary exact typed rows
+sidecar: view exact typed rows
+sidecar: empty-decimal exact typed rows
+sidecar: 320 typed comparisons with 32 client threads; 0 mismatches
+sidecar: cast-error returned an error
+sidecar: divide-error returned an error

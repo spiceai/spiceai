@@ -1,0 +1,10 @@
+[
+  {
+    "plan_type": "logical_plan",
+    "plan": "Federated\n Projection: n\n  Sort: orders.id ASC NULLS LAST\n    Projection: orders.id + CAST(Int64(1) AS Int64) AS n, orders.id\n      Filter: orders.id < Int64(5)\n        TableScan: orders projection=[id]"
+  },
+  {
+    "plan_type": "physical_plan",
+    "plan": "CooperativeExec\n  BytesProcessedExec\n    SubstraitExec: plan_bytes=320\n"
+  }
+]

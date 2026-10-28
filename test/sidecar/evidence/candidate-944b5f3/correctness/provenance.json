@@ -1,0 +1,37 @@
+{
+  "date": "2026-10-28T07:40:34Z",
+  "commit": "944b5f351ef64c8713bfefd9d9cb8ce4cc134606",
+  "harness_commit": "84adbc129690e655781149c1caac33b4cffd626f",
+  "harness_sha256": "8d427ebe7d5fb2ab1756a6bcd39777721fbc44c4f20322e35bd4b5af2166cb9c",
+  "common_harness_sha256": "8d427ebe7d5fb2ab1756a6bcd39777721fbc44c4f20322e35bd4b5af2166cb9c",
+  "binary_sha256": "823f19ba1718df146e8ec7e67627c0c48a65cca0c3e4b6fc6cb68d9ae71cbed9",
+  "legacy_binary_sha256": "ac19b2368b011f2bd2a6916493768134ce4e0aa3c6261e1d7892c5978f2babdb",
+  "testoperator_sha256": null,
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "machine": "arm64",
+  "host_logical_cpus": 14,
+  "cpu_model": "Apple M4 Pro",
+  "host_memory_bytes": 68719476736,
+  "load_average_at_start": [
+    1.5576171875,
+    4.39697265625,
+    6.25341796875
+  ],
+  "cpu_entitlement_per_instance": 2,
+  "topology": "standalone",
+  "upstream_storage": "cayenne-memory",
+  "arguments": {
+    "spiced": "/private/tmp/spice-sidecar-artifacts/candidate-944b5f3/spiced",
+    "out": "/private/tmp/spice-sidecar-artifacts/correctness-944b5f3",
+    "source_commit": "944b5f351ef64c8713bfefd9d9cb8ce4cc134606",
+    "testoperator": "None",
+    "legacy_spiced": "/tmp/spice-sidecar-artifacts/baseline/spiced",
+    "legacy_source_commit": "34825bb456d62d616f693187b0baf0fa1e8cfb14",
+    "modes": "['server', 'sidecar']",
+    "rows": "1000",
+    "duration": "30",
+    "concurrency": "[2, 8, 32, 128]",
+    "cache_states": "['miss']",
+    "executors": "0"
+  }
+}

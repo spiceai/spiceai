@@ -1,0 +1,3 @@
+same-type column reorder: exact SQLite rows with cached sidecar schema
+incompatible type replacement: HTTP 400, no coerced rows
+schema recovery: exact rows without restarting sidecar

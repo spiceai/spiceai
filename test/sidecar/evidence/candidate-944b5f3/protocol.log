@@ -1,0 +1,156 @@
+    Starting 6 tests across 2 binaries (552 tests skipped)
+       START [         ] (1/6) runtime::integration flight::sidecar::sidecar_substrait_connector_roundtrip
+
+running 1 test
+test flight::sidecar::sidecar_substrait_connector_roundtrip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 512 filtered out; finished in 0.29s
+
+        PASS [   0.319s] (1/6) runtime::integration flight::sidecar::sidecar_substrait_connector_roundtrip
+       START [         ] (2/6) runtime::integration flight::statement_substrait_plan::substrait_results_cache_requires_plan_keys
+
+running 1 test
+test flight::statement_substrait_plan::substrait_results_cache_requires_plan_keys ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 512 filtered out; finished in 0.23s
+
+        PASS [   0.260s] (2/6) runtime::integration flight::statement_substrait_plan::substrait_results_cache_requires_plan_keys
+       START [         ] (3/6) runtime::integration flight::statement_substrait_plan::test_substrait_plan_invalid_bytes_rejected
+
+running 1 test
+[2m2026-10-28T07:19:03.982104Z[0m [34mDEBUG[0m [2mintegration::flight[0m[2m:[0m Ports: http: 54683, flight: 54684, metrics: 54685
+[2m2026-10-28T07:19:03.982129Z[0m [34mDEBUG[0m [2mintegration::utils[0m[2m:[0m Starting connector registration for tests
+[2m2026-10-28T07:19:03.982198Z[0m [34mDEBUG[0m [2mintegration::utils[0m[2m:[0m Completed connector registration for tests
+[2m2026-10-28T07:19:03.982428Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized sql results cache; max size: 128.00 MiB, item ttl: 1s, hashing algorithm: XXH3, encoding: none
+[2m2026-10-28T07:19:03.982491Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized search results cache; max size: 128.00 MiB, item ttl: 1s, shards: 16
+[2m2026-10-28T07:19:03.982500Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized embeddings cache; max size: 128.00 MiB, item ttl: 1s, shards: 16
+[2m2026-10-28T07:19:03.982676Z[0m [32m INFO[0m [2mruntime::datafusion::builder[0m[2m:[0m runtime.query.max_concurrent_queries not set; sized from the CPU budget [3mmax_concurrent_queries[0m[2m=[0m12
+[2m2026-10-28T07:19:03.982710Z[0m [32m INFO[0m [2mruntime::datafusion::builder[0m[2m:[0m runtime.query.target_partitions not set; sized from the CPU budget [3mtarget_partitions[0m[2m=[0m3
+[2m2026-10-28T07:19:03.982714Z[0m [32m INFO[0m [2mruntime::datafusion::builder[0m[2m:[0m runtime.query.eager_aggregation not set; defaulting to spiced default [3meager_aggregation[0m[2m=[0mtrue
+[2m2026-10-28T07:19:03.983532Z[0m [32m INFO[0m [2mruntime::init::task_history[0m[2m:[0m Task history enabled: retention_period=28800s, retention_check_interval=900s
+[2m2026-10-28T07:19:03.983750Z[0m [32m INFO[0m [2mhash_index::index[0m[2m:[0m Building hash index [3mrows[0m[2m=[0m0 [3mpartitions[0m[2m=[0m0 [3mbatches[0m[2m=[0m0 [3mkey_columns[0m[2m=[0mspan_id
+[2m2026-10-28T07:19:03.983770Z[0m [32m INFO[0m [2mhash_index::index[0m[2m:[0m Hash index build complete [3mentries[0m[2m=[0m0 [3melapsed_ms[0m[2m=[0m0 [3mrows_per_sec[0m[2m=[0m0 [3mmemory_bytes[0m[2m=[0m65560 [3mmemory_mb[0m[2m=[0m"0.06" [3mbloom_filter[0m[2m=[0mtrue
+[2m2026-10-28T07:19:03.984237Z[0m [32m INFO[0m [2mintegration::flight[0m[2m:[0m Waiting for servers to start...
+[2m2026-10-28T07:19:04.199089Z[0m [32m INFO[0m [2mruntime::flight[0m[2m:[0m Spice Runtime Flight listening on 127.0.0.1:54684
+[2m2026-10-28T07:19:04.199369Z[0m [32m INFO[0m [2mruntime::http[0m[2m:[0m Spice Runtime HTTP listening on 127.0.0.1:54683
+[2m2026-10-28T07:19:04.199382Z[0m [32m INFO[0m [2mruntime::metrics_server[0m[2m:[0m Spice Runtime Metrics listening on 127.0.0.1:54685
+[2m2026-10-28T07:19:04.200391Z[0m [32m INFO[0m [2mruntime[0m[2m:[0m No datasets or catalogs were configured. If this is unexpected, check the Spicepod configuration.
+[2m2026-10-28T07:19:04.200400Z[0m [32m INFO[0m [2mruntime[0m[2m:[0m All components are loaded. Spice runtime is ready!
+[2m2026-10-28T07:19:04.201150Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mruntime.task_history[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3msql[0m[2m=[0mSELECT task_history.trace_id, task_history.span_id, task_history.parent_span_id, task_history."task", task_history."input", task_history.captured_output, task_history.start_time, task_history.end_time, task_history.execution_duration_ms, task_history.error_message, task_history.labels FROM runtime.task_history
+[2m2026-10-28T07:19:04.201718Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mpublic.my_table[1m}[0m[2m:[0m [2mruntime_table::accelerated::refresh_task[0m[2m:[0m Loading data for dataset public.my_table
+[2m2026-10-28T07:19:04.201890Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mpublic.my_table[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3msql[0m[2m=[0mSELECT my_table.a, my_table.b FROM "public".my_table
+[2m2026-10-28T07:19:04.202033Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mpublic.my_table[1m}[0m[2m:[0m [2mruntime_table::accelerated::refresh_task[0m[2m:[0m Loaded 0 rows for dataset public.my_table in 0s.
+[2m2026-10-28T07:19:04.202925Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mruntime.metrics[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3msql[0m[2m=[0mSELECT "metrics".time_unix_nano, "metrics".start_time_unix_nano, "metrics"."resource", "metrics"."scope", "metrics".schema_url, "metrics".metric_type, "metrics"."name", "metrics".description, "metrics".unit, "metrics".aggregation_temporality, "metrics".is_monotonic, "metrics".flags, "metrics".attributes, "metrics".series_id, "metrics".data_number, "metrics".data_histogram FROM runtime."metrics"
+test flight::statement_substrait_plan::test_substrait_plan_invalid_bytes_rejected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 512 filtered out; finished in 0.22s
+
+        PASS [   0.252s] (3/6) runtime::integration flight::statement_substrait_plan::test_substrait_plan_invalid_bytes_rejected
+       START [         ] (4/6) runtime::integration flight::statement_substrait_plan::test_substrait_plan_missing_plan_rejected
+
+running 1 test
+[2m2026-10-28T07:19:04.234681Z[0m [34mDEBUG[0m [2mintegration::flight[0m[2m:[0m Ports: http: 53351, flight: 53352, metrics: 53353
+[2m2026-10-28T07:19:04.234702Z[0m [34mDEBUG[0m [2mintegration::utils[0m[2m:[0m Starting connector registration for tests
+[2m2026-10-28T07:19:04.234762Z[0m [34mDEBUG[0m [2mintegration::utils[0m[2m:[0m Completed connector registration for tests
+[2m2026-10-28T07:19:04.234982Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized sql results cache; max size: 128.00 MiB, item ttl: 1s, hashing algorithm: XXH3, encoding: none
+[2m2026-10-28T07:19:04.235012Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized search results cache; max size: 128.00 MiB, item ttl: 1s, shards: 16
+[2m2026-10-28T07:19:04.235020Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized embeddings cache; max size: 128.00 MiB, item ttl: 1s, shards: 16
+[2m2026-10-28T07:19:04.235194Z[0m [32m INFO[0m [2mruntime::datafusion::builder[0m[2m:[0m runtime.query.max_concurrent_queries not set; sized from the CPU budget [3mmax_concurrent_queries[0m[2m=[0m12
+[2m2026-10-28T07:19:04.235228Z[0m [32m INFO[0m [2mruntime::datafusion::builder[0m[2m:[0m runtime.query.target_partitions not set; sized from the CPU budget [3mtarget_partitions[0m[2m=[0m3
+[2m2026-10-28T07:19:04.235232Z[0m [32m INFO[0m [2mruntime::datafusion::builder[0m[2m:[0m runtime.query.eager_aggregation not set; defaulting to spiced default [3meager_aggregation[0m[2m=[0mtrue
+[2m2026-10-28T07:19:04.236042Z[0m [32m INFO[0m [2mruntime::init::task_history[0m[2m:[0m Task history enabled: retention_period=28800s, retention_check_interval=900s
+[2m2026-10-28T07:19:04.236257Z[0m [32m INFO[0m [2mhash_index::index[0m[2m:[0m Building hash index [3mrows[0m[2m=[0m0 [3mpartitions[0m[2m=[0m0 [3mbatches[0m[2m=[0m0 [3mkey_columns[0m[2m=[0mspan_id
+[2m2026-10-28T07:19:04.236275Z[0m [32m INFO[0m [2mhash_index::index[0m[2m:[0m Hash index build complete [3mentries[0m[2m=[0m0 [3melapsed_ms[0m[2m=[0m0 [3mrows_per_sec[0m[2m=[0m0 [3mmemory_bytes[0m[2m=[0m65560 [3mmemory_mb[0m[2m=[0m"0.06" [3mbloom_filter[0m[2m=[0mtrue
+[2m2026-10-28T07:19:04.236731Z[0m [32m INFO[0m [2mintegration::flight[0m[2m:[0m Waiting for servers to start...
+[2m2026-10-28T07:19:04.451859Z[0m [32m INFO[0m [2mruntime::flight[0m[2m:[0m Spice Runtime Flight listening on 127.0.0.1:53352
+[2m2026-10-28T07:19:04.452185Z[0m [32m INFO[0m [2mruntime::http[0m[2m:[0m Spice Runtime HTTP listening on 127.0.0.1:53351
+[2m2026-10-28T07:19:04.452202Z[0m [32m INFO[0m [2mruntime::metrics_server[0m[2m:[0m Spice Runtime Metrics listening on 127.0.0.1:53353
+[2m2026-10-28T07:19:04.453395Z[0m [32m INFO[0m [2mruntime[0m[2m:[0m No datasets or catalogs were configured. If this is unexpected, check the Spicepod configuration.
+[2m2026-10-28T07:19:04.453402Z[0m [32m INFO[0m [2mruntime[0m[2m:[0m All components are loaded. Spice runtime is ready!
+[2m2026-10-28T07:19:04.454212Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mruntime.task_history[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3msql[0m[2m=[0mSELECT task_history.trace_id, task_history.span_id, task_history.parent_span_id, task_history."task", task_history."input", task_history.captured_output, task_history.start_time, task_history.end_time, task_history.execution_duration_ms, task_history.error_message, task_history.labels FROM runtime.task_history
+[2m2026-10-28T07:19:04.454772Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mpublic.my_table[1m}[0m[2m:[0m [2mruntime_table::accelerated::refresh_task[0m[2m:[0m Loading data for dataset public.my_table
+[2m2026-10-28T07:19:04.454954Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mpublic.my_table[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3msql[0m[2m=[0mSELECT my_table.a, my_table.b FROM "public".my_table
+[2m2026-10-28T07:19:04.455108Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mpublic.my_table[1m}[0m[2m:[0m [2mruntime_table::accelerated::refresh_task[0m[2m:[0m Loaded 0 rows for dataset public.my_table in 0s.
+[2m2026-10-28T07:19:04.456083Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mruntime.metrics[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3msql[0m[2m=[0mSELECT "metrics".time_unix_nano, "metrics".start_time_unix_nano, "metrics"."resource", "metrics"."scope", "metrics".schema_url, "metrics".metric_type, "metrics"."name", "metrics".description, "metrics".unit, "metrics".aggregation_temporality, "metrics".is_monotonic, "metrics".flags, "metrics".attributes, "metrics".series_id, "metrics".data_number, "metrics".data_histogram FROM runtime."metrics"
+test flight::statement_substrait_plan::test_substrait_plan_missing_plan_rejected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 512 filtered out; finished in 0.23s
+
+        PASS [   0.253s] (4/6) runtime::integration flight::statement_substrait_plan::test_substrait_plan_missing_plan_rejected
+       START [         ] (5/6) runtime::integration flight::statement_substrait_plan::test_substrait_plan_repeated_execution_is_stable
+
+running 1 test
+[2m2026-10-28T07:19:04.487744Z[0m [34mDEBUG[0m [2mintegration::flight[0m[2m:[0m Ports: http: 51908, flight: 51909, metrics: 51910
+[2m2026-10-28T07:19:04.487766Z[0m [34mDEBUG[0m [2mintegration::utils[0m[2m:[0m Starting connector registration for tests
+[2m2026-10-28T07:19:04.487826Z[0m [34mDEBUG[0m [2mintegration::utils[0m[2m:[0m Completed connector registration for tests
+[2m2026-10-28T07:19:04.488049Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized sql results cache; max size: 128.00 MiB, item ttl: 1s, hashing algorithm: XXH3, encoding: none
+[2m2026-10-28T07:19:04.488079Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized search results cache; max size: 128.00 MiB, item ttl: 1s, shards: 16
+[2m2026-10-28T07:19:04.488088Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized embeddings cache; max size: 128.00 MiB, item ttl: 1s, shards: 16
+[2m2026-10-28T07:19:04.488263Z[0m [32m INFO[0m [2mruntime::datafusion::builder[0m[2m:[0m runtime.query.max_concurrent_queries not set; sized from the CPU budget [3mmax_concurrent_queries[0m[2m=[0m12
+[2m2026-10-28T07:19:04.488298Z[0m [32m INFO[0m [2mruntime::datafusion::builder[0m[2m:[0m runtime.query.target_partitions not set; sized from the CPU budget [3mtarget_partitions[0m[2m=[0m3
+[2m2026-10-28T07:19:04.488302Z[0m [32m INFO[0m [2mruntime::datafusion::builder[0m[2m:[0m runtime.query.eager_aggregation not set; defaulting to spiced default [3meager_aggregation[0m[2m=[0mtrue
+[2m2026-10-28T07:19:04.489101Z[0m [32m INFO[0m [2mruntime::init::task_history[0m[2m:[0m Task history enabled: retention_period=28800s, retention_check_interval=900s
+[2m2026-10-28T07:19:04.489306Z[0m [32m INFO[0m [2mhash_index::index[0m[2m:[0m Building hash index [3mrows[0m[2m=[0m0 [3mpartitions[0m[2m=[0m0 [3mbatches[0m[2m=[0m0 [3mkey_columns[0m[2m=[0mspan_id
+[2m2026-10-28T07:19:04.489339Z[0m [32m INFO[0m [2mhash_index::index[0m[2m:[0m Hash index build complete [3mentries[0m[2m=[0m0 [3melapsed_ms[0m[2m=[0m0 [3mrows_per_sec[0m[2m=[0m0 [3mmemory_bytes[0m[2m=[0m65560 [3mmemory_mb[0m[2m=[0m"0.06" [3mbloom_filter[0m[2m=[0mtrue
+[2m2026-10-28T07:19:04.489803Z[0m [32m INFO[0m [2mintegration::flight[0m[2m:[0m Waiting for servers to start...
+[2m2026-10-28T07:19:04.704656Z[0m [32m INFO[0m [2mruntime::flight[0m[2m:[0m Spice Runtime Flight listening on 127.0.0.1:51909
+[2m2026-10-28T07:19:04.704949Z[0m [32m INFO[0m [2mruntime::http[0m[2m:[0m Spice Runtime HTTP listening on 127.0.0.1:51908
+[2m2026-10-28T07:19:04.704965Z[0m [32m INFO[0m [2mruntime::metrics_server[0m[2m:[0m Spice Runtime Metrics listening on 127.0.0.1:51910
+[2m2026-10-28T07:19:04.705996Z[0m [32m INFO[0m [2mruntime[0m[2m:[0m No datasets or catalogs were configured. If this is unexpected, check the Spicepod configuration.
+[2m2026-10-28T07:19:04.706002Z[0m [32m INFO[0m [2mruntime[0m[2m:[0m All components are loaded. Spice runtime is ready!
+[2m2026-10-28T07:19:04.706722Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mruntime.task_history[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3msql[0m[2m=[0mSELECT task_history.trace_id, task_history.span_id, task_history.parent_span_id, task_history."task", task_history."input", task_history.captured_output, task_history.start_time, task_history.end_time, task_history.execution_duration_ms, task_history.error_message, task_history.labels FROM runtime.task_history
+[2m2026-10-28T07:19:04.707186Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mpublic.my_table[1m}[0m[2m:[0m [2mruntime_table::accelerated::refresh_task[0m[2m:[0m Loading data for dataset public.my_table
+[2m2026-10-28T07:19:04.707358Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mpublic.my_table[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3msql[0m[2m=[0mSELECT my_table.a, my_table.b FROM "public".my_table
+[2m2026-10-28T07:19:04.707504Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mpublic.my_table[1m}[0m[2m:[0m [2mruntime_table::accelerated::refresh_task[0m[2m:[0m Loaded 0 rows for dataset public.my_table in 0s.
+[2m2026-10-28T07:19:04.708412Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mruntime.metrics[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3msql[0m[2m=[0mSELECT "metrics".time_unix_nano, "metrics".start_time_unix_nano, "metrics"."resource", "metrics"."scope", "metrics".schema_url, "metrics".metric_type, "metrics"."name", "metrics".description, "metrics".unit, "metrics".aggregation_temporality, "metrics".is_monotonic, "metrics".flags, "metrics".attributes, "metrics".series_id, "metrics".data_number, "metrics".data_histogram FROM runtime."metrics"
+[2m2026-10-28T07:19:04.711041Z[0m [32m INFO[0m [1msql_query[0m[1m{[0m[3minput[0m[2m=[0msubstrait:014300257a59ed22fd9347be34436c741ca608b590e2cc134b1b594892eddabb [3mruntime_query[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3mquery_execution_duration_ms[0m[2m=[0m0.322
+[2m2026-10-28T07:19:04.711050Z[0m [32m INFO[0m [1msql_query[0m[1m{[0m[3minput[0m[2m=[0msubstrait:014300257a59ed22fd9347be34436c741ca608b590e2cc134b1b594892eddabb [3mruntime_query[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3mrows_produced[0m[2m=[0m1
+[2m2026-10-28T07:19:04.711054Z[0m [32m INFO[0m [1msql_query[0m[1m{[0m[3minput[0m[2m=[0msubstrait:014300257a59ed22fd9347be34436c741ca608b590e2cc134b1b594892eddabb [3mruntime_query[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3mprotocol[0m[2m=[0mFlightSQL [3mdatasets[0m[2m=[0m""
+[2m2026-10-28T07:19:04.711091Z[0m [32m INFO[0m [1msql_query[0m[1m{[0m[3minput[0m[2m=[0msubstrait:014300257a59ed22fd9347be34436c741ca608b590e2cc134b1b594892eddabb [3mruntime_query[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m [3mcaptured_output[0m[2m=[0m[]
+[2m2026-10-28T07:19:04.711358Z[0m [32m INFO[0m [1msql_query[0m[1m{[0m[3minput[0m[2m=[0msubstrait:014300257a59ed22fd9347be34436c741ca608b590e2cc134b1b594892eddabb [3mruntime_query[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3mquery_execution_duration_ms[0m[2m=[0m0.030875
+[2m2026-10-28T07:19:04.711363Z[0m [32m INFO[0m [1msql_query[0m[1m{[0m[3minput[0m[2m=[0msubstrait:014300257a59ed22fd9347be34436c741ca608b590e2cc134b1b594892eddabb [3mruntime_query[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3mrows_produced[0m[2m=[0m1
+[2m2026-10-28T07:19:04.711367Z[0m [32m INFO[0m [1msql_query[0m[1m{[0m[3minput[0m[2m=[0msubstrait:014300257a59ed22fd9347be34436c741ca608b590e2cc134b1b594892eddabb [3mruntime_query[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3mresults_cache_hit[0m[2m=[0mtrue
+[2m2026-10-28T07:19:04.711370Z[0m [32m INFO[0m [1msql_query[0m[1m{[0m[3minput[0m[2m=[0msubstrait:014300257a59ed22fd9347be34436c741ca608b590e2cc134b1b594892eddabb [3mruntime_query[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3mprotocol[0m[2m=[0mFlightSQL [3mdatasets[0m[2m=[0m""
+[2m2026-10-28T07:19:04.711373Z[0m [32m INFO[0m [1msql_query[0m[1m{[0m[3minput[0m[2m=[0msubstrait:014300257a59ed22fd9347be34436c741ca608b590e2cc134b1b594892eddabb [3mruntime_query[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m [3mcaptured_output[0m[2m=[0m[]
+test flight::statement_substrait_plan::test_substrait_plan_repeated_execution_is_stable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 512 filtered out; finished in 0.23s
+
+        PASS [   0.254s] (5/6) runtime::integration flight::statement_substrait_plan::test_substrait_plan_repeated_execution_is_stable
+       START [         ] (6/6) runtime::integration flight::statement_substrait_plan::test_substrait_plan_round_trip
+
+running 1 test
+[2m2026-10-28T07:19:04.740816Z[0m [34mDEBUG[0m [2mintegration::flight[0m[2m:[0m Ports: http: 53140, flight: 53141, metrics: 53142
+[2m2026-10-28T07:19:04.740837Z[0m [34mDEBUG[0m [2mintegration::utils[0m[2m:[0m Starting connector registration for tests
+[2m2026-10-28T07:19:04.740897Z[0m [34mDEBUG[0m [2mintegration::utils[0m[2m:[0m Completed connector registration for tests
+[2m2026-10-28T07:19:04.741114Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized sql results cache; max size: 128.00 MiB, item ttl: 1s, hashing algorithm: XXH3, encoding: none
+[2m2026-10-28T07:19:04.741143Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized search results cache; max size: 128.00 MiB, item ttl: 1s, shards: 16
+[2m2026-10-28T07:19:04.741152Z[0m [32m INFO[0m [2mruntime::init::caching[0m[2m:[0m Initialized embeddings cache; max size: 128.00 MiB, item ttl: 1s, shards: 16
+[2m2026-10-28T07:19:04.741321Z[0m [32m INFO[0m [2mruntime::datafusion::builder[0m[2m:[0m runtime.query.max_concurrent_queries not set; sized from the CPU budget [3mmax_concurrent_queries[0m[2m=[0m12
+[2m2026-10-28T07:19:04.741355Z[0m [32m INFO[0m [2mruntime::datafusion::builder[0m[2m:[0m runtime.query.target_partitions not set; sized from the CPU budget [3mtarget_partitions[0m[2m=[0m3
+[2m2026-10-28T07:19:04.741359Z[0m [32m INFO[0m [2mruntime::datafusion::builder[0m[2m:[0m runtime.query.eager_aggregation not set; defaulting to spiced default [3meager_aggregation[0m[2m=[0mtrue
+[2m2026-10-28T07:19:04.742162Z[0m [32m INFO[0m [2mruntime::init::task_history[0m[2m:[0m Task history enabled: retention_period=28800s, retention_check_interval=900s
+[2m2026-10-28T07:19:04.742368Z[0m [32m INFO[0m [2mhash_index::index[0m[2m:[0m Building hash index [3mrows[0m[2m=[0m0 [3mpartitions[0m[2m=[0m0 [3mbatches[0m[2m=[0m0 [3mkey_columns[0m[2m=[0mspan_id
+[2m2026-10-28T07:19:04.742396Z[0m [32m INFO[0m [2mhash_index::index[0m[2m:[0m Hash index build complete [3mentries[0m[2m=[0m0 [3melapsed_ms[0m[2m=[0m0 [3mrows_per_sec[0m[2m=[0m0 [3mmemory_bytes[0m[2m=[0m65560 [3mmemory_mb[0m[2m=[0m"0.06" [3mbloom_filter[0m[2m=[0mtrue
+[2m2026-10-28T07:19:04.742861Z[0m [32m INFO[0m [2mintegration::flight[0m[2m:[0m Waiting for servers to start...
+[2m2026-10-28T07:19:04.957248Z[0m [32m INFO[0m [2mruntime::flight[0m[2m:[0m Spice Runtime Flight listening on 127.0.0.1:53141
+[2m2026-10-28T07:19:04.957537Z[0m [32m INFO[0m [2mruntime::http[0m[2m:[0m Spice Runtime HTTP listening on 127.0.0.1:53140
+[2m2026-10-28T07:19:04.957550Z[0m [32m INFO[0m [2mruntime::metrics_server[0m[2m:[0m Spice Runtime Metrics listening on 127.0.0.1:53142
+[2m2026-10-28T07:19:04.958569Z[0m [32m INFO[0m [2mruntime[0m[2m:[0m No datasets or catalogs were configured. If this is unexpected, check the Spicepod configuration.
+[2m2026-10-28T07:19:04.958577Z[0m [32m INFO[0m [2mruntime[0m[2m:[0m All components are loaded. Spice runtime is ready!
+[2m2026-10-28T07:19:04.959552Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mruntime.task_history[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3msql[0m[2m=[0mSELECT task_history.trace_id, task_history.span_id, task_history.parent_span_id, task_history."task", task_history."input", task_history.captured_output, task_history.start_time, task_history.end_time, task_history.execution_duration_ms, task_history.error_message, task_history.labels FROM runtime.task_history
+[2m2026-10-28T07:19:04.960024Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mpublic.my_table[1m}[0m[2m:[0m [2mruntime_table::accelerated::refresh_task[0m[2m:[0m Loading data for dataset public.my_table
+[2m2026-10-28T07:19:04.960195Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mpublic.my_table[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3msql[0m[2m=[0mSELECT my_table.a, my_table.b FROM "public".my_table
+[2m2026-10-28T07:19:04.960336Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mpublic.my_table[1m}[0m[2m:[0m [2mruntime_table::accelerated::refresh_task[0m[2m:[0m Loaded 0 rows for dataset public.my_table in 0s.
+[2m2026-10-28T07:19:04.960929Z[0m [32m INFO[0m [1macceleration_refresh[0m[1m{[0m[3minput[0m[2m=[0mruntime.metrics[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3msql[0m[2m=[0mSELECT "metrics".time_unix_nano, "metrics".start_time_unix_nano, "metrics"."resource", "metrics"."scope", "metrics".schema_url, "metrics".metric_type, "metrics"."name", "metrics".description, "metrics".unit, "metrics".aggregation_temporality, "metrics".is_monotonic, "metrics".flags, "metrics".attributes, "metrics".series_id, "metrics".data_number, "metrics".data_histogram FROM runtime."metrics"
+[2m2026-10-28T07:19:04.963991Z[0m [32m INFO[0m [1msql_query[0m[1m{[0m[3minput[0m[2m=[0msubstrait:49354ea24b5579cfc23dbe5445e9f35521833bac7330e64966f5fa82f639aba9 [3mruntime_query[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3mquery_execution_duration_ms[0m[2m=[0m0.339708
+[2m2026-10-28T07:19:04.964002Z[0m [32m INFO[0m [1msql_query[0m[1m{[0m[3minput[0m[2m=[0msubstrait:49354ea24b5579cfc23dbe5445e9f35521833bac7330e64966f5fa82f639aba9 [3mruntime_query[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3mrows_produced[0m[2m=[0m1
+[2m2026-10-28T07:19:04.964006Z[0m [32m INFO[0m [1msql_query[0m[1m{[0m[3minput[0m[2m=[0msubstrait:49354ea24b5579cfc23dbe5445e9f35521833bac7330e64966f5fa82f639aba9 [3mruntime_query[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m labels [3mprotocol[0m[2m=[0mFlightSQL [3mdatasets[0m[2m=[0m""
+[2m2026-10-28T07:19:04.964022Z[0m [32m INFO[0m [1msql_query[0m[1m{[0m[3minput[0m[2m=[0msubstrait:49354ea24b5579cfc23dbe5445e9f35521833bac7330e64966f5fa82f639aba9 [3mruntime_query[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mtask_history[0m[2m:[0m [3mcaptured_output[0m[2m=[0m[]
+test flight::statement_substrait_plan::test_substrait_plan_round_trip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 512 filtered out; finished in 0.23s
+
+        PASS [   0.252s] (6/6) runtime::integration flight::statement_substrait_plan::test_substrait_plan_round_trip
+────────────
+     Summary [   1.592s] 6 tests run: 6 passed, 552 skipped

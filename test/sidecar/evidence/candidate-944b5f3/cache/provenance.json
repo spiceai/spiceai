@@ -1,0 +1,10 @@
+{
+  "date": "2026-10-28T07:46:27Z",
+  "commit": "944b5f351ef64c8713bfefd9d9cb8ce4cc134606",
+  "harness_commit": "84adbc129690e655781149c1caac33b4cffd626f",
+  "harness_sha256": "44b663a89f8f284ecf753924b98bfb2476fa1cbdb099e9f80198b5f596d96827",
+  "common_harness_sha256": "8d427ebe7d5fb2ab1756a6bcd39777721fbc44c4f20322e35bd4b5af2166cb9c",
+  "binary_sha256": "823f19ba1718df146e8ec7e67627c0c48a65cca0c3e4b6fc6cb68d9ae71cbed9",
+  "plan_sha256": "839696db7f1e27ab98f9ca3cb1cd4a037f6475d883d529d41b9e293a2a017f71",
+  "equivalent_plan_sha256": "7c8d10316bbddb7a14c8b44fbc1c23719156b4d4ef3a7da05f8d00c742b0da86"
+}

@@ -1,0 +1,37 @@
+    Starting 4282 tests across 8 binaries (2 tests skipped)
+  TRY 1 FAIL [   0.073s] (─────────) runtime cluster::service::tests::the_control_stream_of_an_idle_executor_ends
+  stdout ───
+
+    running 1 test
+    test cluster::service::tests::the_control_stream_of_an_idle_executor_ends ... FAILED
+
+    failures:
+
+    failures:
+        cluster::service::tests::the_control_stream_of_an_idle_executor_ends
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1945 filtered out; finished in 0.05s
+
+  stderr ───
+
+    thread 'cluster::service::tests::the_control_stream_of_an_idle_executor_ends' (10199222) panicked at crates/runtime/src/cluster/service.rs:2576:9:
+    the executor registers
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+   DELAY 2/4 by   1.611s (─────────) runtime cluster::service::tests::the_control_stream_of_an_idle_executor_ends
+        SLOW [>120.000s] (─────────) data_components databricks::sql_warehouse::tests::test_shared_semaphore_limits_across_instances
+        SLOW [>240.000s] (─────────) data_components databricks::sql_warehouse::tests::test_shared_semaphore_limits_across_instances
+TRY 1 TRMNTG [>360.000s] (─────────) data_components databricks::sql_warehouse::tests::test_shared_semaphore_limits_across_instances
+   TRY 1 TMT [ 360.012s] (─────────) data_components databricks::sql_warehouse::tests::test_shared_semaphore_limits_across_instances
+  stdout ───
+
+    running 1 test
+    test databricks::sql_warehouse::tests::test_shared_semaphore_limits_across_instances has been running for over 60 seconds
+
+    (test timed out)
+
+   DELAY 2/4 by   1.432s (─────────) data_components databricks::sql_warehouse::tests::test_shared_semaphore_limits_across_instances
+────────────
+     Summary [ 362.619s] 4282 tests run: 4282 passed (2 flaky), 2 skipped
+   FLAKY 2/4 [   0.029s] (2203/4282) runtime cluster::service::tests::the_control_stream_of_an_idle_executor_ends
+   FLAKY 2/4 [   0.061s] (4282/4282) data_components databricks::sql_warehouse::tests::test_shared_semaphore_limits_across_instances

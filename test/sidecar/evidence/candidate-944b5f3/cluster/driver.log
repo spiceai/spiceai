@@ -1,0 +1,12 @@
+configuration: invalid mode and incompatible cluster roles rejected
+configuration: sidecar defaults to one partition; explicit override selects three
+server: 47 SQLite comparisons
+sidecar: 47 SQLite comparisons
+sidecar cache disabled: upstream serialized-plan cache recorded 5 misses and 5 hits
+upstream serialized-plan cache: refresh retained eligible results; TTL expiry returned updated rows
+upstream stopped: results cache returned exact rows
+upstream stopped: Cayenne returned exact rows
+paused upstream: five requests returned HTTP 504
+explicit cancellation before deadline: HTTP 499
+upstream UDFs: sidecar arithmetic, NULL predicates, negation, LIKE, builtin names and argument order preserved
+reload: new connector retained startup sidecar mode

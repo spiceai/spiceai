@@ -1,0 +1,850 @@
+# HELP catalog_load_errors Number of errors loading the catalog provider.
+# TYPE catalog_load_errors counter
+catalog_load_errors 0
+# HELP cayenne_compaction_memory_pool_used_bytes Live bytes reserved in the dedicated compaction memory pool.
+# TYPE cayenne_compaction_memory_pool_used_bytes gauge
+cayenne_compaction_memory_pool_used_bytes 0
+# HELP cayenne_compaction_permits_available Available permits in the fleet-wide Cayenne compaction semaphore; 0 means every compaction slot is in use and peers queue.
+# TYPE cayenne_compaction_permits_available gauge
+cayenne_compaction_permits_available 2
+# HELP cayenne_compaction_permits_total Total permits of the fleet-wide Cayenne compaction semaphore.
+# TYPE cayenne_compaction_permits_total gauge
+cayenne_compaction_permits_total 2
+# HELP cayenne_encode_maintenance_gate_available Available permits in the reserved maintenance slice of the Cayenne encode budget (compaction/rewrite outputs).
+# TYPE cayenne_encode_maintenance_gate_available gauge
+cayenne_encode_maintenance_gate_available 1
+# HELP cayenne_encode_permits_available Available permits in the process-global Cayenne encode-concurrency budget; 0 under a growing backlog is the encode-semaphore stall signature.
+# TYPE cayenne_encode_permits_available gauge
+cayenne_encode_permits_available 1
+# HELP cayenne_encode_permits_total Total permits (ceiling) of the process-global Cayenne encode-concurrency budget.
+# TYPE cayenne_encode_permits_total gauge
+cayenne_encode_permits_total 1
+# HELP cayenne_listing_fence_wait_duration_ms Time Cayenne scans spend waiting to acquire the listing fence read lock.
+# TYPE cayenne_listing_fence_wait_duration_ms histogram
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="0"} 0
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="0.1"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="0.25"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="0.5"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="1"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="2.5"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="5"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="10"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="25"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="50"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="100"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="250"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="500"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="750"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="1000"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="2500"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="5000"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="7500"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="10000"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="25000"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="50000"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="100000"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="250000"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="500000"} 1
+cayenne_listing_fence_wait_duration_ms_bucket{dataset="remote_orders",le="+Inf"} 1
+cayenne_listing_fence_wait_duration_ms_sum{dataset="remote_orders"} 0.000834
+cayenne_listing_fence_wait_duration_ms_count{dataset="remote_orders"} 1
+# HELP cayenne_listing_scan_duration_ms Time Cayenne scans spend building the main ListingTable execution plan while holding the listing fence.
+# TYPE cayenne_listing_scan_duration_ms histogram
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="0"} 0
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="0.1"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="0.25"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="0.5"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="1"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="2.5"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="5"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="10"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="25"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="50"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="100"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="250"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="500"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="750"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="1000"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="2500"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="5000"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="7500"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="10000"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="25000"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="50000"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="100000"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="250000"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="500000"} 2
+cayenne_listing_scan_duration_ms_bucket{dataset="remote_orders",le="+Inf"} 2
+cayenne_listing_scan_duration_ms_sum{dataset="remote_orders"} 0.07983299999999999
+cayenne_listing_scan_duration_ms_count{dataset="remote_orders"} 2
+# HELP cayenne_maintenance_outcome_total Cayenne non-compaction maintenance passes (deletion-vector sweep, retention, retired-directory sweep) by operation and outcome.
+# TYPE cayenne_maintenance_outcome_total counter
+cayenne_maintenance_outcome_total{op="orphan_dv_sweep",outcome="no_op",table="remote_orders"} 1
+# HELP cayenne_metastore_writer_held_ms Time a Cayenne metastore write transaction (or bare write statement) was held, from acquisition through commit/rollback.
+# TYPE cayenne_metastore_writer_held_ms histogram
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="0.1"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="0.25"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="0.5"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="1"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="2.5"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="5"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="10"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="25"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="50"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="100"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="250"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="500"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="1000"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="2500"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="5000"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="10000"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="30000"} 2
+cayenne_metastore_writer_held_ms_bucket{txn="other",le="+Inf"} 2
+cayenne_metastore_writer_held_ms_sum{txn="other"} 0.11341600000000002
+cayenne_metastore_writer_held_ms_count{txn="other"} 2
+# HELP cayenne_metastore_writer_wait_ms Time a Cayenne metastore writer spent waiting to acquire the write transaction (pool-slot acquire + BEGIN IMMEDIATE) or a bare write statement.
+# TYPE cayenne_metastore_writer_wait_ms histogram
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="0.1"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="0.25"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="0.5"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="1"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="2.5"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="5"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="10"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="25"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="50"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="100"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="250"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="500"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="1000"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="2500"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="5000"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="10000"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="30000"} 2
+cayenne_metastore_writer_wait_ms_bucket{txn="other",le="+Inf"} 2
+cayenne_metastore_writer_wait_ms_sum{txn="other"} 0.016333999999999998
+cayenne_metastore_writer_wait_ms_count{txn="other"} 2
+# HELP cayenne_pk_keyset_budget_total_bytes Total byte ceiling of the process-global Cayenne primary-key keyset budget.
+# TYPE cayenne_pk_keyset_budget_total_bytes gauge
+cayenne_pk_keyset_budget_total_bytes 4294967296
+# HELP cayenne_pk_keyset_budget_used_bytes Currently-reserved bytes across all Cayenne primary-key keyset caches; at the total, a table's exact keyset degrades to a bloom instead of growing.
+# TYPE cayenne_pk_keyset_budget_used_bytes gauge
+cayenne_pk_keyset_budget_used_bytes 0
+# HELP cayenne_segment_cache_accesses Cumulative Vortex segment cache get() calls, by cache.
+# TYPE cayenne_segment_cache_accesses counter
+cayenne_segment_cache_accesses{cache="shared"} 0
+# HELP cayenne_segment_cache_capacity_bytes Configured Vortex segment cache capacity in bytes, by cache.
+# TYPE cayenne_segment_cache_capacity_bytes gauge
+cayenne_segment_cache_capacity_bytes{cache="shared"} 1073741824
+# HELP cayenne_segment_cache_entries Approximate live Vortex segment cache entry count, by cache.
+# TYPE cayenne_segment_cache_entries gauge
+cayenne_segment_cache_entries{cache="shared"} 0
+# HELP cayenne_segment_cache_hits Cumulative Vortex segment cache hits, by cache.
+# TYPE cayenne_segment_cache_hits counter
+cayenne_segment_cache_hits{cache="shared"} 0
+# HELP cayenne_segment_cache_weighted_bytes Approximate live Vortex segment cache size in bytes, by cache.
+# TYPE cayenne_segment_cache_weighted_bytes gauge
+cayenne_segment_cache_weighted_bytes{cache="shared"} 0
+# HELP component_metric_registered_count Number of currently registered component metrics.
+# TYPE component_metric_registered_count gauge
+component_metric_registered_count 0
+# HELP dataset_acceleration_last_refresh_unix_time_ms Unix timestamp in milliseconds when the last refresh completed.
+# TYPE dataset_acceleration_last_refresh_unix_time_ms gauge
+dataset_acceleration_last_refresh_unix_time_ms{dataset="remote_orders"} 1793173251604.516
+dataset_acceleration_last_refresh_unix_time_ms{dataset="runtime.metrics"} 1793173251289.875
+dataset_acceleration_last_refresh_unix_time_ms{dataset="runtime.task_history"} 1793173251289.808
+# HELP dataset_acceleration_refresh_bytes_written Cumulative number of bytes (Arrow in-memory size) read from the federated source and written into the accelerated table.
+# TYPE dataset_acceleration_refresh_bytes_written counter
+dataset_acceleration_refresh_bytes_written{dataset="remote_orders"} 26129
+# HELP dataset_acceleration_refresh_duration_ms Duration in milliseconds to load a full or appended refresh data.
+# TYPE dataset_acceleration_refresh_duration_ms histogram
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="0"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="0.1"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="0.25"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="0.5"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="1"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="2.5"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="5"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="10"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="25"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="50"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="100"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="250"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="500"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="750"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="1000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="2500"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="5000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="7500"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="10000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="25000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="50000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="100000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="250000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="500000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="remote_orders",mode="full",le="+Inf"} 1
+dataset_acceleration_refresh_duration_ms_sum{dataset="remote_orders",mode="full"} 1.821917
+dataset_acceleration_refresh_duration_ms_count{dataset="remote_orders",mode="full"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="0"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="0.1"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="0.25"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="0.5"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="1"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="2.5"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="5"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="10"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="25"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="50"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="100"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="250"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="500"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="750"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="1000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="2500"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="5000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="7500"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="10000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="25000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="50000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="100000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="250000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="500000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.metrics",mode="full",le="+Inf"} 1
+dataset_acceleration_refresh_duration_ms_sum{dataset="runtime.metrics",mode="full"} 0.969375
+dataset_acceleration_refresh_duration_ms_count{dataset="runtime.metrics",mode="full"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="0"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="0.1"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="0.25"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="0.5"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="1"} 0
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="2.5"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="5"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="10"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="25"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="50"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="100"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="250"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="500"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="750"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="1000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="2500"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="5000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="7500"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="10000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="25000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="50000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="100000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="250000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="500000"} 1
+dataset_acceleration_refresh_duration_ms_bucket{dataset="runtime.task_history",mode="full",le="+Inf"} 1
+dataset_acceleration_refresh_duration_ms_sum{dataset="runtime.task_history",mode="full"} 1.635459
+dataset_acceleration_refresh_duration_ms_count{dataset="runtime.task_history",mode="full"} 1
+# HELP dataset_acceleration_refresh_processed_bytes Number of bytes processed during dataset refresh.
+# TYPE dataset_acceleration_refresh_processed_bytes counter
+dataset_acceleration_refresh_processed_bytes{dataset="remote_orders"} 26129
+dataset_acceleration_refresh_processed_bytes{dataset="runtime.metrics"} 0
+dataset_acceleration_refresh_processed_bytes{dataset="runtime.task_history"} 0
+# HELP dataset_acceleration_refresh_processed_rows Number of rows processed during dataset refresh.
+# TYPE dataset_acceleration_refresh_processed_rows counter
+dataset_acceleration_refresh_processed_rows{dataset="remote_orders"} 1000
+dataset_acceleration_refresh_processed_rows{dataset="runtime.metrics"} 0
+dataset_acceleration_refresh_processed_rows{dataset="runtime.task_history"} 0
+# HELP dataset_acceleration_refresh_rows_written Cumulative number of rows read from the federated source and written to the accelerated table, as they are read: rows the table does not keep count here and, once their refresh succeeds, in dataset_acceleration_rows_superseded; a refresh that fails counts here only.
+# TYPE dataset_acceleration_refresh_rows_written counter
+dataset_acceleration_refresh_rows_written{dataset="remote_orders"} 1000
+# HELP dataset_active_count Number of currently loaded datasets.
+# TYPE dataset_active_count gauge
+dataset_active_count{engine="cayenne"} 1
+# HELP dataset_load_errors Number of errors loading the dataset.
+# TYPE dataset_load_errors counter
+dataset_load_errors 0
+# HELP dataset_load_state Status of the dataset. 0=Initializing, 1=Ready, 2=Disabled, 3=Error, 4=Refreshing, 5=ShuttingDown.
+# TYPE dataset_load_state gauge
+dataset_load_state{dataset="remote_orders"} 1
+dataset_load_state{dataset="runtime.metrics"} 1
+dataset_load_state{dataset="runtime.task_history"} 1
+# HELP embeddings_cache_evictions Number of entries evicted, split by `reason`: `expired` past their age, `size` to stay under max_size, or `invalidated` dropped by a client write, dataset reload or unload of a table they read.
+# TYPE embeddings_cache_evictions counter
+embeddings_cache_evictions{reason="expired"} 0
+embeddings_cache_evictions{reason="invalidated"} 0
+embeddings_cache_evictions{reason="size"} 0
+# HELP embeddings_cache_hit_ratio Cache hit ratio (hits / total requests).
+# TYPE embeddings_cache_hit_ratio gauge
+embeddings_cache_hit_ratio 0
+# HELP embeddings_cache_hits Cache hit count.
+# TYPE embeddings_cache_hits counter
+embeddings_cache_hits 0
+# HELP embeddings_cache_items_count Number of items currently in the cache.
+# TYPE embeddings_cache_items_count gauge
+embeddings_cache_items_count 0
+# HELP embeddings_cache_max_size_bytes Maximum allowed size of the cache in bytes.
+# TYPE embeddings_cache_max_size_bytes gauge
+embeddings_cache_max_size_bytes 0
+# HELP embeddings_cache_misses Cache miss count.
+# TYPE embeddings_cache_misses counter
+embeddings_cache_misses 0
+# HELP embeddings_cache_requests Number of requests to get a key from the cache.
+# TYPE embeddings_cache_requests counter
+embeddings_cache_requests 0
+# HELP embeddings_cache_size_bytes Size of the cache in bytes.
+# TYPE embeddings_cache_size_bytes gauge
+embeddings_cache_size_bytes 0
+# HELP embeddings_cache_stale_rejections Number of lookups that found an entry but refused to serve it because a client write, dataset reload or unload changed a table it read after its query started. Reported with reason `write_during_read`. These are also counted as misses.
+# TYPE embeddings_cache_stale_rejections counter
+embeddings_cache_stale_rejections{reason="write_during_read"} 0
+# HELP embeddings_cache_stale_swr_count Number of stale-while-revalidate background refreshes skipped due to existing in-flight revalidation.
+# TYPE embeddings_cache_stale_swr_count counter
+embeddings_cache_stale_swr_count 0
+# HELP embeddings_cache_swr_background_query_count Number of background queries triggered for stale-while-revalidate cache refreshes.
+# TYPE embeddings_cache_swr_background_query_count counter
+embeddings_cache_swr_background_query_count 0
+# HELP embeddings_cache_swr_revalidations Number of completed background stale-while-revalidate revalidations, split by `outcome`. Any outcome other than `stored` leaves the previous entry in place to be served stale until it expires.
+# TYPE embeddings_cache_swr_revalidations counter
+embeddings_cache_swr_revalidations{outcome="collect_failed"} 0
+embeddings_cache_swr_revalidations{outcome="encode_failed"} 0
+embeddings_cache_swr_revalidations{outcome="invalidated_mid_flight"} 0
+embeddings_cache_swr_revalidations{outcome="put_failed"} 0
+embeddings_cache_swr_revalidations{outcome="query_failed"} 0
+embeddings_cache_swr_revalidations{outcome="stored"} 0
+embeddings_cache_swr_revalidations{outcome="transient_errors"} 0
+embeddings_cache_swr_revalidations{outcome="unboundable"} 0
+# HELP embeddings_cache_table_invalidations Number of hard table invalidations applied to this cache, always with mode `evict`. SQL results record client writes, dataset reload and unload, but not refresh, CDC or retention. Counts invalidations, not the entries each one affected.
+# TYPE embeddings_cache_table_invalidations counter
+embeddings_cache_table_invalidations{mode="evict"} 0
+# HELP embeddings_load_errors Number of errors loading the embedding.
+# TYPE embeddings_load_errors counter
+embeddings_load_errors 0
+# TYPE flight_request_duration_ms histogram
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="0"} 0
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="0.1"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="0.25"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="0.5"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="1"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="2.5"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="5"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="10"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="25"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="50"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="100"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="250"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="500"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="750"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="1000"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="2500"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="5000"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="7500"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="10000"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="25000"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="50000"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="100000"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="250000"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="500000"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="+Inf"} 7
+flight_request_duration_ms_sum{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable"} 0.13725099999999998
+flight_request_duration_ms_count{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable"} 7
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="0"} 0
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="0.1"} 2
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="0.25"} 4
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="0.5"} 4
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="1"} 5
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="2.5"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="5"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="10"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="25"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="50"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="100"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="250"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="500"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="750"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="1000"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="2500"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="5000"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="7500"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="10000"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="25000"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="50000"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="100000"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="250000"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="500000"} 6
+flight_request_duration_ms_bucket{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",le="+Inf"} 6
+flight_request_duration_ms_sum{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable"} 2.488374
+flight_request_duration_ms_count{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable"} 6
+# TYPE flight_requests counter
+flight_requests{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable"} 7
+flight_requests{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable"} 6
+# HELP http_requests Number of HTTP requests.
+# TYPE http_requests counter
+http_requests{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200"} 1
+http_requests{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503"} 2
+# TYPE http_requests_duration_ms histogram
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="0"} 0
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="0.1"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="0.25"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="0.5"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="1"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="2.5"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="5"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="10"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="25"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="50"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="100"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="250"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="500"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="750"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="1000"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="2500"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="5000"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="7500"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="10000"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="25000"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="50000"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="100000"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="250000"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="500000"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="+Inf"} 1
+http_requests_duration_ms_sum{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200"} 0.015125
+http_requests_duration_ms_count{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200"} 1
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="0"} 0
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="0.1"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="0.25"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="0.5"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="1"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="2.5"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="5"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="10"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="25"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="50"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="100"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="250"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="500"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="750"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="1000"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="2500"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="5000"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="7500"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="10000"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="25000"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="50000"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="100000"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="250000"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="500000"} 2
+http_requests_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="+Inf"} 2
+http_requests_duration_ms_sum{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503"} 0.117208
+http_requests_duration_ms_count{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503"} 2
+# HELP http_requests_total Number of HTTP requests. Deprecated, use http_requests instead.
+# TYPE http_requests_total counter
+http_requests_total{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200"} 1
+http_requests_total{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503"} 2
+# HELP http_responses Number of HTTP responses, counted once the response body terminates. The 'outcome' label reports how it terminated ('complete', 'error', or 'incomplete'), so a streaming response that fails after its 200 head is not counted as a success.
+# TYPE http_responses counter
+http_responses{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200"} 1
+http_responses{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503"} 2
+# HELP http_responses_duration_ms End-to-end HTTP response duration, from the request arriving to the response body terminating. Unlike http_requests_duration_ms, this includes the time spent streaming the body.
+# TYPE http_responses_duration_ms histogram
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="0"} 0
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="0.1"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="0.25"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="0.5"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="1"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="2.5"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="5"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="10"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="25"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="50"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="100"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="250"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="500"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="750"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="1000"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="2500"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="5000"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="7500"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="10000"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="25000"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="50000"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="100000"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="250000"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="500000"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",le="+Inf"} 1
+http_responses_duration_ms_sum{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200"} 0.038959
+http_responses_duration_ms_count{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200"} 1
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="0"} 0
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="0.1"} 0
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="0.25"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="0.5"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="1"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="2.5"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="5"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="10"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="25"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="50"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="100"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="250"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="500"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="750"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="1000"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="2500"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="5000"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="7500"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="10000"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="25000"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="50000"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="100000"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="250000"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="500000"} 2
+http_responses_duration_ms_bucket{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",le="+Inf"} 2
+http_responses_duration_ms_sum{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503"} 0.23529099999999997
+http_responses_duration_ms_count{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503"} 2
+# HELP model_load_errors Number of errors loading the model.
+# TYPE model_load_errors counter
+model_load_errors 0
+# HELP process_resident_anon_bytes Anonymous resident bytes: heap and stacks, which the kernel cannot reclaim. The half of RSS that grows, that a profiler can attribute, and that triggers an OOM kill.
+# TYPE process_resident_anon_bytes gauge
+process_resident_anon_bytes 38338560
+# HELP process_resident_file_bytes File-backed resident bytes: mapped files and page cache the kernel evicts on demand. Real RSS, invisible to heap profilers, and not a leak.
+# TYPE process_resident_file_bytes gauge
+process_resident_file_bytes 80248832
+# HELP process_resident_memory_bytes Resident set size of the spiced process. Budgets and pool gauges describe intent; this describes fact, and the gap between them is the off-pool/unaccounted memory.
+# TYPE process_resident_memory_bytes gauge
+process_resident_memory_bytes 118587392
+# HELP query_duration_ms The total amount of time spent planning and executing queries in milliseconds.
+# TYPE query_duration_ms histogram
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="0"} 0
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="0.1"} 1
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="0.25"} 1
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="0.5"} 1
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="1"} 1
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="2.5"} 1
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="5"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="10"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="25"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="50"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="100"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="250"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="500"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="750"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="1000"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="2500"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="5000"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="7500"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="10000"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="25000"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="50000"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="100000"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="250000"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="500000"} 5
+query_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="+Inf"} 5
+query_duration_ms_sum{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error"} 13.394251
+query_duration_ms_count{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error"} 5
+# HELP query_execution_duration_ms The total amount of time spent only executing queries. This is 0 for cached queries.
+# TYPE query_execution_duration_ms histogram
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="0"} 0
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="0.1"} 1
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="0.25"} 1
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="0.5"} 1
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="1"} 1
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="2.5"} 1
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="5"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="10"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="25"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="50"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="100"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="250"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="500"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="750"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="1000"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="2500"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="5000"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="7500"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="10000"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="25000"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="50000"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="100000"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="250000"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="500000"} 5
+query_execution_duration_ms_bucket{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",le="+Inf"} 5
+query_execution_duration_ms_sum{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error"} 13.394584
+query_execution_duration_ms_count{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error"} 5
+# HELP query_executions Number of query executions.
+# TYPE query_executions counter
+query_executions{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error"} 5
+# HELP query_failures Number of query failures.
+# TYPE query_failures counter
+query_failures{cache_namespace_kind="public",client="other",datasets="",err_code="QueryExecutionError",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error"} 5
+# HELP query_memory_pool_used_bytes Live bytes reserved in the query memory pool, excluding the in-memory CDC tier's mirror account.
+# TYPE query_memory_pool_used_bytes gauge
+query_memory_pool_used_bytes 0
+# HELP query_processed_bytes Number of bytes processed by the runtime.
+# TYPE query_processed_bytes counter
+query_processed_bytes{cache_namespace_kind="system",protocol="internal"} 29020
+# HELP rerankers_load_errors Number of errors loading the reranker.
+# TYPE rerankers_load_errors counter
+rerankers_load_errors 0
+# HELP runtime_flight_server_started Indicates the runtime Flight server has started.
+# TYPE runtime_flight_server_started counter
+runtime_flight_server_started 1
+# HELP runtime_http_server_started Indicates the runtime HTTP server has started.
+# TYPE runtime_http_server_started counter
+runtime_http_server_started 1
+# HELP schema_interner_already_shared Interns whose caller already held the shared allocation. Counted apart from collapsed values because no duplicate was removed.
+# TYPE schema_interner_already_shared counter
+schema_interner_already_shared 0
+# HELP schema_interner_collapsed Distinct Arrow schemas allocations collapsed onto a shared one. The direct evidence that interning is removing duplicates.
+# TYPE schema_interner_collapsed counter
+schema_interner_collapsed 0
+# HELP schema_interner_misses Interns that adopted Arrow schemas the pool had not seen. Misses without collapses means values are arriving distinct and nothing is being shared.
+# TYPE schema_interner_misses counter
+schema_interner_misses 0
+# HELP schema_interner_overhead_bytes The interner's own bookkeeping: its hash-map slots and bucket vectors.
+# TYPE schema_interner_overhead_bytes gauge
+schema_interner_overhead_bytes 0
+# HELP schema_interner_rows Distinct Arrow schemas currently shared by the interner.
+# TYPE schema_interner_rows gauge
+schema_interner_rows 0
+# HELP schema_interner_value_bytes Total size of the Arrow schemas the interner shares. Counted once per distinct value, not once per cache entry holding it.
+# TYPE schema_interner_value_bytes gauge
+schema_interner_value_bytes 0
+# HELP search_results_cache_evictions Number of entries evicted, split by `reason`: `expired` past their age, `size` to stay under max_size, or `invalidated` dropped by a client write, dataset reload or unload of a table they read.
+# TYPE search_results_cache_evictions counter
+search_results_cache_evictions{reason="expired"} 0
+search_results_cache_evictions{reason="invalidated"} 0
+search_results_cache_evictions{reason="size"} 0
+# HELP search_results_cache_hit_ratio Cache hit ratio (hits / total requests).
+# TYPE search_results_cache_hit_ratio gauge
+search_results_cache_hit_ratio 0
+# HELP search_results_cache_hits Cache hit count.
+# TYPE search_results_cache_hits counter
+search_results_cache_hits 0
+# HELP search_results_cache_items_count Number of items currently in the cache.
+# TYPE search_results_cache_items_count gauge
+search_results_cache_items_count 0
+# HELP search_results_cache_max_size_bytes Maximum allowed size of the cache in bytes.
+# TYPE search_results_cache_max_size_bytes gauge
+search_results_cache_max_size_bytes 0
+# HELP search_results_cache_misses Cache miss count.
+# TYPE search_results_cache_misses counter
+search_results_cache_misses 0
+# HELP search_results_cache_requests Number of requests to get a key from the cache.
+# TYPE search_results_cache_requests counter
+search_results_cache_requests 0
+# HELP search_results_cache_size_bytes Size of the cache in bytes.
+# TYPE search_results_cache_size_bytes gauge
+search_results_cache_size_bytes 0
+# HELP search_results_cache_stale_rejections Number of lookups that found an entry but refused to serve it because a client write, dataset reload or unload changed a table it read after its query started. Reported with reason `write_during_read`. These are also counted as misses.
+# TYPE search_results_cache_stale_rejections counter
+search_results_cache_stale_rejections{reason="write_during_read"} 0
+# HELP search_results_cache_stale_swr_count Number of stale-while-revalidate background refreshes skipped due to existing in-flight revalidation.
+# TYPE search_results_cache_stale_swr_count counter
+search_results_cache_stale_swr_count 0
+# HELP search_results_cache_swr_background_query_count Number of background queries triggered for stale-while-revalidate cache refreshes.
+# TYPE search_results_cache_swr_background_query_count counter
+search_results_cache_swr_background_query_count 0
+# HELP search_results_cache_swr_revalidations Number of completed background stale-while-revalidate revalidations, split by `outcome`. Any outcome other than `stored` leaves the previous entry in place to be served stale until it expires.
+# TYPE search_results_cache_swr_revalidations counter
+search_results_cache_swr_revalidations{outcome="collect_failed"} 0
+search_results_cache_swr_revalidations{outcome="encode_failed"} 0
+search_results_cache_swr_revalidations{outcome="invalidated_mid_flight"} 0
+search_results_cache_swr_revalidations{outcome="put_failed"} 0
+search_results_cache_swr_revalidations{outcome="query_failed"} 0
+search_results_cache_swr_revalidations{outcome="stored"} 0
+search_results_cache_swr_revalidations{outcome="transient_errors"} 0
+search_results_cache_swr_revalidations{outcome="unboundable"} 0
+# HELP search_results_cache_table_invalidations Number of hard table invalidations applied to this cache, always with mode `evict`. SQL results record client writes, dataset reload and unload, but not refresh, CDC or retention. Counts invalidations, not the entries each one affected.
+# TYPE search_results_cache_table_invalidations counter
+search_results_cache_table_invalidations{mode="evict"} 0
+# HELP spiced_cpu_budget_cores CPU cores the runtime sizes itself for, and where that value came from.
+# TYPE spiced_cpu_budget_cores gauge
+spiced_cpu_budget_cores{source="configured"} 2
+# HELP spiced_cpu_budget_millicores CPU millicores the runtime sizes itself for, and where that value came from.
+# TYPE spiced_cpu_budget_millicores gauge
+spiced_cpu_budget_millicores{source="configured"} 2000
+# HELP state_store_cleanup_deleted_total Objects that cleanup deleted from the state location because no instance needs them.
+# TYPE state_store_cleanup_deleted_total counter
+state_store_cleanup_deleted_total{feature="rate_control"} 0
+state_store_cleanup_deleted_total{feature="results_cache_warmup"} 0
+state_store_cleanup_deleted_total{feature="scheduler"} 0
+state_store_cleanup_deleted_total{feature="snapshots"} 0
+# HELP state_store_conflicts_total Conditional writes to the state location that the store refused because another writer created or changed the object first.
+# TYPE state_store_conflicts_total counter
+state_store_conflicts_total{feature="rate_control"} 0
+state_store_conflicts_total{feature="results_cache_warmup"} 0
+state_store_conflicts_total{feature="scheduler"} 0
+state_store_conflicts_total{feature="snapshots"} 0
+# HELP table_set_interner_already_shared Interns whose caller already held the shared allocation. Counted apart from collapsed values because no duplicate was removed.
+# TYPE table_set_interner_already_shared counter
+table_set_interner_already_shared 0
+# HELP table_set_interner_collapsed Distinct input-table sets allocations collapsed onto a shared one. The direct evidence that interning is removing duplicates.
+# TYPE table_set_interner_collapsed counter
+table_set_interner_collapsed 0
+# HELP table_set_interner_misses Interns that adopted input-table sets the pool had not seen. Misses without collapses means values are arriving distinct and nothing is being shared.
+# TYPE table_set_interner_misses counter
+table_set_interner_misses 0
+# HELP table_set_interner_overhead_bytes The interner's own bookkeeping: its hash-map slots and bucket vectors.
+# TYPE table_set_interner_overhead_bytes gauge
+table_set_interner_overhead_bytes 0
+# HELP table_set_interner_rows Distinct input-table sets currently shared by the interner.
+# TYPE table_set_interner_rows gauge
+table_set_interner_rows 0
+# HELP table_set_interner_value_bytes Total size of the input-table sets the interner shares. Counted once per distinct value, not once per cache entry holding it.
+# TYPE table_set_interner_value_bytes gauge
+table_set_interner_value_bytes 0
+# HELP tokio_runtime_alive_tasks Alive (spawned, not-yet-completed) tasks per tokio runtime.
+# TYPE tokio_runtime_alive_tasks gauge
+tokio_runtime_alive_tasks{runtime="cdc_apply"} 0
+tokio_runtime_alive_tasks{runtime="cpu"} 0
+tokio_runtime_alive_tasks{runtime="main"} 22
+tokio_runtime_alive_tasks{runtime="refresh"} 0
+# HELP tokio_runtime_global_queue_depth Tasks waiting in the runtime's global (injection) queue per tokio runtime.
+# TYPE tokio_runtime_global_queue_depth gauge
+tokio_runtime_global_queue_depth{runtime="cdc_apply"} 0
+tokio_runtime_global_queue_depth{runtime="cpu"} 0
+tokio_runtime_global_queue_depth{runtime="main"} 0
+tokio_runtime_global_queue_depth{runtime="refresh"} 0
+# HELP tokio_runtime_workers Worker threads per tokio runtime.
+# TYPE tokio_runtime_workers gauge
+tokio_runtime_workers{runtime="cdc_apply"} 1
+tokio_runtime_workers{runtime="cpu"} 1
+tokio_runtime_workers{runtime="main"} 2
+tokio_runtime_workers{runtime="refresh"} 1
+# HELP tool_active_count Number of currently loaded LLM tools.
+# TYPE tool_active_count gauge
+tool_active_count{tool_catalog="auto"} 1
+tool_active_count{tool="get_current_datetime"} 1
+tool_active_count{tool="get_readiness"} 1
+tool_active_count{tool="list_datasets"} 1
+tool_active_count{tool_catalog="memory"} 1
+tool_active_count{tool="random_sample"} 1
+tool_active_count{tool="sample_distinct_columns"} 1
+tool_active_count{tool="search"} 1
+tool_active_count{tool="sql"} 1
+tool_active_count{tool="table_schema"} 1
+tool_active_count{tool="top_n_sample"} 1
+# HELP tool_load_errors Number of errors loading the LLM tool.
+# TYPE tool_load_errors counter
+tool_load_errors 0
+# HELP tool_load_state Status of the LLM tools. 0=Initializing, 1=Ready, 2=Disabled, 3=Error, 4=Refreshing, 5=ShuttingDown.
+# TYPE tool_load_state gauge
+tool_load_state{tool_catalog="auto"} 1
+tool_load_state{tool="get_current_datetime"} 1
+tool_load_state{tool="get_readiness"} 1
+tool_load_state{tool="list_datasets"} 1
+tool_load_state{tool_catalog="memory"} 1
+tool_load_state{tool="random_sample"} 1
+tool_load_state{tool="sample_distinct_columns"} 1
+tool_load_state{tool="search"} 1
+tool_load_state{tool="sql"} 1
+tool_load_state{tool="table_schema"} 1
+tool_load_state{tool="top_n_sample"} 1
+# HELP view_load_errors Number of errors loading the view.
+# TYPE view_load_errors counter
+view_load_errors 0
+# HELP cayenne_listing_fence_wait_duration_ms_summary Summary derived from histogram cayenne_listing_fence_wait_duration_ms
+# TYPE cayenne_listing_fence_wait_duration_ms_summary summary
+cayenne_listing_fence_wait_duration_ms_summary{dataset="remote_orders",quantile="0.5"} 0.000834
+cayenne_listing_fence_wait_duration_ms_summary{dataset="remote_orders",quantile="0.9"} 0.000834
+cayenne_listing_fence_wait_duration_ms_summary{dataset="remote_orders",quantile="0.95"} 0.000834
+cayenne_listing_fence_wait_duration_ms_summary{dataset="remote_orders",quantile="0.99"} 0.000834
+cayenne_listing_fence_wait_duration_ms_summary_sum{dataset="remote_orders"} 0.000834
+cayenne_listing_fence_wait_duration_ms_summary_count{dataset="remote_orders"} 1
+# HELP cayenne_listing_scan_duration_ms_summary Summary derived from histogram cayenne_listing_scan_duration_ms
+# TYPE cayenne_listing_scan_duration_ms_summary summary
+cayenne_listing_scan_duration_ms_summary{dataset="remote_orders",quantile="0.5"} 0.05
+cayenne_listing_scan_duration_ms_summary{dataset="remote_orders",quantile="0.9"} 0.07983299999999999
+cayenne_listing_scan_duration_ms_summary{dataset="remote_orders",quantile="0.95"} 0.07983299999999999
+cayenne_listing_scan_duration_ms_summary{dataset="remote_orders",quantile="0.99"} 0.07983299999999999
+cayenne_listing_scan_duration_ms_summary_sum{dataset="remote_orders"} 0.07983299999999999
+cayenne_listing_scan_duration_ms_summary_count{dataset="remote_orders"} 2
+# HELP cayenne_metastore_writer_held_ms_summary Summary derived from histogram cayenne_metastore_writer_held_ms
+# TYPE cayenne_metastore_writer_held_ms_summary summary
+cayenne_metastore_writer_held_ms_summary{txn="other",quantile="0.5"} 0.1
+cayenne_metastore_writer_held_ms_summary{txn="other",quantile="0.9"} 0.1
+cayenne_metastore_writer_held_ms_summary{txn="other",quantile="0.95"} 0.1
+cayenne_metastore_writer_held_ms_summary{txn="other",quantile="0.99"} 0.1
+cayenne_metastore_writer_held_ms_summary_sum{txn="other"} 0.11341600000000002
+cayenne_metastore_writer_held_ms_summary_count{txn="other"} 2
+# HELP cayenne_metastore_writer_wait_ms_summary Summary derived from histogram cayenne_metastore_writer_wait_ms
+# TYPE cayenne_metastore_writer_wait_ms_summary summary
+cayenne_metastore_writer_wait_ms_summary{txn="other",quantile="0.5"} 0.1
+cayenne_metastore_writer_wait_ms_summary{txn="other",quantile="0.9"} 0.1
+cayenne_metastore_writer_wait_ms_summary{txn="other",quantile="0.95"} 0.1
+cayenne_metastore_writer_wait_ms_summary{txn="other",quantile="0.99"} 0.1
+cayenne_metastore_writer_wait_ms_summary_sum{txn="other"} 0.016333999999999998
+cayenne_metastore_writer_wait_ms_summary_count{txn="other"} 2
+# HELP dataset_acceleration_refresh_duration_ms_summary Summary derived from histogram dataset_acceleration_refresh_duration_ms
+# TYPE dataset_acceleration_refresh_duration_ms_summary summary
+dataset_acceleration_refresh_duration_ms_summary{dataset="remote_orders",mode="full",quantile="0.5"} 1.821917
+dataset_acceleration_refresh_duration_ms_summary{dataset="remote_orders",mode="full",quantile="0.9"} 1.821917
+dataset_acceleration_refresh_duration_ms_summary{dataset="remote_orders",mode="full",quantile="0.95"} 1.821917
+dataset_acceleration_refresh_duration_ms_summary{dataset="remote_orders",mode="full",quantile="0.99"} 1.821917
+dataset_acceleration_refresh_duration_ms_summary_sum{dataset="remote_orders",mode="full"} 1.821917
+dataset_acceleration_refresh_duration_ms_summary_count{dataset="remote_orders",mode="full"} 1
+dataset_acceleration_refresh_duration_ms_summary{dataset="runtime.metrics",mode="full",quantile="0.5"} 0.969375
+dataset_acceleration_refresh_duration_ms_summary{dataset="runtime.metrics",mode="full",quantile="0.9"} 0.969375
+dataset_acceleration_refresh_duration_ms_summary{dataset="runtime.metrics",mode="full",quantile="0.95"} 0.969375
+dataset_acceleration_refresh_duration_ms_summary{dataset="runtime.metrics",mode="full",quantile="0.99"} 0.969375
+dataset_acceleration_refresh_duration_ms_summary_sum{dataset="runtime.metrics",mode="full"} 0.969375
+dataset_acceleration_refresh_duration_ms_summary_count{dataset="runtime.metrics",mode="full"} 1
+dataset_acceleration_refresh_duration_ms_summary{dataset="runtime.task_history",mode="full",quantile="0.5"} 1.635459
+dataset_acceleration_refresh_duration_ms_summary{dataset="runtime.task_history",mode="full",quantile="0.9"} 1.635459
+dataset_acceleration_refresh_duration_ms_summary{dataset="runtime.task_history",mode="full",quantile="0.95"} 1.635459
+dataset_acceleration_refresh_duration_ms_summary{dataset="runtime.task_history",mode="full",quantile="0.99"} 1.635459
+dataset_acceleration_refresh_duration_ms_summary_sum{dataset="runtime.task_history",mode="full"} 1.635459
+dataset_acceleration_refresh_duration_ms_summary_count{dataset="runtime.task_history",mode="full"} 1
+# HELP flight_request_duration_ms_summary Summary derived from histogram flight_request_duration_ms
+# TYPE flight_request_duration_ms_summary summary
+flight_request_duration_ms_summary{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",quantile="0.5"} 0.05
+flight_request_duration_ms_summary{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",quantile="0.9"} 0.09000000000000001
+flight_request_duration_ms_summary{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",quantile="0.95"} 0.095
+flight_request_duration_ms_summary{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",quantile="0.99"} 0.099
+flight_request_duration_ms_summary_sum{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable"} 0.13725099999999998
+flight_request_duration_ms_summary_count{cache_namespace_kind="public",client="other",method="get_schema",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable"} 7
+flight_request_duration_ms_summary{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",quantile="0.5"} 0.175
+flight_request_duration_ms_summary{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",quantile="0.9"} 1.6000000000000005
+flight_request_duration_ms_summary{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",quantile="0.95"} 2.049999999999999
+flight_request_duration_ms_summary{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",quantile="0.99"} 2.4099999999999993
+flight_request_duration_ms_summary_sum{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable"} 2.488374
+flight_request_duration_ms_summary_count{cache_namespace_kind="public",client="other",command="statement_substrait_plan",method="do_get",protocol="flight",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable"} 6
+# HELP http_requests_duration_ms_summary Summary derived from histogram http_requests_duration_ms
+# TYPE http_requests_duration_ms_summary summary
+http_requests_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",quantile="0.5"} 0.015125
+http_requests_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",quantile="0.9"} 0.015125
+http_requests_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",quantile="0.95"} 0.015125
+http_requests_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",quantile="0.99"} 0.015125
+http_requests_duration_ms_summary_sum{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200"} 0.015125
+http_requests_duration_ms_summary_count{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200"} 1
+http_requests_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",quantile="0.5"} 0.05
+http_requests_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",quantile="0.9"} 0.09000000000000001
+http_requests_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",quantile="0.95"} 0.095
+http_requests_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",quantile="0.99"} 0.099
+http_requests_duration_ms_summary_sum{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503"} 0.117208
+http_requests_duration_ms_summary_count{cache_namespace_kind="public",client="other",method="GET",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503"} 2
+# HELP http_responses_duration_ms_summary Summary derived from histogram http_responses_duration_ms
+# TYPE http_responses_duration_ms_summary summary
+http_responses_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",quantile="0.5"} 0.038959
+http_responses_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",quantile="0.9"} 0.038959
+http_responses_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",quantile="0.95"} 0.038959
+http_responses_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200",quantile="0.99"} 0.038959
+http_responses_duration_ms_summary_sum{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200"} 0.038959
+http_responses_duration_ms_summary_count{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="200"} 1
+http_responses_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",quantile="0.5"} 0.13529099999999997
+http_responses_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",quantile="0.9"} 0.13529099999999997
+http_responses_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",quantile="0.95"} 0.13529099999999997
+http_responses_duration_ms_summary{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503",quantile="0.99"} 0.13529099999999997
+http_responses_duration_ms_summary_sum{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503"} 0.23529099999999997
+http_responses_duration_ms_summary_count{cache_namespace_kind="public",client="other",method="GET",outcome="complete",path="/v1/ready",protocol="http",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",status="503"} 2
+# HELP query_duration_ms_summary Summary derived from histogram query_duration_ms
+# TYPE query_duration_ms_summary summary
+query_duration_ms_summary{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",quantile="0.5"} 3.4375
+query_duration_ms_summary{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",quantile="0.9"} 4.6875
+query_duration_ms_summary{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",quantile="0.95"} 4.84375
+query_duration_ms_summary{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",quantile="0.99"} 4.96875
+query_duration_ms_summary_sum{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error"} 13.394251
+query_duration_ms_summary_count{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error"} 5
+# HELP query_execution_duration_ms_summary Summary derived from histogram query_execution_duration_ms
+# TYPE query_execution_duration_ms_summary summary
+query_execution_duration_ms_summary{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",quantile="0.5"} 3.4375
+query_execution_duration_ms_summary{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",quantile="0.9"} 4.6875
+query_execution_duration_ms_summary{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",quantile="0.95"} 4.84375
+query_execution_duration_ms_summary{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error",quantile="0.99"} 4.96875
+query_execution_duration_ms_summary_sum{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error"} 13.394584
+query_execution_duration_ms_summary_count{cache_namespace_kind="public",client="other",datasets="",protocol="flightsql",runtime="spiced",runtime_system="Darwin/27.0.0 aarch64",runtime_version="2.5.0-unstable",tags="error"} 5

@@ -1,0 +1,13 @@
+{
+  "date": "2026-10-28T07:41:44Z",
+  "commit": "944b5f351ef64c8713bfefd9d9cb8ce4cc134606",
+  "binary_sha256": "823f19ba1718df146e8ec7e67627c0c48a65cca0c3e4b6fc6cb68d9ae71cbed9",
+  "harness_commit": "84adbc129690e655781149c1caac33b4cffd626f",
+  "harness_sha256": "5f9fee848f5baf4cd9f5e3da4d494472a7bf16caa302a3f2dac0f7bc7ab1b29f",
+  "common_harness_sha256": "8d427ebe7d5fb2ab1756a6bcd39777721fbc44c4f20322e35bd4b5af2166cb9c",
+  "arguments": {
+    "spiced": "/private/tmp/spice-sidecar-artifacts/candidate-944b5f3/spiced",
+    "source_commit": "944b5f351ef64c8713bfefd9d9cb8ce4cc134606",
+    "out": "/private/tmp/spice-sidecar-artifacts/schema-944b5f3"
+  }
+}

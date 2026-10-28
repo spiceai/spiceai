@@ -1,0 +1,26 @@
+== sidecar-local[mode=server]: Both runtime deployment profiles serve local SQL and results-cache hits with the same literal answers, including NULLs a…
+   ok   default                1 start (0.3s)
+   ok   default                2 query: SELECT COUNT(*) AS n, COUNT(v) AS nonnull, SUM(v) AS total FROM (VALUES (1, CAST… (0.0s)
+   ok   default                3 http POST /v1/sql: SELECT 42 AS id (0.0s) 200 results-cache-status: MISS
+   ok   default                4 http POST /v1/sql: SELECT 42 AS id (0.0s) 200 results-cache-status: HIT
+   ok   default                5 http POST /v1/sql: SELECT 42 AS id (0.0s) 200 results-cache-status: BYPASS
+   ok   default                6 http POST /v1/sql: SELECT id FROM (VALUES (1), (2)) AS t(id) WHERE id < 0 (0.0s) 200 results-cache-status: MISS
+   ok   default                7 http POST /v1/sql: SELECT id FROM (VALUES (1), (2)) AS t(id) WHERE id < 0 (0.0s) 200 results-cache-status: HIT
+   ok   default                8 assert-log (0.0s) 16 lines
+   default log: /tmp/spice-sidecar-artifacts/spicescript-944b5f3/sidecar_local-0-47246/default/spiced.log
+== sidecar-local[mode=server] finished: ran 0.3s, waited 0.0s for slots
+== sidecar-local[mode=sidecar]: Both runtime deployment profiles serve local SQL and results-cache hits with the same literal answers, including NULLs a…
+   ok   default                1 start (0.3s)
+   ok   default                2 query: SELECT COUNT(*) AS n, COUNT(v) AS nonnull, SUM(v) AS total FROM (VALUES (1, CAST… (0.0s)
+   ok   default                3 http POST /v1/sql: SELECT 42 AS id (0.0s) 200 results-cache-status: MISS
+   ok   default                4 http POST /v1/sql: SELECT 42 AS id (0.0s) 200 results-cache-status: HIT
+   ok   default                5 http POST /v1/sql: SELECT 42 AS id (0.0s) 200 results-cache-status: BYPASS
+   ok   default                6 http POST /v1/sql: SELECT id FROM (VALUES (1), (2)) AS t(id) WHERE id < 0 (0.0s) 200 results-cache-status: MISS
+   ok   default                7 http POST /v1/sql: SELECT id FROM (VALUES (1), (2)) AS t(id) WHERE id < 0 (0.0s) 200 results-cache-status: HIT
+   ok   default                8 assert-log (0.0s) 17 lines
+   default log: /tmp/spice-sidecar-artifacts/spicescript-944b5f3/sidecar_local-1-47246/default/spiced.log
+== sidecar-local[mode=sidecar] finished: ran 0.3s, waited 0.3s for slots
+[1/1] done    sidecar-local in 0.7s: 16 passed, 0 failed
+recorded the duration of 1 script(s)
+
+1 scripts: 16 checks passed, 0 failed, in 0.7s

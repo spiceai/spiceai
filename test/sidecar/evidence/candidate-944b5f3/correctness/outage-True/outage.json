@@ -1,0 +1,28 @@
+{
+  "rows": [
+    {
+      "id": 42,
+      "value": null,
+      "label": "group2"
+    }
+  ],
+  "headers": {
+    "content-type": "application/json",
+    "results-cache-scope": "shared",
+    "spice-trace-id": "f27e7b6bb41756067735abe0dab57558",
+    "vary": "origin, access-control-request-method, access-control-request-headers",
+    "connection": "close",
+    "transfer-encoding": "chunked",
+    "date": "Wed, 28 Oct 2026 07:40:51 GMT"
+  },
+  "explain": [
+    {
+      "plan_type": "logical_plan",
+      "plan": "Filter: orders.id = Int64(42)\n  TableScan: orders projection=[id, value, label], partial_filters=[orders.id = Int64(42)]"
+    },
+    {
+      "plan_type": "physical_plan",
+      "plan": "SchemaCastScanExec\n  CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0\n    FilterExec: id@0 = 42\n      BytesProcessedExec\n        DataSourceExec: partitions=1, partition_sizes=[1]\n"
+    }
+  ]
+}

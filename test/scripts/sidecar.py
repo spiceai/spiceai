@@ -77,6 +77,7 @@ class Instance:
         self.http, self.flight, self.metrics = http_port or port(), port(), port()
         self.cores = cores
         self.extra_args = extra_args or []
+        self.executor = "executor" in self.extra_args
         self.api_key = api_key
         self.process = None
         self.log = None
@@ -100,7 +101,11 @@ class Instance:
             f"127.0.0.1:{self.metrics}",
         ] + self.extra_args
         (self.directory / "command.json").write_text(json.dumps(self.command))
-        environment = dict(os.environ, SPICE_CPU_CORES=str(self.cores))
+        environment = dict(
+            os.environ,
+            SPICE_CPU_CORES=str(self.cores),
+            SPICE_INSTANCE_ID=f"sidecar-test-{os.getpid()}-{self.directory.name}",
+        )
         self.process = subprocess.Popen(
             self.command,
             cwd=self.directory,
@@ -125,7 +130,8 @@ class Instance:
                 raise RuntimeError((self.directory / "spiced.log").read_text())
             try:
                 request = urllib.request.Request(
-                    f"http://127.0.0.1:{self.http}/v1/ready",
+                    f"http://127.0.0.1:{self.http}"
+                    + ("/health" if self.executor else "/v1/ready"),
                     headers={"x-api-key": self.api_key} if self.api_key else {},
                 )
                 with urllib.request.urlopen(request, timeout=2):
@@ -628,6 +634,21 @@ def main():
             # also covers partial cluster startup.
             executors.append(executor)
             executor.start()
+        if executors:
+            limit = time.monotonic() + 90
+            readiness = (
+                f"http://127.0.0.1:{upstream.http}/v1/ready"
+                f"?min_ready_executors={len(executors)}&verbose=true"
+            )
+            while True:
+                try:
+                    with urllib.request.urlopen(readiness, timeout=2) as response:
+                        (args.out / "cluster-ready.txt").write_bytes(response.read())
+                    break
+                except urllib.error.URLError:
+                    if time.monotonic() >= limit:
+                        raise TimeoutError("scheduler executor registration") from None
+                    time.sleep(0.1)
         cluster_explain, _ = upstream.query(
             "EXPLAIN SELECT SUM(value) FROM remote_orders"
         )
