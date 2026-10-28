@@ -34,3 +34,6 @@ steps:
   - explain: SELECT DISTINCT ON (a) a FROM app_table ORDER BY a NULLS LAST, id
     contains: CayenneAccelerationExec
     only: cayenne
+  - explain: SELECT a FROM (SELECT DISTINCT ON (a) a FROM app_table ORDER BY a NULLS LAST, id) WHERE a > 0 ORDER BY a
+    contains: FilterExec
+    only: federated
