@@ -10,7 +10,14 @@ in-process HTTPS server. This skill is the end-to-end check against a real `spic
 
 ## 1. PKI in a scratch dir (never in the repo)
 
+Run from the repo root after `cargo build -p spice -p spiced`, so the branch binaries come first on `PATH`
+instead of an installed release:
+
 ```bash
+BIN="$(pwd)/target/debug"
+test -x "$BIN/spice" && test -x "$BIN/spiced" || { echo "build the branch binaries first" >&2; exit 1; }
+export PATH="$BIN:$PATH"
+command -v spice   # must print $BIN/spice
 D=$(mktemp -d); cd "$D"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=verify CA" -keyout ca.key -out ca.pem
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=unrelated CA" -keyout other.key -out wrongca.pem
@@ -41,7 +48,7 @@ datasets: []
 
 Start it on unused ports: `spiced --http 127.0.0.1:28090 --flight 127.0.0.1:25051 --metrics 127.0.0.1:29090 &`.
 
-## 3. Checks (use the CLI built from the branch: `target/debug/spice`)
+## 3. Checks (bare `spice` resolves to `$BIN/spice` from step 1)
 
 | Command | Expected |
 |---|---|
