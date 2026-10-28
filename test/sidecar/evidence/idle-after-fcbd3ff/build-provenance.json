@@ -1,0 +1,7 @@
+{
+  "source_commit": "fcbd3ff838d28aecd9d361049bee284d0618273a",
+  "date": "2026-10-28",
+  "command": "env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ CARGO_TARGET_DIR=/Users/Code/dev/spiceai/target CARGO_BUILD_JOBS=4 LIBRARY_PATH=/tmp/spice-sidecar-deps/odbc/lib cargo test --no-run --message-format json-render-diagnostics --exclude libnfs --all --lib --bins --test adbc_cancellation --test cayenne_runtime_tuning --test chat_tool_use --test cli_integration --test connect_service_cli --test contract --test enrollment_flow --test footer_cache_accounting --test integration --test isolated --test json_semantics --test metrics --test optional_snapshot_files --test rate_control --test results_cache_growth --test standalone_enrollment_e2e --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench,cayenne/result-correctness-duckdb --profile lint",
+  "exit_code": 0,
+  "duration": "2m42s"
+}

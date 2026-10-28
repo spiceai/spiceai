@@ -501,6 +501,7 @@ also requires the repository's full workspace gate on the pushed PR HEAD:
 ```bash
 env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ \
   CARGO_TARGET_DIR=/Users/Code/dev/spiceai/target \
+  LIBRARY_PATH=/tmp/spice-sidecar-deps/odbc/lib \
   CARGO_BUILD_JOBS=4 SIGNOFF_SKIP_TARGETED_LINT=1 SIGNOFF_SKIP_TARGETED_TESTS=1 \
   make signoff
 ```
@@ -508,6 +509,8 @@ env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ \
 The documented targeted-precheck opt-outs avoid repeating the focused passes;
 they do not narrow full workspace lint, nextest or CLI verification. The script
 uses the complete `RUST_GATE_FEATURES` and the merge queue's `lint` profile.
+The linker path provides this host's task-local UnixODBC installation; the
+dependency-repair artifacts below record the verified packages and link probe.
 The PR's `signoff` status and `Attestation` check must refer to its final pushed
 commit. Native qualification and benchmark output do not substitute for that
 gate. See [CI sign-off](../../docs/dev/ci_signoff.md).
@@ -541,5 +544,10 @@ test clock, so this reproduction uses the native test binary.
 
 The fixture now observes registration on real time, pauses time for the idle
 timeout and registry removal, then resumes real time for the gRPC stream's EOF.
-Its sender remains open, preserving the idle-connection assertion. The same
-48-run probe and full sign-off are required on the corrected fixture.
+Its sender remains open, preserving the idle-connection assertion. The exact
+same 48-run/eight-process probe on
+`fcbd3ff838d28aecd9d361049bee284d0618273a` then reported 48 passes, zero
+registration failures and zero other failures. The [after outputs and build command](evidence/idle-after-fcbd3ff)
+retain every result. Production runtime code and the measured sidecar binary
+are unchanged; full sign-off is required on the final pushed commit containing
+this test-fixture correction.
