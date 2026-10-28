@@ -3838,7 +3838,7 @@ dependencies = [
 
 [[package]]
 name = "cayenne-metastore-model"
-version = "2.4.0-unstable"
+version = "2.5.0-unstable"
 dependencies = [
  "stateright",
 ]
