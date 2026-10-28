@@ -112,6 +112,7 @@ pub mod pk_filter_expr;
 pub mod rate_limit;
 
 pub mod cdc;
+pub mod csv_header_projection;
 pub mod delete;
 pub mod http;
 pub mod index_maintenance;
