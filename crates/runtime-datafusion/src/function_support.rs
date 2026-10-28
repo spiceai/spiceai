@@ -105,9 +105,19 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 /// below, not by name. A denied name is never advertised as native, which
 /// [`crate::dialect::duckdb_native_function_names`] enforces should a handled
 /// name ever join this list.
+///
+/// `to_char`, `to_unixtime` and `cardinality` are here because `DuckDB` either
+/// has no function of that name (`to_char`, `to_unixtime`: `Scalar Function
+/// with name to_char does not exist!`) or one that takes a different type
+/// (`cardinality` is `DuckDB`'s map-size function and fails on a list with
+/// `Cardinality can only operate on MAPs`). Each failed the whole query where
+/// `DataFusion` answers it locally (measured on `DuckDB` v1.4.4).
 pub const DUCKDB_DENIED_BUILTINS: &[&str] = &[
     crate::dialect::REGEXP_MATCH_NAME,
     crate::dialect::REGEXP_INSTR_NAME,
+    "to_char",
+    "to_unixtime",
+    "cardinality",
 ];
 
 /// The deny-list for a consumer that installs the `DuckDB` dialect but wants
@@ -135,8 +145,8 @@ pub fn deny_spice_functions_for_duckdb_dialect_without_carve_out() -> FunctionSu
         .aggregate_call(Arc::new(crate::dialect::duckdb_can_translate_aggregate))
         .window_call(Arc::new(crate::dialect::duckdb_can_translate_window))
         .renders_aggregate_order_by(crate::dialect::duckdb_renders_aggregate_order_by)
+        .expression(Arc::new(duckdb_can_evaluate_expression))
         .build()
-        .with_expression_support(Arc::new(duckdb_can_evaluate_expression))
 }
 
 /// The one `DuckDB` policy both public accessors return, so the connector and
@@ -149,8 +159,8 @@ fn duckdb_function_support() -> FunctionSupport {
         .aggregate_call(Arc::new(crate::dialect::duckdb_can_translate_aggregate))
         .window_call(Arc::new(crate::dialect::duckdb_can_translate_window))
         .renders_aggregate_order_by(crate::dialect::duckdb_renders_aggregate_order_by)
+        .expression(Arc::new(duckdb_can_evaluate_expression))
         .build()
-        .with_expression_support(Arc::new(duckdb_can_evaluate_expression))
 }
 
 /// Whether `DuckDB` evaluates this non-function expression node the way
@@ -239,8 +249,8 @@ pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
         .scalar_call(Arc::new(crate::dialect::bigquery_can_translate))
         .aggregate_call(Arc::new(crate::dialect::bigquery_can_translate_aggregate))
         .window_call(Arc::new(crate::dialect::bigquery_can_translate_window))
+        .expression(Arc::new(bigquery_can_evaluate_expression))
         .build()
-        .with_expression_support(Arc::new(bigquery_can_evaluate_expression))
 }
 
 /// Whether `BigQuery` can evaluate this non-function expression shape without
@@ -351,8 +361,8 @@ pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
         .deny_also(SQLITE_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
         .aggregate_call(Arc::new(sqlite_can_translate_aggregate))
         .window_call(Arc::new(sqlite_can_translate_window))
+        .expression(Arc::new(sqlite_can_evaluate_expression))
         .build()
-        .with_expression_support(Arc::new(sqlite_can_evaluate_expression))
 }
 
 /// The aggregates `SQLite` evaluates the way `DataFusion` does. It is an
@@ -566,8 +576,8 @@ fn sqlite_cast_is_faithful(from: &DataType, to: &DataType) -> bool {
 pub fn deny_spice_functions_for_mysql_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .deny_also([crate::dialect::BTRIM_NAME.to_string()])
+        .expression(Arc::new(crate::dialect::mysql_can_evaluate_expression))
         .build()
-        .with_expression_support(Arc::new(crate::dialect::mysql_can_evaluate_expression))
 }
 
 /// `DataFusion`'s nested array/list/map functions that `PostgreSQL` cannot
@@ -607,8 +617,8 @@ pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
         .cloned();
     FunctionSupportBuilder::new()
         .deny_also(unsupported_arrays)
+        .expression(Arc::new(crate::dialect::postgres_can_evaluate_expression))
         .build()
-        .with_expression_support(Arc::new(crate::dialect::postgres_can_evaluate_expression))
 }
 
 #[cfg(test)]
@@ -2180,9 +2190,12 @@ mod tests {
     }
 
     /// The backend policies every test of a universal refusal runs over: the
-    /// plain one every catalog connector takes and each backend's own.
+    /// plain one every catalog connector takes and each backend's own, plus the
+    /// plain policy with an engine's expression gate added the way the ADBC and
+    /// ODBC routes add it, which has to keep the universal refusal rather than
+    /// replace it.
     fn every_backend_policy() -> Vec<(&'static str, FunctionSupport)> {
-        vec![
+        let mut policies = vec![
             ("plain", function_support()),
             ("DuckDB", deny_spice_functions_for_duckdb_table_providers()),
             (
@@ -2199,7 +2212,15 @@ mod tests {
             ),
             ("SQLite", deny_spice_functions_for_sqlite_table_providers()),
             ("MySQL", deny_spice_functions_for_mysql_table_providers()),
-        ]
+        ];
+        for engine in ["duckdb", "postgresql", "mysql"] {
+            let gate = expression_support_for_engine(engine).expect("engine has a gate");
+            policies.push((
+                engine,
+                runtime_udfs_api::and_expression_support(function_support(), gate),
+            ));
+        }
+        policies
     }
 
     fn similar_to(pattern: &str, negated: bool, escape_char: Option<char>) -> Expr {

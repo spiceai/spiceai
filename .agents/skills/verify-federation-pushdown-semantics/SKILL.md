@@ -31,8 +31,10 @@ Each probe runs against both:
    fails or gives an infinity), and `n / 2`, `n % 2`.
 5. `to_char`, `to_unixtime`, `cardinality` (not in DuckDB, or different).
 
-An answer (JSON array) has to match byte for byte. When both sides fail, they
-agree, because the messages differ by engine. Two `EXPLAIN` checks follow:
+Both routes must answer with a JSON array, and the two arrays must match byte
+for byte. The two probes DataFusion fails by design (`n % 0`, `n / (k - 3)`)
+must fail on both routes with `Divide by zero`; any other failure is a
+mismatch, so a shared planning error never passes. Two `EXPLAIN` checks follow:
 `SIMILAR TO` must not reach DuckDB as `LIKE 'cust_[0-9]+'`, and `n / 2` must
 still push (`//` in `base_sql`).
 

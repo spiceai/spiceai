@@ -44,18 +44,32 @@ curl -sf "$HTTP/v1/ready" >/dev/null || { echo "spiced did not become ready; log
 
 q() { curl -s "$HTTP/v1/sql" -H 'content-type: text/plain' -d "$1"; }
 
-# A JSON array is an answer; anything else is an error. Two errors agree (the
-# message differs by engine); an answer must match byte for byte.
+# Every probe must answer on both routes with the same JSON array, byte for
+# byte. A probe DataFusion fails by design is written with `probe_error`: both
+# routes must then fail with that error, so an unrelated failure (a planning
+# error, a missing table) on both never counts as agreement.
 fail=0
-probe() {
-  local sql=$1 fed ref
+run_both() {
+  local sql=$1
   fed=$(q "${sql//\{T\}/fed}")
   ref=$(q "${sql//\{T\}/ref}")
   echo "== $sql"
   echo "fed: $fed"
   echo "ref: $ref"
-  if [[ $ref == \[* || $fed == \[* ]] && [[ $fed != "$ref" ]]; then
+}
+probe() {
+  local fed ref
+  run_both "$1"
+  if [[ $ref != \[* || $fed != \[* || $fed != "$ref" ]]; then
     echo "MISMATCH"
+    fail=1
+  fi
+}
+probe_error() {
+  local fed ref expected=$2
+  run_both "$1"
+  if [[ $ref == \[* || $fed == \[* || $ref != *"$expected"* || $fed != *"$expected"* ]]; then
+    echo "MISMATCH (both routes must fail with: $expected)"
     fail=1
   fi
 }
@@ -70,8 +84,8 @@ probe "select k, substr(s, 0, 2) AS substr_zero from {T} order by k"
 probe "select k, substr(s, 2, 2) AS substr_pos from {T} order by k"
 probe "select count(*) AS x_div0_is_null from {T} where x / 0 is null"
 probe "select count(*) AS x_div0_gt_1 from {T} where x / 0 > 1"
-probe "select count(*) AS n_div_k_minus_3 from {T} where n / (k - 3) > 0"
-probe "select count(*) AS n_mod0 from {T} where n % 0 is null"
+probe_error "select count(*) AS n_div_k_minus_3 from {T} where n / (k - 3) > 0" 'Divide by zero'
+probe_error "select count(*) AS n_mod0 from {T} where n % 0 is null" 'Divide by zero'
 probe "select k, n / 2 AS half, n % 2 AS rem from {T} order by k"
 probe "select to_char(now(), '%Y') AS to_char_y from {T} limit 1"
 probe "select k, to_unixtime(concat('2026-01-0', cast(k as varchar))) AS unix from {T} order by k"
