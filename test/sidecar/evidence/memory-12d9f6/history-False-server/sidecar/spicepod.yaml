@@ -1,0 +1,35 @@
+{
+  "version": "v1",
+  "kind": "Spicepod",
+  "name": "sidecar",
+  "runtime": {
+    "query": {
+      "target_partitions": 1,
+      "max_concurrent_queries": 16,
+      "memory_limit": "512MiB"
+    },
+    "caching": {
+      "sql_results": {
+        "enabled": false,
+        "item_ttl": "1h",
+        "max_size": "32MiB"
+      }
+    }
+  },
+  "datasets": [
+    {
+      "from": "spiceai:remote_orders",
+      "name": "orders",
+      "params": {
+        "spiceai_endpoint": "http://127.0.0.1:49430"
+      }
+    },
+    {
+      "from": "spiceai:remote_orders",
+      "name": "other_orders",
+      "params": {
+        "spiceai_endpoint": "http://127.0.0.1:49430"
+      }
+    }
+  ]
+}

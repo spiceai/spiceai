@@ -1,0 +1,24 @@
+[
+  {
+    "identity": "alice",
+    "trace_id": "cd61e4e33810292267a6e6f7330dd885",
+    "plan_sha256": "472c6f04a65480f591ca796f1e39e2f3ecb20a99650d6f559f47a43461834f08",
+    "rows": [
+      {
+        "id_alice": 1,
+        "key_alice": 1
+      }
+    ]
+  },
+  {
+    "identity": "bob",
+    "trace_id": "cd61e4e33810292267a6e6f7330dd885",
+    "plan_sha256": "8abf04e65a48b23f838422196ebb9c03f3f4e66692e9c96eac3a31c833f2ce0f",
+    "rows": [
+      {
+        "id_bob": 2,
+        "key_bob": 1
+      }
+    ]
+  }
+]

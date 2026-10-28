@@ -1,0 +1,10 @@
+[
+  {
+    "plan_type": "logical_plan",
+    "plan": "Federated\n Projection: reloaded_orders.id\n  TableScan: reloaded_orders projection=[id]"
+  },
+  {
+    "plan_type": "physical_plan",
+    "plan": "CooperativeExec\n  BytesProcessedExec\n    SubstraitExec: plan_bytes=88\n"
+  }
+]

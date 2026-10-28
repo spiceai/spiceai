@@ -1,0 +1,13 @@
+{
+  "source_commit": "12d9f6946ba3085816ab2230c7fdb5cb3bc6c503",
+  "date": "2026-10-28T11:13:05.192772+00:00",
+  "command": "env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ CARGO_TARGET_DIR=/Users/Code/dev/spiceai/target cargo build --release -p spiced -p testoperator -p spicescript --no-default-features --features release",
+  "build_duration": "14m50s",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "binaries": {
+    "spiced": "99aaf8f778ecb9ca4995601add20813e7a9611d2eadef0918221e6995c048f80",
+    "testoperator": "b0e95bb8e00d68272bebffcf709c4567cb4d59e4ec43a408ce77e0aeb40290c4",
+    "spicescript": "1f1d3c38b364ec3dc2c89144eb4a25d2f7e8395b99c15e6ad44485467fecd4fc"
+  },
+  "version": "v2.5.0-unstable"
+}

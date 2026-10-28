@@ -1,0 +1,52 @@
+{
+  "point": [
+    {
+      "plan_type": "logical_plan",
+      "plan": "Federated\n Projection: orders.id, orders.value, orders.label\n  Filter: orders.id = Int64(43)\n    TableScan: orders projection=[id, value, label], partial_filters=[orders.id = Int64(43)]"
+    },
+    {
+      "plan_type": "physical_plan",
+      "plan": "SchemaCastScanExec\n  CooperativeExec\n    BytesProcessedExec\n      VirtualExecutionPlan name=spice.ai compute_context=url=http://127.0.0.1:57696,username= base_sql=SELECT \"remote_orders\".\"id\", \"remote_orders\".\"value\", \"remote_orders\".\"label\" FROM \"remote_orders\" WHERE (\"remote_orders\".\"id\" = 43) AND (\"remote_orders\".\"id\" = 43)\n"
+    }
+  ],
+  "aggregate": [
+    {
+      "plan_type": "logical_plan",
+      "plan": "Federated\n Sort: orders.label ASC NULLS LAST\n  Projection: orders.label, count(Int64(1)) AS n, sum(orders.value) AS total\n    Aggregate: groupBy=[[orders.label]], aggr=[[count(Int64(1)), sum(orders.value)]]\n      TableScan: orders projection=[value, label]"
+    },
+    {
+      "plan_type": "physical_plan",
+      "plan": "SchemaCastScanExec\n  CooperativeExec\n    BytesProcessedExec\n      VirtualExecutionPlan name=spice.ai compute_context=url=http://127.0.0.1:57696,username= base_sql=SELECT \"remote_orders\".\"label\", count(1) AS \"n\", sum(\"remote_orders\".\"value\") AS \"total\" FROM \"remote_orders\" GROUP BY \"remote_orders\".\"label\" ORDER BY \"remote_orders\".\"label\" ASC NULLS LAST\n"
+    }
+  ],
+  "join": [
+    {
+      "plan_type": "logical_plan",
+      "plan": "Federated\n Sort: l.id ASC NULLS LAST\n  Projection: l.id, l.value, r.label\n    Inner Join:  Filter: l.id = r.id\n      Filter: l.id BETWEEN Int64(10) AND Int64(20)\n        SubqueryAlias: l\n          TableScan: orders projection=[id, value]\n      SubqueryAlias: r\n        TableScan: other_orders projection=[id, label]"
+    },
+    {
+      "plan_type": "physical_plan",
+      "plan": "SchemaCastScanExec\n  CooperativeExec\n    BytesProcessedExec\n      VirtualExecutionPlan name=spice.ai compute_context=url=http://127.0.0.1:57696,username= base_sql=SELECT \"l\".\"id\", \"l\".\"value\", \"r\".\"label\" FROM \"remote_orders\" AS \"l\" INNER JOIN \"remote_orders\" AS \"r\" ON (\"l\".\"id\" = \"r\".\"id\") WHERE (\"l\".\"id\" BETWEEN 10 AND 20) ORDER BY \"l\".\"id\" ASC NULLS LAST\n"
+    }
+  ],
+  "topk": [
+    {
+      "plan_type": "logical_plan",
+      "plan": "Federated\n Limit: skip=5, fetch=10\n  Sort: orders.value DESC NULLS FIRST, orders.id ASC NULLS LAST\n    Projection: orders.id, orders.value\n      Filter: orders.value IS NOT NULL\n        TableScan: orders projection=[id, value], partial_filters=[orders.value IS NOT NULL]"
+    },
+    {
+      "plan_type": "physical_plan",
+      "plan": "SchemaCastScanExec\n  CooperativeExec\n    BytesProcessedExec\n      VirtualExecutionPlan name=spice.ai compute_context=url=http://127.0.0.1:57696,username= base_sql=SELECT \"remote_orders\".\"id\", \"remote_orders\".\"value\" FROM \"remote_orders\" WHERE \"remote_orders\".\"value\" IS NOT NULL AND \"remote_orders\".\"value\" IS NOT NULL ORDER BY \"remote_orders\".\"value\" DESC NULLS FIRST, \"remote_orders\".\"id\" ASC NULLS LAST LIMIT 10 OFFSET 5\n"
+    }
+  ],
+  "nulls": [
+    {
+      "plan_type": "logical_plan",
+      "plan": "Federated\n Projection: count(Int64(1)) AS n, count(orders.value) AS nonnull, sum(orders.value) AS total\n  Aggregate: groupBy=[[]], aggr=[[count(Int64(1)), count(orders.value), sum(orders.value)]]\n    TableScan: orders projection=[value]"
+    },
+    {
+      "plan_type": "physical_plan",
+      "plan": "SchemaCastScanExec\n  CooperativeExec\n    BytesProcessedExec\n      VirtualExecutionPlan name=spice.ai compute_context=url=http://127.0.0.1:57696,username= base_sql=SELECT count(1) AS \"n\", count(\"remote_orders\".\"value\") AS \"nonnull\", sum(\"remote_orders\".\"value\") AS \"total\" FROM \"remote_orders\"\n"
+    }
+  ]
+}

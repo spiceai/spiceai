@@ -1,0 +1,21 @@
+{
+  "rows": [
+    {
+      "id": 42,
+      "value": null,
+      "label": "group2"
+    }
+  ],
+  "headers": {
+    "content-type": "application/json",
+    "x-cache": "Hit from spiceai",
+    "results-cache-status": "HIT",
+    "results-cache-scope": "shared",
+    "spice-trace-id": "29c522be683873398c72d02873d1aba5",
+    "vary": "origin, access-control-request-method, access-control-request-headers",
+    "connection": "close",
+    "transfer-encoding": "chunked",
+    "date": "Wed, 28 Oct 2026 11:49:14 GMT"
+  },
+  "explain": null
+}

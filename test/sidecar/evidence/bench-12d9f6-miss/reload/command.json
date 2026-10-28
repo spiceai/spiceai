@@ -1,0 +1,1 @@
+["/private/tmp/spice-sidecar-artifacts/candidate-12d9f6/spiced", "--http", "127.0.0.1:57678", "--flight", "127.0.0.1:57679", "--metrics", "127.0.0.1:57680", "--pods-watcher-enabled"]

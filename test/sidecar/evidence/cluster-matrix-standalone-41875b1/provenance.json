@@ -1,0 +1,20 @@
+{
+  "date": "2026-10-28T12:00:12.022237+00:00",
+  "tool_source_commit": "41875b12765bde0755da3358ce68c51bd9bd7661",
+  "runtime_source_commit": "12d9f6946ba3085816ab2230c7fdb5cb3bc6c503",
+  "spicescript_sha256": "2fe7b656ea019109543b20d99b71681188d75fdcf898bb81ce4cdafd7de9b6a7",
+  "spiced_sha256": "99aaf8f778ecb9ca4995601add20813e7a9611d2eadef0918221e6995c048f80",
+  "command": [
+    "env",
+    "SPICE_CPU_CORES=2",
+    "/tmp/spice-sidecar-artifacts/candidate-41875b1/spicescript",
+    "--jobs",
+    "1",
+    "--spiced",
+    "/tmp/spice-sidecar-artifacts/candidate-12d9f6/spiced",
+    "--work-dir",
+    "/tmp/spice-sidecar-artifacts/cluster-matrix-standalone-41875b1/run",
+    "test/spicescript/sidecar-local.yaml"
+  ],
+  "exit_code": 0
+}

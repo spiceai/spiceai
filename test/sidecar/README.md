@@ -76,8 +76,8 @@ python3 test/scripts/sidecar.py \
 
 ## Candidate qualification
 
-The initial qualification binary was built from
-`944b5f351ef64c8713bfefd9d9cb8ce4cc134606` on 2026-10-28 UTC with:
+The final native qualification binary was built from
+`12d9f6946ba3085816ab2230c7fdb5cb3bc6c503` on 2026-10-28 UTC with:
 
 ```bash
 env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ \
@@ -86,18 +86,20 @@ env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ \
   --no-default-features --features release
 ```
 
-The build exited 0 after 14m51s. `spiced --version` reported
+The build exited 0 after 14m50s. `spiced --version` reported
 `v2.5.0-unstable`; its SHA-256 is
-`823f19ba1718df146e8ec7e67627c0c48a65cca0c3e4b6fc6cb68d9ae71cbed9`.
+`99aaf8f778ecb9ca4995601add20813e7a9611d2eadef0918221e6995c048f80`.
 This uses the core release feature set; the complete workspace sign-off remains
-a separate requirement. The trace correction described below changes the
-production Rust tree and needs a new binary and qualification run.
+a separate requirement. This binary includes the trace correction described
+below and trunk through `81e841769af2a3063328539c12929cac94503161`.
 
-The [candidate artifacts](evidence/candidate-944b5f3) retain returned rows,
+The [candidate artifacts](evidence/candidate-12d9f6) retain returned rows,
 schemas, plans, responses, source identities and commands. The native commands
-above used `/tmp/spice-sidecar-artifacts/candidate-944b5f3/spiced`,
-`--source-commit 944b5f351ef64c8713bfefd9d9cb8ce4cc134606`, and fresh output
+above used `/tmp/spice-sidecar-artifacts/candidate-12d9f6/spiced`,
+`--source-commit 12d9f6946ba3085816ab2230c7fdb5cb3bc6c503`, and fresh output
 directories named after each driver under `/tmp/spice-sidecar-artifacts`.
+Large raw files and logs are compressed byte-for-byte; each directory's manifest
+records their uncompressed SHA-256 and size. No private keys are included.
 
 | Run | Actual result |
 | --- | --- |
@@ -111,9 +113,17 @@ directories named after each driver under `/tmp/spice-sidecar-artifacts`.
 | mTLS identities | Returned `(aid=1, bid=2)` through two identity-scoped fragments |
 | Source-free spicescript | `16 checks passed, 0 failed` in server/sidecar matrix |
 | Scheduler topology | Two of two executors registered; 47 exact comparisons per mode. Captured synchronous plan executed locally, so this does not establish distributed task execution |
-| Flight/Substrait integration | `6 tests passed, 552 skipped` under the focused protocol filter |
+| Trace propagation | Four cases retained their trace IDs and W3C parents with zero internal history reads; ten distinct generated IDs reused one plan-cache entry for nine hits |
 
-The scoped release unit command was:
+The expanded Flight/Substrait/HTTP trace integration command on source
+`f4f0d5dc7885fc4bc5d20dcc130ab3456a881682` reported
+`15 tests passed, 547 skipped` in 3.098s. Its [command and raw log](evidence/trace-sdk-f4f0d5d/protocol.json)
+cover the real network handlers, sidecar and Substrait commands, HTTP and Flight
+trace precedence, authentication metadata and cookies. The subsequent trunk
+merge changed the cache implementation; the final native cache runs above
+exercise that merged code, and full workspace sign-off remains required.
+
+The earlier scoped release unit command on candidate `944b5f3` was:
 
 ```bash
 env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ \
@@ -245,7 +255,85 @@ instance; this is not an OS CPU quota on macOS. Provenance records the CPU model
 host CPU count, memory and starting load average. The integer-millisecond load
 table cannot establish submillisecond differences.
 
-## Standalone uplink measurements
+## Final standalone uplink measurements
+
+Source `12d9f6946ba3085816ab2230c7fdb5cb3bc6c503`, 2026-10-28 UTC.
+The exact command was:
+
+```bash
+python3 test/scripts/sidecar.py \
+  --spiced /tmp/spice-sidecar-artifacts/candidate-12d9f6/spiced \
+  --source-commit 12d9f6946ba3085816ab2230c7fdb5cb3bc6c503 \
+  --testoperator /tmp/spice-sidecar-artifacts/candidate-12d9f6/testoperator \
+  --rows 100000 --concurrency 2 8 32 128 --duration 30 --cache-states miss \
+  --out /tmp/spice-sidecar-artifacts/bench-12d9f6-miss
+python3 test/scripts/sidecar_report.py \
+  /tmp/spice-sidecar-artifacts/bench-12d9f6-miss \
+  --output /tmp/spice-sidecar-artifacts/bench-12d9f6-miss-summary.json
+```
+
+Both commands exited 0. The [complete report and raw artifacts](evidence/bench-12d9f6-miss)
+record `complete: true`, 16 of 16 arms, every measured query status `passed`,
+and zero resource-observer errors. Each repetition is shown below; P99 values
+are not averaged.
+
+| Clients | Protocol | Repetition | Queries/s | P99 ms: aggregate / join / nulls / point / topk | Upstream peak RSS MiB |
+| --- | --- | --- | ---: | --- | ---: |
+| 2 | SQL | 0 | 646.7 | 2 / 2 / 5 / 4 / 8 | 181.1 |
+| 2 | Substrait | 1 | 732.6 | 5 / 5 / 4 / 4 / 5 | 173.0 |
+| 2 | Substrait | 2 | 748.2 | 5 / 2 / 4 / 4 / 8 | 173.7 |
+| 2 | SQL | 3 | 639.2 | 2 / 2 / 5 / 5 / 5 | 180.8 |
+| 8 | SQL | 0 | 828.3 | 22 / 22 / 20 / 22 / 26 | 191.2 |
+| 8 | Substrait | 1 | 867.3 | 22 / 21 / 21 / 20 / 24 | 181.5 |
+| 8 | Substrait | 2 | 867.4 | 21 / 20 / 20 / 20 / 23 | 180.8 |
+| 8 | SQL | 3 | 835.5 | 22 / 21 / 21 / 22 / 25 | 191.1 |
+| 32 | SQL | 0 | 851.3 | 63 / 63 / 61 / 62 / 66 | 194.0 |
+| 32 | Substrait | 1 | 870.2 | 61 / 61 / 59 / 59 / 62 | 182.5 |
+| 32 | Substrait | 2 | 875.0 | 61 / 61 / 59 / 60 / 63 | 182.3 |
+| 32 | SQL | 3 | 851.2 | 64 / 64 / 62 / 62 / 67 | 194.3 |
+| 128 | SQL | 0 | 851.7 | 188 / 186 / 185 / 186 / 187 | 194.2 |
+| 128 | Substrait | 1 | 876.0 | 198 / 199 / 197 / 196 / 202 | 183.2 |
+| 128 | Substrait | 2 | 875.0 | 197 / 194 / 194 / 193 / 198 | 183.4 |
+| 128 | SQL | 3 | 849.6 | 187 / 187 / 187 / 188 / 190 | 195.6 |
+
+Substrait throughput was higher in every completed bracket: 13–17% at two
+clients, approximately 4% at eight, and 2–3% at 32 and 128. This is not a
+universal tail-latency improvement. P99 was mixed at two clients, lower at eight
+and 32, and higher at 128: SQL reported 185–190 ms across the five queries,
+versus Substrait 193–202 ms. The high-concurrency throughput gain therefore
+comes with a measured tail tradeoff on this rig. These loopback results do not
+quantify the benefit of removing a round trip across a remote network.
+
+Upstream peak RSS ranged from 173.0–183.4 MiB for Substrait versus
+180.8–195.6 MiB for SQL. Sidecar process peaks ranged from 136.6–156.7 MiB
+across both protocols. HTTP health P99 remained below 0.91 ms in every arm.
+Whole-arm counters recorded one `do_get/statement_substrait_plan` per remote
+Substrait fragment versus SQL `get_flight_info/sql_query` plus `do_get/sql_query`.
+
+Large raw files are gzip-compressed byte-for-byte. `manifest.json` records
+their uncompressed hashes and lengths; the report separately records each
+testoperator log hash. Query files contain the independent SQLite answers used
+by `--validate`.
+
+The separate cache-hit command used the same immutable binaries and source,
+`--rows 100000 --concurrency 32 --duration 30 --cache-states hit`, and output
+`/tmp/spice-sidecar-artifacts/bench-12d9f6-hit`. The driver and reporter exited
+0. The [complete cache-hit report and raw artifacts](evidence/bench-12d9f6-hit)
+record four of four arms, all query statuses `passed`, and zero observer errors:
+
+| Protocol | Repetition | Queries/s | Per-query P99 ms |
+| --- | --- | ---: | --- |
+| SQL | 0 | 13000.6 | 3 for all five queries |
+| Substrait | 1 | 13599.4 | 3 for all five queries |
+| Substrait | 2 | 13590.8 | 3 for all five queries |
+| SQL | 3 | 13035.7 | 3 for all five queries |
+
+All four arms recorded zero upstream query RPCs after warmup. Sidecar peak RSS
+was 699.8–723.8 MiB with task history enabled, and upstream peak RSS was
+136.2–139.5 MiB. HTTP health P99 ranged from 3.12–3.55 ms. These arms measure
+local cache serving; they do not measure remote delegation.
+
+## Before the trace correction: standalone uplink measurements
 
 Source `944b5f351ef64c8713bfefd9d9cb8ce4cc134606`, 2026-10-28 UTC, on the
 host described above. The command was:
@@ -348,8 +436,25 @@ recorded `10, 1, 1, 1` reconciliation reads for generated IDs, explicit pins,
 W3C parents and conflicting headers respectively, while every ID and parent
 remained correlated. All four cases failed the zero-reconciliation guard;
 the [actual failure and observations](evidence/trace-before-944b5f3) are retained.
-The corrected binary, repeated memory probe and new uplink measurements remain
-to be run.
+On the corrected `12d9f6` binary, the same command recorded
+`0, 0, 0, 0` internal reads. All four cases retained the expected rows, IDs and
+parents; the ten generated IDs produced nine hits for the same serialized plan.
+The [after observations and metric snapshots](evidence/candidate-12d9f6/trace)
+retain that run.
+
+The exact same [20,000-request memory probe](evidence/memory-12d9f6) then recorded:
+
+| Task history | SQL peak upstream RSS MiB | Substrait peak upstream RSS MiB |
+| --- | ---: | ---: |
+| Enabled | 155.9 | 155.4 |
+| Disabled | 138.2 | 134.0 |
+
+Every answer matched SQLite. Both enabled runs recorded all 20,005 SQL-query
+tasks (20,000 measured requests plus five warmup queries), with no internal
+history reconciliation reads during load. The artifacts include every answer,
+resource trace, metric snapshot, idle-period reading, command, source identity,
+and the unchanged probe's source and hash. The probe establishes process-memory
+behavior; its wall-clock duration is not used as a latency benchmark.
 
 The real-SDK nested-span guard also caught a root-claim ordering error in
 candidate `00971c2`: a root with no incoming propagated ID could publish its ID
@@ -358,5 +463,51 @@ without consuming the root claim, letting its child reparent itself. The
 Candidate `f4f0d5d` consumes that claim after resolution. The exact same focused
 command then reported [16 passed, 3625 skipped](evidence/trace-sdk-f4f0d5d) in
 0.383s, including matching pins, conflicting IDs, missing propagation, generated
-IDs and nested parent checks. These SDK tests supplement the pending native
-after-run; they do not replace it.
+IDs and nested parent checks. These SDK tests supplement the native after-run;
+they do not replace it.
+
+## Shared cluster scenario runner
+
+The review reproduction used the immutable `12d9f6` runtime and spicescript:
+
+```bash
+env SPICE_CPU_CORES=2 /tmp/spice-sidecar-artifacts/candidate-12d9f6/spicescript \
+  --jobs 1 --cluster \
+  --spiced /tmp/spice-sidecar-artifacts/candidate-12d9f6/spiced \
+  --work-dir /tmp/spice-sidecar-artifacts/cluster-matrix-before-12d9f6/run \
+  test/spicescript/sidecar-local.yaml
+```
+
+It exited 1 with `8 checks passed, 1 failed`; the sidecar instance received
+`--role scheduler` and emitted the documented incompatible-role error. The
+[before output and runtime logs](evidence/cluster-matrix-before-12d9f6) retain
+the failure. The shared instance creator now skips sidecar entries when the
+runner assigns cluster roles, including the results-cache matrix.
+
+Repeating the command with spicescript from
+`41875b12765bde0755da3358ce68c51bd9bd7661` and a fresh work directory exited
+0: `8 checks passed, 0 failed`, retaining server-mode cluster coverage and
+printing the explicit sidecar skip. The same tool without `--cluster` reported
+`16 checks passed, 0 failed`. The [cluster after-run](evidence/cluster-matrix-after-41875b1)
+and [standalone after-run](evidence/cluster-matrix-standalone-41875b1) record
+their exact commands, tool hash and unchanged runtime hash. This reproduction
+uses the source-free scenario; it does not claim a PostgreSQL-backed run.
+
+## Merge sign-off
+
+The native binaries above use the core release feature set. Merge qualification
+also requires the repository's full workspace gate on the pushed PR HEAD:
+
+```bash
+env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ \
+  CARGO_TARGET_DIR=/Users/Code/dev/spiceai/target \
+  CARGO_BUILD_JOBS=4 SIGNOFF_SKIP_TARGETED_LINT=1 SIGNOFF_SKIP_TARGETED_TESTS=1 \
+  make signoff
+```
+
+The documented targeted-precheck opt-outs avoid repeating the focused passes;
+they do not narrow full workspace lint, nextest or CLI verification. The script
+uses the complete `RUST_GATE_FEATURES` and the merge queue's `lint` profile.
+The PR's `signoff` status and `Attestation` check must refer to its final pushed
+commit. Native qualification and benchmark output do not substitute for that
+gate. See [CI sign-off](../../docs/dev/ci_signoff.md).

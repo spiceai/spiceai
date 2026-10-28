@@ -1,0 +1,101 @@
+import argparse
+import concurrent.futures
+import hashlib
+import json
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, '/Users/Code/dev/spiceai/test/scripts')
+from sidecar import Instance, QUERIES, base_pod, expected, fixture, observe
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--spiced', type=Path, required=True)
+    parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--source-commit', required=True)
+    parser.add_argument('--requests', type=int, default=20000)
+    parser.add_argument('--threads', type=int, default=8)
+    parser.add_argument('--idle-seconds', type=int, default=30)
+    args = parser.parse_args()
+    args.spiced = args.spiced.resolve()
+    args.out.mkdir(parents=True, exist_ok=False)
+    (args.out/'provenance.json').write_text(json.dumps({
+        'source_commit':args.source_commit,
+        'date': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'binary_sha256': hashlib.sha256(args.spiced.read_bytes()).hexdigest(),
+        'probe_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        'command':sys.argv,
+    }, indent=2))
+    database, source = fixture(args.out, 100000)
+    queries = [(name,sql,expected(database,sql)) for name,sql in QUERIES.items() if name != 'empty']
+    results=[]
+    for history in [True,False]:
+        for mode in ['server','sidecar']:
+            run = args.out/f'history-{history}-{mode}'
+            upstream_pod=base_pod('upstream', [{
+                'from': f'file:{source}', 'name':'remote_orders',
+                'params':{'file_format':'csv'},
+                'acceleration':{'enabled':True,'engine':'cayenne','mode':'memory'},
+            }])
+            upstream_pod['runtime']['task_history']={'enabled':history}
+            upstream=Instance(args.spiced,run/'upstream',upstream_pod)
+            sidecar=None
+            stop=threading.Event()
+            observer=None
+            try:
+                upstream.start()
+                datasets=[{'from':f'spiceai:remote_orders','name':name,'params':{'spiceai_endpoint':f'http://127.0.0.1:{upstream.flight}'}} for name in ['orders','other_orders']]
+                sidecar=Instance(args.spiced,run/'sidecar',base_pod('sidecar',datasets,mode))
+                sidecar.start()
+                for name,sql,oracle in queries:
+                    actual,_=sidecar.query(sql)
+                    assert actual==oracle,(name,actual,oracle)
+                (run/'upstream-metrics-before.txt').write_text(upstream.metrics_text())
+                with (run/'resources.jsonl').open('w') as resource_file, (run/'answers.jsonl').open('w') as answer_file:
+                    observer=threading.Thread(target=observe,args=(sidecar,upstream,stop,resource_file))
+                    observer.start()
+                    def worker(index):
+                        name,sql,oracle=queries[index%len(queries)]
+                        actual,_=sidecar.query(sql)
+                        assert actual==oracle,(index,name,actual,oracle)
+                        return {'index':index,'name':name,'actual':actual}
+                    started=time.monotonic()
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as workers:
+                        # Bounded submission keeps the Python client independent of the request count.
+                        for begin in range(0,args.requests,args.threads*4):
+                            for answer in workers.map(worker,range(begin,min(begin+args.threads*4,args.requests))):
+                                answer_file.write(json.dumps(answer)+'\n')
+                    elapsed=time.monotonic()-started
+                    (run/'load-ended-ns.txt').write_text(str(time.time_ns()))
+                    (run/'upstream-metrics-after.txt').write_text(upstream.metrics_text())
+                    for tool,arguments in [('vmmap',['-summary']),('heap',['--sortBySize','--noContent'])]:
+                        with (run/f'{tool}.txt').open('w') as output:
+                            try:
+                                subprocess.run([tool,*arguments,str(upstream.process.pid)],stdout=output,stderr=subprocess.STDOUT,timeout=30,check=False)
+                            except subprocess.TimeoutExpired:
+                                output.write('profile command timed out\n')
+                    time.sleep(args.idle_seconds)
+                    if history:
+                        task_rows,_=upstream.query('SELECT task, COUNT(*) AS n, SUM(length(input)) AS input_bytes, SUM(length(captured_output)) AS output_bytes FROM runtime.task_history GROUP BY task ORDER BY task')
+                        (run/'task-history-count.json').write_text(json.dumps(task_rows))
+                    stop.set();observer.join();observer=None
+                samples=[json.loads(line) for line in (run/'resources.jsonl').read_text().splitlines()]
+                rss=[row['upstream_rss_bytes'] for row in samples if 'upstream_rss_bytes' in row]
+                result={'history':history,'mode':mode,'requests':args.requests,'elapsed_seconds':elapsed,'initial_upstream_rss':rss[0],'peak_upstream_rss':max(rss),'after_idle_upstream_rss':rss[-1]}
+                results.append(result)
+                (args.out/'results.json').write_text(json.dumps(results,indent=2))
+                print(json.dumps(result),flush=True)
+            finally:
+                stop.set()
+                if observer:observer.join()
+                if sidecar:sidecar.stop()
+                upstream.stop()
+    database.close()
+
+
+if __name__=='__main__':
+    main()

@@ -1,0 +1,10 @@
+[
+  {
+    "plan_type": "logical_plan",
+    "plan": "Aggregate: groupBy=[[]], aggr=[[sum(remote_orders.value)]]\n  TableScan: remote_orders projection=[value]"
+  },
+  {
+    "plan_type": "physical_plan",
+    "plan": "AggregateExec: mode=Single, gby=[], aggr=[sum(remote_orders.value)]\n  SchemaCastScanExec\n    CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0\n      BytesProcessedExec\n        DataSourceExec: partitions=1, partition_sizes=[1]\n"
+  }
+]

@@ -1,0 +1,17 @@
+[
+  {
+    "path": "provenance.json",
+    "uncompressed_sha256": "0c3be03c30e791cc5b86389423fdd2ceb523556eaeaf4d8e44296588b3e47773",
+    "uncompressed_bytes": 731
+  },
+  {
+    "path": "build.log.gz",
+    "uncompressed_sha256": "a30cd6d20bff192a6ad537fb3f8d198eec3bd90c052f8fb226e7fb56d0befb45",
+    "uncompressed_bytes": 5578
+  },
+  {
+    "path": "check.log.gz",
+    "uncompressed_sha256": "88f2a27396a5025f79857d9adbff3965c6ec32863db206864dec79ae063f94f1",
+    "uncompressed_bytes": 30624
+  }
+]

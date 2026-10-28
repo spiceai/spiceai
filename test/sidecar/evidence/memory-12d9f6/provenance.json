@@ -1,0 +1,21 @@
+{
+  "source_commit": "12d9f6946ba3085816ab2230c7fdb5cb3bc6c503",
+  "date": "2026-10-28T11:15:17Z",
+  "binary_sha256": "99aaf8f778ecb9ca4995601add20813e7a9611d2eadef0918221e6995c048f80",
+  "probe_sha256": "5c4046308eb47407aae0d6b3c1b492f60e383628377f6140d6820d55b4a5b186",
+  "command": [
+    "/tmp/spice-sidecar-memory-probe.py",
+    "--spiced",
+    "/tmp/spice-sidecar-artifacts/candidate-12d9f6/spiced",
+    "--source-commit",
+    "12d9f6946ba3085816ab2230c7fdb5cb3bc6c503",
+    "--requests",
+    "20000",
+    "--threads",
+    "2",
+    "--idle-seconds",
+    "30",
+    "--out",
+    "/tmp/spice-sidecar-artifacts/memory-12d9f6"
+  ]
+}

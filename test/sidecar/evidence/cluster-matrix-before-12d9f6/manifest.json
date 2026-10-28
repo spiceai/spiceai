@@ -25,31 +25,6 @@
     "uncompressed_bytes": 361
   },
   {
-    "path": "run/sidecar_local-0-73735/default/state/_spice/format.json",
-    "uncompressed_sha256": "389dd876dcd314b0fbc0c9e8a00a9501d9ebd805eb2cbffcc807bf921d6531a5",
-    "uncompressed_bytes": 20
-  },
-  {
-    "path": "run/sidecar_local-0-73735/default/state/cluster/cluster.json",
-    "uncompressed_sha256": "c48658ca1a61af03a1bf08d9ed34f3c2e82a3517f879b6be232b8627a894853c",
-    "uncompressed_bytes": 128
-  },
-  {
-    "path": "run/sidecar_local-0-73735/default/state/cluster/executor_processes.json",
-    "uncompressed_sha256": "b9714ee5359cc612de20d3ea93594017c69dcae0549cb64671915458a2fff7f1",
-    "uncompressed_bytes": 217
-  },
-  {
-    "path": "run/sidecar_local-0-73735/default/state/cluster/executors/127.0.0.1:21289.json",
-    "uncompressed_sha256": "930da8938ab9eb58aa5e4a7a4246d9c6c9eb97d60c7a10245b07f671c14bea15",
-    "uncompressed_bytes": 113
-  },
-  {
-    "path": "run/sidecar_local-0-73735/default/state/cluster/heartbeats/sidecar_local-0-73735-0.json",
-    "uncompressed_sha256": "635412c35669607866ae674b62e3583021f545c4d3c54215acbedd616987cd60",
-    "uncompressed_bytes": 144
-  },
-  {
     "path": "run/sidecar_local-1-73735/default/spiced.log.gz",
     "uncompressed_sha256": "14292ba5f8944597df14304e3980f25cd93b0f8aeb3d746cebcdc252baeb47dc",
     "uncompressed_bytes": 1080

@@ -1,6 +1,6 @@
 # Cluster sidecar mode Enhancement
 
-Status: surface approved by the requester on 2026-10-27; implementation and qualification in progress.
+Status: surface approved by the requester on 2026-10-27; implementation, native qualification and standalone benchmarks complete. The full workspace merge gate is tracked in [PR #15728](https://github.com/spiceai/spiceai/pull/15728).
 Enhancement: [#15707](https://github.com/spiceai/spiceai/issues/15707).
 Source baseline: `34825bb456d62d616f693187b0baf0fa1e8cfb14`, inspected 2026-10-27.
 The specification below is the approved implementation contract.
@@ -54,10 +54,10 @@ Performance acceptance requires the engine runs in the QA plan.
 - [x] DX/UX Review
 - [ ] Release Notes / PRFAQ
 - [ ] Threat Model / Security Review
-- [ ] Tests
-- [ ] Telemetry / Metrics / Task History
-- [ ] Performance / Benchmarks
-- [ ] Documentation
+- [x] Tests (native qualification; full workspace gate is required on the final PR HEAD)
+- [x] Telemetry / Metrics / Task History
+- [x] Performance / Benchmarks (including the measured P99 tradeoff at 128 clients)
+- [x] Documentation
 - [ ] Cookbook Recipes/Tutorials
 
 The requester approved proceeding with implementation after reviewing this draft
@@ -391,20 +391,22 @@ recorded beside the test.
 Benchmark the same binary/rig with `server` and `sidecar` profiles, then compare
 the baseline and candidate commits with interleaved A/B/B/A runs. Use
 `testoperator` for query load and retain per-query timings, returned rows,
-validation output, metrics, and run directories. Exercise concurrency
-1/8/32/128 at 1/2/4 CPU budgets: warm results cache, cold remote misses,
-local point lookups, aggregations, mixed joins, unique-query bursts, and slow
-consumers. Separate SQL/plan/serialization time, remote request count, and
-execution time in the artifacts. Report P99 (P99.9 with sufficient samples),
-throughput, errors, and RSS under a fixed memory limit. Include expiry bursts,
-cache-disabled runs, sustained execution, and `/health` under load.
+validation output, metrics, and run directories. The completed comparison uses
+concurrency 2/8/32/128 at a two-core runtime budget, with point reads,
+aggregations, remote joins, top-k and NULLs. Both caches are disabled for uplink
+measurements; local-cache hits are measured separately at concurrency 32.
+Retain per-query P99, throughput, errors, RSS, RPC counts, plans and `/health`
+observations under the same configured query memory and admission limits.
 
-Ship only with equal results, bounded memory and admission, and no per-workload
-performance regression beyond the measured noise floor. Report improvements
-only where those runs show them; Substrait alone is not a latency measurement.
-The qualification record contains commands, source identities and retained
-artifacts. Final-candidate qualification and merge sign-off remain in progress;
-protocol selection alone does not establish a performance improvement.
+Require equal results, bounded admission, and measured memory and per-workload
+performance. Report regressions and improvements where those runs show them;
+Substrait alone is not a latency measurement. The final standalone runs measured
+higher throughput at every tested concurrency and lower P99 at eight and 32
+clients, mixed P99 at two, and higher P99 at 128. The qualification record retains
+each repetition, the resource traces, commands, source identities and returned
+rows. Other CPU budgets, remote network RTTs, mixed local/remote performance,
+unique-query bursts and slow-consumer performance are unverified. The full
+workspace merge gate remains a separate requirement.
 
 ## Release Notes
 

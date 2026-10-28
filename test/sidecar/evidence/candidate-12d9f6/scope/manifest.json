@@ -1,0 +1,47 @@
+[
+  {
+    "path": "explain.json",
+    "uncompressed_sha256": "6fd9e745a572595b7bba7b2a21b8f1d6e33ac07e3288c4803201980bef2eec0a",
+    "uncompressed_bytes": 830
+  },
+  {
+    "path": "provenance.json",
+    "uncompressed_sha256": "032c58e10cb5ab2654a18aad8022228f1f5b5ac92e55f0ca9ab8ddcdc086c1e6",
+    "uncompressed_bytes": 426
+  },
+  {
+    "path": "result.json",
+    "uncompressed_sha256": "86af7e231bb832275e4abfc18e56c26b68d75d4def3fda07e88a8cd2ae8c97c9",
+    "uncompressed_bytes": 128
+  },
+  {
+    "path": "sidecar/command.json",
+    "uncompressed_sha256": "f739439af591e4853ea432e11759aa8c6e9735d5a3820ea7762d9fecf1a46b9b",
+    "uncompressed_bytes": 156
+  },
+  {
+    "path": "sidecar/spiced.log.gz",
+    "uncompressed_sha256": "28c692056e1da66856c046037e95de39068181caf6fbcb65cad2bc3df053853f",
+    "uncompressed_bytes": 2884
+  },
+  {
+    "path": "sidecar/spicepod.yaml",
+    "uncompressed_sha256": "d5cdcfb725dcea563406b0f2d623eda76905fc800d91a7ba64d50712f0588f3d",
+    "uncompressed_bytes": 1319
+  },
+  {
+    "path": "sidecar/starts.jsonl.gz",
+    "uncompressed_sha256": "214bd7584b4be77ee40c419a90d6bef67505d7f848f1e79c3f61745dcfc565b0",
+    "uncompressed_bytes": 216
+  },
+  {
+    "path": "upstream-observations.json",
+    "uncompressed_sha256": "df194fd1797d1711c266d91da8ad219a2048263ae9cdf6e12835231d5827bd53",
+    "uncompressed_bytes": 506
+  },
+  {
+    "path": "driver.log.gz",
+    "uncompressed_sha256": "e03480ee2345c910ba2c2a0fc1397e339227d2bcfdf2699ecf66115660d22576",
+    "uncompressed_bytes": 71
+  }
+]

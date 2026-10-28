@@ -1,0 +1,34 @@
+{
+  "version": "v1",
+  "kind": "Spicepod",
+  "name": "plan-cache-origin",
+  "runtime": {
+    "query": {
+      "target_partitions": 1,
+      "max_concurrent_queries": 16,
+      "memory_limit": "512MiB"
+    },
+    "caching": {
+      "sql_results": {
+        "enabled": true,
+        "item_ttl": "10s",
+        "max_size": "32MiB",
+        "cache_key_type": "plan"
+      }
+    }
+  },
+  "datasets": [
+    {
+      "from": "file:/private/tmp/spice-sidecar-artifacts/cluster-12d9f6/cache-orders.csv",
+      "name": "remote_orders",
+      "params": {
+        "file_format": "csv"
+      },
+      "acceleration": {
+        "enabled": true,
+        "engine": "cayenne",
+        "mode": "memory"
+      }
+    }
+  ]
+}

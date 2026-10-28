@@ -1,0 +1,90 @@
+{
+  "version": "v1",
+  "kind": "Spicepod",
+  "name": "upstream-functions",
+  "runtime": {
+    "query": {
+      "target_partitions": 1,
+      "max_concurrent_queries": 16,
+      "memory_limit": "512MiB"
+    },
+    "caching": {
+      "sql_results": {
+        "enabled": false,
+        "item_ttl": "1h",
+        "max_size": "32MiB"
+      }
+    },
+    "functions": {
+      "enabled": true
+    }
+  },
+  "datasets": [
+    {
+      "from": "file:/private/tmp/spice-sidecar-artifacts/bench-12d9f6-miss/orders.csv",
+      "name": "remote_orders",
+      "params": {
+        "file_format": "csv"
+      },
+      "acceleration": {
+        "enabled": true,
+        "engine": "cayenne",
+        "mode": "memory"
+      }
+    }
+  ],
+  "functions": [
+    {
+      "name": "add",
+      "from": "sql",
+      "signature": {
+        "args": [
+          {
+            "name": "a",
+            "type": "int64"
+          },
+          {
+            "name": "b",
+            "type": "int64"
+          }
+        ],
+        "returns": "int64"
+      },
+      "body": "a - b",
+      "volatility": "immutable",
+      "as_tool": false
+    },
+    {
+      "name": "is_null",
+      "from": "sql",
+      "signature": {
+        "args": [
+          {
+            "name": "a",
+            "type": "int64"
+          }
+        ],
+        "returns": "boolean"
+      },
+      "body": "false",
+      "volatility": "immutable",
+      "as_tool": false
+    },
+    {
+      "name": "is_nan",
+      "from": "sql",
+      "signature": {
+        "args": [
+          {
+            "name": "x",
+            "type": "float64"
+          }
+        ],
+        "returns": "boolean"
+      },
+      "body": "x > -100",
+      "volatility": "immutable",
+      "as_tool": false
+    }
+  ]
+}

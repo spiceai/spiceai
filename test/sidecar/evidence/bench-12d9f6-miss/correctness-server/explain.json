@@ -1,0 +1,10 @@
+[
+  {
+    "plan_type": "logical_plan",
+    "plan": "Federated\n Sort: l.id ASC NULLS LAST\n  Projection: l.id, l.value, r.label\n    Inner Join:  Filter: l.id = r.id\n      Filter: l.id BETWEEN Int64(10) AND Int64(20)\n        SubqueryAlias: l\n          TableScan: orders projection=[id, value]\n      SubqueryAlias: r\n        TableScan: other_orders projection=[id, label]"
+  },
+  {
+    "plan_type": "physical_plan",
+    "plan": "SchemaCastScanExec\n  CooperativeExec\n    BytesProcessedExec\n      VirtualExecutionPlan name=spice.ai compute_context=url=http://127.0.0.1:57339,username= base_sql=SELECT \"l\".\"id\", \"l\".\"value\", \"r\".\"label\" FROM \"remote_orders\" AS \"l\" INNER JOIN \"remote_orders\" AS \"r\" ON (\"l\".\"id\" = \"r\".\"id\") WHERE (\"l\".\"id\" BETWEEN 10 AND 20) ORDER BY \"l\".\"id\" ASC NULLS LAST\n"
+  }
+]

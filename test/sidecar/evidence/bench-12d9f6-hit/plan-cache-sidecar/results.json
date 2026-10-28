@@ -1,0 +1,712 @@
+[
+  {
+    "name": "point",
+    "repetition": 0,
+    "sql": "SELECT id, value, label FROM orders WHERE id = 42",
+    "actual": [
+      {
+        "id": 42,
+        "value": null,
+        "label": "group2"
+      }
+    ],
+    "expected": [
+      {
+        "id": 42,
+        "value": null,
+        "label": "group2"
+      }
+    ]
+  },
+  {
+    "name": "point",
+    "repetition": 1,
+    "sql": "SELECT id, value, label FROM orders WHERE id = 42",
+    "actual": [
+      {
+        "id": 42,
+        "value": null,
+        "label": "group2"
+      }
+    ],
+    "expected": [
+      {
+        "id": 42,
+        "value": null,
+        "label": "group2"
+      }
+    ]
+  },
+  {
+    "name": "aggregate",
+    "repetition": 0,
+    "sql": "SELECT label, COUNT(*) AS n, SUM(value) AS total FROM orders GROUP BY label ORDER BY label",
+    "actual": [
+      {
+        "label": "group0",
+        "n": 10000,
+        "total": 1285157190
+      },
+      {
+        "label": "group1",
+        "n": 10000,
+        "total": 1285097163
+      },
+      {
+        "label": "group2",
+        "n": 10000,
+        "total": 1285337092
+      },
+      {
+        "label": "group3",
+        "n": 10000,
+        "total": 1285277128
+      },
+      {
+        "label": "group4",
+        "n": 10000,
+        "total": 1285217172
+      },
+      {
+        "label": "group5",
+        "n": 10000,
+        "total": 1285157145
+      },
+      {
+        "label": "group6",
+        "n": 10000,
+        "total": 1285397116
+      },
+      {
+        "label": "group7",
+        "n": 10000,
+        "total": 1285337181
+      },
+      {
+        "label": "group8",
+        "n": 10000,
+        "total": 1285277154
+      },
+      {
+        "label": "group9",
+        "n": 10000,
+        "total": 1285517104
+      }
+    ],
+    "expected": [
+      {
+        "label": "group0",
+        "n": 10000,
+        "total": 1285157190
+      },
+      {
+        "label": "group1",
+        "n": 10000,
+        "total": 1285097163
+      },
+      {
+        "label": "group2",
+        "n": 10000,
+        "total": 1285337092
+      },
+      {
+        "label": "group3",
+        "n": 10000,
+        "total": 1285277128
+      },
+      {
+        "label": "group4",
+        "n": 10000,
+        "total": 1285217172
+      },
+      {
+        "label": "group5",
+        "n": 10000,
+        "total": 1285157145
+      },
+      {
+        "label": "group6",
+        "n": 10000,
+        "total": 1285397116
+      },
+      {
+        "label": "group7",
+        "n": 10000,
+        "total": 1285337181
+      },
+      {
+        "label": "group8",
+        "n": 10000,
+        "total": 1285277154
+      },
+      {
+        "label": "group9",
+        "n": 10000,
+        "total": 1285517104
+      }
+    ]
+  },
+  {
+    "name": "aggregate",
+    "repetition": 1,
+    "sql": "SELECT label, COUNT(*) AS n, SUM(value) AS total FROM orders GROUP BY label ORDER BY label",
+    "actual": [
+      {
+        "label": "group0",
+        "n": 10000,
+        "total": 1285157190
+      },
+      {
+        "label": "group1",
+        "n": 10000,
+        "total": 1285097163
+      },
+      {
+        "label": "group2",
+        "n": 10000,
+        "total": 1285337092
+      },
+      {
+        "label": "group3",
+        "n": 10000,
+        "total": 1285277128
+      },
+      {
+        "label": "group4",
+        "n": 10000,
+        "total": 1285217172
+      },
+      {
+        "label": "group5",
+        "n": 10000,
+        "total": 1285157145
+      },
+      {
+        "label": "group6",
+        "n": 10000,
+        "total": 1285397116
+      },
+      {
+        "label": "group7",
+        "n": 10000,
+        "total": 1285337181
+      },
+      {
+        "label": "group8",
+        "n": 10000,
+        "total": 1285277154
+      },
+      {
+        "label": "group9",
+        "n": 10000,
+        "total": 1285517104
+      }
+    ],
+    "expected": [
+      {
+        "label": "group0",
+        "n": 10000,
+        "total": 1285157190
+      },
+      {
+        "label": "group1",
+        "n": 10000,
+        "total": 1285097163
+      },
+      {
+        "label": "group2",
+        "n": 10000,
+        "total": 1285337092
+      },
+      {
+        "label": "group3",
+        "n": 10000,
+        "total": 1285277128
+      },
+      {
+        "label": "group4",
+        "n": 10000,
+        "total": 1285217172
+      },
+      {
+        "label": "group5",
+        "n": 10000,
+        "total": 1285157145
+      },
+      {
+        "label": "group6",
+        "n": 10000,
+        "total": 1285397116
+      },
+      {
+        "label": "group7",
+        "n": 10000,
+        "total": 1285337181
+      },
+      {
+        "label": "group8",
+        "n": 10000,
+        "total": 1285277154
+      },
+      {
+        "label": "group9",
+        "n": 10000,
+        "total": 1285517104
+      }
+    ]
+  },
+  {
+    "name": "join",
+    "repetition": 0,
+    "sql": "SELECT l.id, l.value, r.label FROM orders l JOIN other_orders r ON l.id = r.id WHERE l.id BETWEEN 10 AND 20 ORDER BY l.id",
+    "actual": [
+      {
+        "id": 10,
+        "value": -20,
+        "label": "group0"
+      },
+      {
+        "id": 11,
+        "value": -17,
+        "label": "group1"
+      },
+      {
+        "id": 12,
+        "value": -14,
+        "label": "group2"
+      },
+      {
+        "id": 13,
+        "value": -11,
+        "label": "group3"
+      },
+      {
+        "id": 14,
+        "value": null,
+        "label": "group4"
+      },
+      {
+        "id": 15,
+        "value": -5,
+        "label": "group5"
+      },
+      {
+        "id": 16,
+        "value": -2,
+        "label": "group6"
+      },
+      {
+        "id": 17,
+        "value": 1,
+        "label": "group7"
+      },
+      {
+        "id": 18,
+        "value": 4,
+        "label": "group8"
+      },
+      {
+        "id": 19,
+        "value": 7,
+        "label": "group9"
+      },
+      {
+        "id": 20,
+        "value": 10,
+        "label": "group0"
+      }
+    ],
+    "expected": [
+      {
+        "id": 10,
+        "value": -20,
+        "label": "group0"
+      },
+      {
+        "id": 11,
+        "value": -17,
+        "label": "group1"
+      },
+      {
+        "id": 12,
+        "value": -14,
+        "label": "group2"
+      },
+      {
+        "id": 13,
+        "value": -11,
+        "label": "group3"
+      },
+      {
+        "id": 14,
+        "value": null,
+        "label": "group4"
+      },
+      {
+        "id": 15,
+        "value": -5,
+        "label": "group5"
+      },
+      {
+        "id": 16,
+        "value": -2,
+        "label": "group6"
+      },
+      {
+        "id": 17,
+        "value": 1,
+        "label": "group7"
+      },
+      {
+        "id": 18,
+        "value": 4,
+        "label": "group8"
+      },
+      {
+        "id": 19,
+        "value": 7,
+        "label": "group9"
+      },
+      {
+        "id": 20,
+        "value": 10,
+        "label": "group0"
+      }
+    ]
+  },
+  {
+    "name": "join",
+    "repetition": 1,
+    "sql": "SELECT l.id, l.value, r.label FROM orders l JOIN other_orders r ON l.id = r.id WHERE l.id BETWEEN 10 AND 20 ORDER BY l.id",
+    "actual": [
+      {
+        "id": 10,
+        "value": -20,
+        "label": "group0"
+      },
+      {
+        "id": 11,
+        "value": -17,
+        "label": "group1"
+      },
+      {
+        "id": 12,
+        "value": -14,
+        "label": "group2"
+      },
+      {
+        "id": 13,
+        "value": -11,
+        "label": "group3"
+      },
+      {
+        "id": 14,
+        "value": null,
+        "label": "group4"
+      },
+      {
+        "id": 15,
+        "value": -5,
+        "label": "group5"
+      },
+      {
+        "id": 16,
+        "value": -2,
+        "label": "group6"
+      },
+      {
+        "id": 17,
+        "value": 1,
+        "label": "group7"
+      },
+      {
+        "id": 18,
+        "value": 4,
+        "label": "group8"
+      },
+      {
+        "id": 19,
+        "value": 7,
+        "label": "group9"
+      },
+      {
+        "id": 20,
+        "value": 10,
+        "label": "group0"
+      }
+    ],
+    "expected": [
+      {
+        "id": 10,
+        "value": -20,
+        "label": "group0"
+      },
+      {
+        "id": 11,
+        "value": -17,
+        "label": "group1"
+      },
+      {
+        "id": 12,
+        "value": -14,
+        "label": "group2"
+      },
+      {
+        "id": 13,
+        "value": -11,
+        "label": "group3"
+      },
+      {
+        "id": 14,
+        "value": null,
+        "label": "group4"
+      },
+      {
+        "id": 15,
+        "value": -5,
+        "label": "group5"
+      },
+      {
+        "id": 16,
+        "value": -2,
+        "label": "group6"
+      },
+      {
+        "id": 17,
+        "value": 1,
+        "label": "group7"
+      },
+      {
+        "id": 18,
+        "value": 4,
+        "label": "group8"
+      },
+      {
+        "id": 19,
+        "value": 7,
+        "label": "group9"
+      },
+      {
+        "id": 20,
+        "value": 10,
+        "label": "group0"
+      }
+    ]
+  },
+  {
+    "name": "topk",
+    "repetition": 0,
+    "sql": "SELECT id, value FROM orders WHERE value IS NOT NULL ORDER BY value DESC, id LIMIT 10 OFFSET 5",
+    "actual": [
+      {
+        "id": 99993,
+        "value": 299929
+      },
+      {
+        "id": 99992,
+        "value": 299926
+      },
+      {
+        "id": 99991,
+        "value": 299923
+      },
+      {
+        "id": 99990,
+        "value": 299920
+      },
+      {
+        "id": 99989,
+        "value": 299917
+      },
+      {
+        "id": 99987,
+        "value": 299911
+      },
+      {
+        "id": 99986,
+        "value": 299908
+      },
+      {
+        "id": 99985,
+        "value": 299905
+      },
+      {
+        "id": 99984,
+        "value": 299902
+      },
+      {
+        "id": 99983,
+        "value": 299899
+      }
+    ],
+    "expected": [
+      {
+        "id": 99993,
+        "value": 299929
+      },
+      {
+        "id": 99992,
+        "value": 299926
+      },
+      {
+        "id": 99991,
+        "value": 299923
+      },
+      {
+        "id": 99990,
+        "value": 299920
+      },
+      {
+        "id": 99989,
+        "value": 299917
+      },
+      {
+        "id": 99987,
+        "value": 299911
+      },
+      {
+        "id": 99986,
+        "value": 299908
+      },
+      {
+        "id": 99985,
+        "value": 299905
+      },
+      {
+        "id": 99984,
+        "value": 299902
+      },
+      {
+        "id": 99983,
+        "value": 299899
+      }
+    ]
+  },
+  {
+    "name": "topk",
+    "repetition": 1,
+    "sql": "SELECT id, value FROM orders WHERE value IS NOT NULL ORDER BY value DESC, id LIMIT 10 OFFSET 5",
+    "actual": [
+      {
+        "id": 99993,
+        "value": 299929
+      },
+      {
+        "id": 99992,
+        "value": 299926
+      },
+      {
+        "id": 99991,
+        "value": 299923
+      },
+      {
+        "id": 99990,
+        "value": 299920
+      },
+      {
+        "id": 99989,
+        "value": 299917
+      },
+      {
+        "id": 99987,
+        "value": 299911
+      },
+      {
+        "id": 99986,
+        "value": 299908
+      },
+      {
+        "id": 99985,
+        "value": 299905
+      },
+      {
+        "id": 99984,
+        "value": 299902
+      },
+      {
+        "id": 99983,
+        "value": 299899
+      }
+    ],
+    "expected": [
+      {
+        "id": 99993,
+        "value": 299929
+      },
+      {
+        "id": 99992,
+        "value": 299926
+      },
+      {
+        "id": 99991,
+        "value": 299923
+      },
+      {
+        "id": 99990,
+        "value": 299920
+      },
+      {
+        "id": 99989,
+        "value": 299917
+      },
+      {
+        "id": 99987,
+        "value": 299911
+      },
+      {
+        "id": 99986,
+        "value": 299908
+      },
+      {
+        "id": 99985,
+        "value": 299905
+      },
+      {
+        "id": 99984,
+        "value": 299902
+      },
+      {
+        "id": 99983,
+        "value": 299899
+      }
+    ]
+  },
+  {
+    "name": "nulls",
+    "repetition": 0,
+    "sql": "SELECT COUNT(*) AS n, COUNT(value) AS nonnull, SUM(value) AS total FROM orders",
+    "actual": [
+      {
+        "n": 100000,
+        "nonnull": 85714,
+        "total": 12852771445
+      }
+    ],
+    "expected": [
+      {
+        "n": 100000,
+        "nonnull": 85714,
+        "total": 12852771445
+      }
+    ]
+  },
+  {
+    "name": "nulls",
+    "repetition": 1,
+    "sql": "SELECT COUNT(*) AS n, COUNT(value) AS nonnull, SUM(value) AS total FROM orders",
+    "actual": [
+      {
+        "n": 100000,
+        "nonnull": 85714,
+        "total": 12852771445
+      }
+    ],
+    "expected": [
+      {
+        "n": 100000,
+        "nonnull": 85714,
+        "total": 12852771445
+      }
+    ]
+  }
+]

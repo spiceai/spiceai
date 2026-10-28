@@ -1,0 +1,12 @@
+version: v1
+kind: Spicepod
+name: sidecar-local
+runtime:
+  mode: server
+  cpu:
+    cores: 2
+  caching:
+    sql_results:
+      enabled: true
+      item_ttl: 1h
+      max_size: 16MiB

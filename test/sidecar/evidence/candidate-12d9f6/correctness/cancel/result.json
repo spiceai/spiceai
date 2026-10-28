@@ -1,0 +1,8 @@
+{
+  "acknowledgement": {
+    "query_id": "a1a4af0a-61e2-4a5a-b9be-5f9a21465f9d",
+    "status": "cancelled"
+  },
+  "status": 499,
+  "body": "Query a1a4af0a-61e2-4a5a-b9be-5f9a21465f9d was cancelled"
+}

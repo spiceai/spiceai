@@ -1,0 +1,42 @@
+{
+  "version": "v1",
+  "kind": "Spicepod",
+  "name": "identity-scope",
+  "runtime": {
+    "query": {
+      "target_partitions": 1,
+      "max_concurrent_queries": 16,
+      "memory_limit": "512MiB"
+    },
+    "caching": {
+      "sql_results": {
+        "enabled": false,
+        "item_ttl": "1h",
+        "max_size": "32MiB"
+      }
+    },
+    "mode": "sidecar"
+  },
+  "datasets": [
+    {
+      "from": "spice.ai:remote_alice",
+      "name": "alice",
+      "params": {
+        "spiceai_endpoint": "https://localhost:57475",
+        "spiceai_tls_ca_certificate_file": "/private/tmp/spice-sidecar-artifacts/scope-12d9f6/ca.crt",
+        "spiceai_tls_client_certificate_file": "/private/tmp/spice-sidecar-artifacts/scope-12d9f6/alice.crt",
+        "spiceai_tls_client_key_file": "/private/tmp/spice-sidecar-artifacts/scope-12d9f6/alice.key"
+      }
+    },
+    {
+      "from": "spice.ai:remote_bob",
+      "name": "bob",
+      "params": {
+        "spiceai_endpoint": "https://localhost:57475",
+        "spiceai_tls_ca_certificate_file": "/private/tmp/spice-sidecar-artifacts/scope-12d9f6/ca.crt",
+        "spiceai_tls_client_certificate_file": "/private/tmp/spice-sidecar-artifacts/scope-12d9f6/bob.crt",
+        "spiceai_tls_client_key_file": "/private/tmp/spice-sidecar-artifacts/scope-12d9f6/bob.key"
+      }
+    }
+  ]
+}
