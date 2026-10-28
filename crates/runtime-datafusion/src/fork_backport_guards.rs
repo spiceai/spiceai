@@ -549,3 +549,62 @@ async fn a_sort_over_aggregate_output_slices_charges_each_slice_for_its_own_rows
         panic!("row {index} is {got}, expected {want}: groups must sort by their sum, descending");
     }
 }
+
+/// spiceai/datafusion#279. A nested-loop or cross join yields many output batches
+/// per probe batch without polling an input, so unless each output batch spends
+/// the cooperative budget, the task running it never yields: a cancelled or
+/// timed-out query cannot stop it, and on a single-threaded runtime nothing else
+/// runs. Each query here reads a probe side too large to finish, on a
+/// single-threaded runtime, and must give its 100 ms read timeout a chance to fire.
+#[test]
+fn nested_loop_and_cross_joins_yield_to_the_scheduler() {
+    for (operator, sql) in [
+        (
+            "NestedLoopJoinExec",
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b JOIN range(1, 1000000000000) a ON a.value + b.value > 1",
+        ),
+        (
+            "CrossJoinExec",
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b CROSS JOIN range(1, 1000000000000) a",
+        ),
+    ] {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime builds");
+            let result = runtime.block_on(async {
+                let ctx = spice_session(|_| {});
+                let plan = ctx
+                    .sql(sql)
+                    .await
+                    .expect("query plans")
+                    .create_physical_plan()
+                    .await
+                    .expect("physical plan");
+                let shown = datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(false)
+                    .to_string();
+                assert!(
+                    shown.contains(operator),
+                    "{sql} is not planned with {operator}:\n{shown}"
+                );
+                let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())
+                    .expect("query executes");
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    futures::StreamExt::next(&mut stream),
+                )
+                .await
+                .is_err()
+            });
+            let _ = done.send(result);
+        });
+        assert_eq!(
+            finished.recv_timeout(std::time::Duration::from_secs(30)),
+            Ok(true),
+            "{operator} never yielded, so its query's read timeout could not fire"
+        );
+    }
+}
