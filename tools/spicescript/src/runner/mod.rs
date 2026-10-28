@@ -834,6 +834,12 @@ async fn create_instances(
                     .as_ref()
                     .is_some_and(|c| c.containers);
             if cluster {
+                if spicepod.pointer("/runtime/mode").and_then(Value::as_str) == Some("sidecar") {
+                    say!(
+                        "   skip {label:<20} runtime.mode: sidecar does not run as a cluster node"
+                    );
+                    continue;
+                }
                 if let Some(engine) = undistributed_engine(&spicepod) {
                     // A cluster accelerates only into Cayenne and Arrow.
                     say!("   skip {label:<20} the '{engine}' engine does not run in a cluster");
