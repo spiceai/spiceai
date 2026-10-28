@@ -1,0 +1,13 @@
+   Compiling flight_client v2.5.0-unstable (/Users/Code/dev/spiceai/crates/flight_client)
+    Finished `release` profile [optimized] target(s) in 3.76s
+     Running tests/cookie_middleware.rs (target/release/deps/cookie_middleware-c2c1211c940eb74d)
+
+running 4 tests
+test username_password_without_handshake_token_returns_unauthorized ... ok
+test cookie_middleware_persists_cookie_across_requests ... ok
+test anonymous_flight_client_query_does_not_require_authorization ... ok
+contexts_equal=false; observed_authorization=["Bearer bob", "Bearer alice"]
+test federation_context_preserves_repeated_authorization_order ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

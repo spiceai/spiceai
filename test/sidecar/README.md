@@ -137,6 +137,15 @@ then observed `1001` after the configured ten-second TTL expired. The
 both phases. This was a test-policy error, not an engine invalidation defect;
 the complete acdfbe0 run still stopped later on the recorded scalar-alias defect.
 
+A Flight network integration test also exercises repeated authorization metadata
+through the public `FlightClient` API. Before the correction, the server observed
+`Bearer bob` and `Bearer alice` while the clients reported equal federation
+contexts. Stable sorting by header name retains repeated-value overwrite order;
+the same test then observed those two values with distinct contexts. The
+[before/after logs and command](evidence/metadata-order) include the four-test
+Flight client suite result. This state is tested directly through `MetadataMap`,
+rather than claimed as a Spicepod-only reproduction.
+
 ## Benchmark method and limits
 
 Each concurrency level uses SQL, Substrait, Substrait, SQL arms. Every arm starts

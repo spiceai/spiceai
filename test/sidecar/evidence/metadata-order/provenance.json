@@ -1,0 +1,9 @@
+{
+  "date": "2026-10-28T06:26:40.755472+00:00",
+  "before_production_commit": "b9e87d4da26d231d7d05475c93820010964559a7",
+  "after_commit": "902764d36e6d5f81709343d6da77f5e0d2743bd4",
+  "fixture": "crates/flight_client/tests/cookie_middleware.rs",
+  "fixture_sha256": "a8aaac0fda1372aecf07ea56206143b3aabe8bcc4e9beb4c4c7eae6e645899f4",
+  "command": "env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ CARGO_TARGET_DIR=/Users/Code/dev/spiceai/target cargo test --release -p spiced -p runtime -p flight_client --no-default-features --features release --test cookie_middleware federation_context_preserves_repeated_authorization_order -- --nocapture",
+  "scope": "Real local Flight gRPC server observes transmitted authorization headers. Exercises the public FlightClient MetadataMap API; no Spicepod-only reproduction is claimed."
+}

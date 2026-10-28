@@ -1,0 +1,20 @@
+   Compiling flight_client v2.5.0-unstable (/Users/Code/dev/spiceai/crates/flight_client)
+    Finished `release` profile [optimized] target(s) in 3.71s
+     Running tests/cookie_middleware.rs (target/release/deps/cookie_middleware-c2c1211c940eb74d)
+
+running 1 test
+contexts_equal=true; observed_authorization=["Bearer bob", "Bearer alice"]
+
+thread 'federation_context_preserves_repeated_authorization_order' (10166820) panicked at crates/flight_client/tests/cookie_middleware.rs:342:5:
+different wire identities must not share a federation context
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test federation_context_preserves_repeated_authorization_order ... FAILED
+
+failures:
+
+failures:
+    federation_context_preserves_repeated_authorization_order
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p flight_client --test cookie_middleware`
