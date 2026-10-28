@@ -1,0 +1,6 @@
+{
+  "source_commit": "00971c286983a6cbd752a87cd679d3b9e20bf083",
+  "command": "env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ CARGO_TARGET_DIR=/Users/Code/dev/spiceai/target cargo nextest run --cargo-profile release -p spiced -p runtime -p flight_client -p data_components --no-default-features --features release --lib -E 'test(/task_history::correlation::tests/) | test(/flight::traced_ticket::tests/)' --no-capture",
+  "date": "2026-10-28",
+  "result": "15 passed, 1 failed, 3625 skipped; nested-span guard failed all four attempts"
+}

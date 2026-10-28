@@ -100,6 +100,8 @@ pub fn begin_task_trace(task_span: &Span, request_context: &RequestContext) -> S
     // cannot — HTTP, MCP — has no id to return until a task resolves one, and
     // this is where that happens.
     request_context.propagate_trace_id(Arc::clone(&trace_id));
+    // An id resolved here must not let a nested task claim the trace root.
+    let _ = request_context.claim_propagated_trace();
 
     // Deliberately NOT `target: "task_history"`: that target is what the
     // console layer filters out, and this span exists to be seen there. It is
@@ -395,6 +397,7 @@ mod tests {
             (Some(PINNED), Some(PROPAGATED), false),
             (Some(PINNED), None, false),
             (None, Some(PINNED), true),
+            (None, None, false),
         ] {
             let spans = Arc::new(std::sync::Mutex::new(Vec::new()));
             let provider = SdkTracerProvider::builder()
