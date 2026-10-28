@@ -563,6 +563,7 @@ async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::{Result, not_impl_err};
     use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
     use datafusion::execution::TaskContext;
     use datafusion::logical_expr::function::AccumulatorArgs;
     use datafusion::logical_expr::{
@@ -572,9 +573,7 @@ async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
     use datafusion::physical_expr::aggregate::AggregateExprBuilder;
     use datafusion::physical_expr::expressions::col;
     use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-    use datafusion::physical_plan::aggregates::{
-        AggregateExec, AggregateMode, PhysicalGroupBy,
-    };
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use datafusion::physical_plan::{ExecutionPlan, InputOrderMode, collect};
 
     type Emits = Arc<Mutex<Vec<EmitTo>>>;
@@ -710,7 +709,7 @@ async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
         .expect("memory source builds")
         .try_with_sort_information(vec![ordering])
         .expect("input is sorted on k");
-    let input = MemorySourceConfig::try_new_from_config(input);
+    let input = DataSourceExec::from_data_source(input);
 
     let emits = Emits::default();
     let probe = Arc::new(AggregateUDF::from(EmitProbe {
@@ -736,7 +735,10 @@ async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
     )
     .expect("aggregate plans");
     assert!(
-        matches!(aggregate.input_order_mode(), InputOrderMode::PartiallySorted(_)),
+        matches!(
+            aggregate.input_order_mode(),
+            InputOrderMode::PartiallySorted(_)
+        ),
         "the guard needs the ordered aggregate path, got {:?}",
         aggregate.input_order_mode()
     );
