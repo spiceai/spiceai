@@ -68,7 +68,7 @@ use super::{ResponseMimeType, current_principal_requires_read_only, sql_to_http_
     ),
     responses(
         (status = 200, description = "SQL query executed successfully", headers(
-            ("Server-Timing" = String, description = "The time the server spent on the query, in milliseconds: `total;dur=<ms>` (W3C Server-Timing). Sent on every response whose body is complete before its head is sent — every format except the default streamed `application/json`, and every error. A streamed `application/json` body is not complete until it ends, so it sends the field as a trailer instead (declared by `Trailer: Server-Timing`) when the request allows trailers: HTTP/2, or `TE: trailers` on HTTP/1.1.")
+            ("Server-Timing" = String, description = "The time the server spent on the query, in milliseconds: `total;dur=<ms>` (W3C Server-Timing). Sent in the head of every response whose body is complete before its head is sent: `text/plain` and every error. A streamed `application/json`, `application/vnd.spiceai.sql.v1+json` or `text/csv` body is not complete until it ends, so it sends the field as a trailer instead (declared by `Trailer: Server-Timing`) when the request allows trailers: HTTP/2, or `TE: trailers` on HTTP/1.1.")
         ), content((
             Vec<serde_json::Value> = "application/json",
             example = json!([
@@ -114,7 +114,6 @@ use super::{ResponseMimeType, current_principal_requires_read_only, sql_to_http_
         (
             serde_json::Value = "application/vnd.spiceai.sql.v1+json",
             example = json!({
-                "row_count": 3,
                 "schema": {
                     "fields": [
                     {
@@ -166,7 +165,8 @@ use super::{ResponseMimeType, current_principal_requires_read_only, sql_to_http_
                         "COUNT(Int64(1))": 405_103,
                         "passenger_count": 2
                     }
-                ]
+                ],
+                "row_count": 3
             })
         )
         )),
