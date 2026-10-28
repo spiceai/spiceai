@@ -1356,7 +1356,7 @@ impl VerifiedDownload {
 /// whatever that call moved aside before this returns the rename error.
 pub(crate) async fn replace_downloaded_file(
     engine: &dyn SnapshotEngine,
-    download: VerifiedDownload,
+    download: &VerifiedDownload,
     local_path: &Path,
     dataset_name: &str,
 ) -> Result<(), SnapshotDownloadError> {
@@ -3699,7 +3699,7 @@ impl SnapshotManager {
         // the file. See `replace_downloaded_file`.
         replace_downloaded_file(
             self.snapshot_engine.as_ref(),
-            verified,
+            &verified,
             local_path,
             &self.dataset_name,
         )
@@ -11889,7 +11889,7 @@ mod tests {
 
     // ========== A download the engine cannot open ==========
 
-    /// Publishes `contents` as snapshot `snapshot_id` in `entries`, at a distinct key.
+    /// Writes `contents` at a key of its own and returns its entry as `snapshot_id`.
     #[cfg(feature = "duckdb")]
     async fn put_duckdb_snapshot(
         store: &InMemory,

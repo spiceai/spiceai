@@ -185,7 +185,7 @@ impl SnapshotEngine for DuckDBSnapshotEngine {
         dataset_name: &str,
     ) -> Result<(), super::SnapshotEngineError> {
         let path = downloaded.to_path_buf();
-        let opened = tokio::task::spawn_blocking(move || {
+        let opened = match tokio::task::spawn_blocking(move || {
             let conn = duckdb::Connection::open_in_memory().map_err(|e| e.to_string())?;
             let escaped = escape_duckdb_string(&path.to_string_lossy());
             conn.execute(&format!("ATTACH '{escaped}' AS downloaded (READ_ONLY)"), [])
@@ -193,8 +193,10 @@ impl SnapshotEngine for DuckDBSnapshotEngine {
             Ok::<(), String>(())
         })
         .await
-        .map_err(|e| format!("the check ended unexpectedly: {e}"))
-        .and_then(|opened| opened);
+        {
+            Ok(opened) => opened,
+            Err(e) => Err(format!("the check ended unexpectedly: {e}")),
+        };
         opened.map_err(|reason| super::SnapshotEngineError::Unopenable {
             dataset: dataset_name.to_string(),
             path: downloaded.to_path_buf(),

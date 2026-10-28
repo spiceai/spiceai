@@ -987,7 +987,7 @@ mod tests {
         let missing = tmp.path().join("missing-download.sqlite");
         let error = crate::snapshot::replace_downloaded_file(
             &engine,
-            crate::snapshot::VerifiedDownload::assume_verified(&missing),
+            &crate::snapshot::VerifiedDownload::assume_verified(&missing),
             &live_path,
             "orders",
         )
@@ -1211,7 +1211,7 @@ mod tests {
         let engine = SqliteSnapshotEngine::new();
         crate::snapshot::replace_downloaded_file(
             &engine,
-            crate::snapshot::VerifiedDownload::assume_verified(&download),
+            &crate::snapshot::VerifiedDownload::assume_verified(&download),
             &live_path,
             "orders",
         )
