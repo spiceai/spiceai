@@ -30,6 +30,8 @@ fn config() -> HeadLogConfig {
         batch_budget_bytes: 180,
         batch_max_records: 4,
         max_record_bytes: 100,
+        // headlog_500_records_cold_open_and_lagging_poll lists 125 batches.
+        max_listed_batches: 256,
     }
 }
 
@@ -867,55 +869,62 @@ async fn headlog_byte_cut_waits_for_published_successor_and_exact_record_limit()
 }
 
 #[tokio::test]
-async fn headlog_minimum_budget_reports_envelope_overhead_instead_of_unsafe_copy() {
+async fn headlog_budget_below_b_plus_r_plus_m_is_refused_at_construction() {
     for backend in backends() {
+        // H >= B + R alone: a third maximum record cannot fit beside the
+        // head's own fields, record envelopes and batch index.
         let bounds = HeadLogConfig {
             head_budget_bytes: 300,
             batch_budget_bytes: 200,
             max_record_bytes: 100,
             batch_max_records: 64,
+            max_listed_batches: 16,
         };
-        HeadLog::create(Arc::clone(&backend.store), backend.prefix.clone(), bounds)
+        let error = HeadLog::create(Arc::clone(&backend.store), backend.prefix.clone(), bounds)
             .await
-            .expect("specified inequalities hold");
-        let mut writer = Writer::take_over(
+            .expect_err("H = 300 is below B + R + M");
+        let overhead = bounds.head_overhead_bytes().expect("M");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Invalid head log: head budget 300 is below B + R + M = 200 + 100 + {overhead}; \
+                 raise head_budget_bytes or lower the batch or record budget"
+            )
+        );
+        let feasible = HeadLogConfig {
+            head_budget_bytes: 300 + overhead,
+            ..bounds
+        };
+        HeadLog::create(Arc::clone(&backend.store), backend.prefix.clone(), feasible)
+            .await
+            .expect("H = B + R + M");
+        Writer::take_over(
             Arc::clone(&backend.store),
             backend.prefix.clone(),
             bounds,
             1,
         )
         .await
+        .err()
+        .expect("a writer refuses the same infeasible budgets");
+        let mut writer = Writer::take_over(
+            Arc::clone(&backend.store),
+            backend.prefix.clone(),
+            feasible,
+            1,
+        )
+        .await
         .expect("owner");
-        for _ in 0..2 {
+        // 78 payload bytes encode to a 100-byte record: every record is R.
+        for _ in 0..20 {
             append(&mut writer, Bytes::from(vec![0; 78])).await;
         }
-        let observed = &writer.state().head;
-        let observed_len = observed.encoded_len();
-        let mut planned = observed.clone();
-        planned.commit += 1;
-        planned.window.push(observed.window[0].clone());
-        let error = writer
-            .prepare(Bytes::from(vec![0; 78]))
-            .await
-            .expect_err("full head includes envelope and index overhead");
-        println!(
-            "{}: H=300 B=200 R=100; observed={} planned={}; {}",
-            backend.prefix,
-            observed_len,
-            planned.encoded_len(),
-            error
+        let head = &writer.state().head;
+        assert_eq!(head.commit, 20);
+        assert_eq!(
+            head.batches.len() * 2 + head.window.len(),
+            20,
+            "two maximum records per batch"
         );
-        assert_eq!(writer.state().head.commit, 2);
-        backend
-            .store
-            .get(
-                &backend
-                    .prefix
-                    .clone()
-                    .join("wal")
-                    .join("00000000000000000001"),
-            )
-            .await
-            .expect_err("unpublished successor cannot justify a copy");
     }
 }

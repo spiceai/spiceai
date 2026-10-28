@@ -73,6 +73,7 @@ async fn workload_with_reader(
                 // this workload exercise both inline and spilled records.
                 max_record_bytes: 1024,
                 batch_max_records: 1,
+                max_listed_batches: 1024,
             },
         )
     } else {

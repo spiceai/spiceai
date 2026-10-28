@@ -13,6 +13,8 @@ pub struct HeadLogConfig {
     pub batch_max_records: usize,
     /// Maximum ORIGINAL encoded record length, including its envelope.
     pub max_record_bytes: usize,
+    /// Most batch ends the head lists before a checkpoint must trim the index.
+    pub max_listed_batches: usize,
 }
 
 impl Default for HeadLogConfig {
@@ -21,26 +23,68 @@ impl Default for HeadLogConfig {
             head_budget_bytes: 128 * 1024,
             batch_budget_bytes: 64 * 1024,
             batch_max_records: 64,
-            max_record_bytes: 64 * 1024,
+            max_record_bytes: 32 * 1024,
+            max_listed_batches: 1024,
         }
     }
 }
 
+const MAX_VARINT_BYTES: usize = 10;
+const INCARNATION_BYTES: usize = 16;
+
+fn varint_len(value: usize) -> usize {
+    prost::encoding::encoded_len_varint(value as u64)
+}
+
 impl HeadLogConfig {
+    /// H >= B + R + M: the head must hold a full batch and the record that
+    /// makes it final beside everything else it carries.
     pub(super) fn validate(self) -> Result<()> {
+        let invalid = |reason: String| Err(Error::Invalid { reason });
         if self.max_record_bytes == 0
             || self.batch_max_records == 0
             || self.max_record_bytes > self.batch_budget_bytes
-            || self
-                .batch_budget_bytes
-                .checked_add(self.max_record_bytes)
-                .is_none_or(|sum| self.head_budget_bytes < sum)
         {
-            return Err(Error::Invalid {
-                reason: "infeasible head/batch/record budgets".into(),
-            });
+            return invalid("infeasible head/batch/record budgets".into());
+        }
+        let required = self
+            .batch_budget_bytes
+            .checked_add(self.max_record_bytes)
+            .and_then(|sum| sum.checked_add(self.head_overhead_bytes()?));
+        if required.is_none_or(|required| self.head_budget_bytes < required) {
+            return invalid(format!(
+                "head budget {} is below B + R + M = {} + {} + {}; raise head_budget_bytes or lower the batch or record budget",
+                self.head_budget_bytes,
+                self.batch_budget_bytes,
+                self.max_record_bytes,
+                self.head_overhead_bytes()
+                    .map_or_else(|| "overflow".into(), |m| m.to_string()),
+            ));
         }
         Ok(())
+    }
+
+    /// M: the largest encoded head content outside the window's record bytes.
+    /// Fixed fields at their widest, one window envelope for each of the K + 1
+    /// records a full batch and its successor can hold, and the batch index at
+    /// `max_listed_batches` entries.
+    #[must_use]
+    pub fn head_overhead_bytes(self) -> Option<usize> {
+        let field = |payload: usize| 1 + payload;
+        let fixed = field(5) // format: uint32
+            + field(varint_len(INCARNATION_BYTES) + INCARNATION_BYTES)
+            + 3 * field(MAX_VARINT_BYTES); // commit, floor, lease
+        // WindowRecord { encoded } inside the head's repeated field 5.
+        let inner = 1 + varint_len(self.max_record_bytes) + self.max_record_bytes;
+        let envelope = 1 + varint_len(inner) + (inner - self.max_record_bytes);
+        let window = self
+            .batch_max_records
+            .checked_add(1)?
+            .checked_mul(envelope)?;
+        // Packed repeated uint64: tag, length, then at most 10 bytes per entry.
+        let entries = self.max_listed_batches.checked_mul(MAX_VARINT_BYTES)?;
+        let index = 1 + varint_len(entries) + entries;
+        fixed.checked_add(window)?.checked_add(index)
     }
 }
 

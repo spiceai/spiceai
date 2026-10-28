@@ -125,6 +125,7 @@ impl Replay {
                 batch_budget_bytes: 30_000,
                 max_record_bytes: 20_000,
                 batch_max_records: 3,
+                max_listed_batches: 64,
             }
         } else {
             HeadLogConfig {
@@ -132,6 +133,7 @@ impl Replay {
                 batch_budget_bytes: 180,
                 max_record_bytes: 100,
                 batch_max_records: 2,
+                max_listed_batches: 64,
             }
         };
         HeadLog::create(Arc::clone(&object), Path::from("replay"), config)

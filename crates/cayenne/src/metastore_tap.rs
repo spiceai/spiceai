@@ -577,6 +577,7 @@ impl MetastoreTap {
                     batch_budget_bytes: 64 * 1024,
                     batch_max_records: 64,
                     max_record_bytes: 16 * 1024,
+                    max_listed_batches: 1024,
                 },
             ),
             Err(e) => {

@@ -337,6 +337,9 @@ impl Writer {
             let end = observed_start + count as u64 - 1;
             head.window.drain(..count);
             head.batches.push(end);
+            if head.batches.len() > self.config.max_listed_batches {
+                return invalid("batch index is full; publish a checkpoint before committing");
+            }
         }
         head.validate()?;
         let head_bytes = Bytes::from(head.encode_to_vec());
