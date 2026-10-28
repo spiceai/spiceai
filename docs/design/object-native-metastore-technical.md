@@ -2174,12 +2174,26 @@ A library change, with no Cayenne or runtime change.
 
 ### Step 7: on by default
 
-- **Change:** `enabled` becomes the default; `disabled` keeps the SQL
-  metastore for a stated number of releases. This is a user-facing change, in
-  the same Enhancement.
-- **Exit proof:** the full benchmark suite (TPC-H, TPC-DS, ClickBench,
-  CH-benCH) against the previous release, with no regression at any query or
-  scale factor.
+- **Change:** the object-native metastore becomes the default; the flag can
+  still select the SQL metastore for a stated number of releases. This is a
+  user-facing change, in the same Enhancement.
+- **Prerequisite: no racing writers.** Fencing keeps state correct when two
+  instances write one destination, but each new writer fences the other, and
+  both consume the source. That is tolerable while the path is opt-in; as a
+  default it would turn a common mistake (two instances started on one
+  destination) into an outage. Before this step, one of these ships:
+  - read-only support, so a second instance serves queries without writing
+    (Milestone 2's replicated ingestion, or a read-only instance before it);
+  - or detection and prevention: an instance that finds another live writer
+    for a dataset in the head does not take over, and reports it with an
+    error naming the dataset and the other instance, unless it is told it
+    replaces that writer.
+- **Exit proof:**
+  - `spiced` started twice on one destination: no source is consumed by
+    both, no commit is lost, and the second instance either serves reads or
+    reports the conflict;
+  - the full benchmark suite (TPC-H, TPC-DS, ClickBench, CH-benCH) against
+    the previous release, with no regression at any query or scale factor.
 
 ### Step 8: remove the SQL metastore
 

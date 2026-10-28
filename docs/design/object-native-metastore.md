@@ -842,7 +842,9 @@ as discrete changes, each shipping on its own, and each with an exit proof:
    flag.
 6. Existing datasets re-bootstrap from their sources; metastore contents are
    not migrated.
-7. On by default.
+7. On by default, once a second instance on the same destination can no
+   longer race the writer: either read-only support or detection that
+   refuses it.
 8. Removal of the SQL metastore.
 
 The format is in real use from step 3, first as a follower; the default
