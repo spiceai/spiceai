@@ -268,7 +268,7 @@ jobs:
       cancel-in-progress: true
     # Standard pool, not `spiceai-macos-large`. A dispatched sign-off takes a
     # `spiceai-macos` runner instead of waiting on the large pool.
-    runs-on: spiceai-macos
+    runs-on: signoff
     # This pool terminates a job at ~360 minutes, and that arrives
     # as `cancelled` with no failed step — the same shape as the
     # cancel-in-progress eviction above, and with no chance for the steps below
