@@ -548,21 +548,6 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                                 }
                             }
                         }
-                        BuilderTarget::NullableFloat64((name, value)) => {
-                            match extended_metrics_builders.get_mut(&name) {
-                                Some(Builder::Float64(builder)) => builder.append_option(value),
-                                Some(b) => {
-                                    return Err(anyhow::anyhow!(
-                                        "Invalid builder type for NullableFloat64: {b}"
-                                    ));
-                                }
-                                None => {
-                                    return Err(anyhow::anyhow!(
-                                        "No builder found for NullableFloat64: {name}"
-                                    ));
-                                }
-                            }
-                        }
                     }
                 }
             } else {
@@ -779,8 +764,6 @@ pub enum BuilderTarget {
     String((String, String)),
     UInt64((String, u64)),
     Float64((String, f64)),
-    /// A value of a nullable `Float64` field. `None` appends a null.
-    NullableFloat64((String, Option<f64>)),
 }
 
 impl Display for Builder {

@@ -16,7 +16,7 @@ limitations under the License.
 
 use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{num::NonZeroUsize, path::PathBuf};
+use std::path::PathBuf;
 use test_framework::{
     TestType, anyhow,
     layout::Layout,
@@ -425,18 +425,6 @@ pub struct SearchArgs {
     /// it. Omitted to search through `POST /v1/search`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql_pipeline: Option<String>,
-    /// Number of concurrent search clients. The workflow default is 10.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub concurrency: Option<NonZeroUsize>,
-    /// Maximum number of results of each search request. The workflow default is 10.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<NonZeroUsize>,
-    /// Unmeasured passes over all test queries. The workflow default is 0.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warmup_passes: Option<usize>,
-    /// Measured passes over all test queries. The workflow default is 1.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub passes: Option<NonZeroUsize>,
 }
 
 /// Schema test workflow arguments, defined in the test files
@@ -1240,38 +1228,6 @@ tests:
             .collect();
         keys.sort_unstable();
         assert_eq!(keys, ["ready_wait", "runner_type", "spicepod_path"]);
-    }
-
-    #[test]
-    fn test_search_section_benchmark_fields_round_trip() {
-        let yaml = "
-tests:
-  search:
-    spicepod_path: test/spicepods/search/perf/msmarco/full_text_search-cayenne[file].yaml
-    runner_type: spiceai-dev-runners
-    concurrency: 8
-    limit: 100
-    warmup_passes: 1
-    passes: 2
-";
-
-        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
-        let serialized =
-            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
-        assert_eq!(serialized["concurrency"], 8);
-        assert_eq!(serialized["limit"], 100);
-        assert_eq!(serialized["warmup_passes"], 1);
-        assert_eq!(serialized["passes"], 2);
-
-        let zero_passes = "
-tests:
-  search:
-    spicepod_path: test/spicepods/search/perf/msmarco/full_text_search-cayenne[file].yaml
-    runner_type: spiceai-dev-runners
-    passes: 0
-";
-        yaml::from_str::<DispatchTestFile>(zero_passes)
-            .expect_err("a run needs at least one measured pass");
     }
 
     #[test]

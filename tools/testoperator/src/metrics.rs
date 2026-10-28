@@ -155,28 +155,6 @@ pub static SEARCH_P95_RESPONSE_TIME: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .build()
 });
 
-pub static SEARCH_LATENCY: LazyLock<Gauge<f64>> = LazyLock::new(|| {
-    meter()
-        .f64_gauge("search_latency_ms")
-        .with_description(
-            "Search request latency at a percentile (the `percentile` attribute: p50, p95, p99, \
-            p99.9), for all queries or one `query_type`. Not recorded when fewer than 10 samples \
-            are slower than the percentile.",
-        )
-        .with_unit("ms")
-        .build()
-});
-
-pub static SEARCH_LATENCY_SAMPLES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
-    meter()
-        .u64_gauge("search_latency_samples")
-        .with_description(
-            "Number of measured search requests behind `search_latency_ms`, for all queries or \
-            one `query_type`.",
-        )
-        .build()
-});
-
 pub static PEAK_MEMORY_USAGE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     meter()
         .f64_gauge("peak_memory_usage_mb")

@@ -15,8 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    collections::{BTreeMap, HashMap, btree_map::Entry},
-    num::NonZeroUsize,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -206,47 +205,18 @@ impl SearchConfig {
 
 pub(crate) struct VectorSearchWorkerResult {
     pub(crate) search_results: BTreeMap<String, SearchResult>,
-    /// When the first measured pass started, after any warmup passes.
-    pub(crate) measured_started_at: Instant,
-    pub(crate) finished_at: Instant,
-}
-
-/// How many times a worker sends each of its requests. Warmup passes are sent but not measured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SearchPasses {
-    pub warmup: usize,
-    pub measured: NonZeroUsize,
-}
-
-impl SearchPasses {
-    #[must_use]
-    pub fn total(&self) -> usize {
-        self.warmup + self.measured.get()
-    }
-}
-
-impl Default for SearchPasses {
-    fn default() -> Self {
-        Self {
-            warmup: 0,
-            measured: NonZeroUsize::MIN,
-        }
-    }
 }
 
 pub struct SearchResult {
-    /// The response of the first measured pass.
     pub response: SearchResponse,
     pub score: f64,
-    /// The latency of each measured pass, in pass order.
-    pub durations: Vec<Duration>,
+    pub duration: Duration,
 }
 
 pub(crate) struct VectorSearchWorker {
     worker_id: usize,
     http_client: Client,
     config: SearchConfig,
-    passes: SearchPasses,
 }
 
 /// The response to one [`SearchRequest`], in the shape of the [`SearchMethod`] that sent it.
@@ -329,17 +299,11 @@ pub struct SearchResponseResult {
 }
 
 impl VectorSearchWorker {
-    pub fn new(
-        worker_id: usize,
-        http_client: Client,
-        config: SearchConfig,
-        passes: SearchPasses,
-    ) -> Self {
+    pub fn new(worker_id: usize, http_client: Client, config: SearchConfig) -> Self {
         Self {
             worker_id,
             http_client,
             config,
-            passes,
         }
     }
 
@@ -349,52 +313,35 @@ impl VectorSearchWorker {
                 worker_id,
                 http_client,
                 config: SearchConfig { requests, method },
-                passes,
             } = self;
             let mut results: BTreeMap<String, SearchResult> = BTreeMap::new();
-            let total_requests = requests.len() * passes.total();
-            let mut completed = 0;
+            let total_requests = requests.len();
             let mut last_progress_time = Instant::now();
-            let mut measured_started_at = Instant::now();
 
             println!("[SearchWorker-{worker_id:02}] STARTED, {total_requests} remaining");
 
-            for pass in 0..passes.total() {
-                let measured = pass >= passes.warmup;
-                if pass == passes.warmup {
-                    measured_started_at = Instant::now();
-                }
+            for (index, request) in requests.into_iter().enumerate() {
+                let start = Instant::now();
+                let response = send_request(&http_client, &method, &request).await?;
+                let duration = start.elapsed();
+                results.insert(
+                    request.id,
+                    SearchResult {
+                        score: response.top_score(),
+                        response,
+                        duration,
+                    },
+                );
 
-                for request in &requests {
-                    let start = Instant::now();
-                    let response = send_request(&http_client, &method, request).await?;
-                    let duration = start.elapsed();
-                    completed += 1;
-
-                    // Keep the response of the first measured pass for evaluation, and the latency
-                    // of every measured pass.
-                    if measured {
-                        match results.entry(request.id.clone()) {
-                            Entry::Occupied(mut entry) => entry.get_mut().durations.push(duration),
-                            Entry::Vacant(entry) => {
-                                entry.insert(SearchResult {
-                                    score: response.top_score(),
-                                    response,
-                                    durations: vec![duration],
-                                });
-                            }
-                        }
-                    }
-
-                    // Trace progress every 10 seconds
-                    if last_progress_time.elapsed() >= Duration::from_secs(10) {
-                        #[expect(clippy::cast_precision_loss)]
-                        let completed_percent = (completed as f64 / total_requests as f64) * 100.0;
-                        println!(
-                            "[SearchWorker-{worker_id:02}]: {completed}/{total_requests} completed ({completed_percent:.1}%)"
-                        );
-                        last_progress_time = Instant::now();
-                    }
+                // Trace progress every 10 seconds
+                if last_progress_time.elapsed() >= Duration::from_secs(10) {
+                    let completed = index + 1;
+                    #[expect(clippy::cast_precision_loss)]
+                    let completed_percent = (completed as f64 / total_requests as f64) * 100.0;
+                    println!(
+                        "[SearchWorker-{worker_id:02}]: {completed}/{total_requests} completed ({completed_percent:.1}%)"
+                    );
+                    last_progress_time = Instant::now();
                 }
             }
 
@@ -402,8 +349,6 @@ impl VectorSearchWorker {
 
             Ok(VectorSearchWorkerResult {
                 search_results: results,
-                measured_started_at,
-                finished_at: Instant::now(),
             })
         })
     }

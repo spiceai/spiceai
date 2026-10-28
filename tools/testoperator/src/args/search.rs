@@ -14,20 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    num::NonZeroUsize,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use super::CommonArgs;
 use clap::Parser;
-use test_framework::spicetest::search::SearchPasses;
 
 /// Arguments of `testoperator run search`. The spicepod at `--spicepod-path` loads its own data
-/// and must define the `corpus` and `test_queries` tables, and can define `relevance_data` (each a
-/// dataset or a view). Without `relevance_data`, the run measures latency only. The run reports
-/// the `benchmark_dataset` telemetry attribute from the spicepod's top-level
-/// `metadata.benchmark_dataset` value.
+/// and must define the `corpus`, `test_queries`, and `relevance_data` tables (each a dataset or a
+/// view). The run reports the `benchmark_dataset` telemetry attribute from the spicepod's
+/// top-level `metadata.benchmark_dataset` value.
 #[derive(Parser)]
 pub struct SearchTestArgs {
     #[clap(flatten)]
@@ -40,30 +35,6 @@ pub struct SearchTestArgs {
     /// must be in rank order. A value that ends with `.sql` or has no whitespace must be a file.
     #[arg(long, value_name = "FILE_OR_SQL", value_parser = SqlPipelineArg::parse)]
     pub(crate) sql_pipeline: Option<SqlPipelineArg>,
-
-    /// The maximum number of results of each search request.
-    #[arg(long, default_value = "10")]
-    pub(crate) limit: NonZeroUsize,
-
-    /// The number of passes over all test queries that are sent before measurement starts. Use
-    /// warmup passes to load the search index into memory and caches before the measured passes.
-    #[arg(long, default_value = "0")]
-    pub(crate) warmup_passes: usize,
-
-    /// The number of measured passes over all test queries. Each pass adds one latency sample per
-    /// query. Retrieval quality uses the results of the first measured pass. More than one pass
-    /// in total requires the spicepod to disable the results cache that the search method uses.
-    #[arg(long, default_value = "1")]
-    pub(crate) passes: NonZeroUsize,
-}
-
-impl SearchTestArgs {
-    pub(crate) fn search_passes(&self) -> SearchPasses {
-        SearchPasses {
-            warmup: self.warmup_passes,
-            measured: self.passes,
-        }
-    }
 }
 
 /// The `--sql-pipeline` value: a file that holds the SQL, or the SQL text itself.
