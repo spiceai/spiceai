@@ -356,12 +356,12 @@ bytes never repeat without it, so it is left out (see
 ## The write path
 
 Writes accumulate in the writer's buffer and become durable in one remote
-commit at the next acknowledgement point (direction document, Milestone 1 decision
-2). Data files and objects are uploaded first, and the head CAS that references
+commit at the next acknowledgement point (direction document, decision
+1.2). Data files and objects are uploaded first, and the head CAS that references
 them is the commit point. As today, a buffered write is queryable on the
 writing node as soon as it is applied; other nodes see it once the commit
 succeeds and they poll. Publishing at commit instead is an option (direction
-document, Milestone 1 decision 2), independent of how `seq`s are stamped.
+document, decision 1.2), independent of how `seq`s are stamped.
 
 A writer holds the dataset state at commit n, the head version V that carries
 it, and V's ETag. A commit:
@@ -1100,7 +1100,7 @@ Retired. Its one remaining writer, the flush path at
 ### `cayenne_inlined_data` and `cayenne_inlined_delete`
 
 Removed. Small writes become ordinary level-0 files in the live-file collection,
-and their tombstones become ordinary deletion vectors (direction document, decision 5).
+and their tombstones become ordinary deletion vectors (direction document, decision 1.5).
 
 ### `cayenne_cold_tier_file`
 
@@ -1122,7 +1122,7 @@ metastore (direction document, "Relationship to the datalake tier"):
 | Record of which files are live   | Local metastore                                                                                                 | The destination                                                 |
 | After losing the instance's disk | The S3 files remain, but nothing says which are live                                                            | Recovered from the destination alone                            |
 | Readers                          | The owning instance only                                                                                        | Any instance                                                    |
-| GC of S3 objects                 | Root in the local metastore; deletes objects unreferenced for a grace period (5 min by default), no reader pins | Generations and reader pins; no timing assumption (decision 10) |
+| GC of S3 objects                 | Root in the local metastore; deletes objects unreferenced for a grace period (5 min by default), no reader pins | Generations and reader pins; no timing assumption (decision 1.10) |
 | Requirements                     | A primary key, `changes` or `append` refresh, no partitioned tables                                             | None of these                                                   |
 | Settings                         | Location, promotion thresholds, file size, check and GC intervals                                               | The destination                                                 |
 
@@ -1136,7 +1136,7 @@ metastore (direction document, "Relationship to the datalake tier"):
 - **Stored as:** a per-dataset source-position collection in the checkpoint
   root, keyed by `(source, partition)`. The collection is small.
 - **Changed by:** `AdvanceSourcePosition`, carried in the same record as the
-  state the position covers (direction document, decision 9). The connector-facing stores become
+  state the position covers (direction document, decision 1.9). The connector-facing stores become
   reads of this state plus writes into the writer's next commit, so the
   connector API does not change.
 - **Derived or rebuilt:** rebuilt from the root and the tail on open. A
@@ -1187,7 +1187,7 @@ so those round trips are acceptable.
 - **Reads are not atomic across datasets.** A query can still see A's `Resolve`
   but not yet B's. That matches today, where no multi-table read is atomic. A
   catalog transaction frontier would close the gap later (direction document,
-  decision 3).
+  decision 1.3).
 - **Accepting a `Prepare`.** A `Prepare` is accepted iff its CAS succeeds and
   its full guard set held at its base: the participant's own guards (inputs
   live, lease generation, admission), plus **no unresolved `Prepare` whose
@@ -1249,7 +1249,7 @@ so those round trips are acceptable.
 ### Source positions and backfill
 
 Source positions commit with the state they cover (direction document,
-decision 9).
+decision 1.9).
 
 - **Where positions live today.** Some sources keep their position source-side,
   such as PostgreSQL's slot `confirmed_flush_lsn`. The consumer-side ones live in
@@ -1509,7 +1509,7 @@ layout change when Milestone 2 adds remote GC and maintenance.
 ## Small writes and the inline tier
 
 Small writes are buffered locally, and the inline tier is retired once its
-replacement is measured (direction document, decision 5).
+replacement is measured (direction document, decision 1.5).
 
 - **Buffering.** Small writes accumulate in the writer's local buffer (the RAM
   tier) and are written out at the next commit. A flush then writes at most one
@@ -1559,7 +1559,7 @@ replacement is measured (direction document, decision 5).
   This design changes three things for that workload:
   1. **Commits.** A caching write needs no durable acknowledgement, because the
      data can always be fetched again from the origin. Its commit cadence is set
-     by the freshness and size bounds of decision 2, not by the 500 ms batch.
+     by the freshness and size bounds of decision 1.2, not by the 500 ms batch.
      So the remote rate is one record per bound, not one conditional write per
      batch per table.
   2. **Where the batches live until then.** Rebuildable writes go into the
@@ -2129,7 +2129,7 @@ A library change, with no Cayenne or runtime change.
 
 - **Change:** an `ObjectCatalog` implements `MetadataCatalog` over the dataset
   state and the head log, and SQL is not written for those datasets. It is
-  chosen by `runtime.state.object_native: enabled`, once the
+  chosen by `runtime.experimental_cayenne_metastore: enabled`, once the
   Enhancement is signed off. It adds what a shadow never needed:
   - the lease, fencing and failover;
   - resolution of uncertain writes, reported as "commit outcome unknown";
@@ -2153,7 +2153,7 @@ A library change, with no Cayenne or runtime change.
     factor.
 - **Inline tier.** Step 5 is where the level-0 replacement for the SQL inline
   tier is measured against it, including the rc.3 caching workload (direction
-  document, decision 5).
+  document, decision 1.5).
 
 ### Step 6: existing datasets re-bootstrap
 

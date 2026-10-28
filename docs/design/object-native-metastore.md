@@ -97,7 +97,7 @@ What holds, in common terms:
   they are today. A read there can therefore see a value that is never
   committed: a crash, a fence, or an unknown commit outcome drops the buffer,
   which was never acknowledged. Other nodes only ever see committed state.
-  Publishing at commit (decision 2) would remove this.
+  Publishing at commit (decision 1.2) would remove this.
 
 What does not hold: linearizable reads, read-your-writes across nodes, and
 atomic reads across datasets (non-goals below).
@@ -119,7 +119,7 @@ atomic reads across datasets (non-goals below).
 - **Atomic reads across datasets.** A query that reads several datasets sees
   each one at its own snapshot, as it does today. Snapshot tokens and
   transaction outcomes are designed so a consistent cross-dataset read can be
-  added later (Milestone 1, decision 3).
+  added later (decision 1.3).
 - **One atomic commit across regions**, and **source-version ordering** for
   overlapping keys: deferred, as described in Milestone 3.
 - **An interchange table format.** This is Cayenne's internal format, as its
@@ -192,7 +192,7 @@ same Enhancement review as the flag below.
 
 **One gap this closes.** The tier's GC has no reader pins, so a query still
 reading cold files when GC sweeps them fails. A Cayenne integration test that
-forces that interleaving reproduces it, and reader pins (decision 10) remove
+forces that interleaving reproduces it, and reader pins (decision 1.10) remove
 it.
 
 ## Milestones
@@ -253,14 +253,14 @@ the source before it holds the lease. Both lift with much less than many
 writers need. Maintenance
 records only rewrite files: they draw no new `seq`s and raise no table's
 high-water mark, so with one ingest writer they need no key footprints and
-no answer to Milestone 3's `seq` decision (decision 6). The protocol model
+no answer to Milestone 3's `seq` decision (decision 3.4). The protocol model
 checks this: one ingest writer racing maintenance on other nodes keeps every
 row correct with neither.
 
 **Delivers:**
 
 - Maintenance on any node, coordinated by leases over file sets, racing the
-  writer on the head with guards (Milestone 3 decisions 1 and 4).
+  writer on the head with guards (decisions 2.1 and 2.2).
 - **Replicated ingestion behind a lease.** Several replicas run the same
   Spicepod against one destination. A lease picks the replica that consumes
   the source and writes; the others answer queries from the shared state and
@@ -270,7 +270,7 @@ row correct with neither.
     commit instead of writing. Safety never depends on lease timing; only
     failover delay does, as in Milestone 1's failover limit.
   - *Durable resume.* Source positions commit with the state they cover
-    (decision 9), so the new holder resumes from the head, not from the old
+    (decision 1.9), so the new holder resumes from the head, not from the old
     holder's disk.
   - *Shared reads.* Standby replicas already answer queries from committed
     state.
@@ -282,7 +282,7 @@ row correct with neither.
     must not poll.
   - *Acknowledge the source only after the commit.* The holder confirms the
     slot's flush position, or deletes the SQS messages, only once the record
-    covering them has committed: the acknowledgement points of decision 2.
+    covering them has committed: the acknowledgement points of decision 1.2.
   - *Replay after takeover.* PostgreSQL resumes from the committed position.
     SQS has no position: messages not yet deleted reappear after their
     visibility timeout, so the new holder must skip files the log already
@@ -385,7 +385,7 @@ be decided now:
   a format change, and gives clients a read-your-writes token.
 - *Committed state is distinguishable from buffered writes.* Other nodes only
   ever see committed state. On the writing node, a strict read would exclude
-  the buffer, or the dataset would publish at commit (decision 2).
+  the buffer, or the dataset would publish at commit (decision 1.2).
 - Serializable reads across datasets build on the atomic cross-dataset read
   item above.
 
@@ -422,11 +422,11 @@ proven its durability, re-bootstrap and operating behavior.
 - **A metastore round trip on every write.** Writes commit once per
   acknowledgement point.
 - **A separate small-write tier inside the database,** once its replacement is
-  measured (decision 5).
+  measured (decision 1.5).
 
 ## Key decisions
 
-**1. One conditional write commits: a compare-and-swap of the dataset's head.**
+**1.1 One conditional write commits: a compare-and-swap of the dataset's head.**
 The head carries the newest commit records, so a CAS on its version both
 orders a commit and accepts it, and a stale writer's CAS fails. Guards are
 checked locally against the exact version the CAS replaces, and acceptance is
@@ -454,7 +454,7 @@ coordinator.
   appending would not reduce billed writes. Rejected as inconsistently
   supported and no cheaper.
 
-**2. Commit when something must be acknowledged, not on every write.** Writes
+**1.2 Commit when something must be acknowledged, not on every write.** Writes
 accumulate in a buffer and are committed as one record when one of these
 happens. Each is an *acknowledgement point*: something is waiting for an
 acknowledgement. It triggers the commit, and the acknowledgement itself is sent
@@ -478,7 +478,7 @@ node can see a value that is never committed (see [Consistency](#consistency)).
   a value that is never committed. The cost is freshness on the ingesting node:
   up to one commit interval plus the conditional write, about 2 s plus
   30–100 ms on S3 Standard. It is independent of how `seq`s are stamped
-  (Milestone 3, decision 6), and would be chosen if reads of uncommitted values
+  (decision 3.4), and would be chosen if reads of uncommitted values
   must be ruled out.
 
 On a
@@ -494,7 +494,7 @@ It is not in Milestone 1. The general form, tiers of storage beneath the
 destination, is listed under
 [possible future improvements](#milestone-n-possible-future-improvements).
 
-**3. A transaction domain per dataset.** There is one log per accelerated
+**1.3 A transaction domain per dataset.** There is one log per accelerated
 dataset, so a commit across a dataset's partitions is one record. A small
 catalog log holds the name registry. The rare multi-table transaction spanning
 datasets uses a create-if-absent decision object. One log per dataset gives the
@@ -537,7 +537,7 @@ cross-dataset read possible later: snapshot tokens are vectors of
   Readers would have to merge logs from day one. And it ties concurrency to
   declared layout, which Milestone 3 sets out to remove.
 
-**4. Data out of the log; checkpoints chunked and incremental.** Records carry
+**1.4 Data out of the log; checkpoints chunked and incremental.** Records carry
 small typed actions. Manifests, deletion-vector lists, statistics and
 cold-tier manifests are immutable objects named by content hash. A
 checkpoint is a small root plus sorted, size-bounded parts, and it rewrites only
@@ -547,7 +547,7 @@ dataset reads the latest checkpoint plus the records after it.
 *Details in:* [Dataset state](object-native-metastore-technical.md#dataset-state-where-it-lives-and-how-it-changes),
 [Mapping the metastore tables](object-native-metastore-technical.md#mapping-the-metastore-tables).
 
-**5. Small writes are buffered locally; the inline tier is retired once its
+**1.5 Small writes are buffered locally; the inline tier is retired once its
 replacement is measured.** Today small writes are stored as Arrow IPC rows
 *inside* SQLite, to avoid one file per tiny batch. Here they accumulate in the
 writer's RAM tier and are written out at the next commit, so the file count is
@@ -559,12 +559,12 @@ removed only once this replacement meets the bar measured against it, including
 a caching workload that depends on it today.
 *Details in:* [Small writes and the inline tier](object-native-metastore-technical.md#small-writes-and-the-inline-tier).
 
-**6. File-level actions from day one.** Even with one writer, records use
+**1.6 File-level actions from day one.** Even with one writer, records use
 file-level actions (`AddFiles`, `RemoveFiles`, `ReplaceFiles`,
 `AddDeleteFiles`), and "current snapshot" is derived state. That costs little
 now and is what lets Milestone 2 run compaction alongside other writers.
 
-**7. Not SlateDB.** SlateDB is a well-built LSM on object storage, but its model
+**1.7 Not SlateDB.** SlateDB is a well-built LSM on object storage, but its model
 is one writer per database: "SlateDB ensures a single writer through a formally
 verified manifest fencing protocol, but supports multiple readers"
 ([slatedb.io](https://slatedb.io/), read 2026-10-26). We found no published
@@ -572,11 +572,11 @@ plan for multiple writers. It also has no atomic commit across databases. Milest
 (breaking cross-partition commits, and Milestone 2's maintenance on other nodes) or a single
 funnel process (an added service). The single-writer model is the deciding
 mismatch; smaller ones are that it does not fsync on a local directory, and that
-its compaction of a large mutable keyspace solves a problem decision 4 avoids
+its compaction of a large mutable keyspace solves a problem decision 1.4 avoids
 having. Its fencing and GC primitives (`slatedb-txn-obj`) are worth borrowing
 from, and the GC design does.
 
-**8. Two numbers: commit numbers name states, `seq`s order mutations.** Every
+**1.8 Two numbers: commit numbers name states, `seq`s order mutations.** Every
 accepted record gets the next commit number, data commits and maintenance
 alike, and a commit number names the dataset state after it: snapshot tokens,
 checkpoints and reader pins use it. Cayenne's sequence numbers stay as they
@@ -585,7 +585,7 @@ each table, every `seq` in a record is above every `seq` in earlier records,
 so `seq` order is commit order, every existing `seq` comparison keeps its
 meaning, and Milestone 1 changes no allocation or stamping code. Iceberg splits
 its numbers the same way, between snapshot and data sequence numbers. How a
-Milestone 3 writer that loses a race keeps `seq` order is Milestone 3, decision 6.
+Milestone 3 writer that loses a race keeps `seq` order is decision 3.4.
 *Details in:* [Commit numbers and sequence numbers](object-native-metastore-technical.md#commit-numbers-and-sequence-numbers).
 
 - *Alternative: name states by `seq`, with no commit number.* A compaction or a
@@ -600,7 +600,7 @@ Milestone 3 writer that loses a race keeps `seq` order is Milestone 3, decision 
   differ from commit order across writers, needing re-reserve rules and every
   cross-key comparison rewritten against a separate position. Rejected.
 
-**9. Source positions commit with the state they cover.** Consumer-side CDC
+**1.9 Source positions commit with the state they cover.** Consumer-side CDC
 positions live today in `spice_sys_*` sidecar tables inside the Cayenne
 metastore, written separately from data commits. Here an
 `AdvanceSourcePosition` action rides in the same record as the state it covers,
@@ -609,7 +609,7 @@ running alongside live CDC needs one more rule: a live change after the
 backfill's snapshot position wins over backfilled data.
 *Details in:* [Source positions and backfill](object-native-metastore-technical.md#source-positions-and-backfill).
 
-**10. GC deletes from the log, and reader pins are low-water marks.** GC is
+**1.10 GC deletes from the log, and reader pins are low-water marks.** GC is
 one protocol with fencing, staging and reader pins, and correctness never
 depends on a grace period.
 
@@ -655,15 +655,20 @@ an opt-in experiment, enabled runtime-wide, not a new `acceleration.mode` value.
 what has to be deprecated. Once the new path is proven it becomes the default,
 and the flag and `mode` both retire.
 
-The flag is `runtime.state.object_native`, which takes `enabled` or
-`disabled` (the default). It sits beside `runtime.state.location`, the
-destination it writes to, so the setting and what it affects are configured
-together. An enum rather than a boolean follows the Spicepod convention.
+The flag is `runtime.experimental_cayenne_metastore`, which takes `enabled` or
+`disabled` (the default). The name says what it is: an experiment that changes
+Cayenne's metastore. It is not under `runtime.state`, because that block names
+where the runtime keeps its shared state, and Cayenne's data may later live in
+other locations as well (see
+[multiple data locations](object-native-metastore-technical.md#future-multiple-data-locations)).
+An enum rather than a boolean follows the Spicepod convention against boolean
+settings.
 
-- *Alternatives considered:* a `runtime.params.object_native_metastore` key,
-  which matches how runtime parameters are set but separates the flag from
-  the location it uses; a comma-separated `runtime.params.experiments` list;
-  and a new `runtime.experiments` list field.
+- *Alternatives considered:* `runtime.state.object_native`, which reads as a
+  property of the runtime-state location rather than of Cayenne; a
+  `runtime.params.object_native_metastore` key; a comma-separated
+  `runtime.params.experiments` list; and a new `runtime.experiments` list
+  field.
 
 **Location: reuse `runtime.state.location` rather than add
 `runtime.object_store`.** Spicepods already have one root for shared runtime
@@ -682,13 +687,13 @@ configure the same thing.
 ```yaml
 runtime:
   state:
-    location: s3://my-bucket/spice      # existing field; Cayenne uses <location>/cayenne/v1/
-    object_native: enabled              # runtime-wide opt-in during rollout; default disabled
+    location: s3://my-bucket/spice          # existing field; Cayenne uses <location>/cayenne/v1/
+  experimental_cayenne_metastore: enabled   # runtime-wide opt-in during rollout; default disabled
 datasets:
   - from: postgres:public.orders
     name: orders
     acceleration:
-      enabled: true                     # no mode value: the runtime-wide experiment decides the path
+      enabled: true                         # no mode value: the runtime-wide experiment decides the path
 ```
 
 **Questions for the review:**
@@ -696,11 +701,12 @@ datasets:
 - **The default when `runtime.state` is unset.** The proposal is the local data
 directory (`.spice/data`), the same default file mode uses today, so the
 zero-config case still works.
-- **What replaces `mode: memory`.** It is today's default, and users read it as
-"nothing on disk". Once `mode` is deprecated, a per-dataset volatile
-acceleration needs a defined home. `mem://` is a whole-runtime test
-destination, not a per-dataset choice. This is an implication of the
-direction, not a dependency: deprecating `mode` can be decided and scheduled
+- **What replaces `mode: memory`.** It is today's default. Ideally nothing
+replaces it: every dataset uses the same metastore, and the runtime finds that
+a table is small enough to hold in memory and serves it from there, so there
+is no separate mode to choose. Whether that works depends on measurements and
+details not yet available. `mem://` stays a whole-runtime test destination,
+not a per-dataset choice. Deprecating `mode` can be decided and scheduled
 separately from the metastore work.
 - **The layout of data files.** Data files live in the destination (see
 [What we are building](#what-we-are-building)), under each dataset's
@@ -717,7 +723,7 @@ store that every instance can read.
 # Milestones 2 and 3: concurrent metastore
 
 *Note: The decisions below are settled. What is still open waits on evidence,
-not on design: decision 6 (a measurement on Milestone 1's code), and wider
+not on design: decision 3.4 (a measurement on Milestone 1's code), and wider
 model checks that join maintenance and transactions with failures and GC.
 Measurements on Milestone 1 may still adjust details.*
 
@@ -753,11 +759,11 @@ the ceiling a future several-logs improvement would lift.
 
 ## Key decisions
 
-Details for all seven are in
+Details for all of them are in
 [Milestones 2 and 3: concurrent writers](object-native-metastore-technical.md#milestones-2-and-3-concurrent-writers).
-Milestone 2 needs decisions 1 and 4; Milestone 3 adds the rest.
+Decisions 2.1 and 2.2 are what Milestone 2 needs; decisions 3.1 to 3.5 come with Milestone 3.
 
-**1. A writer that loses a race retries if the winners did not touch what it
+**2.1 A writer that loses a race retries if the winners did not touch what it
 depends on.** The losing writer checks its guards and footprint against the
 commits that won, and the outcome has four classes: compatible (retry
 unchanged), rebasable (transform the actions, for example remapping a position
@@ -765,7 +771,12 @@ delete onto a compaction's outputs), retryable (re-plan from the new state), or
 incompatible (return the conflict). This is safe because actions never carry
 values computed from what was read.
 
-**2. Commits publish key footprints,** checked cheapest first: PK hash buckets
+**2.2 Leases coordinate work; guards guarantee correctness.** CDC writers hold
+one lease per source partition, and maintenance nodes lease a deterministic
+unit. A lost lease or a racing node fails its guard and wastes work; it cannot
+corrupt state.
+
+**3.1 Commits publish key footprints,** checked cheapest first: PK hash buckets
 and per-file min/max in the record, then the commit's keys as sorted 64-bit
 digests, compared by one linear merge. A digest collision can only report a
 false conflict, never miss a real one. Bloom filters are not used: their false
@@ -773,22 +784,17 @@ positives compound over a commit's keys (at 1% per key, a 1,000-key commit
 almost always matches), so they decide only small commits and the digests are
 needed anyway.
 
-**3. Overlapping keys are resolved by the writers.** Writers whose keys do not
+**3.2 Overlapping keys are resolved by the writers.** Writers whose keys do not
 overlap need no resolution and no coordination, which is the common case. When
 keys can overlap, Milestone 3 supports abort-and-re-plan and key-range ownership.
 Source-version ordering, where the highest source version of a key wins, is
 deferred until a concrete use case justifies its new semantics and surface.
 
-**4. Leases coordinate work; guards guarantee correctness.** CDC writers hold
-one lease per source partition, and maintenance nodes lease a deterministic
-unit. A lost lease or a racing node fails its guard and wastes work; it cannot
-corrupt state.
-
-**5. Distributed execution writes by source partition, not table partition.** A
+**3.3 Distributed execution writes by source partition, not table partition.** A
 distributed query commits once with every successful task's output; distributed
 ingest assigns source partitions to executors, each an independent writer.
 
-**6. Open: how a writer that loses a race keeps `seq` order,** decided by
+**3.4 Open: how a writer that loses a race keeps `seq` order,** decided by
 measurement. A losing writer's buffered `seq`s are below the winner's, and the
 rule that, within a table, every record is above every earlier one must still
 hold. Two options:
@@ -806,9 +812,9 @@ hold. Two options:
 
 The choice rests on measuring the shift for a realistic window against a
 retry's round trips; (a) unless that is expensive. It is independent of
-publishing at commit (Milestone 1, decision 2).
+publishing at commit (decision 1.2).
 
-**7. Read-dependent writes validate what they read.** An `UPDATE … WHERE`,
+**3.5 Read-dependent writes validate what they read.** An `UPDATE … WHERE`,
 `DELETE … WHERE`, `INSERT … SELECT` or transaction records the keys it looked
 up and the predicates it scanned. On a lost race it conflicts only with
 winners that wrote one of those keys or changed a row matching one of those
@@ -859,5 +865,13 @@ metastore (step 8) can proceed alongside them.
 
 # Open decisions
 
-- **What replaces per-dataset `mode: memory`** in the end state (user-facing
-  surface).
+Both open decisions wait on measurements, not on design.
+
+- **What replaces per-dataset `mode: memory`.** The preferred answer is
+  nothing: the same metastore for every dataset, with the runtime finding that
+  a table is small enough to hold in memory. Whether that works depends on
+  measurements and details not yet available. It is user-facing surface, so the
+  answer goes through the Enhancement.
+- **How a writer that loses a race keeps `seq` order** (decision 3.4): shift
+  the buffer, or coalesce eagerly and stamp at commit, decided by measuring the
+  shift on Milestone 1's code.
