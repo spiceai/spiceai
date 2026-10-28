@@ -21,7 +21,7 @@ pub enum Action {
     Append(usize),
     Observe,
     Create(usize),
-    Checkpoint,
+    Checkpoint(usize),
     Gc,
     Pin,
 }
@@ -55,10 +55,12 @@ impl Model for Protocol {
         for j in 0..state.store.pending.len() {
             action.push(Action::Create(j));
         }
-        if !state.checkpoint && !state.log.is_empty() {
-            action.push(Action::Checkpoint);
+        if !state.checkpoint {
+            for c in state.store.checkpoint_ends() {
+                action.push(Action::Checkpoint(c));
+            }
         }
-        if state.checkpoint && !state.gc {
+        if state.store.floor > 0 && !state.gc {
             action.push(Action::Gc);
         }
         if state.pin.is_none() {
@@ -78,8 +80,10 @@ impl Model for Protocol {
             }
             Action::Observe => next.store.observe(&self.mode),
             Action::Create(j) => next.store.create(j),
-            Action::Checkpoint => {
-                next.store.checkpoint();
+            Action::Checkpoint(c) => {
+                if !next.store.checkpoint(c) {
+                    return None;
+                }
                 next.checkpoint = true;
             }
             Action::Gc => {

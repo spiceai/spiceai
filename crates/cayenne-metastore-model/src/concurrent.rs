@@ -254,7 +254,11 @@ impl Model for Protocol {
                 }
             }
             Checkpoint(i) => {
-                next.ds[i].store.checkpoint();
+                // The writer checkpoints at its newest batch end.
+                let first = next.ds[i].store.first;
+                if !next.ds[i].store.checkpoint(first) {
+                    return None;
+                }
                 next.ds[i].checkpoint = true;
             }
             Gc(i) => {

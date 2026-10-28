@@ -58,7 +58,7 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `commits-retry` | Unavailable head read, fresh-id retry, delayed deliveries and acknowledgement; exactly-once logical write, I5 | Exhaustive/control 2; one writer, two attempts |
 | `commits-etag` | Explicit store-version CAS and delayed retry across head changes; I1–I3, I5 | Exhaustive/control 1; one writer, one original/retry pair |
 | `commits-storage` | Checkpoint parts/root before head publication, delayed GC, pin registration/recheck, lagging reopen, late seal; I4, I7, I8 | Bound 2; samples 4 |
-| `transactions-txn` | Two datasets, one transaction, competing ordinary writes, reservations, commit/abort create race, helper Resolve, uncertain CAS, checkpoint/GC; I3–I6, I8 | Exhaustive 1 (two lease generations), controls 0 except owner restriction 1; samples 2, 3 (two outstanding handles per dataset) |
+| `transactions-txn` | Two datasets, one transaction, competing ordinary writes, reservations, commit/abort create race, helper Resolve, uncertain CAS, checkpoint/GC; one participant writes other keys while prepared so the Prepare can reach a checkpoint; I3–I6, I8 | Exhaustive 1 (two lease generations), controls 0 except owner restriction 1; samples 2, 3 (two outstanding handles per dataset) |
 | `window-storage` | Canonical inline bytes, byte/count pressure, copy rule, cold replay, pins, checkpoint/GC; I4, I7, I8 | Exhaustive 6 records; controls 5; samples 7, 9 |
 | `window-txn` | Transaction resolution composed with explicit delayed byte-batch sealing and eviction; I3–I6, I8 | Exhaustive 0; samples 2, 3 |
 | `concurrent-txn-overlap`, `concurrent-txn-disjoint` | Two transaction identities, overlapping/disjoint footprints, ordinary writer, rejected and late Prepare, opposite reservations, cleanup, checkpointed pending ids; I4, I6, I8 | Exhaustive/control 0; samples 1, 2 |
@@ -96,7 +96,11 @@ R=2 and head budget H=5. Samples visit at least 100,000 states at depth at most 
 with seeds 7, 42 and 20261024. The transaction-resolution profile completes sealing
 as part of planning and omits post-Resolve filler records; `window-txn` schedules
 seals separately. Checkpoints retain symbolic prefix bytes and acceptance evidence;
-they do not encode real checkpoint pages.
+they do not encode real checkpoint pages. A checkpoint names a batch end or the
+record before the window, never a position inside a batch or the window. In
+`window-storage` and `concurrent-*` the writer writes the root and the next
+commit publishes the floor; `transactions-*` publishes it with a CAS of its own,
+as a separate maintenance process does.
 
 ## Negative controls
 
