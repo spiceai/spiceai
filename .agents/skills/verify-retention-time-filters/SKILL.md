@@ -35,7 +35,7 @@ Needs a `spiced` built with `duckdb`, `sqlite` and `cayenne`, `curl`, and `pytho
 `pyarrow`.
 
 ```bash
-SPICED=/path/to/spiced .cursor/skills/verify-retention-time-filters/run.sh
+SPICED=/path/to/spiced .agents/skills/verify-retention-time-filters/run.sh
 ```
 
 | Variable | Default | Meaning |
