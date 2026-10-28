@@ -584,8 +584,9 @@ enum BodyEncoder {
 }
 
 /// The encoder that streams `format` over `schema`, or `None` when the
-/// response buffers: `text/plain` sizes its columns from the whole result, and
-/// the Arrow JSON and CSV writers cannot render union columns.
+/// response buffers: `text/plain` sizes its columns from the whole result, the
+/// Arrow JSON and CSV writers cannot render union columns, and the CSV writer
+/// rejects nested columns, an error that must reach the client as a status.
 fn streamed_encoder(
     format: ResponseMimeType,
     schema: &arrow::datatypes::Schema,
@@ -602,6 +603,7 @@ fn streamed_encoder(
                 started: false,
             })
         }
+        ResponseMimeType::Csv if schema.fields().iter().any(|f| f.data_type().is_nested()) => None,
         ResponseMimeType::Csv => Some(BodyEncoder::Csv { header: true }),
         ResponseMimeType::Plain => None,
     }
@@ -1352,6 +1354,9 @@ mod tests {
         for (format, buffered) in streamed_formats() {
             for batches in &cases {
                 let expected = buffered(batches).expect("buffered body");
+                if matches!(format, ResponseMimeType::VndSqlJsonV1) && batches.is_empty() {
+                    assert_eq!(expected, r#"{"schema":{},"data":[],"row_count":0}"#);
+                }
 
                 let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
                 let account = EgressAccount::register(&pool, "test_egress");
@@ -1460,6 +1465,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// CSV cannot encode a nested column, so the request fails with an error
+    /// status rather than a `200` head over an empty body.
+    #[tokio::test]
+    async fn csv_with_a_nested_column_is_an_error_response() {
+        use arrow::array::{Array, ArrayRef, ListArray};
+        use arrow::datatypes::Int64Type;
+        use datafusion::error::DataFusionError;
+        use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let list = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(1)])]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l",
+            list.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(list) as ArrayRef])
+            .expect("record batch");
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(std::iter::once(Ok::<_, DataFusionError>(batch))),
+        ));
+
+        let response = query_stream_to_http_response(
+            data,
+            CacheStatus::CacheMiss,
+            ResponseMimeType::Csv,
+            pool,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("error body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("not supported in CSV"),
+            "the error names the cause: `{}`",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     /// HTTP JSON, vnd JSON and CSV from `QueryResult::from_cached_raw` must

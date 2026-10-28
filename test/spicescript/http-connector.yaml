@@ -335,7 +335,8 @@ steps:
     expect-error: Declared schema does not match source schema
 
   # Runtime HTTP: Server-Timing on a buffered answer and an error, the vnd
-  # JSON and CSV answers streamed with every DECIMAL digit, and the trace id
+  # JSON and CSV answers streamed with every DECIMAL digit, the CSV error for a
+  # nested column, and the trace id
   # echoed back when the request pins one.
   - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain, accept: text/plain }, body: SELECT 1 }
     expect: { status: 200, headers: { server-timing: 'total;dur=' } }
@@ -343,6 +344,8 @@ steps:
     expect: { status: 200, body-contains: '"data":[{"d":99999999999999999999999999999999999999}],"row_count":1', lacks-headers: [content-length, server-timing] }
   - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain, accept: text/csv }, body: "SELECT CAST('99999999999999999999999999999999999999' AS DECIMAL(38, 0)) AS d" }
     expect: { status: 200, body-contains: "d\n99999999999999999999999999999999999999\n", lacks-headers: [content-length, server-timing] }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain, accept: text/csv }, body: "SELECT [1, 2] AS l" }
+    expect: { status: 500, body-contains: not supported in CSV }
   - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain }, body: SELECT * FROM no_such_table }
     expect: { status: 400, headers: { server-timing: 'total;dur=' } }
   - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain, spice-trace-id: 4bf92f3577b34da6a3ce929d0e0e4736 }, body: SELECT 1 }
