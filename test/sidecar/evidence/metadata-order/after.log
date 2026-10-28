@@ -1,9 +1,0 @@
-    Finished `release` profile [optimized] target(s) in 0.64s
-     Running tests/cookie_middleware.rs (target/release/deps/cookie_middleware-c2c1211c940eb74d)
-
-running 1 test
-contexts_equal=false; observed_authorization=["Bearer bob", "Bearer alice"]
-test federation_context_preserves_repeated_authorization_order ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
-

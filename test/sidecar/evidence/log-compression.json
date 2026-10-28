@@ -1,0 +1,18 @@
+[
+  {
+    "path": "test/sidecar/evidence/candidate-944b5f3/unit-before.log.gz",
+    "uncompressed_sha256": "ebf2be69d95c343bf696666ad4c0332b5511eb9f04b3f96a6cf0970d65b7ca71"
+  },
+  {
+    "path": "test/sidecar/evidence/metadata-order/flight-client-integration.log.gz",
+    "uncompressed_sha256": "052fd3c7035c77ccf2b1d0fbecd0c1144ea2f51e97a9f0594f179e456e749e18"
+  },
+  {
+    "path": "test/sidecar/evidence/metadata-order/before.log.gz",
+    "uncompressed_sha256": "eaa2a2a3567f23fa58daeb8315a12424730087081d4bcafda7de31d91416fe0f"
+  },
+  {
+    "path": "test/sidecar/evidence/metadata-order/after.log.gz",
+    "uncompressed_sha256": "875965f5c92d8eb3917bec5af5cde397647c7c63819d33390d91f083fab9ac5e"
+  }
+]
