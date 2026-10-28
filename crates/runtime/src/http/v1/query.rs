@@ -187,8 +187,8 @@ pub(crate) async fn post(
 ) -> Response {
     let mut response = respond(&headers, accept.as_ref(), &body).await;
     // Every response this handler builds is complete before its head is sent —
-    // a query error, a rejected body, a buffered format — except the streamed
-    // JSON body, which marked itself for a trailer.
+    // a query error, a rejected body, a buffered format — except a streamed
+    // body, which marked itself for a trailer.
     if response.extensions().get::<ServerTiming>().is_none() {
         response.extensions_mut().insert(ServerTiming::Header);
     }
