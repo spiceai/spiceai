@@ -167,21 +167,23 @@ fn tag(path: &str) -> Option<String> {
 #[must_use]
 pub fn quantizations(listing: &[ListedFile]) -> Vec<Quantization> {
     let size: BTreeMap<&str, u64> = listing.iter().map(|f| (f.path.as_str(), f.size)).collect();
-    // Files grouped by (folder, stem without the shard suffix).
-    let mut groups: BTreeMap<(String, String), Vec<&str>> = BTreeMap::new();
+    // Files grouped by (folder, stem without the shard suffix, shard count): a series is one
+    // shard count, so a partial layout of another count beside it neither hides it nor joins it.
+    let mut groups: BTreeMap<(String, String, Option<u32>), Vec<&str>> = BTreeMap::new();
     for file in listing {
         let path = file.path.as_str();
         if !is_gguf(path) || is_draft_head(path) || is_projector(path) {
             continue;
         }
-        let stem = shard(path).map_or_else(|| path.to_string(), |(stem, _, _)| stem);
+        let (stem, count) =
+            shard(path).map_or_else(|| (path.to_string(), None), |(stem, _, n)| (stem, Some(n)));
         groups
-            .entry((folder(path).to_string(), stem))
+            .entry((folder(path).to_string(), stem, count))
             .or_default()
             .push(path);
     }
     let mut complete = Vec::new();
-    for ((dir, stem), mut files) in groups {
+    for ((dir, stem, _), mut files) in groups {
         let whole = match shard(files[0]) {
             None => files.len() == 1,
             Some((_, _, n)) => {
@@ -388,7 +390,9 @@ pub fn resolve(
             named_quantization = Some(q);
         }
     }
-    weights.dedup();
+    // Each entry naming a shard expands to its whole series, so naming two shards repeats it.
+    let mut seen = BTreeSet::new();
+    weights.retain(|w| seen.insert(w.clone()));
     if weights.is_empty() && draft.is_none() {
         return Ok(None);
     }
@@ -973,5 +977,54 @@ mod tests {
             resolve(&safetensors, &["tokenizer.model", "extra.v1"]),
             Ok(None)
         );
+    }
+
+    /// A partial layout of a quantization beside a complete one with the same stem, as a
+    /// re-split upload left half done, is its own series: it neither hides the complete layout
+    /// nor counts as one.
+    #[test]
+    fn a_partial_layout_does_not_hide_a_complete_one_with_the_same_stem() {
+        let files = listing(&[
+            ("Qwen3-0.6B-Q4_K_M-00001-of-00002.gguf", 3 * GB),
+            ("Qwen3-0.6B-Q4_K_M-00002-of-00002.gguf", 2 * GB),
+            ("Qwen3-0.6B-Q4_K_M-00001-of-00003.gguf", 2 * GB),
+        ]);
+        let found = quantizations(&files);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].files,
+            [
+                "Qwen3-0.6B-Q4_K_M-00001-of-00002.gguf",
+                "Qwen3-0.6B-Q4_K_M-00002-of-00002.gguf"
+            ]
+        );
+        assert_eq!(found[0].bytes, 5 * GB);
+        assert_eq!(found[0].name, "Q4_K_M");
+    }
+
+    /// Naming every shard of a series loads each once and still names its quantization.
+    #[test]
+    fn naming_every_shard_identifies_the_quantization() {
+        let files = listing(&[
+            ("Qwen3-0.6B-Q4_K_M-00001-of-00002.gguf", 3 * GB),
+            ("Qwen3-0.6B-Q4_K_M-00002-of-00002.gguf", 2 * GB),
+        ]);
+        let resolved = resolve(
+            &files,
+            &[
+                "Qwen3-0.6B-Q4_K_M-00001-of-00002.gguf",
+                "Qwen3-0.6B-Q4_K_M-00002-of-00002.gguf",
+            ],
+        )
+        .expect("the files resolve")
+        .expect("GGUF files");
+        assert_eq!(
+            resolved.weights,
+            [
+                "Qwen3-0.6B-Q4_K_M-00001-of-00002.gguf",
+                "Qwen3-0.6B-Q4_K_M-00002-of-00002.gguf"
+            ]
+        );
+        assert_eq!(resolved.quantization.as_deref(), Some("Q4_K_M"));
     }
 }
