@@ -100,7 +100,8 @@ DIR/<script>/[<combination>/]<instance>/  its spiced.log (executors' too), spice
 ```
 
 `<combination>` is the matrix combination (`src_postgres`), for a script with
-a matrix. A container that fails to start or become healthy puts its last lines
+a matrix; combinations whose values differ only in case or punctuation also
+get their position in the matrix (`k_a_b-1`, `k_a_b-2`). A container that fails to start or become healthy puts its last lines
 of output in the error either way. Processes a script starts inside a container
 (Debezium Server under `source-exec`) write to the container's output,
 `/proc/1/fd/1`, so its log has them too.

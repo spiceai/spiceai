@@ -780,10 +780,27 @@ pub fn capture_dir(root: &Path, script: &Script) -> PathBuf {
 
 /// A matrix combination's directory within its script's: the script's own
 /// for a script without a matrix, else one named by the combination's values.
+/// Values that differ only in case or punctuation (`a-b` and `a_b`) name the
+/// same directory, so each such combination also gets its position in the
+/// matrix after a `-`, which no named directory contains.
 fn combination_capture_dir(script_dir: &Path, script: &Script, run_label: &str) -> PathBuf {
-    match run_label.strip_prefix(script.name.as_str()) {
-        Some("") | None => script_dir.to_path_buf(),
-        Some(combo) => script_dir.join(sanitize(combo).trim_matches('_')),
+    let dir_name = |label: &str| {
+        label
+            .strip_prefix(script.name.as_str())
+            .map(|combo| sanitize(combo).trim_matches('_').to_string())
+            .filter(|name| !name.is_empty())
+    };
+    let Some(name) = dir_name(run_label) else {
+        return script_dir.to_path_buf();
+    };
+    let labels = script.run_labels();
+    let sharing = labels
+        .iter()
+        .filter(|label| dir_name(label).as_ref() == Some(&name))
+        .count();
+    match labels.iter().position(|label| label == run_label) {
+        Some(index) if sharing > 1 => script_dir.join(format!("{name}-{}", index + 1)),
+        _ => script_dir.join(name),
     }
 }
 
@@ -1517,6 +1534,33 @@ mod tests {
             ]
         );
         assert_eq!(matrix_combinations(&IndexMap::new()), vec![Map::new()]);
+    }
+
+    #[test]
+    fn combinations_differing_only_in_punctuation_capture_apart() {
+        let script = Script::parse(
+            "name: s\nspicepod: {}\nmatrix: { k: [a-b, a_b, c], m: [x] }\nsteps: [{ start: {} }]",
+        )
+        .expect("script parses");
+        let dirs: Vec<PathBuf> = script
+            .run_labels()
+            .iter()
+            .map(|label| combination_capture_dir(Path::new("cap/s"), &script, label))
+            .collect();
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from("cap/s/k_a_b_m_x-1"),
+                PathBuf::from("cap/s/k_a_b_m_x-2"),
+                PathBuf::from("cap/s/k_c_m_x"),
+            ]
+        );
+        let plain =
+            Script::parse("name: s\nspicepod: {}\nsteps: [{ start: {} }]").expect("script parses");
+        assert_eq!(
+            combination_capture_dir(Path::new("cap/s"), &plain, "s"),
+            PathBuf::from("cap/s")
+        );
     }
 }
 
