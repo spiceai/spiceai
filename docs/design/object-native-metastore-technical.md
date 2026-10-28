@@ -151,7 +151,10 @@ The protocol also needs a version to **never repeat**: once the head moves
 from version V, no later write may produce V's ETag again, or a delayed CAS
 conditioned on V could apply. The head's bytes never repeat, because its
 commit number, the lease generation and the floor only grow, and the model shows that this is
-enough. What remains is a store whose ETag can repeat for different bytes; the
+enough, and it is required, not a precaution: an S3-compatible store whose
+ETag is a content hash was observed to return the same ETag for rewritten
+identical bytes and then accept a delayed CAS conditioned on the first
+version. What remains is a store whose ETag can repeat for different bytes; the
 local store had that defect and it was fixed in `object_store_occ`
 (`d735f39a6a`).
 
@@ -169,8 +172,15 @@ local create becomes:
 
   A record may reference only objects whose directory syncs have completed.
 
-  *Cost:* this is mandatory, not optional. A durable local create measured
-  8.0 ms P50 and 11.6 ms P99 on macOS, below a remote object-store commit.
+  *Cost:* this is mandatory, not optional. A durable local create or CAS
+  measured about 8 ms P50 and 14–15 ms P99 on macOS (APFS, `F_FULLFSYNC`),
+  below a remote object-store commit.
+
+  *Concurrency:* uploads and the head CAS must proceed independently; only
+  writes to one path need ordering. A local store that funnels every put
+  through one writer makes each commit wait behind unrelated uploads: a
+  prototype measured head CAS P99 rising from 12 ms to 175 ms with 16
+  concurrent 1 MiB uploads, and to 909 ms behind four 64 MiB uploads.
 - **The head log:** the head, its window, batches and the copy rule; commit,
   identical retry and resolution; an "advance after my own commit" call, so a
   writer keeps its state in memory instead of rebuilding a snapshot per
@@ -443,8 +453,13 @@ the one after record `a`. A batch is named by its first record's commit number.
   Otherwise a reader behind the window finds neither the record nor its
   batch, or the index and the batch disagree.
 - **Feasible budgets.** The largest record R must fit a batch (R ≤ B), and the
-  head must hold a full batch plus one more record (H ≥ B + R). Otherwise the
-  record that makes a batch final may not fit beside it. The cut, R, B, H and
+  head must hold a full batch plus one more record beside everything else it
+  carries: H ≥ B + R + M, where M bounds the head's content outside the window
+  (its fields, record envelopes, and the batch index at its largest before a
+  checkpoint trims it). Otherwise the record that makes a batch final may not
+  fit beside it. H ≥ B + R alone is not enough: a prototype at H = 300,
+  B = 200, R = 100 could not fit the third 100-byte record once the head's
+  other content was counted. The cut, R, B, H and
   K are protocol constants, not head fields.
 - **One canonical encoding.** Every sealer must produce identical bytes, so the
   record and batch encodings are versioned with `format`, and a sealer copies
@@ -542,6 +557,16 @@ it to stop. This is the pattern `object_store_occ::lease` already documents: a
 holder checks its generation inside its own conditional writes of the state it
 guards. Nothing about ownership is checked at replay. The old writer's
 unflushed buffer is discarded, since it was never acknowledged.
+
+**Every committer carries the generation, background tasks included.**
+Statistics, compaction, cold promotion and every other background task commit
+through the writer's handle, so the head CAS fences them like ingest. A
+writer's handle is closed when its session ends (a dataset reloaded or
+recreated in the same process), even if a background task still holds it;
+otherwise a task that outlives its session commits after the new session has
+written. Today's SQL metastore accepts exactly that late write, from a
+dropped provider's post-write maintenance loop persisting table statistics: a
+prototype reproduced it 3 times out of 3.
 
 **Safety comes from the head, not from the lease's timing.** Recording a new
 generation in the head fences every older writer whatever its lease says, so
@@ -708,8 +733,11 @@ flowchart LR
 **Reconstruction:**
 
 1. GET the head.
-2. In parallel, GET the checkpoint root named by `floor` and every listed
-   batch.
+2. In parallel, with bounded concurrency, GET the checkpoint root named by
+   `floor` and every listed batch. An unbounded fan-out saturated an
+   S3-compatible test server (1,025 GETs at once: P99 6.2 s, against 28 ms on
+   a local directory); the checkpoint cadence keeps the batch count, and so
+   the fan-out, small.
 3. Apply the batches' records, then the window's, in commit order.
 4. Load pages lazily, per collection, when they are first needed: live files
    when a scan plans, deletion vectors when the deletion index builds.
@@ -1537,6 +1565,13 @@ replacement is measured (direction document, decision 1.5).
   still in the window. That is bandwidth, not requests (in-region transfer is
   free on S3), and it is what bounds H. Readers and recovery reproduce the
   inline bytes exactly in the protocol model.
+- **The per-record bound decides what stays inline, not H.** A record above
+  about R/2 is stored as an object and the window carries its reference, so a
+  few large records cannot keep the head near its budget. In a prototype at
+  H = 128 KiB, 28 KiB inline records sealed a batch every two commits
+  (1.5 creates and 1 GET per commit, against 0.05 creates at 1 KiB). A busy
+  CDC table's 2 s window is often tens of KB to MBs, so for those tables the
+  rows go to files and only small tables' commits stay inline.
 - **Retirement is conditional.** The SQL inline tier is removed only once this
   replacement meets the bar measured against it (see [roadmap step 5](#step-5-the-object-native-metastore-as-authority-for-new-datasets)),
   including the caching workload below. Its removal would also remove the
