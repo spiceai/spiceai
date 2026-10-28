@@ -276,6 +276,8 @@ pub(super) enum QueryRuntimeBinding {
 
 pub struct Query {
     serialized_plan_cache_key: Option<Arc<str>>,
+    /// The snapshot used to decode a sessionless wire plan, reused for execution.
+    planning_session: Option<Box<SessionState>>,
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
     tracker: Option<QueryTracker>,
@@ -1461,7 +1463,10 @@ impl Query {
                     CacheProbe::Skipped => None,
                 };
 
-                let mut session = ctx.get_session_state(&request_context);
+                let mut session = match ctx.planning_session.take() {
+                    Some(session) => *session,
+                    None => ctx.get_session_state(&request_context),
+                };
                 if let Some(timeout) = request_context.query_timeout()
                     && let Some(deadline) = started_at.checked_add(timeout)
                 {
@@ -2095,6 +2100,7 @@ impl Query {
     pub fn from_logical_plan(df: &Arc<DataFusion>, plan: LogicalPlan) -> Self {
         Self {
             serialized_plan_cache_key: None,
+            planning_session: None,
             df: Arc::clone(df),
             sql: QueryMethod::Plan(Box::new(plan)),
             tracker: None,

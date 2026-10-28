@@ -30,7 +30,7 @@ use datafusion::{
     datasource::empty::EmptyTable,
     error::DataFusionError,
     execution::{TaskContext, context::SessionState},
-    logical_expr::{Expr, Extension, LogicalPlan, LogicalPlanBuilder, TableScan},
+    logical_expr::{Expr, ExprSchemable, Extension, LogicalPlan, LogicalPlanBuilder, TableScan},
     optimizer::{Analyzer, AnalyzerRule},
     physical_expr::EquivalenceProperties,
     physical_plan::{
@@ -158,7 +158,41 @@ impl SubstraitProducer for SpiceProducer {
                 function.func.name(),
             )));
         }
-        datafusion_substrait::logical_plan::producer::from_scalar_function(self, function, schema)
+        use datafusion_substrait::substrait::proto::{
+            Expression, FunctionArgument,
+            expression::{RexType, ScalarFunction},
+            function_argument::ArgType,
+        };
+        let (_, output) = Expr::ScalarFunction(function.clone()).to_field(schema)?;
+        let output_type = datafusion_substrait::logical_plan::producer::to_substrait_type(
+            self,
+            output.data_type(),
+            output.is_nullable(),
+        )?;
+        let arguments = function
+            .args
+            .iter()
+            .map(|arg| {
+                Ok(FunctionArgument {
+                    arg_type: Some(ArgType::Value(self.handle_expr(arg, schema)?)),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Preserve exact DataFusion names and argument order: canonical
+        // Substrait aliases and rewrites may bind to a different upstream UDF.
+        let function_reference = self
+            .extensions
+            .register_function(&format!("spice.function.{}", function.func.name()));
+        #[expect(deprecated, reason = "the protobuf retains the legacy args field")]
+        Ok(Expression {
+            rex_type: Some(RexType::ScalarFunction(ScalarFunction {
+                function_reference,
+                arguments,
+                output_type: Some(output_type),
+                options: vec![],
+                args: vec![],
+            })),
+        })
     }
 
     fn register_function(&mut self, signature: String) -> u32 {

@@ -252,6 +252,19 @@ impl SubstraitConsumer for SpiceSubstraitConsumer<'_> {
             let arguments = from_substrait_func_args(self, &expr.arguments, input_schema).await?;
             return lower_spice_operator(operator, arguments);
         }
+        if let Some(name) = self
+            .extensions
+            .functions
+            .get(&expr.function_reference)
+            .and_then(|name| name.strip_prefix("spice.function."))
+        {
+            let func = self.state.udf(name)?;
+            let args = from_substrait_func_args(self, &expr.arguments, input_schema).await?;
+            return spark_like_to_like_expr(Expr::ScalarFunction(ScalarFunctionExpr {
+                func,
+                args,
+            }));
+        }
         spark_like_to_like_expr(from_scalar_function(self, expr, input_schema).await?)
     }
 

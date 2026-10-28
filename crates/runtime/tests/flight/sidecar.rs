@@ -74,6 +74,14 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
             ))),
         );
         upstream.ctx.register_udf(shadow_add);
+        upstream.ctx.register_udf(datafusion::logical_expr::create_udf(
+            "is_nan", vec![arrow::datatypes::DataType::Float64],
+            arrow::datatypes::DataType::Boolean,
+            datafusion::logical_expr::Volatility::Immutable,
+            Arc::new(|_| Ok(datafusion::logical_expr::ColumnarValue::Scalar(
+                datafusion::common::ScalarValue::Boolean(Some(true)),
+            ))),
+        ));
         let oracle = SessionContext::new();
         oracle.register_batch("orders", input.clone())?;
         oracle.register_batch("other_orders", input.clone())?;
@@ -124,6 +132,8 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
             "SELECT named_struct('key', id, 'value', label) AS nested FROM orders ORDER BY id",
             "SELECT map(make_array('key', 'value'), make_array(id, value)) AS attributes FROM orders ORDER BY id",
             "SELECT to_timestamp_seconds(id) AS ts FROM orders ORDER BY id",
+            "SELECT id, isnan(CAST(id AS DOUBLE)) AS n FROM orders ORDER BY id",
+            "SELECT id, log(CAST(2 AS DOUBLE), CAST(id AS DOUBLE)) AS n FROM orders WHERE id > 0 ORDER BY id",
             "SELECT sidecar_roundtrip_identity(value) AS value FROM orders ORDER BY id",
         ];
         for sql in corpus {

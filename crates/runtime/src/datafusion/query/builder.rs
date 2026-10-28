@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashSet, sync::Arc};
 
 use datafusion::common::ParamValues;
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use tokio::time::Instant;
@@ -54,6 +55,7 @@ pub struct QueryBuilder {
     runtime_binding: QueryRuntimeBinding,
     emit_tracker: bool,
     serialized_plan_cache_key: Option<Arc<str>>,
+    planning_session: Option<Box<SessionState>>,
 }
 
 impl QueryBuilder {
@@ -70,6 +72,7 @@ impl QueryBuilder {
             runtime_binding: QueryRuntimeBinding::QueryRuntime,
             emit_tracker: true,
             serialized_plan_cache_key: None,
+            planning_session: None,
         }
     }
 
@@ -91,6 +94,7 @@ impl QueryBuilder {
             runtime_binding: QueryRuntimeBinding::QueryRuntime,
             emit_tracker: true,
             serialized_plan_cache_key: None,
+            planning_session: None,
         }
     }
 
@@ -115,6 +119,7 @@ impl QueryBuilder {
             runtime_binding: QueryRuntimeBinding::QueryRuntime,
             emit_tracker: true,
             serialized_plan_cache_key: None,
+            planning_session: None,
         }
     }
 
@@ -122,10 +127,12 @@ impl QueryBuilder {
     pub(crate) fn from_substrait_plan(
         plan: LogicalPlan,
         digest: String,
+        session: Option<SessionState>,
         df: Arc<DataFusion>,
     ) -> Self {
         let mut builder = Self::from_plan(plan, digest.clone(), df);
         builder.serialized_plan_cache_key = Some(digest.into());
+        builder.planning_session = session.map(Box::new);
         builder
     }
 
@@ -254,6 +261,7 @@ impl QueryBuilder {
             results_cache_mode: self.results_cache_mode,
             runtime_binding: self.runtime_binding,
             serialized_plan_cache_key: self.serialized_plan_cache_key,
+            planning_session: self.planning_session,
         }
     }
 }

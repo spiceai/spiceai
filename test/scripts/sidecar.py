@@ -850,6 +850,19 @@ def main():
                 "as_tool": False,
             }
         )
+        function_pod["functions"].append(
+            {
+                "name": "is_nan",
+                "from": "sql",
+                "signature": {
+                    "args": [{"name": "x", "type": "float64"}],
+                    "returns": "boolean",
+                },
+                "body": "x > -100",
+                "volatility": "immutable",
+                "as_tool": False,
+            }
+        )
         function_upstream = Instance(
             args.spiced, args.out / "function-upstream", function_pod
         )
@@ -885,6 +898,22 @@ def main():
                 results.append(
                     {"sql": sql, "actual": actual, "expected": expected(database, sql)}
                 )
+            alias_udf, _ = function_upstream.query(
+                "SELECT is_nan(CAST(1 AS DOUBLE)) AS n"
+            )
+            assert alias_udf == [{"n": True}], alias_udf
+            for sql, wanted in [
+                (
+                    "SELECT id, isnan(CAST(id AS DOUBLE)) AS n FROM orders WHERE id < 10 ORDER BY id",
+                    [{"id": i, "n": False} for i in range(10)],
+                ),
+                (
+                    "SELECT id, log(CAST(2 AS DOUBLE), CAST(id AS DOUBLE)) AS n FROM orders WHERE id = 8",
+                    [{"id": 8, "n": 3.0}],
+                ),
+            ]:
+                actual, _ = function_sidecar.query(sql)
+                results.append({"sql": sql, "actual": actual, "expected": wanted})
             (function_sidecar.directory / "result.json").write_text(
                 json.dumps(results, indent=2)
             )
@@ -892,7 +921,7 @@ def main():
                 results
             )
             print(
-                "upstream UDFs: sidecar arithmetic, NULL predicates, negation and LIKE preserved",
+                "upstream UDFs: sidecar arithmetic, NULL predicates, negation, LIKE, builtin names and argument order preserved",
                 flush=True,
             )
         finally:
