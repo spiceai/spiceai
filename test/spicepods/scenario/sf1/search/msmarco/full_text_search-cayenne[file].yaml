@@ -1,17 +1,14 @@
 version: v1
 kind: Spicepod
-name: full_text_search-duckdb[file]
+name: full_text_search-cayenne[file]
 
-metadata:
-  benchmark_dataset: msmarco_dev_retrieval
-
-# Latency benchmark for full-text search. Each query must reach the search index on every pass, so
-# both results caches are off. Run with `--warmup-passes` and `--passes`, for example:
-#   testoperator run search -p <this file> --warmup-passes 1 --passes 2 --concurrency 8
+# Full-text search latency benchmark for `testoperator run bench`, with the scenario query file
+# `test/scenario/search/msmarco_text_search.yaml`:
+#   testoperator run bench -p <this file> --query-set scenario \
+#     --scenario-query-file test/scenario/search/msmarco_text_search.yaml
+# Each search must reach the index on every run, so the SQL results cache is off.
 runtime:
   caching:
-    search_results:
-      enabled: false
     sql_results:
       enabled: false
 
@@ -57,7 +54,8 @@ datasets:
     params:
       file_format: parquet
 
-  # All 509,962 MS MARCO queries. `test_queries` keeps only the dev queries that have judgments.
+  # All 509,962 MS MARCO queries. `test_queries` keeps only the 6,980 dev queries that have
+  # judgments.
   - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/queries/queries/0.parquet
     name: all_queries
     params:
@@ -65,7 +63,7 @@ datasets:
     acceleration:
       enabled: true
 
-  # The MS MARCO dev qrels (6,980 queries), which MTEB evaluates.
+  # The MS MARCO dev qrels. They are used only to choose `test_queries`.
   - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/default/dev/0.parquet
     name: relevance_data
     params:
@@ -90,7 +88,7 @@ views:
       UNION ALL SELECT * FROM corpus_6
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
     columns:
       - name: text

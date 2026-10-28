@@ -2,16 +2,13 @@ version: v1
 kind: Spicepod
 name: full_text_search-cayenne[file]
 
-metadata:
-  benchmark_dataset: search_benchmark_game
-
-# Latency benchmark for full-text search. Each query must reach the search index on every pass, so
-# both results caches are off. There is no `relevance_data`, so the run measures latency only.
-#   testoperator run search -p <this file> --warmup-passes 2 --passes 35 --concurrency 1
+# Full-text search latency benchmark for `testoperator run bench`, with the scenario query file
+# `test/scenario/search/search_benchmark_game_text_search.yaml`:
+#   testoperator run bench -p <this file> --query-set scenario \
+#     --scenario-query-file test/scenario/search/search_benchmark_game_text_search.yaml
+# Each search must reach the index on every run, so the SQL results cache is off.
 runtime:
   caching:
-    search_results:
-      enabled: false
     sql_results:
       enabled: false
 
