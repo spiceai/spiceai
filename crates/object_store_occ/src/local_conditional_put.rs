@@ -90,6 +90,7 @@ use object_store::{
 pub struct LocalConditionalPut {
     inner: Arc<LocalFileSystem>,
     root: PathBuf,
+    durable: bool,
     writes: tokio::sync::mpsc::Sender<Publication>,
 }
 
@@ -160,10 +161,15 @@ fn publication_lock_path(root: &std::path::Path, location: &Path) -> PathBuf {
 /// publication have one owner, even when the caller drops its future or shuts
 /// its runtime down. The bounded queue limits pending payloads; closing all
 /// senders drains accepted writes and exits.
-fn write_worker(root: &std::path::Path, mut receive: tokio::sync::mpsc::Receiver<Publication>) {
+fn write_worker(
+    root: &std::path::Path,
+    durable: bool,
+    mut receive: tokio::sync::mpsc::Receiver<Publication>,
+) {
     while let Some(request) = receive.blocking_recv() {
         let result = publish(
             root,
+            durable,
             &request.location,
             &request.path,
             &request.payload,
@@ -257,7 +263,7 @@ impl Drop for Staging {
 fn stage(
     path: &std::path::Path,
     payload: &PutPayload,
-) -> Result<(std::fs::File, Staging), ObjectStoreError> {
+) -> Result<(std::fs::File, Staging, bool), ObjectStoreError> {
     let mut suffix = 1_u64;
     let mut created_parent = false;
     let (mut file, staging) = loop {
@@ -292,7 +298,28 @@ fn stage(
         .iter()
         .try_for_each(|chunk| file.write_all(chunk))
         .map_err(worker_error)?;
-    Ok((file, staging))
+    Ok((file, staging, created_parent))
+}
+
+/// Makes a published name durable: syncs the directory holding `path`, and,
+/// when the put created directories, every ancestor up to `root`, because a new
+/// directory is durable only once the entry linking it into its parent is.
+fn sync_directories(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    created_parent: bool,
+) -> Result<(), ObjectStoreError> {
+    let mut directory = path.parent();
+    while let Some(current) = directory {
+        std::fs::File::open(current)
+            .and_then(|handle| handle.sync_all())
+            .map_err(worker_error)?;
+        if !created_parent || current == root || !current.starts_with(root) {
+            break;
+        }
+        directory = current.parent();
+    }
+    Ok(())
 }
 
 /// Moves the staged file's stored modification time, `written`, past `floor`
@@ -338,6 +365,7 @@ fn stamp(
 /// Port any change to that function, such as an fsync option, here too.
 fn publish(
     root: &std::path::Path,
+    durable: bool,
     location: &Path,
     path: &std::path::Path,
     payload: &PutPayload,
@@ -345,7 +373,7 @@ fn publish(
 ) -> Result<PutResult, ObjectStoreError> {
     // Every writer in this root shares the legacy lock, so the payload is
     // written before it is taken.
-    let (staged, mut staging) = stage(path, payload)?;
+    let (staged, mut staging, created_parent) = stage(path, payload)?;
     let written = staged.metadata().map_err(worker_error)?;
     // Take the legacy root lock before the directory lock. An older process
     // locks only the root file. Reversing this order can deadlock with a writer
@@ -407,6 +435,11 @@ fn publish(
     directory_guard
         .set_modified(modified)
         .map_err(worker_error)?;
+    // The stamp is the version's ETag, so the sync comes after it: a version
+    // must not come back from a crash with a different ETag than it reported.
+    if durable {
+        staged.sync_all().map_err(worker_error)?;
+    }
     // Some FUSE filesystems, such as Blobfuse, upload a file only once it is
     // closed.
     drop(staged);
@@ -425,6 +458,9 @@ fn publish(
             worker_error(source)
         }
     })?;
+    if durable {
+        sync_directories(root, path, created_parent)?;
+    }
     Ok(PutResult {
         e_tag: Some(local_etag(&written, modified)),
         version: None,
@@ -450,17 +486,33 @@ impl LocalConditionalPut {
     /// Returns an error if the `LocalFileSystem` cannot be initialized
     /// (e.g. `root` does not exist or is not a directory).
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, ObjectStoreError> {
+        Self::with_durability(root, false)
+    }
+
+    /// Creates a `LocalConditionalPut` whose puts survive power loss: each
+    /// staged file is synced before it is linked into place, and the directory
+    /// entries that publish it are synced before the put returns.
+    ///
+    /// # Errors
+    ///
+    /// As [`LocalConditionalPut::new`].
+    pub fn new_durable(root: impl Into<PathBuf>) -> Result<Self, ObjectStoreError> {
+        Self::with_durability(root, true)
+    }
+
+    fn with_durability(root: impl Into<PathBuf>, durable: bool) -> Result<Self, ObjectStoreError> {
         let root = root.into();
         let inner = Arc::new(LocalFileSystem::new_with_prefix(&root)?);
         let (writes, receive) = tokio::sync::mpsc::channel(1);
         let worker_root = root.clone();
         std::thread::Builder::new()
             .name("local-state-writer".to_owned())
-            .spawn(move || write_worker(&worker_root, receive))
+            .spawn(move || write_worker(&worker_root, durable, receive))
             .map_err(worker_error)?;
         Ok(Self {
             inner,
             root,
+            durable,
             writes,
         })
     }
@@ -468,7 +520,8 @@ impl LocalConditionalPut {
 
 impl Display for LocalConditionalPut {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "LocalConditionalPut({})", self.root.display())
+        let mode = if self.durable { ", durable" } else { "" };
+        write!(f, "LocalConditionalPut({}{mode})", self.root.display())
     }
 }
 
