@@ -11985,15 +11985,11 @@ mod tests {
             loaded.as_ref(),
             "the served file stays in place"
         );
-        let leftovers: Vec<_> = std::fs::read_dir(temp_dir.path())
+        let leftover = std::fs::read_dir(temp_dir.path())
             .expect("list")
             .map(|entry| entry.expect("entry").file_name())
-            .filter(|name| name.to_string_lossy().contains("download"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "the download is removed: {leftovers:?}"
-        );
+            .any(|name| name.to_string_lossy().contains("download"));
+        assert!(!leftover, "the download is removed");
 
         let bootstrap_dir = TempDir::new().expect("create temp dir");
         let bootstrap_path = bootstrap_dir.path().join("accelerated.db");
