@@ -229,7 +229,7 @@
   },
   {
     "path": "types/local/concurrent-results.json",
-    "sha256": "505ef9e4abb7bbd720806e40da9805035ad0e636b7aa3229628f321a29fc0c5c"
+    "sha256": "daf88795c7a7477b840eed7bed15625d9cdc15df59f6142a94fd7800027ae9ec"
   },
   {
     "path": "types/local/results.json",
@@ -245,7 +245,7 @@
   },
   {
     "path": "types/server/concurrent-results.json",
-    "sha256": "d7945e072d8be1571b6fcd9f1dabe3e66c997bac9d10c7f2f014f65d6628e139"
+    "sha256": "a7b2248502984ac50c813abac57b5e12945466c6114ae524e18c1857e8b5208d"
   },
   {
     "path": "types/server/results.json",
@@ -257,7 +257,7 @@
   },
   {
     "path": "types/sidecar/concurrent-results.json",
-    "sha256": "2091b6c4a5187ce300132edbde4d165c333cfc3033097bb7ebb10d94d910e9f4"
+    "sha256": "85298b42cf44474b59c5bbc4d6aad358f2fa65b154b71023711e689472ae77e4"
   },
   {
     "path": "types/sidecar/results.json",

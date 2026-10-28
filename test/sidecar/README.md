@@ -71,6 +71,65 @@ python3 test/scripts/sidecar.py \
   --out /tmp/sidecar-cache-hits
 ```
 
+## Candidate qualification
+
+The final native binary was built from
+`944b5f351ef64c8713bfefd9d9cb8ce4cc134606` on 2026-10-28 UTC with:
+
+```bash
+env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ \
+  CARGO_TARGET_DIR=/Users/Code/dev/spiceai/target \
+  cargo build --release -p spiced -p testoperator -p spicescript \
+  --no-default-features --features release
+```
+
+The build exited 0 after 14m51s. `spiced --version` reported
+`v2.5.0-unstable`; its SHA-256 is
+`823f19ba1718df146e8ec7e67627c0c48a65cca0c3e4b6fc6cb68d9ae71cbed9`.
+This uses the core release feature set; the complete workspace sign-off remains
+a separate requirement. Later qualification commits change only harnesses,
+documentation and evidence, not the production Rust tree.
+
+The [candidate artifacts](evidence/candidate-944b5f3) retain returned rows,
+schemas, plans, responses, source identities and commands. The native commands
+above used `/tmp/spice-sidecar-artifacts/candidate-944b5f3/spiced`,
+`--source-commit 944b5f351ef64c8713bfefd9d9cb8ce4cc134606`, and fresh output
+directories named after each driver under `/tmp/spice-sidecar-artifacts`.
+
+| Run | Actual result |
+| --- | --- |
+| Main standalone driver | 47 SQLite comparisons per mode; local cache and Cayenne reads during upstream outage; five HTTP 504 deadline responses; HTTP 499 cancellation; reload and explicit partition checks |
+| Legacy upstream | SQL federation returned exact rows; sidecar returned the upgrade/server-mode diagnostic |
+| Focused semantics | All five recorded development regressions returned their expected answers |
+| Typed driver | Exact decimal, nested, timestamp, binary and view results; valid BIGINT boundaries; 320 comparisons per mode with 32 threads and zero mismatches; cast/division errors propagated |
+| Schema changes | Reordered same-type fields preserved bindings; incompatible field type returned HTTP 400; restored schema recovered without sidecar restart |
+| Plan cache | Exact-wire and authorization separation: `MISS, HIT, MISS, HIT, MISS, HIT`; SQL-key mode bypassed all six requests |
+| Cache freshness | Refresh preserved eligible cached count `1000`; TTL expiry returned updated count `1001` |
+| mTLS identities | Returned `(aid=1, bid=2)` through two identity-scoped fragments |
+| Source-free spicescript | `16 checks passed, 0 failed` in server/sidecar matrix |
+| Scheduler topology | Two of two executors registered; 47 exact comparisons per mode. Captured synchronous plan executed locally, so this does not establish distributed task execution |
+| Flight/Substrait integration | `6 tests passed, 552 skipped` under the focused protocol filter |
+
+The scoped release unit command was:
+
+```bash
+env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ \
+  CARGO_TARGET_DIR=/Users/Code/dev/spiceai/target \
+  make nextest-packages \
+  PACKAGES='spiced testoperator spicescript runtime spicepod flight_client data_components cache runtime-request-context cpu-budget' \
+  FEATURES=release RUST_PROFILE=release \
+  _FEATURES_FLAGS='--no-default-features --features release'
+```
+
+It reported `4282 tests run: 4282 passed (2 after retry), 2 skipped`.
+The two corrected release-profile test fixtures passed on their first attempts.
+Two other first attempts remain unresolved: the idle-executor test failed its
+registration assertion, and the shared Databricks semaphore test timed out at
+360 seconds with threads parked in Tokio. Both succeeded on the repository's
+permitted retry. The [first-attempt diagnostics](evidence/candidate-944b5f3/unit.log)
+and [captured stack](evidence/candidate-944b5f3/databricks-semaphore-stack.txt)
+are retained; retries do not establish a fix or a cause for either failure.
+
 ## Before-change observations
 
 The committed JSON preserves the actual rows, errors, plans and source/date
