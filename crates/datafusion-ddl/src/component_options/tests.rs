@@ -483,7 +483,7 @@ columns:
       - from: openai
 ",
     );
-    let sql = create_statement(&dataset, &|_, _| false).expect("statement");
+    let sql = create_statement(&dataset, &|_| true).expect("statement");
     assert_eq!(
         sql,
         r#"CREATE TABLE sales.orders WITH (
@@ -523,8 +523,10 @@ params:
   pg_user: ${secrets:pg_user}
 ",
     );
-    let sql = create_statement(&dataset, &|key, value| {
-        key.ends_with("_pass") && !matches!(value, OptionValue::String(s) if s.starts_with("${"))
+    let sql = create_statement(&dataset, &|path| {
+        !path
+            .last()
+            .is_some_and(|name| name.ends_with("_pass") || name.ends_with("_user"))
     })
     .expect("statement");
     assert_eq!(
@@ -542,6 +544,82 @@ params:
     assert_eq!(
         err.strip_backtrace(),
         "Error during planning: Option 'pg_pass' holds '<redacted>', which SHOW CREATE prints in place of a secret it does not show. Set the value, or a reference to it such as '${secrets:pg_pass}'."
+    );
+}
+
+/// Every parameters map is redacted the same way, at any depth: the
+/// accelerator's, a snapshot location's, and one inside a list printed as
+/// `JSON`. `shown` is given each entry's path in the component.
+#[test]
+fn parameters_maps_at_any_depth_are_redacted() {
+    let dataset = dataset_from_yaml(
+        "
+from: file:orders.csv
+name: orders
+params:
+  file_format: csv
+acceleration:
+  enabled: true
+  engine: cayenne
+  params:
+    cayenne_s3_key: AKIAEXAMPLE
+    cayenne_s3_secret: hunter2
+    cayenne_s3_region: us-west-2
+  snapshots_params:
+    s3_secret: hunter3
+columns:
+  - name: body
+    embeddings:
+      - from: openai
+        engine: s3_vectors
+        params:
+          s3_vectors_aws_secret_access_key: hunter4
+          s3_vectors_bucket: vectors
+",
+    );
+    let paths = std::sync::Mutex::new(Vec::new());
+    let shown = |path: &[String]| {
+        paths.lock().expect("paths").push(path.join("."));
+        matches!(
+            path.last().map(String::as_str),
+            Some("file_format" | "cayenne_s3_region" | "s3_vectors_bucket")
+        )
+    };
+    let sql = create_statement(&dataset, &shown).expect("statement");
+    assert_eq!(
+        sql,
+        r#"CREATE TABLE orders WITH (
+  from = 'file:orders.csv',
+  file_format = 'csv',
+  "columns.body.embeddings" = JSON '[{"from":"openai","engine":"s3_vectors","params":{"s3_vectors_aws_secret_access_key":"<redacted>","s3_vectors_bucket":"vectors"}}]',
+  "acceleration.engine" = 'cayenne',
+  "acceleration.params.cayenne_s3_key" = '<redacted>',
+  "acceleration.params.cayenne_s3_region" = 'us-west-2',
+  "acceleration.params.cayenne_s3_secret" = '<redacted>',
+  "acceleration.snapshots_params.s3_secret" = '<redacted>'
+)"#
+    );
+    let mut paths = paths.into_inner().expect("paths");
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            "acceleration.params.cayenne_s3_key",
+            "acceleration.params.cayenne_s3_region",
+            "acceleration.params.cayenne_s3_secret",
+            "acceleration.snapshots_params.s3_secret",
+            "columns.0.embeddings.0.params.s3_vectors_aws_secret_access_key",
+            "columns.0.embeddings.0.params.s3_vectors_bucket",
+            "params.file_format",
+        ]
+    );
+
+    // Replaying it stores no placeholder, at any depth.
+    let err = dataset_from_sql(&sql).expect_err("the placeholder is not a value");
+    assert!(
+        err.to_string()
+            .contains("holds '<redacted>', which SHOW CREATE prints in place of a secret"),
+        "{err}"
     );
 }
 
@@ -651,15 +729,15 @@ fn unquoted_dotted_option_keys_are_quoted_and_the_rest_is_kept() {
 #[test]
 fn secret_option_values_are_redacted_from_statement_text() {
     let dialect = PostgreSqlDialect {};
-    let secret = |key: &str| key == "pg_pass" || key == "pg_user";
+    let shown = |name: &str| !matches!(name, "pg_pass" | "pg_user");
     let sql = "CREATE TABLE orders WITH (\n  from = 'postgres:public.orders',\n  pg_pass = 'hunter''2', \"params.pg_user\" = 'app',\n  pg_host = 'db', pg_db = '${secrets:pg_pass}'\n)";
     assert_eq!(
-        redact_secret_option_values(sql, &dialect, &secret),
+        redact_secret_option_values(sql, &dialect, &shown),
         "CREATE TABLE orders WITH (\n  from = 'postgres:public.orders',\n  pg_pass = '<redacted>', \"params.pg_user\" = '<redacted>',\n  pg_host = 'db', pg_db = '${secrets:pg_pass}'\n)"
     );
     let reference = "ALTER TABLE orders SET (pg_pass = '${secrets:pg_pass}')";
     assert!(matches!(
-        redact_secret_option_values(reference, &dialect, &secret),
+        redact_secret_option_values(reference, &dialect, &shown),
         Cow::Borrowed(_)
     ));
     // Every spelling the option reader takes as a value is redacted whole.
@@ -685,7 +763,7 @@ fn secret_option_values_are_redacted_from_statement_text() {
                 .to_string()
         };
         assert_eq!(
-            redact_secret_option_values(&sql, &dialect, &secret),
+            redact_secret_option_values(&sql, &dialect, &shown),
             expected,
             "{value}"
         );
@@ -701,7 +779,7 @@ fn secret_option_values_are_redacted_from_statement_text() {
             "{prefix}CREATE TABLE o WITH (from = 'postgres:public.o', pg_pass = 'hunter2')"
         );
         assert_eq!(
-            redact_secret_option_values(&sql, &dialect, &secret),
+            redact_secret_option_values(&sql, &dialect, &shown),
             format!(
                 "{kept}CREATE TABLE o WITH (from = 'postgres:public.o', pg_pass = '<redacted>')"
             ),
@@ -710,7 +788,44 @@ fn secret_option_values_are_redacted_from_statement_text() {
     }
     let query = "SELECT * FROM t WHERE pg_pass = 'hunter2'";
     assert!(matches!(
-        redact_secret_option_values(query, &dialect, &secret),
+        redact_secret_option_values(query, &dialect, &shown),
+        Cow::Borrowed(_)
+    ));
+}
+
+/// Every parameters map is redacted in the recorded text, not only the
+/// connector's: the accelerator's, a snapshot location's, and one inside a
+/// `JSON` value. A parameter not known to be non-secret is redacted; a field
+/// is not.
+#[test]
+fn parameters_of_every_map_are_redacted_from_statement_text() {
+    let dialect = PostgreSqlDialect {};
+    let shown = |name: &str| {
+        matches!(
+            name,
+            "file_format" | "cayenne_s3_region" | "s3_vectors_bucket"
+        )
+    };
+    let sql = "CREATE TABLE o WITH (from = 'file:o.csv', file_format = 'csv', file_fromat = 'csv', description = 'Orders', acceleration.params.cayenne_s3_secret = 'hunter2', \"acceleration.params.cayenne_s3_region\" = 'us-west-2', \"acceleration.snapshots_params.s3_key\" = 'AKIA', dataset.params.pg_pass = 'hunter3')";
+    assert_eq!(
+        redact_secret_option_values(sql, &dialect, &shown),
+        "CREATE TABLE o WITH (from = 'file:o.csv', file_format = 'csv', file_fromat = '<redacted>', description = 'Orders', acceleration.params.cayenne_s3_secret = '<redacted>', \"acceleration.params.cayenne_s3_region\" = 'us-west-2', \"acceleration.snapshots_params.s3_key\" = '<redacted>', dataset.params.pg_pass = '<redacted>')"
+    );
+
+    let json = r#"CREATE TABLE o WITH (from = 'file:o.csv', columns.body.embeddings = JSON '[{"from": "openai", "params": {"s3_vectors_aws_secret_access_key": "hunter4", "s3_vectors_bucket": "v"}}]')"#;
+    assert_eq!(
+        redact_secret_option_values(json, &dialect, &shown),
+        r#"CREATE TABLE o WITH (from = 'file:o.csv', columns.body.embeddings = JSON '[{"from":"openai","params":{"s3_vectors_aws_secret_access_key":"<redacted>","s3_vectors_bucket":"v"}}]')"#
+    );
+    let whole_map = r#"ALTER TABLE o SET (acceleration.params = JSON '{"cayenne_s3_key": "AKIA2", "cayenne_s3_region": "us-west-2"}')"#;
+    assert_eq!(
+        redact_secret_option_values(whole_map, &dialect, &shown),
+        r#"ALTER TABLE o SET (acceleration.params = JSON '{"cayenne_s3_key":"<redacted>","cayenne_s3_region":"us-west-2"}')"#
+    );
+    // A structured value with no parameters map is kept as written.
+    let plain = r#"CREATE TABLE o WITH (from = 'file:o.csv', columns.body.embeddings = JSON '[{"from": "openai"}]')"#;
+    assert!(matches!(
+        redact_secret_option_values(plain, &dialect, &shown),
         Cow::Borrowed(_)
     ));
 }
@@ -762,7 +877,7 @@ fn every_test_spicepod_component_round_trips_through_its_create_statement() {
             let ComponentOrReference::Component(dataset) = dataset else {
                 continue;
             };
-            let sql = create_statement(&dataset, &|_, _| false).expect("statement");
+            let sql = create_statement(&dataset, &|_| true).expect("statement");
             let read_back = dataset_from_sql(&sql).unwrap_or_else(|e| {
                 panic!(
                     "{}: dataset '{}' does not read back from\n{sql}\n{e}",

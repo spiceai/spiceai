@@ -20,7 +20,7 @@ limitations under the License.
 //! `CATALOG` statements define the components a Spicepod declares, in the
 //! Spicepod's own terms (see [`datafusion_ddl::component_options`]). The
 //! runtime keeps what SQL defined in one [`SqlDefinitions`] document in the
-//! `ddl/` folder of its state location, adds it to the [`App`] it serves, and
+//! `sql-definitions/` folder of its state location, adds it to the [`App`] it serves, and
 //! applies a statement with the diff that applies a Spicepod edit, so a
 //! SQL-defined component loads, reloads, and unloads as a declared one does.
 //!
@@ -30,6 +30,7 @@ limitations under the License.
 mod plan;
 mod store;
 
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
@@ -43,8 +44,9 @@ use datafusion_ddl::component_ddl::{ComponentDdlHandler, ComponentDdlOp};
 use datafusion_ddl::component_options::{
     ComponentKind, ConnectorParameters, OptionValue, create_statement,
 };
+use runtime_acceleration::Engine;
 use runtime_auth::AuthRequestContext;
-use runtime_parameters::{ParameterKey, Parameters};
+use runtime_parameters::{ParameterKey, ParameterSpec, Parameters};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
@@ -68,12 +70,12 @@ const REGISTRATION_WAIT: Duration = Duration::from_secs(30);
 /// source.
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How often an instance whose definitions are in `runtime.state` checks them
-/// for a change another instance made.
-const SHARED_DEFINITIONS_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+/// How often the SQL definitions are read again: while they could not be read,
+/// and, from a store other instances share, to serve the changes they make.
+const SQL_DEFINITIONS_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
-/// The task that follows definitions shared through `runtime.state`.
-const SHARED_DEFINITIONS_TASK: &str = "sql_definitions_follower";
+/// The task that reads the SQL definitions again.
+const SQL_DEFINITIONS_TASK: &str = "sql_definitions";
 
 const RUNTIME_STATE_DOCS: &str = "https://spiceai.org/docs/reference/spicepod/runtime#runtimestate";
 
@@ -204,15 +206,15 @@ impl ComponentDdlHandler for RuntimeComponentDdl {
                 else {
                     return Ok(None);
                 };
-                let secret = secret_parameters(ComponentKind::Dataset, &dataset.from).await;
-                create_statement(dataset, &|key, value| redacted(&secret, key, value)).map(Some)
+                let shown = ShownParameters::of_dataset(&runtime, dataset).await;
+                create_statement(dataset, &|path| shown.shows(path)).map(Some)
             }
             ComponentKind::Catalog => {
                 let Some(catalog) = app.catalogs.iter().find(|c| c.name == name) else {
                     return Ok(None);
                 };
-                let secret = secret_parameters(ComponentKind::Catalog, &catalog.from).await;
-                create_statement(catalog, &|key, value| redacted(&secret, key, value)).map(Some)
+                let shown = ShownParameters::of_catalog(&runtime, catalog).await;
+                create_statement(catalog, &|path| shown.shows(path)).map(Some)
             }
         }
     }
@@ -279,7 +281,7 @@ fn is_loopback_host(host: &str) -> bool {
 pub(crate) struct SpecParameters {
     connector: String,
     prefix: &'static str,
-    specs: &'static [crate::parameters::ParameterSpec],
+    specs: &'static [ParameterSpec],
 }
 
 impl SpecParameters {
@@ -322,56 +324,149 @@ impl ConnectorParameters for SpecParameters {
     }
 }
 
-/// The parameter names a component's connector marks secret.
-async fn secret_parameters(kind: ComponentKind, from: &str) -> Vec<String> {
-    match kind {
-        ComponentKind::Dataset => {
-            let source = runtime_component::dataset::DatasetSpec::source_of(from);
-            match get_connector_factory(source).await {
-                Some(factory) => factory
-                    .parameters()
-                    .iter()
-                    .filter(|spec| spec.secret)
-                    .map(|spec| spec.display_name(factory.prefix()))
-                    .collect(),
-                None => Vec::new(),
-            }
+/// The names a set of parameter specs shows the values of: each name a spec
+/// declares non-secret and none declares secret.
+fn shown_names<'a>(
+    specs: impl IntoIterator<Item = (&'a str, &'a [ParameterSpec])>,
+) -> HashSet<String> {
+    let mut shown: HashMap<String, bool> = HashMap::new();
+    for (prefix, specs) in specs {
+        for spec in specs {
+            *shown.entry(spec.display_name(prefix)).or_insert(true) &= !spec.secret;
         }
-        ComponentKind::Catalog => {
-            let provider = runtime_component::catalog::CatalogSpec::provider(from);
-            crate::catalogconnector::parameter_specs(provider)
-                .await
-                .map(|(prefix, specs)| {
-                    specs
-                        .iter()
-                        .filter(|spec| spec.secret)
-                        .map(|spec| spec.display_name(prefix))
-                        .collect()
-                })
-                .unwrap_or_default()
+    }
+    shown
+        .into_iter()
+        .filter_map(|(name, shown)| shown.then_some(name))
+        .collect()
+}
+
+/// The parameters of the vector engines that declare which are secret, which
+/// read `vectors.params` and a column's `embeddings[].params`. The parameters
+/// of the other vector engines, and of the full-text engines, are always
+/// redacted.
+fn vector_engine_specs() -> [(&'static str, &'static [ParameterSpec]); 1] {
+    [("s3_vectors", crate::embeddings::index::s3::PARAMETERS)]
+}
+
+/// The prefix and parameters of the accelerator `engine`, when it is registered.
+async fn accelerator_specs(
+    runtime: &Runtime,
+    engine: Engine,
+) -> Option<(&'static str, &'static [ParameterSpec])> {
+    let accelerator = runtime
+        .df
+        .accelerator_engine_registry()
+        .get_accelerator_engine(engine)
+        .await?;
+    Some((accelerator.prefix(), accelerator.parameters()))
+}
+
+/// What `SHOW CREATE` prints of one component's parameters maps: per map, the
+/// value of an entry whose name the specs of the map's reader declare
+/// non-secret. Any other entry, an unknown one or one of a map no spec
+/// describes, is printed as `'<redacted>'`.
+#[derive(Debug, Default)]
+struct ShownParameters {
+    /// `params`: the data or catalog connector's.
+    connector: HashSet<String>,
+    /// A catalog's `dataset_params`: what every data connector shows.
+    dataset_params: HashSet<String>,
+    /// `acceleration.params`: the accelerator's.
+    accelerator: HashSet<String>,
+    /// `acceleration.snapshots_params`: a snapshot location's.
+    location: HashSet<String>,
+    /// `vectors.params` and a column's `embeddings[].params`.
+    vectors: HashSet<String>,
+}
+
+impl ShownParameters {
+    async fn of_dataset(runtime: &Runtime, dataset: &Dataset) -> Self {
+        let source = runtime_component::dataset::DatasetSpec::source_of(&dataset.from);
+        let connector = match get_connector_factory(source).await {
+            Some(factory) => shown_names([(factory.prefix(), factory.parameters())]),
+            None => HashSet::new(),
+        };
+        let engine = dataset
+            .acceleration
+            .as_ref()
+            .and_then(|acceleration| Engine::try_from(acceleration.engine_name()).ok());
+        let accelerator = match engine {
+            Some(engine) => shown_names(accelerator_specs(runtime, engine).await),
+            None => HashSet::new(),
+        };
+        Self {
+            connector,
+            accelerator,
+            location: shown_names(runtime_state_location::location_parameter_specs()),
+            vectors: shown_names(vector_engine_specs()),
+            ..Self::default()
         }
+    }
+
+    async fn of_catalog(runtime: &Runtime, catalog: &Catalog) -> Self {
+        let provider = runtime_component::catalog::CatalogSpec::provider(&catalog.from);
+        let connector = shown_names(crate::catalogconnector::parameter_specs(provider).await);
+        let accelerator = shown_names(accelerator_specs(runtime, Engine::Cayenne).await);
+        Self {
+            connector,
+            dataset_params: shown_names(crate::dataconnector::all_parameter_specs().await),
+            accelerator,
+            ..Self::default()
+        }
+    }
+
+    /// Whether `SHOW CREATE` prints the value at `path`, an entry of one of the
+    /// component's parameters maps.
+    fn shows(&self, path: &[String]) -> bool {
+        let [map @ .., name] = path else {
+            return false;
+        };
+        let map: Vec<&str> = map.iter().map(String::as_str).collect();
+        let shown = match map.as_slice() {
+            ["params"] => &self.connector,
+            ["dataset_params"] => &self.dataset_params,
+            ["acceleration", "params"] => &self.accelerator,
+            ["acceleration", "snapshots_params"] => &self.location,
+            ["vectors", "params"] | ["columns", _, "embeddings", _, "params"] => &self.vectors,
+            _ => return false,
+        };
+        shown.contains(name)
     }
 }
 
-/// Whether `SHOW CREATE` hides the value of the parameter `key`: a secret
-/// parameter's value is hidden unless it is a `${ ... }` reference, which names
-/// where the secret is rather than what it is.
-fn redacted(secret: &[String], key: &str, value: &OptionValue) -> bool {
-    let name = key.strip_prefix("params.").unwrap_or(key);
-    secret.iter().any(|s| s == name)
-        && !matches!(value, OptionValue::String(s) if s.trim_start().starts_with("${"))
+/// The names of the parameters task history and the list of running queries
+/// show the values of: each name that some component's specs declare
+/// non-secret and none declares secret. Any other parameter is recorded as
+/// `'<redacted>'`.
+async fn recorded_parameter_names(runtime: &Runtime) -> HashSet<String> {
+    let mut specs: Vec<(&'static str, &'static [ParameterSpec])> =
+        crate::dataconnector::all_parameter_specs().await;
+    specs.extend(crate::catalogconnector::all_parameter_specs().await);
+    specs.extend(runtime_state_location::location_parameter_specs());
+    let accelerators: Vec<Arc<dyn crate::dataaccelerator::DataAccelerator>> = runtime
+        .df
+        .accelerator_engine_registry()
+        .accelerator_engine_registry
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect();
+    specs.extend(
+        accelerators
+            .iter()
+            .map(|accelerator| (accelerator.prefix(), accelerator.parameters())),
+    );
+    specs.extend(vector_engine_specs());
+    shown_names(specs)
 }
 
 impl Runtime {
     /// Install the handler that applies component statements, once.
     pub(crate) async fn install_component_ddl_handler(self: &Arc<Self>) {
-        let secret: std::collections::HashSet<String> =
-            crate::dataconnector::secret_parameter_names()
-                .await
-                .into_iter()
-                .chain(crate::catalogconnector::secret_parameter_names().await)
-                .collect();
-        self.df.set_secret_parameter_names(secret);
+        self.df
+            .set_recorded_parameter_names(recorded_parameter_names(self).await);
         let listeners = vec![
             self.config.http_bind_address,
             self.config.flight_bind_address,
@@ -406,80 +501,130 @@ impl Runtime {
     }
 
     /// Load the SQL-defined components into the app, before the components
-    /// load. A definition the store cannot give is reported, and the
-    /// statements that define components stay refused until a restart reads
-    /// it, so none is applied over definitions this runtime did not see.
+    /// load. When they cannot be read, none is served and the statements that
+    /// define components are refused, so none is applied over definitions this
+    /// runtime did not see, until a retry every
+    /// [`SQL_DEFINITIONS_CHECK_INTERVAL`] reads them.
     pub(crate) async fn load_sql_definitions(self: &Arc<Self>) {
-        let store = match self.sql_definitions_store().await {
-            Ok(store) => store,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to open the store of datasets and catalogs defined with SQL, so none is loaded and defining one with SQL is refused until Spice restarts. Cause: {e}"
-                );
-                return;
+        let (store, reported) = match self.read_sql_definitions(false).await {
+            Ok(store) if !store.is_shared() => return,
+            Ok(store) => (Some(store), None),
+            Err(cause) => {
+                tracing::error!("{}", self.unread_definitions_message(&cause).await);
+                (None, Some(cause))
             }
         };
-        let defined = match store.load().await {
-            Ok(defined) => defined,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to load the datasets and catalogs defined with SQL, so none is loaded and defining one with SQL is refused until Spice restarts. Cause: {e}"
-                );
-                return;
-            }
-        };
+        let runtime = Arc::downgrade(self);
+        // The task is cancelled at shutdown; its future is not awaited.
+        drop(
+            self.start_runtime_task(SQL_DEFINITIONS_TASK, None, async move {
+                Self::keep_sql_definitions(runtime, store, reported).await;
+                Ok(())
+            })
+            .await,
+        );
+    }
+
+    /// Read the SQL definitions and serve them: before the components load
+    /// (`late` false), as part of the app the load reads; after, applied as a
+    /// Spicepod edit is. Returns the store they were read from.
+    async fn read_sql_definitions(
+        self: &Arc<Self>,
+        late: bool,
+    ) -> Result<Arc<DefinitionsStore>, String> {
+        let store = self
+            .sql_definitions_store()
+            .await
+            .map_err(|e| e.to_string())?;
+        let defined = store.load().await.map_err(|e| e.to_string())?;
         // Serialized with every other change to the served app.
         let serialized = self.apply_app_lock.lock().await;
-        let mut app = self.app.write().await;
-        let spicepod = app
+        let served = self.read_app().await;
+        let spicepod = served
             .clone()
             .unwrap_or_else(|| Arc::new(AppBuilder::new("spice").build()));
         if !defined.is_empty() {
             tracing::info!(
-                "Loading {} dataset(s) and {} catalog(s) defined with SQL, from {}",
-                defined.datasets.len(),
-                defined.catalogs.len(),
+                "Loading {} defined with SQL from {}",
+                plan::component_counts(&defined),
                 store.location()
             );
             plan::warn_shadowed(&spicepod, &defined);
-            *app = Some(Arc::new(plan::serve((*spicepod).clone(), &defined)));
+            let next = Arc::new(plan::serve((*spicepod).clone(), &defined));
+            if late {
+                Arc::clone(self).apply_app_diff(served.as_ref(), next).await;
+            } else {
+                *self.app.write().await = Some(next);
+            }
         }
         *self.sql_components.spicepod.write().await = Some(spicepod);
         *self.sql_components.defined.write().await = Some(defined);
-        drop(app);
         drop(serialized);
-
-        if store.is_shared() {
-            let follow = Self::follow_shared_definitions(Arc::downgrade(self), store);
-            // The task is cancelled at shutdown; its future is not awaited.
-            drop(
-                self.start_runtime_task(SHARED_DEFINITIONS_TASK, None, async move {
-                    follow.await;
-                    Ok(())
-                })
-                .await,
-            );
-        }
+        Ok(store)
     }
 
-    /// Serve, every [`SHARED_DEFINITIONS_CHECK_INTERVAL`], the definitions
-    /// another instance that shares `runtime.state` stored, until the runtime
-    /// is gone.
-    async fn follow_shared_definitions(runtime: Weak<Self>, store: Arc<DefinitionsStore>) {
-        let mut interval = tokio::time::interval(SHARED_DEFINITIONS_CHECK_INTERVAL);
+    /// The error a failed read of the SQL definitions logs.
+    async fn unread_definitions_message(&self, cause: &str) -> String {
+        let shared = self
+            .read_app()
+            .await
+            .is_some_and(|app| app.runtime.state.is_some());
+        let check = if shared {
+            "Check `runtime.state.location` and its credentials."
+        } else {
+            "Check that Spice can read its instance directory."
+        };
+        format!(
+            "Failed to read the datasets and catalogs defined with SQL, so none is served and defining one with SQL is refused; Spice retries every {} seconds. {check} Cause: {cause} See {RUNTIME_STATE_DOCS}",
+            SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
+        )
+    }
+
+    /// Every [`SQL_DEFINITIONS_CHECK_INTERVAL`], until the runtime is gone:
+    /// read the SQL definitions while they are not read (`store` is `None`),
+    /// and then, from a store other instances share, serve the changes they
+    /// make. `reported` is the failure already logged.
+    async fn keep_sql_definitions(
+        runtime: Weak<Self>,
+        mut store: Option<Arc<DefinitionsStore>>,
+        mut reported: Option<String>,
+    ) {
+        let mut interval = tokio::time::interval(SQL_DEFINITIONS_CHECK_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The first tick completes at once, and the definitions were just loaded.
+        // The first tick completes at once, and the definitions were just read.
         interval.tick().await;
-        let mut reported: Option<String> = None;
         loop {
             interval.tick().await;
             let Some(runtime) = runtime.upgrade() else {
                 return;
             };
+            let Some(shared) = store.clone() else {
+                match runtime.read_sql_definitions(true).await {
+                    Ok(read) => {
+                        tracing::info!(
+                            "Read the datasets and catalogs defined with SQL from {}, and serving them.",
+                            read.location()
+                        );
+                        if !read.is_shared() {
+                            return;
+                        }
+                        store = Some(read);
+                        reported = None;
+                    }
+                    Err(cause) => {
+                        // Reported once until it changes.
+                        if reported.as_deref() != Some(cause.as_str()) {
+                            tracing::error!("{}", runtime.unread_definitions_message(&cause).await);
+                        }
+                        reported = Some(cause);
+                    }
+                }
+                continue;
+            };
             // Compared without the lock first: a change is rare, and a statement
             // or a Spicepod reload should not wait on every check. A failed read
             // takes the locked path, which reports it.
-            let unchanged = match (store.load().await, runtime.sql_components.defined().await) {
+            let unchanged = match (shared.load().await, runtime.sql_components.defined().await) {
                 (_, None) => return,
                 (Ok(stored), Some(known)) => stored == known,
                 (Err(_), Some(_)) => false,
@@ -492,15 +637,15 @@ impl Runtime {
             let Some(known) = runtime.sql_components.defined().await else {
                 return;
             };
-            match runtime.serve_stored_definitions(&store, known).await {
+            match runtime.serve_stored_definitions(&shared, known).await {
                 Ok(_) => reported = None,
                 Err(cause) => {
                     // Reported once until it changes or the check succeeds.
                     if reported.as_deref() != Some(cause.as_str()) {
                         tracing::warn!(
                             "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in {}, so this instance keeps serving its earlier definitions and retries every {} seconds. Cause: {cause}",
-                            store.location(),
-                            SHARED_DEFINITIONS_CHECK_INTERVAL.as_secs()
+                            shared.location(),
+                            SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
                         );
                     }
                     reported = Some(cause);
@@ -638,9 +783,10 @@ impl Runtime {
         let serialized = self.apply_app_lock.lock().await;
         let Some(known) = self.sql_components.defined().await else {
             return Err(DataFusionError::Execution(format!(
-                "{} was not applied: the datasets and catalogs defined with SQL were not loaded from {}. Fix the cause the startup log reports, then restart Spice.",
+                "{} was not applied: the datasets and catalogs defined with SQL could not be read from {}. Spice retries every {} seconds, and its log reports why it fails; run the statement again once they are read.",
                 op.label(),
-                store.location()
+                store.location(),
+                SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
             )));
         };
         // Another instance that shares the state location may have changed
@@ -808,7 +954,7 @@ impl Runtime {
             ComponentKind::Catalog => format!("Catalog '{}'", op.component_name()),
         };
         tracing::warn!(
-            "{component} was defined with SQL in {location}, which Kubernetes discards when the container restarts unless that path is on a volume, so it is not loaded after a restart. Set `runtime.state.location` to keep it. See {RUNTIME_STATE_DOCS}"
+            "{component} was defined with SQL in {location}, on the container's own filesystem, so it is lost when the container restarts unless that path is on a volume. Set `runtime.state.location` to keep it. See {RUNTIME_STATE_DOCS}"
         );
         Some(format!(
             "Its definition is kept in {location}, which Kubernetes discards when the container restarts unless that path is on a volume. Set `runtime.state.location` to keep it. See {RUNTIME_STATE_DOCS}"
@@ -1015,7 +1161,7 @@ impl Runtime {
 /// leave the component without the setting it was given.
 fn refuse_ignored_parameters<'a>(
     component: &str,
-    specs: &[crate::parameters::ParameterSpec],
+    specs: &[ParameterSpec],
     prefix: &str,
     keys: impl Iterator<Item = &'a String>,
 ) -> DFResult<()> {

@@ -175,7 +175,7 @@ pub fn options_from_sql(options: &[SqlOption]) -> DFResult<Vec<ComponentOption>>
             )));
         }
         let value = OptionValue::from_expr(&key, value)?;
-        if value == OptionValue::String(REDACTED.to_string()) {
+        if value.holds_placeholder() {
             return Err(DataFusionError::Plan(format!(
                 "Option '{key}' holds {REDACTED_SQL}, which SHOW CREATE prints in place of a secret it does not show. Set the value, or a reference to it such as '${{secrets:{name}}}'.",
                 name = key.strip_prefix("params.").unwrap_or(&key),
@@ -187,6 +187,25 @@ pub fn options_from_sql(options: &[SqlOption]) -> DFResult<Vec<ComponentOption>>
 }
 
 impl OptionValue {
+    /// Whether the value is, or holds, the placeholder `SHOW CREATE` prints in
+    /// place of a secret.
+    fn holds_placeholder(&self) -> bool {
+        fn json_holds(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::String(s) => s == REDACTED,
+                serde_json::Value::Array(items) => items.iter().any(json_holds),
+                serde_json::Value::Object(map) => map.values().any(json_holds),
+                _ => false,
+            }
+        }
+        match self {
+            Self::String(s) => s == REDACTED,
+            Self::List(items) => items.iter().any(Self::holds_placeholder),
+            Self::Json(json) => json_holds(json),
+            Self::Number(_) | Self::Bool(_) | Self::Null => false,
+        }
+    }
+
     /// Read an option's value from its SQL expression.
     ///
     /// # Errors
@@ -928,10 +947,25 @@ fn unknown_field(message: &str) -> Option<(&str, Vec<String>)> {
 ///
 /// Returns an error when the component cannot be read as a Spicepod value.
 pub fn component_options<T: SqlComponent>(component: &T) -> DFResult<Vec<ComponentOption>> {
+    component_options_shown(component, &|_| true)
+}
+
+/// [`component_options`], with the value of each entry of a parameters map
+/// that `shown` does not show replaced by the redaction placeholder.
+fn component_options_shown<T: SqlComponent>(
+    component: &T,
+    shown: &dyn Fn(&[String]) -> bool,
+) -> DFResult<Vec<ComponentOption>> {
     let kind = T::KIND;
     let mut mapping = component_mapping(component)?;
     prune_defaults::<T>(&mut mapping);
     mapping.shift_remove(&Value::String("name".to_string()));
+    let mut path = Vec::new();
+    for (key, value) in &mut mapping {
+        path.push(yaml_key_text(key));
+        prepare_maps(&mut path, value, shown);
+        path.pop();
+    }
 
     let mut options = Vec::new();
     if let Some(from) = mapping.shift_remove(&Value::String("from".to_string()))
@@ -1083,18 +1117,22 @@ fn flatten_columns(value: Value, options: &mut Vec<ComponentOption>) {
     }
 }
 
-/// The statement that recreates `component`. `redact` says whether the value
-/// of a connector parameter is shown as `'***'`.
+/// The statement that recreates `component`. The value of an entry of a
+/// parameters map (`params`, or a key ending in `_params`, at any depth) is
+/// printed as `'<redacted>'` unless `shown` shows it, given the entry's path
+/// in the component (`["acceleration", "params", "cayenne_s3_key"]`); a value
+/// that is a `${ ... }` reference, which names where a secret is rather than
+/// what it is, is always printed.
 ///
 /// # Errors
 ///
 /// Returns an error when the component cannot be read as a Spicepod value.
 pub fn create_statement<T: SqlComponent>(
     component: &T,
-    redact: &dyn Fn(&str, &OptionValue) -> bool,
+    shown: &dyn Fn(&[String]) -> bool,
 ) -> DFResult<String> {
     let kind = T::KIND;
-    let options = component_options(component)?;
+    let options = component_options_shown(component, shown)?;
     let mut sql = format!(
         "CREATE {} {}",
         kind.sql_object(),
@@ -1108,19 +1146,105 @@ pub fn create_statement<T: SqlComponent>(
         if i > 0 {
             sql.push(',');
         }
-        let value = if is_param_key(kind, &option.key) && redact(&option.key, &option.value) {
-            REDACTED_SQL.to_string()
-        } else {
+        let _ = write!(
+            sql,
+            "\n  {} = {}",
+            quote_identifier(&option.key),
             option.value.to_sql()
-        };
-        let _ = write!(sql, "\n  {} = {value}", quote_identifier(&option.key));
+        );
     }
     sql.push_str("\n)");
     Ok(sql)
 }
 
-fn is_param_key(kind: ComponentKind, key: &str) -> bool {
-    matches!(resolve_key(kind, key, None), Ok(KeyPath::Param(_)))
+/// Whether `key` names a map of parameters: `params`, or a key ending in
+/// `_params` (`snapshots_params`, `dataset_params`).
+#[must_use]
+pub fn is_params_map(key: &str) -> bool {
+    key == "params" || key.ends_with("_params")
+}
+
+/// Whether `value` is a `${ ... }` reference, which names where a secret is
+/// rather than what it is.
+fn is_reference(value: &str) -> bool {
+    value.trim_start().starts_with("${")
+}
+
+/// Whether the map at `key` is one the Spicepod keeps unordered: a parameters
+/// map, `metadata`, `indexes`, or `on_conflict`.
+fn is_unordered_map(key: &str) -> bool {
+    is_params_map(key) || matches!(key, "metadata" | "indexes" | "on_conflict")
+}
+
+/// Prepare the maps in `value` for printing: the value of each entry of a
+/// parameters map that `shown` does not show replaced by the redaction
+/// placeholder, and each map the Spicepod keeps unordered put in name order,
+/// so the statement is the same every time. `path` is where `value` is in the
+/// component; `shown` is given the path of each entry.
+fn prepare_maps(path: &mut Vec<String>, value: &mut Value, shown: &dyn Fn(&[String]) -> bool) {
+    match value {
+        Value::Mapping(mapping) => {
+            let key = path.last().map(String::as_str);
+            let in_parameters = key.is_some_and(is_params_map);
+            if key.is_some_and(is_unordered_map) {
+                mapping.sort_by(|a, _, b, _| yaml_key_text(a).cmp(&yaml_key_text(b)));
+            }
+            for (key, entry) in mapping.iter_mut() {
+                path.push(yaml_key_text(key));
+                if in_parameters {
+                    let reference = matches!(&*entry, Value::String(s) if is_reference(s));
+                    if !reference && !shown(path) {
+                        *entry = Value::String(REDACTED.to_string());
+                    }
+                } else {
+                    prepare_maps(path, entry, shown);
+                }
+                path.pop();
+            }
+        }
+        Value::Sequence(items) => {
+            for (i, item) in items.iter_mut().enumerate() {
+                path.push(i.to_string());
+                prepare_maps(path, item, shown);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Like [`prepare_maps`]' redaction, over a `JSON` option value, with `shown` given
+/// only the entry's name. `in_parameters` when `value` is itself a parameters
+/// map. Returns whether a value was replaced.
+fn redact_json_parameters(
+    value: &mut serde_json::Value,
+    in_parameters: bool,
+    shown: &dyn Fn(&str) -> bool,
+) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut redacted = false;
+            for (key, entry) in map.iter_mut() {
+                if in_parameters {
+                    let keep = match &*entry {
+                        serde_json::Value::String(s) => is_reference(s) || s == REDACTED,
+                        _ => false,
+                    };
+                    if !keep && !shown(key) {
+                        *entry = serde_json::Value::String(REDACTED.to_string());
+                        redacted = true;
+                    }
+                } else {
+                    redacted |= redact_json_parameters(entry, is_params_map(key), shown);
+                }
+            }
+            redacted
+        }
+        serde_json::Value::Array(items) => items.iter_mut().fold(false, |redacted, item| {
+            redact_json_parameters(item, false, shown) || redacted
+        }),
+        _ => false,
+    }
 }
 
 /// A component name as SQL: each part of a dotted name quoted as it needs.
@@ -1351,6 +1475,8 @@ struct ValueInText {
     range: std::ops::Range<usize>,
     /// The text of the value, when it is one string literal of any quoting.
     string: Option<String>,
+    /// The JSON text of a `JSON '...'` value.
+    json: Option<String>,
 }
 
 /// The text of a string literal token, in any quoting.
@@ -1527,10 +1653,20 @@ fn options_in_text(sql: &str, dialect: &dyn Dialect) -> Option<Vec<OptionInText>
                                     && let Some(value_range) =
                                         range(significant[start], significant[end - 1])
                                 {
+                                    let json_keyword = matches!(
+                                        &significant[start].token,
+                                        Token::Word(word)
+                                            if word.quote_style.is_none()
+                                                && word.value.eq_ignore_ascii_case("json")
+                                    );
                                     value = Some(ValueInText {
                                         range: value_range,
                                         string: (end == start + 1)
                                             .then(|| string_literal(&significant[start].token))
+                                            .flatten()
+                                            .map(str::to_string),
+                                        json: (end == start + 2 && json_keyword)
+                                            .then(|| string_literal(&significant[start + 1].token))
                                             .flatten()
                                             .map(str::to_string),
                                     });
@@ -1601,15 +1737,19 @@ pub fn quote_dotted_option_keys<'a>(sql: &'a str, dialect: &dyn Dialect) -> Cow<
     }
 }
 
-/// `sql` with the value of each option whose key `secret` names replaced by
-/// the redaction placeholder, whatever its spelling, unless the value is a
-/// `${ ... }` reference: the text to record of a statement that may carry a
-/// credential. Everything else in the text is kept as written.
+/// `sql`, a statement that may carry credentials, as it may be recorded: the
+/// value of each parameter that `shown` does not show replaced by the
+/// redaction placeholder, whatever its spelling. A parameter is an entry of a
+/// parameters map (`params.x`, `acceleration.params.x`, a key under a
+/// `_params` map, or one inside a `JSON '...'` value), or a connector
+/// parameter by its bare name; `shown` is given its name. A value that is a
+/// `${ ... }` reference is kept. Everything else in the text is kept as
+/// written.
 #[must_use]
 pub fn redact_secret_option_values<'a>(
     sql: &'a str,
     dialect: &dyn Dialect,
-    secret: &dyn Fn(&str) -> bool,
+    shown: &dyn Fn(&str) -> bool,
 ) -> Cow<'a, str> {
     if !starts_a_definition(sql) {
         return Cow::Borrowed(sql);
@@ -1620,14 +1760,44 @@ pub fn redact_secret_option_values<'a>(
     let replacements: Vec<_> = options
         .into_iter()
         .filter_map(|option| {
-            let key = option.parts.join(".");
-            let key = key.strip_prefix("params.").unwrap_or(&key).to_string();
             let value = option.value?;
-            let reference = value
-                .string
-                .as_deref()
-                .is_some_and(|s| s.trim_start().starts_with("${"));
-            (secret(&key) && !reference).then(|| (value.range, REDACTED_SQL.to_string()))
+            let mut path: Vec<&str> = option
+                .parts
+                .iter()
+                .flat_map(|part| part.split('.'))
+                .collect();
+            // `dataset.` is an alias for the dataset's own fields.
+            if path.len() > 1 && path[0] == "dataset" {
+                path.remove(0);
+            }
+            let parameter = match path.as_slice() {
+                [] => false,
+                [name] => {
+                    !ComponentKind::Dataset.is_field(name) && !ComponentKind::Catalog.is_field(name)
+                }
+                [map @ .., _] => map.iter().any(|segment| is_params_map(segment)),
+            };
+            if parameter {
+                let name: &str = path.last()?;
+                let reference = value.string.as_deref().is_some_and(is_reference);
+                return (!reference && !shown(name))
+                    .then(|| (value.range, REDACTED_SQL.to_string()));
+            }
+            // A structured value can hold parameters maps, or be one.
+            let json = value.json.as_deref().or_else(|| {
+                value
+                    .string
+                    .as_deref()
+                    .filter(|s| s.trim_start().starts_with(['{', '[']))
+            })?;
+            let mut parsed: serde_json::Value = serde_json::from_str(json).ok()?;
+            let whole_map = path.last().is_some_and(|key| is_params_map(key));
+            redact_json_parameters(&mut parsed, whole_map, shown).then(|| {
+                (
+                    value.range,
+                    format!("JSON {}", quote_string(&parsed.to_string())),
+                )
+            })
         })
         .collect();
     if replacements.is_empty() {

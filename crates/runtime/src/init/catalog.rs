@@ -236,9 +236,10 @@ impl Runtime {
         let valid_catalogs = Arc::clone(&self).get_valid_catalogs(new_app, LogErrors(true));
         let existing_catalogs = Arc::clone(&self).get_valid_catalogs(current_app, LogErrors(false));
 
-        // A DataFusion catalog registration outlives the declaration that created it: the
-        // removal branch below can only warn, so a provider an earlier reload registered stays
-        // registered after its declaration is dropped or stops validating. `existing_catalogs`
+        // A DataFusion catalog registration can outlive the declaration that created it: the
+        // removal branch below unloads only a catalog whose name is no longer declared, so a
+        // provider an earlier reload registered stays registered after its declaration stops
+        // validating, or when it is accelerated and its declaration is dropped. `existing_catalogs`
         // is the *valid* subset of one app revision, so it under-reports what is registered —
         // a name missing from it can still have a live provider that cached plans resolved
         // through. Both remaining signals are consulted before deciding a catalog is new:
@@ -312,16 +313,18 @@ impl Runtime {
             }
         }
 
-        // Process catalogs that are no longer in the app
+        // A catalog whose name the new app no longer declares is unloaded. One it still
+        // declares, even in a declaration that fails to validate, stays loaded, as a dataset
+        // does: an edit with a mistake in it does not take the catalog away.
         for catalog in &existing_catalogs {
-            if valid_catalogs.iter().any(|c| c.name == catalog.name) {
+            if new_app.catalogs.iter().any(|c| c.name == catalog.name) {
                 continue;
             }
             // An accelerated catalog loads a dataset for each of its tables,
             // which removing the catalog does not unload yet.
             if catalog.acceleration.is_some() {
                 tracing::warn!(
-                    "Catalog '{}' was removed, but an accelerated catalog cannot be removed while Spice is running: its tables stay queryable until Spice restarts.",
+                    "Catalog '{}' was removed, but it is accelerated, so its tables stay queryable until Spice restarts.",
                     catalog.name
                 );
                 continue;
@@ -333,7 +336,7 @@ impl Runtime {
                     tracing::info!("Unloaded catalog '{}'", catalog.name);
                 }
                 Err(e) => tracing::error!(
-                    "Failed to remove catalog '{}', so its tables stay queryable until Spice restarts. Cause: {e}",
+                    "Failed to unload catalog '{}', so its tables stay queryable until Spice restarts. Cause: {e}",
                     catalog.name
                 ),
             }
@@ -719,6 +722,45 @@ mod tests {
         assert!(
             valid.is_empty(),
             "an uncompilable include glob must make the declaration invalid for this test to mean anything"
+        );
+    }
+
+    /// A reload whose declaration of a catalog fails to validate keeps the catalog loaded, as
+    /// a dataset's does; a reload that no longer declares it unloads it.
+    #[tokio::test]
+    async fn only_a_catalog_no_longer_declared_is_unloaded() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        runtime
+            .df
+            .register_catalog(
+                "reloaded",
+                &AccessMode::default(),
+                Arc::new(datafusion::catalog::MemoryCatalogProvider::new()),
+            )
+            .await
+            .expect("registers");
+        let loaded = app_with_catalog("not_a_real_catalog_connector:loaded");
+
+        Arc::clone(&runtime)
+            .apply_catalog_diff(
+                &loaded,
+                &app_with_invalid_catalog("not_a_real_catalog_connector:loaded"),
+            )
+            .await;
+        assert!(
+            runtime.df.catalog_exists("reloaded"),
+            "an edit that fails to validate leaves the catalog loaded"
+        );
+
+        Arc::clone(&runtime)
+            .apply_catalog_diff(
+                &loaded,
+                &Arc::new(app::AppBuilder::new("catalog_reload").build()),
+            )
+            .await;
+        assert!(
+            !runtime.df.catalog_exists("reloaded"),
+            "a catalog the app no longer declares is unloaded"
         );
     }
 }

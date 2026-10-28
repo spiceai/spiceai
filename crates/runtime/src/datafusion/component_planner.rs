@@ -693,7 +693,9 @@ mod tests {
             _kind: ComponentKind,
             name: &str,
         ) -> DFResult<Option<String>> {
-            Ok(Some(format!("CREATE TABLE {name} WITH (from = 'file:t.csv')")))
+            Ok(Some(format!(
+                "CREATE TABLE {name} WITH (from = 'file:t.csv')"
+            )))
         }
     }
 

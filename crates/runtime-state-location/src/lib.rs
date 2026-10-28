@@ -84,6 +84,17 @@ static SNAPSHOT_S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     parameters
 });
 
+/// The parameters a state or snapshot location's `params` take, each with the
+/// prefix it is written with: an S3 location's, which include the snapshot
+/// queue, and a GCS location's.
+#[must_use]
+pub fn location_parameter_specs() -> [(&'static str, &'static [ParameterSpec]); 2] {
+    [
+        ("s3", SNAPSHOT_S3_PARAMETERS.as_slice()),
+        ("gcs", GCS_PARAMETERS.as_slice()),
+    ]
+}
+
 /// The GCS data connector's object-store parameters, so a `gs://` location takes the
 /// same names (`gcs_skip_signature`, `gcs_service_account_path`, ...).
 static GCS_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
@@ -184,8 +195,8 @@ pub enum StateFeature {
     RateControl,
     ResultsCacheWarmup,
     Snapshots,
-    /// The datasets and catalogs defined with SQL DDL.
-    Ddl,
+    /// The datasets and catalogs defined with SQL.
+    SqlDefinitions,
     /// The startup check of a `runtime.state` location, which keeps
     /// `format.json` and its probe object in the location's `_spice/` folder.
     StartupCheck,
@@ -197,7 +208,7 @@ impl StateFeature {
         Self::RateControl,
         Self::ResultsCacheWarmup,
         Self::Snapshots,
-        Self::Ddl,
+        Self::SqlDefinitions,
         Self::StartupCheck,
     ];
 
@@ -210,7 +221,7 @@ impl StateFeature {
             Self::RateControl => Some("rate_control"),
             Self::ResultsCacheWarmup => Some("results_cache_warmup"),
             Self::Snapshots => Some("snapshots"),
-            Self::Ddl => Some("ddl"),
+            Self::SqlDefinitions => Some("sql_definitions"),
             Self::StartupCheck => None,
         }
     }
@@ -225,7 +236,7 @@ impl StateFeature {
             Self::Scheduler | Self::RateControl | Self::ResultsCacheWarmup | Self::Snapshots => {
                 true
             }
-            Self::Ddl | Self::StartupCheck => false,
+            Self::SqlDefinitions | Self::StartupCheck => false,
         }
     }
 
@@ -236,7 +247,7 @@ impl StateFeature {
             Self::RateControl => "rate-control",
             Self::ResultsCacheWarmup => "results-cache",
             Self::Snapshots => SNAPSHOTS_STATE_FOLDER,
-            Self::Ddl => "ddl",
+            Self::SqlDefinitions => "sql-definitions",
             Self::StartupCheck => "_spice",
         }
     }
@@ -247,7 +258,7 @@ impl StateFeature {
             Self::RateControl => "rate-control state",
             Self::ResultsCacheWarmup => "SQL results cache warmup state",
             Self::Snapshots => "snapshot",
-            Self::Ddl => "SQL-defined component",
+            Self::SqlDefinitions => "SQL-defined component",
             Self::StartupCheck => "shared state location check",
         }
     }
@@ -260,7 +271,7 @@ impl StateFeature {
             Self::RateControl => "source rate control",
             Self::ResultsCacheWarmup => "SQL results cache warmup",
             Self::Snapshots => "acceleration snapshots",
-            Self::Ddl => "datasets and catalogs defined with SQL",
+            Self::SqlDefinitions => "datasets and catalogs defined with SQL",
             Self::StartupCheck => "the startup check",
         }
     }
@@ -275,7 +286,7 @@ impl StateFeature {
                 Self::Scheduler
                 | Self::RateControl
                 | Self::ResultsCacheWarmup
-                | Self::Ddl
+                | Self::SqlDefinitions
                 | Self::StartupCheck,
                 _,
             ) => &S3_PARAMETERS,
@@ -640,7 +651,7 @@ mod tests {
             (StateFeature::RateControl, "rate-control"),
             (StateFeature::ResultsCacheWarmup, "results-cache"),
             (StateFeature::Snapshots, "snapshots"),
-            (StateFeature::Ddl, "ddl"),
+            (StateFeature::SqlDefinitions, "sql-definitions"),
         ] {
             let (store, prefix) = build_object_store(
                 secrets(),
@@ -674,10 +685,10 @@ mod tests {
             root,
             [
                 "cluster",
-                "ddl",
                 "rate-control",
                 "results-cache",
-                "snapshots"
+                "snapshots",
+                "sql-definitions"
             ]
         );
     }

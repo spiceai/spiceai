@@ -1608,9 +1608,10 @@ pub struct DataFusion {
     /// them.
     component_ddl_handler:
         std::sync::OnceLock<Arc<dyn datafusion_ddl::component_ddl::ComponentDdlHandler>>,
-    /// The parameters any connector marks secret, whose values a statement
-    /// that defines a component records redacted.
-    secret_parameter_names: std::sync::OnceLock<HashSet<String>>,
+    /// The parameters whose values a statement that defines a component
+    /// records as written: each one some component declares non-secret and
+    /// none declares secret. Any other parameter is recorded redacted.
+    recorded_parameter_names: std::sync::OnceLock<HashSet<String>>,
 }
 
 /// Remove `name` from `list`, the session's catalogs: the in-memory list, or
@@ -2292,22 +2293,22 @@ impl DataFusion {
         let _ = self.component_ddl_handler.set(handler);
     }
 
-    /// Install the names of the parameters any connector marks secret. The
-    /// first set installed is kept.
-    pub(crate) fn set_secret_parameter_names(&self, names: HashSet<String>) {
-        let _ = self.secret_parameter_names.set(names);
+    /// Install the names of the parameters a statement that defines a
+    /// component records the values of. The first set installed is kept.
+    pub(crate) fn set_recorded_parameter_names(&self, names: HashSet<String>) {
+        let _ = self.recorded_parameter_names.set(names);
     }
 
-    /// `sql` as task history records it: a statement that defines a
-    /// component has the literal values of its secret parameters redacted.
+    /// `sql` as task history and the list of running queries record it: a
+    /// statement that defines a component has the value of each parameter
+    /// not known to be non-secret redacted, every one until the names are
+    /// installed.
     pub(crate) fn recorded_statement_text<'a>(&self, sql: &'a str) -> std::borrow::Cow<'a, str> {
-        let Some(secret) = self.secret_parameter_names.get() else {
-            return std::borrow::Cow::Borrowed(sql);
-        };
+        let recorded = self.recorded_parameter_names.get();
         datafusion_ddl::component_options::redact_secret_option_values(
             sql,
             &datafusion::sql::sqlparser::dialect::PostgreSqlDialect {},
-            &|key| secret.contains(key),
+            &|name| recorded.is_some_and(|names| names.contains(name)),
         )
     }
 

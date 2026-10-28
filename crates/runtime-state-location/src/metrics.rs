@@ -625,11 +625,11 @@ mod tests {
             }
         }
         assert_eq!(
-            series.get("state_store_conflicts_total{feature=ddl}"),
+            series.get("state_store_conflicts_total{feature=sql_definitions}"),
             Some(&0)
         );
         assert_eq!(
-            series.get("state_store_cleanup_deleted_total{feature=ddl}"),
+            series.get("state_store_cleanup_deleted_total{feature=sql_definitions}"),
             None,
             "cleanup never deletes the SQL definitions"
         );

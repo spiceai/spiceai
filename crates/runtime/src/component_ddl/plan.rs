@@ -459,29 +459,64 @@ pub(crate) fn retired_datasets(
         .collect()
 }
 
-/// The components that differ between `known` and `stored`, for a message:
-/// `dataset 'orders'` and `catalog 'lake'`, each once.
+/// How many components `defined` holds, for a message: `2 datasets and 1
+/// catalog`.
+pub(crate) fn component_counts(defined: &SqlDefinitions) -> String {
+    let count =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    format!(
+        "{} and {}",
+        count(defined.datasets.len(), "dataset", "datasets"),
+        count(defined.catalogs.len(), "catalog", "catalogs")
+    )
+}
+
+/// What changed from `known` to `stored`, for a message: each component that
+/// differs, and how, as `dataset 'orders' (dropped)` or `catalog 'lake'
+/// (created)`.
 pub(crate) fn changed_components(known: &SqlDefinitions, stored: &SqlDefinitions) -> Vec<String> {
-    let mut changed = Vec::new();
-    let mut dataset = |name: &str| {
-        let display = format!("dataset {}", display_dataset_name(name));
-        if !changed.contains(&display) {
-            changed.push(display);
-        }
+    let how = |before: bool, after: bool| match (before, after) {
+        (false, _) => "created",
+        (true, true) => "changed",
+        (true, false) => "dropped",
     };
-    for (one, other) in [(known, stored), (stored, known)] {
-        for ds in &one.datasets {
-            if !other.datasets.contains(ds) {
-                dataset(&ds.name);
-            }
+    let mut changed = Vec::new();
+    let mut datasets: Vec<&str> = Vec::new();
+    for ds in known.datasets.iter().chain(&stored.datasets) {
+        if datasets.iter().any(|name| same_dataset(name, &ds.name)) {
+            continue;
+        }
+        datasets.push(&ds.name);
+        let before = known
+            .datasets
+            .iter()
+            .find(|d| same_dataset(&d.name, &ds.name));
+        let after = stored
+            .datasets
+            .iter()
+            .find(|d| same_dataset(&d.name, &ds.name));
+        if before != after {
+            changed.push(format!(
+                "dataset {} ({})",
+                display_dataset_name(&ds.name),
+                how(before.is_some(), after.is_some())
+            ));
         }
     }
-    for (one, other) in [(known, stored), (stored, known)] {
-        for catalog in &one.catalogs {
-            let display = format!("catalog '{}'", catalog.name);
-            if !other.catalogs.contains(catalog) && !changed.contains(&display) {
-                changed.push(display);
-            }
+    let mut catalogs: Vec<&str> = Vec::new();
+    for catalog in known.catalogs.iter().chain(&stored.catalogs) {
+        if catalogs.contains(&catalog.name.as_str()) {
+            continue;
+        }
+        catalogs.push(&catalog.name);
+        let before = known.catalogs.iter().find(|c| c.name == catalog.name);
+        let after = stored.catalogs.iter().find(|c| c.name == catalog.name);
+        if before != after {
+            changed.push(format!(
+                "catalog '{}' ({})",
+                catalog.name,
+                how(before.is_some(), after.is_some())
+            ));
         }
     }
     changed
@@ -525,7 +560,7 @@ pub(crate) fn shadowed_warnings(spicepod: &App, defined: &SqlDefinitions) -> Vec
         .filter(|dataset| spicepod_declares_dataset(spicepod, &dataset.name))
         .map(|dataset| {
             format!(
-                "Dataset {} is defined both in the Spicepod and with SQL, so the Spicepod's definition is used and the SQL one is not loaded. Run DROP TABLE {} to remove the SQL definition, or rename one of them.",
+                "Dataset {} is defined both in the Spicepod and with SQL, so the Spicepod's definition is used and the SQL one is not loaded. Run `DROP TABLE {}` to remove the SQL definition, or rename one of them.",
                 display_dataset_name(&dataset.name),
                 datafusion_ddl::component_options::object_name_sql(&dataset.name),
             )
@@ -536,7 +571,7 @@ pub(crate) fn shadowed_warnings(spicepod: &App, defined: &SqlDefinitions) -> Vec
         .filter(|catalog| spicepod_declares_catalog(spicepod, &catalog.name))
         .map(|catalog| {
             format!(
-                "Catalog '{}' is defined both in the Spicepod and with SQL, so the Spicepod's definition is used and the SQL one is not loaded. Run DROP CATALOG {} to remove the SQL definition, or rename one of them.",
+                "Catalog '{}' is defined both in the Spicepod and with SQL, so the Spicepod's definition is used and the SQL one is not loaded. Run `DROP CATALOG {}` to remove the SQL definition, or rename one of them.",
                 catalog.name,
                 datafusion_ddl::component_options::quote_identifier(&catalog.name),
             )
@@ -709,7 +744,7 @@ mod tests {
         assert_eq!(
             shadowed_warnings(&spicepod, &defined),
             vec![
-                "Dataset 'orders' is defined both in the Spicepod and with SQL, so the Spicepod's definition is used and the SQL one is not loaded. Run DROP TABLE orders to remove the SQL definition, or rename one of them."
+                "Dataset 'orders' is defined both in the Spicepod and with SQL, so the Spicepod's definition is used and the SQL one is not loaded. Run `DROP TABLE orders` to remove the SQL definition, or rename one of them."
                     .to_string()
             ]
         );
@@ -829,7 +864,7 @@ mod tests {
         );
         assert_eq!(
             changed_components(&defined, &replaced.definitions),
-            vec!["dataset 'orders'".to_string()]
+            vec!["dataset 'orders' (changed)".to_string()]
         );
         let lake = Catalog::new("iceberg".to_string(), "lake".to_string());
         assert_eq!(
@@ -841,10 +876,29 @@ mod tests {
                 }
             ),
             vec![
-                "dataset 'orders'".to_string(),
-                "dataset 'customers'".to_string(),
-                "catalog 'lake'".to_string()
+                "dataset 'orders' (dropped)".to_string(),
+                "dataset 'customers' (created)".to_string(),
+                "catalog 'lake' (created)".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn component_counts_read_as_a_sentence() {
+        let lake = Catalog::new("iceberg".to_string(), "lake".to_string());
+        assert_eq!(
+            component_counts(&SqlDefinitions {
+                datasets: vec![dataset("orders"), dataset("customers")],
+                catalogs: vec![lake],
+            }),
+            "2 datasets and 1 catalog"
+        );
+        assert_eq!(
+            component_counts(&SqlDefinitions {
+                datasets: vec![dataset("orders")],
+                ..SqlDefinitions::default()
+            }),
+            "1 dataset and 0 catalogs"
         );
     }
 

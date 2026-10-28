@@ -95,20 +95,12 @@ pub async fn register_connector_factory(
     registry.insert(name.to_string(), connector_factory);
 }
 
-/// The names, as a dataset writes them, of the parameters every registered
-/// connector marks secret.
-pub async fn secret_parameter_names() -> Vec<String> {
+/// The parameter prefix and parameters of every registered connector.
+pub async fn all_parameter_specs() -> Vec<(&'static str, &'static [ParameterSpec])> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
     guard
         .values()
-        .flat_map(|factory| {
-            let prefix = factory.prefix();
-            factory
-                .parameters()
-                .iter()
-                .filter(|spec| spec.secret)
-                .map(move |spec| spec.display_name(prefix))
-        })
+        .map(|factory| (factory.prefix(), factory.parameters()))
         .collect()
 }
 

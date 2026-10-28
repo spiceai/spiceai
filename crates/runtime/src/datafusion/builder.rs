@@ -1508,7 +1508,7 @@ impl DataFusionBuilder {
             #[cfg(not(windows))]
             cayenne_ddl_handler,
             component_ddl_handler: std::sync::OnceLock::new(),
-            secret_parameter_names: std::sync::OnceLock::new(),
+            recorded_parameter_names: std::sync::OnceLock::new(),
         }
     }
 }

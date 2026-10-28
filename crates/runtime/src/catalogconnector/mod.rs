@@ -256,20 +256,12 @@ pub async fn parameter_specs(name: &str) -> Option<(&'static str, &'static [Para
         .map(|factory| (factory.prefix(), factory.parameters()))
 }
 
-/// The names, as a catalog writes them, of the parameters every registered
-/// catalog connector marks secret.
-pub async fn secret_parameter_names() -> Vec<String> {
+/// The parameter prefix and parameters of every registered catalog connector.
+pub async fn all_parameter_specs() -> Vec<(&'static str, &'static [ParameterSpec])> {
     let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
     guard
         .values()
-        .flat_map(|factory| {
-            let prefix = factory.prefix();
-            factory
-                .parameters()
-                .iter()
-                .filter(|spec| spec.secret)
-                .map(move |spec| spec.display_name(prefix))
-        })
+        .map(|factory| (factory.prefix(), factory.parameters()))
         .collect()
 }
 

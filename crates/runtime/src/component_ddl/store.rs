@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Durable storage for the datasets and catalogs defined with SQL.
 //!
-//! The definitions are one JSON document, `ddl/definitions.json`, in the
+//! The definitions are one JSON document, `sql-definitions/definitions.json`, in the
 //! runtime's state location: `runtime.state.location` when it is set, which a
 //! cluster shares, and otherwise the instance directory (`.spice`, or
 //! `$SPICE_CONFIG_DIR`), which one runtime owns. Every write is conditional on
@@ -140,13 +140,14 @@ impl DefinitionsStore {
                 false,
             ),
         };
-        let (store, prefix) = build_object_store(secrets, io_runtime, &state, StateFeature::Ddl)
-            .await
-            .context(OpenSnafu {
-                location: state.location.clone(),
-            })?;
+        let (store, prefix) =
+            build_object_store(secrets, io_runtime, &state, StateFeature::SqlDefinitions)
+                .await
+                .context(OpenSnafu {
+                    location: state.location.clone(),
+                })?;
         let store = match state_location_check.filter(|_| guarded) {
-            Some(check) => check.guard(StateFeature::Ddl, store),
+            Some(check) => check.guard(StateFeature::SqlDefinitions, store),
             None => store,
         };
         let location = format!(
@@ -268,7 +269,7 @@ mod tests {
     }
 
     /// Definitions written by one store are read back by another over the same
-    /// directory, as a restarted runtime reads them, from `ddl/definitions.json`.
+    /// directory, as a restarted runtime reads them, from `sql-definitions/definitions.json`.
     #[tokio::test]
     async fn definitions_survive_reopening_the_store() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -283,7 +284,12 @@ mod tests {
             .replace(&SqlDefinitions::default(), &defined)
             .await
             .expect("first write");
-        assert!(dir.path().join("ddl").join("definitions.json").is_file());
+        assert!(
+            dir.path()
+                .join("sql-definitions")
+                .join("definitions.json")
+                .is_file()
+        );
 
         let reopened = open(dir.path()).await;
         assert_eq!(reopened.load().await.expect("load"), defined);
