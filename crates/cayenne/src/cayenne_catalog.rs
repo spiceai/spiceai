@@ -3346,6 +3346,24 @@ impl MetadataCatalog for CayenneCatalog {
 
     /// cycle-5 TASK 2b: drain the WAL off the hot path with a non-blocking
     /// PASSIVE checkpoint (delegated to the backend).
+    // Prototype instrumentation, compiled in only with `--cfg cayenne_metastore_tap`:
+    // at shutdown, verify the shadow from storage alone against SQL and write the
+    // report beside the tap file. Without the cfg this method keeps the trait's
+    // default, unchanged.
+    #[cfg(cayenne_metastore_tap)]
+    async fn shutdown(&self) -> CatalogResult<()> {
+        if self.tap.is_some() {
+            let report = self.shadow_verify().await;
+            let path = std::env::temp_dir()
+                .join("cayenne-metastore-tap")
+                .join(format!("shadow-verify-{}.txt", std::process::id()));
+            if let Err(e) = std::fs::write(&path, format!("{report:#?}\n")) {
+                tracing::warn!("Failed to write the metastore shadow report to '{}': {e}", path.display());
+            }
+        }
+        Ok(())
+    }
+
     async fn checkpoint_wal(&self) -> CatalogResult<()> {
         self.metastore.checkpoint_wal().await
     }
