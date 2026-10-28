@@ -501,6 +501,47 @@ async fn headlog_missing_listed_batch_is_an_error_for_open_and_poll() {
     }
 }
 
+#[tokio::test]
+async fn headlog_creates_each_sealed_batch_once() {
+    for backend in backends() {
+        let store = Arc::new(object_store_occ::sim::fault::FaultStore::new(Arc::clone(
+            &backend.store,
+        )));
+        let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        HeadLog::create(Arc::clone(&shared), backend.prefix.clone(), config())
+            .await
+            .expect("create");
+        let mut writer = Writer::take_over(shared, backend.prefix.clone(), config(), 1)
+            .await
+            .expect("take over");
+        for i in 0..40u8 {
+            append(&mut writer, Bytes::from(vec![i; 20])).await;
+        }
+        writer.wait_for_sealing().await;
+        assert!(
+            writer.sealing_error().is_none(),
+            "{:?}",
+            writer.sealing_error()
+        );
+        let creates = store
+            .log()
+            .into_iter()
+            .filter(|applied| {
+                applied.op == object_store_occ::sim::Op::Create
+                    && applied.path.as_ref().contains("/wal/")
+            })
+            .map(|applied| applied.path.to_string())
+            .collect::<Vec<_>>();
+        let batches = creates.iter().collect::<std::collections::BTreeSet<_>>();
+        assert!(batches.len() >= 8, "too few sealed batches: {batches:?}");
+        assert_eq!(
+            creates.len(),
+            batches.len(),
+            "one create per sealed batch, got {creates:?}"
+        );
+    }
+}
+
 #[derive(Clone, PartialEq, Message)]
 struct TestBatch {
     #[prost(bytes = "vec", repeated, tag = "1")]
@@ -543,6 +584,7 @@ async fn headlog_copy_preserves_original_unknown_fields_and_checks_duplicates() 
             .join("wal")
             .join("00000000000000000001");
         append(&mut writer, Bytes::from_static(b"fourth")).await;
+        writer.wait_for_sealing().await;
         let original = writer
             .state()
             .head
@@ -603,6 +645,7 @@ async fn headlog_copy_preserves_original_unknown_fields_and_checks_duplicates() 
             Bytes::from_static(b"finalizes despite copy failure"),
         )
         .await;
+        writer.wait_for_sealing().await;
         assert!(
             writer.sealing_error().is_some(),
             "post-acceptance copy error is observable"
@@ -804,6 +847,7 @@ async fn headlog_byte_cut_waits_for_published_successor_and_exact_record_limit()
             writer.commit(&attempt).await.expect("publish successor"),
             Outcome::Accepted { commit: 2 }
         );
+        writer.wait_for_sealing().await;
         let bytes = backend
             .store
             .get(&batch_path)

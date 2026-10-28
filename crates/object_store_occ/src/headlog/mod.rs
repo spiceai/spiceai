@@ -148,6 +148,11 @@ pub struct Writer {
     pending: Option<Vec<u8>>,
     checkpoint: Option<u64>,
     sealing_error: Option<Error>,
+    /// The newest batch this writer has created or confirmed, as its first
+    /// commit number. Its records can be dropped without another request.
+    sealed: Option<u64>,
+    /// At most one batch copy runs beside the writer, off the acknowledgement.
+    sealing: Option<(u64, tokio::task::JoinHandle<Result<()>>)>,
 }
 
 impl Writer {
@@ -192,6 +197,8 @@ impl Writer {
             pending: None,
             checkpoint: None,
             sealing_error: None,
+            sealed: None,
+            sealing: None,
         })
     }
 
@@ -221,6 +228,8 @@ impl Writer {
             pending: None,
             checkpoint: None,
             sealing_error: None,
+            sealed: None,
+            sealing: None,
         })
     }
 
@@ -229,11 +238,61 @@ impl Writer {
         &self.state
     }
 
-    /// A failure of inline sealing after acceptance. Commit still returns
-    /// Accepted; a later prepare retries the immutable copy before dropping.
+    /// A failure of background sealing after acceptance, observed when the copy
+    /// is collected. Commit still returns Accepted; a later prepare retries the
+    /// immutable copy before dropping.
     #[must_use]
     pub fn sealing_error(&self) -> Option<&Error> {
         self.sealing_error.as_ref()
+    }
+
+    /// Wait for the background batch copy, if any, and record its outcome.
+    pub async fn wait_for_sealing(&mut self) {
+        if let Some((start, task)) = self.sealing.take() {
+            let result = match task.await {
+                Ok(result) => result,
+                Err(error) => invalid(&format!("batch copy task failed: {error}")),
+            };
+            self.record_sealing(start, result);
+        }
+    }
+
+    fn record_sealing(&mut self, start: u64, result: Result<()>) {
+        match result {
+            Ok(()) => {
+                self.sealed = Some(start);
+                self.sealing_error = None;
+            }
+            Err(error) => self.sealing_error = Some(error),
+        }
+    }
+
+    /// Start copying the oldest final batch beside the writer, unless it is
+    /// already copied or a copy is running. A finished copy is collected first.
+    fn start_sealing(&mut self) {
+        if let Some((start, task)) = self.sealing.take_if(|(_, task)| task.is_finished()) {
+            let result = match futures::FutureExt::now_or_never(task) {
+                Some(Ok(result)) => result,
+                Some(Err(error)) => invalid(&format!("batch copy task failed: {error}")),
+                None => invalid("finished batch copy did not complete"),
+            };
+            self.record_sealing(start, result);
+        }
+        if self.sealing.is_some() {
+            return;
+        }
+        let Ok(Some((start, _, bytes))) = self.plan_seal() else {
+            return;
+        };
+        if self.sealed == Some(start) {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let path = numbered(&self.prefix, "wal", start);
+        self.sealing = Some((
+            start,
+            tokio::spawn(async move { immutable(store.as_ref(), &path, bytes).await }),
+        ));
     }
 
     /// Construct and return the EXACT CAS to persist before sending. Required
@@ -257,8 +316,8 @@ impl Writer {
         if encoded.len() > self.config.max_record_bytes {
             return invalid("encoded record exceeds max_record_bytes");
         }
-        let observed = &self.state.head;
-        let mut head = observed.clone();
+        let observed_start = self.state.head.window_start();
+        let mut head = self.state.head.clone();
         if let Some(floor) = self.checkpoint {
             head.floor = floor;
             head.batches.retain(|end| *end > floor);
@@ -275,13 +334,14 @@ impl Writer {
                     "head budget exhausted without a final batch; checkpoint or increase budgets"
                         .into(),
             })?;
-            let end = observed.window_start() + count as u64 - 1;
+            let end = observed_start + count as u64 - 1;
             head.window.drain(..count);
             head.batches.push(end);
         }
         head.validate()?;
         let head_bytes = Bytes::from(head.encode_to_vec());
         check_budget(&head_bytes, self.config)?;
+        let observed = &self.state.head;
         let attempt = PreparedAttempt {
             prefix: self.prefix.to_string(),
             incarnation: observed.incarnation.clone(),
@@ -343,9 +403,10 @@ impl Writer {
                 self.state = HeadState { head, version };
                 self.pending = None;
                 self.checkpoint = None;
-                // Acceptance cannot be undone by a maintenance failure. Keep
-                // that error observable and retry the copy before any drop.
-                self.sealing_error = self.seal_oldest().await.err();
+                // Acceptance cannot be undone by a maintenance failure. The
+                // copy runs beside the writer; the head drops records only
+                // after their batch exists.
+                self.start_sealing();
                 return Ok(Outcome::Accepted {
                     commit: attempt.base_commit + 1,
                 });
@@ -466,8 +527,35 @@ impl Writer {
         Ok(outcome)
     }
 
-    /// Copy a deterministic FINAL prefix from the observed head. Returns its size.
-    async fn seal_oldest(&self) -> Result<Option<usize>> {
+    /// Make sure the deterministic FINAL prefix of the observed head exists as
+    /// a batch, with one create per batch. Returns its size.
+    async fn seal_oldest(&mut self) -> Result<Option<usize>> {
+        let Some((start, count, bytes)) = self.plan_seal()? else {
+            return Ok(None);
+        };
+        if self
+            .sealing
+            .as_ref()
+            .is_some_and(|(running, _)| *running == start)
+        {
+            self.wait_for_sealing().await;
+        }
+        if self.sealed != Some(start) {
+            immutable(
+                self.store.as_ref(),
+                &numbered(&self.prefix, "wal", start),
+                bytes,
+            )
+            .await?;
+            self.sealed = Some(start);
+            self.sealing_error = None;
+        }
+        Ok(Some(count))
+    }
+
+    /// The oldest final batch of the observed head: its first commit, record
+    /// count and encoding. The prefix depends only on the oldest records.
+    fn plan_seal(&self) -> Result<Option<(u64, usize, Bytes)>> {
         let head = &self.state.head;
         let mut size = 0usize;
         let mut count = 0;
@@ -490,13 +578,11 @@ impl Writer {
                 .map(|entry| entry.encoded.clone())
                 .collect(),
         };
-        immutable(
-            self.store.as_ref(),
-            &numbered(&self.prefix, "wal", head.window_start()),
+        Ok(Some((
+            head.window_start(),
+            count,
             batch.encode_to_vec().into(),
-        )
-        .await?;
-        Ok(Some(count))
+        )))
     }
 
     /// Upload immutable caller data into this writer's generation. No garbage
