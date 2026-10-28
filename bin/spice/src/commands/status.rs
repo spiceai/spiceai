@@ -137,4 +137,28 @@ mod tests {
             );
         }
     }
+    /// The CA flag only fixes a certificate from an issuer the client does not know. A
+    /// certificate the CA vouches for but that does not cover the dialed host is not fixed by
+    /// passing a CA, so the error must not send the user there.
+    #[tokio::test]
+    async fn status_does_not_prescribe_the_ca_flag_for_a_host_name_mismatch() {
+        let server = TlsServer::answering_for_names(STATUS_BODY, vec!["spice.invalid".to_string()]);
+        let ctx = ctx_for(&server, Some(server.ca_file()));
+
+        let message = execute(&ctx, &table())
+            .await
+            .expect_err("status should fail when the certificate does not cover the host")
+            .to_string();
+
+        assert!(
+            message.contains("TLS certificate verification failed")
+                && message.contains(server.url())
+                && message.contains("not valid for"),
+            "expected a certificate error naming the endpoint and the host-name mismatch, got: {message}"
+        );
+        assert!(
+            !message.contains("Pass --tls-root-certificate-file"),
+            "a host-name mismatch is not fixed by a CA file, got: {message}"
+        );
+    }
 }

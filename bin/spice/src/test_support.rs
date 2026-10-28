@@ -328,6 +328,13 @@ pub(crate) struct TlsServer {
 impl TlsServer {
     /// Answer every request with `body` as `application/json`.
     pub(crate) fn answering(body: &'static str) -> Self {
+        Self::answering_for_names(body, vec!["127.0.0.1".to_string(), "localhost".to_string()])
+    }
+
+    /// As [`TlsServer::answering`], with a certificate that covers only `names`. A name list
+    /// without `127.0.0.1` gives a certificate the CA vouches for but that does not match the
+    /// address the client dials.
+    pub(crate) fn answering_for_names(body: &'static str, names: Vec<String>) -> Self {
         use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 
         fn ca(name: &str) -> (rcgen::Certificate, KeyPair) {
@@ -344,15 +351,14 @@ impl TlsServer {
         let (other_ca_cert, _) = ca("spice cli unrelated CA");
 
         let leaf_key = KeyPair::generate().expect("leaf key should generate");
-        let leaf_cert =
-            CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
-                .expect("leaf params should build")
-                .signed_by(
-                    &leaf_key,
-                    &Issuer::from_ca_cert_pem(&ca_cert.pem(), ca_key)
-                        .expect("CA should become an issuer"),
-                )
-                .expect("CA should sign the leaf");
+        let leaf_cert = CertificateParams::new(names)
+            .expect("leaf params should build")
+            .signed_by(
+                &leaf_key,
+                &Issuer::from_ca_cert_pem(&ca_cert.pem(), ca_key)
+                    .expect("CA should become an issuer"),
+            )
+            .expect("CA should sign the leaf");
 
         let dir = tempfile::TempDir::new().expect("temp dir should be created");
         std::fs::write(dir.path().join("ca.pem"), ca_cert.pem()).expect("CA should be written");

@@ -3052,6 +3052,32 @@ mod tests {
         assert_eq!(ctx.tls_root_certificate_file, Some(server.ca_file()));
     }
 
+    /// `--tls-root-certificate-file` names the runtime's CA. Registry downloads (`spice add`,
+    /// `spice connect`) go to the public registry, so their client must keep the platform
+    /// roots rather than trusting only the runtime's CA.
+    #[tokio::test]
+    async fn registry_client_does_not_take_the_runtime_root_certificate() {
+        let server = crate::test_support::TlsServer::answering("[]");
+        let ctx = RuntimeContext::with_args(
+            Some(server.url().to_string()),
+            None,
+            None,
+            Some(server.ca_file()),
+        )
+        .expect("with_args should succeed");
+
+        ctx.http_client()
+            .get(server.url())
+            .send()
+            .await
+            .expect("the runtime client should trust the runtime's CA");
+        ctx.registry_http_client()
+            .get(server.url())
+            .send()
+            .await
+            .expect_err("the registry client should not trust a CA passed for the runtime");
+    }
+
     /// The HTTP clients are built with the root certificate, so a file that cannot be used
     /// is reported up front, naming it, rather than as a later connection failure.
     #[test]
