@@ -81,6 +81,7 @@ impl TestServer {
 struct CookieFlightService {
     cookie_required: Arc<AtomicBool>,
     cookie_seen: Arc<AtomicBool>,
+    authorization_seen: Arc<parking_lot::Mutex<Vec<String>>>,
 }
 
 impl CookieFlightService {
@@ -88,6 +89,7 @@ impl CookieFlightService {
         Self {
             cookie_required: Arc::new(AtomicBool::new(false)),
             cookie_seen,
+            authorization_seen: Arc::default(),
         }
     }
 }
@@ -176,8 +178,16 @@ impl FlightService for CookieFlightService {
 
     async fn do_get(
         &self,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        if let Some(value) = request.metadata().get("authorization") {
+            self.authorization_seen.lock().push(
+                value
+                    .to_str()
+                    .map_err(|_| Status::invalid_argument("invalid authorization"))?
+                    .to_owned(),
+            );
+        }
         Ok(Response::new(tokio_stream::empty()))
     }
 
@@ -288,4 +298,50 @@ async fn username_password_without_handshake_token_returns_unauthorized() {
     );
 
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn federation_context_preserves_repeated_authorization_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let service = CookieFlightService::new(Arc::new(AtomicBool::new(false)));
+    let observed = Arc::clone(&service.authorization_seen);
+    let server = TestServer::start(service).await;
+    let endpoint: Arc<str> = format!("http://{}", server.addr).into();
+    let mut clients = Vec::new();
+    for values in [
+        ["Bearer alice", "Bearer bob"],
+        ["Bearer bob", "Bearer alice"],
+    ] {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        for value in values {
+            metadata.append("authorization", value.parse()?);
+        }
+        clients.push(
+            FlightClient::try_new(
+                Arc::clone(&endpoint),
+                Credentials::anonymous(),
+                Some(metadata),
+                None,
+            )
+            .await?,
+        );
+    }
+    let contexts_equal = clients[0].federation_context() == clients[1].federation_context();
+    for client in &clients {
+        drop(
+            client
+                .query_substrait(bytes::Bytes::from_static(b"identity probe"), None)
+                .await?,
+        );
+    }
+    let actual = observed.lock().clone();
+    drop(clients);
+    server.shutdown().await;
+    eprintln!("contexts_equal={contexts_equal}; observed_authorization={actual:?}");
+    assert_eq!(actual, ["Bearer bob", "Bearer alice"]);
+    assert!(
+        !contexts_equal,
+        "different wire identities must not share a federation context"
+    );
+    Ok(())
 }

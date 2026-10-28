@@ -707,7 +707,7 @@ mod tests {
     extern "C" fn spiced_crash_handler_test_fault() {
         // SAFETY: a deliberate wild write — the behaviour under test.
         unsafe {
-            std::ptr::with_exposed_provenance_mut::<u8>(FAULT_ADDR).write(1);
+            std::ptr::with_exposed_provenance_mut::<u8>(std::hint::black_box(FAULT_ADDR)).write(1);
         }
     }
 

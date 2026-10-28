@@ -65,12 +65,15 @@ async fn deep_named_chains_are_rejected_on_the_worker_stack() {
          expression (for example, compute part of a long chain of +, || or AND in a subquery)."
     );
     for sql in [
-        format!("SELECT {}", plus_chain("1", 300)),
+        format!("SELECT {}", plus_chain("1", MAX_UNPROTECTED_EXPR_DEPTH + 1)),
         format!(
             "SELECT id FROM (VALUES (1)) t(id) ORDER BY {}",
-            plus_chain("id", 200)
+            plus_chain("id", MAX_UNPROTECTED_EXPR_DEPTH + 1)
         ),
-        format!("SELECT * FROM (VALUES ({})) v(x)", plus_chain("1", 300)),
+        format!(
+            "SELECT * FROM (VALUES ({})) v(x)",
+            plus_chain("1", MAX_UNPROTECTED_EXPR_DEPTH + 1)
+        ),
     ] {
         let err = plan_on_default_worker_stack(sql)
             .await

@@ -334,7 +334,9 @@ impl FlightClient {
                     }
                 })
                 .collect();
-            fields.sort_unstable();
+            // Request metadata overwrites repeated values in iteration order.
+            // Keep that order while canonicalizing independent field names.
+            fields.sort_by_key(|(key, _)| *key);
             for (key, value) in fields {
                 field(key.as_bytes());
                 field(value);
