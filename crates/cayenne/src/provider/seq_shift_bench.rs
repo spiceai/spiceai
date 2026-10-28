@@ -76,16 +76,22 @@ fn report(label: &str, mut samples: Vec<Duration>) {
 fn seq_shift_bench() {
     let base: i64 = 2_000_000;
     let delta = 1_000_000_i64;
-    for (window, samples) in [(10_000_usize, 11_000_usize), (100_000, 1_100), (1_000_000, 1_100)] {
+    for (window, samples) in [
+        (10_000_usize, 11_000_usize),
+        (100_000, 1_100),
+        (1_000_000, 1_100),
+    ] {
         let window_i64 = i64::try_from(window).expect("window fits i64");
         // The keyset: base committed keys and the window's keys, each stamped
         // at a `seq`; the window's keys get re-stamped by the shift.
-        let converter = crate::row_converter::RowConverter::new(vec![
-            crate::row_converter::SortField::new(arrow::datatypes::DataType::Int64),
-        ])
-        .expect("row converter");
-        let column: arrow::array::ArrayRef =
-            std::sync::Arc::new(arrow::array::Int64Array::from_iter_values(0..base + window_i64));
+        let converter =
+            crate::row_converter::RowConverter::new(vec![crate::row_converter::SortField::new(
+                arrow::datatypes::DataType::Int64,
+            )])
+            .expect("row converter");
+        let column: arrow::array::ArrayRef = std::sync::Arc::new(
+            arrow::array::Int64Array::from_iter_values(0..base + window_i64),
+        );
         let rows = converter.convert_columns(&[column]).expect("rows");
         let mut keyset = CachedPkKeyset::with_capacity(rows.num_rows());
         let mut window_digests = Vec::with_capacity(window);
@@ -129,8 +135,14 @@ fn seq_shift_bench() {
             deletion_samples.push(end - keyset_done);
             total_samples.push(end - start);
         }
-        report(&format!("window={window} base={base} keyset"), keyset_samples);
-        report(&format!("window={window} base={base} deletion_index"), deletion_samples);
+        report(
+            &format!("window={window} base={base} keyset"),
+            keyset_samples,
+        );
+        report(
+            &format!("window={window} base={base} deletion_index"),
+            deletion_samples,
+        );
         report(&format!("window={window} base={base} total"), total_samples);
     }
 }
