@@ -931,7 +931,7 @@ impl RuntimeBuilder {
                 self.instance_dir
                     .unwrap_or_else(crate::component_ddl::SqlComponents::default_instance_dir),
             )),
-            catalog_loads: parking_lot::Mutex::default(),
+            catalog_loads: Arc::default(),
         };
 
         if let (Some(state), Some(check)) = (spicepod_rt.state.clone(), state_location_check) {
