@@ -74,9 +74,11 @@ python3 test/scripts/sidecar.py \
   --concurrency 2 8 32 128 --duration 30
 ```
 
-The driver holds CPU, memory, admission, and local partitions constant and
-measures remote cache misses by default. Use `--cache-states hit` for a separate
+The driver holds CPU, memory, admission, and local partitions constant, starts
+a fresh standalone upstream for every comparison arm, and measures remote
+cache misses by default. Use `--cache-states hit` for a separate
 measurement of sidecar-cache hits. It keeps
 commands, provenance, expected/returned rows, plans, metrics, and benchmark
 outputs in the run directory. Add `--executors 2` for separate distributed
-cluster qualification.
+cluster qualification. The [qualification record](../../test/sidecar/README.md)
+documents the independent oracles, reproduction commands and measurement limits.

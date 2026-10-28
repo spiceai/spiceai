@@ -1,0 +1,27 @@
+[
+  {
+    "status": 504,
+    "body": "External error: Query 98610e1f-1a37-4e7a-bfb6-f871bf06a03d exceeded the configured timeout of 250ms and was cancelled. Increase 'runtime.query.timeout' or optimize the query. See: https://spiceai.org/docs/reference/spicepod",
+    "elapsed_ms": 255.430917
+  },
+  {
+    "status": 504,
+    "body": "External error: Query 76dbbec0-9918-444d-b81a-0bda4a60b94a exceeded the configured timeout of 250ms and was cancelled. Increase 'runtime.query.timeout' or optimize the query. See: https://spiceai.org/docs/reference/spicepod",
+    "elapsed_ms": 254.101041
+  },
+  {
+    "status": 504,
+    "body": "External error: Query ad05b17f-f32d-4854-8d4a-38bc9d7eca31 exceeded the configured timeout of 250ms and was cancelled. Increase 'runtime.query.timeout' or optimize the query. See: https://spiceai.org/docs/reference/spicepod",
+    "elapsed_ms": 256.394584
+  },
+  {
+    "status": 504,
+    "body": "External error: Query 97802e15-4426-426c-84fa-b764337f809c exceeded the configured timeout of 250ms and was cancelled. Increase 'runtime.query.timeout' or optimize the query. See: https://spiceai.org/docs/reference/spicepod",
+    "elapsed_ms": 256.338792
+  },
+  {
+    "status": 400,
+    "body": "External error: Query execution failed. Timeout expired",
+    "elapsed_ms": 256.28825
+  }
+]

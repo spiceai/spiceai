@@ -1,0 +1,8 @@
+{
+  "date": "2026-10-28",
+  "baseline_commit": "34825bb456d62d616f693187b0baf0fa1e8cfb14",
+  "candidate_commit": "acdfbe0586b178ef580598039823442534092a3b",
+  "candidate_binary_sha256": "c3a380bd3b5c46a7d1f802958d43fe857360041803cda421e8e4ee73725e4719",
+  "reading": "DataFusion physical-expr expressions/binary.rs dispatches Operator::Plus to add_wrapping (fork 3a75c403e4db3bc2f76f0d8c2cfce610f52f3675, line 634).",
+  "command": "target/release/spicescript --jobs 1 --spiced baseline=/tmp/spice-sidecar-artifacts/baseline/spiced --spiced acdfbe0=/tmp/spice-sidecar-artifacts/candidate-acdfbe0/spiced --work-dir /tmp/spice-sidecar-artifacts/spicescript-overflow-before --record-durations --record-failures test/spicescript/known-failing/datafusion/int64-overflow.yaml"
+}

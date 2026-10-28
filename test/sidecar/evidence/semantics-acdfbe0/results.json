@@ -1,0 +1,193 @@
+[
+  {
+    "name": "null-aware-antijoin",
+    "sql": "SELECT id FROM orders WHERE value NOT IN (SELECT value FROM orders) ORDER BY id",
+    "expected": [],
+    "actual": [],
+    "passed": true
+  },
+  {
+    "name": "operator-identity",
+    "sql": "SELECT id + CAST(1 AS BIGINT) AS n FROM orders WHERE id < 5 ORDER BY id",
+    "expected": [
+      {
+        "n": 1
+      },
+      {
+        "n": 2
+      },
+      {
+        "n": 3
+      },
+      {
+        "n": 4
+      },
+      {
+        "n": 5
+      }
+    ],
+    "actual": [
+      {
+        "n": 1
+      },
+      {
+        "n": 2
+      },
+      {
+        "n": 3
+      },
+      {
+        "n": 4
+      },
+      {
+        "n": 5
+      }
+    ],
+    "passed": true
+  },
+  {
+    "name": "builtin-identity",
+    "sql": "SELECT id, isnan(CAST(id AS DOUBLE)) AS n FROM orders WHERE id < 10 ORDER BY id",
+    "expected": [
+      {
+        "id": 0,
+        "n": false
+      },
+      {
+        "id": 1,
+        "n": false
+      },
+      {
+        "id": 2,
+        "n": false
+      },
+      {
+        "id": 3,
+        "n": false
+      },
+      {
+        "id": 4,
+        "n": false
+      },
+      {
+        "id": 5,
+        "n": false
+      },
+      {
+        "id": 6,
+        "n": false
+      },
+      {
+        "id": 7,
+        "n": false
+      },
+      {
+        "id": 8,
+        "n": false
+      },
+      {
+        "id": 9,
+        "n": false
+      }
+    ],
+    "actual": [
+      {
+        "id": 0,
+        "n": true
+      },
+      {
+        "id": 1,
+        "n": true
+      },
+      {
+        "id": 2,
+        "n": true
+      },
+      {
+        "id": 3,
+        "n": true
+      },
+      {
+        "id": 4,
+        "n": true
+      },
+      {
+        "id": 5,
+        "n": true
+      },
+      {
+        "id": 6,
+        "n": true
+      },
+      {
+        "id": 7,
+        "n": true
+      },
+      {
+        "id": 8,
+        "n": true
+      },
+      {
+        "id": 9,
+        "n": true
+      }
+    ],
+    "passed": false
+  },
+  {
+    "name": "builtin-argument-order",
+    "sql": "SELECT id, log(CAST(2 AS DOUBLE), CAST(id AS DOUBLE)) AS n FROM orders WHERE id = 8",
+    "expected": [
+      {
+        "id": 8,
+        "n": 3.0
+      }
+    ],
+    "actual": [
+      {
+        "id": 8,
+        "n": 3.0
+      }
+    ],
+    "passed": true
+  },
+  {
+    "name": "flight-string-view",
+    "sql": "SELECT arrow_cast(label, 'Utf8View') AS label FROM orders WHERE id < 5 ORDER BY id",
+    "expected": [
+      {
+        "label": "group0"
+      },
+      {
+        "label": "group1"
+      },
+      {
+        "label": "group2"
+      },
+      {
+        "label": "group3"
+      },
+      {
+        "label": "group4"
+      }
+    ],
+    "actual": [
+      {
+        "label": "group0"
+      },
+      {
+        "label": "group1"
+      },
+      {
+        "label": "group2"
+      },
+      {
+        "label": "group3"
+      },
+      {
+        "label": "group4"
+      }
+    ],
+    "passed": true
+  }
+]

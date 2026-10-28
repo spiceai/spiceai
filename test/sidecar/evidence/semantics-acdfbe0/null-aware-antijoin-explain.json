@@ -1,0 +1,10 @@
+[
+  {
+    "plan_type": "logical_plan",
+    "plan": "Sort: orders.id ASC NULLS LAST\n  Projection: orders.id\n    LeftAnti Join: orders.value = __correlated_sq_1.value null_aware\n      Federated\n Projection: orders.id, orders.value\n  TableScan: orders projection=[id, value]\n      SubqueryAlias: __correlated_sq_1\n        TableScan: orders projection=[value]"
+  },
+  {
+    "plan_type": "physical_plan",
+    "plan": "SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]\n  HashJoinExec: mode=CollectLeft, join_type=LeftAnti, accumulator=MinMaxLeftAccumulator, on=[(value@1, value@0)], projection=[id@0], null_aware\n    CooperativeExec\n      BytesProcessedExec\n        SubstraitExec: plan_bytes=99\n    CooperativeExec\n      BytesProcessedExec\n        SubstraitExec: plan_bytes=93\n"
+  }
+]

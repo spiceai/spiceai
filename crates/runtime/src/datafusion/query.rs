@@ -469,7 +469,7 @@ impl Query {
                     let deadline = async move {
                         match timer_deadline {
                             Some(deadline) => {
-                                tokio::time::sleep_until(Instant::from_std(deadline)).await
+                                tokio::time::sleep_until(Instant::from_std(deadline)).await;
                             }
                             None => std::future::pending::<()>().await,
                         }

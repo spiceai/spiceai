@@ -1,0 +1,10 @@
+[
+  {
+    "plan_type": "logical_plan",
+    "plan": "Federated\n Sort: orders.id ASC NULLS LAST\n  Projection: orders.id\n    Filter: orders.value NOT IN (<subquery>)\n      Subquery:\n        Projection: orders.value\n          TableScan: orders\n      TableScan: orders projection=[id, value]"
+  },
+  {
+    "plan_type": "physical_plan",
+    "plan": "CooperativeExec\n  BytesProcessedExec\n    SubstraitExec: plan_bytes=271\n"
+  }
+]
