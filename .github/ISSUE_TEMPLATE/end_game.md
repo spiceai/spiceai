@@ -36,7 +36,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 - [ ] Communicate the feature freeze date to contributors.
 - [ ] **Patch Release (vX.Y.Z)**: Verify no backward-incompatible changes and cherry-pick relevant commits.
 - [ ] **Minor Release (vX.Y)**: Plan to merge `trunk` into the release branch.
-- [ ] **Minor Release (xV,Y)**: Review and update [threat model](https://github.com/spiceai/spiceai/tree/trunk/docs/threat_models).
+- [ ] **Minor Release (vX.Y)**: Review and update [threat model](https://github.com/spiceai/spiceai/tree/trunk/docs/threat_models).
 
 ## Release Branch Creation
 
