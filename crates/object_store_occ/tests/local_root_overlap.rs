@@ -102,3 +102,53 @@ async fn conditional_writes_to_the_same_file_have_one_winner() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_to_other_directories_do_not_wait_behind_a_large_write() {
+    let directory = tempfile::tempdir().expect("state directory");
+    let store = std::sync::Arc::new(
+        LocalConditionalPut::new_durable(directory.path()).expect("durable state store"),
+    );
+    let head = Path::from("log/head");
+    let payload = Bytes::from(vec![7_u8; 512 * 1024 * 1024]);
+    // The large create goes to another directory, as a sealed batch does.
+    let large = {
+        let store = std::sync::Arc::clone(&store);
+        tokio::spawn(async move {
+            conditional_put(
+                store.as_ref(),
+                &Path::from("log/wal/00000000000000000001"),
+                payload.into(),
+                &Expected::Absent,
+            )
+            .await
+            .expect("large create");
+            std::time::Instant::now()
+        })
+    };
+    // Send the small write only once the large one is being staged.
+    let wal = directory.path().join("log").join("wal");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::fs::read_dir(&wal).map_or(true, |mut entries| entries.next().is_none()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the large write never started staging"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    conditional_put(
+        store.as_ref(),
+        &head,
+        Bytes::from_static(b"head").into(),
+        &Expected::Absent,
+    )
+    .await
+    .expect("small create");
+    let small_done = std::time::Instant::now();
+    let large_done = large.await.expect("large task");
+    assert!(
+        small_done < large_done,
+        "the head write finished {:?} after the large write",
+        small_done.duration_since(large_done)
+    );
+}

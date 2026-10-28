@@ -42,9 +42,12 @@ limitations under the License.
 //!
 //! **Concurrency model**: each put takes an advisory lock for the object's
 //! directory. Two clients whose roots and keys name the same file
-//! therefore share one lock, including across processes. A dedicated filesystem
-//! worker retains that lock through publication after caller cancellation or
-//! Tokio shutdown. Accepted writes may finish after their caller stops waiting.
+//! therefore share one lock, including across processes. Puts are published by
+//! dedicated filesystem workers, one per shard of directories: puts to one
+//! directory publish in order, and puts to different directories publish in
+//! parallel. A worker retains its lock through publication after caller
+//! cancellation or Tokio shutdown. Accepted writes may finish after their caller
+//! stops waiting.
 //! The lock file is not an object and is not removed: unlinking it would let
 //! the next writer lock a different inode.
 //!
@@ -91,8 +94,12 @@ pub struct LocalConditionalPut {
     inner: Arc<LocalFileSystem>,
     root: PathBuf,
     durable: bool,
-    writes: tokio::sync::mpsc::Sender<Publication>,
+    /// One queue per worker; a directory always maps to the same worker.
+    writes: Vec<tokio::sync::mpsc::Sender<Publication>>,
 }
+
+/// Workers publishing in parallel, each for a fixed shard of directories.
+const WRITE_WORKERS: usize = 8;
 
 struct Publication {
     location: Path,
@@ -117,6 +124,12 @@ fn is_publication_lock(location: &Path) -> bool {
 }
 
 fn lock_file(path: &std::path::Path) -> Result<std::fs::File, ObjectStoreError> {
+    let file = open_lock_file(path)?;
+    file.lock().map_err(worker_error)?;
+    Ok(file)
+}
+
+fn open_lock_file(path: &std::path::Path) -> Result<std::fs::File, ObjectStoreError> {
     let open = || {
         OpenOptions::new()
             .read(true)
@@ -125,7 +138,7 @@ fn lock_file(path: &std::path::Path) -> Result<std::fs::File, ObjectStoreError> 
             .truncate(false)
             .open(path)
     };
-    let file = match open() {
+    match open() {
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(worker_error)?;
@@ -134,9 +147,7 @@ fn lock_file(path: &std::path::Path) -> Result<std::fs::File, ObjectStoreError> 
         }
         opened => opened,
     }
-    .map_err(worker_error)?;
-    file.lock().map_err(worker_error)?;
-    Ok(file)
+    .map_err(worker_error)
 }
 
 fn reserved_lock_error(location: &Path) -> ObjectStoreError {
@@ -371,14 +382,16 @@ fn publish(
     payload: &PutPayload,
     options: &PutOptions,
 ) -> Result<PutResult, ObjectStoreError> {
-    // Every writer in this root shares the legacy lock, so the payload is
-    // written before it is taken.
+    // An older process holds the legacy lock for its whole put, so the payload
+    // is written before it is taken.
     let (staged, mut staging, created_parent) = stage(path, payload)?;
     let written = staged.metadata().map_err(worker_error)?;
     // Take the legacy root lock before the directory lock. An older process
-    // locks only the root file. Reversing this order can deadlock with a writer
-    // that still uses this order.
-    let _legacy_guard = lock_file(&root.join(".spice-object-store-occ.lock"))?;
+    // locks only the root file, exclusively; holding it shared excludes that
+    // process while writers to other directories publish in parallel.
+    // Reversing this order can deadlock with a writer that still uses it.
+    let legacy_guard = open_lock_file(&root.join(".spice-object-store-occ.lock"))?;
+    legacy_guard.lock_shared().map_err(worker_error)?;
     let directory_guard = lock_file(&publication_lock_path(root, location))?;
     // `LocalFileSystem` reports a directory at an object's path as no object.
     let current = match std::fs::metadata(path) {
@@ -503,12 +516,16 @@ impl LocalConditionalPut {
     fn with_durability(root: impl Into<PathBuf>, durable: bool) -> Result<Self, ObjectStoreError> {
         let root = root.into();
         let inner = Arc::new(LocalFileSystem::new_with_prefix(&root)?);
-        let (writes, receive) = tokio::sync::mpsc::channel(1);
-        let worker_root = root.clone();
-        std::thread::Builder::new()
-            .name("local-state-writer".to_owned())
-            .spawn(move || write_worker(&worker_root, durable, receive))
-            .map_err(worker_error)?;
+        let mut writes = Vec::with_capacity(WRITE_WORKERS);
+        for worker in 0..WRITE_WORKERS {
+            let (send, receive) = tokio::sync::mpsc::channel(1);
+            let worker_root = root.clone();
+            std::thread::Builder::new()
+                .name(format!("local-state-writer-{worker}"))
+                .spawn(move || write_worker(&worker_root, durable, receive))
+                .map_err(worker_error)?;
+            writes.push(send);
+        }
         Ok(Self {
             inner,
             root,
@@ -545,7 +562,17 @@ impl ObjectStore for LocalConditionalPut {
         }
         let path = self.inner.path_to_filesystem(location)?;
         let (reply, result) = tokio::sync::oneshot::channel();
+        // Equivalent roots and keys name the same directory lock, so they map
+        // to the same worker and publish in order.
+        let shard = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            publication_lock_path(&self.root, location).hash(&mut hasher);
+            usize::try_from(hasher.finish() % WRITE_WORKERS as u64).unwrap_or_default()
+        };
         self.writes
+            .get(shard)
+            .ok_or_else(|| worker_error(io::Error::other("no local state writer for shard")))?
             .send(Publication {
                 location: location.clone(),
                 path,
