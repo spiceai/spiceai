@@ -16,9 +16,7 @@ limitations under the License.
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion_ddl::component_options::{
-    UNREADABLE_STATEMENT, recorded_statement, redact_values,
-};
+use datafusion_ddl::component_options::{UNREADABLE_STATEMENT, recorded_statement, redact_values};
 use std::{borrow::Cow, sync::Arc};
 
 use crate::builtin::function_tool::current_principal_allows_write;
@@ -170,7 +168,10 @@ mod tests {
             input,
             r#"{"query":"CREATE TABLE t WITH (from = 'postgres:public.t', pg_host = '<redacted>', pg_pass = '<redacted>')"}"#
         );
-        assert!(removed.iter().any(|value| value == "hunter2"), "{removed:?}");
+        assert!(
+            removed.iter().any(|value| value == "hunter2"),
+            "{removed:?}"
+        );
         assert_eq!(
             redact_values("password for 'hunter2' refused", &removed),
             "password for <redacted> refused"

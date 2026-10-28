@@ -1010,10 +1010,7 @@ fn values_taken_out_of_the_text_are_taken_out_of_its_error() {
     // A short value goes only as it was written, quotes included, so it does
     // not take other text with it.
     assert_eq!(
-        redact_values(
-            "role 'ab' denied: ab hunter2 db",
-            &recorded.removed
-        ),
+        redact_values("role 'ab' denied: ab hunter2 db", &recorded.removed),
         "role <redacted> denied: ab <redacted> db"
     );
     assert!(matches!(

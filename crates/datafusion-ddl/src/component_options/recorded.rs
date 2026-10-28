@@ -298,7 +298,10 @@ impl<'s, 't> Recording<'s, 't> {
                 Token::Word(word)
                     if depth == 0
                         && word.quote_style.is_none()
-                        && matches!(word.keyword, Keyword::WITH | Keyword::SET | Keyword::RESET) =>
+                        && matches!(
+                            word.keyword,
+                            Keyword::WITH | Keyword::SET | Keyword::RESET
+                        ) =>
                 {
                     if significant
                         .get(k + 1)
@@ -404,7 +407,9 @@ impl<'s, 't> Recording<'s, 't> {
         while let Some(&i) = item.get(n) {
             match self.token(i) {
                 Token::Word(word) => parts.push(word.value.clone()),
-                Token::SingleQuotedString(s) | Token::DoubleQuotedString(s) => parts.push(s.clone()),
+                Token::SingleQuotedString(s) | Token::DoubleQuotedString(s) => {
+                    parts.push(s.clone())
+                }
                 _ => break,
             }
             n += 1;
@@ -461,7 +466,8 @@ impl<'s, 't> Recording<'s, 't> {
             return;
         };
         if let Some(name) = parameter {
-            let reference = matches!(&shape, Shape::Scalar { string: Some(s), .. } if is_secret_reference(s));
+            let reference =
+                matches!(&shape, Shape::Scalar { string: Some(s), .. } if is_secret_reference(s));
             if reference || (self.shown)(&name) {
                 self.keep(value);
             } else {
@@ -478,11 +484,12 @@ impl<'s, 't> Recording<'s, 't> {
         let token = |n: usize| self.token(value[n]);
         match value.len() {
             0 => None,
-            1 => (matches!(token(0), Token::Word(_)) || carries_value(self.text(value[0])))
-                .then(|| Shape::Scalar {
+            1 => (matches!(token(0), Token::Word(_)) || carries_value(self.text(value[0]))).then(
+                || Shape::Scalar {
                     tokens: value,
                     string: string_literal(token(0)).map(str::to_string),
-                }),
+                },
+            ),
             2 if matches!(token(0), Token::Minus | Token::Plus)
                 && matches!(token(1), Token::Number(..)) =>
             {
@@ -491,12 +498,10 @@ impl<'s, 't> Recording<'s, 't> {
                     string: None,
                 })
             }
-            2 if is_keyword(token(0), "json") => {
-                string_literal(token(1)).map(|text| Shape::Json {
-                    tokens: value,
-                    text: text.to_string(),
-                })
-            }
+            2 if is_keyword(token(0), "json") => string_literal(token(1)).map(|text| Shape::Json {
+                tokens: value,
+                text: text.to_string(),
+            }),
             len if len >= 3
                 && is_keyword(token(0), "array")
                 && matches!(token(1), Token::LBracket)

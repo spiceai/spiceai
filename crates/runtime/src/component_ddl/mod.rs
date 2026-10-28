@@ -694,9 +694,10 @@ impl Runtime {
                             "Read the datasets and catalogs defined with SQL from {}, and serving them.",
                             read.location()
                         );
-                        runtime
-                            .status
-                            .update_component_status(SQL_DEFINITIONS_STATUS, ComponentStatus::Ready);
+                        runtime.status.update_component_status(
+                            SQL_DEFINITIONS_STATUS,
+                            ComponentStatus::Ready,
+                        );
                         if !read.is_shared() {
                             return;
                         }
@@ -838,7 +839,9 @@ impl Runtime {
         // be drained, is still served from its acceleration data.
         if let Some(dataset) = retired.iter().find(|dataset| {
             self.df
-                .table_exists(&datafusion::common::TableReference::parse_str(&dataset.name))
+                .table_exists(&datafusion::common::TableReference::parse_str(
+                    &dataset.name,
+                ))
         }) {
             Arc::clone(self)
                 .apply_app_diff(Some(&without_app), Arc::clone(served))
