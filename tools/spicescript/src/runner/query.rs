@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 //! `query` and `explain` steps: running a query, checking its answer, the
-//! SQL it sends to its source, and that HTTP gives the same answer.
+//! SQL it sends to its source, and that HTTP and `/v1/queries` give the same
+//! answer.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -25,7 +26,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use arrow::array::RecordBatch;
 
 use crate::compare;
-use crate::script::{Expect, ExplainStep, QueryStep, Script, Timing};
+use crate::script::{Defaults, Expect, ExplainStep, QueryStep, Script, Timing};
 
 use super::{Instance, POLL, Sources, at_place, max_wait, namespace, one_line};
 
@@ -124,15 +125,7 @@ pub(super) async fn run_query(
             .defaults
             .query_timeout
             .unwrap_or(Duration::from_mins(2));
-        let attempt = query_attempt(
-            instance,
-            q,
-            expect,
-            sources,
-            limit,
-            script.defaults.also_http,
-        )
-        .await;
+        let attempt = query_attempt(instance, q, expect, sources, limit, &script.defaults).await;
         match (timing, attempt) {
             (Timing::Once, result) => return result,
             (Timing::Eventually(_), Ok(answer)) => return Ok(answer),
@@ -193,9 +186,9 @@ pub(super) async fn query_attempt(
     expect: Option<&Expect>,
     sources: &Sources,
     limit: Duration,
-    also_http: bool,
+    defaults: &Defaults,
 ) -> Result<Option<Vec<RecordBatch>>> {
-    let answer = answer_attempt(instance, q, expect, sources, limit, also_http).await?;
+    let answer = answer_attempt(instance, q, expect, sources, limit, defaults).await?;
     if answer.is_some() && !q.sent.is_empty() {
         let sql = instance.sql(&q.sql)?;
         check_sent(instance, q, &sql).await?;
@@ -209,7 +202,7 @@ pub(super) async fn answer_attempt(
     expect: Option<&Expect>,
     sources: &Sources,
     limit: Duration,
-    also_http: bool,
+    defaults: &Defaults,
 ) -> Result<Option<Vec<RecordBatch>>> {
     let spice_sql = instance.sql(&q.sql)?;
     let oracle_sql = instance.sql(q.oracle_sql.as_deref().unwrap_or(&q.sql))?;
@@ -290,7 +283,21 @@ pub(super) async fn answer_attempt(
             oracle: None,
             rows: None,
             same_as: None,
-        }) => return Ok(Some(actual)),
+        }) => {
+            if defaults.also_async {
+                async_agrees(
+                    instance,
+                    &spice_sql,
+                    q.parameters.as_deref(),
+                    &actual,
+                    &schema,
+                    q.expect_empty,
+                    limit,
+                )
+                .await?;
+            }
+            return Ok(Some(actual));
+        }
         Some(Expect {
             oracle: Some(oracle),
             rows: None,
@@ -327,8 +334,20 @@ pub(super) async fn answer_attempt(
     )? {
         bail!("answer differs from the expected one: {report}");
     }
-    if also_http {
+    if defaults.also_http {
         http_agrees(instance, &spice_sql, &actual, &schema, q.expect_empty).await?;
+    }
+    if defaults.also_async {
+        async_agrees(
+            instance,
+            &spice_sql,
+            q.parameters.as_deref(),
+            &actual,
+            &schema,
+            q.expect_empty,
+            limit,
+        )
+        .await?;
     }
     Ok(Some(actual))
 }
@@ -452,6 +471,141 @@ pub(super) async fn http_agrees(
     // would round a 38-digit decimal to a double.
     let rows = json_array_elements(&body)
         .with_context(|| format!("HTTP answered with no JSON rows: {}", one_line(&body, 200)))?;
+    let typed = decode_json_rows(&rows, schema)
+        .context("could not decode the HTTP JSON answer as Flight's schema")?;
+    if let Some(report) = compare::compare(&instance.label, sql, flight, &typed, expect_empty)? {
+        bail!("the HTTP JSON answer differs from Flight's: {report}");
+    }
+    Ok(())
+}
+
+/// Runs the same SQL as a `/v1/queries` job and requires the answer Flight
+/// gave, all within `limit`. On a cluster this is a distributed job whose
+/// stages exchange data between executors, a path Flight queries do not take.
+async fn async_agrees(
+    instance: &Instance,
+    sql: &str,
+    parameters: Option<&[serde_json::Value]>,
+    flight: &[RecordBatch],
+    schema: &arrow::datatypes::SchemaRef,
+    expect_empty: bool,
+    limit: Duration,
+) -> Result<()> {
+    let names: Vec<&String> = schema.fields().iter().map(|f| f.name()).collect();
+    let unique: std::collections::BTreeSet<&&String> = names.iter().collect();
+    if unique.len() != names.len() {
+        return Ok(());
+    }
+    let typed = tokio::time::timeout(limit, async_answer(instance, sql, parameters, schema))
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow!(
+                "the /v1/queries job did not answer within {limit:?}"
+            ))
+        })?;
+    if let Some(report) = compare::compare(&instance.label, sql, flight, &typed, expect_empty)? {
+        bail!("the /v1/queries answer differs from Flight's: {report}");
+    }
+    Ok(())
+}
+
+/// The answer to `sql`, with its positional `parameters`, as a `/v1/queries`
+/// job, typed with `schema`.
+async fn async_answer(
+    instance: &Instance,
+    sql: &str,
+    parameters: Option<&[serde_json::Value]>,
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    let json = [("content-type".to_string(), "application/json".to_string())];
+    let key = crate::spiced::Key::Default;
+    let request = serde_json::json!({ "sql": sql, "parameters": parameters }).to_string();
+    let (status, _, body) = instance
+        .spiced
+        .http("POST", "/v1/queries", &json, Some(&request), &key)
+        .await?;
+    ensure!(
+        (200..300).contains(&status),
+        "/v1/queries answered {status}: {}",
+        one_line(&body, 300)
+    );
+    let submitted: serde_json::Value = serde_json::from_str(&body)?;
+    let id = submitted["query_id"]
+        .as_str()
+        .with_context(|| format!("/v1/queries returned no query_id: {}", one_line(&body, 200)))?;
+    loop {
+        let path = format!("/v1/queries/{id}/status");
+        let (_, _, body) = instance.spiced.http("GET", &path, &[], None, &key).await?;
+        let state: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("{path} answered {}", one_line(&body, 200)))?;
+        match state["status"].as_str() {
+            Some("SUCCEEDED") => break,
+            Some("PENDING" | "RUNNING") => {}
+            _ => bail!(
+                "the /v1/queries job did not succeed: {}",
+                one_line(&body, 600)
+            ),
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    let mut rows_text = Vec::new();
+    let mut path = Some(format!("/v1/queries/{id}/results"));
+    while let Some(p) = path.take() {
+        let (status, _, body) = instance.spiced.http("GET", &p, &[], None, &key).await?;
+        ensure!(
+            status == 200,
+            "{p} answered {status}: {}",
+            one_line(&body, 300)
+        );
+        let chunk: serde_json::Value = serde_json::from_str(&body)?;
+        path = chunk["next_chunk_url"].as_str().map(str::to_string);
+        // The rows come from the body's own text, as for `/v1/sql`.
+        let rows = json_field_array(&body, "data_array")
+            .with_context(|| format!("{p} answered with no rows: {}", one_line(&body, 200)))?;
+        rows_text.extend(json_array_elements(rows)?.into_iter().map(str::to_string));
+    }
+    let rows: Vec<&str> = rows_text.iter().map(String::as_str).collect();
+    decode_json_rows(&rows, schema)
+        .context("could not decode the /v1/queries answer as Flight's schema")
+}
+
+/// The text of the JSON array a top-level field of `text` holds.
+fn json_field_array<'a>(text: &'a str, field: &str) -> Result<&'a str> {
+    let key = format!("\"{field}\":");
+    let at = text.find(&key).context("no such field")? + key.len();
+    let rest = text[at..].trim_start();
+    ensure!(rest.starts_with('['), "the field is not an array");
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for (i, c) in rest.char_indices() {
+        if in_string {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '[' | '{' => depth += 1,
+            ']' | '}' => {
+                depth = depth.checked_sub(1).context("unbalanced JSON")?;
+                if depth == 0 {
+                    return Ok(&rest[..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    bail!("unterminated JSON array")
+}
+
+/// JSON objects, one per row, as batches of `schema`.
+fn decode_json_rows(
+    rows: &[&str],
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<Vec<RecordBatch>> {
     let mut decoder = arrow::json::ReaderBuilder::new(Arc::clone(schema))
         .with_strict_mode(true)
         .build_decoder()?;
@@ -460,9 +614,7 @@ pub(super) async fn http_agrees(
     let mut input = rows_text.as_slice();
     let mut typed = Vec::new();
     while !input.is_empty() {
-        let read = decoder
-            .decode(input)
-            .context("could not decode the HTTP JSON answer as Flight's schema")?;
+        let read = decoder.decode(input)?;
         input = &input[read..];
         if read == 0 || input.is_empty() {
             typed.extend(decoder.flush()?);
@@ -471,10 +623,7 @@ pub(super) async fn http_agrees(
     if typed.is_empty() {
         typed.push(RecordBatch::new_empty(Arc::clone(schema)));
     }
-    if let Some(report) = compare::compare(&instance.label, sql, flight, &typed, expect_empty)? {
-        bail!("the HTTP JSON answer differs from Flight's: {report}");
-    }
-    Ok(())
+    Ok(typed)
 }
 
 #[cfg(test)]

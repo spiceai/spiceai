@@ -573,7 +573,9 @@ mod tests {
     }
 
     /// The normalization is what makes a *naive* timestamp compare against the rendered UTC
-    /// literal at all, so passing a schema must not remove it there.
+    /// literal at all, so passing a schema must not remove it there. Against a literal, a naive
+    /// microsecond column is pinned to UTC through its `epoch_us` count and compared in
+    /// nanoseconds, so the sub-millisecond part survives (spiceai#13146).
     #[test]
     fn a_naive_timestamp_filter_keeps_the_utc_normalization() {
         let schema = docs_schema(vec![Field::new(
@@ -586,8 +588,12 @@ mod tests {
         let sql = flat_sql(&schema, &filter).expect("SQL should build");
 
         assert!(
-            sql.contains(r#"TO_TIMESTAMP(EPOCH_MS("ts") / 1000)"#),
-            "a naive column still has to be pinned to UTC to compare with the literal: {sql}"
+            sql.contains(r#"(epoch_us("ts")::HUGEINT * 1000) > 1767225600000999000"#),
+            "a naive column has to be pinned to UTC, at full precision, to compare with the literal: {sql}"
+        );
+        assert!(
+            !sql.contains("EPOCH_MS"),
+            "the millisecond normalization would drop the literal's sub-millisecond part: {sql}"
         );
     }
 

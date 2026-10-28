@@ -754,6 +754,16 @@ fn serve(
                 (model, false)
             }
         };
+    // This engine decodes one token after another with a decoder alone. An encoder-decoder
+    // model's decoder aborts the process when no encoder pass ran, and a diffusion model
+    // decodes nothing, so both are refused while they load.
+    if model.has_encoder() || model.is_diffusion() {
+        let _ = ready.send(Err(ChatError::UnsupportedArchitecture {
+            architecture: model.architecture().unwrap_or_default(),
+            file: file_name(path),
+        }));
+        return;
+    }
     let draft_model = match draft.map(|d| {
         let params = ModelParams::default().with_load_mtp(true);
         let head = Model::load(backend, d, &params).map_err(|e| {

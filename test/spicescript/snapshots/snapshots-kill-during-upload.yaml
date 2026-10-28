@@ -1,7 +1,7 @@
 name: snapshots-kill-during-upload
 description: >
-  spiced killed (SIGKILL) at points from the end of a refresh through the
-  snapshot upload that follows it never leaves a snapshot that restores
+  spiced killed (SIGKILL) at delays after a refresh completes never leaves
+  a snapshot that restores
   wrong: started on empty local storage with the source down, the
   acceleration serves one whole generation of the table — the one before the
   refresh or the one after — never a mix, a part, or nothing.
@@ -44,8 +44,8 @@ defaults:
   ready-timeout: 5m
 
 steps:
-  # 2,000,000 rows with one generation label: a snapshot of about 75 MB,
-  # uploaded in about half a second, which the kills below are spread across.
+  # Large deterministic rows exercise snapshot publication boundaries. Kills
+  # are timed from refresh completion; they need not interrupt an active upload.
   - source-exec:
       src: |
         CREATE TABLE t (id int PRIMARY KEY, v text NOT NULL, pad text NOT NULL);
@@ -65,9 +65,14 @@ steps:
       patch:
         datasets:
           t: { acceleration: { params: { cayenne_file_path: '${instance.dir}/accel-gen2/data', cayenne_metadata_dir: '${instance.dir}/accel-gen2/meta' } } }
-  - query: SELECT count(*) AS n, count(DISTINCT v) AS generations, sum(id) AS ids FROM t
-    expect: { rows: [['2000000', '1', '2000001000000']] }
+  - query: SELECT count(*) AS n, count(DISTINCT v) AS generations, sum(id) AS ids, count(DISTINCT id) AS keys, min(id) AS lo, max(id) AS hi FROM t
+    expect: { rows: [['2000000', '1', '2000001000000', '2000000', '1', '2000000']] }
     eventually: 120s
+  - query: >
+      SELECT count(*) AS invalid FROM t
+      WHERE v IS NULL OR pad IS NULL OR v NOT IN ('gen1', 'gen2')
+         OR pad <> md5(CAST(id AS VARCHAR)) || md5(CAST(id * 7 AS VARCHAR))
+    expect: { rows: [['0']] }
 
   # Refreshed to gen3, killed 150ms after the refresh completes.
   - start-source: src
@@ -81,9 +86,14 @@ steps:
       patch:
         datasets:
           t: { acceleration: { params: { cayenne_file_path: '${instance.dir}/accel-gen3/data', cayenne_metadata_dir: '${instance.dir}/accel-gen3/meta' } } }
-  - query: SELECT count(*) AS n, count(DISTINCT v) AS generations, sum(id) AS ids FROM t
-    expect: { rows: [['2000000', '1', '2000001000000']] }
+  - query: SELECT count(*) AS n, count(DISTINCT v) AS generations, sum(id) AS ids, count(DISTINCT id) AS keys, min(id) AS lo, max(id) AS hi FROM t
+    expect: { rows: [['2000000', '1', '2000001000000', '2000000', '1', '2000000']] }
     eventually: 120s
+  - query: >
+      SELECT count(*) AS invalid FROM t
+      WHERE v IS NULL OR pad IS NULL OR v NOT IN ('gen1', 'gen2', 'gen3')
+         OR pad <> md5(CAST(id AS VARCHAR)) || md5(CAST(id * 7 AS VARCHAR))
+    expect: { rows: [['0']] }
 
   # Refreshed to gen4, killed 300ms after the refresh completes.
   - start-source: src
@@ -97,9 +107,14 @@ steps:
       patch:
         datasets:
           t: { acceleration: { params: { cayenne_file_path: '${instance.dir}/accel-gen4/data', cayenne_metadata_dir: '${instance.dir}/accel-gen4/meta' } } }
-  - query: SELECT count(*) AS n, count(DISTINCT v) AS generations, sum(id) AS ids FROM t
-    expect: { rows: [['2000000', '1', '2000001000000']] }
+  - query: SELECT count(*) AS n, count(DISTINCT v) AS generations, sum(id) AS ids, count(DISTINCT id) AS keys, min(id) AS lo, max(id) AS hi FROM t
+    expect: { rows: [['2000000', '1', '2000001000000', '2000000', '1', '2000000']] }
     eventually: 120s
+  - query: >
+      SELECT count(*) AS invalid FROM t
+      WHERE v IS NULL OR pad IS NULL OR v NOT IN ('gen1', 'gen2', 'gen3', 'gen4')
+         OR pad <> md5(CAST(id AS VARCHAR)) || md5(CAST(id * 7 AS VARCHAR))
+    expect: { rows: [['0']] }
 
   # Refreshed to gen5, killed 450ms after the refresh completes.
   - start-source: src
@@ -113,9 +128,14 @@ steps:
       patch:
         datasets:
           t: { acceleration: { params: { cayenne_file_path: '${instance.dir}/accel-gen5/data', cayenne_metadata_dir: '${instance.dir}/accel-gen5/meta' } } }
-  - query: SELECT count(*) AS n, count(DISTINCT v) AS generations, sum(id) AS ids FROM t
-    expect: { rows: [['2000000', '1', '2000001000000']] }
+  - query: SELECT count(*) AS n, count(DISTINCT v) AS generations, sum(id) AS ids, count(DISTINCT id) AS keys, min(id) AS lo, max(id) AS hi FROM t
+    expect: { rows: [['2000000', '1', '2000001000000', '2000000', '1', '2000000']] }
     eventually: 120s
+  - query: >
+      SELECT count(*) AS invalid FROM t
+      WHERE v IS NULL OR pad IS NULL OR v NOT IN ('gen1', 'gen2', 'gen3', 'gen4', 'gen5')
+         OR pad <> md5(CAST(id AS VARCHAR)) || md5(CAST(id * 7 AS VARCHAR))
+    expect: { rows: [['0']] }
 
   # Refreshed to gen6, killed 600ms after the refresh completes.
   - start-source: src
@@ -129,9 +149,14 @@ steps:
       patch:
         datasets:
           t: { acceleration: { params: { cayenne_file_path: '${instance.dir}/accel-gen6/data', cayenne_metadata_dir: '${instance.dir}/accel-gen6/meta' } } }
-  - query: SELECT count(*) AS n, count(DISTINCT v) AS generations, sum(id) AS ids FROM t
-    expect: { rows: [['2000000', '1', '2000001000000']] }
+  - query: SELECT count(*) AS n, count(DISTINCT v) AS generations, sum(id) AS ids, count(DISTINCT id) AS keys, min(id) AS lo, max(id) AS hi FROM t
+    expect: { rows: [['2000000', '1', '2000001000000', '2000000', '1', '2000000']] }
     eventually: 120s
+  - query: >
+      SELECT count(*) AS invalid FROM t
+      WHERE v IS NULL OR pad IS NULL OR v NOT IN ('gen1', 'gen2', 'gen3', 'gen4', 'gen5', 'gen6')
+         OR pad <> md5(CAST(id AS VARCHAR)) || md5(CAST(id * 7 AS VARCHAR))
+    expect: { rows: [['0']] }
 
   # Refreshed to gen7, killed 1s after the refresh completes.
   - start-source: src
@@ -145,8 +170,13 @@ steps:
       patch:
         datasets:
           t: { acceleration: { params: { cayenne_file_path: '${instance.dir}/accel-gen7/data', cayenne_metadata_dir: '${instance.dir}/accel-gen7/meta' } } }
-  - query: SELECT count(*) AS n, count(DISTINCT v) AS generations, sum(id) AS ids FROM t
-    expect: { rows: [['2000000', '1', '2000001000000']] }
+  - query: SELECT count(*) AS n, count(DISTINCT v) AS generations, sum(id) AS ids, count(DISTINCT id) AS keys, min(id) AS lo, max(id) AS hi FROM t
+    expect: { rows: [['2000000', '1', '2000001000000', '2000000', '1', '2000000']] }
     eventually: 120s
+  - query: >
+      SELECT count(*) AS invalid FROM t
+      WHERE v IS NULL OR pad IS NULL OR v NOT IN ('gen1', 'gen2', 'gen3', 'gen4', 'gen5', 'gen6', 'gen7')
+         OR pad <> md5(CAST(id AS VARCHAR)) || md5(CAST(id * 7 AS VARCHAR))
+    expect: { rows: [['0']] }
 
   - assert-log: { count: { 'Snapshot restored': '>=6' } }

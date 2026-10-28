@@ -19,7 +19,12 @@ limitations under the License.
 //! and replication slots again.
 
 use secrecy::SecretString;
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use arrow::array::RecordBatch;
@@ -63,6 +68,22 @@ pub struct Spiced {
         String,
         arrow_flight::sql::client::FlightSqlServiceClient<tonic::transport::Channel>,
     >,
+    /// Runs `spiced` in a container rather than as a local process.
+    container: Option<ContainerRun>,
+    /// The `binary` last copied into `dir` for a container to run.
+    staged_from: Option<PathBuf>,
+}
+
+/// A container `spiced` runs in: on the host's network, so it serves on the
+/// same local ports a process would, with the binary and `volumes` mounted
+/// and its working directory at the same path as on the host. Everything
+/// else, the temporary directory included, is its own.
+#[derive(Debug, Clone)]
+pub struct ContainerRun {
+    pub image: String,
+    pub name: String,
+    /// `docker run -v` specifications.
+    pub volumes: Vec<String>,
 }
 
 /// Which API key a request presents.
@@ -98,7 +119,14 @@ impl Spiced {
             tls_ca: None,
             extra_args: Vec::new(),
             sessions: std::collections::HashMap::new(),
+            container: None,
+            staged_from: None,
         })
+    }
+
+    /// Runs `spiced` in this container on every start.
+    pub fn set_container(&mut self, run: ContainerRun) {
+        self.container = Some(run);
     }
 
     /// Serves HTTP on `port`, one a script was told in advance
@@ -209,15 +237,24 @@ impl Spiced {
             .create(true)
             .append(true)
             .open(self.log_path())?;
-        let child = Command::new(&self.binary)
-            .current_dir(&self.dir)
+        let mut command = match self.container.clone() {
+            None => {
+                let mut command = Command::new(&self.binary);
+                command.current_dir(&self.dir).envs(&self.env);
+                command
+            }
+            Some(run) => {
+                let binary = self.stage_binary()?;
+                self.container_command(&run, &binary)?
+            }
+        };
+        let child = command
             .arg("--telemetry-enabled=false")
             .args(["--http", &format!("127.0.0.1:{}", self.http)])
             .args(["--flight", &format!("127.0.0.1:{}", self.flight)])
             .args(["--metrics", &format!("127.0.0.1:{}", self.metrics)])
             .args(["--open_telemetry", &format!("127.0.0.1:{}", self.otel)])
             .args(&self.extra_args)
-            .envs(&self.env)
             .stdout(log.try_clone()?)
             .stderr(log)
             .kill_on_drop(true)
@@ -231,9 +268,88 @@ impl Spiced {
             )?;
             crate::cleanup::track_process(pid, self.http);
         }
+        if let Some(run) = &self.container {
+            crate::cleanup::track_container(&run.name, &run.name, None);
+        }
         self.child = Some(child);
         self.flight_client = None;
         Ok(())
+    }
+
+    /// The binary a container runs: a copy of `binary` in this instance's
+    /// directory, made again only when `binary` changes.
+    ///
+    /// A `docker run -v` source is a path on the Docker daemon's filesystem,
+    /// which need not be this process's: under Docker-in-Docker the daemon
+    /// shares only the runner's work volume, and for a source it cannot see
+    /// it mounts an empty directory, so the container fails with
+    /// `exec /usr/local/bin/spiced failed: Permission denied`. The instance
+    /// directory is mounted into the container already, so the daemon sees
+    /// the copy wherever it sees the rest of the run.
+    fn stage_binary(&mut self) -> Result<PathBuf> {
+        let copy = std::path::absolute(self.dir.join("spiced.bin"))?;
+        if self.staged_from.as_ref() != Some(&self.binary) {
+            std::fs::copy(&self.binary, &copy).with_context(|| {
+                format!(
+                    "Failed to copy {} to {} for its container",
+                    self.binary.display(),
+                    copy.display()
+                )
+            })?;
+            self.staged_from = Some(self.binary.clone());
+        }
+        Ok(copy)
+    }
+
+    /// `docker run` for `run`, in the foreground so that its output is the log
+    /// and the signals `stop` sends reach `spiced`.
+    fn container_command(&self, run: &ContainerRun, binary: &Path) -> Result<Command> {
+        use std::os::unix::fs::MetadataExt;
+        // A container left behind by an interrupted run would hold the name.
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &run.name])
+            .output();
+        let dir = std::path::absolute(&self.dir)?;
+        let owner = std::fs::metadata(&dir)?;
+        let mut command = Command::new("docker");
+        command
+            .args(["run", "--rm", "--init", "--network", "host"])
+            .args(["--name", &run.name])
+            .arg("--label")
+            .arg(format!(
+                "{}={}",
+                crate::docker::RUNNER_LABEL,
+                std::process::id()
+            ))
+            // Files it writes in the shared directories stay the runner's.
+            .args(["--user", &format!("{}:{}", owner.uid(), owner.gid())])
+            .arg("-v")
+            .arg(format!("{}:/usr/local/bin/spiced:ro", binary.display()))
+            .arg("-v")
+            .arg(format!("{0}:{0}", dir.display()))
+            .arg("-w")
+            .arg(&dir)
+            .arg("-e")
+            .arg(format!("HOME={}", dir.display()));
+        for volume in &run.volumes {
+            command.args(["-v", volume]);
+        }
+        for (key, value) in &self.env {
+            command.arg("-e").arg(format!("{key}={value}"));
+        }
+        command.arg(&run.image).arg("/usr/local/bin/spiced");
+        Ok(command)
+    }
+
+    /// Stops this instance's container at once, if it runs in one.
+    async fn kill_container(&self) {
+        if let Some(run) = &self.container {
+            let _ = Command::new("docker")
+                .args(["kill", &run.name])
+                .output()
+                .await;
+            crate::cleanup::untrack_container(&run.name);
+        }
     }
 
     /// Waits until a scheduler has at least `count` executors ready to take work
@@ -482,13 +598,14 @@ impl Spiced {
         };
         self.child = None;
         self.flight_client = None;
+        self.kill_container().await;
         outcome
     }
 
     /// Kills `spiced` without letting it shut down. With `freeze_first` it is
     /// sent SIGSTOP first, so it is frozen at one point before it dies.
     pub async fn kill(&mut self, freeze_first: bool) -> Result<()> {
-        let Some(child) = self.child.as_mut() else {
+        let Some(mut child) = self.child.take() else {
             bail!("spiced is not running");
         };
         if let Some(pid) = child.id() {
@@ -497,8 +614,8 @@ impl Spiced {
                 nix::sys::signal::kill(Pid::from_raw(pid.cast_signed()), Signal::SIGSTOP)?;
             }
         }
+        self.kill_container().await;
         child.kill().await?;
-        self.child = None;
         self.flight_client = None;
         Ok(())
     }
@@ -775,6 +892,17 @@ impl Spiced {
             bail!("refresh of '{dataset}' returned {status}: {body}");
         }
         Ok(())
+    }
+}
+
+impl Drop for Spiced {
+    /// Dropping the `docker run` process leaves its container running, so a
+    /// container instance dropped without being stopped is removed here,
+    /// unless `--keep`.
+    fn drop(&mut self) {
+        if let Some(run) = &self.container {
+            crate::cleanup::remove_if_tracked(&run.name);
+        }
     }
 }
 
