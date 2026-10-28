@@ -384,9 +384,12 @@ mod tests {
         struct Capture(Arc<std::sync::Mutex<Vec<SpanData>>>);
 
         impl SpanExporter for Capture {
-            async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            fn export(
+                &self,
+                batch: Vec<SpanData>,
+            ) -> impl std::future::Future<Output = OTelSdkResult> {
                 self.0.lock().expect("capture lock").extend(batch);
-                Ok(())
+                std::future::ready(Ok(()))
             }
         }
 

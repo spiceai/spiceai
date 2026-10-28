@@ -1,0 +1,8 @@
+{
+  "date": "2026-10-28",
+  "source_commit": "9499820653e030bdedc28e1e99ea4d6a3d12d781",
+  "command": "env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ CARGO_TARGET_DIR=/Users/Code/dev/spiceai/target CARGO_BUILD_JOBS=4 SIGNOFF_SKIP_TARGETED_LINT=1 SIGNOFF_SKIP_TARGETED_TESTS=1 make signoff",
+  "exit_code": 2,
+  "failure": "clippy::unused_async_trait_impl in the test-only SDK Capture exporter",
+  "tests_started": false
+}

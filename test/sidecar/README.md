@@ -511,3 +511,10 @@ uses the complete `RUST_GATE_FEATURES` and the merge queue's `lint` profile.
 The PR's `signoff` status and `Attestation` check must refer to its final pushed
 commit. Native qualification and benchmark output do not substitute for that
 gate. See [CI sign-off](../../docs/dev/ci_signoff.md).
+
+The first full gate on `9499820653e030bdedc28e1e99ea4d6a3d12d781`
+stopped before test execution with `clippy::unused_async_trait_impl` in the
+test-only SDK trace exporter. Its [complete output](evidence/signoff-9499820)
+is retained. The exporter now returns `std::future::ready`; the full gate must
+be rerun on the new pushed commit. The native runtime implementation and
+measured binaries are unchanged by this test-fixture correction.
