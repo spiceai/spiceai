@@ -1704,13 +1704,13 @@ impl Output {
         if let Some(finish) = self.route(&held) {
             return Some(finish);
         }
-        match self.harmony.as_mut()?.mark(token) {
-            harmony::Mark::Next => {
-                if !eog {
-                    self.produced += 1;
-                }
-                self.spent()
-            }
+        let reader = self.harmony.as_mut()?;
+        // A marker that does not end generation is a completion token, whatever it does.
+        if !eog {
+            self.produced += 1;
+        }
+        match reader.mark(token) {
+            harmony::Mark::Next => self.spent(),
             harmony::Mark::Call(call) => Some(self.calls(None, vec![call])),
             harmony::Mark::Done => Some(FinishReason::Stop),
         }
@@ -3285,6 +3285,25 @@ mod tests {
                 "t:get_weather({\"city\":\"Paris\"})".to_string()
             ]
         );
+    }
+
+    /// `<|end|>` can close a call whose arguments are complete JSON, and it does not end
+    /// generation in the vocabulary, so it is a completion token like any other marker; only
+    /// the `<|return|>` or `<|call|>` that ends a reply is not counted.
+    #[test]
+    fn an_end_that_closes_a_harmony_call_counts_as_a_completion_token() {
+        let (mut out, rx) = harmony_output(&["f"], &[], None);
+        let reply = "<|channel|>commentary to=functions.f<|message|>{}<|end|>";
+        let (finish, n) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        let outcome = out
+            .finish(FinishReason::ToolCalls, 1)
+            .expect("the request succeeds");
+        assert_eq!(
+            outcome.completion_tokens as usize, n,
+            "every token, `<|end|>` included"
+        );
+        assert_eq!(joined(sent(rx)), ["t:f({})".to_string()]);
     }
 
     #[test]
