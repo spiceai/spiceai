@@ -56,8 +56,8 @@ use either::Either;
 use futures::Stream;
 use indexmap::IndexMap;
 use llama_cpp::{
-    Backend, Batch, Context, ContextParams, Model, ModelParams, Mtp, MtpParams, Sampler, Token,
-    Vocab,
+    Backend, Batch, Context, ContextParams, DraftKind, Model, ModelParams, Mtp, MtpParams, Sampler,
+    Token, Vocab,
 };
 use mistralrs_core::reasoning_parsers::{
     TagReasoningContext,
@@ -83,11 +83,14 @@ use llms::chat::{
 };
 use llms::streaming_utils::generate_stream_id;
 
+mod distributed;
+
 llms::register_local_chat_engine!(
     LLAMA_CPP,
     LocalChatEngine {
         name: "llama.cpp",
         serves: serves_weights,
+        distributed: Some(llama_cpp::rpc::splits_by_tensor),
         load: load_weights,
     }
 );
@@ -107,6 +110,16 @@ fn load_weights<'a>(
     options: LocalModelOptions<'a>,
 ) -> futures::future::BoxFuture<'a, Result<std::sync::Arc<dyn Chat>>> {
     Box::pin(async move {
+        if let Some(cfg) = options.distributed {
+            distributed::ensure_insecure_allowed(cfg, options.reasoning.model_name)?;
+            // A rank other than 0 lends its GPU and never reads the weights: the head sends each
+            // rank its share.
+            if cfg.node_rank > 0 {
+                return distributed::lend_gpu(cfg, options.reasoning.model_name)
+                    .await
+                    .map(|share| std::sync::Arc::new(share) as std::sync::Arc<dyn Chat>);
+            }
+        }
         LlamaCpp::from(weights, options)
             .await
             .map(|model| std::sync::Arc::new(model) as std::sync::Arc<dyn Chat>)
@@ -123,6 +136,36 @@ const DEFAULT_CONTEXT: u32 = 8192;
 /// on a DGX Spark: over eight prompts, 60.7 tok/s against 53.8 with one and 47.5 without a
 /// draft, and three was slower than none on a story prompt.
 const MTP_DRAFT: i32 = 2;
+
+/// Draft tokens an MTP head proposes per step for Qwen3.8-Flash-Next (`qwen4exp`) split across
+/// nodes. Split three ways over DGX Sparks, three drafted measured fastest over eight prompts:
+/// 53.6 tok/s against 51.8 with two through spiced, 55.0-56.7 against 51.2-53.2 under
+/// llama-server. GLM-5.3 split the same way ran slower with three (39-40 against 42.1-42.6), so
+/// it keeps [`MTP_DRAFT`].
+const MTP_DRAFT_SPLIT_QWEN4EXP: i32 = 3;
+
+/// Draft tokens a `DFlash` or `DSpark` drafter proposes per step. Three measured fastest on DGX
+/// Sparks over eight prompts: DeepSeek-V4.1 with `DSpark` at 35.0 tok/s on two nodes (two and
+/// four drafted 30.0 and 29.7), Qwen3.8-Flash-Next `Q2_K` with `DFlash2` at 58.7 on one (four:
+/// 53.7).
+const DFLASH_DRAFT: i32 = 3;
+
+/// How many tokens an MTP head proposes per step for `model`, which is `split` across nodes or not.
+fn mtp_draft(model: &Model, split: bool) -> i32 {
+    if split && model.architecture().as_deref() == Some("qwen4exp") {
+        MTP_DRAFT_SPLIT_QWEN4EXP
+    } else {
+        MTP_DRAFT
+    }
+}
+
+/// How many tokens a draft model of this kind proposes per step, an MTP head `mtp`.
+fn draft_len(kind: DraftKind, mtp: i32) -> i32 {
+    match kind {
+        DraftKind::Mtp => mtp,
+        DraftKind::DFlash | DraftKind::DSpark => DFLASH_DRAFT,
+    }
+}
 
 /// How many streamed tokens may wait for a slow client before decoding pauses.
 const STREAM_BUFFER: usize = 64;
@@ -262,8 +305,21 @@ impl LlamaCpp {
     ///
     /// When a weight file is missing, llama.cpp cannot load the model or its MTP head, the
     /// model has no chat template or writes Harmony replies, or `reasoning_effort` is one
-    /// its chat template refuses.
+    /// its chat template refuses, or `options` makes this node a rank other than 0 of a
+    /// distributed model: such a rank serves no model of its own, and the engine's `load`
+    /// returns the share it holds for the head instead.
     pub async fn from(weights: &[PathBuf], options: LocalModelOptions<'_>) -> Result<Self> {
+        if let Some(cfg) = options.distributed
+            && cfg.node_rank > 0
+        {
+            return Err(ChatError::FailedToLoadModel {
+                source: format!(
+                    "Model '{}' is a share held for the first node in `nodes` on this node (rank {}), so it loads through the engine, not as a model of its own.",
+                    options.reasoning.model_name, cfg.node_rank
+                )
+                .into(),
+            });
+        }
         for weight in weights {
             if !weight.exists() {
                 return Err(ChatError::LocalModelNotFound {
@@ -273,8 +329,10 @@ impl LlamaCpp {
         }
         // An MTP head ships as its own GGUF (`mtp-*.gguf`); it drafts for the model, so it is
         // loaded beside it rather than as one of its shards.
-        let (drafts, trunk): (Vec<_>, Vec<_>) =
-            weights.iter().cloned().partition(|w| is_mtp_head(w));
+        let (drafts, trunk): (Vec<_>, Vec<_>) = weights
+            .iter()
+            .cloned()
+            .partition(|w| is_mtp_head(w) || DraftKind::dflash_of(w).is_some());
         let first = first_shard(&trunk).ok_or_else(|| ChatError::LocalModelNotFound {
             expected_path: String::new(),
         })?;
@@ -294,6 +352,12 @@ impl LlamaCpp {
             Some(file) => template_in_file(file).await?,
             None => None,
         };
+        // A distributed model: the head reaches every rank's GPU and splits the model across
+        // them.
+        let devices = match options.distributed {
+            None => Vec::new(),
+            Some(cfg) => distributed::reach_ranks(cfg, options.reasoning.model_name).await?,
+        };
         let (ready_tx, ready_rx) = oneshot::channel();
         let (jobs_tx, jobs_rx) = std_mpsc::channel();
         let (freed_tx, freed_rx) = std_mpsc::channel::<()>();
@@ -302,7 +366,15 @@ impl LlamaCpp {
         thread::Builder::new()
             .name("llama-cpp".to_string())
             .spawn(move || {
-                serve(&name, &first, draft.as_deref(), n_ctx, ready_tx, &jobs_rx);
+                serve(
+                    &name,
+                    &first,
+                    draft.as_deref(),
+                    &devices,
+                    n_ctx,
+                    ready_tx,
+                    &jobs_rx,
+                );
                 // Everything `serve` held is freed by now.
                 drop(freed_tx);
             })
@@ -734,26 +806,30 @@ fn serve(
     name: &str,
     path: &Path,
     draft: Option<&Path>,
+    devices: &[llama_cpp::rpc::Device],
     n_ctx: Option<NonZeroU32>,
     ready: oneshot::Sender<std::result::Result<Loaded, ChatError>>,
     jobs: &std_mpsc::Receiver<Job>,
 ) {
     let backend = Backend::get();
+    // On one node the model goes to this node's GPUs; split across nodes, every weight is
+    // split across `devices`, and so is a draft model's.
+    let params = ModelParams::default().with_devices(devices.to_vec());
     // A GGUF may carry its own MTP (NextN) layers, which only load when asked for; a file
     // without them loads as it would otherwise. A model that no longer fits with its MTP
     // layer still loads without it, and decodes without drafting.
-    let (model, loaded_mtp) =
-        match Model::load(backend, path, &ModelParams::default().with_load_mtp(true)) {
-            Ok(model) => (model, true),
-            Err(with_mtp) => {
-                let Ok(model) = Model::load(backend, path, &ModelParams::default()) else {
-                    let _ = ready.send(Err(load_error(path, with_mtp)));
-                    return;
-                };
-                tracing::info!("{}", without_mtp_note(name, &with_mtp));
-                (model, false)
-            }
-        };
+    let (model, loaded_mtp) = match Model::load(backend, path, &params.clone().with_load_mtp(true))
+    {
+        Ok(model) => (model, true),
+        Err(with_mtp) => {
+            let Ok(model) = Model::load(backend, path, &params) else {
+                let _ = ready.send(Err(load_error(path, with_mtp)));
+                return;
+            };
+            tracing::info!("{}", without_mtp_note(name, &with_mtp));
+            (model, false)
+        }
+    };
     // This engine decodes one token after another with a decoder alone. An encoder-decoder
     // model's decoder aborts the process when no encoder pass ran, and a diffusion model
     // decodes nothing, so both are refused while they load.
@@ -765,15 +841,19 @@ fn serve(
         return;
     }
     let draft_model = match draft.map(|d| {
-        let params = ModelParams::default().with_load_mtp(true);
+        // A DFlash or DSpark drafter says so in its header; any other draft file is an MTP head.
+        let kind = DraftKind::dflash_of(d).unwrap_or(DraftKind::Mtp);
+        // A draft model goes where the target is: an MTP head drafts through the target's
+        // context, and a DFlash or DSpark drafter uses the target's own output head.
+        let params = params.clone().with_load_mtp(kind == DraftKind::Mtp);
         let head = Model::load(backend, d, &params).map_err(|e| {
             format!(
-                "llama.cpp could not load the MTP head '{}': {e}",
+                "llama.cpp could not load the draft model '{}': {e}",
                 d.display()
             )
         })?;
-        if head.n_layer_nextn() > 0 {
-            Ok(head)
+        if kind != DraftKind::Mtp || head.n_layer_nextn() > 0 {
+            Ok((head, kind))
         } else {
             Err(not_a_head(d))
         }
@@ -789,15 +869,20 @@ fn serve(
     // llama.cpp's server does. A model loaded without the layer still counts it in its
     // header, so only one loaded with it drafts.
     let drafts_itself = draft_model.is_none() && loaded_mtp && model.n_layer_nextn() > 0;
-    // The contexts borrow the models, so all of them live in this frame for the thread's
-    // lifetime. With a draft head, verification rolls back up to `MTP_DRAFT` rejected tokens,
-    // and a hybrid model's recurrent layers can roll back only as many tokens as the context
-    // keeps state snapshots for, so it keeps that many, as llama.cpp's server sizes it.
-    let snapshots = if draft_model.is_some() || drafts_itself {
-        u32::try_from(MTP_DRAFT).unwrap_or(0)
-    } else {
-        0
+    let split = devices.len() > 1;
+    let mtp_len = mtp_draft(&model, split);
+    // The model that drafts, if any, and how.
+    let head = match &draft_model {
+        Some((head, kind)) => Some((head, *kind)),
+        None => drafts_itself.then_some((&model, DraftKind::Mtp)),
     };
+    // The contexts borrow the models, so all of them live in this frame for the thread's
+    // lifetime. With a draft model, verification rolls back up to its draft length of rejected
+    // tokens, and a hybrid model's recurrent layers can roll back only as many tokens as the
+    // context keeps state snapshots for, so it keeps that many, as llama.cpp's server sizes it.
+    let snapshots = head.map_or(0, |(_, kind)| {
+        u32::try_from(draft_len(kind, mtp_len)).unwrap_or(0)
+    });
     let context_params = ContextParams::default()
         .with_n_ctx(n_ctx)
         .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
@@ -811,10 +896,9 @@ fn serve(
             return;
         }
     };
-    let head = draft_model.as_ref().or(drafts_itself.then_some(&model));
     let mut decoder = match head {
         None => Decoder::Plain(context),
-        Some(head) => match mtp(head, context) {
+        Some((head, kind)) => match mtp(head, kind, context, mtp_len) {
             Ok(spec) => Decoder::Mtp(Box::new(spec)),
             Err(message) => {
                 let _ = ready.send(Err(failed(message)));
@@ -847,7 +931,7 @@ fn serve(
         let stopping = Arc::clone(&job.stopping);
         let result = match &mut decoder {
             Decoder::Plain(context) => generate(&model, context, job, &eog),
-            Decoder::Mtp(spec) => generate_mtp(&model, spec, job, &eog),
+            Decoder::Mtp(spec) => generate_mtp(&model, spec, split, job, &eog),
         };
         let event = match result {
             Ok(outcome) => Event::Done(outcome),
@@ -1053,7 +1137,12 @@ enum Decoder<'m> {
 
 /// Creates an MTP draft context linked to `context`, as llama.cpp's own server does: an
 /// MTP-type context of the same size, reading the target's hidden states.
-fn mtp<'m>(draft_model: &'m Model, context: Context<'m>) -> std::result::Result<Mtp<'m>, String> {
+fn mtp<'m>(
+    draft_model: &'m Model,
+    kind: DraftKind,
+    context: Context<'m>,
+    mtp_len: i32,
+) -> std::result::Result<Mtp<'m>, String> {
     let params = ContextParams::default()
         .with_n_ctx(NonZeroU32::new(context.n_ctx()))
         .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX));
@@ -1062,12 +1151,13 @@ fn mtp<'m>(draft_model: &'m Model, context: Context<'m>) -> std::result::Result<
         draft_model,
         &params,
         MtpParams {
-            n_max: MTP_DRAFT,
+            kind,
+            n_max: draft_len(kind, mtp_len),
             n_min: 0,
             p_min: 0.0,
         },
     )
-    .map_err(|e| format!("llama.cpp could not start MTP drafting: {e}"))
+    .map_err(|e| format!("llama.cpp could not start drafting: {e}"))
 }
 
 /// What prompt reading needs from either engine.
@@ -1543,10 +1633,16 @@ fn generate(
 }
 
 /// Runs one request with MTP drafting: each forward pass verifies the last token plus up
-/// to [`MTP_DRAFT`] drafted ones, and keeps the drafts the target would have sampled.
+/// to its draft length of drafted ones, and keeps the drafts the target would have sampled.
+///
+/// A model `split` across nodes verifies every drafted token even when the request has fewer
+/// left, so each verify batch keeps one shape: a shorter batch at a request's end rebuilds the
+/// verify graph twice (to the short shape and back), which over RPC re-serializes every rank's
+/// graph. Tokens past the limit are verified but never emitted.
 fn generate_mtp(
     model: &Model,
     spec: &mut Mtp<'_>,
+    split: bool,
     job: Job,
     eog: &[Token],
 ) -> std::result::Result<Outcome, String> {
@@ -1562,6 +1658,7 @@ fn generate_mtp(
     let mut history = tokens.clone();
     let mut n_past = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
     let mut id = picker.sample(spec.target(), batch.n_tokens() - 1, out.in_content());
+    let full_draft = split;
     let finish = 'generate: loop {
         if let Some(finish) = out.token(model, id) {
             break finish;
@@ -1575,7 +1672,21 @@ fn generate_mtp(
             .map_err(|e| e.to_string())?;
         // `accept` is owed exactly when the head drafted something.
         let drafted = !draft.is_empty();
-        draft.truncate(out.remaining().min(n_ctx - past - 1));
+        draft.truncate(if full_draft {
+            n_ctx - past - 1
+        } else {
+            out.remaining().min(n_ctx - past - 1)
+        });
+        // The tokens the head drafted; with `full_draft` a shorter draft is padded to the head's
+        // length so every verify batch keeps one shape, and only these can be accepted.
+        let real = draft.len();
+        if full_draft && real > 0 {
+            let want = spec.n_max().min(n_ctx - past - 1);
+            if real < want {
+                let last = draft[real - 1];
+                draft.resize(want, last);
+            }
+        }
         // Drafting wrote its positions into the head's cache, and processing the verify batch
         // writes them again, so they go first.
         truncate_cache(spec.draft_mut(), n_past)?;
@@ -1596,7 +1707,7 @@ fn generate_mtp(
         let next = loop {
             let index = i32::try_from(accepted).map_err(|e| e.to_string())?;
             let token = picker.sample(spec.target(), index, out.in_content());
-            if accepted < draft.len() && token == draft[accepted] {
+            if accepted < real && token == draft[accepted] {
                 accepted += 1;
                 if let Some(finish) = out.token(model, token) {
                     break 'generate finish;
