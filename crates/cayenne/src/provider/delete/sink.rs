@@ -434,8 +434,8 @@ impl StagedPkDelete {
         Ok(())
     }
 
-    /// Number of keys this delete newly tombstones: the distinct keys of the
-    /// rows it matched. Every key was already judged live in the source it was
+    /// Number of keys a filtered delete newly tombstones: the distinct keys of
+    /// the rows it matched. Every key was already judged live in the source it was
     /// read from, against that source's own cutoff (see
     /// [`CayenneDeletionSink::is_live_int64_pk`]), so a key deleted before this
     /// delete began, or a superseded version, never reaches this set. Judging
@@ -732,10 +732,16 @@ impl CayenneDeletionSink {
         })
     }
 
+    /// Delete-all tombstones every key any source holds, live or not: a key the
+    /// count below judges dead is already hidden, so tombstoning it again changes
+    /// nothing, while skipping a key judged dead under the main source's
+    /// conservative re-insert handling could leave its row behind. The reported
+    /// count is the distinct keys live in the source they were read from, by
+    /// the same per-source rule the filtered path uses.
     async fn prepare_delete_all_rows_from_tables(
         &self,
         ctx: &SessionContext,
-        tables: &[Arc<ListingTable>],
+        sources: &[DeleteScanSource],
     ) -> super::super::Result<Option<PreparedDeletionPublish>> {
         let table_name = &self.table_metadata.table_name;
         // For position-based deletions, we need per-file row tracking
@@ -743,16 +749,24 @@ impl CayenneDeletionSink {
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk { .. } => {
                 let mut pending_pk_values = HashSet::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
+                let mut live_pks: HashSet<i64> = HashSet::new();
                 let mut delete_sequence = None;
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
-                for table in tables {
-                    let scan_plan = table
+                for source in sources {
+                    let scan_plan = source
+                        .table
                         .scan(&ctx.state(), Some(&self.pk_column_indices), &[], None)
                         .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
                     while let Some(batch) = stream.next().await {
                         let batch = batch?;
-                        pending_pk_values.extend(self.extract_int64_pk_values(&batch, &[0])?);
+                        let pks = self.extract_int64_pk_values(&batch, &[0])?;
+                        live_pks.extend(
+                            pks.iter()
+                                .copied()
+                                .filter(|pk| self.is_live_int64_pk(*pk, source)),
+                        );
+                        pending_pk_values.extend(pks);
                         if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let row_keys = pending_pk_values.drain().map(i64_key).collect();
                             let results = self
@@ -783,7 +797,7 @@ impl CayenneDeletionSink {
                 if delete_sequence.is_none() {
                     return Ok(None);
                 }
-                self.prepare_staged_pk_deletions(staged).map(Some)
+                self.prepare_staged_pk_deletions(staged, Some(live_pks.len())).map(Some)
             }
             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                 let Some(ref row_converter) = self.pk_row_converter else {
@@ -794,10 +808,12 @@ impl CayenneDeletionSink {
                     });
                 };
                 let mut pending_row_keys = HashSet::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
+                let mut live_keys: HashSet<Box<[u8]>> = HashSet::new();
                 let mut delete_sequence = None;
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
-                for table in tables {
-                    let scan_plan = table
+                for source in sources {
+                    let scan_plan = source
+                        .table
                         .scan(&ctx.state(), Some(&self.pk_column_indices), &[], None)
                         .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
@@ -815,7 +831,13 @@ impl CayenneDeletionSink {
                             });
                         }
                         let rows = row_converter.convert_columns(&pk_columns)?;
-                        pending_row_keys.extend(rows.iter().map(|row| bytes_key(row.as_ref())));
+                        for row in &rows {
+                            let key = bytes_key(row.as_ref());
+                            if self.is_live_row_key(&key, source) {
+                                live_keys.insert(key.clone());
+                            }
+                            pending_row_keys.insert(key);
+                        }
                         if pending_row_keys.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let results = self
                                 .write_key_based_chunk_with_shared_sequence(
@@ -847,7 +869,7 @@ impl CayenneDeletionSink {
                 if delete_sequence.is_none() {
                     return Ok(None);
                 }
-                self.prepare_staged_pk_deletions(staged).map(Some)
+                self.prepare_staged_pk_deletions(staged, Some(live_keys.len())).map(Some)
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // Position-based deletion for "delete all" (delete w/o filters)
@@ -1182,7 +1204,7 @@ impl CayenneDeletionSink {
                 if delete_sequence.is_none() {
                     return Ok(None);
                 }
-                self.prepare_staged_pk_deletions(staged).map(Some)
+                self.prepare_staged_pk_deletions(staged, None).map(Some)
             }
             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                 let Some(row_converter) = self.pk_row_converter.as_ref() else {
@@ -1254,7 +1276,7 @@ impl CayenneDeletionSink {
                 if delete_sequence.is_none() {
                     return Ok(None);
                 }
-                self.prepare_staged_pk_deletions(staged).map(Some)
+                self.prepare_staged_pk_deletions(staged, None).map(Some)
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
                 unreachable!(
@@ -1274,13 +1296,9 @@ impl CayenneDeletionSink {
         let mut all_tables = vec![self.capture_main_scan_source().await];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
         if self.filters.is_empty() {
-            // Delete-all removes every row, so no version is preferred over another and
-            // the thresholds carry no information.
-            let plain: Vec<Arc<ListingTable>> = all_tables
-                .iter()
-                .map(|source| Arc::clone(&source.table))
-                .collect();
-            self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
+            // Delete-all tombstones every key; the thresholds only decide which keys
+            // it counts.
+            self.prepare_delete_all_rows_from_tables(&ctx, &all_tables).await
         } else if self.pk_deletion_strategy.is_position_based() {
             // As in `delete_from`: a position tombstone can only hide the version it
             // matched, so the per-snapshot visibility rules carry nothing for it.
@@ -1467,12 +1485,18 @@ impl CayenneDeletionSink {
             .await
     }
 
+    /// `live_count` overrides the staged keys as the reported count, for a
+    /// delete that tombstones keys it did not judge live (delete-all).
     fn prepare_staged_pk_deletions(
         &self,
         mut staged: StagedPkDelete,
+        live_count: Option<usize>,
     ) -> super::super::Result<PreparedDeletionPublish> {
-        let deleted_count =
-            convert_to_u64_box(staged.new_count(), "deleted row count").map_err(|error| {
+        let deleted_count = convert_to_u64_box(
+            live_count.unwrap_or_else(|| staged.new_count()),
+            "deleted row count",
+        )
+        .map_err(|error| {
                 Error::Internal {
                     table: self.table_metadata.table_name.clone(),
                     message: error.to_string(),
@@ -1544,12 +1568,8 @@ impl DeletionSink for CayenneDeletionSink {
         all_tables.extend(self.additional_scan_tables.iter().cloned());
 
         let prepared = if self.filters.is_empty() {
-            // See above: delete-all needs no per-snapshot visibility.
-            let plain: Vec<Arc<ListingTable>> = all_tables
-                .iter()
-                .map(|source| Arc::clone(&source.table))
-                .collect();
-            self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
+            // See above: the thresholds only decide which keys delete-all counts.
+            self.prepare_delete_all_rows_from_tables(&ctx, &all_tables).await
         } else if self.pk_deletion_strategy.is_position_based() {
             // A position tombstone names a file and row position, so it can only ever
             // hide the version it matched — the per-snapshot thresholds that keep a key
