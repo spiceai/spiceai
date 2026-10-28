@@ -879,3 +879,148 @@ async fn the_plan_shows_one_decision_below_the_filter() {
     .await;
     insta::assert_snapshot!("filter_plan", plan);
 }
+
+/// `teams(team)`: three teams, with `billing` listed twice.
+fn with_teams(ctx: SessionContext) -> SessionContext {
+    let teams = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("team", DataType::Utf8, false)])),
+        vec![Arc::new(StringArray::from(vec![
+            "billing",
+            "technical",
+            "account",
+            "billing",
+        ]))],
+    )
+    .expect("teams batch");
+    ctx.register_batch("teams", teams).expect("register teams");
+    ctx
+}
+
+/// The labels each request asked to choose from, sorted.
+fn asked_labels(requests: &[EvaluateRequest]) -> Vec<Vec<String>> {
+    requests
+        .iter()
+        .map(|request| {
+            let mut labels: Vec<String> = request
+                .questions
+                .values()
+                .flat_map(|question| match question {
+                    Question::Choice { criteria, .. } => criteria.keys().cloned().collect(),
+                    _ => Vec::new(),
+                })
+                .collect();
+            labels.sort();
+            labels
+        })
+        .collect()
+}
+
+/// `labels` can come from a table, through an uncorrelated subquery that returns one
+/// label per row or one list. `DataFusion` computes it once when the query runs.
+#[tokio::test]
+async fn ai_classify_reads_labels_from_a_subquery() {
+    for labels in [
+        "(SELECT DISTINCT team FROM teams)",
+        "(SELECT array_agg(DISTINCT team) FROM teams)",
+    ] {
+        let jev = Mock::decision_model();
+        let ctx = with_teams(session(vec![("jev", Arc::clone(&jev))], tickets(4, 1)));
+
+        let rows = run(
+            &ctx,
+            &format!(
+                "SELECT id, ai_classify(body, {labels}, instructions => 'Route to the owning team') AS team FROM tickets ORDER BY id"
+            ),
+        )
+        .await;
+        assert_eq!(
+            rows,
+            "+----+-----------+\n| id | team      |\n+----+-----------+\n| 0  | billing   |\n| 1  | technical |\n| 2  | billing   |\n| 3  | account   |\n+----+-----------+",
+            "{labels}"
+        );
+        let requests = jev.requests();
+        assert_eq!(requests.len(), 4, "one request per row: {labels}");
+        let expected = vec![
+            "account".to_string(),
+            "billing".to_string(),
+            "technical".to_string(),
+        ];
+        assert_eq!(asked_labels(&requests), vec![expected; 4], "{labels}");
+    }
+}
+
+/// A deferred constant works where the planner rule moves the call, here a filter.
+#[tokio::test]
+async fn ai_if_reads_its_condition_from_a_subquery_in_a_filter() {
+    let jev = Mock::decision_model();
+    let ctx = with_teams(session(vec![("jev", Arc::clone(&jev))], tickets(4, 1)));
+
+    // `max(team)` is 'technical'.
+    assert_eq!(
+        run(
+            &ctx,
+            "SELECT id FROM tickets WHERE ai_if(body, (SELECT max(team) FROM teams)) ORDER BY id",
+        )
+        .await,
+        "+----+\n| id |\n+----+\n| 1  |\n+----+"
+    );
+    assert_eq!(jev.requests().len(), 4);
+}
+
+/// A subquery's value is checked by the rules a literal is checked by, before any
+/// model is called; and the errors say what is wrong with arguments that are refused.
+#[tokio::test]
+async fn constants_from_subqueries_are_checked() {
+    let jev = Mock::decision_model();
+    let ctx = with_teams(session(vec![("jev", Arc::clone(&jev))], tickets(4, 1)));
+
+    // Without DISTINCT, `billing` is listed twice.
+    assert_eq!(
+        run_err(
+            &ctx,
+            "SELECT ai_classify(body, (SELECT team FROM teams)) FROM tickets"
+        )
+        .await,
+        "Execution error: ai_classify: label 'billing' is listed more than once. List each label once."
+    );
+    assert_eq!(
+        run_err(
+            &ctx,
+            "SELECT ai_classify(body, (SELECT team FROM teams WHERE team = 'account')) FROM tickets"
+        )
+        .await,
+        "Execution error: ai_classify: `labels` must list between 2 and 255 labels; it lists 1. Include a fallback such as 'other' when no label may fit."
+    );
+    assert_eq!(jev.requests().len(), 0, "invalid labels call no model");
+
+    assert_eq!(
+        run_err(&ctx, "SELECT ai_classify(body, status) FROM tickets").await,
+        "Error during planning: ai_classify: `labels` must have one value for the whole query: a literal such as ['billing', 'technical'], or a subquery that does not refer to the outer query. This argument can change from row to row, because it reads a column or refers to the outer query. Usage: ai_classify(input, labels[, instructions => '...'][, model => 'name'][, on_error => 'fail' | 'null'])"
+    );
+    let correlated = run_err(
+        &ctx,
+        "SELECT ai_classify(body, (SELECT array_agg(team) FROM teams WHERE team = tickets.status)) FROM tickets",
+    )
+    .await;
+    assert!(
+        correlated.contains("`labels` must have one value for the whole query"),
+        "{correlated}"
+    );
+    assert_eq!(
+        run_err(
+            &ctx,
+            "SELECT ai_if(body, 'refund', (SELECT max(team) FROM teams)) FROM tickets"
+        )
+        .await,
+        "Error during planning: ai_if: argument 3 is not a literal. Optional arguments such as `model` and `on_error` must be literals, because only for a literal can Spice tell which parameter it fills. Usage: ai_if(input, condition[, model => 'name'][, on_error => 'fail' | 'null'])"
+    );
+    assert_eq!(
+        run_err(
+            &ctx,
+            "SELECT ai_decide(body, (SELECT max(team) FROM teams)) FROM tickets"
+        )
+        .await,
+        r#"Error during planning: ai_decide: `questions` must be a literal such as '{"urgent": {"type": "noul", "instructions": "Is this urgent?"}}', because it sets the type of the result. Usage: ai_decide(input, questions[, model => 'name'][, on_error => 'fail' | 'null'])"#
+    );
+    assert_eq!(jev.requests().len(), 0);
+}
