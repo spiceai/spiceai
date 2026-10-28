@@ -129,11 +129,14 @@ steps:
 | Kind | What it is |
 | --- | --- |
 | `postgres`, `mysql`, `clickhouse` | A database in Docker. Each instance gets its own database inside it. `${sources.<name>.params}` holds the connector parameters. |
+| `kafka` | Redpanda (`v26.1.6`), with a topic prefix per instance. Tables are `<namespace>_<table>`, created with three partitions on first write. Connector params include bootstrap servers and PLAINTEXT security. |
+| `mongodb` | MongoDB (`8.0`) single-node replica set, with a database per instance. Connector params include its connection string. |
+| `dynamodb` | LocalStack (`4.9`), with a table-name prefix per instance. Tables are `<namespace>_<table>`, created on first write with a numeric or string HASH key and `NEW_AND_OLD_IMAGES` streams. Connector params include endpoint, region and test credentials. |
 | `rustfs` | An S3-compatible store with conditional writes, with a bucket per instance, managed with the `aws` CLI. `${sources.<name>.params}` holds the `s3_*` parameters. `.bucket`, `.endpoint`, `.key` and `.secret` serve other uses, such as a Cayenne data tier or a state location. `.shared_bucket` is one bucket every instance shares, for two variants that act as replicas over one state location. |
 | `files` | A directory per instance (`${sources.<name>.path}`) holding generated Parquet or CSV part files. |
 | `iceberg` | An Iceberg REST catalog over rustfs. `source-exec` and oracle queries run through the `duckdb` CLI attached to the catalog, so a script writes Iceberg with plain SQL and checks Spice against DuckDB reading the same tables. |
 | `ducklake` | A DuckLake catalog written with the DuckDB CLI matching Spice's embedded DuckDB. |
-| `docker` | Any image: `image`, `ports`, `env` (`${port.N}` is the host port of container port N), `command`, and `ready` (a shell command that succeeds once the container is ready). `source-exec` runs a shell command inside it and `source-query` returns the lines it prints. `host-network: true` lets the container reach `spiced` and the other sources on the host: on Linux it shares the host's network, elsewhere Docker routes to the host, and `${sources.<name>.host_from_container}` is the host's address from inside the container either way. Used for MongoDB, Redpanda (Kafka), LocalStack (DynamoDB) and Debezium Server. |
+| `docker` | Any image: `image`, `ports`, `env` (`${port.N}` is the host port of container port N), `command`, and `ready` (a shell command that succeeds once the container is ready). `source-exec` runs a shell command inside it and `source-query` returns the lines it prints. `host-network: true` lets the container reach `spiced` and the other sources on the host: on Linux it shares the host's network, elsewhere Docker routes to the host, and `${sources.<name>.host_from_container}` is the host's address from inside the container either way. Useful for services such as Debezium Server. |
 | `mock-http` | An HTTP server whose routes the script sets with `source-exec`: `path`, and optionally `method`, `query`, `headers-match`, `status`, `headers`, `body`, `delay-ms` and `times`; `reset` removes them all. `source-query` reads what it received: `count <path>`, `log <path>`, `header <path> <name>`. |
 
 Files and object stores answer no queries themselves, so a script mirrors their
@@ -201,6 +204,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `edit-spicepod: <patch>` | Rewrite the running instance's spicepod (for `--pods-watcher-enabled`). |
 | `start-source`, `stop-source`, `pause-source`, `unpause-source: <name>` | Control a source container; it keeps its host port across a stop. |
 | `source-exec: { <name>: <sql, list, or { file }> }` | Run statements on a source, in this instance's database. |
+| `write: { <source>: <sql or list> }` | Execute PostgreSQL DML on the required `mirror: <postgres source>` and apply its row images to the target. `key: <column>` defaults to `id`. |
 | `source-query: { <name>: <sql> }` | Ask a source directly and check `expect: { rows }`. |
 | `generate: { <source>: <table spec> }` | Create a table of seeded generated rows (see below); `mirror: <source>` loads the same rows into a database. |
 | `dbgen: { scale, into: [<source>…] }` | Load TPC-H, generated with the `duckdb` CLI and cached. |
@@ -224,13 +228,143 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `corpus: <file.sql>` | One `query` per statement in the file (see Corpora). |
 | `slt-setup` / `slt: { file, source }` | Run a sqllogictest file: statements on the source, then its queries through Spice against the recorded answers. |
 | `tlp: { table, seed, queries, depth, aggregate, oracle, avoid }` | Ternary logic partitioning over random predicates. |
-| `random-queries: { tables, joins, seed, queries, depth, oracle, avoid }` | Random nested-subquery queries, each checked against the oracle. |
+| `random-queries: { tables, joins, seed, queries, depth, oracle, protocols, avoid }` | Random nested-subquery queries checked against an oracle or across protocols. |
 | `sleep: 5s` | Wait; prefer `eventually`, `consistently` and `drive`. |
 
 Any step takes `only: <variant>` or `except: <variant>` (or a list), and
 `when: { <matrix key>: <value> }`. A failed lifecycle step (`start`, `stop`,
 `restart`, `upgrade`, `kill-spiced`, `wait-ready`) skips the rest of that
 instance; any other failure is a failed check and the script goes on.
+
+`protocols` on `query`, `corpus`, and inside `random-queries` selects the
+transports to compare: `flight`, `flightsql`, and `http` (`/v1/sql`, JSON).
+Existing queries retain their current path; random queries default to `[flight]`.
+Without a random-query `oracle`, select at least two distinct protocols,
+including `flight` or `flightsql` to supply the Arrow result schema. HTTP JSON
+requires unique result column names. Queries must be deterministic and read
+unchanging data. Every selected transport must succeed and return the same
+rows, including duplicates and NULLs; empty results are also compared.
+An optional random-query `oracle` additionally checks those results against a source.
+Explicit protocol comparisons check values exactly after normalizing unordered
+rows and signed zero. The protocol fixture uses one execution core to keep
+floating aggregate evaluation stable between independent requests. Flight SQL checks the advertised schema against every
+stream, including decimal precision/scale, nullability, and metadata. HTTP is
+decoded from its raw JSON text using the Arrow schema, retaining decimal digits.
+Prepared queries (`parameters` or `flight-session`) support an explicit
+`protocols: [flightsql]`; the existing prepared path is retained when omitted.
+
+[`query-protocols.yaml`](../../test/spicescript/query-protocols.yaml) compares
+Flight SQL with HTTP using the generated SQL reference corpus and seeded
+random queries over local Parquet files. One seed also exercises plain Flight:
+
+```bash
+target/debug/spicescript --spiced target/release/spiced test/spicescript/query-protocols.yaml
+```
+
+The [SQL surface generator](../../test/spicescript/corpus/sql_surface.py) maintains
+an inventory pinned to a revision of `spiceai/docs`, explicit function arguments,
+and the generated [coverage index](../../test/spicescript/corpus/sql-surface-coverage.json).
+It includes documented aliases, operators, query clauses, optional argument
+forms, and literal-sensitive decimal schema cases. Core scalar cases use typed
+literals, columns with NULLs and duplicate rows, and empty inputs. This is
+representative surface coverage, not an exhaustive enumeration of SQL programs
+or a proof of each function's semantics. Existing oracle suites keep checking
+results independently of protocol parity.
+
+```bash
+python3 test/spicescript/corpus/sql_surface.py
+python3 test/spicescript/corpus/sql_surface.py --check
+# Audit against a checkout of the documentation repository:
+python3 test/spicescript/corpus/sql_surface.py --check --docs-dir /path/to/docs/website/docs/reference/sql
+```
+
+Reproduced failures remain generated and executable in
+[`known-failing/sql-protocols`](../../test/spicescript/known-failing/sql-protocols).
+Their case identifiers, reasons, documentation revision, source commit and
+runtime binary hash are recorded in `corpus/sql-surface-known-failures.json`
+and `corpus/sql-surface-known-values.json`. They are not counted as passing
+surface coverage. Remove resolved entries and regenerate to return those
+cases to the passing suite; the failure ledger also detects when a case stops
+failing or changes its symptom.
+
+When the reference changes, refresh its inventory with `--docs-dir ...
+--refresh-inventory`, add cases for new entries, and regenerate. CI checks the
+generated files and alias parsing without requiring network access. AI,
+embeddings, indexed search, prepared statements and writes have separate
+fixtures named in the coverage index. The prepared decimal and NULL cases also
+run in `sql-schema-protocols.yaml`, and `sql-operator-values.yaml` checks
+operator semantics against literal expected answers. They are not counted as deterministic
+core protocol cases. `sql-explain-protocols.yaml` exercises documented EXPLAIN
+options independently on HTTP and Flight SQL because live plan metrics vary.
+
+ADBC is a client API; its Flight SQL driver uses the Flight SQL protocol.
+This scenario exercises Flight SQL directly, rather than an ADBC driver.
+
+### Source-neutral writes
+
+```yaml
+sources:
+  src: { kind: '${matrix.src}' }
+  ref: { kind: postgres }
+matrix:
+  src: [kafka, mongodb, dynamodb, postgres, mysql]
+steps:
+  - generate:
+      src:
+        table: t
+        rows: 100
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: s, choice: [start] }
+    mirror: ref
+  - write: { src: "UPDATE t SET s = 'x' WHERE id <= 10" }
+    mirror: ref
+    key: id
+```
+
+`write` accepts one or more `INSERT`, `UPDATE` or `DELETE` statements, either
+in a SQL string or a list. The mirror must be a separate PostgreSQL source.
+Each statement runs there with `RETURNING *`; full INSERT/UPDATE after-images
+become target upserts, and DELETE images become deletes by key. Statements
+apply in order. The key must be present and non-NULL in every row image and
+uniquely identify a row in both sources. The mirror requires a single-column
+PRIMARY KEY or UNIQUE constraint on that key; a composite or partial index
+does not establish this. Key-changing updates and explicit
+RETURNING clauses are rejected; use DELETE then INSERT
+to change a key. Use unqualified table names for Kafka, MongoDB and DynamoDB.
+Tables must already exist on PostgreSQL and MySQL (for example via `generate`).
+
+PostgreSQL and MySQL use their own upsert dialects. Kafka emits keyed JSON and
+tombstones; MongoDB replaces documents with `_id` equal to the key; DynamoDB
+puts or deletes items. Signed integer values in MongoDB use BSON Long; larger positive integers
+use Decimal128 so they cannot wrap at the signed boundary. Numeric and boolean mirror columns become JSON numbers
+and booleans, NULL stays null, and other columns become strings. Non-finite
+numbers fail rather than silently changing their value. MongoDB adds `_id`
+when the key has another name: use `key: _id` and a matching generated primary
+key to keep `SELECT *` identical to the mirror.
+
+`generate` also seeds these three kinds with typed upserts. It requires at
+least one row, since the document schema is inferred from data; an empty
+generation is rejected before clearing the existing table. `primary-key`
+selects their key (default `id`); replace mode clears the existing collection,
+topic or table first. `${sources.src.from_prefix}t${sources.src.from_suffix}`
+selects a table for any of these built-in kinds, including across a matrix.
+Their `source-exec` and `source-query` steps run container shell commands.
+`version` overrides the image tag.
+
+The mirror statement commits before target application. A target failure fails
+the step and reports that the mirror has committed; there is no cross-source
+transaction or automatic retry. Connector refresh semantics still apply:
+Kafka append acceleration does not promise UPDATE/DELETE parity with a SQL
+mirror. Choose the connector's supported refresh mode in the spicepod.
+
+`feed-chaos.yaml` shares mutation and restart phases across these feeds and
+PostgreSQL through Debezium. Its MongoDB source-restart check retains the
+known, timing-dependent failure tracked in #15544. Kafka append receives only
+inserts and runs without a primary key so deduplication cannot hide replayed
+messages. `debezium-offset-recovery.yaml` separately keeps the stress case
+that kills the supervisor while background mutations are in flight.
 
 ### Checking answers
 
@@ -262,9 +396,9 @@ top-level `ORDER BY … LIMIT`, with ties at the cutoff allowed and floats withi
 Defaults (`defaults:`):
 - **Expectations and timing:** `expect`, `eventually`, `query-timeout` (default 120 s), `ready-timeout`.
 - **Comparing variants:** `compare-variants: false` turns off agreement between variants; `compare-to: <variant>` compares every variant with one.
-- **Protocols and auth:** `also-http: true` also asks every query over HTTP JSON and requires the same answer; `api-key`; `tls: { ca }`.
+- **Protocols and auth:** `also-http: true` also asks every query over HTTP JSON and requires the same answer; `also-async: true` also runs every query as a `/v1/queries` job (a distributed job on a cluster) and requires the same answer; `api-key`; `tls: { ca }`.
 - **Running spiced:** `spiced-args`, `executor-args`.
-- **Clusters:** `cluster: { executors, spare }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs.
+- **Clusters:** `cluster: { executors, spare, containers }`, and `cluster-partition-by: { <dataset or *>: <column> }` for `--cluster` runs. `containers: true` runs each executor in a container of its own on the host's network (Linux only; elsewhere the script is skipped), with the work and script directories mounted. Each executor writes shuffle output to its own `/tmp`, so a stage reads another executor's output over the network, as on separate hosts; a spicepod that sets `runtime.query.temp_directory` to a shared path undoes this, since an executor reads a peer's shuffle file from disk wherever its path exists.
 - **Scheduling:**
   - `exclusive: true` runs the script alone, its instances one after another;
   - `run-variants: side-by-side` runs variants that work together (a snapshot writer and its reader) a step at a time, as one job.
@@ -385,7 +519,9 @@ fails anywhere.
 | `runner/api.rs` | Refreshes, the `spice` CLI, HTTP steps, source queries. |
 | `runner/generators.rs` | TLP, random queries, sqllogictest. |
 | `runner/cluster.rs` | Scheduler and executors: arguments, readiness, spicepod changes. |
-| `spiced.rs` | One `spiced` process: start, readiness, stop, Flight and HTTP clients. |
+| `spiced.rs` | One `spiced` process, or container: start, readiness, stop, Flight and HTTP clients. |
+| `source/write.rs` | PostgreSQL DML parsing, row-image typing, and SQL upsert generation. |
+| `source/document.rs` | Kafka, MongoDB and DynamoDB containers and batched row application. |
 | `source/` | One module per source kind; `mod.rs` holds the `Source` trait. |
 | `docker.rs` | Containers on fixed host ports, so a restarted container keeps its address. |
 | `ledger.rs` | Expected failures: recording, signatures, judging a run against them. |

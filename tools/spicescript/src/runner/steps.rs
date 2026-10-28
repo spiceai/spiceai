@@ -57,6 +57,9 @@ pub(super) fn describe(action: &Action) -> String {
         Action::StopSource(s) => format!("stop-source {s}"),
         Action::PauseSource(s) => format!("pause-source {s}"),
         Action::UnpauseSource(s) => format!("unpause-source {s}"),
+        Action::Write { source, sql, .. } => {
+            format!("write {source}: {}", one_line(&sql.join("; "), 70))
+        }
         Action::SourceExec { source, sql } => {
             format!("source-exec {source}: {}", one_line(&sql.join("; "), 70))
         }
@@ -311,6 +314,71 @@ pub(super) async fn run_instance_step(
         Action::EditSpicepod(patch) => {
             apply_patch(instance, Some(patch))?;
             instance.spiced.write_spicepod(&instance.spicepod_yaml)?;
+        }
+        Action::Write {
+            source,
+            sql,
+            mirror,
+            key,
+        } => {
+            ensure!(source != mirror, "a write target cannot be its own mirror");
+            ensure!(
+                sources
+                    .kinds
+                    .get(mirror)
+                    .is_some_and(|kind| kind == "postgres"),
+                "write mirror '{mirror}' must be a postgres source"
+            );
+            let sql = sql
+                .iter()
+                .map(|s| instance.sql(s))
+                .collect::<Result<Vec<_>>>()?;
+            let statements = crate::source::write::statements(&sql, key)?;
+            let kind = sources
+                .kinds
+                .get(source)
+                .context("write target is not a source")?;
+            ensure!(
+                matches!(
+                    kind.as_str(),
+                    "postgres" | "mysql" | "kafka" | "mongodb" | "dynamodb"
+                ),
+                "source '{source}' ({kind}) does not support write steps"
+            );
+            if matches!(kind.as_str(), "kafka" | "mongodb" | "dynamodb") {
+                for statement in &statements {
+                    ensure!(
+                        crate::source::write::table_parts(&statement.table)?.len() == 1,
+                        "{kind} writes require an unqualified table name"
+                    );
+                }
+            }
+            let target = sources.get(source)?;
+            let target_namespace = namespace(instance, source)?;
+            let mirror_source = sources.get(mirror)?;
+            let mirror_namespace = namespace(instance, mirror)?;
+            for statement in statements {
+                let types = crate::source::write::column_types(
+                    mirror_source,
+                    &mirror_namespace,
+                    &statement.table,
+                    key,
+                )
+                .await?;
+                ensure!(
+                    types.iter().any(|(name, _)| name == key),
+                    "table {} has no key column '{key}'",
+                    statement.table
+                );
+                let images = mirror_source
+                    .query(&mirror_namespace, &statement.sql)
+                    .await?;
+                let changes =
+                    crate::source::write::row_changes(&images, &types, key, statement.delete)
+                        .context("mirror statement committed; failed to convert row images")?;
+                target.apply(&target_namespace, &statement.table, key, &changes).await
+                    .context("mirror statement committed; target apply failed (the write is not atomic across sources)")?;
+            }
         }
         Action::SourceExec { source, sql } => {
             let namespace = namespace(instance, source)?;

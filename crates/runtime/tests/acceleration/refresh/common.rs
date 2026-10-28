@@ -476,7 +476,7 @@ pub(crate) async fn test_append_timestamp_for_engine(
                 "{engine}/Timestamp: expected 2 rows after no-op refresh"
             );
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -530,7 +530,7 @@ pub(crate) async fn test_append_unix_seconds_for_engine(
                 "{engine}/UnixSeconds: expected 2 rows after no-op refresh"
             );
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -584,7 +584,7 @@ pub(crate) async fn test_append_iso8601_for_engine(
                 "{engine}/ISO8601: expected 2 rows after no-op refresh"
             );
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await

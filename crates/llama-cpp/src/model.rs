@@ -110,6 +110,22 @@ impl Model {
         unsafe { sys::llama_model_n_layer_nextn(self.raw.as_ptr()) }
     }
 
+    /// Whether the model has an encoder, as an encoder-decoder model such as T5 does: its
+    /// decoder reads the encoder's output, so it cannot decode a prompt on its own.
+    #[must_use]
+    pub fn has_encoder(&self) -> bool {
+        // SAFETY: reads the loaded model's architecture.
+        unsafe { sys::llama_model_has_encoder(self.raw.as_ptr()) }
+    }
+
+    /// Whether the model is a diffusion model, such as `LLaDA` or Dream, which generates by
+    /// unmasking a whole sequence rather than one token after another.
+    #[must_use]
+    pub fn is_diffusion(&self) -> bool {
+        // SAFETY: reads the loaded model's architecture.
+        unsafe { sys::llama_model_is_diffusion(self.raw.as_ptr()) }
+    }
+
     /// The chat template the GGUF file carries, if any.
     #[must_use]
     pub fn chat_template(&self) -> Option<String> {

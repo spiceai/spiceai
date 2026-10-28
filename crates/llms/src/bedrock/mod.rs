@@ -20,6 +20,7 @@ mod auth_error;
 pub mod chat;
 pub mod embed;
 mod list_models;
+pub(crate) mod model_id;
 
 pub use auth_error::BedrockAuthError;
 

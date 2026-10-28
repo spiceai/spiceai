@@ -8,12 +8,12 @@ on:
         description: 'spiced build commit'
         required: false
         type: string
-      # Benchmarks another release's spiced with this ref's testoperator and spec files. The
-      # newest commit within ten of the ref that has a MinIO build is used, so a release tag
-      # resolves to the build of its release-branch commit. No result or explain-plan snapshot
-      # is compared or written back, since those record this ref's answers and plans.
+      # Benchmarks another release's spiced with this ref's testoperator and spec files. A release
+      # tag installs the spiced_linux_x86_64.tar.gz that release published; a branch or other ref
+      # uses the newest commit within ten of it that has a MinIO build. No result or explain-plan
+      # snapshot is compared or written back, since those record this ref's answers and plans.
       spiced_ref:
-        description: 'Branch or tag whose spiced to benchmark, e.g. v2.3.3 or release/2.4; empty = trunk. Ignored when spiced_commit is set'
+        description: 'Branch or tag whose spiced to benchmark, e.g. v2.1.0 or release/2.4; empty = trunk. A release tag uses that release''s published binary. Ignored when spiced_commit is set'
         required: false
         type: string
         default: ''
@@ -250,7 +250,22 @@ jobs:
         run: |
           spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
+      # A release tag benchmarks the binary that release published, so releases older than the
+      # MinIO builds (kept only for recent commits) can be measured.
+      - name: Resolve the spiced source
+        id: spiced_source
+        env:
+          SPICED_COMMIT_INPUT: ${{ github.event.inputs.spiced_commit }}
+          SPICED_REF: ${{ github.event.inputs.spiced_ref }}
+        run: |
+          if [ -z "${SPICED_COMMIT_INPUT}" ] && [[ "${SPICED_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "release=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "release=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Setup spiced
+        if: steps.spiced_source.outputs.release != 'true'
         uses: ./.github/actions/setup-spiced
         id: setup-spiced
         with:
@@ -258,8 +273,18 @@ jobs:
           ref: ${{ github.event.inputs.spiced_ref || 'refs/heads/trunk' }}
           with_odbc: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
 
+      - name: Install the released spiced
+        if: steps.spiced_source.outputs.release == 'true'
+        id: release-spiced
+        uses: ./.github/actions/setup-released-spiced
+        with:
+          release: ${{ github.event.inputs.spiced_ref }}
+          spicepod_file: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          with_odbc: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Display spiced commit
-        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}"
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
@@ -587,6 +612,16 @@ jobs:
           echo "cluster ${DATABRICKS_CLUSTER_ID} did not reach RUNNING"
           exit 1
 
+      # The image restores its database once, after a fixed sleep, and never retries;
+      # see .github/scripts/mssql_tpch_restore.sh.
+      - name: Wait for the SQL Server TPC-H database
+        if: ${{ contains(github.event.inputs.spicepod_path, 'mssql') }}
+        # The script gives up after ten minutes; this also bounds a hung docker call.
+        timeout-minutes: 15
+        env:
+          MSSQL_SA_PASSWORD: S3cretP@ssw0rd
+        run: bash .github/scripts/mssql_tpch_restore.sh "${{ job.services.mssql_tpch.id }}" tpch_sf1
+
       # `--disable-caching` sends `Cache-Control: no-cache` on the benchmark's Flight
       # connection. It is load-bearing: `runtime.caching.sql_results` is enabled by
       # default with a one-second `item_ttl`, and the harness runs one warmup query
@@ -669,7 +704,7 @@ jobs:
           ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
           ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}
           SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
           SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
           SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
