@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 //! A source that is any Docker image (`kind: docker`), for systems with no
-//! source of their own here, such as MongoDB, `DynamoDB` under `LocalStack`, or
-//! Kafka. `source-exec` runs a shell command inside the container and
+//! source adapter of their own here. `source-exec` runs a shell command inside
+//! the container and
 //! `source-query` returns the lines a command prints, one row each. The
 //! script isolates instances itself, by naming its databases, tables or
 //! topics after `${sources.<name>.namespace}`.
