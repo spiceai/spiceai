@@ -810,9 +810,6 @@ impl RefreshTask {
             let _ = self.federated.try_wait_table_provider().await;
         }
 
-        // Limit parallel refreshes via a semaphore
-        let _permit = self.semaphore.acquire().await;
-
         let max_retries = if refresh.retry_enabled {
             refresh.retry_max_attempts
         } else {
@@ -835,6 +832,9 @@ impl RefreshTask {
             .last()
             .unwrap_or_else(|| unreachable!("There is always at least one span"));
         let result = retry(retry_strategy, || async {
+            // Limit parallel refreshes via a semaphore. The permit covers one attempt, so a
+            // refresh waiting out a retry backoff does not hold back other datasets.
+            let _permit = self.semaphore.acquire().await;
             match self.run_once(&refresh).await {
                 Ok(outcome) => Ok(outcome),
                 Err(retry_err) => {
