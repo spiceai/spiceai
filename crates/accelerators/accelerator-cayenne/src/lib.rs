@@ -259,16 +259,6 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    /// The dataset sets `cayenne_metastore: turso`, but its Cayenne metastore is not a
-    /// Turso catalog (that case is [`Self::TursoMetastoreOnDisk`]), so dropping the
-    /// param is the whole fix.
-    #[snafu(display(
-        "Failed to load dataset '{dataset}' (cayenne): the Cayenne metastore 'turso' is no longer supported. \
-        Remove `cayenne_metastore` from this dataset to use the built-in metastore, then restart Spice. \
-        See: {CAYENNE_MIGRATION_DOCS}"
-    ))]
-    TursoMetastoreConfigured { dataset: Arc<str> },
-
     /// The Cayenne metastore on disk was written by the Turso metastore. The metastore
     /// is shared by every file-mode Cayenne dataset in the instance, so recovering means
     /// rebuilding all of them.
@@ -923,6 +913,29 @@ fn auto_tuned_config_is_newly_resolved(table_name: &str, fingerprint: u64) -> bo
     }
     logged.insert(table_name.to_string(), fingerprint);
     true
+}
+
+/// The warning for a dataset that still sets `cayenne_metastore: turso` over a metastore
+/// Turso did not write. The param has no effect, so the dataset loads and the warning says
+/// to remove it.
+fn turso_metastore_param_warning(dataset: &str) -> String {
+    format!(
+        "Dataset '{dataset}' sets `cayenne_metastore: turso`, which is no longer supported and has no effect: \
+        the dataset uses the built-in metastore. Remove `cayenne_metastore` from this dataset. \
+        See: {CAYENNE_MIGRATION_DOCS}"
+    )
+}
+
+/// Whether the `cayenne_metastore: turso` warning for `dataset` has yet to be emitted: once
+/// per dataset, however often its load is retried or the Spicepod reloaded.
+fn turso_metastore_param_unreported(dataset: &str) -> bool {
+    static REPORTED: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+    REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(dataset.to_string())
 }
 
 /// The retired-parameter warnings for `table_name` that have not been emitted yet: once per
@@ -2934,14 +2947,13 @@ impl CayenneAccelerator {
             .await
     }
 
-    /// Refuses a dataset that would run on the retired Turso metastore: one whose
-    /// metastore on disk Turso wrote, or one that still sets `cayenne_metastore: turso`.
+    /// Refuses a dataset whose metastore on disk the retired Turso metastore wrote, and
+    /// warns, once per dataset, about one that still sets `cayenne_metastore: turso`.
     ///
-    /// The on-disk check comes first because it is the one whose fix is larger: a
-    /// Turso catalog has to be deleted and every dataset in it reloaded, while a param
-    /// over a `SQLite` catalog only has to be removed. Neither case opens, creates, or
-    /// changes a file. The param is refused in `mode: memory` too, which never had a
-    /// Turso metastore to select.
+    /// A Turso catalog has to be deleted and every dataset in it reloaded, so it fails
+    /// the dataset before anything opens, creates, or changes a file. Otherwise the param
+    /// has no effect: the dataset runs on the `SQLite` metastore and loads, including in
+    /// `mode: memory`, which never had a Turso metastore to select.
     async fn ensure_supported_metastore(source: &dyn AccelerationSource) -> Result<()> {
         let acceleration = source.acceleration();
         if source.is_file_accelerated() {
@@ -2960,12 +2972,14 @@ impl CayenneAccelerator {
         let configured_turso = acceleration
             .and_then(|acceleration| acceleration.params.get("cayenne_metastore"))
             .is_some_and(|metastore| metastore.trim().eq_ignore_ascii_case(TURSO_METASTORE));
-        ensure!(
-            !configured_turso,
-            TursoMetastoreConfiguredSnafu {
-                dataset: Arc::from(source.name().to_string()),
-            }
-        );
+        let dataset = source.name().to_string();
+        if configured_turso && turso_metastore_param_unreported(&dataset) {
+            tracing::warn!(
+                target: "spiced::acceleration::cayenne",
+                "{}",
+                turso_metastore_param_warning(&dataset)
+            );
+        }
         Ok(())
     }
 
@@ -3636,9 +3650,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("metadata_dir")
             .description("Path for storing Cayenne metadata (SQLite catalog). If not specified, defaults to '{cayenne_file_path}/metadata'."),
         ParameterSpec::component("metastore")
-            .description("Metastore backend for the Cayenne catalog. 'sqlite' is the only supported value and the default. 'turso' is no longer supported: a dataset that sets it fails to load with instructions to remove it.")
+            .description("Metastore backend for the Cayenne catalog. 'sqlite' is the only supported value and the default. 'turso' is no longer supported and has no effect: a dataset that sets it loads on 'sqlite' and logs a warning to remove it.")
             // 'turso' stays accepted here so a leftover value reaches the specific
-            // load error in `ensure_supported_metastore` rather than a generic
+            // warning in `ensure_supported_metastore` rather than a generic
             // invalid-value error.
             .one_of(&["sqlite", "turso"])
             .default("sqlite"),
@@ -4690,7 +4704,6 @@ impl DataAccelerator for CayenneAccelerator {
                     | Error::UnsupportedDataTypes { .. }
                     | Error::PartitionByChanged { .. }
                     | Error::PartitionByChangeHeld { .. }
-                    | Error::TursoMetastoreConfigured { .. }
                     | Error::TursoMetastoreOnDisk { .. }
             )
         ) || rejects_stored_table(error)
@@ -5860,17 +5873,17 @@ mod tests {
     }
 
     #[test]
-    fn turso_metastore_errors_name_the_dataset_the_fix_and_the_docs() {
-        let configured = Error::TursoMetastoreConfigured {
-            dataset: Arc::from("orders"),
-        }
-        .to_string();
+    fn turso_metastore_messages_name_the_dataset_the_fix_and_the_docs() {
         assert_eq!(
-            configured,
-            "Failed to load dataset 'orders' (cayenne): the Cayenne metastore 'turso' is no longer supported. \
-             Remove `cayenne_metastore` from this dataset to use the built-in metastore, then restart Spice. \
+            turso_metastore_param_warning("orders"),
+            "Dataset 'orders' sets `cayenne_metastore: turso`, which is no longer supported and has no effect: \
+             the dataset uses the built-in metastore. Remove `cayenne_metastore` from this dataset. \
              See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration"
         );
+        // Once per dataset: an init retry or a reload that keeps the param stays quiet.
+        assert!(turso_metastore_param_unreported("turso_param_dedupe"));
+        assert!(!turso_metastore_param_unreported("turso_param_dedupe"));
+        assert!(turso_metastore_param_unreported("turso_param_dedupe_other"));
 
         let on_disk = Error::TursoMetastoreOnDisk {
             dataset: Arc::from("orders"),

@@ -4,9 +4,10 @@ description: >
   with a message that names it and what is wrong — an unknown connector
   (listing the known ones), an unreachable host, a rejected password, a
   primary key, time column or partition naming no column, refresh_sql over
-  another table, a missing file, a missing table, the retired Turso Cayenne
-  metastore — while a healthy dataset beside them serves, including a Cayenne
-  dataset on the metastore the Turso one names.
+  another table, a missing file, a missing table — while a healthy dataset
+  beside them serves. A Cayenne dataset that still names the retired Turso
+  metastore loads on the SQLite metastore it shares with a healthy one, and
+  is warned once to drop the param.
 
 sources:
   src: { kind: postgres }
@@ -26,8 +27,8 @@ spicepod:
     - { from: 'file:/no/such/file.parquet', name: bad_file }
     - { from: 'postgres:public.no_such_table', name: bad_table, params: '${sources.src.params}' }
     - { from: 'postgres:public.t', name: healthy_cayenne, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file, params: { cayenne_metastore: sqlite, cayenne_file_path: '${instance.dir}/healthy_cayenne', cayenne_metadata_dir: '${instance.dir}/meta' } } }
-    - { from: 'postgres:public.t', name: bad_metastore, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file, params: { cayenne_metastore: turso, cayenne_file_path: '${instance.dir}/bad_metastore', cayenne_metadata_dir: '${instance.dir}/meta' } } }
-    - { from: 'postgres:public.t', name: bad_metastore_memory, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: memory, params: { cayenne_metastore: turso } } }
+    - { from: 'postgres:public.t', name: turso_param, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file, params: { cayenne_metastore: turso, cayenne_file_path: '${instance.dir}/turso_param', cayenne_metadata_dir: '${instance.dir}/meta' } } }
+    - { from: 'postgres:public.t', name: turso_param_memory, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: memory, params: { cayenne_metastore: turso } } }
 steps:
   - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a')" }
   - start: { ready: false }
@@ -52,14 +53,20 @@ steps:
     eventually: 30s
   - assert-status: { dataset: bad_table, status: Error, message-contains: "Failed to load the dataset bad_table (postgres). The table, 'public.no_such_table', was not found." }
     eventually: 30s
-  # The Turso metastore is removed: a dataset that still names it fails with the
-  # fix, and the SQLite catalog it shares with a healthy dataset is untouched.
+  # The Turso metastore is removed: a dataset that still names it has no effect,
+  # so it loads on the SQLite catalog it shares with a healthy dataset, in both
+  # modes, and is warned once to drop the param.
   - query: SELECT * FROM healthy_cayenne
     expect: { rows: [['1', a]] }
     eventually: 30s
-  - assert-status: { dataset: bad_metastore, status: Error, message-contains: "Failed to load dataset 'bad_metastore' (cayenne): the Cayenne metastore 'turso' is no longer supported. Remove `cayenne_metastore` from this dataset to use the built-in metastore, then restart Spice." }
+  - query: SELECT * FROM turso_param
+    expect: { rows: [['1', a]] }
     eventually: 30s
-  - assert-status: { dataset: bad_metastore_memory, status: Error, message-contains: "Failed to load dataset 'bad_metastore_memory' (cayenne): the Cayenne metastore 'turso' is no longer supported." }
+  - query: SELECT * FROM turso_param_memory
+    expect: { rows: [['1', a]] }
     eventually: 30s
-  # It is refused before it creates its data directory or touches the catalog.
-  - assert-files: { contains: ['^meta/cayenne\.db$'], lacks: ['^bad_metastore/', '^meta/cayenne\.db-log$'] }
+  - assert-log:
+      count:
+        "Dataset 'turso_param' sets `cayenne_metastore: turso`, which is no longer supported and has no effect: the dataset uses the built-in metastore. Remove `cayenne_metastore` from this dataset. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration": 1
+        "Dataset 'turso_param_memory' sets `cayenne_metastore: turso`, which is no longer supported and has no effect": 1
+  - assert-files: { contains: ['^meta/cayenne\.db$'], lacks: ['^meta/cayenne\.db-log$'] }

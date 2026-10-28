@@ -1514,7 +1514,7 @@ Both axes classify every component kind that creates a Cayenne table: datasets, 
 
 | Parameter | Meaning | Default |
 |-----------|---------|---------|
-| `cayenne_metastore` | `sqlite`, the only supported value. `turso` is no longer supported: a dataset that sets it, or whose metastore on disk the Turso metastore wrote, fails to load and changes no file | `sqlite` |
+| `cayenne_metastore` | `sqlite`, the only supported value. `turso` is no longer supported and has no effect: the dataset loads on `sqlite` and logs a warning. A dataset whose metastore on disk the Turso metastore wrote fails to load and changes no file | `sqlite` |
 | `cayenne_file_path` | base data path (local or `s3://…--x-s3/…`); the table's files go under `{cayenne_file_path}/{dataset}/` | `{spice_data}` (so `{spice_data}/{dataset}/`) |
 | `cayenne_metadata_dir` | directory holding the metastore (`cayenne.db`). Must not sit inside any acceleration's data directory: that directory is deleted wholesale on a `file_create` bootstrap and on a schema recreate, and one metastore is the catalog for every Cayenne dataset in the instance. A layout this dataset's own parameters place inside its data directory is refused at load; a metastore found on disk under the directory about to be deleted — whoever configured it — refuses the teardown. The Cayenne *catalog* connector carries the same pair (`cayenne_data_dir` / `cayenne_metadata_dir`) and is refused at load on the same terms — see *Catalog visibility: which tables the catalog exposes* | `{cayenne_file_path}/metadata` when it is local, else `{spice_data}/metadata` |
 | `cayenne_pk_conflict_detection` | `auto` (resolve upserts) or `none` (blind append) | `auto` |
